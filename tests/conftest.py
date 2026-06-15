@@ -155,6 +155,7 @@ async def _clean_tables() -> AsyncIterator[None]:
     _admin_psql(
         "TRUNCATE leads, instances, accounts, admin_audit_log, knowledge_sources, "
         "knowledge_chunks, sessions, transcripts, session_summaries, instance_connections, "
-        "escalation_events, instance_tool_authorizations RESTART IDENTITY CASCADE",
+        "escalation_events, instance_tool_authorizations, conversation_budgets "
+        "RESTART IDENTITY CASCADE",
         db=TEST_DB,
     )
