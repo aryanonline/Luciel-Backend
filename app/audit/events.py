@@ -23,6 +23,13 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "escalation_owner_fallback",
         "budget_exhausted",
         "budget_overage_threshold",
+        # Billing / metering lifecycle (Architecture §3.4.1b, CJ §6, Legal §A3)
+        "billing_checkout_started",
+        "payment_method_added",
+        "payment_method_removed",
+        "invoice_paid",
+        "payment_failed",
+        "dunning_state_changed",
         "connection_status_changed",
         "connection_secret_cleanup",
         "admin_login",
