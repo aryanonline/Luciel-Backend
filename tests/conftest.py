@@ -48,8 +48,19 @@ def _admin_psql(sql: str, db: str = "postgres") -> None:
         env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
         subprocess.run(
             [
-                "psql", "-h", PG_HOST, "-p", PG_PORT, "-U", _SUPERUSER,
-                "-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql,
+                "psql",
+                "-h",
+                PG_HOST,
+                "-p",
+                PG_PORT,
+                "-U",
+                _SUPERUSER,
+                "-d",
+                db,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                sql,
             ],
             check=True,
             capture_output=True,

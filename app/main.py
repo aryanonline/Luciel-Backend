@@ -34,9 +34,13 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     # v1 routers (mounted as arcs land).
+    from app.api.v1.admin.account import router as account_router
+    from app.api.v1.admin.luciel import router as luciel_router
     from app.api.v1.auth import router as auth_router
 
     app.include_router(auth_router)
+    app.include_router(luciel_router)
+    app.include_router(account_router)
 
     return app
 

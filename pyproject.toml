@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "VantageMind Luciel server platform — backend"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
+    # Pinned: fastapi 0.137.x + starlette 1.3 silently dropped include_router routes.
+    "fastapi>=0.115,<0.116",
+    "starlette>=0.40,<0.42",
     "uvicorn[standard]>=0.32",
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",
@@ -57,6 +59,12 @@ exclude = ["app/migrations/"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    # Benign Pydantic false-positive from `type X = Literal[...]` aliases interacting
+    # with the model alias_generator; camelCase serialization is verified correct.
+    "ignore::pydantic.PydanticDeprecatedSince20",
+    "ignore:.*alias.*attribute with value.*:UserWarning",
+]
 markers = [
     "isolation: tenant-isolation suite (non-overridable in CI)",
     "contract: frontend wire-contract conformance",

@@ -52,12 +52,15 @@ async def emit(
         raise ValueError(f"Unknown audit event_type: {event_type!r}")
     payload = payload or {}
 
-    # Find the tenant's current chain head. RLS guarantees this is tenant-scoped.
+    # Find the tenant's current chain head, ordered by the monotonic seq (created_at
+    # is transaction-constant, so it cannot order rows written in one txn). RLS
+    # guarantees this is tenant-scoped. flush() makes prior same-txn rows visible.
+    await session.flush()
     latest = (
         await session.execute(
             select(AdminAuditLog)
             .where(AdminAuditLog.admin_id == admin_id)
-            .order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.event_id.desc())
+            .order_by(AdminAuditLog.seq.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -87,7 +90,7 @@ async def verify_chain(session: AsyncSession, admin_id: uuid.UUID) -> bool:
             await session.execute(
                 select(AdminAuditLog)
                 .where(AdminAuditLog.admin_id == admin_id)
-                .order_by(AdminAuditLog.created_at.asc(), AdminAuditLog.event_id.asc())
+                .order_by(AdminAuditLog.seq.asc())
             )
         )
         .scalars()
