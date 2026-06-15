@@ -23,7 +23,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.connection import InstanceConnection
+from app.connections import gate
 from app.models.tool_auth import InstanceToolAuthorization
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
@@ -53,17 +53,13 @@ class ToolBroker:
     async def _connection_status(
         self, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
     ) -> str | None:
-        row = (
-            await self.s.execute(
-                select(InstanceConnection.status).where(
-                    InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.instance_id == instance_id,
-                    InstanceConnection.connection_type == connection_type,
-                    InstanceConnection.status != "revoked",
-                )
-            )
-        ).scalar_one_or_none()
-        return row
+        # Delegates to the universal gate (§3.8.7 rule A) — one source of truth for
+        # what "connected" means. Reads LIVE status so a mid-conversation revoke is
+        # immediate (§3.8.7 rule E safety side). Behavior is identical to the prior
+        # inline check (revoked rows excluded, returns None when unconfigured).
+        return await gate.connection_status(
+            self.s, admin_id=admin_id, instance_id=instance_id, connection_type=connection_type
+        )
 
     async def dispatch(
         self,
@@ -85,11 +81,11 @@ class ToolBroker:
             conn_status = await self._connection_status(
                 admin_id, instance_id, tool.requires_connection
             )
-            if conn_status != "connected":
-                # Structured tool-error of the same shape as a refusal (§3.3.3).
-                ct = tool.requires_connection
-                cs = conn_status or "unconfigured"
-                result = c.failed(f"connection_not_ready:{ct}:{cs}")
+            if conn_status != gate.CONNECTED:
+                # Structured tool-error of the same shape as a refusal (§3.3.3), built
+                # by the shared gate so the reason string is one source of truth
+                # (§3.8.7 rule A): connection_not_ready:{type}:{status}.
+                result = c.failed(gate.gate_failure_reason(tool.requires_connection, conn_status))
                 await self._trace(
                     admin_id, instance_id, tool.tool_id, result, connection=tool.requires_connection
                 )

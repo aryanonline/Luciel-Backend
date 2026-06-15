@@ -14,6 +14,7 @@ from app.models.conversation import (
     SessionSummary,
     Transcript,
 )
+from app.models.deferred import DeferredAction
 from app.models.instance import Account, Instance
 from app.models.knowledge import (
     KnowledgeChunk,
@@ -42,4 +43,5 @@ __all__ = [
     "InstanceConnection",
     "ConversationBudget",
     "VoiceCallRecord",
+    "DeferredAction",
 ]
