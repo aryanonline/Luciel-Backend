@@ -1,0 +1,194 @@
+"""Agentic loop end-to-end with the deterministic EchoModel (Architecture §3.4.1).
+
+Exercises the loop hermetically: budget gate, intake escalation, normal answer +
+fire-once counting, grounding, the at-cap graceful no-LLM reply, llm_unavailable
+failover, and the human_controlled stop.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from app.db.session import tenant_session
+from app.models.conversation import EscalationEvent, Transcript
+from app.models.conversation import Session as SessionModel
+from app.runtime import budget
+from app.runtime.escalation import Signal
+from app.runtime.llm_router import LLMRouter
+from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
+from app.runtime.testing import EchoModel
+from sqlalchemy import select
+
+pytestmark = [pytest.mark.asyncio]
+
+
+async def _empty_retriever(_q: str) -> list[str]:
+    return []
+
+
+async def _seed_session(s, admin, iid, *, mode="ai") -> uuid.UUID:
+    sid = uuid.uuid4()
+    s.add(SessionModel(id=sid, admin_id=admin, instance_id=iid, channel="widget", mode=mode))
+    await s.flush()
+    return sid
+
+
+def _orch(s, admin, iid, *, primary, fallback=None, has_pm=False) -> Orchestrator:
+    return Orchestrator(
+        session=s,
+        router=LLMRouter(primary=primary, fallback=fallback or primary),
+        retriever=_empty_retriever,
+        admin_id=admin,
+        instance_id=iid,
+        enabled_channels={"widget"},
+        has_payment_method=has_pm,
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_normal_turn_answers_and_counts_once():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=0.9))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Do you have any openings?",
+        )
+        assert result.reply_text.startswith("Echo:")
+        assert result.counted is True
+        assert result.at_cap is False
+        # The transcript persisted both the lead message and the luciel reply.
+        rows = (
+            (await s.execute(select(Transcript).where(Transcript.session_id == sid)))
+            .scalars()
+            .all()
+        )
+        roles = sorted(r.role for r in rows)
+        assert roles == ["lead", "luciel"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_explicit_human_request_hands_off_at_intake():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel())
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I want to speak to a human please",
+        )
+        assert result.handed_off is True
+        assert result.escalation is not None
+        assert result.escalation.signal is Signal.explicit_human_request
+        # An escalation event row was written at the intake gate (§3.5.2).
+        ev = (
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
+        assert any(e.gate == "intake" for e in ev)
+        # Session is now human_controlled (§3.4.12).
+        sess = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
+        assert sess.mode == "human_controlled"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_at_cap_returns_graceful_reply_without_counting():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        # Drive the tenant to the cap first.
+        state0 = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+        for _ in range(state0.free_allowance):
+            await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+            )
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(), has_pm=False)
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="hello",
+        )
+        # Graceful at-cap reply, no LLM, no increment (§3.4.1b).
+        assert result.at_cap is True
+        assert result.reply_text == AT_CAP_REPLY
+        assert result.counted is False
+        state = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+        assert state.counted == state.free_allowance  # unchanged by the capped turn
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_both_providers_down_escalates_llm_unavailable():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        down = EchoModel(raise_provider_error=True)
+        orch = _orch(s, admin, iid, primary=down, fallback=down)
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="any availability?",
+        )
+        # No served turn → not counted; cannot_answer escalation (§3.4.5 server signal).
+        assert result.counted is False
+        assert result.escalation is not None
+        ev = (
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
+        assert any(e.signal == "llm_unavailable" for e in ev)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_human_controlled_session_stops_the_loop():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, mode="human_controlled")
+        orch = _orch(s, admin, iid, primary=EchoModel())
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="human_controlled",
+            inbound_text="still there?",
+        )
+        # No LLM reply; inbound persisted to the live feed only (§3.4.12).
+        assert result.handed_off is True
+        assert result.reply_text == ""
+        rows = (
+            (await s.execute(select(Transcript).where(Transcript.session_id == sid)))
+            .scalars()
+            .all()
+        )
+        assert [r.role for r in rows] == ["lead"]  # inbound only, no luciel turn
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_high_value_lead_escalates_at_outcome():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=0.9))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I have a $5000 budget and want to book today",
+        )
+        assert result.escalation is not None
+        assert result.escalation.signal is Signal.high_value_lead
+        assert result.counted is True  # answered + counted, then escalated at outcome

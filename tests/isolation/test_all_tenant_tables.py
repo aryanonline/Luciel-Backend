@@ -61,7 +61,10 @@ async def test_cross_tenant_invisible_for_every_model():
     a, b = uuid.uuid4(), uuid.uuid4()
     # Write one minimal row per tenant table under tenant A, then assert tenant B
     # sees none of them. We construct rows generically with required columns.
+    from datetime import date
+
     from app.models.audit import ActorType, AdminAuditLog
+    from app.models.budget import ConversationBudget
     from app.models.connection import InstanceConnection
     from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
     from app.models.instance import Account, AccountState, Instance, LucielState
@@ -145,6 +148,16 @@ async def test_cross_tenant_invisible_for_every_model():
                 gate="outcome",
             )
         )
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=a,
+                instance_id=iid,
+                billing_period_start=date(2026, 6, 1),
+                counted_conversations=1,
+                counted_session_ids=[str(sid)],
+            )
+        )
 
     # admin_audit_log via the writer (chained).
     from app.audit import log as audit
@@ -165,6 +178,7 @@ async def test_cross_tenant_invisible_for_every_model():
         SessionSummary,
         InstanceConnection,
         EscalationEvent,
+        ConversationBudget,
         AdminAuditLog,
     ]
     async with tenant_session(b) as s:
