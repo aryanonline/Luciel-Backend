@@ -42,8 +42,9 @@ src = ["app", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
 # S101 assert-in-tests; B008 is the FastAPI Depends() idiom; UP042 conflicts with
-# the (str, Enum) pattern SQLAlchemy maps cleanly.
-ignore = ["S101", "B008", "UP042"]
+# the (str, Enum) pattern SQLAlchemy maps cleanly; ASYNC109 — webhook executor
+# signatures intentionally carry a `timeout` param (the 10s envelope, §3.8.6).
+ignore = ["S101", "B008", "UP042", "ASYNC109"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "B"]

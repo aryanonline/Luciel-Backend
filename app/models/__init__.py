@@ -16,8 +16,10 @@ from app.models.conversation import (
 from app.models.instance import Account, Instance
 from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from app.models.lead import Lead
+from app.models.tool_auth import InstanceToolAuthorization
 
 __all__ = [
+    "InstanceToolAuthorization",
     "Account",
     "Instance",
     "Lead",
