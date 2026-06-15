@@ -7,6 +7,7 @@ PUT channels/tools wrap arrays; lifecycle posts return the updated Luciel.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
@@ -14,6 +15,11 @@ from sqlalchemy import select
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found
+from app.api.v1.admin.luciel_invariants import (
+    ensure_config_editable,
+    validate_channels,
+    validate_personality,
+)
 from app.audit import log as audit
 from app.db.session import tenant_session
 from app.lifecycle import state_machine
@@ -22,10 +28,10 @@ from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
 from app.schemas_api.luciel import (
     CreateLucielRequest,
-    EscalationContactWire,
     LucielOut,
-    PersonalityConfigWire,
     UpdateChannelsRequest,
+    UpdateEscalationRequest,
+    UpdatePersonalityRequest,
     UpdateToolsRequest,
 )
 
@@ -126,14 +132,28 @@ async def create_luciel(
 
 
 async def _update_config(
-    admin_id: uuid.UUID, user_id: uuid.UUID, field: str, value: object
-) -> Instance:
+    admin_id: uuid.UUID,
+    user_id: uuid.UUID,
+    field: str,
+    build_value: Callable[[Instance], object],
+) -> LucielOut:
+    """Validated full-replace of one pillar's JSONB blob.
+
+    Replaces the prior blind ``setattr``: now we (1) load the instance, (2) gate on
+    lifecycle state (Arch §3.6), then (3) call ``build_value`` — which runs the
+    state-dependent invariant checks against the loaded ``inst`` and returns the value
+    to persist. Only after all checks pass do we overwrite (full-replace, matching the
+    frozen mock-admin.ts semantics) and emit the audit event.
+    """
     async with tenant_session(admin_id) as s:
         inst = (
             await s.execute(select(Instance).where(Instance.admin_id == admin_id))
         ).scalar_one_or_none()
         if inst is None:
             raise not_found("No Luciel.")
+        # Lifecycle gate before any mutation (Arch §3.6): no edits once grace/hard-deleted.
+        ensure_config_editable(inst)
+        value = build_value(inst)
         setattr(inst, field, value)
         await s.flush()
         await audit.emit(
@@ -145,47 +165,67 @@ async def _update_config(
             event_type="instance_configured",
             payload={"surface": field},
         )
-        return _to_out(inst)  # type: ignore[return-value]
+        return _to_out(inst)
 
 
 @router.put("/channels", response_model=LucielOut)
 async def update_channels(
     req: UpdateChannelsRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
-    channels = [c.model_dump(by_alias=True, exclude_none=True) for c in req.channels]
-    return await _update_config(subject.admin_id, subject.user_id, "channels", channels)  # type: ignore[return-value]
+    def _build(inst: Instance) -> object:
+        # Voice-enable requires prior consent-ack (Vision §3.1, Arch §3.1.2).
+        validate_channels(req, inst)
+        return [c.model_dump(by_alias=True, exclude_none=True) for c in req.channels]
+
+    return await _update_config(subject.admin_id, subject.user_id, "channels", _build)
 
 
 @router.put("/tools", response_model=LucielOut)
 async def update_tools(
     req: UpdateToolsRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
-    tools = [t.model_dump(by_alias=True, exclude_none=True) for t in req.tools]
-    return await _update_config(subject.admin_id, subject.user_id, "tools", tools)  # type: ignore[return-value]
+    # AddonToolIdWire (Vision §3.2, Arch §3.8.7) already rejects unknown ids AND the 4
+    # builtin cognition items at parse time, so no extra value-check is needed here.
+    # The SECOND GATE (a tool is usable only when enabled AND its connection is healthy)
+    # is RUNTIME, not config — so we intentionally persist enabled=true even if the
+    # connection is unhealthy (Arch §3.8.7); the runtime arbiter enforces usability.
+    def _build(_: Instance) -> object:
+        return [t.model_dump(by_alias=True, exclude_none=True) for t in req.tools]
+
+    return await _update_config(subject.admin_id, subject.user_id, "tools", _build)
 
 
 @router.put("/escalation", response_model=LucielOut)
 async def update_escalation(
-    req: EscalationContactWire, subject: Subject = Depends(current_admin)
+    req: UpdateEscalationRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
-    return await _update_config(
-        subject.admin_id,
-        subject.user_id,
-        "escalation",
-        req.model_dump(by_alias=True, exclude_none=True),
-    )  # type: ignore[return-value]
+    # The 4 escalation signals are FIXED and never admin-configurable (Vision §3.4, Arch
+    # §3.4.5): UpdateEscalationRequest has no "signals" field, and routing rules are
+    # constrained to the 4 fixed signals by EscalationSignalWire — so signal
+    # add/remove/disable or an unknown signal is already a 422 at parse time. Only the
+    # who/how (contacts + per-signal routing channel + ccOwner) is editable here.
+    def _build(_: Instance) -> object:
+        return req.model_dump(by_alias=True, exclude_none=True)
+
+    return await _update_config(subject.admin_id, subject.user_id, "escalation", _build)
 
 
 @router.put("/personality", response_model=LucielOut)
 async def update_personality(
-    req: PersonalityConfigWire, subject: Subject = Depends(current_admin)
+    req: UpdatePersonalityRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
-    return await _update_config(
-        subject.admin_id,
-        subject.user_id,
-        "personality",
-        req.model_dump(by_alias=True, exclude_none=True),
-    )  # type: ignore[return-value]
+    # NO model-selection field is accepted (Arch §3.4.3) — enforced structurally by
+    # extra='forbid' on UpdatePersonalityRequest. Custom preset requires the 4 axes.
+    def _build(_: Instance) -> object:
+        validate_personality(req)
+        # Non-custom presets ignore axes per doc (preset is the source of the shape):
+        # drop any stray axes so they are never persisted for a non-custom preset.
+        dumped = req.model_dump(by_alias=True, exclude_none=True)
+        if req.preset != "custom":
+            dumped.pop("axes", None)
+        return dumped
+
+    return await _update_config(subject.admin_id, subject.user_id, "personality", _build)
 
 
 @router.post("/voice-consent", response_model=LucielOut)
@@ -196,10 +236,16 @@ async def acknowledge_voice_consent(subject: Subject = Depends(current_admin)) -
         ).scalar_one_or_none()
         if inst is None:
             raise not_found("No Luciel.")
-        channels = inst.channels or []
-        for ch in channels:
-            if ch.get("id") == "voice":
-                ch["voiceConsentAcknowledgedAt"] = datetime.now(UTC).isoformat()
+        # Same lifecycle gate as the PUT pillars (Arch §3.6): no consent-ack on a
+        # grace-window/hard-deleted instance.
+        ensure_config_editable(inst)
+        # Rebuild as a NEW list so SQLAlchemy detects the JSONB change (the column is not
+        # a MutableList, so in-place edits of the existing list are NOT flushed).
+        now = datetime.now(UTC).isoformat()
+        channels = [
+            {**ch, "voiceConsentAcknowledgedAt": now} if ch.get("id") == "voice" else dict(ch)
+            for ch in (inst.channels or [])
+        ]
         inst.channels = channels
         await s.flush()
         await audit.emit(
