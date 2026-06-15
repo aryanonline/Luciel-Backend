@@ -5,11 +5,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import BigInteger, DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TenantMixin, TimestampMixin
+
+EMBED_DIM = 1536
 
 
 class KnowledgeSource(Base, TenantMixin, TimestampMixin):
@@ -45,3 +48,4 @@ class KnowledgeChunk(Base, TenantMixin, TimestampMixin):
     source_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBED_DIM), nullable=True)
