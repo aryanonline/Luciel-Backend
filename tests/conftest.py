@@ -138,12 +138,23 @@ async def two_tenants() -> tuple[uuid.UUID, uuid.UUID]:
     return new_admin_id(), new_admin_id()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter() -> None:
+    """Reset the module-global rate-limit store so token buckets / auto-blocks do
+    not leak across tests (the limiter is a process singleton in app code)."""
+    from app.channels import rate_limit
+
+    rate_limit._store = rate_limit.TokenBucketStore()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables() -> AsyncIterator[None]:
     """Truncate tenant tables between tests using a superuser path (bypasses RLS)."""
     yield
     # Cleanup after each test. Use the postgres superuser to truncate regardless of RLS.
     _admin_psql(
-        "TRUNCATE leads, instances, accounts, admin_audit_log RESTART IDENTITY CASCADE",
+        "TRUNCATE leads, instances, accounts, admin_audit_log, knowledge_sources, "
+        "knowledge_chunks, sessions, transcripts, session_summaries, instance_connections, "
+        "escalation_events, instance_tool_authorizations RESTART IDENTITY CASCADE",
         db=TEST_DB,
     )
