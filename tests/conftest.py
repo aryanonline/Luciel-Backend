@@ -157,7 +157,7 @@ async def _clean_tables() -> AsyncIterator[None]:
         "knowledge_chunks, knowledge_entities, knowledge_edges, sessions, transcripts, "
         "session_summaries, instance_connections, escalation_events, "
         "instance_tool_authorizations, conversation_budgets, voice_call_records, "
-        "deferred_actions "
+        "deferred_actions, billing_accounts "
         "RESTART IDENTITY CASCADE",
         db=TEST_DB,
     )

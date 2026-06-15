@@ -38,9 +38,12 @@ def create_app() -> FastAPI:
     from app.api.v1.admin.connections import router as connections_router
     from app.api.v1.admin.knowledge import router as knowledge_router
     from app.api.v1.admin.luciel import router as luciel_router
+    from app.api.v1.admin.usage import router as usage_router
     from app.api.v1.auth import router as auth_router
+    from app.api.v1.billing import router as billing_router
     from app.api.v1.chat_widget import router as chat_widget_router
     from app.api.v1.dashboard import router as dashboard_router
+    from app.api.v1.webhooks.stripe import router as stripe_webhook_router
 
     app.include_router(auth_router)
     app.include_router(luciel_router)
@@ -52,6 +55,11 @@ def create_app() -> FastAPI:
     app.include_router(dashboard_router)
     # Data plane: embeddable widget — ZERO admin surface (§1.2, §6.3).
     app.include_router(chat_widget_router)
+    # Billing data plane (admin's own account) + usage dashboard (§3.4.1b, §3.9).
+    app.include_router(billing_router)
+    app.include_router(usage_router)
+    # Stripe webhooks: signature-verified before routing (§3.4.1b, HARD CONSTRAINT #4).
+    app.include_router(stripe_webhook_router)
 
     return app
 
