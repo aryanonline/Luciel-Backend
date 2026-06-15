@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
 
     # v1 routers (mounted as arcs land).
     from app.api.v1.admin.account import router as account_router
+    from app.api.v1.admin.connections import router as connections_router
     from app.api.v1.admin.knowledge import router as knowledge_router
     from app.api.v1.admin.luciel import router as luciel_router
     from app.api.v1.auth import router as auth_router
@@ -45,6 +46,8 @@ def create_app() -> FastAPI:
     app.include_router(luciel_router)
     app.include_router(knowledge_router)
     app.include_router(account_router)
+    # Connections layer: one model for every external dependency (§3.8).
+    app.include_router(connections_router)
     # Control plane: dashboard conversations/leads (cookie-authed, §3.4).
     app.include_router(dashboard_router)
     # Data plane: embeddable widget — ZERO admin surface (§1.2, §6.3).
