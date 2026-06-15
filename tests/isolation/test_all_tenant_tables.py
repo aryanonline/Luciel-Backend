@@ -68,13 +68,20 @@ async def test_cross_tenant_invisible_for_every_model():
     from app.models.connection import InstanceConnection
     from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
     from app.models.instance import Account, AccountState, Instance, LucielState
-    from app.models.knowledge import KnowledgeChunk, KnowledgeSource
+    from app.models.knowledge import (
+        KnowledgeChunk,
+        KnowledgeEdge,
+        KnowledgeEntity,
+        KnowledgeSource,
+    )
     from app.models.lead import Lead
     from app.models.voice import VoiceCallRecord
 
     iid = uuid.uuid4()
     sid = uuid.uuid4()
     srcid = uuid.uuid4()
+    ent_a = uuid.uuid4()
+    ent_b = uuid.uuid4()
 
     async with tenant_session(a) as s:
         s.add(
@@ -115,6 +122,39 @@ async def test_cross_tenant_invisible_for_every_model():
         s.add(
             KnowledgeChunk(
                 id=uuid.uuid4(), admin_id=a, instance_id=iid, source_id=srcid, ordinal=0, text="t"
+            )
+        )
+        s.add(
+            KnowledgeEntity(
+                id=ent_a,
+                admin_id=a,
+                instance_id=iid,
+                source_id=srcid,
+                entity_type="Thing",
+                name="A",
+                canonical="a",
+            )
+        )
+        s.add(
+            KnowledgeEntity(
+                id=ent_b,
+                admin_id=a,
+                instance_id=iid,
+                source_id=srcid,
+                entity_type="Thing",
+                name="B",
+                canonical="b",
+            )
+        )
+        s.add(
+            KnowledgeEdge(
+                id=uuid.uuid4(),
+                admin_id=a,
+                instance_id=iid,
+                source_id=srcid,
+                src_entity_id=ent_a,
+                dst_entity_id=ent_b,
+                relationship_type="RELATES_TO",
             )
         )
         s.add(Session(id=sid, admin_id=a, instance_id=iid, channel="widget", mode="ai"))
@@ -183,6 +223,8 @@ async def test_cross_tenant_invisible_for_every_model():
         Lead,
         KnowledgeSource,
         KnowledgeChunk,
+        KnowledgeEntity,
+        KnowledgeEdge,
         Session,
         Transcript,
         SessionSummary,
