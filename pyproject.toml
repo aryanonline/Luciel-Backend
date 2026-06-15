@@ -1,0 +1,66 @@
+[project]
+name = "luciel-backend"
+version = "0.1.0"
+description = "VantageMind Luciel server platform — backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "redis>=5.2",
+    "pgvector>=0.3.6",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.10",
+    "python-multipart>=0.0.20",
+    "httpx>=0.28",
+    "stripe>=11.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+    "mypy>=1.14",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+    "detect-secrets>=1.5",
+    "types-redis",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+# S101 assert-in-tests; B008 is the FastAPI Depends() idiom; UP042 conflicts with
+# the (str, Enum) pattern SQLAlchemy maps cleanly.
+ignore = ["S101", "B008", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+"app/migrations/**" = ["E501", "F401"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+exclude = ["app/migrations/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "isolation: tenant-isolation suite (non-overridable in CI)",
+    "contract: frontend wire-contract conformance",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", "app/migrations"]

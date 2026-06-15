@@ -1,0 +1,121 @@
+name: CI
+
+# Non-overridable quality gate (Architecture §5.14/§5.15, Space Instructions §8):
+# isolation suite + unit + integration + contract + migration apply/rollback +
+# ruff + mypy + bandit (SAST) + pip-audit (deps) + detect-secrets + doctrine sync.
+# The tenant-isolation suite failing blocks the merge — there is no override.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    env:
+      PGPASSWORD: postgres
+      LUCIEL_COOKIE_SECURE: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install deps
+        run: |
+          uv venv .venv
+          . .venv/bin/activate
+          uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
+
+      - name: Provision DB roles (the non-superuser app role + narrow auth role)
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f scripts/bootstrap_roles.sql
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE luciel_app PASSWORD 'luciel_dev_pw';"
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE luciel_dev OWNER luciel_app;"
+          psql -h localhost -U postgres -d luciel_dev -v ON_ERROR_STOP=1 -f scripts/bootstrap_db.sql
+
+      - name: Lint (ruff)
+        run: |
+          . .venv/bin/activate
+          ruff check app tests
+          ruff format --check app tests
+
+      - name: Type-check (mypy strict)
+        run: |
+          . .venv/bin/activate
+          mypy app
+
+      - name: SAST (bandit)
+        run: |
+          . .venv/bin/activate
+          bandit -q -r app -c pyproject.toml
+
+      - name: Dependency audit (pip-audit)
+        run: |
+          . .venv/bin/activate
+          pip-audit -s osv || true   # advisory; do not block on transitive advisories at this stage
+
+      - name: Secret scan (detect-secrets)
+        run: |
+          . .venv/bin/activate
+          detect-secrets scan --baseline .secrets.baseline || \
+            (echo "New secrets detected — review .secrets.baseline" && exit 1)
+
+      - name: Doctrine-to-code sync (Architecture §5.9.3)
+        run: |
+          . .venv/bin/activate
+          python scripts/check_doctrine_sync.py --diff-base "${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+
+      - name: Migration apply + rollback (expand-contract, §5.9.1)
+        env:
+          LUCIEL_DATABASE_URL_SYNC: postgresql+psycopg://luciel_app:luciel_dev_pw@localhost:5432/luciel_dev
+        run: |
+          . .venv/bin/activate
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Tenant-isolation suite (NON-OVERRIDABLE)
+        env:
+          LUCIEL_PG_HOST: localhost
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/isolation -v
+
+      - name: Unit + integration + contract suites
+        env:
+          LUCIEL_PG_HOST: localhost
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/unit tests/integration tests/contract tests/migrations -v
