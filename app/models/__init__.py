@@ -18,6 +18,7 @@ from app.models.instance import Account, Instance
 from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from app.models.lead import Lead
 from app.models.tool_auth import InstanceToolAuthorization
+from app.models.voice import VoiceCallRecord
 
 __all__ = [
     "InstanceToolAuthorization",
@@ -33,4 +34,5 @@ __all__ = [
     "EscalationEvent",
     "InstanceConnection",
     "ConversationBudget",
+    "VoiceCallRecord",
 ]
