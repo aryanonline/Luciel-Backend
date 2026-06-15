@@ -45,6 +45,7 @@ from app.channels.voice_adapter import (
 from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
 from app.models.voice import VoiceCallRecord
+from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.sessions import resolve_or_open_session
@@ -194,15 +195,16 @@ async def handle_turn(
         resolved_lead_id=None,
     )
 
-    async def _retriever(_query: str) -> list[str]:
-        # No bound retrieval store in Arc 14b (Arc 11/16) — injected empty retriever,
-        # same hermetic wiring the widget data plane uses (§3.2 flagged).
-        return []
+    # Arc 16 binds the production hybrid retriever (vector + intent-gated graph, §3.2.1)
+    # behind the orchestrator's injected seam — closing the Arc 14b empty "Arc 11/16" stub.
+    # Voice runs the SAME orchestrator/retrieval path as every other channel; retrieved
+    # content flows through wrap_untrusted in the loop (§3.4.14).
+    retriever = make_retriever(session, admin_id=admin_id, instance_id=instance_id)
 
     orch = Orchestrator(
         session=session,
         router=router,
-        retriever=_retriever,
+        retriever=retriever,
         admin_id=admin_id,
         instance_id=instance_id,
         enabled_channels={"voice"},

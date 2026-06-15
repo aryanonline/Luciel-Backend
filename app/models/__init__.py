@@ -15,7 +15,12 @@ from app.models.conversation import (
     Transcript,
 )
 from app.models.instance import Account, Instance
-from app.models.knowledge import KnowledgeChunk, KnowledgeSource
+from app.models.knowledge import (
+    KnowledgeChunk,
+    KnowledgeEdge,
+    KnowledgeEntity,
+    KnowledgeSource,
+)
 from app.models.lead import Lead
 from app.models.tool_auth import InstanceToolAuthorization
 from app.models.voice import VoiceCallRecord
@@ -28,6 +33,8 @@ __all__ = [
     "AdminAuditLog",
     "KnowledgeSource",
     "KnowledgeChunk",
+    "KnowledgeEntity",
+    "KnowledgeEdge",
     "Session",
     "Transcript",
     "SessionSummary",

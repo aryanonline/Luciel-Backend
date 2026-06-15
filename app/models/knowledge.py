@@ -7,6 +7,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import BigInteger, DateTime, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -49,3 +50,45 @@ class KnowledgeChunk(Base, TenantMixin, TimestampMixin):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBED_DIM), nullable=True)
+
+
+# --- Graph store (Architecture §3.2.1 — Path Locked: PostgreSQL ONLY) ------------- #
+# The graph store is a DOMAIN-AGNOSTIC typed-node + directed-typed-edge model (§3.2.1):
+# entity_type/relationship_type are free-text strings INFERRED at ingest from content +
+# the admin's business description — the platform imposes NO vertical-specific ontology
+# (§3.2.1 table is illustrative, not enumerated). Both tables are TenantMixin so the RLS
+# generator (app/db/rls.py) + the isolation sweep auto-cover them, and both carry source_id
+# so they cascade-delete with their KnowledgeSource exactly like KnowledgeChunk does (§3.2.1
+# rule 5 / §3.2.2 soft-delete cascade). Stored entirely inside the existing Postgres footprint
+# — NO Neo4j/Memgraph/new vendor (§3.2.1 Path-Lock, Locked Decision §7 #4).
+
+
+class KnowledgeEntity(Base, TenantMixin, TimestampMixin):
+    __tablename__ = "knowledge_entities"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # entity_type is inferred, not from a fixed ontology (§3.2.1 domain-agnostic).
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    # canonical (normalized) name is the traversal/membership key; name is the surface form.
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    canonical: Mapped[str] = mapped_column(String(512), nullable=False)
+    attributes: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class KnowledgeEdge(Base, TenantMixin, TimestampMixin):
+    __tablename__ = "knowledge_edges"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    src_entity_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    dst_entity_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # relationship_type is inferred from source context (§3.2.1 domain-agnostic).
+    relationship_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    attributes: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)

@@ -35,6 +35,7 @@ from app.db.session import tenant_session, untenanted_session
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.runtime import budget
+from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.sessions import resolve_or_open_session
@@ -160,17 +161,18 @@ async def send_message(body: WidgetSendRequest) -> WidgetSendResult:
             resolved_lead_id=None,
         )
 
-        # Arc 14 has no bound retrieval store (Arc 11/16) and no external LLM keys:
-        # the loop runs against an injected empty retriever + the deterministic
-        # EchoModel router so the data plane is exercisable hermetically (§3.4.3).
-        async def _retriever(_query: str) -> list[str]:
-            return []
+        # Arc 16 binds the production hybrid retriever (vector + intent-gated graph,
+        # §3.2.1) behind the orchestrator's injected seam — closing the Arc 14/14b empty
+        # "Arc 11/16" stub. The LLM router stays the deterministic EchoModel (no external
+        # keys in this plane, §3.4.3); retrieval is now real over the tenant's ingested
+        # knowledge. Content flows through wrap_untrusted in the loop (§3.4.14).
+        retriever = make_retriever(s, admin_id=ctx.admin_id, instance_id=ctx.instance_id)
 
         echo = EchoModel(confidence=0.9)
         orch = Orchestrator(
             session=s,
             router=LLMRouter(primary=echo, fallback=echo),
-            retriever=_retriever,
+            retriever=retriever,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels={CHANNEL},
