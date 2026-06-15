@@ -51,6 +51,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "password_reset_requested",
         "password_reset_completed",
         "voice_consent_ack",
+        # Per-call proof the mandatory recording/AI disclosure was played (§3.1.2).
+        "voice_disclosure_played",
         "lead_pruned",
         "lead_archived",
         "lead_reactivated",

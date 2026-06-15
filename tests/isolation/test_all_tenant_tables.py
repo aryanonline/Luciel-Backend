@@ -70,6 +70,7 @@ async def test_cross_tenant_invisible_for_every_model():
     from app.models.instance import Account, AccountState, Instance, LucielState
     from app.models.knowledge import KnowledgeChunk, KnowledgeSource
     from app.models.lead import Lead
+    from app.models.voice import VoiceCallRecord
 
     iid = uuid.uuid4()
     sid = uuid.uuid4()
@@ -158,6 +159,15 @@ async def test_cross_tenant_invisible_for_every_model():
                 counted_session_ids=[str(sid)],
             )
         )
+        s.add(
+            VoiceCallRecord(
+                id=uuid.uuid4(),
+                admin_id=a,
+                instance_id=iid,
+                provider_call_id="CA_test",
+                from_number="+15551230000",
+            )
+        )
 
     # admin_audit_log via the writer (chained).
     from app.audit import log as audit
@@ -179,6 +189,7 @@ async def test_cross_tenant_invisible_for_every_model():
         InstanceConnection,
         EscalationEvent,
         ConversationBudget,
+        VoiceCallRecord,
         AdminAuditLog,
     ]
     async with tenant_session(b) as s:
