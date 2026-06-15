@@ -12,14 +12,26 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, String, func
+from sqlalchemy import BigInteger, DateTime, Enum, Sequence, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TenantMixin
+
+# Pre-existing DB sequence (created in migration 0003_arc10_audit_seq). Binding it to the
+# column makes SQLAlchemy OMIT seq from the INSERT column list and fetch the assigned value
+# back via RETURNING — instead of sending an explicit NULL that overrides the column's
+# DEFAULT nextval(...). Without this binding, every row was written with seq=NULL, so the
+# per-admin "ORDER BY seq" used by both the writer (chain-head lookup) and verify_chain was
+# nondeterministic — the intermittent root cause of the audit-chain verification failures.
+_audit_seq = Sequence("admin_audit_log_seq")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class ActorType(str, enum.Enum):
@@ -41,10 +53,18 @@ class AdminAuditLog(Base, TenantMixin):
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     event_payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    # created_at is APP-ASSIGNED at insert (datetime.now(UTC)), NOT a server default. The
+    # hash material includes created_at (§5.2), so the value hashed by the writer must be
+    # the EXACT value persisted; an app-assigned value round-trips identically and removes
+    # any dependence on server now()/asyncpg timestamptz decoding for chain integrity.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), default=_utcnow, nullable=False
     )
     prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # Monotonic chain-ordering key (BIGSERIAL). created_at is transaction-constant,
-    # so seq is what gives a strict order for the per-admin hash chain (§5.3).
-    seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Strict monotonic chain-ordering key. Bound to the DB sequence (server_default) so the
+    # DB assigns it and SQLAlchemy reads it back — NEVER sent as NULL by the ORM. created_at
+    # is transaction-constant (same txn → same timestamp), so seq is the ONLY reliable order
+    # key for the per-admin hash chain (§5.3). Nullable kept for the pre-0003 backfilled rows.
+    seq: Mapped[int | None] = mapped_column(
+        BigInteger, _audit_seq, server_default=_audit_seq.next_value(), nullable=True
+    )
