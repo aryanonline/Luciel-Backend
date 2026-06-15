@@ -6,7 +6,27 @@ Importing this package imports every model module so that:
 """
 
 from app.models.audit import AdminAuditLog
+from app.models.connection import InstanceConnection
+from app.models.conversation import (
+    EscalationEvent,
+    Session,
+    SessionSummary,
+    Transcript,
+)
 from app.models.instance import Account, Instance
+from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from app.models.lead import Lead
 
-__all__ = ["Account", "Instance", "Lead", "AdminAuditLog"]
+__all__ = [
+    "Account",
+    "Instance",
+    "Lead",
+    "AdminAuditLog",
+    "KnowledgeSource",
+    "KnowledgeChunk",
+    "Session",
+    "Transcript",
+    "SessionSummary",
+    "EscalationEvent",
+    "InstanceConnection",
+]

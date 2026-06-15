@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Enum, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -89,3 +90,12 @@ class Instance(Base, TenantMixin, TimestampMixin):
     grace_window_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Five-pillar config stored as JSONB (camelCase wire shapes round-trip cleanly).
+    # Channels/tools/escalation/personality are per-instance config the owner edits;
+    # connection health is layered in from instance_connections at read time (Arc 17).
+    channels: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False, default=list)
+    tools: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False, default=list)
+    escalation: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    personality: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Soft-delete marker mirrored onto the state machine (grace window).
+    soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
