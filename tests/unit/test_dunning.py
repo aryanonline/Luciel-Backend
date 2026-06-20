@@ -47,3 +47,13 @@ def test_reduced_behaves_as_free_cap() -> None:
     assert dunning.behaves_as_free_cap(dunning.REDUCED) is True
     assert dunning.behaves_as_free_cap(dunning.RETRYING) is False
     assert dunning.behaves_as_free_cap(dunning.NONE) is False
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis8-F03 (lifecycle_notice_sent audit event)
+# ---------------------------------------------------------------------------
+
+
+def test_dunning_module_exports_retry_days() -> None:
+    """Axis8-F03: RETRY_DAYS constant is available for attempt calculation."""
+    assert dunning.RETRY_DAYS == (1, 3, 5, 7)

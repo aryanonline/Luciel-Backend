@@ -7,10 +7,14 @@ then dispatches here. Idempotent on the Stripe event id (HARD CONSTRAINT, §3.4.
 a redelivered event is a no-op — Stripe may redeliver.
 
 Events handled:
-  * invoice.paid          → reset period + counter (NO rollover), clear dunning.
-  * invoice.payment_failed → drive dunning none→retrying, record dunning_started_at.
-  * payment_method.attached → flip billingState→payg_enabled + store display tuple.
-  * payment_method.detached → flip billingState→free_cap + clear display tuple.
+  * invoice.paid                    → reset period + counter (NO rollover), clear dunning,
+                                      restore dormant connections (Legal §A3 / §3.6.7).
+  * invoice.payment_failed          → drive dunning none→retrying, email notification +
+                                      lifecycle_notice_sent audit (Legal §A3 / §3.6.7).
+  * payment_method.attached         → flip billingState→payg_enabled + store display tuple,
+                                      restore dormant connections (Legal §A3).
+  * payment_method.detached         → flip billingState→free_cap + clear display tuple.
+  * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -28,6 +32,8 @@ from app.billing.stripe_gateway import StripeEvent
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount
 from app.models.budget import ConversationBudget
+from app.models.connection import InstanceConnection
+from app.notifications import notifier as notify
 
 
 async def _already_processed(account: BillingAccount, event_id: str) -> bool:
@@ -59,6 +65,9 @@ async def handle_event(
         action = await _on_pm_attached(session, admin_id=admin_id, account=account, event=event)
     elif event.type == "payment_method.detached":
         action = await _on_pm_detached(session, admin_id=admin_id, account=account)
+    elif event.type == "customer.subscription.renewed":
+        # §3.4.1b: subscription renewal triggers same period-reset as invoice.paid.
+        action = await _on_invoice_paid(session, admin_id=admin_id, account=account, event=event)
     else:
         action = "ignored"
 
@@ -74,7 +83,8 @@ async def _on_invoice_paid(
     account: BillingAccount,
     event: StripeEvent,
 ) -> str:
-    """invoice.paid → reset the period + counter (NO rollover) and clear dunning.
+    """invoice.paid → reset the period + counter (NO rollover), clear dunning,
+    and restore dormant connections (Legal §A3 / Architecture §3.6.7).
 
     Period is Stripe-billing-date anchored (§3.4.1b): the new period bounds come
     from the invoice's period fields when present."""
@@ -111,6 +121,9 @@ async def _on_invoice_paid(
             event_type="dunning_state_changed",
             payload={"from": prev_dunning, "to": account.dunning_state, "reason": "invoice_paid"},
         )
+
+    # Legal §A3: restore dormant connections on successful payment.
+    await _restore_dormant_connections(session, admin_id=admin_id)
     return "invoice_paid"
 
 
@@ -121,10 +134,14 @@ async def _on_payment_failed(
     account: BillingAccount,
     now: datetime,
 ) -> str:
-    """invoice.payment_failed → enter/continue dunning (CJ §6 / Legal §A3).
+    """invoice.payment_failed → enter/continue dunning + notify admin (CJ §6 / Legal §A3).
 
     First failure → retrying (full service, days 0–7). The day-7 → reduced advance
-    is time-driven (dunning.advance), applied here against dunning_started_at."""
+    is time-driven (dunning.advance), applied here against dunning_started_at.
+
+    Architecture §3.6.7 / Legal §A3: "A notification is sent at each retry attempt"
+    and "The cadence is logged to admin_audit_log (event_type = 'lifecycle_notice_sent')."
+    """
     prev = account.dunning_state
     if account.dunning_started_at is None:
         account.dunning_started_at = now
@@ -133,6 +150,15 @@ async def _on_payment_failed(
     )
     # Apply the time-driven advance (retrying → reduced once day 7 is reached).
     account.dunning_state = dunning.advance(account.dunning_state, account.dunning_started_at, now)
+
+    # Compute the attempt number (1-based: which retry attempt this is, days 1/3/5/7).
+    attempt_number = 1
+    if account.dunning_started_at is not None:
+        elapsed_days = (now - account.dunning_started_at).days
+        retry_days = dunning.RETRY_DAYS  # (1, 3, 5, 7)
+        # attempt_number = position in the retry schedule (1-indexed).
+        attempt_number = sum(1 for d in retry_days if elapsed_days >= d) or 1
+
     await session.flush()
 
     await audit.emit(
@@ -150,6 +176,16 @@ async def _on_payment_failed(
             event_type="dunning_state_changed",
             payload={"from": prev, "to": account.dunning_state, "reason": "payment_failed"},
         )
+
+    # Architecture §3.6.7 / Legal §A3: notify admin at each retry attempt and emit
+    # lifecycle_notice_sent audit event.
+    await notify.notify_payment_failed(
+        session,
+        admin_id=admin_id,
+        dunning_state=account.dunning_state,
+        attempt_number=attempt_number,
+        now=now,
+    )
     return "payment_failed"
 
 
@@ -183,7 +219,43 @@ async def _on_pm_attached(
         event_type="payment_method_added",
         payload={"brand": account.pm_brand, "last4": account.pm_last4},
     )
+
+    # Legal §A3: "connections that go dormant … are restored automatically if a valid
+    # payment method is added within the retention window."
+    await _restore_dormant_connections(session, admin_id=admin_id)
     return "payment_method.attached"
+
+
+async def _restore_dormant_connections(session: AsyncSession, *, admin_id: uuid.UUID) -> int:
+    """Restore dormant connections to unconfigured for re-health-check (Legal §A3 / §3.6.7).
+
+    When a valid payment method is added or invoice.paid fires after dunning, any
+    connections placed in ``dormant`` state must be made re-checkable (unconfigured).
+    The health worker will then probe them and promote to ``connected`` if healthy.
+
+    Returns the number of rows transitioned."""
+    result = await session.execute(
+        update(InstanceConnection)
+        .where(
+            InstanceConnection.admin_id == admin_id,
+            InstanceConnection.status == "dormant",
+        )
+        .values(status="unconfigured", status_detail="restored_after_payment")
+    )
+    restored = int(result.rowcount or 0)  # type: ignore[attr-defined]
+    if restored > 0:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="connection_status_changed",
+            payload={
+                "reason": "dormant_connections_restored_on_payment",
+                "count": restored,
+                "new_status": "unconfigured",
+            },
+        )
+    return restored
 
 
 async def _on_pm_detached(
