@@ -234,6 +234,43 @@ async def get_chunks(
     )
 
 
+async def view_chunks(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None = None,
+    limit: int = 20,
+) -> list[KnowledgeChunk]:
+    """Return a source's chunks AND emit a ``knowledge_source_viewed`` audit event.
+
+    Architecture §3.2.2 requires that view + edit + delete history of a knowledge
+    source flows into ``admin_audit_log``; §5.1 registers ``knowledge_source_viewed``
+    as a defined event. The chunk-preview surface is the "view" of a source, so the
+    raw-view chunk read is the correct emit site (audit finding Axis4-F04). Only
+    emits when the source actually exists for this tenant (no event for a 404).
+    """
+    source = (
+        await session.execute(
+            select(KnowledgeSource).where(
+                KnowledgeSource.admin_id == admin_id, KnowledgeSource.id == source_id
+            )
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        return []
+    chunks = await get_chunks(session, admin_id, source_id, limit=limit)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        actor_user_id=actor_user_id,
+        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+        event_type="knowledge_source_viewed",
+        payload={"source_id": str(source_id), "chunks": len(chunks)},
+    )
+    return chunks
+
+
 async def delete_source(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -286,6 +323,16 @@ async def delete_source(
     return True
 
 
+# Retrieval re-rank tuning (Architecture §3.2 retrieval flow, step 3:
+# "Re-rank by recency and chunk-ordinal proximity"). The ANN pass (step 2) is the
+# dominant relevance signal; re-rank is a TIE-BREAK within a small cosine band so it
+# cannot reorder semantically-distinct results (which would regress recall). Two
+# candidates are "close" if their cosine distances differ by <= _RERANK_BAND; within a
+# band the more recently updated source and the lower-ordinal chunk are preferred.
+_RERANK_BAND = 0.05
+_RERANK_OVERFETCH = 4  # pull a wider candidate set than k so the re-rank has material
+
+
 async def retrieve(
     session: AsyncSession,
     *,
@@ -298,13 +345,24 @@ async def retrieve(
 
     Filters to (admin_id, instance_id) and only sources whose ingestion is ready
     and not soft-deleted (Architecture §3.2 retrieval flow). RLS is the backstop.
+
+    Implements the §3.2 retrieval flow in full:
+      step 2 — HNSW ANN over the embedding (ordered by cosine distance);
+      step 3 — re-rank the top candidates by recency + chunk-ordinal proximity as a
+               tie-break within a narrow cosine band, then truncate to k.
     """
     embedder = get_embedder()
     qvec = (await embedder.embed([query]))[0]
     distance = KnowledgeChunk.embedding.cosine_distance(qvec)
+    # Over-fetch: the ANN gives us more candidates than k so step-3 re-ranking has
+    # material to reorder within the cosine band before we truncate to k.
     rows = (
         await session.execute(
-            select(KnowledgeChunk, distance.label("distance"))
+            select(
+                KnowledgeChunk,
+                distance.label("distance"),
+                KnowledgeSource.last_updated_at.label("src_updated_at"),
+            )
             .join(KnowledgeSource, KnowledgeSource.id == KnowledgeChunk.source_id)
             .where(
                 KnowledgeChunk.admin_id == admin_id,
@@ -313,7 +371,42 @@ async def retrieve(
                 KnowledgeSource.soft_deleted_at.is_(None),
             )
             .order_by(distance.asc())
-            .limit(k)
+            .limit(max(k, k + _RERANK_OVERFETCH))
         )
     ).all()
-    return [(row[0], float(row[1])) for row in rows]
+    candidates = [
+        (row[0], float(row[1]), row[2]) for row in rows
+    ]  # (chunk, cosine_distance, source_last_updated_at)
+    reranked = _rerank(candidates)
+    return [(chunk, dist) for chunk, dist, _ in reranked[:k]]
+
+
+def _rerank(
+    candidates: list[tuple[KnowledgeChunk, float, datetime | None]],
+) -> list[tuple[KnowledgeChunk, float, datetime | None]]:
+    """Step-3 re-rank: stable tie-break by recency + chunk-ordinal proximity (§3.2).
+
+    Cosine distance stays the primary key, so a clearly-more-relevant chunk is never
+    demoted. Only within a narrow distance band (<= _RERANK_BAND) do we prefer the
+    fresher source and then the lower-ordinal chunk. We quantise the distance into
+    bands and sort by (band, -recency, ordinal, distance) so the reorder is bounded
+    and deterministic.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+    def sort_key(
+        item: tuple[KnowledgeChunk, float, datetime | None],
+    ) -> tuple[int, float, int, float]:
+        chunk, dist, updated_at = item
+        band = int(dist / _RERANK_BAND)  # candidates in the same band are "close"
+        ts = updated_at or epoch
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        recency = ts.timestamp()
+        # Within a band: newer source first (-recency), then lower ordinal, then the
+        # raw distance as the final, fully-deterministic tie-break.
+        return (band, -recency, chunk.ordinal, dist)
+
+    return sorted(candidates, key=sort_key)

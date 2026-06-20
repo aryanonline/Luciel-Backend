@@ -73,7 +73,9 @@ async def get_chunks(
     source_id: uuid.UUID, subject: Subject = Depends(current_admin)
 ) -> list[KnowledgeChunkOut]:
     async with tenant_session(subject.admin_id) as s:
-        chunks = await service.get_chunks(s, subject.admin_id, source_id)
+        # view_chunks emits the knowledge_source_viewed audit event (Architecture
+        # §3.2.2 "view + edit + delete history flows into admin_audit_log"; Axis4-F04).
+        chunks = await service.view_chunks(s, subject.admin_id, source_id, subject.user_id)
         return [
             KnowledgeChunkOut.model_validate(
                 {"chunkId": c.id, "sourceId": c.source_id, "ordinal": c.ordinal, "text": c.text}

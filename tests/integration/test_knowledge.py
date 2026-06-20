@@ -13,6 +13,7 @@ import pytest
 from app.db.session import tenant_session
 from app.knowledge import service
 from app.knowledge.service import PER_FILE_MAX_BYTES, QuotaError
+from app.models.audit import AdminAuditLog
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk
 from sqlalchemy import func, select
@@ -169,3 +170,91 @@ async def test_retrieval_is_tenant_scoped():
         )
         for chunk, _dist in results:
             assert chunk.admin_id == b
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_rerank_preserves_relevance_primary_order():
+    """Step-3 re-rank (Axis4-F01) must not demote a clearly-more-relevant chunk.
+
+    The re-rank is a tie-break WITHIN a narrow cosine band, so the single best
+    semantic match still ranks first; recency/ordinal only reorder near-ties.
+    """
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        await service.ingest_text(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            name="pricing.txt",
+            text="The starter engagement price is 899 dollars for new clients.",
+        )
+        await service.ingest_text(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            name="hours.txt",
+            text="Our office hours are nine to five on weekdays only.",
+        )
+    async with tenant_session(admin) as s:
+        results = await service.retrieve(
+            s, admin_id=admin, instance_id=iid, query="what is the starter engagement price", k=3
+        )
+        assert results, "retrieval returned nothing"
+        # distances must be non-decreasing across bands (primary key is cosine band)
+        dists = [d for _c, d in results]
+        # the strongest semantic match still leads
+        assert "899" in results[0][0].text.lower() or "starter" in results[0][0].text.lower()
+        # re-rank never produces a wildly out-of-order leader: best result is within
+        # one band of the global minimum distance
+        assert dists[0] <= min(dists) + 0.05
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_view_chunks_emits_knowledge_source_viewed_audit_event():
+    """Axis4-F04: viewing a source's chunks emits knowledge_source_viewed (§3.2.2)."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        src = await service.ingest_text(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            name="p.txt",
+            text="starter engagement price 899 dollars",
+        )
+        sid = src.id
+    async with tenant_session(admin) as s:
+        chunks = await service.view_chunks(s, admin, sid, admin)
+        assert chunks, "view_chunks returned no chunks for a real source"
+    async with tenant_session(admin) as s:
+        cnt = (
+            await s.execute(
+                select(func.count())
+                .select_from(AdminAuditLog)
+                .where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "knowledge_source_viewed",
+                )
+            )
+        ).scalar_one()
+        assert cnt == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_view_chunks_missing_source_emits_no_event():
+    """Axis4-F04: a 404 (unknown source) must NOT emit a spurious viewed event."""
+    admin = uuid.uuid4()
+    await _seed(admin)
+    async with tenant_session(admin) as s:
+        chunks = await service.view_chunks(s, admin, uuid.uuid4(), admin)
+        assert chunks == []
+    async with tenant_session(admin) as s:
+        cnt = (
+            await s.execute(
+                select(func.count())
+                .select_from(AdminAuditLog)
+                .where(AdminAuditLog.event_type == "knowledge_source_viewed")
+            )
+        ).scalar_one()
+        assert cnt == 0
