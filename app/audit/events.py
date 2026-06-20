@@ -32,8 +32,6 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "dunning_state_changed",
         "connection_status_changed",
         "connection_secret_cleanup",
-        "admin_login",
-        "admin_login_failed",
         "data_export_requested",
         "data_export_ready",
         "data_export_self_serve",
