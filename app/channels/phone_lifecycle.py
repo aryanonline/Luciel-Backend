@@ -61,8 +61,15 @@ async def ensure_sms_number(
         connection_type="sms_sender",
         auth_class="provisioned_resource",
         provider="twilio",
-        status="connected",
+        # The number exists immediately, but A2P 10DLC carrier registration is not yet
+        # approved, so it cannot send to US recipients (§3.1.6 / Decision §46). Surface
+        # an honest pending status — NOT "connected" — until the carrier approves; the
+        # registration-status poller flips it to "connected" on approval.
+        status="pending_carrier_registration",
         non_secret_config={"destination": number},
+        status_detail=(
+            "Being activated with the carriers (A2P 10DLC) — usually a few business days."
+        ),
     )
     session.add(conn)
     await session.flush()

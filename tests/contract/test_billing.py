@@ -137,7 +137,9 @@ async def test_checkout_returns_url(client) -> None:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_remove_payment_method_204_and_reverts(client) -> None:
+async def test_remove_payment_method_returns_billing_info_and_reverts(client) -> None:
+    # Axis10-F01: removePaymentMethod returns 200 + the updated BillingInfo (matching
+    # the frontend `Promise<BillingInfo>` and the mock adapter), not a bare 204.
     admin = await _signup_verify_login(client)
     await _seed_instance(admin, counted=60)
     async with tenant_session(admin) as s:
@@ -150,11 +152,15 @@ async def test_remove_payment_method_204_and_reverts(client) -> None:
     set_stripe_gateway(FakeStripeGateway())
     try:
         r = await client.delete("/api/v1/billing/payment-method")
-        assert r.status_code == 204
-        assert r.content == b""
+        assert r.status_code == 200
+        body = r.json()
+        # The response body IS the updated BillingInfo: reverted to free_cap, no card.
+        assert body["budget"]["billingState"] == "free_cap"
+        assert body["budget"]["atCap"] is True
+        assert body.get("paymentMethod") in (None, {})
     finally:
         set_stripe_gateway(None)
-    # Reverted to free_cap; over 50 now at_cap.
+    # And a subsequent GET agrees.
     g = await client.get("/api/v1/billing")
     assert g.json()["budget"]["billingState"] == "free_cap"
     assert g.json()["budget"]["atCap"] is True

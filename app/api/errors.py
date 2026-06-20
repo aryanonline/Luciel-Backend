@@ -20,6 +20,7 @@ with state='unverified' + nextRoute='verify_wall', and gated writes return 403
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
@@ -74,3 +75,20 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=_body(exc))
+
+    # Axis10-F02: FastAPI's native RequestValidationError emits a 422 with a
+    # ``{"detail": [...]}`` body, which does NOT match the wire error contract
+    # (the frontend transport reads ``{message, retryAfterSeconds?}`` and maps the
+    # STATUS — 422 → validation_error). Convert it to the contract body shape so the
+    # frontend shows a real message instead of falling back to statusText.
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        errs = exc.errors()
+        if errs:
+            first = errs[0]
+            loc = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+            msg = first.get("msg", "Validation failed.")
+            message = f"{loc}: {msg}" if loc else msg
+        else:
+            message = "Validation failed."
+        return JSONResponse(status_code=422, content={"message": message})

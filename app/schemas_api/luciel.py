@@ -46,7 +46,15 @@ AddonToolIdWire = Literal[
     "bring_your_own_webhook",
 ]
 ConnectionStatusWire = Literal[
-    "unconfigured", "connected", "error", "expired", "revoked", "dormant"
+    "unconfigured",
+    "connected",
+    "error",
+    "expired",
+    "revoked",
+    "dormant",
+    # SMS/Voice number provisioned but A2P 10DLC carrier registration not yet
+    # approved — the channel is NOT live and must not be shown as connected (§3.1.6).
+    "pending_carrier_registration",
 ]
 KnowledgeSyncStatusWire = Literal["synced", "syncing", "needs_reconnect"]
 NotificationChannelWire = Literal["email", "sms"]

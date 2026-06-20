@@ -87,6 +87,9 @@ async def test_phone_provision_idempotent_and_resolves():
             s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
         )
         assert c1.connection_id == c2.connection_id  # idempotent — number retained
+        # Axis6-F02 (§3.1.6): the number is provisioned immediately but A2P 10DLC
+        # registration is pending, so the connection is NOT shown as connected/live.
+        assert c1.status == "pending_carrier_registration"
         number = c1.non_secret_config["destination"]
     # Destination resolves back to the tenant via the SECURITY DEFINER resolver.
     async with tenant_session(admin) as s:
