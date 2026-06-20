@@ -74,6 +74,9 @@ class ToolContext:
     connection_status: str | None = None
     # Live values gathered in the conversation (for required-input resolution).
     gathered: dict[str, Any] = field(default_factory=dict)
+    # Optional DB session injected by the broker for tools that durably write rows
+    # (e.g. ScheduleCallbackTool — §3.3.5). Never used by read-only tools.
+    session: Any = None
 
 
 class Tool(Protocol):
