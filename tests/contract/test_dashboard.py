@@ -249,3 +249,102 @@ async def test_prune_deletes_named_leads(client):
     async with tenant_session(admin) as s:
         rows = (await s.execute(select(Lead))).scalars().all()
         assert rows == []  # prune = permanent delete (§3.4.10a)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis3-F01 (lead erasure cascade)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_session_with_transcript(admin: uuid.UUID, lead_id: uuid.UUID) -> uuid.UUID:
+    """Seed a session + transcript for the given lead."""
+    from app.models.conversation import SessionSummary
+
+    # Use a synthetic iid (no FK to instances required — matches _seed_conversation pattern)
+    iid = uuid.uuid4()
+    sess_id = uuid.uuid4()
+
+    async with tenant_session(admin) as s:
+        s.add(
+            SessionModel(
+                id=sess_id,
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead_id,
+                channel="widget",
+                mode="ai",
+                counted=False,
+            )
+        )
+        s.add(
+            Transcript(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sess_id,
+                role="user",
+                text="hello",
+            )
+        )
+        s.add(
+            SessionSummary(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead_id,
+                session_id=sess_id,
+                summary="test summary",
+            )
+        )
+        await s.flush()
+        return sess_id
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_erase_lead_cascades_to_transcripts_and_summaries(client):
+    """Axis3-F01: erase_lead must delete transcripts and session summaries."""
+    from app.models.conversation import SessionSummary
+
+    admin = await _signup_verify_login(client)
+    lead_id = await _seed_lead(admin)
+    sess_id = await _seed_session_with_transcript(admin, lead_id)
+
+    # Verify precondition: transcript and summary exist
+    async with tenant_session(admin) as s:
+        transcripts_before = (
+            (await s.execute(select(Transcript).where(Transcript.session_id == sess_id)))
+            .scalars()
+            .all()
+        )
+        summaries_before = (
+            (
+                await s.execute(
+                    select(SessionSummary).where(SessionSummary.resolved_lead_id == lead_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(transcripts_before) == 1, "precondition: transcript must exist"
+    assert len(summaries_before) == 1, "precondition: summary must exist"
+
+    r = await client.delete(f"/api/v1/dashboard/leads/{lead_id}")
+    assert r.status_code == 204
+
+    async with tenant_session(admin) as s:
+        transcripts_after = (
+            (await s.execute(select(Transcript).where(Transcript.session_id == sess_id)))
+            .scalars()
+            .all()
+        )
+        summaries_after = (
+            (
+                await s.execute(
+                    select(SessionSummary).where(SessionSummary.resolved_lead_id == lead_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert transcripts_after == [], "Transcripts must be deleted when lead is erased (§3.4.11)"
+    assert summaries_after == [], "SessionSummaries must be deleted when lead is erased (§3.4.11)"
