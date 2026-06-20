@@ -3,7 +3,7 @@
 Uses a deterministic in-memory SyncProvider to exercise the full incremental
 machinery without external APIs: initial sync ingests; changed-revision items are
 re-ingested (chunks replaced); items removed at source are removed from the KB
-(so Luciel stops answering from deleted content); revocation flags needs_reconnect.
+(so Luciel stops answering from deleted content); revocation flags paused_reconnect_needed.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ async def test_initial_change_and_delete_propagation():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_revocation_flags_needs_reconnect_not_silent_stale():
+async def test_revocation_flags_paused_reconnect_needed_not_silent_stale():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     conn = uuid.uuid4()
@@ -153,4 +153,5 @@ async def test_revocation_flags_needs_reconnect_not_silent_stale():
         assert n == 1
     async with tenant_session(admin) as s:
         sources = await service.list_sources(s, admin)
-        assert sources[0].sync_status == "needs_reconnect"
+        # §3.2.3 canonical vocabulary (renamed from needs_reconnect, Axis4-F02).
+        assert sources[0].sync_status == "paused_reconnect_needed"
