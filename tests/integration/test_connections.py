@@ -448,3 +448,197 @@ def _select_one(model):
     from sqlalchemy import select
 
     return select(model)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis5-F04 (proven-before-cutover reconnect)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_reconnect_preserves_connected_status_until_confirm():
+    """Axis5-F04: reconnect() must NOT immediately drop the connection to unconfigured.
+    The existing connected status is preserved until confirm_reconnect() is called."""
+    from app.connections.service import reconnect
+
+    admin = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@rc.test",
+                email_lower=f"{admin}@rc.test",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        iid = uuid.uuid4()
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="T",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        cid = uuid.uuid4()
+        s.add(
+            InstanceConnection(
+                connection_id=cid,
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="calendar",
+                auth_class="oauth_token",
+                provider="google",
+                status="connected",
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(admin) as s:
+        result = await reconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+        assert result is not None
+        conn, start_result = result
+        # CRITICAL: status must NOT be "unconfigured" — the old connection stays live.
+        assert conn.status == "connected", (
+            f"reconnect() must preserve connected status; got {conn.status!r}"
+        )
+        assert conn.status_detail is not None and "reconnect_pending" in conn.status_detail
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_confirm_reconnect_on_probe_success_sets_connected():
+    """Axis5-F04: confirm_reconnect() with probe_ok=True sets status=connected."""
+    from app.connections.service import confirm_reconnect, reconnect
+
+    admin = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@rc2.test",
+                email_lower=f"{admin}@rc2.test",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        iid = uuid.uuid4()
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="T2",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        cid = uuid.uuid4()
+        s.add(
+            InstanceConnection(
+                connection_id=cid,
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="calendar",
+                auth_class="oauth_token",
+                provider="google",
+                status="connected",
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(admin) as s:
+        await reconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+
+    async with tenant_session(admin) as s:
+        ok, reason = await confirm_reconnect(
+            s, admin_id=admin, connection_id=cid, user_id=None, probe_ok=True
+        )
+        assert ok is True
+        assert reason == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_confirm_reconnect_on_probe_failure_restores_prior_status():
+    """Axis5-F04: confirm_reconnect() with probe_ok=False restores the prior status."""
+    from app.connections.service import confirm_reconnect, reconnect
+
+    admin = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@rc3.test",
+                email_lower=f"{admin}@rc3.test",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        iid = uuid.uuid4()
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="T3",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        cid = uuid.uuid4()
+        s.add(
+            InstanceConnection(
+                connection_id=cid,
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="calendar",
+                auth_class="oauth_token",
+                provider="google",
+                status="connected",
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(admin) as s:
+        await reconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+
+    async with tenant_session(admin) as s:
+        ok, reason = await confirm_reconnect(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            user_id=None,
+            probe_ok=False,
+            probe_detail="oauth_token_invalid",
+        )
+        assert ok is False
+
+    # Verify the prior connection status is restored, not left as unconfigured.
+    from sqlalchemy import select as sa_select
+
+    async with tenant_session(admin) as s:
+        conn = (
+            await s.execute(
+                sa_select(InstanceConnection).where(InstanceConnection.connection_id == cid)
+            )
+        ).scalar_one()
+        assert conn.status == "connected", (
+            f"Prior status must be restored on failed health check; got {conn.status!r}"
+        )
