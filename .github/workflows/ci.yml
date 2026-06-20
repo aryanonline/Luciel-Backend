@@ -55,7 +55,7 @@ jobs:
           . .venv/bin/activate
           uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
 
-      - name: Provision DB roles (the non-superuser app role + narrow auth role)
+      - name: Provision DB roles (the non-superuser app role + narrow auth role + audit owner)
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
           psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f scripts/bootstrap_roles.sql
@@ -81,10 +81,14 @@ jobs:
           . .venv/bin/activate
           bandit -q -r app -c pyproject.toml
 
-      - name: Dependency audit (pip-audit)
+      - name: Dependency audit (pip-audit — blocks on a fixable vulnerability)
         run: |
           . .venv/bin/activate
-          pip-audit -s osv || true   # advisory; do not block on transitive advisories at this stage
+          # Architecture §5.14 / Commitment §27: a dependency CVE with a fix available
+          # must BLOCK the build (images failing on a high/critical CVE do not promote).
+          # --strict makes pip-audit exit non-zero on any vulnerability with a known fix;
+          # this is no longer advisory (was `|| true`, audit finding Axis11-F03).
+          pip-audit --strict --desc
 
       - name: Secret scan (detect-secrets)
         run: |
@@ -105,6 +109,14 @@ jobs:
           alembic upgrade head
           alembic downgrade base
           alembic upgrade head
+
+      - name: Lock audit log immutability (Architecture §5.3 / B1 — superuser post-migrate step)
+        run: |
+          # admin_audit_log is owned by luciel_audit_owner (a NOLOGIN role the app role
+          # is not a member of) + an append-only guard trigger, so immutability is a true
+          # lock, not a revocable grant. This runs as the postgres superuser after
+          # migrations, exactly as the dev/prod ops step does.
+          psql -h localhost -U postgres -d luciel_dev -v ON_ERROR_STOP=1 -f scripts/lock_audit_log.sql
 
       - name: Tenant-isolation suite (NON-OVERRIDABLE)
         env:
