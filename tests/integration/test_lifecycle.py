@@ -158,3 +158,167 @@ async def test_close_account_deletes_luciel_first_then_closes():
         # Luciel was deleted as part of the nested close flow.
         assert (await s.execute(select(func.count()).select_from(Instance))).scalar_one() == 0
         assert await verify_chain(s, admin) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis3-F02 (hard-delete cascade calls SecretStore.delete)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hard_delete_cascade_calls_secret_store_delete():
+    """Axis3-F02: hard_delete_cascade must call SecretStore.delete() for each connection."""
+    import uuid as _uuid
+
+    from app.connections.secrets import LocalSecretStore, secret_ref_for
+    from app.lifecycle.cascade import hard_delete_cascade
+    from app.models.connection import InstanceConnection
+
+    admin = _uuid.uuid4()
+    store = LocalSecretStore()
+    # Patch the global store so the cascade uses our test store.
+    import app.connections.secrets as _sec
+
+    original = _sec._default
+    _sec._default = store
+
+    try:
+        async with tenant_session(admin) as s:
+            s.add(
+                Account(
+                    id=admin,
+                    admin_id=admin,
+                    user_id=admin,
+                    email=f"{admin}@cs.test",
+                    email_lower=f"{admin}@cs.test",
+                    password_hash="x",
+                    state=AccountState.verified,
+                    email_verified=True,
+                )
+            )
+            iid = _uuid.uuid4()
+            s.add(
+                Instance(
+                    id=iid,
+                    admin_id=admin,
+                    name="T",
+                    state=LucielState.luciel_grace_window,
+                    channels=[],
+                    tools=[],
+                    escalation={},
+                    personality={},
+                )
+            )
+            ref = secret_ref_for(admin, iid, "calendar")
+            s.add(
+                InstanceConnection(
+                    connection_id=_uuid.uuid4(),
+                    admin_id=admin,
+                    instance_id=iid,
+                    connection_type="calendar",
+                    auth_class="oauth_token",
+                    provider="google",
+                    status="connected",
+                    secret_ref=ref,
+                )
+            )
+            await s.flush()
+
+        # Seed a secret into the store.
+        await store.put(ref, {"access_token": "tok-abc"})
+        assert await store.get(ref) is not None, "precondition: secret must be in store"
+
+        async with tenant_session(admin) as s:
+            await hard_delete_cascade(s, admin)
+
+        # Secret must have been deleted by the cascade.
+        assert await store.get(ref) is None, (
+            "SecretStore.delete() must be called during hard_delete_cascade (§3.6.5 step 6)"
+        )
+    finally:
+        _sec._default = original
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis3-F03 (lead_reactivated event)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_archived_lead_reactivated_on_inbound():
+    """Axis3-F03: Returning archived lead is reactivated with lead_reactivated event."""
+    from app.models.audit import AdminAuditLog
+    from app.models.lead import LeadState
+    from app.runtime.sessions import resolve_or_open_session
+
+    admin = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@lr.test",
+                email_lower=f"{admin}@lr.test",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        iid = uuid.uuid4()
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="T",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        lead_id = uuid.uuid4()
+        from app.models.lead import Lead
+
+        s.add(
+            Lead(
+                id=lead_id,
+                admin_id=admin,
+                instance_id=iid,
+                name="Test User",
+                contact_identifier="test@x.com",
+                state=LeadState.archived,
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(admin) as s:
+        sess, is_new = await resolve_or_open_session(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            channel="email",
+            resolved_lead_id=lead_id,
+        )
+
+    # Lead must now be active
+    async with tenant_session(admin) as s:
+        from app.models.lead import Lead as LeadModel
+        from sqlalchemy import select as sa_sel
+
+        lead = (await s.execute(sa_sel(LeadModel).where(LeadModel.id == lead_id))).scalar_one()
+        assert lead.state == LeadState.active, (
+            f"Archived lead must be reactivated on inbound; got {lead.state!r}"
+        )
+
+        # lead_reactivated audit event must be emitted
+        evt = (
+            await s.execute(
+                sa_sel(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "lead_reactivated",
+                )
+            )
+        ).scalar_one_or_none()
+        assert evt is not None, "lead_reactivated audit event must be emitted"
