@@ -170,3 +170,144 @@ async def test_resend_verification_rate_limited(client):
         results.append(rr.json())
     assert results[-1]["ok"] is False
     assert results[-1]["cooldownSecondsRemaining"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis2-F01 (logout audit event)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_logout_emits_audit_event(client):
+    """Axis2-F01: POST /auth/logout must emit a logout audit event (§3.7.1a)."""
+    from app.audit.log import AdminAuditLog
+    from app.db.session import tenant_session
+    from sqlalchemy import select
+
+    # Sign up, verify, and log in.
+    email = f"logout-test-{uuid.uuid4().hex[:8]}@x.com"
+    await client.post(
+        "/api/v1/auth/signup",
+        json={"email": email, "password": "pw-123456", "captchaToken": "t"},
+    )
+    from app.auth import access
+
+    acct, token = await access.signup(email, "pw-123456")
+    admin_id = acct.id
+    r_verify = await client.post("/api/v1/auth/verify-email", json={"token": token})
+    assert r_verify.status_code == 200
+
+    # Logout
+    r_logout = await client.post("/api/v1/auth/logout")
+    assert r_logout.status_code == 204
+
+    # Check that a logout audit event was emitted.
+    async with tenant_session(admin_id) as s:
+        evt = (
+            await s.execute(
+                select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin_id,
+                    AdminAuditLog.event_type == "logout",
+                )
+            )
+        ).scalar_one_or_none()
+    assert evt is not None, "logout must emit a 'logout' audit event (§3.7.1a)"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis2-F02 (7-day unverified account reaper)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_reaper_deletes_aged_unverified_account():
+    """Axis2-F02: reap_unverified_accounts deletes aged unverified accounts."""
+    from datetime import UTC, datetime
+
+    from app.auth.reaper import reap_unverified_accounts
+    from app.db.session import tenant_session
+    from app.models.instance import Account, AccountState
+    from sqlalchemy import select
+
+    admin = uuid.uuid4()
+    # Create an unverified account that's 8 days old.
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"stale-{admin}@reap.test",
+                email_lower=f"stale-{admin}@reap.test",
+                password_hash="x",
+                state=AccountState.unverified,
+                email_verified=False,
+                created_at=datetime(2026, 6, 1, tzinfo=UTC),  # well past 7 days
+            )
+        )
+        await s.flush()
+
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    async with tenant_session(admin) as s:
+        reaped = await reap_unverified_accounts(s, now=now)
+
+    assert admin in reaped, "Aged unverified account must be reaped"
+
+    # Account row must be gone.
+    async with tenant_session(admin) as s:
+        acct = (await s.execute(select(Account).where(Account.id == admin))).scalar_one_or_none()
+    assert acct is None, "Reaped account row must be deleted"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_reaper_spares_fresh_and_verified_accounts():
+    """Axis2-F02: reaper must NOT delete fresh or verified accounts."""
+    from datetime import UTC, datetime
+
+    from app.auth.reaper import reap_unverified_accounts
+    from app.db.session import tenant_session
+    from app.models.instance import Account, AccountState
+
+    fresh = uuid.uuid4()
+    verified = uuid.uuid4()
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+
+    async with tenant_session(fresh) as s:
+        # Fresh unverified (only 1 day old — inside window)
+        s.add(
+            Account(
+                id=fresh,
+                admin_id=fresh,
+                user_id=fresh,
+                email=f"fresh-{fresh}@reap.test",
+                email_lower=f"fresh-{fresh}@reap.test",
+                password_hash="x",
+                state=AccountState.unverified,
+                email_verified=False,
+                created_at=datetime(2026, 6, 19, tzinfo=UTC),  # 1 day ago — inside window
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(verified) as s:
+        # Verified account (even if old, must not be reaped)
+        s.add(
+            Account(
+                id=verified,
+                admin_id=verified,
+                user_id=verified,
+                email=f"verified-{verified}@reap.test",
+                email_lower=f"verified-{verified}@reap.test",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+                created_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
+        await s.flush()
+
+    async with tenant_session(fresh) as s:
+        reaped = await reap_unverified_accounts(s, now=now)
+
+    assert fresh not in reaped, "Fresh unverified account (inside window) must NOT be reaped"
+    assert verified not in reaped, "Verified account must NOT be reaped"
