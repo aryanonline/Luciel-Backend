@@ -213,6 +213,9 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels={CHANNEL},
+            # 280-char admin business-context, composed UNDER the platform invariants
+            # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
+            business_context=inst.business_one_liner,
             has_payment_method=False,
         )
         result = await orch.run_turn(
