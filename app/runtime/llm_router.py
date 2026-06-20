@@ -15,6 +15,7 @@ bind in deployment behind the same interface.
 from __future__ import annotations
 
 import enum
+import uuid
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -54,13 +55,45 @@ def should_route_fast(*, requires_tools: bool, context_tokens: int, complexity: 
 
 class LLMRouter:
     """Routes to primary, falls back to secondary immediately on primary failure
-    (no retry on primary). Fallback is recorded but never surfaced."""
+    (no retry on primary). Fallback is recorded but never surfaced.
 
-    def __init__(self, primary: LLMProvider, fallback: LLMProvider) -> None:
+    Architecture §9 C9 / §4.6: enforces per-admin_id concurrency cap (50/min)
+    before every LLM call. Raises ``LLMCapExceeded`` when the tenant is over cap.
+    The cap is checked at the router level so it is uniform across all callers
+    (orchestrator, handoff, any future runtime path)."""
+
+    def __init__(
+        self,
+        primary: LLMProvider,
+        fallback: LLMProvider,
+        admin_id: uuid.UUID | None = None,
+    ) -> None:
         self._primary = primary
         self._fallback = fallback
+        # admin_id is used for the per-tenant LLM concurrency cap (§9 C9).
+        # When None (legacy or test construction), the cap is skipped.
+        self._admin_id = admin_id
 
-    async def complete(self, system_prompt: str, messages: list[dict[str, str]]) -> LLMResponse:
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        *,
+        admin_id: uuid.UUID | None = None,
+    ) -> LLMResponse:
+        """Complete with per-admin_id LLM concurrency cap enforcement (§9 C9).
+
+        ``admin_id`` kwarg overrides the instance-level admin_id; both are optional
+        for backwards compatibility (existing callers that don't pass admin_id skip
+        the cap — they should be updated to pass admin_id).
+        """
+        effective_admin_id = admin_id if admin_id is not None else self._admin_id
+        if effective_admin_id is not None:
+            # Circular import avoided: import inline, module is small + stable.
+            from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415
+
+            admit_llm_call(effective_admin_id)
+
         try:
             resp = await self._primary.complete(system_prompt, messages)
             resp.used_fallback = False
