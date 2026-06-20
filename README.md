@@ -18,8 +18,13 @@ Alembic, Pydantic v2, Redis, pgvector. Built arc-by-arc (Architecture §6).
   2. Postgres RLS (`ENABLE` + `FORCE`; policy `admin_id = current_setting('app.admin_id')`),
   3. per-request `app.admin_id` set once from the authenticated subject.
   Proven by `tests/isolation/` — the non-overridable CI gate.
-- **Append-only, hash-chained audit log** (§5.2/§5.3): INSERT-only grant, SHA-256
-  `prev_hash` per `admin_id`.
+- **Append-only, hash-chained audit log** (§5.2/§5.3): `admin_audit_log` is owned
+  by `luciel_audit_owner` (a NOLOGIN role the app role is **not** a member of) with
+  the app role granted only INSERT+SELECT and an owner-owned `BEFORE UPDATE OR DELETE`
+  guard trigger — so immutability is a true lock, not a revocable grant (the app role
+  cannot re-grant itself UPDATE/DELETE nor drop the guard). SHA-256 `prev_hash` per
+  `admin_id`. The ownership transfer + guard install runs as a superuser **after**
+  `alembic upgrade head` via `scripts/lock_audit_log.sql` (Docker/CI/ops post-migrate step).
 
 ## Local development
 
@@ -28,6 +33,7 @@ Alembic, Pydantic v2, Redis, pgvector. Built arc-by-arc (Architecture §6).
 docker compose up -d db redis          # Postgres+pgvector + Redis, roles auto-bootstrapped
 uv venv && . .venv/bin/activate && uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
 alembic upgrade head                   # create schema + RLS + grants
+psql -d luciel_dev -f scripts/lock_audit_log.sql   # SUPERUSER: lock audit log (§5.3) — run once, post-migrate
 LUCIEL_COOKIE_SECURE=false uvicorn app.main:app --reload --port 8080
 ```
 
@@ -39,6 +45,7 @@ createdb luciel_dev -O luciel_app
 psql -d luciel_dev -f scripts/bootstrap_db.sql
 # Then:
 alembic upgrade head
+psql -d luciel_dev -f scripts/lock_audit_log.sql   # superuser, once, post-migrate (§5.3)
 LUCIEL_COOKIE_SECURE=false uvicorn app.main:app --reload --port 8080
 ```
 

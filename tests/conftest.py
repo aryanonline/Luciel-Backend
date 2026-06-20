@@ -74,6 +74,44 @@ def _admin_psql(sql: str, db: str = "postgres") -> None:
         )
 
 
+def superuser_exec(sql: str) -> None:
+    """Run a statement against the TEST DB as a superuser.
+
+    Used by the audit-chain tamper tests: after the B1 immutability lock,
+    admin_audit_log can be mutated ONLY by a superuser (by design), so a
+    deliberate tamper for a tamper-evidence test must take the superuser path
+    rather than the old self-grant loophole.
+    """
+    if _CI_PG:
+        env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
+        subprocess.run(
+            [
+                "psql",
+                "-h",
+                PG_HOST,
+                "-p",
+                PG_PORT,
+                "-U",
+                _SUPERUSER,
+                "-d",
+                TEST_DB,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                sql,
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+    else:
+        subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-d", TEST_DB, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            check=True,
+            capture_output=True,
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _provision_test_db() -> None:
     """Create the test DB (owned by the app role), extensions, and run migrations."""
@@ -90,9 +128,18 @@ def _provision_test_db() -> None:
         "THEN CREATE ROLE luciel_auth NOLOGIN NOSUPERUSER BYPASSRLS; END IF; END $$;"
     )
     _admin_psql(f"GRANT luciel_auth TO {APP_USER}")
+    # Append-only audit-log owner role (Architecture §5.3 / audit finding B1): a
+    # NOLOGIN role that the app role is NOT a member of, so it cannot re-grant
+    # itself UPDATE/DELETE on admin_audit_log nor drop the guard. Mirrors
+    # scripts/bootstrap_roles.sql.
+    _admin_psql(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='luciel_audit_owner') "
+        "THEN CREATE ROLE luciel_audit_owner NOLOGIN NOSUPERUSER NOBYPASSRLS; END IF; END $$;"
+    )
     _admin_psql(f"ALTER SCHEMA public OWNER TO {APP_USER}", db=TEST_DB)
     _admin_psql(f"GRANT ALL ON SCHEMA public TO {APP_USER}", db=TEST_DB)
     _admin_psql("GRANT USAGE, CREATE ON SCHEMA public TO luciel_auth", db=TEST_DB)
+    _admin_psql("GRANT USAGE ON SCHEMA public TO luciel_audit_owner", db=TEST_DB)
 
     # Run migrations via alembic against the test DB.
     env = dict(os.environ)
@@ -103,6 +150,47 @@ def _provision_test_db() -> None:
         env=env,
         cwd=os.path.dirname(os.path.dirname(__file__)),
     )
+
+    # Apply the audit-log immutability lock as a superuser, exactly as the
+    # post-migrate ops step (scripts/lock_audit_log.sql) does in dev/prod. This is
+    # what makes the append-only guarantee a true lock (ownership by
+    # luciel_audit_owner + guard trigger) rather than a revocable grant.
+    _repo_root = os.path.dirname(os.path.dirname(__file__))
+    _lock_sql = os.path.join(_repo_root, "scripts", "lock_audit_log.sql")
+    # Pass the SQL on STDIN rather than `-f <path>`: under `sudo -u postgres` the
+    # postgres OS user may not be able to read the repo path (Permission denied),
+    # so we read the file ourselves and pipe its contents in.
+    _lock_body = open(_lock_sql, encoding="utf-8").read()
+    if _CI_PG:
+        _env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
+        subprocess.run(
+            [
+                "psql",
+                "-h",
+                PG_HOST,
+                "-p",
+                PG_PORT,
+                "-U",
+                _SUPERUSER,
+                "-d",
+                TEST_DB,
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            check=True,
+            capture_output=True,
+            env=_env,
+            input=_lock_body,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-d", TEST_DB, "-v", "ON_ERROR_STOP=1"],
+            check=True,
+            capture_output=True,
+            input=_lock_body,
+            text=True,
+        )
 
 
 @pytest_asyncio.fixture
