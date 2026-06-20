@@ -197,6 +197,31 @@ async def test_pm_attach_detach_flips_billing_state() -> None:
         assert acct.billing_state == "free_cap"
         assert acct.pm_brand is None
 
+    # Axis3-F04: each billing state change emits the canonical lifecycle_transition.
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    sa_select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "lifecycle_transition",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        transitions = {
+            (r.event_payload.get("from"), r.event_payload.get("to"))
+            for r in rows
+            if r.event_payload.get("trigger") == "payment_method"
+        }
+        assert ("free_cap", "payg_enabled") in transitions
+        assert ("payg_enabled", "free_cap") in transitions
+
 
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_idempotent_metered_reporting_no_double_bill() -> None:
@@ -218,3 +243,157 @@ async def test_idempotent_metered_reporting_no_double_bill() -> None:
     assert q2 == 2  # same quantity reported, but gateway deduped the key
     # Exactly one idempotency key recorded → no double-bill.
     assert len(gw._usage_keys) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis8-F02, Axis8-F03, Axis8-F04
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payment_failed_emits_lifecycle_notice_sent():
+    """Axis8-F03: invoice.payment_failed must emit lifecycle_notice_sent audit event."""
+    from app.audit.log import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    event = StripeEvent(event_id="evt_test_f03", type="invoice.payment_failed", data={})
+
+    async with tenant_session(admin) as s:
+        action = await billing_webhooks.handle_event(s, admin_id=admin, event=event, now=now)
+    assert action == "payment_failed"
+
+    async with tenant_session(admin) as s:
+        notice = (
+            await s.execute(
+                sa_select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "lifecycle_notice_sent",
+                )
+            )
+        ).scalar_one_or_none()
+        assert notice is not None, "lifecycle_notice_sent event must be emitted on payment failure"
+        assert notice.event_payload.get("notice_type") == "payment_failed_retry"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_subscription_renewed_resets_budget():
+    """Axis8-F02: customer.subscription.renewed triggers same budget reset as invoice.paid."""
+    admin = uuid.uuid4()
+    await _seed_tenant(admin, counted=30)
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    ps = int(now.timestamp())
+    pe = int((now.replace(month=7)).timestamp())
+    event = StripeEvent(
+        event_id="evt_sub_renewed",
+        type="customer.subscription.renewed",
+        data={"period_start": ps, "period_end": pe},
+    )
+
+    async with tenant_session(admin) as s:
+        action = await billing_webhooks.handle_event(s, admin_id=admin, event=event, now=now)
+    assert action == "invoice_paid"
+
+    # Budget should be reset: no budget rows remain.
+    async with tenant_session(admin) as s:
+        from sqlalchemy import func
+        from sqlalchemy import select as sa_select
+
+        count = (
+            await s.execute(
+                sa_select(func.count())
+                .select_from(ConversationBudget)
+                .where(ConversationBudget.admin_id == admin)
+            )
+        ).scalar_one()
+        assert count == 0, f"Budget rows must be reset on subscription.renewed; got {count}"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_invoice_paid_restores_dormant_connections():
+    """Axis8-F04: invoice.paid must restore dormant connections to unconfigured."""
+    from app.models.connection import InstanceConnection
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+
+    # Seed a dormant connection.
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="calendar",
+                auth_class="oauth_token",
+                provider="google",
+                status="dormant",
+            )
+        )
+        await s.flush()
+
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    event = StripeEvent(event_id="evt_inv_paid_f04", type="invoice.paid", data={})
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=event, now=now)
+
+    async with tenant_session(admin) as s:
+        conn = (
+            await s.execute(
+                sa_select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin,
+                    InstanceConnection.connection_type == "calendar",
+                )
+            )
+        ).scalar_one()
+        assert conn.status == "unconfigured", (
+            f"Dormant connection must be restored on invoice.paid; got {conn.status!r}"
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_pm_attached_restores_dormant_connections():
+    """Axis8-F04: payment_method.attached must restore dormant connections."""
+    from app.models.connection import InstanceConnection
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="crm",
+                auth_class="oauth_token",
+                provider="salesforce",
+                status="dormant",
+            )
+        )
+        await s.flush()
+
+    event = StripeEvent(
+        event_id="evt_pm_att_f04",
+        type="payment_method.attached",
+        data={"card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2028}},
+    )
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=event)
+
+    async with tenant_session(admin) as s:
+        conn = (
+            await s.execute(
+                sa_select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin,
+                    InstanceConnection.connection_type == "crm",
+                )
+            )
+        ).scalar_one()
+        assert conn.status == "unconfigured", (
+            f"Dormant connection must be restored on pm.attached; got {conn.status!r}"
+        )

@@ -51,7 +51,13 @@ from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
 from app.runtime.grounding import score_grounding
-from app.runtime.input_safety import detect_injection, moderate, wrap_untrusted
+from app.runtime.input_safety import (
+    build_system_prompt,
+    detect_injection,
+    moderate,
+    pre_send_check,
+    wrap_untrusted,
+)
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
 from app.tools.contract import Tool
 
@@ -163,12 +169,24 @@ class Orchestrator:
     admin_id: uuid.UUID
     instance_id: uuid.UUID
     enabled_channels: set[str]
-    system_prompt: str = "You are Luciel, an AI assistant."
+    # Admin-provided 280-char business-context (Vision §3.5). Composed into the system
+    # prompt UNDER the platform-invariant stanzas via Defense 6 (§3.4.14) so it can
+    # tune tone/facts but cannot override AI-identity disclosure, grounding, the
+    # escalation contract, or moderation.
+    business_context: str | None = None
+    system_prompt: str = field(default="", init=False)
     has_payment_method: bool = False
     # Resolves a proposed tool_id to a Tool with its Arc 17 backend bound; None when
     # tools are not wired (the default in Arc 14). A None resolution yields a `failed`
     # outcome so the loop reasons about it uniformly (§3.4.1).
     tool_resolver: ToolResolver | None = None
+
+    def __post_init__(self) -> None:
+        # Defense 6 (§3.4.14): compose the system prompt with the platform-invariant
+        # stanzas at higher precedence than the admin business-context field, so admin
+        # text can never suppress AI-identity disclosure, grounding, escalation, or
+        # moderation. This is the in-code enforcement; it does not depend on the model.
+        self.system_prompt = build_system_prompt(self.business_context)
 
     async def run_turn(
         self,
@@ -341,10 +359,13 @@ class Orchestrator:
             )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
+        # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
+        # model may have produced and never lets the untrusted-data delimiters leak.
+        reply_text = pre_send_check(resp.text)
         outbound = choose_outbound_channel(
             inbound_channel=channel,
             enabled_channels=self.enabled_channels or {channel},
-            response_length=len(resp.text),
+            response_length=len(reply_text),
             is_urgent_escalation=outcome.fired,
         )
         await _persist_turn(
@@ -353,10 +374,10 @@ class Orchestrator:
             instance_id=instance_id,
             session_id=session_id,
             role="luciel",
-            text=resp.text,
+            text=reply_text,
         )
         return LoopResult(
-            reply_text=resp.text,
+            reply_text=reply_text,
             outbound_channel=outbound,
             counted=counted,
             escalation=escalation,

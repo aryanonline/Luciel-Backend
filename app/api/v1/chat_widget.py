@@ -25,13 +25,16 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from sqlalchemy import select
 
-from app.api.errors import not_found
+from app.api.errors import not_found, rate_limited
+from app.audit import log as audit
+from app.channels import rate_limit
 from app.channels.base import InboundRejected, InstanceContext
 from app.channels.routing import resolve_widget
 from app.db.session import tenant_session, untenanted_session
+from app.models.audit import ActorType
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.runtime import budget
@@ -69,6 +72,37 @@ async def _resolve_embed_key(embed_key: str) -> InstanceContext:
         except InboundRejected as exc:
             # Unresolvable embed key → 404 (never routed on a guess, §3.1.3).
             raise not_found("Unknown widget.") from exc
+
+
+async def _widget_abuse_gate(
+    ctx: InstanceContext, request: Request, session_id: uuid.UUID | None
+) -> None:
+    """Pre-budget abuse / rate-limit admission for the widget (§3.1.5).
+
+    The widget is a direct browser POST (no channel webhook), so it does not flow
+    through channels.pipeline.ingest(); this is the widget's equivalent pre-budget
+    gate. It MUST run before the budget gate and before any LLM call, so a flood can
+    never drain a tenant's conversation budget or run up cost (denial-of-wallet).
+
+    Source identifier per §3.1.5: the per-session widget token + client IP. On a
+    denial we audit widget_abuse_blocked (no raw PII) and return HTTP 429, which the
+    frontend transport maps to `rate_limited` via the documented error contract (§4).
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    source_id = f"{session_id or 'new'}:{client_ip}"
+    decision = rate_limit.admit("widget", source_id, str(ctx.admin_id))
+    if not decision.allowed:
+        async with tenant_session(ctx.admin_id) as s:
+            await audit.emit(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                actor_type=ActorType.platform,
+                event_type="widget_abuse_blocked",
+                # No raw PII: channel + reason only (§3.1.5 / §3.4.11).
+                payload={"channel": "widget", "reason": decision.reason},
+            )
+        raise rate_limited("Too many messages — please slow down.", retry_after_seconds=3)
 
 
 def _names(inst: Instance) -> tuple[str, str]:
@@ -123,13 +157,16 @@ async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
 
 
 @router.post("/messages", response_model=WidgetSendResult)
-async def send_message(body: WidgetSendRequest) -> WidgetSendResult:
+async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendResult:
     """Run one inbound widget message through the agentic loop (§3.4.1).
 
     Paused → empty render, no LLM. At-cap is handled inside the loop (graceful
     no-LLM reply, §3.4.1b) and surfaces here as renderState 'at_cap'.
     """
     ctx = await _resolve_embed_key(body.embed_key)
+    # Pre-budget abuse gate (§3.1.5): runs BEFORE the budget gate / any LLM call so a
+    # widget flood can never drain budget or run up cost (denial-of-wallet). 429 on deny.
+    await _widget_abuse_gate(ctx, request, body.session_id)
     async with tenant_session(ctx.admin_id) as s:
         inst = (
             await s.execute(select(Instance).where(Instance.id == ctx.instance_id))
@@ -176,6 +213,9 @@ async def send_message(body: WidgetSendRequest) -> WidgetSendResult:
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels={CHANNEL},
+            # 280-char admin business-context, composed UNDER the platform invariants
+            # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
+            business_context=inst.business_one_liner,
             has_payment_method=False,
         )
         result = await orch.run_turn(

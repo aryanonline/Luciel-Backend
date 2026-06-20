@@ -15,10 +15,12 @@ from sqlalchemy import select
 
 from app.api.deps import Subject, current_session_subject
 from app.api.errors import unauthorized, validation_error
+from app.audit import log as audit
 from app.auth import access
 from app.auth.tokens import decode_token
 from app.config import get_settings
 from app.db.session import tenant_session
+from app.models.audit import ActorType
 from app.models.instance import Account
 from app.schemas_api.auth import (
     AccountOut,
@@ -97,7 +99,21 @@ async def login(req: LoginRequest, response: Response) -> SessionOut:
 
 
 @router.post("/logout", status_code=204)
-async def logout(response: Response) -> Response:
+async def logout(
+    response: Response,
+    subject: Subject = Depends(current_session_subject),
+) -> Response:
+    """Clears the session cookie and emits the logout audit event (§3.7.1a)."""
+    from app.db.session import tenant_session
+
+    async with tenant_session(subject.admin_id) as s:
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="logout",
+        )
     _clear_session_cookie(response)
     response.status_code = 204
     return response

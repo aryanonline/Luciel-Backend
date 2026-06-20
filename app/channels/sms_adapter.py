@@ -24,6 +24,32 @@ from app.channels.base import (
 )
 from app.channels.signatures import verify_twilio
 
+# Inbound opt-out / help keywords the platform handles AT THE SMS ADAPTER
+# (Architecture §3.1.6 / Legal §A2). These are matched case-insensitively against
+# the trimmed message body. Twilio Messaging Services also handles STOP/HELP at the
+# carrier layer; this app-layer detection is defense-in-depth so the platform-handled
+# claim is true even if a webhook reaches us (e.g. Advanced Opt-Out disabled). Matched
+# messages are suppressed from the orchestrator/LLM path (audit finding Axis6-F05).
+_STOP_KEYWORDS = frozenset({"stop", "stopall", "unsubscribe", "cancel", "end", "quit"})
+_HELP_KEYWORDS = frozenset({"help", "info"})
+_START_KEYWORDS = frozenset({"start", "unstop", "yes"})
+
+
+def classify_keyword(body: str) -> str | None:
+    """Return 'stop' | 'help' | 'start' if the body is an opt-out/help keyword, else None.
+
+    Carriers treat the message as a keyword only when the whole body (trimmed,
+    case-insensitive) is the keyword, so we match the same way.
+    """
+    word = body.strip().lower()
+    if word in _STOP_KEYWORDS:
+        return "stop"
+    if word in _HELP_KEYWORDS:
+        return "help"
+    if word in _START_KEYWORDS:
+        return "start"
+    return None
+
 
 class SmsSender(Protocol):
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None: ...
@@ -49,14 +75,21 @@ class SmsAdapter:
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         params = request["params"]
+        body = params.get("Body", "")
+        # STOP/HELP/START detection (§3.1.6). The keyword is surfaced on metadata so
+        # the pipeline can suppress routing to the orchestrator/LLM (Axis6-F05).
+        keyword = classify_keyword(body)
+        metadata: dict[str, Any] = {"message_sid": params.get("MessageSid")}
+        if keyword is not None:
+            metadata["opt_keyword"] = keyword
         return InboundMessage(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             channel="sms",
             session_id=None,
             customer_identifier=params.get("From", ""),
-            body=params.get("Body", ""),
-            channel_metadata={"message_sid": params.get("MessageSid")},
+            body=body,
+            channel_metadata=metadata,
             received_at=datetime.now(UTC),
         )
 

@@ -56,6 +56,10 @@ async def test_model_selection_field_rejected_on_personality(client):
         json={"preset": "professional_advisor", "model": "gpt-4o"},
     )
     assert r.status_code == 422
+    # Axis10-F02: the 422 body must match the wire error contract {message,…} — NOT
+    # FastAPI's native {detail:[…]} — so transport.ts surfaces a real message.
+    body = r.json()
+    assert "message" in body and "detail" not in body
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

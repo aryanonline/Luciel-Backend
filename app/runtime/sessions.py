@@ -21,7 +21,10 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
+from app.models.audit import ActorType
 from app.models.conversation import Session
+from app.models.lead import Lead, LeadState
 
 # Inactivity timeout by channel interaction class (§3.4.8) — platform constants.
 INACTIVITY_TIMEOUT = {
@@ -76,9 +79,17 @@ async def resolve_or_open_session(
     Liveness is determined deterministically by the channel inactivity timeout —
     a session whose last_message_at is older than the timeout is considered closed,
     and a new inbound opens a fresh session (a new budget unit, §3.4.8).
+
+    Architecture §3.4.10a: if the resolved lead is in ``archived`` state, it is
+    automatically reactivated (archived → active) and a ``lead_reactivated`` audit
+    event is emitted.
     """
     timeout = INACTIVITY_TIMEOUT.get(channel, timedelta(minutes=30))
     cutoff = _now() - timeout
+
+    # §3.4.10a: check if the resolved lead is archived and reactivate it.
+    if resolved_lead_id is not None:
+        await _maybe_reactivate_lead(session, admin_id=admin_id, lead_id=resolved_lead_id)
 
     existing = None
     if resolved_lead_id is not None:
@@ -114,3 +125,32 @@ async def resolve_or_open_session(
     session.add(new_session)
     await session.flush()
     return new_session, True
+
+
+async def _maybe_reactivate_lead(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    lead_id: uuid.UUID,
+) -> bool:
+    """Reactivate an archived lead on inbound contact (Architecture §3.4.10a).
+
+    If the lead exists and is in ``archived`` state, transition it to ``active``
+    and emit ``lead_reactivated`` to the audit log. Returns True if reactivated."""
+    lead: Lead | None = (
+        await session.execute(select(Lead).where(Lead.admin_id == admin_id, Lead.id == lead_id))
+    ).scalar_one_or_none()
+    if lead is None or lead.state != LeadState.archived:
+        return False
+
+    lead.state = LeadState.active
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=lead.instance_id,
+        actor_type=ActorType.platform,
+        event_type="lead_reactivated",
+        payload={"lead_id": str(lead_id)},
+    )
+    await session.flush()
+    return True

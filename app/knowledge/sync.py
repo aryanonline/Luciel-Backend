@@ -184,10 +184,10 @@ async def sync_connection(
 async def pause_sync_on_revocation(
     session: AsyncSession, *, admin_id: uuid.UUID, connection_id: uuid.UUID
 ) -> int:
-    """On revoked/expired connection, flag synced sources needs_reconnect and pause.
+    """On revoked/expired connection, flag synced sources paused_reconnect_needed and pause.
 
     Never silently keep serving the last-synced copy (§3.2.3): the sources are
-    marked needs_reconnect so the raw view shows the honest state.
+    marked paused_reconnect_needed so the raw view shows the honest state.
     """
     sources = (
         (
@@ -203,6 +203,6 @@ async def pause_sync_on_revocation(
         .all()
     )
     for s in sources:
-        s.sync_status = "needs_reconnect"
+        s.sync_status = "paused_reconnect_needed"  # §3.2.3 vocabulary (Axis4-F02)
     await session.flush()
     return len(sources)

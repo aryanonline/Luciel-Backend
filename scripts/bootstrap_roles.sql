@@ -12,6 +12,16 @@
 --                 lookup (signup/login/reset) can resolve an email to its account
 --                 before app.admin_id is known. It logs in nowhere and owns
 --                 nothing else.
+--   luciel_audit_owner — a NOLOGIN, NON-BYPASSRLS role that OWNS admin_audit_log
+--                 and its append-only guard trigger (Architecture §5.3). It is
+--                 deliberately NOT granted to luciel_app: the audit log's
+--                 immutability cannot rest on a REVOKE alone, because a table's
+--                 OWNER can re-GRANT UPDATE/DELETE to itself and DROP its own
+--                 triggers. By owning admin_audit_log with a role the application
+--                 role is not a member of, luciel_app can INSERT/SELECT but can
+--                 neither mutate rows, restore the grant, nor remove the guard.
+--                 The ownership transfer + guard install is scripts/lock_audit_log.sql,
+--                 run as a superuser AFTER `alembic upgrade head`.
 
 DO $$
 BEGIN
@@ -22,6 +32,14 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'luciel_auth') THEN
     CREATE ROLE luciel_auth NOLOGIN NOSUPERUSER BYPASSRLS;
   END IF;
+  -- Owner of the append-only audit log. NOLOGIN, NON-BYPASSRLS, and intentionally
+  -- NOT granted to luciel_app (see header). This is what makes §5.3 immutability
+  -- a true lock rather than a revocable grant.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'luciel_audit_owner') THEN
+    CREATE ROLE luciel_audit_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
+  END IF;
 END $$;
 
 GRANT luciel_auth TO luciel_app;
+-- NB: luciel_audit_owner is NOT granted to luciel_app — that non-membership is
+-- the security property. Do not add `GRANT luciel_audit_owner TO luciel_app`.

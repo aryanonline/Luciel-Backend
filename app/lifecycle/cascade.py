@@ -15,6 +15,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.connections.secrets import get_secret_store
 from app.db.base import TenantMixin
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
@@ -75,6 +76,37 @@ async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dic
     counts["escalation_events"] = await _log_and_delete(
         session, admin_id, iid, EscalationEvent, "escalation_event"
     )
+    # §3.6.5 step 6: delete connection secrets BEFORE removing the rows (§3.8.3 / §3.6.3).
+    # Idempotent/best-effort: a missing ref is not an error (LocalSecretStore.delete → False).
+    _store = get_secret_store()
+    conn_rows = (
+        (
+            await session.execute(
+                select(InstanceConnection).where(InstanceConnection.admin_id == admin_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for _conn in conn_rows:
+        if _conn.secret_ref is not None:
+            try:
+                _deleted = await _store.delete(_conn.secret_ref)
+            except Exception:  # noqa: BLE001
+                _deleted = False
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=iid,
+                actor_type=ActorType.platform,
+                event_type="connection_secret_cleanup",
+                payload={
+                    "connection_id": str(_conn.connection_id),
+                    "secret_ref": _conn.secret_ref,
+                    "deleted": _deleted,
+                    "context": "hard_delete_cascade",
+                },
+            )
     counts["instance_connections"] = await _log_and_delete(
         session, admin_id, iid, InstanceConnection, "instance_connection"
     )

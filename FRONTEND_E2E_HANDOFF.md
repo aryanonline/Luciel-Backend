@@ -52,11 +52,11 @@ pip install -e .[dev]            # or: pip install -r requirements (see pyprojec
 docker compose up -d             # postgres+pgvector, redis
 #   native alt: pg_ctlcluster 18 main start ; redis-server --daemonize yes --port 6379
 
-alembic upgrade head             # apply all 11 migrations
+alembic upgrade head             # apply all migrations
 
 # run the API
-uvicorn app.main:app --reload --port 8000
-# OpenAPI: http://localhost:8000/docs   health: http://localhost:8000/healthz
+uvicorn app.main:app --reload --port 8080
+# OpenAPI: http://localhost:8080/docs   health: http://localhost:8080/healthz
 ```
 
 For local frontend dev over plain HTTP, set `LUCIEL_COOKIE_SECURE=false` so the httpOnly session cookie is issued without the Secure flag.

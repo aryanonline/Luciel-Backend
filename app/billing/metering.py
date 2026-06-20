@@ -19,8 +19,10 @@ Idempotent reporting (HARD CONSTRAINT #3, §3.4.1b): metered usage is reported t
 Stripe with an idempotency key per (period, quantity) so a retry / webhook
 redelivery never double-bills.
 
-Storage honesty (BUILD_SPEC ~196): Postgres is the source of truth for the
-counter; Redis is the write-through hot cache (already so in budget.py).
+Storage honesty (Architecture §3.4.1b): the counter is written synchronously to
+Postgres (the source of truth) in budget.py; a Redis hot cache in front of the
+counter is the ratified target optimization but is NOT yet wired into the budget
+path (no Redis import in the billing/budget modules today).
 """
 
 from __future__ import annotations

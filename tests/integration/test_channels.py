@@ -10,10 +10,10 @@ import uuid
 
 import pytest
 from app.channels import rate_limit, routing
-from app.channels.base import InboundRejected, OutboundMessage
+from app.channels.base import InboundMessage, InboundRejected, OutboundMessage
 from app.channels.email_adapter import EmailAdapter
 from app.channels.phone_lifecycle import ensure_sms_number
-from app.channels.pipeline import AdmissionDenied, ingest
+from app.channels.pipeline import AdmissionDenied, OptOutHandled, ingest
 from app.channels.signatures import twilio_signature
 from app.channels.sms_adapter import SmsAdapter
 from app.db.session import tenant_session
@@ -87,6 +87,9 @@ async def test_phone_provision_idempotent_and_resolves():
             s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
         )
         assert c1.connection_id == c2.connection_id  # idempotent — number retained
+        # Axis6-F02 (§3.1.6): the number is provisioned immediately but A2P 10DLC
+        # registration is pending, so the connection is NOT shown as connected/live.
+        assert c1.status == "pending_carrier_registration"
         number = c1.non_secret_config["destination"]
     # Destination resolves back to the tenant via the SECURITY DEFINER resolver.
     async with tenant_session(admin) as s:
@@ -212,6 +215,54 @@ async def test_inbound_pipeline_admits_then_blocks_and_audits():
             )
         ).scalar_one()
         assert n >= 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_inbound_stop_keyword_suppressed_from_runtime():
+    """Axis6-F05: an inbound STOP/HELP keyword is handled at the SMS adapter and
+    never routed to the orchestrator/LLM (returns OptOutHandled, not InboundMessage)."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        conn = await ensure_sms_number(
+            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
+        )
+        number = conn.non_secret_config["destination"]
+
+    rate_limit._store = rate_limit.TokenBucketStore()
+    adapter = SmsAdapter(FakeTwilio())
+    token = "tw"  # noqa: S105
+    url = "https://x/sms"
+
+    async def resolve(ct, dest):
+        async with tenant_session(admin) as s:
+            return await routing.resolve_destination(s, ct, dest)
+
+    def make_req(body):
+        params = {"To": number, "From": "+15550000009", "Body": body, "MessageSid": "S"}
+        return {
+            "auth_token": token,
+            "url": url,
+            "params": params,
+            "x_twilio_signature": twilio_signature(token, url, params),
+            "resolve": resolve,
+        }
+
+    # "STOP" (any case, with whitespace) → OptOutHandled, suppressed pre-budget.
+    async with tenant_session(admin) as s:
+        r = await ingest(adapter, make_req("  Stop "), s)
+    assert isinstance(r, OptOutHandled)
+    assert r.keyword == "stop"
+
+    # "HELP" → OptOutHandled(help).
+    async with tenant_session(admin) as s:
+        r = await ingest(adapter, make_req("HELP"), s)
+    assert isinstance(r, OptOutHandled) and r.keyword == "help"
+
+    # A normal question is NOT an opt-keyword; it is admitted as an InboundMessage.
+    async with tenant_session(admin) as s:
+        r = await ingest(adapter, make_req("are you open on weekends?"), s)
+    assert isinstance(r, InboundMessage)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

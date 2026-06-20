@@ -27,7 +27,7 @@ class InstanceConnection(Base, TenantMixin, TimestampMixin):
     connection_type: Mapped[str] = mapped_column(String(32), nullable=False)
     auth_class: Mapped[str] = mapped_column(String(32), nullable=False)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="unconfigured")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="unconfigured")
     secret_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
     non_secret_config: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

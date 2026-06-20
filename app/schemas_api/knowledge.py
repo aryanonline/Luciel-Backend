@@ -12,7 +12,9 @@ KnowledgeSourceOriginWire = Literal[
     "upload", "paste", "csv", "website_crawl", "google_drive", "notion", "crm_kb"
 ]
 IngestionStatusWire = Literal["pending", "ready", "error"]
-KnowledgeSyncStatusWire = Literal["synced", "syncing", "needs_reconnect"]
+# Architecture §3.2.3 sync_status vocabulary. paused_reconnect_needed replaces the
+# former needs_reconnect (Axis4-F02); error surfaces non-revocation sync failures.
+KnowledgeSyncStatusWire = Literal["synced", "syncing", "paused_reconnect_needed", "error"]
 
 
 class KnowledgeSourceOut(WireModel):

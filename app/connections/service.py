@@ -164,9 +164,18 @@ async def reconnect(
     connection_id: uuid.UUID,
     user_id: uuid.UUID | None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
-    """Re-initiate a connect flow for an existing connection (§3.8.4 re-auth path).
+    """Re-initiate a connect flow: proven-before-cutover (Decision §45 / §3.8.7 rule B).
 
-    Resets status to ``unconfigured`` and returns a fresh StartConnectionResult.
+    The EXISTING connection is kept LIVE while the new credential flow is prepared.
+    Status is NOT immediately dropped to ``unconfigured``; that would take the live
+    dependency offline before the new credential is confirmed healthy.  Instead:
+
+      1. ``status_detail`` records ``reconnect_pending:prior_status=<old>`` so the
+         confirm step (and the health worker) can roll back if the probe fails.
+      2. When the OAuth callback / credential submission arrives, the caller invokes
+         ``confirm_reconnect()`` which health-checks the new credential and only then
+         cuts over to ``connected`` (or restores the prior status on failure).
+
     Returns None if the connection does not exist for this tenant."""
     connection = (
         await session.execute(
@@ -179,9 +188,9 @@ async def reconnect(
     if connection is None:
         return None
 
+    # Proven-before-cutover: record intent without taking the live connection offline.
     old_status = connection.status
-    connection.status = "unconfigured"
-    connection.status_detail = None
+    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
     await session.flush()
 
     await audit.emit(
@@ -194,11 +203,90 @@ async def reconnect(
         payload={
             "connection_id": str(connection.connection_id),
             "old_status": old_status,
-            "new_status": "unconfigured",
-            "reason": "reconnect",
+            "new_status": old_status,  # preserved — cutover only on health confirm
+            "reason": "reconnect_pending",
         },
     )
     return connection, _start_result(connection.auth_class, connection)
+
+
+async def confirm_reconnect(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    probe_ok: bool,
+    probe_detail: str | None = None,
+) -> tuple[bool, str]:
+    """Complete a proven-before-cutover reconnect (Decision §45 / §3.8.7 rule B).
+
+    Called by the OAuth callback / credential submission handler AFTER health-checking
+    the new credential externally.  ``probe_ok`` is the result of that health check.
+
+      * On success — promotes status to ``connected``, clears the pending detail.
+      * On failure — restores the prior status from ``status_detail``, surfaces the
+        error; the old connection remains live.
+
+    Returns (True, 'connected') on success, (False, reason) on failure.
+    Returns (False, 'not_found') if the connection does not exist for this tenant."""
+    connection = (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if connection is None:
+        return False, "not_found"
+
+    detail = connection.status_detail or ""
+    prior_status = "unconfigured"
+    if detail.startswith("reconnect_pending:prior_status="):
+        prior_status = detail.split("=", 1)[1]
+
+    if probe_ok:
+        # New credential confirmed healthy — cut over now (proven-before-cutover).
+        connection.status = "connected"
+        connection.status_detail = None
+        await session.flush()
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=connection.instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "old_status": prior_status,
+                "new_status": "connected",
+                "reason": "reconnect_confirmed",
+            },
+        )
+        return True, "connected"
+    else:
+        # Health check failed — keep the prior connection live (Decision §45 rule B).
+        connection.status = prior_status
+        reason = probe_detail or "reconnect_health_check_failed"
+        connection.status_detail = reason
+        await session.flush()
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=connection.instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "old_status": prior_status,
+                "new_status": prior_status,  # preserved — kept live
+                "reason": "reconnect_health_check_failed",
+            },
+        )
+        return False, reason
 
 
 async def revoke(

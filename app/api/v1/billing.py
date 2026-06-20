@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -122,13 +122,17 @@ async def start_checkout(
         return CheckoutSessionOut.model_validate({"url": session.url})
 
 
-@router.delete("/payment-method", status_code=204)
+@router.delete("/payment-method", response_model=BillingInfoOut)
 async def remove_payment_method(
-    response: Response,
     subject: Subject = Depends(current_admin),
     gateway: StripeGateway = Depends(get_stripe_gateway),
-) -> Response:
-    """Remove the card → revert toward free_cap behavior (§3.4.1b / Legal §A3)."""
+) -> BillingInfoOut:
+    """Remove the card → revert toward free_cap behavior (§3.4.1b / Legal §A3).
+
+    Axis10-F01: returns the updated BillingInfo (200) so the wire return type matches
+    the frontend client (`Promise<BillingInfo>`) and the mock adapter — previously this
+    returned 204 (no body) while both sides expected the billing object.
+    """
     async with tenant_session(subject.admin_id) as s:
         account = await metering.get_or_create_billing_account(s, admin_id=subject.admin_id)
         if account.stripe_customer_id is not None:
@@ -148,5 +152,7 @@ async def remove_payment_method(
             event_type="payment_method_removed",
             payload={"reason": "admin_removed"},
         )
-    response.status_code = 204
-    return response
+        instance_id = await _instance_id(s, subject.admin_id)
+        budget = await metering.build_budget(s, admin_id=subject.admin_id, instance_id=instance_id)
+        # After removal the account is free_cap, so paymentMethod is omitted.
+        return BillingInfoOut.model_validate({"budget": _budget_out(budget), "paymentMethod": None})

@@ -1,9 +1,13 @@
-"""Tool broker — two-gate dispatch + result contract (Architecture §3.3.3, §3.3.4).
+"""Tool broker — three-gate dispatch + result contract (Architecture §3.3.3, §3.3.4).
 
 Dispatch gate order:
   Gate 1 (Authorization, default-deny): a live instance_tool_authorizations row for
     (instance, tool) with enabled=true. Absent → structured refusal.
-  Gate 2 (Connection): if the tool declares requires_connection, a live
+  Gate 2 (Channel prerequisite, §3.3.3): if the tool declares requires_channels,
+    every named channel must be enabled-and-connected for this instance. Absent or
+    disabled channel → structured tool-error channel_not_enabled:{channel_id}, same
+    shape as gate 3 (§3.3.3 gate 2 / Decision §43).
+  Gate 3 (Connection): if the tool declares requires_connection, a live
     instance_connections row for that type with status='connected'. Otherwise a
     structured tool-error (NOT a 500, NOT a silent failure) so the agentic loop
     reasons about it uniformly (§3.8.7 rule A / §3.4.1).
@@ -24,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connections import gate
+from app.models.instance import Instance
 from app.models.tool_auth import InstanceToolAuthorization
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
@@ -50,6 +55,32 @@ class ToolBroker:
         ).scalar_one_or_none()
         return row is not None
 
+    async def _channel_enabled(
+        self, admin_id: uuid.UUID, instance_id: uuid.UUID, channel_id: str
+    ) -> bool:
+        """Gate 2 — channel prerequisite (§3.3.3, Decision §43).
+
+        A channel is enabled-and-connected for the instance when the instance's
+        ``channels`` JSONB contains an entry for the channel_id with
+        ``enabled: true``.  An absent entry OR ``enabled: false`` is a hard gate.
+        This is a LIVE read (§3.8.7 rule E safety side) — the same session the
+        broker runs in, no caching."""
+        row = (
+            await self.s.execute(
+                select(Instance.channels).where(
+                    Instance.admin_id == admin_id,
+                    Instance.id == instance_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        channels: list[dict[str, object]] = row or []
+        for ch in channels:
+            if ch.get("id") == channel_id and ch.get("enabled") is True:
+                return True
+        return False
+
     async def _connection_status(
         self, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
     ) -> str | None:
@@ -75,7 +106,22 @@ class ToolBroker:
             await self._trace(admin_id, instance_id, tool.tool_id, result, connection=None)
             return result
 
-        # Gate 2 — Connection (only if the tool requires one).
+        # Gate 2 — Channel prerequisite (§3.3.3, Decision §43).
+        # Only applies when the tool declares requires_channels (non-empty frozenset).
+        if tool.requires_channels:
+            for channel_id in sorted(tool.requires_channels):  # deterministic order
+                if not await self._channel_enabled(admin_id, instance_id, channel_id):
+                    result = c.failed(f"channel_not_enabled:{channel_id}")
+                    await self._trace(
+                        admin_id,
+                        instance_id,
+                        tool.tool_id,
+                        result,
+                        connection=tool.requires_connection,
+                    )
+                    return result
+
+        # Gate 3 — Connection (only if the tool requires one).
         conn_status: str | None = None
         if tool.requires_connection is not None:
             conn_status = await self._connection_status(
@@ -102,7 +148,12 @@ class ToolBroker:
 
         # Execute. Any unexpected raise is normalized to a structured `failed`,
         # never a 500/silent failure (§3.8.7 rule D synchronous path).
-        ctx = ToolContext(admin_id=admin_id, instance_id=instance_id, connection_status=conn_status)
+        ctx = ToolContext(
+            admin_id=admin_id,
+            instance_id=instance_id,
+            connection_status=conn_status,
+            session=self.s,  # §3.3.5: tools that need a durable write receive the session
+        )
         try:
             result = await tool.execute(inputs, ctx)
         except Exception as exc:  # noqa: BLE001

@@ -243,3 +243,134 @@ async def test_schedule_callback_no_connection_gate():
             instance_id=iid,
         )
         assert res.outcome is Outcome.ok  # passes gate 2 (requires_connection None)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Axis5-F01 (Gate 2 channel prerequisite) and
+# Axis5-F03 (ScheduleCallbackTool durable write)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_with_email_channel(admin, *, authorize, email_channel_enabled=True):
+    """Seed with an email channel that is optionally enabled."""
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@x.com",
+                email_lower=f"{admin}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        iid = uuid.uuid4()
+        channels = [{"id": "email", "enabled": email_channel_enabled}]
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="L",
+                state=LucielState.active,
+                channels=channels,
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        for tool_id in authorize:
+            s.add(
+                InstanceToolAuthorization(
+                    id=uuid.uuid4(),
+                    admin_id=admin,
+                    instance_id=iid,
+                    tool_id=tool_id,
+                    enabled=True,
+                )
+            )
+        # Always add a connected email_sender connection
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="email_sender",
+                auth_class="api_key",
+                provider="ses",
+                status="connected",
+            )
+        )
+        await s.flush()
+        return iid
+
+
+class FakeMessenger:
+    async def send(self, ctx, to, body):
+        return "msg-id-1"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_gate2_channel_off_blocks_send_email():
+    """Axis5-F01: Gate 2 blocks send_email when email channel is disabled."""
+    admin = uuid.uuid4()
+    iid = await _seed_with_email_channel(
+        admin, authorize=["send_email"], email_channel_enabled=False
+    )
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        res = await broker.dispatch(
+            catalog.SendEmailTool(FakeMessenger()),
+            {"to": "a@b.com", "body": "hello"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+    assert res.outcome is Outcome.failed
+    assert "channel_not_enabled:email" in (res.reason or "")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_gate2_channel_on_allows_send_email():
+    """Axis5-F01: Gate 2 passes when email channel is enabled."""
+    admin = uuid.uuid4()
+    iid = await _seed_with_email_channel(
+        admin, authorize=["send_email"], email_channel_enabled=True
+    )
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        res = await broker.dispatch(
+            catalog.SendEmailTool(FakeMessenger()),
+            {"to": "a@b.com", "body": "hello"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+    assert res.outcome is Outcome.ok
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_schedule_callback_writes_deferred_action_row():
+    """Axis5-F03: ScheduleCallbackTool.execute() must persist a DeferredAction row."""
+    from app.models.deferred import DeferredAction
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, authorize=["schedule_callback"], connect_calendar=None)
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        res = await broker.dispatch(
+            catalog.ScheduleCallbackTool(),
+            {"fire_at": "2026-06-25T10:00Z", "channel": "email", "message": "follow up"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+        assert res.outcome is Outcome.ok, f"Expected ok, got {res.outcome}: {res.reason}"
+        count = (
+            await s.execute(
+                sa_select(func.count())
+                .select_from(DeferredAction)
+                .where(DeferredAction.admin_id == admin)
+            )
+        ).scalar_one()
+        assert count == 1, f"Expected 1 DeferredAction row, got {count}"

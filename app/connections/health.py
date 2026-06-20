@@ -10,7 +10,7 @@ connection", §3.8.5). It:
   * transitions status (connected / error / expired / dormant) and stamps
     ``last_health_check_at`` + ``status_detail`` (§3.8.4 lifecycle);
   * for a revoked/expired knowledge_source connection, pauses the sync and flags
-    the source needs_reconnect — reusing the Arc 11b mechanism
+    the source paused_reconnect_needed — reusing the Arc 11b mechanism
     (app/knowledge/sync.pause_sync_on_revocation, §3.2.3) rather than a parallel one.
 
 ``dormant`` (§3.8.4): a connection preserved but unused for a long window — defined
@@ -193,7 +193,7 @@ async def _transition(
 
 
 async def _propagate_knowledge_pause(session: AsyncSession, connection: InstanceConnection) -> None:
-    """Expired/error knowledge_source connection → pause sync + needs_reconnect.
+    """Expired/error knowledge_source connection → pause sync + paused_reconnect_needed.
 
     Reuses the Arc 11b mechanism (§3.2.3) rather than a parallel one (§3.8 single
     abstraction): a revoked/expired token must not let Luciel serve stale content."""

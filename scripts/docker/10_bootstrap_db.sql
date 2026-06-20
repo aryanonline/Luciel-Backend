@@ -5,3 +5,4 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 ALTER SCHEMA public OWNER TO luciel_app;
 GRANT ALL ON SCHEMA public TO luciel_app;
 GRANT USAGE, CREATE ON SCHEMA public TO luciel_auth;
+GRANT USAGE ON SCHEMA public TO luciel_audit_owner;

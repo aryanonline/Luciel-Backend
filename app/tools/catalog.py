@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from app.connections import deferred_queue
 from app.tools import contract as c
 from app.tools.contract import Outcome, Tool, ToolContext, ToolResult
 
@@ -146,14 +147,47 @@ class ScheduleCallbackTool:
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"fire_at", "channel", "message"})
 
+    # Map from the free-form channel string to the connection_type checked at fire time
+    # (§3.3.5: delivery channel bound at FIRE time, not scheduling time).
+    _CHANNEL_TO_CONNECTION: dict[str, str] = {
+        "email": "email_sender",
+        "sms": "sms_sender",
+        "whatsapp": "channel_auth",
+        "voice": "channel_auth",
+        "widget": "channel_auth",
+    }
+
     async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
-        # Durably write a scheduled_callback row (Arc 14 worker fires it). Here we
-        # return ok only once "scheduled" — modeled as success of the write.
+        """Durably enqueue a DeferredAction row (§3.3.5). ok ONLY after the write."""
+        session = context.session
+        if session is None:
+            # Should never happen when dispatched via broker; guard against test misuse.
+            return c.failed("enqueue_failed:no_session")
+
+        channel: str = inputs["channel"]
+        connection_type = self._CHANNEL_TO_CONNECTION.get(channel, "channel_auth")
+
+        try:
+            await deferred_queue.enqueue(
+                session,
+                admin_id=context.admin_id,
+                instance_id=context.instance_id,
+                action_type="schedule_callback",
+                connection_type=connection_type,
+                payload={
+                    "fire_at": inputs["fire_at"],
+                    "channel": channel,
+                    "message": inputs["message"],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return c.failed(f"enqueue_failed:{type(exc).__name__}")
+
         return c.ok(
             {
                 "scheduled": True,
                 "fireAt": inputs["fire_at"],
-                "channel": inputs["channel"],
+                "channel": channel,
             }
         )
 

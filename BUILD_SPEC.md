@@ -74,13 +74,15 @@ app/
   channels/
     __init__.py
     base.py                    # ChannelAdapter Protocol (§3.1.1)
-    email_adapter.py sms_adapter.py voice_adapter.py whatsapp_adapter.py meta_messaging_adapter.py
+    email_adapter.py sms_adapter.py voice_adapter.py
+    phone_lifecycle.py pipeline.py rate_limit.py routing.py signatures.py
+    # whatsapp_adapter.py meta_messaging_adapter.py — deferred (Arc 13/14b, Meta channels)
   connections/                 # DOCTRINE ANCHOR app/connections/ — Connections Layer (§3.8)
     __init__.py
-    model.py registry.py health_worker.py credentials.py sandbox.py gating.py
+    service.py gate.py health.py secrets.py sandbox.py deferred_queue.py
   lifecycle/                   # DOCTRINE ANCHOR app/lifecycle/ — state machine + cascade (§3.6)
     __init__.py
-    state_machine.py cascade.py export_bundle.py
+    state_machine.py cascade.py export_bundle.py grace_expiry.py
   auth/
     __init__.py
     access.py                  # DOCTRINE ANCHOR app/auth/access.py — single-login + tenant scoping (§3.7)
@@ -90,12 +92,11 @@ app/
     __init__.py
     metering.py                # DOCTRINE ANCHOR app/billing/metering.py — counter + Stripe overage (§3.4.1b)
     stripe_gateway.py          # Stripe client wrapper (test mode)
-  notifications/               # DOCTRINE ANCHOR app/notifications/ — escalation delivery (§3.5)
+  notifications/               # DOCTRINE ANCHOR app/notifications/ — escalation/lifecycle delivery (§3.5)
     __init__.py
-    delivery.py routing.py retry.py
+    notifier.py                # lifecycle_notice_sent emitter; real send path is AWS-deferred
   analytics/                   # DOCTRINE ANCHOR app/analytics/ — read-only aggregates (§3.9)
-    __init__.py
-    reports.py
+    __init__.py                # aggregate read endpoints live in api/v1/admin; module reserved
   audit/
     __init__.py
     log.py                     # append-only, SHA-256 hash-chained per admin_id (§5.2/§5.3)
@@ -130,7 +131,8 @@ Every tenant table carries `admin_id uuid NOT NULL`. All three layers on every t
   STATUS_TO_CODE (transport.ts): 401->unauthorized, 402->payment_required, 403->unauthorized,
   404->not_found, 409->conflict, 422->validation_error, 429->rate_limited, else server_error.
   => Therefore: gated-unverified write = 403; at_cap rejection (if any) = 402; slot taken = 409;
-     bad input = 422; resend cooldown = 429 (+retryAfterSeconds).
+     bad input = 422; resend cooldown = 200 with `{ok:false, cooldownSecondsRemaining:N}`
+     (a soft signal, NOT an HTTP error — see schemas/auth.ts resendVerificationResult).
 - 204 No Content for void methods: logout, knowledge.deleteSource, connections.disconnect,
   leads.erase, leads.prune, conversations.flagAnswer, account.close.
 - `GET /api/v1/admin/luciel` returns JSON `null` (200) when no Luciel — NOT 404.

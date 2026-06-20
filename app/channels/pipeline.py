@@ -11,6 +11,7 @@ the normalized InboundMessage and the admission decision.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,8 @@ from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 
+logger = logging.getLogger("luciel.channels.inbound")
+
 
 @dataclass
 class AdmissionDenied:
@@ -30,13 +33,29 @@ class AdmissionDenied:
     source_id: str
 
 
+@dataclass
+class OptOutHandled:
+    """An inbound STOP/HELP/START keyword the platform handles at the channel edge.
+
+    The customer's keyword is suppressed from the orchestrator/LLM path (§3.1.6,
+    Legal §A2); the carrier (Twilio Messaging Services) sends the canonical opt-out /
+    help reply. We surface the classified keyword so the caller can record consent
+    state without ever invoking the runtime (audit finding Axis6-F05).
+    """
+
+    keyword: str  # stop|help|start
+    channel: str
+    customer_identifier: str
+
+
 async def ingest(
     adapter: ChannelAdapter,
     request: dict[str, Any],
     session: AsyncSession,
-) -> InboundMessage | AdmissionDenied | InboundRejected:
+) -> InboundMessage | AdmissionDenied | OptOutHandled | InboundRejected:
     """Run the inbound edge. Returns:
     - InboundMessage on admission (ready for the runtime budget gate, Arc 14),
+    - OptOutHandled when the inbound is a STOP/HELP/START keyword (suppressed pre-budget),
     - AdmissionDenied when rate-limited / abuse-blocked (audited, pre-budget),
     - raises/returns InboundRejected on signature/resolution failure (audited).
     """
@@ -46,6 +65,16 @@ async def ingest(
     # 2. Normalize enough to know the source identifier for rate-limiting.
     msg = await adapter.receive(request, ctx)
     source_id = msg.customer_identifier or request.get("source_ip", "unknown")
+
+    # 2b. Opt-out / help keyword handling (§3.1.6) BEFORE the orchestrator/LLM. The
+    # carrier sends the canonical reply; we never route the keyword to the runtime.
+    opt_keyword = msg.channel_metadata.get("opt_keyword")
+    if opt_keyword:
+        return OptOutHandled(
+            keyword=str(opt_keyword),
+            channel=adapter.channel_id,
+            customer_identifier=msg.customer_identifier,
+        )
 
     # 3. Pre-budget admission (per-source token bucket + per-tenant ceiling).
     decision = rate_limit.admit(adapter.channel_id, source_id, str(ctx.admin_id))
@@ -72,14 +101,20 @@ async def ingest(
     return msg
 
 
-async def record_inbound_rejection(session: AsyncSession, *, reason: str, channel: str) -> None:
+async def record_inbound_rejection(
+    session: AsyncSession, *, reason: str, channel: str, source_hint: str | None = None
+) -> None:
     """An unsigned/unresolvable inbound is rejected and audit-logged (§3.1.3).
 
-    These occur BEFORE tenant resolution, so there is no tenant scope; they are
-    logged to platform observability (CloudWatch in prod). We do not write a
-    tenant audit row because no tenant is resolved (and writing under a guessed
-    tenant would itself be a cross-tenant action). Recorded here as an interface
-    point; the platform-log sink binds in deployment.
+    These occur BEFORE tenant resolution, so there is no tenant scope; we therefore
+    do NOT write a tenant audit row (writing under a guessed tenant would itself be
+    a cross-tenant action). Instead we emit a structured WARNING to platform
+    observability (the prod log pipeline ships these to CloudWatch). No PII is
+    logged — only the channel, the rejection reason, and an OPTIONAL caller-supplied
+    hash hint (never the raw source identifier). Audit finding Axis6-F06.
     """
-    # Intentionally no tenant audit write (no resolved tenant). Hook for CloudWatch.
+    logger.warning(
+        "inbound_rejected",
+        extra={"channel": channel, "reason": reason, "source_hint": source_hint},
+    )
     return None

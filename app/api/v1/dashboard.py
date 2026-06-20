@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, Response
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
@@ -23,7 +23,7 @@ from app.api.errors import not_found
 from app.audit import log as audit
 from app.db.session import tenant_session
 from app.models.audit import ActorType
-from app.models.conversation import EscalationEvent, Transcript
+from app.models.conversation import EscalationEvent, SessionSummary, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
@@ -291,10 +291,42 @@ async def _require_lead(s: AsyncSession, *, admin_id: uuid.UUID, lead_id: uuid.U
 async def erase_lead(
     lead_id: uuid.UUID, response: Response, subject: Subject = Depends(current_admin)
 ) -> Response:
-    """Right-to-erasure: hard-delete one lead + audit (§3.4.11). Irreversible."""
+    """Right-to-erasure: hard-delete one lead + all transcripts + all session
+    summaries associated with that resolved_lead_id (Architecture §3.4.11). Irreversible."""
     async with tenant_session(subject.admin_id) as s:
         lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
         instance_id = lead.instance_id
+
+        # §3.4.11 cascade: collect sessions for this lead, then delete transcripts.
+        session_rows = (
+            (
+                await s.execute(
+                    select(SessionModel.id).where(
+                        SessionModel.admin_id == subject.admin_id,
+                        SessionModel.resolved_lead_id == lead_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        if session_rows:
+            await s.execute(
+                delete(Transcript).where(
+                    Transcript.admin_id == subject.admin_id,
+                    Transcript.session_id.in_(list(session_rows)),
+                )
+            )
+
+        # §3.4.11: delete all SessionSummary rows for this resolved_lead_id.
+        await s.execute(
+            delete(SessionSummary).where(
+                SessionSummary.admin_id == subject.admin_id,
+                SessionSummary.resolved_lead_id == lead_id,
+            )
+        )
+
         await s.delete(lead)
         await audit.emit(
             s,
@@ -303,8 +335,13 @@ async def erase_lead(
             event_type="lead_erasure",
             actor_type=ActorType.admin_user,
             actor_user_id=subject.user_id,
-            # No raw PII in the payload — lead id only (§3.4.11).
-            payload={"lead_id": str(lead_id)},
+            # No raw PII in the chained payload — store the HASHED resolved_lead_id
+            # so erasure-by-key-destruction holds against the immutable log (§3.4.11/§5.3).
+            payload={
+                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                "transcripts_deleted": len(session_rows),
+                "summaries_deleted": True,
+            },
         )
     response.status_code = 204
     return response
@@ -336,7 +373,7 @@ async def prune_leads(
                 event_type="lead_pruned",
                 actor_type=ActorType.admin_user,
                 actor_user_id=subject.user_id,
-                payload={"lead_id": str(lead_id)},
+                payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
             )
     response.status_code = 204
     return response
@@ -355,7 +392,7 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
             event_type="lead_archived",
             actor_type=ActorType.admin_user,
             actor_user_id=subject.user_id,
-            payload={"lead_id": str(lead_id)},
+            payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
         )
         await s.flush()
         return LeadOut(

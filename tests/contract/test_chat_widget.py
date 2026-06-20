@@ -125,3 +125,41 @@ async def test_history_maps_roles_to_visitor_assistant(client):
     roles = {m["role"] for m in r.json()}
     # The widget never sees lead/luciel — only visitor/assistant.
     assert roles <= {"visitor", "assistant"}
+
+
+async def test_widget_flood_is_rate_limited_before_budget(client):
+    """B3 regression (Architecture §3.1.5): the widget /messages endpoint must run
+    the pre-budget abuse gate BEFORE the budget gate / any LLM call, so a flood from
+    one source can never drain a tenant's conversation budget (denial-of-wallet). A
+    burst beyond the widget token bucket (burst=5, sustained 1/3s) returns HTTP 429
+    and audits widget_abuse_blocked."""
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select
+
+    admin, embed_key = await _seed_active_instance()
+    sid = str(uuid.uuid4())  # one widget session token → one source bucket
+    statuses = []
+    for _ in range(8):  # exceed burst of 5 within the same instant (no refill)
+        r = await client.post(
+            "/api/v1/chat-widget/messages",
+            json={"embedKey": embed_key, "sessionId": sid, "text": "hi"},
+        )
+        statuses.append(r.status_code)
+    assert 429 in statuses, f"expected a 429 once the burst is exhausted, got {statuses}"
+    # The 429 carries the documented error-contract body shape.
+    blocked = [s for s in statuses if s == 429]
+    assert blocked, "rate-limit must trigger"
+    # And the block is audited as widget_abuse_blocked (no raw PII).
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(AdminAuditLog.event_type == "widget_abuse_blocked")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows, "widget_abuse_blocked audit event must be written on a flood"
+    for row in rows:
+        assert "reason" in row.event_payload and row.event_payload["channel"] == "widget"
