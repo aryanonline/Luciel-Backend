@@ -33,6 +33,20 @@ def compute_hash(event_id: uuid.UUID, created_at: datetime, payload: dict[str, o
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def hash_lead_id(lead_id: uuid.UUID | str) -> str:
+    """Stable, non-reversible digest of a lead identifier for audit payloads.
+
+    Architecture §3.4.11 / §5.3: audit events that reference a lead must store the
+    HASHED ``resolved_lead_id`` (and non-identifying metadata) in the immutable,
+    hash-chained payload — never the raw id — so PIPEDA lead erasure is reconciled
+    with audit immutability by data placement + key destruction, not by rewriting
+    history. After the lead row (and its display-lookup) are erased, an audit row
+    still proves *that* an event happened and *when*, but resolves to no recoverable
+    identity. This is a one-way SHA-256 digest; the raw UUID never enters the chain.
+    """
+    return hashlib.sha256(str(lead_id).encode("utf-8")).hexdigest()
+
+
 async def emit(
     session: AsyncSession,
     *,

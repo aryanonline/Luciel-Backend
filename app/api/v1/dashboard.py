@@ -303,8 +303,9 @@ async def erase_lead(
             event_type="lead_erasure",
             actor_type=ActorType.admin_user,
             actor_user_id=subject.user_id,
-            # No raw PII in the payload — lead id only (§3.4.11).
-            payload={"lead_id": str(lead_id)},
+            # No raw PII in the chained payload — store the HASHED resolved_lead_id
+            # so erasure-by-key-destruction holds against the immutable log (§3.4.11/§5.3).
+            payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
         )
     response.status_code = 204
     return response
@@ -336,7 +337,7 @@ async def prune_leads(
                 event_type="lead_pruned",
                 actor_type=ActorType.admin_user,
                 actor_user_id=subject.user_id,
-                payload={"lead_id": str(lead_id)},
+                payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
             )
     response.status_code = 204
     return response
@@ -355,7 +356,7 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
             event_type="lead_archived",
             actor_type=ActorType.admin_user,
             actor_user_id=subject.user_id,
-            payload={"lead_id": str(lead_id)},
+            payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
         )
         await s.flush()
         return LeadOut(

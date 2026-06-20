@@ -202,6 +202,45 @@ async def test_erase_lead_deletes_row(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_lead_lifecycle_audit_payloads_carry_no_raw_lead_id(client):
+    """B2 regression (Architecture §3.4.11 / §5.3): lead_erasure / lead_pruned /
+    lead_archived must store the HASHED resolved_lead_id in the immutable chained
+    payload, never the raw lead UUID — otherwise PIPEDA erasure-by-key-destruction
+    is defeated by the audit log retaining the identifier."""
+    from app.audit.log import hash_lead_id
+    from app.models.audit import AdminAuditLog
+
+    admin = await _signup_verify_login(client)
+    archived = await _seed_lead(admin)
+    erased = await _seed_lead(admin)
+    await client.post(f"/api/v1/dashboard/leads/{archived}/archive")
+    await client.delete(f"/api/v1/dashboard/leads/{erased}")
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.event_type.in_(["lead_archived", "lead_erasure"])
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows, "expected lead lifecycle audit rows"
+    for row in rows:
+        blob = str(row.event_payload)
+        assert str(archived) not in blob and str(erased) not in blob, (
+            "raw lead UUID leaked into immutable audit payload"
+        )
+        assert "resolved_lead_id_hash" in row.event_payload, "hashed id must be present"
+    # The hash for the erased lead is present and matches the one-way digest.
+    erasure = [r for r in rows if r.event_type == "lead_erasure"][0]
+    assert erasure.event_payload["resolved_lead_id_hash"] == hash_lead_id(erased)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_prune_deletes_named_leads(client):
     admin = await _signup_verify_login(client)
     a, b = await _seed_lead(admin), await _seed_lead(admin)
