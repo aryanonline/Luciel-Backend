@@ -197,6 +197,31 @@ async def test_pm_attach_detach_flips_billing_state() -> None:
         assert acct.billing_state == "free_cap"
         assert acct.pm_brand is None
 
+    # Axis3-F04: each billing state change emits the canonical lifecycle_transition.
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    sa_select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "lifecycle_transition",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        transitions = {
+            (r.event_payload.get("from"), r.event_payload.get("to"))
+            for r in rows
+            if r.event_payload.get("trigger") == "payment_method"
+        }
+        assert ("free_cap", "payg_enabled") in transitions
+        assert ("payg_enabled", "free_cap") in transitions
+
 
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_idempotent_metered_reporting_no_double_bill() -> None:

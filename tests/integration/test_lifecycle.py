@@ -322,3 +322,74 @@ async def test_archived_lead_reactivated_on_inbound():
             )
         ).scalar_one_or_none()
         assert evt is not None, "lead_reactivated audit event must be emitted"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_grace_expiry_sweep_fires_cascade_only_after_30_days():
+    """Axis3-F06: the day-30 grace-window expiry job fires the hard-delete cascade.
+
+    Before day 30 the Luciel is recoverable and the sweep is a no-op; after the
+    deadline the sweep runs the cascade (and emits the grace_window_expiry
+    lifecycle_transition), honoring the §3.6.3 'then permanently destroyed' promise.
+    """
+    from datetime import timedelta
+
+    from app.lifecycle.grace_expiry import expire_grace_window_if_due, run_grace_expiry_sweep
+
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)
+    # Move into the grace window.
+    async with tenant_session(admin) as s:
+        inst = await state_machine.delete_luciel(s, admin, admin)
+        started = inst.grace_window_started_at
+        assert started is not None
+
+    # 29 days in: NOT yet due — sweep is a no-op, data still present.
+    not_yet = started + timedelta(days=29)
+    async with tenant_session(admin) as s:
+        assert await expire_grace_window_if_due(s, admin_id=admin, now=not_yet) is None
+    async with tenant_session(admin) as s:
+        n = (
+            await s.execute(select(func.count()).select_from(Lead).where(Lead.admin_id == admin))
+        ).scalar_one()
+        assert n >= 1, "data must remain recoverable before day 30"
+
+    # Day 30 + 1s: due — the multi-tenant sweep deletes this tenant's Luciel.
+    past = started + timedelta(days=30, seconds=1)
+    deleted = await run_grace_expiry_sweep([admin, uuid.uuid4()], now=past)
+    assert str(admin) in deleted, "expired tenant must be cascaded"
+
+    async with tenant_session(admin) as s:
+        n = (
+            await s.execute(select(func.count()).select_from(Lead).where(Lead.admin_id == admin))
+        ).scalar_one()
+        assert n == 0, "leads must be hard-deleted after grace expiry"
+        # Audit trail of the expiry transition is retained (audit log survives cascade).
+        evt = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "lifecycle_transition",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert any((e.event_payload or {}).get("trigger") == "grace_window_expiry" for e in evt), (
+            "grace_window_expiry lifecycle_transition must be logged"
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_grace_expiry_noop_when_not_in_grace_window():
+    """An active (or already-restored) Luciel is never deleted by the sweep."""
+    from datetime import UTC, datetime
+
+    from app.lifecycle.grace_expiry import expire_grace_window_if_due
+
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)  # state = active
+    async with tenant_session(admin) as s:
+        assert await expire_grace_window_if_due(s, admin_id=admin, now=datetime.now(UTC)) is None

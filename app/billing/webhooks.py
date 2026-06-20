@@ -209,6 +209,7 @@ async def _on_pm_attached(
         ey = card.get("exp_year")
         account.pm_exp_month = int(em) if isinstance(em, (int, float)) else None
         account.pm_exp_year = int(ey) if isinstance(ey, (int, float)) else None
+    prev_billing_state = account.billing_state
     account.billing_state = "payg_enabled"  # adding a card flips behavior >50 (Vision §7)
     await session.flush()
 
@@ -219,6 +220,18 @@ async def _on_pm_attached(
         event_type="payment_method_added",
         payload={"brand": account.pm_brand, "last4": account.pm_last4},
     )
+    # Architecture §3.6.7 / §5.2: the billing state change itself is the canonical
+    # lifecycle_transition (free_cap → payg_enabled). payment_method_added above is
+    # supplementary detail. Emit only on an actual state change so idempotent webhook
+    # redelivery does not log a spurious transition (audit finding Axis3-F04).
+    if prev_billing_state != "payg_enabled":
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="lifecycle_transition",
+            payload={"from": prev_billing_state, "to": "payg_enabled", "trigger": "payment_method"},
+        )
 
     # Legal §A3: "connections that go dormant … are restored automatically if a valid
     # payment method is added within the retention window."
@@ -262,6 +275,7 @@ async def _on_pm_detached(
     session: AsyncSession, *, admin_id: uuid.UUID, account: BillingAccount
 ) -> str:
     """payment_method.detached → free_cap + clear the display tuple (Legal §A3)."""
+    prev_billing_state = account.billing_state
     account.billing_state = "free_cap"
     account.pm_brand = None
     account.pm_last4 = None
@@ -276,4 +290,14 @@ async def _on_pm_detached(
         event_type="payment_method_removed",
         payload={"reason": "stripe_detached"},
     )
+    # Canonical billing lifecycle_transition (payg_enabled → free_cap), §3.6.7 / §5.2.
+    # Only on a real state change (idempotent redelivery safe) (Axis3-F04).
+    if prev_billing_state != "free_cap":
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="lifecycle_transition",
+            payload={"from": prev_billing_state, "to": "free_cap", "trigger": "payment_method"},
+        )
     return "payment_method.detached"
