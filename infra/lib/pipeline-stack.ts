@@ -85,5 +85,37 @@ export class PipelineStack extends Stack {
         resources: [`arn:aws:iam::${this.account}:role/cdk-*`],
       }),
     );
+
+    // Permissions for run-migration-task.sh: read stack exports, run the one-off
+    // migration ECS task, look up the VPC/subnets, and pass the task roles.
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'CfnExports',
+        actions: ['cloudformation:ListExports', 'cloudformation:DescribeStacks'],
+        resources: ['*'],
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'RunMigrationTask',
+        actions: ['ecs:RunTask', 'ecs:DescribeTasks', 'ecs:ListTasks'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'DescribeNet',
+        actions: ['ec2:DescribeSubnets', 'ec2:DescribeVpcs', 'ec2:DescribeSecurityGroups'],
+        resources: ['*'],
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'PassTaskRoles',
+        actions: ['iam:PassRole'],
+        resources: [`arn:aws:iam::${this.account}:role/Luciel-${envConfig.envName}-Compute-*`],
+      }),
+    );
   }
 }
