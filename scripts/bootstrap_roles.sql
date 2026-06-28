@@ -72,3 +72,8 @@ ALTER SCHEMA public OWNER TO luciel_app;
 -- object). Grant both target roles schema privileges.
 GRANT CREATE, USAGE ON SCHEMA public TO luciel_auth;
 GRANT CREATE, USAGE ON SCHEMA public TO luciel_audit_owner;
+
+-- pgvector: migration 0004 adds a vector column, which needs the extension. On RDS
+-- only the master/rds_superuser can CREATE EXTENSION, so do it here (bootstrap runs
+-- as master) rather than in the app-role-run alembic step. Idempotent.
+CREATE EXTENSION IF NOT EXISTS vector;
