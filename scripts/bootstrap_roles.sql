@@ -66,3 +66,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO luciel_app;
 -- single-platform DB) so it can create objects and reassign their ownership. Run as
 -- master/owner.
 ALTER SCHEMA public OWNER TO luciel_app;
+-- The OWNER-transfer targets (luciel_auth, luciel_audit_owner) must ALSO hold
+-- CREATE/USAGE on public, or 'ALTER ... OWNER TO <role>' fails with 'permission
+-- denied for schema public' (the new owner role needs schema rights to hold the
+-- object). Grant both target roles schema privileges.
+GRANT CREATE, USAGE ON SCHEMA public TO luciel_auth;
+GRANT CREATE, USAGE ON SCHEMA public TO luciel_audit_owner;
