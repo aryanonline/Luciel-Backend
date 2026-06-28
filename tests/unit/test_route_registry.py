@@ -1,0 +1,134 @@
+"""Permanent guard for the include_router route registry.
+
+A prior dependency bump (fastapi 0.137.x + starlette 1.3) silently dropped routes
+that were mounted via ``app.include_router(...)`` — the app booted fine but whole
+API surfaces returned 404. This test freezes the full set of registered
+(method, path) pairs so that regression can never recur silently: any router that
+stops registering (or any route added without updating this list) fails CI.
+
+It checks the framework's own view of the surface two independent ways:
+  1. ``app.openapi()`` — what FastAPI believes is registered.
+  2. live ASGI routing via ``TestClient`` — every path actually resolves (never 404).
+Neither needs Postgres/Redis, so this runs in the unit tier.
+"""
+
+from __future__ import annotations
+
+import pytest
+from app.main import create_app
+from fastapi.testclient import TestClient
+
+# The complete control-plane + data-plane surface mounted in app/main.py via
+# include_router, plus the bare /healthz probe. Update this set ONLY with an
+# intentional route change (and say so in the PR).
+EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/healthz"),
+        # auth
+        ("POST", "/api/v1/auth/signup"),
+        ("POST", "/api/v1/auth/login"),
+        ("POST", "/api/v1/auth/logout"),
+        ("GET", "/api/v1/auth/me"),
+        ("POST", "/api/v1/auth/verify-email"),
+        ("POST", "/api/v1/auth/resend-verification"),
+        ("POST", "/api/v1/auth/forgot-password"),
+        ("POST", "/api/v1/auth/reset-password"),
+        # admin/luciel
+        ("GET", "/api/v1/admin/luciel"),
+        ("POST", "/api/v1/admin/luciel"),
+        ("PUT", "/api/v1/admin/luciel/channels"),
+        ("POST", "/api/v1/admin/luciel/delete"),
+        ("PUT", "/api/v1/admin/luciel/escalation"),
+        ("POST", "/api/v1/admin/luciel/pause"),
+        ("PUT", "/api/v1/admin/luciel/personality"),
+        ("POST", "/api/v1/admin/luciel/restore"),
+        ("POST", "/api/v1/admin/luciel/resume"),
+        ("PUT", "/api/v1/admin/luciel/tools"),
+        ("POST", "/api/v1/admin/luciel/voice-consent"),
+        # admin/knowledge
+        ("GET", "/api/v1/admin/knowledge/quota"),
+        ("GET", "/api/v1/admin/knowledge/sources"),
+        ("POST", "/api/v1/admin/knowledge/sources/paste"),
+        ("POST", "/api/v1/admin/knowledge/sources/upload"),
+        ("DELETE", "/api/v1/admin/knowledge/sources/{source_id}"),
+        ("GET", "/api/v1/admin/knowledge/sources/{source_id}/chunks"),
+        ("POST", "/api/v1/admin/knowledge/sources/{source_id}/resync"),
+        # admin/account
+        ("POST", "/api/v1/admin/account/close"),
+        ("POST", "/api/v1/admin/account/export"),
+        # admin/connections
+        ("GET", "/api/v1/admin/connections"),
+        ("POST", "/api/v1/admin/connections"),
+        ("DELETE", "/api/v1/admin/connections/{connection_id}"),
+        ("POST", "/api/v1/admin/connections/{connection_id}/reconnect"),
+        # admin/usage
+        ("GET", "/api/v1/admin/usage/audit-log"),
+        ("GET", "/api/v1/admin/usage/overview"),
+        # dashboard
+        ("GET", "/api/v1/dashboard/conversations"),
+        ("POST", "/api/v1/dashboard/conversations/{session_id}/hand-back"),
+        ("GET", "/api/v1/dashboard/conversations/{session_id}/messages"),
+        ("GET", "/api/v1/dashboard/conversations/{session_id}/messages/{message_id}/evidence"),
+        ("POST", "/api/v1/dashboard/conversations/{session_id}/messages/{message_id}/flag"),
+        ("POST", "/api/v1/dashboard/conversations/{session_id}/take-over"),
+        ("GET", "/api/v1/dashboard/escalations"),
+        ("GET", "/api/v1/dashboard/leads"),
+        ("POST", "/api/v1/dashboard/leads/prune"),
+        ("DELETE", "/api/v1/dashboard/leads/{lead_id}"),
+        ("POST", "/api/v1/dashboard/leads/{lead_id}/archive"),
+        # chat-widget (data plane)
+        ("POST", "/api/v1/chat-widget/bootstrap"),
+        ("POST", "/api/v1/chat-widget/messages"),
+        ("GET", "/api/v1/chat-widget/sessions/{session_id}"),
+        # billing
+        ("GET", "/api/v1/billing"),
+        ("POST", "/api/v1/billing/checkout"),
+        ("DELETE", "/api/v1/billing/payment-method"),
+        # webhooks
+        ("POST", "/api/v1/webhooks/stripe"),
+    }
+)
+
+
+def _registered_routes() -> set[tuple[str, str]]:
+    """All (method, path) pairs FastAPI reports as registered, via the OpenAPI schema.
+
+    Uses the public schema rather than walking ``app.routes`` because newer FastAPI
+    nests included routers under internal mount objects rather than flattening them;
+    the OpenAPI schema is the stable, public view of the registered surface.
+    """
+    spec = create_app().openapi()
+    return {
+        (method.upper(), path)
+        for path, operations in spec["paths"].items()
+        for method in operations
+    }
+
+
+def test_all_include_router_routes_are_registered() -> None:
+    registered = _registered_routes()
+    missing = EXPECTED_ROUTES - registered
+    unexpected = registered - EXPECTED_ROUTES
+    assert not missing, (
+        f"include_router routes dropped from the app (regression!): {sorted(missing)}"
+    )
+    assert not unexpected, (
+        "routes present but not in EXPECTED_ROUTES — update this guard intentionally: "
+        f"{sorted(unexpected)}"
+    )
+
+
+@pytest.mark.parametrize(("method", "path"), sorted(EXPECTED_ROUTES))
+def test_every_route_resolves_not_404(method: str, path: str) -> None:
+    """Each registered path must actually route (never 404). Path params get dummy
+    values; the route may answer 401/422/405, but a 404 means it is unmounted."""
+    client = TestClient(create_app())
+    concrete = path.format(
+        source_id="00000000-0000-0000-0000-000000000000",
+        connection_id="00000000-0000-0000-0000-000000000000",
+        session_id="00000000-0000-0000-0000-000000000000",
+        message_id="00000000-0000-0000-0000-000000000000",
+        lead_id="00000000-0000-0000-0000-000000000000",
+    )
+    response = client.request(method, concrete)
+    assert response.status_code != 404, f"{method} {concrete} is not routed (404)"

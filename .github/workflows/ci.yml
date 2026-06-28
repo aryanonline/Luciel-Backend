@@ -88,7 +88,15 @@ jobs:
           # must BLOCK the build (images failing on a high/critical CVE do not promote).
           # --strict makes pip-audit exit non-zero on any vulnerability with a known fix;
           # this is no longer advisory (was `|| true`, audit finding Axis11-F03).
-          pip-audit --strict --desc
+          #
+          # We audit a frozen requirements set rather than the live environment so the
+          # editable-installed project itself (`luciel-backend`, unpublished) is never in
+          # the audit set. `--skip-editable` alone is incompatible with `--strict` (strict
+          # treats the skipped editable dist as a collection failure and exits 1). The
+          # export omits editable installs, so every real third-party dependency is still
+          # audited strictly and a fixable CVE still BLOCKS the build (Arch §5.14 / C27).
+          uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
+          pip-audit --strict --desc -r /tmp/audit-reqs.txt
 
       - name: Secret scan (detect-secrets)
         run: |
