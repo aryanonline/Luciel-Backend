@@ -19,13 +19,26 @@ import { ComputeStack } from '../lib/compute-stack';
 import { EdgeStack } from '../lib/edge-stack';
 import { ObservabilityStack } from '../lib/observability-stack';
 import { PipelineStack } from '../lib/pipeline-stack';
-import { getEnvConfig, OFFERING_REGION, EnvName } from '../lib/env-config';
+import { DnsStack } from '../lib/dns-stack';
+import { WebStack } from '../lib/web-stack';
+import { WidgetCertStack, WidgetStack } from '../lib/widget-stack';
+import {
+  getEnvConfig,
+  applyContextOverrides,
+  OFFERING_REGION,
+  CLOUDFRONT_CERT_REGION,
+  EnvName,
+} from '../lib/env-config';
 
 const app = new cdk.App();
 const envName = (app.node.tryGetContext('env') as EnvName) ?? 'dev';
-const envConfig = getEnvConfig(envName);
+// Cheap-idle pause switch: `-c paused=true` forces every ECS service to count 0.
+const paused = app.node.tryGetContext('paused') === 'true';
+const envConfig = applyContextOverrides(getEnvConfig(envName), paused);
 const account = process.env.CDK_DEFAULT_ACCOUNT;
 const env: cdk.Environment = { account, region: OFFERING_REGION };
+// CloudFront certs MUST be in us-east-1 (the single sanctioned region deviation).
+const usEast1Env: cdk.Environment = { account, region: CLOUDFRONT_CERT_REGION };
 // infra/ lives inside the backend repo, so the backend root (Docker build context)
 // is two levels up from infra/bin/.
 const backendPath = path.join(__dirname, '..', '..');
@@ -43,6 +56,10 @@ const data = new DataStack(app, `${prefix}-Data`, {
   cmk: sec.cmk,
 });
 
+// DNS + regional certs (created before compute so the api cert can attach to the
+// backend ALB's HTTPS listener). Only the existing hosted zone is referenced.
+const dns = new DnsStack(app, `${prefix}-Dns`, { env, envConfig });
+
 const compute = new ComputeStack(app, `${prefix}-Compute`, {
   env,
   envConfig,
@@ -52,6 +69,32 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   dbSecretArn: data.db.secret!.secretArn,
   platformSecretArn: sec.platformSecret.secretArn,
   backendPath,
+  apiCert: dns.apiCert,
+  hostedZone: dns.hostedZone,
+});
+
+// Frontend web service (SSR Next.js on ECS) — mirrors the backend compute pattern.
+new WebStack(app, `${prefix}-Web`, {
+  env,
+  envConfig,
+  vpc: net.vpc,
+  webCert: dns.webCert,
+  hostedZone: dns.hostedZone,
+});
+
+// Widget CDN: the cert must be in us-east-1 (CloudFront), the bucket+distribution
+// in ca-central-1. crossRegionReferences lets the ca-central-1 stack consume the
+// us-east-1 cert.
+const widgetCert = new WidgetCertStack(app, `${prefix}-WidgetCert`, {
+  env: usEast1Env,
+  envConfig,
+  crossRegionReferences: true,
+});
+new WidgetStack(app, `${prefix}-Widget`, {
+  env,
+  envConfig,
+  cert: widgetCert.cert,
+  crossRegionReferences: true,
 });
 
 new EdgeStack(app, `${prefix}-Edge`, {
@@ -70,6 +113,7 @@ new PipelineStack(app, `${prefix}-Pipeline`, {
   env,
   envConfig,
   githubRepo: 'aryanonline/Luciel-Backend',
+  frontendRepo: 'aryanonline/Luciel-Frontend',
 });
 
 app.synth();

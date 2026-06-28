@@ -20,15 +20,24 @@ export interface PipelineStackProps extends StackProps {
   readonly envConfig: EnvConfig;
   /** GitHub org/repo allowed to assume the deploy role, e.g. "aryanonline/Luciel-Backend". */
   readonly githubRepo: string;
+  /**
+   * FRONTEND GitHub org/repo (e.g. "aryanonline/Luciel-Frontend") that gets its OWN
+   * least-privilege OIDC deploy role: push the web image to ECR, sync the widget
+   * bucket, invalidate CloudFront, and roll the web ECS service. Reuses the single
+   * account-wide OIDC provider created here (a 2nd provider for the same URL would
+   * conflict). When omitted, no frontend role is created.
+   */
+  readonly frontendRepo?: string;
 }
 
 export class PipelineStack extends Stack {
   public readonly ecrRepo: ecr.Repository;
   public readonly deployRole: iam.Role;
+  public readonly frontendDeployRole?: iam.Role;
 
   constructor(scope: Construct, id: string, props: PipelineStackProps) {
     super(scope, id, props);
-    const { envConfig, githubRepo } = props;
+    const { envConfig, githubRepo, frontendRepo } = props;
 
     // ECR repo for the backend image, with scan-on-push (CVE gate, §5.8).
     this.ecrRepo = new ecr.Repository(this, 'BackendRepo', {
@@ -117,5 +126,113 @@ export class PipelineStack extends Stack {
         resources: [`arn:aws:iam::${this.account}:role/Luciel-${envConfig.envName}-Compute-*`],
       }),
     );
+
+    // ---- Frontend (Luciel-Frontend) deploy role -----------------------------
+    // Separate, least-privilege role for the frontend repo's CI. It builds the web
+    // image + widget bundle (in the frontend repo) and delivers them to resources
+    // THIS app owns: the luciel-<env>-web ECR repo, the widget S3 bucket, the widget
+    // CloudFront distribution, and the web ECS service. Resource patterns mirror the
+    // backend role (built from account/region + deterministic names) so there is no
+    // cross-stack construct dependency. prod is NEVER auto-deployed — the manual
+    // approval gate is a GitHub Environment rule, enforced outside CloudFormation.
+    if (frontendRepo) {
+      const region = this.region;
+      const account = this.account;
+      const webRepoArn = `arn:aws:ecr:${region}:${account}:repository/luciel-${envConfig.envName}-web`;
+      const widgetBucketArn = `arn:aws:s3:::luciel-${envConfig.envName}-widget-${account}`;
+
+      this.frontendDeployRole = new iam.Role(this, 'FrontendGitHubDeployRole', {
+        roleName: `luciel-${envConfig.envName}-frontend-github-deploy`,
+        assumedBy: new iam.WebIdentityPrincipal(oidcProvider.openIdConnectProviderArn, {
+          StringEquals: {
+            'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          },
+          StringLike: {
+            'token.actions.githubusercontent.com:sub': [
+              `repo:${frontendRepo}:ref:refs/heads/*`,
+              `repo:${frontendRepo}:environment:*`,
+            ],
+          },
+        }),
+        description: 'GitHub Actions OIDC deploy role for Luciel-Frontend (no static keys).',
+      });
+
+      // Push the web image to its ECR repo (+ auth token, which is account-wide).
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'EcrAuth',
+          actions: ['ecr:GetAuthorizationToken'],
+          resources: ['*'],
+        }),
+      );
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'EcrPushWeb',
+          actions: [
+            'ecr:BatchCheckLayerAvailability',
+            'ecr:CompleteLayerUpload',
+            'ecr:InitiateLayerUpload',
+            'ecr:PutImage',
+            'ecr:UploadLayerPart',
+            'ecr:BatchGetImage',
+            'ecr:GetDownloadUrlForLayer',
+            'ecr:DescribeImages',
+            'ecr:DescribeImageScanFindings',
+          ],
+          resources: [webRepoArn],
+        }),
+      );
+      // Sync the widget bundle to S3.
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'SyncWidgetBucket',
+          actions: ['s3:PutObject', 's3:DeleteObject', 's3:GetObject', 's3:ListBucket'],
+          resources: [widgetBucketArn, `${widgetBucketArn}/*`],
+        }),
+      );
+      // Invalidate CloudFront (id unknown at synth; CreateInvalidation is low-risk).
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'InvalidateCdn',
+          actions: ['cloudfront:CreateInvalidation', 'cloudfront:GetInvalidation', 'cloudfront:ListDistributions'],
+          resources: ['*'],
+        }),
+      );
+      // Roll the web ECS service (force-new-deployment on :latest). ECS service ARNs
+      // are name-generated, so scope by region condition like the backend role.
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'RollWebService',
+          actions: ['ecs:UpdateService', 'ecs:DescribeServices', 'ecs:DescribeTasks', 'ecs:ListTasks', 'ecs:ListServices'],
+          resources: ['*'],
+          conditions: { StringEquals: { 'aws:RequestedRegion': region } },
+        }),
+      );
+      // PassRole for the web task + execution roles when registering task defs.
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'PassWebTaskRoles',
+          actions: ['iam:PassRole'],
+          resources: [`arn:aws:iam::${account}:role/Luciel-${envConfig.envName}-Web-*`],
+        }),
+      );
+      // Parity with the backend role: allow assuming CDK bootstrap roles + reading
+      // stack exports, in case the frontend CI runs `cdk deploy` for the web/widget
+      // stacks rather than a force-new-deployment rollout.
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'AssumeCdkRoles',
+          actions: ['sts:AssumeRole'],
+          resources: [`arn:aws:iam::${account}:role/cdk-*`],
+        }),
+      );
+      this.frontendDeployRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'CfnExports',
+          actions: ['cloudformation:ListExports', 'cloudformation:DescribeStacks'],
+          resources: ['*'],
+        }),
+      );
+    }
   }
 }

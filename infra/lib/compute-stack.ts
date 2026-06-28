@@ -21,8 +21,11 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { EnvConfig } from './env-config';
+import { EnvConfig, DOMAINS } from './env-config';
 
 export interface ComputeStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -36,6 +39,15 @@ export interface ComputeStackProps extends StackProps {
   readonly platformSecretArn: string;
   /** Path to the backend repo (contains the Dockerfile). */
   readonly backendPath: string;
+  /**
+   * Regional (ca-central-1) ACM cert for api.vantagemind.ai (from DnsStack). When
+   * provided, an HTTPS:443 listener is added to the ALB and an api.vantagemind.ai
+   * ALIAS record points at it. Optional so the stack still synthesizes standalone
+   * (e.g. unit tests) before DNS is wired.
+   */
+  readonly apiCert?: acm.ICertificate;
+  /** Existing hosted zone for the api ALIAS record (from DnsStack). */
+  readonly hostedZone?: route53.IHostedZone;
 }
 
 export class ComputeStack extends Stack {
@@ -44,7 +56,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, knowledgeBucket, dbSecretArn, platformSecretArn, backendPath } =
+    const { envConfig, vpc, cmkArn, knowledgeBucket, dbSecretArn, platformSecretArn, backendPath, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -184,11 +196,15 @@ export class ComputeStack extends Stack {
       return td;
     };
 
+    // Cheap-idle pause (§ pause/resume): desiredCount 0 across the env when paused.
+    const dataCount = envConfig.paused ? 0 : envConfig.multiAz ? 2 : 1;
+    const controlCount = envConfig.paused ? 0 : 1;
+
     // Data plane behind the ALB (public ingress: widget, channels).
     const dataService = new ecs.FargateService(this, 'DataPlane', {
       cluster: this.cluster,
       taskDefinition: makeTaskDef('data-plane'),
-      desiredCount: envConfig.multiAz ? 2 : 1,
+      desiredCount: dataCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
@@ -197,7 +213,7 @@ export class ComputeStack extends Stack {
     new ecs.FargateService(this, 'ControlPlane', {
       cluster: this.cluster,
       taskDefinition: makeTaskDef('control-plane'),
-      desiredCount: 1,
+      desiredCount: controlCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
@@ -250,5 +266,38 @@ export class ComputeStack extends Stack {
       targets: [dataService],
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
     });
+
+    // HTTPS:443 with the api.vantagemind.ai cert (spec §1: add the HTTPS listener to
+    // the EXISTING ALB; keep the existing HTTP routing above). Only wired when DNS
+    // has provided the regional cert. Forwards to the same data plane on 8000.
+    if (apiCert) {
+      const https = this.alb.addListener('Https', {
+        port: 443,
+        open: true,
+        certificates: [apiCert],
+      });
+      https.addTargets('DataPlaneTargetsHttps', {
+        port: 8000,
+        targets: [dataService],
+        healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
+      });
+    }
+
+    // api.vantagemind.ai -> this ALB (A + AAAA ALIAS). Zone already exists (spec §1).
+    if (hostedZone) {
+      const albTarget = route53.RecordTarget.fromAlias(
+        new route53targets.LoadBalancerTarget(this.alb),
+      );
+      new route53.ARecord(this, 'ApiA', {
+        zone: hostedZone,
+        recordName: DOMAINS.api,
+        target: albTarget,
+      });
+      new route53.AaaaRecord(this, 'ApiAaaa', {
+        zone: hostedZone,
+        recordName: DOMAINS.api,
+        target: albTarget,
+      });
+    }
   }
 }
