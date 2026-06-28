@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Run the one-off DB migration ECS task and wait for it to finish (DEVOPS §5.3/§5.9).
-# Invoked by the deploy pipeline AFTER the Compute stack is deployed. Pulls cluster,
-# task def, subnets, and SG from the deployed CloudFormation stacks.
+# Run the one-off DB migration ECS task and wait for it (DEVOPS §5.3/§5.9).
+# Reuses the EXACT network config (subnets + security group) of the running
+# data-plane service, so the migration task has the same SM/NAT reachability the
+# app already proved. Hand-rolling subnet/SG discovery was unreliable (tasks
+# timed out reaching Secrets Manager); copying the proven config is robust.
 set -euo pipefail
 ENVIRONMENT="${1:-dev}"
 REGION="${AWS_REGION:-ca-central-1}"
@@ -12,21 +14,26 @@ cluster=$(aws cloudformation list-exports --region "$REGION" \
 taskdef=$(aws cloudformation list-exports --region "$REGION" \
   --query "Exports[?Name=='${PREFIX}-MigrationTaskArn'].Value" --output text)
 
-# App-tier private subnets + SG from the networking/compute stacks.
-subnets=$(aws ec2 describe-subnets --region "$REGION" \
-  --filters "Name=tag:aws-cdk:subnet-name,Values=app" "Name=vpc-id,Values=$(
-    aws ec2 describe-vpcs --region "$REGION" --filters "Name=tag:Name,Values=${PREFIX}-Networking/Vpc" --query 'Vpcs[0].VpcId' --output text)" \
-  --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+# Pull subnets + SG from a running service in the cluster (the data plane).
+svc=$(aws ecs list-services --region "$REGION" --cluster "$cluster" \
+  --query 'serviceArns[0]' --output text)
+netcfg=$(aws ecs describe-services --region "$REGION" --cluster "$cluster" --services "$svc" \
+  --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
+subnets=$(echo "$netcfg" | python3 -c "import sys,json;print(','.join(json.load(sys.stdin)['subnets']))")
+sgs=$(echo "$netcfg" | python3 -c "import sys,json;print(','.join(json.load(sys.stdin)['securityGroups']))")
 
 echo "[run-migration] cluster=$cluster taskdef=$taskdef"
+echo "[run-migration] subnets=$subnets sg=$sgs"
 arn=$(aws ecs run-task --region "$REGION" --cluster "$cluster" \
   --task-definition "$taskdef" --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$subnets],assignPublicIp=DISABLED}" \
+  --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$sgs],assignPublicIp=DISABLED}" \
   --query 'tasks[0].taskArn' --output text)
 echo "[run-migration] started $arn ; waiting..."
 aws ecs wait tasks-stopped --region "$REGION" --cluster "$cluster" --tasks "$arn"
 
 code=$(aws ecs describe-tasks --region "$REGION" --cluster "$cluster" --tasks "$arn" \
   --query 'tasks[0].containers[0].exitCode' --output text)
-echo "[run-migration] exit code: $code"
-[ "$code" = "0" ] || { echo "::error::migration task failed (exit $code)"; exit 1; }
+reason=$(aws ecs describe-tasks --region "$REGION" --cluster "$cluster" --tasks "$arn" \
+  --query 'tasks[0].stoppedReason' --output text)
+echo "[run-migration] exit code: $code ; reason: $reason"
+[ "$code" = "0" ] || { echo "::error::migration task failed (exit $code; $reason)"; exit 1; }

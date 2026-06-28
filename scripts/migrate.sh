@@ -11,6 +11,27 @@
 #   APP_PASSWORD                         - password to set for luciel_app
 set -euo pipefail
 
+# The task injects the RDS master secret as LUCIEL_DB_SECRET (JSON blob with
+# host/port/username/password/dbname). Parse it into PG* vars. The app-role
+# password is derived deterministically from the master secret (a stable secret
+# not stored elsewhere) so bootstrap and the app agree without a separate secret.
+eval "$(python3 - <<'PY'
+import json, os, hashlib
+s = json.loads(os.environ["LUCIEL_DB_SECRET"])
+host = s["host"]; port = s.get("port", 5432)
+user = s["username"]; pw = s["password"]
+db = s.get("dbname") or "luciel"
+# Deterministic app password derived from the master password (not logged).
+app_pw = hashlib.sha256(("luciel_app:" + pw).encode()).hexdigest()[:32]
+print(f'export PGHOST={host!r}')
+print(f'export PGPORT={port}')
+print(f'export MASTER_USER={user!r}')
+print(f'export MASTER_PASSWORD={pw!r}')
+print(f'export PGDATABASE={db!r}')
+print(f'export APP_PASSWORD={app_pw!r}')
+PY
+)"
+
 export PGPASSWORD="$MASTER_PASSWORD"
 PSQL="psql -h $PGHOST -p ${PGPORT:-5432} -U $MASTER_USER -d $PGDATABASE -v ON_ERROR_STOP=1"
 

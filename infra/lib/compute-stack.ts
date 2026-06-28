@@ -162,6 +162,9 @@ export class ComputeStack extends Stack {
       );
       td.addContainer(`${name}Container`, {
         image: containerImage,
+        // Entrypoint builds the luciel_app (non-superuser) DB URL from the secret
+        // so RLS binds, then execs uvicorn.
+        command: ['bash', 'scripts/app-entrypoint.sh'],
         logging: ecs.LogDrivers.awsLogs({ streamPrefix: `luciel-${name}` }),
         environment: {
           LUCIEL_ENV: envConfig.envName,
