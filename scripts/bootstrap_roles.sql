@@ -43,3 +43,11 @@ END $$;
 GRANT luciel_auth TO luciel_app;
 -- NB: luciel_audit_owner is NOT granted to luciel_app — that non-membership is
 -- the security property. Do not add `GRANT luciel_audit_owner TO luciel_app`.
+
+-- Cloud deploys (Phase B) inject a real generated password via -v app_password=...
+-- so the well-known dev password 'luciel_dev_pw' is NEVER used outside local dev.
+-- Local/CI runs that don't pass the var keep the dev default (psql substitutes the
+-- fallback). This keeps the local docker loop unchanged while making cloud secure.
+\if :{?app_password}
+  ALTER ROLE luciel_app PASSWORD :'app_password';
+\endif
