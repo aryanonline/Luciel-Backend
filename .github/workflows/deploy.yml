@@ -1,0 +1,86 @@
+name: deploy
+
+# CD pipeline (DEVOPS §5.8). Build+scan image -> push ECR -> run migrations as a
+# one-off ECS task INSIDE the VPC (RDS is private) -> deploy Compute/Edge/Observability
+# via the OIDC deploy role (no static keys; INFRA-SEC-01 fix).
+# Promotion: dev on push to main; staging/prod via workflow_dispatch behind GitHub
+# Environment protection rules (manual approval gate configured on the repo).
+
+# NOTE: manual-dispatch only (no push trigger) so merging to main registers the
+# workflow WITHOUT auto-deploying. The first dev deploy is triggered deliberately
+# after merge; a push trigger can be added once the pipeline is proven.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ca-central-1
+  ACCOUNT: '729005488042'
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::729005488042:role/luciel-${{ env.ENVIRONMENT }}-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, scan, push image
+        env:
+          ECR: ${{ steps.ecr.outputs.registry }}
+          REPO: luciel-backend-${{ env.ENVIRONMENT }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR/$REPO:$TAG" -t "$ECR/$REPO:latest" .
+          docker push "$ECR/$REPO:$TAG"
+          docker push "$ECR/$REPO:latest"
+          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
+          CRIT=$(aws ecr describe-image-scan-findings --repository-name "$REPO" \
+            --image-id imageTag="$TAG" \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text 2>/dev/null || echo None)
+          if [ "$CRIT" != "None" ] && [ "$CRIT" != "0" ]; then
+            echo "::error::$CRIT CRITICAL CVEs in image - blocking deploy"; exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Deploy infra stacks (Compute/Edge/Observability) with the built image
+        working-directory: infra
+        run: |
+          npm ci
+          npx cdk deploy "Luciel-${ENVIRONMENT}-Compute" "Luciel-${ENVIRONMENT}-Edge" \
+            "Luciel-${ENVIRONMENT}-Observability" \
+            -c env=$ENVIRONMENT -c buildImage=true --require-approval never
+
+      - name: Run DB migrations as a one-off ECS task (inside the VPC)
+        run: |
+          # The Compute stack publishes the cluster + a migration task definition.
+          # We run scripts/migrate.sh once: bootstrap roles (master) -> alembic ->
+          # audit-log lock (master). The task pulls master creds + app password from
+          # Secrets Manager via its task role.
+          bash scripts/run-migration-task.sh "$ENVIRONMENT"
