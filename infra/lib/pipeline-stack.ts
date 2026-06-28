@@ -69,8 +69,15 @@ export class PipelineStack extends Stack {
       description: 'GitHub Actions OIDC deploy role (assumed by CI; no static keys).',
     });
 
-    // Push to ECR + read CDK bootstrap roles to run cdk deploy.
+    // Push to ECR + read scan findings (CVE gate) + read CDK bootstrap roles.
     this.ecrRepo.grantPullPush(this.deployRole);
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EcrScanFindings',
+        actions: ['ecr:DescribeImageScanFindings', 'ecr:DescribeImages'],
+        resources: [this.ecrRepo.repositoryArn],
+      }),
+    );
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'AssumeCdkRoles',

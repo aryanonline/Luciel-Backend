@@ -88,6 +88,22 @@ export class ComputeStack extends Stack {
           new ecr_assets.DockerImageAsset(this, 'BackendImage', {
             directory: backendPath,
             platform: ecr_assets.Platform.LINUX_AMD64,
+            // CRITICAL: exclude the infra dir + its cdk.out from the asset source.
+            // The backend root CONTAINS infra/, so without this the asset staging
+            // recurses into infra/cdk.out (its own output) -> ENAMETOOLONG. Also
+            // trims the build context. Mirrors .dockerignore.
+            exclude: [
+              'infra',
+              '.git',
+              '.github',
+              '.venv',
+              'node_modules',
+              'tests',
+              '**/__pycache__',
+              '.pytest_cache',
+              '.ruff_cache',
+              '.mypy_cache',
+            ],
           }),
         )
       : ecs.ContainerImage.fromRegistry('public.ecr.aws/docker/library/python:3.12-slim');
