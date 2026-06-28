@@ -60,3 +60,9 @@ GRANT luciel_auth TO luciel_app;
 GRANT CREATE, USAGE ON SCHEMA public TO luciel_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO luciel_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO luciel_app;
+-- Migrations reassign object ownership to luciel_auth (e.g. ALTER FUNCTION ... OWNER
+-- TO luciel_auth). A role can only assign ownership to a role it belongs to AND on a
+-- schema it owns. Make luciel_app own the public schema (this is a dedicated
+-- single-platform DB) so it can create objects and reassign their ownership. Run as
+-- master/owner.
+ALTER SCHEMA public OWNER TO luciel_app;
