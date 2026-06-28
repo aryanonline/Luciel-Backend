@@ -35,6 +35,12 @@ dependencies = [
     "python-multipart>=0.0.20",
     "httpx>=0.28",
     "stripe>=11.4",
+    # Live LLM cutover (gated behind LUCIEL_INTEGRATION_MODE=live). Imported lazily
+    # in app/runtime/providers.py and app/connections/secrets.py so mock-mode/CI
+    # never touches them at runtime, but they ship in the image for the flip.
+    "anthropic>=0.40",
+    "openai>=1.55",
+    "boto3>=1.35",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +53,9 @@ dev = [
     "pip-audit>=2.7",
     "detect-secrets>=1.5",
     "types-redis",
+    # Hermetic test doubles for the live cutover: fakeredis for the Redis cap store,
+    # botocore Stubber (ships with boto3) for SecretsManagerStore. No AWS, no Redis.
+    "fakeredis>=2.20",
 ]
 
 [tool.ruff]

@@ -39,10 +39,9 @@ from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.runtime import budget
 from app.runtime.knowledge_retrieval import make_retriever
-from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
+from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import resolve_or_open_session
-from app.runtime.testing import EchoModel
 from app.schemas_api.widget import (
     WidgetBootstrapOut,
     WidgetBootstrapRequest,
@@ -200,15 +199,17 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
 
         # Arc 16 binds the production hybrid retriever (vector + intent-gated graph,
         # §3.2.1) behind the orchestrator's injected seam — closing the Arc 14/14b empty
-        # "Arc 11/16" stub. The LLM router stays the deterministic EchoModel (no external
-        # keys in this plane, §3.4.3); retrieval is now real over the tenant's ingested
-        # knowledge. Content flows through wrap_untrusted in the loop (§3.4.14).
+        # "Arc 11/16" stub. Retrieval is real over the tenant's ingested knowledge.
+        # Content flows through wrap_untrusted in the loop (§3.4.14).
         retriever = make_retriever(s, admin_id=ctx.admin_id, instance_id=ctx.instance_id)
 
-        echo = EchoModel(confidence=0.9)
+        # LLM router is mode-aware (GATE 2 cutover, §3.4.3): mock (default) returns the
+        # deterministic EchoModel exactly as before; live binds the real Anthropic/
+        # OpenAI providers from the platform secret. admin_id flows through so the
+        # per-tenant LLM cap applies (§9 C9).
         orch = Orchestrator(
             session=s,
-            router=LLMRouter(primary=echo, fallback=echo),
+            router=build_llm_router(admin_id=ctx.admin_id),
             retriever=retriever,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,

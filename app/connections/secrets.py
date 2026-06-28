@@ -12,15 +12,16 @@ The ``secret_ref`` convention mirrors the §3.8.3 tenant-isolation path
 backend — a request for another tenant's secret targets a path outside the
 requesting tenant's IAM boundary (§3.8.3 rule 5).
 
-AWS-DEFERRED SEAM (binds later on explicit owner approval): the real
-``SecretsManagerStore`` (boto3 + KMS-encrypted, least-privilege IAM per §3.8.3
-rules 2–3) implements this same Protocol. NO boto3 / real Secrets Manager call is
-made in this arc — the owner instruction is "local fully-tested system first, infra
-on explicit approval." Tests use :class:`LocalSecretStore`.
+AWS SEAM (GATE 2 cutover): the real ``SecretsManagerStore`` (boto3 + KMS-encrypted,
+least-privilege IAM per §3.8.3 rules 2–3) implements this same Protocol and is bound
+by ``get_secret_store`` ONLY when ``integration_mode == "live"``. The default
+(``mock``) mode and all tests continue to use :class:`LocalSecretStore`; boto3 is
+imported lazily so CI (no AWS) imports this module cleanly and makes no AWS call.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import uuid
 from typing import Protocol, runtime_checkable
@@ -85,15 +86,82 @@ class LocalSecretStore:
             cls._store.clear()
 
 
+class SecretsManagerStore:
+    """AWS Secrets Manager backend implementing the ``SecretStore`` Protocol (§3.8.3).
+
+    Binds the real backend behind the same Protocol ``LocalSecretStore`` satisfies, so
+    the connect flow / health worker / revoke path are unchanged. Material is stored as
+    a JSON ``SecretString`` per ``secret_ref``; KMS encryption is handled by the
+    secret's own associated key (§3.8.3 rules 2–3) — no explicit KMS API call is made.
+    The ``secret_ref`` path convention (``vm/{admin_id}/{instance_id}/{type}``) doubles
+    as the secret name so least-privilege IAM scopes to a tenant prefix (§3.8.3 rule 5).
+
+    boto3 is imported LAZILY so CI (no AWS, boto3 may be absent) still imports this
+    module and runs the LocalSecretStore tests. Only selected in ``live`` mode by
+    ``get_secret_store``; never the default."""
+
+    def __init__(self, *, region_name: str) -> None:
+        self._region_name = region_name
+        self._client: object | None = None
+
+    def _get_client(self) -> object:
+        if self._client is None:
+            import boto3  # noqa: PLC0415 — lazy/guarded import (CI has no AWS)
+
+            self._client = boto3.client("secretsmanager", region_name=self._region_name)
+        return self._client
+
+    async def put(self, secret_ref: str, material: dict[str, str]) -> None:
+        client = self._get_client()
+        payload = json.dumps(dict(material))
+        # Create-or-update: PutSecretValue requires the secret to exist, so create on
+        # first write and fall back to a value update on subsequent writes.
+        try:
+            client.create_secret(Name=secret_ref, SecretString=payload)  # type: ignore[attr-defined]
+        except client.exceptions.ResourceExistsException:  # type: ignore[attr-defined]
+            client.put_secret_value(SecretId=secret_ref, SecretString=payload)  # type: ignore[attr-defined]
+
+    async def get(self, secret_ref: str) -> dict[str, str] | None:
+        client = self._get_client()
+        try:
+            resp = client.get_secret_value(SecretId=secret_ref)  # type: ignore[attr-defined]
+        except client.exceptions.ResourceNotFoundException:  # type: ignore[attr-defined]
+            return None
+        raw = resp.get("SecretString")
+        if raw is None:
+            return None
+        decoded = json.loads(raw)
+        return {str(k): str(v) for k, v in decoded.items()}
+
+    async def delete(self, secret_ref: str) -> bool:
+        client = self._get_client()
+        try:
+            client.delete_secret(  # type: ignore[attr-defined]
+                SecretId=secret_ref, ForceDeleteWithoutRecovery=True
+            )
+        except client.exceptions.ResourceNotFoundException:  # type: ignore[attr-defined]
+            # Idempotent revoke: deleting an absent ref returns False, not an error
+            # (§3.6.3 cleanup pattern — a revoke that runs twice must not fault).
+            return False
+        return True
+
+
 _default: SecretStore | None = None
 
 
 def get_secret_store() -> SecretStore:
     """Return the bound SecretStore. Defaults to the local backend (§3.8.3).
 
-    Production swaps in ``SecretsManagerStore`` behind this same seam, on explicit
-    owner approval — the connect flow / worker depend only on the Protocol."""
+    In ``live`` integration mode this binds the AWS ``SecretsManagerStore``; in every
+    other mode (the default ``mock``) it stays ``LocalSecretStore`` so all existing
+    tests are unaffected. The connect flow / worker depend only on the Protocol."""
     global _default
     if _default is None:
-        _default = LocalSecretStore()
+        from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
+
+        settings = get_settings()
+        if settings.integration_mode == "live":
+            _default = SecretsManagerStore(region_name=settings.aws_region)
+        else:
+            _default = LocalSecretStore()
     return _default

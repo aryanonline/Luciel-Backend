@@ -7,10 +7,14 @@ Postgres. The values here are process/runtime config read from the environment.
 
 from __future__ import annotations
 
+import json
+import logging
 from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -63,6 +67,66 @@ class Settings(BaseSettings):
     export_link_ttl_days: int = 7
 
     environment: str = "development"
+
+    # --- LLM integration mode (GATE 2 cutover — Architecture §3.4.3) ---------
+    # The single runtime gate between the deterministic EchoModel plane and the
+    # real Anthropic/OpenAI providers. "mock" (the default) preserves the exact
+    # pre-cutover behavior: EchoModel primary + fallback, no external keys, no
+    # network. An operator flips this to "live" ONLY after the platform secret is
+    # populated and the DPA/no-training terms are confirmed. Read from
+    # LUCIEL_INTEGRATION_MODE (ECS injects it; currently "mock").
+    integration_mode: str = "mock"
+
+    # JSON blob injected from AWS Secrets Manager (LUCIEL_PLATFORM_SECRET). In
+    # "mock" mode this stays the empty-object placeholder "{}" and is never read.
+    # In "live" mode it carries the platform LLM keys (ANTHROPIC_API_KEY,
+    # OPENAI_API_KEY, ...). Parsed at runtime by ``parse_platform_secret``; the
+    # parsed values are NEVER logged (Space Instructions §3.4 / §3.8.3).
+    platform_secret: str = "{}"  # noqa: S105 — placeholder JSON, not a secret literal
+
+    # AWS region for the live SecretsManagerStore backend (§3.8.3).
+    # Defaults to ca-central-1: residency lock (DEVOPS §2.1, LD 21) — a missing env
+    # must never point the secret backend out of region.
+    aws_region: str = "ca-central-1"
+
+    # --- LLM model IDs (platform-controlled, §7 #11 — single source of truth) --
+    # Centralized here so the cutover changes model selection in ONE place and an
+    # admin can never set the model (§7 #11). Founder-confirmed production IDs
+    # (first-party Anthropic/OpenAI API, matching the keys in Secrets Manager):
+    #   primary  = Claude Sonnet 4.6  ($3/$15 per MTok) — the "competent employee" default
+    #   fast     = Claude Haiku 4.5   ($1/$5)  — intra-session no-tools/<4K-ctx routing
+    #   fallback = GPT-5.4            ($2.50/$15) — used only on primary failover
+    # Override via env (LUCIEL_LLM_*) without a code change.
+    llm_anthropic_primary_model: str = "claude-sonnet-4-6"
+    llm_anthropic_fast_model: str = "claude-haiku-4-5"
+    llm_openai_fallback_model: str = "gpt-5.4"
+
+    # Upper bound on generated tokens per LLM call (platform cost control).
+    llm_max_output_tokens: int = 1024
+
+
+def parse_platform_secret(raw: str) -> dict[str, str]:
+    """Parse the LUCIEL_PLATFORM_SECRET JSON blob into a flat str->str mapping.
+
+    The blob is injected from AWS Secrets Manager and holds the platform LLM
+    keys (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY). Returns an empty dict for the
+    "{}" placeholder or any unparsable/empty input so "mock" mode never faults.
+
+    SECURITY: the parsed values are credentials — this function NEVER logs them.
+    On a parse error it logs only the failure fact, not the input (Space
+    Instructions §3.4 / Architecture §3.8.3)."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Never log ``raw`` — it may contain secret material.
+        logger.warning("LUCIEL_PLATFORM_SECRET is not valid JSON; treating as empty")
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("LUCIEL_PLATFORM_SECRET did not decode to an object; treating as empty")
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()}
 
 
 @lru_cache

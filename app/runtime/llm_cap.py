@@ -16,8 +16,11 @@ the in-memory fallback here is exercisable without Redis and is the test/CI impl
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 # Default: 50 LLM calls per admin_id per 60-second window (Architecture §9 C9).
 LLM_CAP_PER_MINUTE: int = 50
@@ -68,15 +71,95 @@ class InMemoryLLMCapStore:
         return sum(1 for ts in calls if ts >= window_start)
 
 
-_store: InMemoryLLMCapStore | None = None
+class RedisLLMCapStore:
+    """Redis-backed per-admin_id LLM cap (production backend, Architecture §9 C9).
+
+    Mirrors ``InMemoryLLMCapStore``'s interface (``admit``, ``current_count``) using a
+    fixed 60-second key per admin_id: ``INCR`` the counter then ``EXPIRE`` it on first
+    touch. This is the per-minute window the module docstring describes — a strict cap,
+    not a refillable bucket. Redis is shared across tasks/containers so the cap holds
+    platform-wide (the in-memory store only counts within one process).
+
+    GRACEFUL DEGRADATION (cost-control doctrine, §9 C9 / §4.6): the cap is a cost/abuse
+    control, so failing OPEN (removing the cap) on a Redis outage is NOT acceptable —
+    one tenant could then monopolize the platform keys. But a Redis outage must not
+    drop ALL traffic either. So on any Redis error we log and fall back to a
+    process-local ``InMemoryLLMCapStore`` (per-task counting). The cap stays in force,
+    degraded to per-process granularity until Redis recovers.
+
+    The redis client is injected (tests pass fakeredis); ``redis`` itself is imported
+    lazily only in ``get_llm_cap_store`` so CI imports this module without redis."""
+
+    def __init__(self, client: object) -> None:
+        self._client = client
+        # Per-process fallback used only while Redis is unreachable (degraded mode).
+        self._fallback = InMemoryLLMCapStore()
+
+    @staticmethod
+    def _key(admin_id: str) -> str:
+        return f"llmcap:{admin_id}"
+
+    def admit(self, admin_id: str, *, cap: int = LLM_CAP_PER_MINUTE) -> bool:
+        key = self._key(admin_id)
+        try:
+            count = int(self._client.incr(key))  # type: ignore[attr-defined]
+            if count == 1:
+                # First call in this window — start the 60s expiry.
+                self._client.expire(key, int(LLM_CAP_WINDOW_SECONDS))  # type: ignore[attr-defined]
+            return count <= cap
+        except Exception:  # noqa: BLE001 — any redis error → degrade, never fail open
+            logger.warning(
+                "LLM cap Redis unavailable; degrading to in-memory per-process counting",
+                exc_info=True,
+            )
+            return self._fallback.admit(admin_id, cap=cap)
+
+    def current_count(self, admin_id: str) -> int:
+        try:
+            raw = self._client.get(self._key(admin_id))  # type: ignore[attr-defined]
+            return int(raw) if raw is not None else 0
+        except Exception:  # noqa: BLE001 — observability only; degrade quietly
+            logger.warning("LLM cap Redis unavailable for current_count", exc_info=True)
+            return self._fallback.current_count(admin_id)
 
 
-def get_llm_cap_store() -> InMemoryLLMCapStore:
-    """Return the process-global LLM cap store (in-memory; Redis swaps in for prod)."""
+_store: InMemoryLLMCapStore | RedisLLMCapStore | None = None
+
+
+def get_llm_cap_store() -> InMemoryLLMCapStore | RedisLLMCapStore:
+    """Return the process-global LLM cap store.
+
+    In ``live`` mode (and only if redis is importable + reachable) this binds the
+    ``RedisLLMCapStore`` so the cap holds platform-wide. In every other mode (the
+    default ``mock``) it stays ``InMemoryLLMCapStore`` — the CI/test default. If redis
+    cannot be reached at bind time in live mode, we log and stay in-memory rather than
+    dropping the cap (graceful degradation, see ``RedisLLMCapStore``)."""
     global _store
     if _store is None:
-        _store = InMemoryLLMCapStore()
+        from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
+
+        settings = get_settings()
+        if settings.integration_mode == "live":
+            _store = _build_redis_store(settings.redis_url) or InMemoryLLMCapStore()
+        else:
+            _store = InMemoryLLMCapStore()
     return _store
+
+
+def _build_redis_store(redis_url: str) -> RedisLLMCapStore | None:
+    """Build a RedisLLMCapStore, or None if redis is unavailable at bind time."""
+    try:
+        import redis  # noqa: PLC0415 — lazy/guarded import (CI has no redis)
+
+        client = redis.Redis.from_url(redis_url, decode_responses=True)
+        client.ping()
+        return RedisLLMCapStore(client)
+    except Exception:  # noqa: BLE001 — redis missing/unreachable → degrade to in-memory
+        logger.warning(
+            "LLM cap: redis unavailable at bind time; using in-memory cap (degraded)",
+            exc_info=True,
+        )
+        return None
 
 
 def admit_llm_call(admin_id: uuid.UUID, *, cap: int = LLM_CAP_PER_MINUTE) -> None:
