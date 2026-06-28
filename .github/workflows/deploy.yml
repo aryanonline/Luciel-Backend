@@ -6,9 +6,10 @@ name: deploy
 # Promotion: dev on push to main; staging/prod via workflow_dispatch behind GitHub
 # Environment protection rules (manual approval gate configured on the repo).
 
+# NOTE: manual-dispatch only (no push trigger) so merging to main registers the
+# workflow WITHOUT auto-deploying. The first dev deploy is triggered deliberately
+# after merge; a push trigger can be added once the pipeline is proven.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
