@@ -32,12 +32,12 @@ print(f'export APP_PASSWORD={app_pw!r}')
 PY
 )"
 
-export PGPASSWORD="$MASTER_PASSWORD"
-PSQL="psql -h $PGHOST -p ${PGPORT:-5432} -U $MASTER_USER -d $PGDATABASE -v ON_ERROR_STOP=1"
+# SQL is executed via run_sql.py (psycopg), NOT psql, so the image needs no
+# postgresql-client (which dragged in perl + CVE-2026-12087).
+MASTER_DSN="host=$PGHOST port=${PGPORT:-5432} dbname=$PGDATABASE user=$MASTER_USER password=$MASTER_PASSWORD"
 
 echo "[migrate] 1/3 bootstrap roles (master)"
-# Pass the desired app password into the bootstrap script.
-$PSQL -v app_password="$APP_PASSWORD" -f scripts/bootstrap_roles.sql
+python3 scripts/run_sql.py --dsn "$MASTER_DSN" --file scripts/bootstrap_roles.sql --app-password "$APP_PASSWORD"
 
 echo "[migrate] 2/3 alembic upgrade head (as luciel_app)"
 export LUCIEL_DATABASE_URL_SYNC="postgresql+psycopg://luciel_app:${APP_PASSWORD}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE}"
@@ -45,6 +45,6 @@ export LUCIEL_DATABASE_URL="postgresql+asyncpg://luciel_app:${APP_PASSWORD}@${PG
 alembic upgrade head
 
 echo "[migrate] 3/3 lock audit log (master, post-migrate)"
-$PSQL -f scripts/lock_audit_log.sql
+python3 scripts/run_sql.py --dsn "$MASTER_DSN" --file scripts/lock_audit_log.sql
 
 echo "[migrate] done — schema, RLS, grants, and audit-log lock applied."

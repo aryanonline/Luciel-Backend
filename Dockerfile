@@ -19,9 +19,10 @@ RUN uv pip install --python /opt/venv/bin/python -e . "psycopg[binary]" "pydanti
 
 # --- runtime: slim, non-root ---
 FROM base AS runtime
-# postgresql-client provides psql, needed by scripts/migrate.sh (bootstrap roles
-# + audit-log lock run as SQL via psql). bash for the migrate scripts.
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client bash \
+# bash for the migrate scripts. We deliberately do NOT install postgresql-client:
+# it pulls in perl (CVE-2026-12087, CRITICAL). SQL is run via scripts/run_sql.py
+# using psycopg (already in the venv), so psql is unnecessary.
+RUN apt-get update && apt-get install -y --no-install-recommends bash \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r luciel && useradd -r -g luciel luciel
 WORKDIR /app
