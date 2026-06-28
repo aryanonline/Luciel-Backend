@@ -44,5 +44,29 @@ export class NetworkingStack extends Stack {
         { name: 'data', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 24 },
       ],
     });
+
+    // VPC endpoints so private ECS tasks reach AWS APIs reliably WITHOUT depending
+    // on NAT (fixes the migration task's 'context deadline exceeded' to Secrets
+    // Manager). Interface endpoints for SM/ECR/Logs/STS; S3 gateway endpoint for
+    // ECR layer pulls. More reliable, more secure, and cheaper than routing this
+    // traffic through NAT.
+    const interfaceEndpoints: Record<string, ec2.InterfaceVpcEndpointAwsService> = {
+      SecretsManager: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+      EcrApi: ec2.InterfaceVpcEndpointAwsService.ECR,
+      EcrDkr: ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+      CwLogs: ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
+      Sts: ec2.InterfaceVpcEndpointAwsService.STS,
+    };
+    for (const [id, service] of Object.entries(interfaceEndpoints)) {
+      this.vpc.addInterfaceEndpoint(id, {
+        service,
+        subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        privateDnsEnabled: true,
+      });
+    }
+    // S3 gateway endpoint (ECR image layers live in S3).
+    this.vpc.addGatewayEndpoint('S3', {
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+    });
   }
 }

@@ -51,3 +51,12 @@ GRANT luciel_auth TO luciel_app;
 \if :{?app_password}
   ALTER ROLE luciel_app PASSWORD :'app_password';
 \endif
+
+-- Postgres 15+ revokes CREATE on the public schema from non-owner roles by default,
+-- so on RDS the app role cannot create tables (alembic fails: 'permission denied for
+-- schema public'). Grant the app role create+usage on public and make future objects
+-- it doesn't own still usable. Run as the database owner/master (migrate.sh connects
+-- as master to the target DB before alembic runs as luciel_app).
+GRANT CREATE, USAGE ON SCHEMA public TO luciel_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO luciel_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO luciel_app;
