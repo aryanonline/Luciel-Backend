@@ -55,10 +55,14 @@ jobs:
           REPO: luciel-backend-${{ env.ENVIRONMENT }}
           TAG: ${{ github.sha }}
         run: |
-          # Tag with the immutable commit SHA only. The repo is IMMUTABLE, so a
-          # moving ':latest' tag can't be re-pushed across runs (causes exit 1).
-          docker build -t "$ECR/$REPO:$TAG" .
-          docker push "$ECR/$REPO:$TAG"
+          # Idempotent: if this commit's image is already in ECR (e.g. a re-run of
+          # the same SHA against an IMMUTABLE repo), skip build/push and reuse it.
+          if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already present - skipping build/push, reusing it."
+          else
+            docker build -t "$ECR/$REPO:$TAG" .
+            docker push "$ECR/$REPO:$TAG"
+          fi
           aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
           CRIT=$(aws ecr describe-image-scan-findings --repository-name "$REPO" \
             --image-id imageTag="$TAG" \
