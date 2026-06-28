@@ -207,6 +207,10 @@ export class ComputeStack extends Stack {
       desiredCount: dataCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // Auto-rollback on a failed deploy (DEVOPS §5.5). Without this, a deploy whose
+      // tasks never reach healthy churns for up to 3h instead of failing fast.
+      circuitBreaker: { rollback: true },
+      minHealthyPercent: 100,
     });
 
     // Control plane (admin API) - same image, separate service/role-split.
@@ -216,6 +220,8 @@ export class ComputeStack extends Stack {
       desiredCount: controlCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      circuitBreaker: { rollback: true },
+      minHealthyPercent: 100,
     });
 
     // One-off MIGRATION task definition (run by the pipeline before app deploy).
@@ -261,7 +267,13 @@ export class ComputeStack extends Stack {
       internetFacing: true,
     });
     const listener = this.alb.addListener('Http', { port: 80, open: true });
-    listener.addTargets('DataPlaneTargets', {
+    // ONE target group for the data plane, shared by both the HTTP and HTTPS
+    // listeners. Registering a single-task dev service into two separate target
+    // groups made the rolling deployment unable to satisfy minHealthy across both
+    // groups, causing an endless register/drain loop (the service never reached
+    // steady state and the CFN update hung). One TG + multiple listeners forwarding
+    // to it is the correct ALB pattern.
+    const dataPlaneTg = listener.addTargets('DataPlaneTargets', {
       port: 8000,
       targets: [dataService],
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
@@ -269,18 +281,18 @@ export class ComputeStack extends Stack {
 
     // HTTPS:443 with the api.vantagemind.ai cert (spec §1: add the HTTPS listener to
     // the EXISTING ALB; keep the existing HTTP routing above). Only wired when DNS
-    // has provided the regional cert. Forwards to the same data plane on 8000.
+    // has provided the regional cert. Forwards to the SAME data-plane target group
+    // (no second TG — see the comment above).
     if (apiCert) {
       const https = this.alb.addListener('Https', {
         port: 443,
         open: true,
         certificates: [apiCert],
+        defaultTargetGroups: [dataPlaneTg],
       });
-      https.addTargets('DataPlaneTargetsHttps', {
-        port: 8000,
-        targets: [dataService],
-        healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
-      });
+      // Reference https to satisfy no-unused; the listener is attached to the ALB
+      // by construction above.
+      void https;
     }
 
     // api.vantagemind.ai -> this ALB (A + AAAA ALIAS). Zone already exists (spec §1).
