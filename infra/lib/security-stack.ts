@@ -9,6 +9,7 @@
 import { Stack, StackProps, RemovalPolicy, Duration } from 'aws-cdk-lib';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import { EnvConfig } from './env-config';
 
@@ -33,6 +34,26 @@ export class SecurityStack extends Stack {
       pendingWindow: Duration.days(envConfig.envName === 'prod' ? 30 : 7),
     });
     this.cmk.addAlias(`alias/luciel-${envConfig.envName}`);
+
+    // Allow this account's IAM principals to use the key for decrypt ONLY via
+    // Secrets Manager (the kms:ViaService guard). This lets the ECS execution role
+    // resolve KMS-encrypted secrets at task startup without a cross-stack grant
+    // (which would create a Security<->Compute dependency cycle). Without this the
+    // task fails: 'unable to retrieve secret ... AccessDeniedException: Access to
+    // KMS is not allowed'. Scoped to SecretsManager so it is not a blanket grant.
+    this.cmk.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowDecryptViaSecretsManager',
+        principals: [new iam.AccountRootPrincipal()],
+        actions: ['kms:Decrypt', 'kms:DescribeKey'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: {
+            'kms:ViaService': `secretsmanager.${this.region}.amazonaws.com`,
+          },
+        },
+      }),
+    );
 
     // Platform secret placeholder. Real values are injected post-deploy via the
     // secure path (NOT committed). Generated empty so nothing sensitive is in IaC.

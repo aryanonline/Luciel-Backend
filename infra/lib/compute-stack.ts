@@ -143,6 +143,23 @@ export class ComputeStack extends Stack {
         memoryLimitMiB: envConfig.envName === 'prod' ? 2048 : 512,
         taskRole,
       });
+      // The EXECUTION role resolves `secrets:` at task startup. It needs both
+      // secret-read AND kms:Decrypt on the CMK (the secrets are CMK-encrypted).
+      // CDK can't auto-add the KMS grant because the key is imported by ARN, so we
+      // add it explicitly here. Without this: 'AccessDeniedException: Access to KMS
+      // is not allowed' and tasks never start.
+      td.addToExecutionRolePolicy(
+        new iam.PolicyStatement({
+          actions: ['kms:Decrypt', 'kms:DescribeKey'],
+          resources: [cmk.keyArn],
+        }),
+      );
+      td.addToExecutionRolePolicy(
+        new iam.PolicyStatement({
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [dbSecret.secretArn, platformSecret.secretArn],
+        }),
+      );
       td.addContainer(`${name}Container`, {
         image: containerImage,
         logging: ecs.LogDrivers.awsLogs({ streamPrefix: `luciel-${name}` }),
@@ -190,6 +207,18 @@ export class ComputeStack extends Stack {
       memoryLimitMiB: 512,
       taskRole,
     });
+    migrationTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['kms:Decrypt', 'kms:DescribeKey'],
+        resources: [cmk.keyArn],
+      }),
+    );
+    migrationTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [dbSecret.secretArn],
+      }),
+    );
     migrationTask.addContainer('MigrationContainer', {
       image: containerImage,
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-migrate' }),
