@@ -1,3 +1,13 @@
+[build-system]
+# Explicit build config so the package builds deterministically everywhere
+# (Docker/CI/local). Without this, setuptools auto-discovery fails on the
+# multi-top-level-dir layout: "Multiple top-level packages discovered".
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]
+
 [project]
 name = "luciel-backend"
 version = "0.1.0"

@@ -55,8 +55,14 @@ export class PipelineStack extends Stack {
             'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
           },
           StringLike: {
-            // Only this repo, on main or deploy/* branches, may assume.
-            'token.actions.githubusercontent.com:sub': `repo:${githubRepo}:ref:refs/heads/*`,
+            // Accept both branch-ref tokens AND environment-scoped tokens. Jobs that
+            // declare `environment:` get a sub of `repo:<repo>:environment:<env>`,
+            // not `ref:refs/heads/*` — so both forms must be allowed or OIDC assume
+            // fails with 'Not authorized to perform sts:AssumeRoleWithWebIdentity'.
+            'token.actions.githubusercontent.com:sub': [
+              `repo:${githubRepo}:ref:refs/heads/*`,
+              `repo:${githubRepo}:environment:*`,
+            ],
           },
         },
       ),
