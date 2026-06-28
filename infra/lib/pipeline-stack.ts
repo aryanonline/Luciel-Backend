@@ -107,7 +107,16 @@ export class PipelineStack extends Stack {
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'RunMigrationTask',
-        actions: ['ecs:RunTask', 'ecs:DescribeTasks', 'ecs:ListTasks'],
+        // run-migration-task.sh discovers the cluster/taskdef via CFN exports, then
+        // looks up the service (ListServices + DescribeServices) to copy its network
+        // config onto the one-off migration RunTask, waits, and reads the exit code.
+        actions: [
+          'ecs:RunTask',
+          'ecs:DescribeTasks',
+          'ecs:ListTasks',
+          'ecs:ListServices',
+          'ecs:DescribeServices',
+        ],
         resources: ['*'],
         conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
       }),
