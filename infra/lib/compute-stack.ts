@@ -95,6 +95,12 @@ export class ComputeStack extends Stack {
     // neutral placeholder so the data/networking/security stacks can be synthesized
     // and cost-reviewed independently of an image build.
     const buildImage = this.node.tryGetContext('buildImage') === 'true';
+    // GATE 2 cutover flag. Defaults to 'mock' (EchoModel, no external LLM). A
+    // deliberate `-c integrationMode=live` flips real Anthropic/OpenAI on — set per
+    // environment, so dev can go live for verification while staging/prod stay mock
+    // until their own gated cutover. The flip is an explicit deploy parameter, never
+    // a silent default (DEVOPS §6 / §2.8).
+    const integrationMode = this.node.tryGetContext('integrationMode') === 'live' ? 'live' : 'mock';
     const containerImage = buildImage
       ? ecs.ContainerImage.fromDockerImageAsset(
           new ecr_assets.DockerImageAsset(this, 'BackendImage', {
@@ -182,7 +188,7 @@ export class ComputeStack extends Stack {
           LUCIEL_ENV: envConfig.envName,
           LUCIEL_PLANE: name,
           // Integrations remain MOCK until a gated cutover flips them (GATE 2).
-          LUCIEL_INTEGRATION_MODE: 'mock',
+          LUCIEL_INTEGRATION_MODE: integrationMode,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -260,6 +266,41 @@ export class ComputeStack extends Stack {
     new cdk.CfnOutput(this, 'ClusterName', {
       value: this.cluster.clusterName,
       exportName: `Luciel-${envConfig.envName}-ClusterName`,
+    });
+
+    // VERIFY task (§10 live probe): same image, runs scripts/verify.sh as luciel_app
+    // against the live RDS to prove audit append-only, RLS, and no-secret-material on
+    // real infra. Read-only/non-destructive (its mutating attempts are expected to be
+    // REJECTED). Run via scripts/run-verify-task.sh, mirroring the migration runner.
+    const verifyTask = new ecs.FargateTaskDefinition(this, 'VerifyTask', {
+      cpu: 256,
+      memoryLimitMiB: 512,
+      taskRole,
+    });
+    verifyTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['kms:Decrypt', 'kms:DescribeKey'],
+        resources: [cmk.keyArn],
+      }),
+    );
+    verifyTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [dbSecret.secretArn],
+      }),
+    );
+    verifyTask.addContainer('VerifyContainer', {
+      image: containerImage,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-verify' }),
+      command: ['bash', 'scripts/verify.sh'],
+      secrets: {
+        LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
+      },
+      environment: { LUCIEL_ENV: envConfig.envName },
+    });
+    new cdk.CfnOutput(this, 'VerifyTaskArn', {
+      value: verifyTask.taskDefinitionArn,
+      exportName: `Luciel-${envConfig.envName}-VerifyTaskArn`,
     });
 
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
