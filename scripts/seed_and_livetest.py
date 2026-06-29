@@ -61,7 +61,9 @@ import httpx  # noqa: E402
 
 API_BASE = os.environ.get("LUCIEL_API_BASE", "https://api.vantagemind.ai").rstrip("/")
 RUN_ID = os.environ.get("LUCIEL_SEEDTEST_RUN_ID", str(int(time.time())))
-EMAIL_DOMAIN = "vantagemind-dev.invalid"
+# Synthetic but syntactically-valid domain (the signup validator rejects reserved
+# TLDs like .invalid). seed.vantagemind.ai is ours and routes nowhere real.
+EMAIL_DOMAIN = "seed.vantagemind.ai"
 PASSWORD = "Seed-" + uuid.uuid4().hex  # synthetic, per-run, never reused.
 KNOWN_FACT = "Our return window is 30 days from the date of delivery."
 GROUNDED_QUESTION = "How many days do I have to return an item?"
@@ -159,7 +161,7 @@ def login(client: httpx.Client, email: str) -> None:
 def create_luciel(client: httpx.Client, name: str) -> str:
     body = {
         "name": name,
-        "websiteUrl": "https://example.invalid",
+        "websiteUrl": "https://example.com",
         "businessOneLiner": "We sell refurbished gadgets with a friendly return policy.",
     }
     data = _check(client.post(f"{API_BASE}/api/v1/admin/luciel", json=body), "create_luciel")
