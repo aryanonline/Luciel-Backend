@@ -126,23 +126,29 @@ async def mint_verify_token(email: str) -> str:
     from app.auth.lookup import lookup_account_by_email
     from app.auth.tokens import mint_link_token
     from app.config import get_settings
+    from app.db.engine import dispose_engine
     from app.db.session import tenant_session, untenanted_session
     from app.models.instance import Account
     from sqlalchemy import select
 
-    async with untenanted_session() as s:
-        found = await lookup_account_by_email(s, email)
-    if found is None:
-        raise RuntimeError(f"account not found after signup: {email}")
-    async with tenant_session(found.account_id) as s:
-        acct = (
-            await s.execute(select(Account).where(Account.id == found.account_id))
-        ).scalar_one()
-        jti = acct.pending_verify_jti
-    if not jti:
-        raise RuntimeError("no pending_verify_jti on freshly signed-up account")
-    ttl = get_settings().verification_link_ttl_seconds
-    return mint_link_token(found.account_id, "verify", ttl, jti)
+    # Dispose the engine before returning (see _admin_id_for) so it is not reused
+    # across a later asyncio.run() loop.
+    try:
+        async with untenanted_session() as s:
+            found = await lookup_account_by_email(s, email)
+        if found is None:
+            raise RuntimeError(f"account not found after signup: {email}")
+        async with tenant_session(found.account_id) as s:
+            acct = (
+                await s.execute(select(Account).where(Account.id == found.account_id))
+            ).scalar_one()
+            jti = acct.pending_verify_jti
+        if not jti:
+            raise RuntimeError("no pending_verify_jti on freshly signed-up account")
+        ttl = get_settings().verification_link_ttl_seconds
+        return mint_link_token(found.account_id, "verify", ttl, jti)
+    finally:
+        await dispose_engine()
 
 
 def verify_email(client: httpx.Client, token: str) -> None:
@@ -336,13 +342,17 @@ async def _run_inprocess_turn(
     tool_resolver=None,
 ):
     """Open a real session for the seeded tenant and run one orchestrator turn."""
+    from app.db.engine import dispose_engine
     from app.db.session import tenant_session
     from app.models.instance import Instance
     from app.runtime.orchestrator import Orchestrator
     from app.runtime.sessions import resolve_or_open_session
     from sqlalchemy import select
 
-    async with tenant_session(admin_id) as s:
+    # This coroutine is invoked from several separate asyncio.run() blocks; dispose
+    # the global engine on exit so it is never reused across a dead event loop.
+    try:
+      async with tenant_session(admin_id) as s:
         instance_id = (
             await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
         ).scalar_one()
@@ -367,6 +377,8 @@ async def _run_inprocess_turn(
             mode=sess.mode,
             inbound_text=inbound,
         )
+    finally:
+        await dispose_engine()
 
 
 def test_failsafe_escalation(r: Results, admin_id: uuid.UUID) -> None:
@@ -538,13 +550,19 @@ def main() -> int:
 
 async def _admin_id_for(email: str) -> uuid.UUID:
     from app.auth.lookup import lookup_account_by_email
+    from app.db.engine import dispose_engine
     from app.db.session import untenanted_session
 
-    async with untenanted_session() as s:
-        found = await lookup_account_by_email(s, email)
-    if found is None:
-        raise RuntimeError(f"could not resolve admin_id for {email}")
-    return found.account_id
+    # Dispose the async engine before returning so it is never reused across a later
+    # asyncio.run() loop (otherwise SQLAlchemy raises 'attached to a different loop').
+    try:
+        async with untenanted_session() as s:
+            found = await lookup_account_by_email(s, email)
+        if found is None:
+            raise RuntimeError(f"could not resolve admin_id for {email}")
+        return found.account_id
+    finally:
+        await dispose_engine()
 
 
 if __name__ == "__main__":
