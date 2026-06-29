@@ -132,7 +132,11 @@ class OpenAIProvider:
         try:
             resp = await client.chat.completions.create(  # type: ignore[attr-defined]
                 model=self._model,
-                max_tokens=self._max_output_tokens,
+                # GPT-5.x models reject `max_tokens` and require `max_completion_tokens`
+                # (verified live: gpt-5.4 returns unsupported_parameter for max_tokens).
+                # Sending the wrong name silently breaks the FALLBACK path — the router
+                # would error instead of gracefully failing over when Anthropic is down.
+                max_completion_tokens=self._max_output_tokens,
                 messages=api_messages,
             )
         except OpenAIError as exc:
