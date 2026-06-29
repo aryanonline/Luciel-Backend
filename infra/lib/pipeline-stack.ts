@@ -212,7 +212,16 @@ export class PipelineStack extends Stack {
       this.frontendDeployRole.addToPolicy(
         new iam.PolicyStatement({
           sid: 'RollWebService',
-          actions: ['ecs:UpdateService', 'ecs:DescribeServices', 'ecs:DescribeTasks', 'ecs:ListTasks', 'ecs:ListServices'],
+          // deploy.yml discovers the web cluster via `aws ecs list-clusters` then
+          // rolls the service — ListClusters was missing, blocking the rollout.
+          actions: [
+            'ecs:ListClusters',
+            'ecs:UpdateService',
+            'ecs:DescribeServices',
+            'ecs:DescribeTasks',
+            'ecs:ListTasks',
+            'ecs:ListServices',
+          ],
           resources: ['*'],
           conditions: { StringEquals: { 'aws:RequestedRegion': region } },
         }),
