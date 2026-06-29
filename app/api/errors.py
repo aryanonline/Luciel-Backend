@@ -92,3 +92,21 @@ def register_error_handlers(app: FastAPI) -> None:
         else:
             message = "Validation failed."
         return JSONResponse(status_code=422, content={"message": message})
+
+    # Per-admin LLM concurrency cap (Architecture §9 C9 / §4.6). When a tenant is over
+    # the 50/min cap the router raises ``LLMCapExceeded`` from inside a turn. Surface it
+    # as a 429 (→ rate_limited via the frozen STATUS_TO_CODE map) so the conversation is
+    # gracefully rate-limited rather than 500-dropped. This only TRANSPORTS the existing
+    # cap to the wire — it does not change when the cap fires. Imported lazily to avoid
+    # an import cycle (errors is imported very early, llm_cap pulls in config).
+    from app.runtime.llm_cap import LLMCapExceeded  # noqa: PLC0415
+
+    @app.exception_handler(LLMCapExceeded)
+    async def _handle_llm_cap(_: Request, exc: LLMCapExceeded) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "message": "We're handling a lot of requests right now — please retry in a moment.",
+                "retryAfterSeconds": 5,
+            },
+        )

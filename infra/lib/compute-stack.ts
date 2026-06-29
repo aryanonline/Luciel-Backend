@@ -303,6 +303,49 @@ export class ComputeStack extends Stack {
       exportName: `Luciel-${envConfig.envName}-VerifyTaskArn`,
     });
 
+    // SEED + LIVE-BEHAVIOR TEST task (§10 live probe): same image, runs
+    // scripts/seed_and_livetest.py against the live API+RDS to convert §10 rows
+    // (live LLM happy path, free-cap zero-LLM/denial-of-wallet, per-admin 50/min
+    // cap, fail-safe escalation, primary→fallback failover, channel parity +
+    // AI-identity disclosure) from CI-proven to live-proven. Synthetic data only;
+    // idempotent; needs the PLATFORM secret too (live LLM keys) plus the DB secret.
+    // Run via scripts/run-seedtest-task.sh, mirroring the verify runner.
+    const seedTestTask = new ecs.FargateTaskDefinition(this, 'SeedTestTask', {
+      cpu: 256,
+      memoryLimitMiB: 512,
+      taskRole,
+    });
+    seedTestTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['kms:Decrypt', 'kms:DescribeKey'],
+        resources: [cmk.keyArn],
+      }),
+    );
+    seedTestTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [dbSecret.secretArn, platformSecret.secretArn],
+      }),
+    );
+    seedTestTask.addContainer('SeedTestContainer', {
+      image: containerImage,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-seedtest' }),
+      command: ['python3', 'scripts/seed_and_livetest.py'],
+      secrets: {
+        LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
+        LUCIEL_PLATFORM_SECRET: ecs.Secret.fromSecretsManager(platformSecret),
+      },
+      environment: {
+        LUCIEL_ENV: envConfig.envName,
+        // Same gated cutover flag as the app: 'live' exercises real Anthropic/OpenAI.
+        LUCIEL_INTEGRATION_MODE: integrationMode,
+      },
+    });
+    new cdk.CfnOutput(this, 'SeedTestTaskArn', {
+      value: seedTestTask.taskDefinitionArn,
+      exportName: `Luciel-${envConfig.envName}-SeedTestTaskArn`,
+    });
+
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,
       internetFacing: true,
