@@ -55,6 +55,19 @@ def main() -> int:
     with psycopg.connect(args.dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
+            # Surface NOTICE/WARNING messages and any final result rows as evidence
+            # (used by the §10 verify probe). psycopg exposes notices on the conn.
+            for note in getattr(conn, "notices", []) or []:
+                print(f"[run_sql:notice] {str(note).rstrip()}")
+            try:
+                if cur.description is not None:
+                    cols = [d.name for d in cur.description]
+                    rows = cur.fetchall()
+                    print(f"[run_sql:result] columns={cols}")
+                    for r in rows:
+                        print(f"[run_sql:result] {r}")
+            except psycopg.ProgrammingError:
+                pass  # last statement returned no result set
     print(f"[run_sql] applied {args.file}")
     return 0
 
