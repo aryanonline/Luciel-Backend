@@ -101,6 +101,10 @@ export class WebStack extends Stack {
       desiredCount: envConfig.paused ? 0 : baseCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // Auto-rollback on a failed deploy (DEVOPS §5.5) — same protection as the
+      // backend services (PR #17). Without it a bad/missing image churns for hours.
+      circuitBreaker: { rollback: true },
+      minHealthyPercent: 100,
     });
 
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'WebAlb', {
