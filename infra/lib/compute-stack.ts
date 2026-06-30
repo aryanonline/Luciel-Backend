@@ -102,7 +102,7 @@ export class ComputeStack extends Stack {
     const buildImage = this.node.tryGetContext('buildImage') === 'true';
     // GATE 2 cutover flag. Defaults to 'mock' (EchoModel, no external LLM). A
     // deliberate `-c integrationMode=live` flips real Anthropic/OpenAI on — set per
-    // environment, so dev can go live for verification while staging/prod stay mock
+    // environment, so dev can go live for verification while prod stays mock
     // until their own gated cutover. The flip is an explicit deploy parameter, never
     // a silent default (DEVOPS §6 / §2.8).
     const integrationMode = this.node.tryGetContext('integrationMode') === 'live' ? 'live' : 'mock';

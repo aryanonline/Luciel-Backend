@@ -3,7 +3,7 @@
  *
  * CloudWatch alarms on the load-bearing signals + log-group retention matching
  * doctrine (90d app logs; audit/trace 1yr held in the data tier, not here).
- * Alarms are fully armed in staging/prod; dev gets the groups but relaxed alarms.
+ * Alarms are fully armed in preprod/prod; dev gets the groups but relaxed alarms.
  */
 import { Stack, StackProps, Duration } from 'aws-cdk-lib';
 import * as cw from 'aws-cdk-lib/aws-cloudwatch';

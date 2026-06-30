@@ -1,8 +1,9 @@
 # Pause / Resume (cost control)
 
 Two tiers for parking an environment when it isn't needed. Region is **ca-central-1**
-(CloudFront/widget cert is global/us-east-1). Substitute `<env>` = `dev` | `staging`
-| `prod`. The OIDC deploy role / your admin profile must be assumed first.
+(CloudFront/widget cert is global/us-east-1). Substitute `<env>` = `dev`
+| `prod` (the ephemeral preprod is torn down by its release pipeline, never parked).
+The OIDC deploy role / your admin profile must be assumed first.
 
 The recurring cost split (dev): the **compute** tier (Fargate tasks + 2 ALBs + NAT)
 is the bulk and is what these tiers shed; the **data** floor (RDS instance + storage
@@ -68,7 +69,7 @@ npx cdk destroy \
   "Luciel-<env>-Edge" "Luciel-<env>-Observability" "Luciel-<env>-Compute" \
   -c env=<env> --force
 
-# (Optional, dev/staging only) drop the rest INCLUDING data. RDS takes a final
+# (Optional, dev only) drop the rest INCLUDING data. RDS takes a final
 # snapshot unless deletion is forced; dev RDS removalPolicy is DESTROY.
 npx cdk destroy "Luciel-<env>-Data" "Luciel-<env>-Networking" "Luciel-<env>-Dns" \
   "Luciel-<env>-Security" -c env=<env> --force
@@ -87,7 +88,7 @@ bash ../scripts/run-migration-task.sh <env>
 Notes:
 - **prod** RDS has `deletionProtection` + `RemovalPolicy.RETAIN` — Tier 2 will not
   silently drop prod data. Don't destroy prod data without a deliberate snapshot.
-- The widget S3 bucket retains in prod (RETAIN); dev/staging auto-delete objects.
+- The widget S3 bucket retains in prod (RETAIN); dev/preprod auto-delete objects.
 - DNS records (api/apex/embed) live in the Compute/Web/Widget stacks, so they come
   and go with those stacks. The hosted zone itself is never created or destroyed
   here (it pre-exists: `Z0203683JUDTD67YTV93`).

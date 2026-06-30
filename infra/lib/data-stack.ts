@@ -2,7 +2,7 @@
  * Data layer - RDS Postgres (pgvector) + S3 buckets (DEVOPS §5.3, Arch §4.2/§5.9).
  *
  * - RDS Postgres in PRIVATE_ISOLATED subnets (never public), KMS-encrypted,
- *   PITR/backup retention 7 days (Commitment 3), Multi-AZ in staging/prod.
+ *   PITR/backup retention 7 days (Commitment 3), Multi-AZ in preprod/prod.
  * - pgvector enabled via migrations (app/migrations), not here.
  * - The app connects as the NON-superuser, NON-BYPASSRLS `luciel_app` role
  *   (bootstrapped post-deploy) so RLS tenant isolation actually binds (LD 18).
@@ -119,7 +119,7 @@ export class DataStack extends Stack {
       cacheSubnetGroupName: `luciel-${envConfig.envName}-redis`,
     });
 
-    // Single small node for dev; staging/prod scale the node type via env if needed.
+    // Single small node for dev; preprod/prod scale the node type via env if needed.
     // At-rest encryption uses the CMK; in-transit TLS is ON (so the app uses rediss://).
     const redis = new elasticache.CfnReplicationGroup(this, 'Redis', {
       replicationGroupDescription: `Luciel ${envConfig.envName} LLM-cap Redis`,

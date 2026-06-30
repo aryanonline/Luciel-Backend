@@ -1,14 +1,17 @@
 /**
  * Per-environment configuration (DEVOPS §4 Environments & Promotion Model).
  *
- * One parameterized config drives dev / staging / prod from the SAME constructs
- * (§5.1: "one parameterized stack/construct per layer instantiated three times").
+ * One parameterized config drives dev / prod, plus an ephemeral preprod, from the
+ * SAME constructs (§5.1: "one parameterized stack/construct per layer"). The model
+ * is now two STANDING environments (dev + prod) and one EPHEMERAL, prod-shaped
+ * `preprod` that is stood up on every prod release to run the §10 verification
+ * harness as a HARD gate, then torn down (never left running, for cost).
  * Region is LOCKED to ca-central-1 for every environment of the current offering
  * (Locked Decision 21 / §4.2). Changing region per-offering is a deliberate future
  * action, never a silent default.
  */
 
-export type EnvName = 'dev' | 'staging' | 'prod';
+export type EnvName = 'dev' | 'preprod' | 'prod';
 
 /** The ONE region for the current offering. No environment may deviate (LD 21, §4.2). */
 export const OFFERING_REGION = 'ca-central-1';
@@ -45,9 +48,9 @@ export interface EnvConfig {
   readonly envName: EnvName;
   /** Multi-AZ everywhere except dev (dev is single-AZ, small, ephemeral - §4 / §7). */
   readonly multiAz: boolean;
-  /** Number of AZs the VPC spans. dev keeps cost down; staging/prod mirror prod. */
+  /** Number of AZs the VPC spans. dev keeps cost down; preprod/prod mirror prod. */
   readonly maxAzs: number;
-  /** NAT gateways: 1 in dev (cost), one-per-AZ in staging/prod (no single point). */
+  /** NAT gateways: 1 in dev (cost), one-per-AZ in preprod/prod (no single point). */
   readonly natGateways: number;
   /** RDS instance class (layer 3 - NOT provisioned until founder dollar sign-off). */
   readonly rdsInstanceClass: string;
@@ -73,12 +76,18 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     alarmsArmed: false,
     paused: false,
   },
-  staging: {
-    envName: 'staging',
+  // EPHEMERAL pre-production. NOT a standing environment: it is created at release
+  // time by the prod pipeline, runs the §10 verification harness as a HARD gate
+  // (any failure blocks the prod deploy), and is ALWAYS torn down afterwards
+  // (cdk destroy; ephemeral RDS deleted with NO final snapshot). It mirrors `prod`
+  // sizing EXACTLY (multiAz, azCount, NAT-per-AZ, RDS class, prod-like desired
+  // counts) so the rehearsal is faithful to production. Must never be left running.
+  preprod: {
+    envName: 'preprod',
     multiAz: true,
     maxAzs: 2,
     natGateways: 2,
-    rdsInstanceClass: 'db.t4g.medium',
+    rdsInstanceClass: 'db.r6g.large',
     alarmsArmed: true,
     paused: false,
   },
@@ -104,7 +113,7 @@ export function getEnvConfig(envName: EnvName): EnvConfig {
 /**
  * Apply per-deploy context overrides to a base config. Currently the single
  * cheap-idle pause switch (`-c paused=true`) which forces every ECS service in the
- * environment to desiredCount 0. Kept here so dev/staging/prod share one code path.
+ * environment to desiredCount 0. Kept here so dev/preprod/prod share one code path.
  */
 export function applyContextOverrides(cfg: EnvConfig, paused: boolean): EnvConfig {
   return paused ? { ...cfg, paused: true } : cfg;

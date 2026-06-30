@@ -12,7 +12,33 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import { ResidencyGuard } from '../lib/residency';
 import { NetworkingStack } from '../lib/networking-stack';
-import { getEnvConfig, OFFERING_REGION } from '../lib/env-config';
+import { getEnvConfig, OFFERING_REGION, EnvName } from '../lib/env-config';
+
+describe('Environment model (dev + prod, plus ephemeral preprod)', () => {
+  test('preprod mirrors prod sizing EXACTLY (prod-shaped rehearsal)', () => {
+    const preprod = getEnvConfig('preprod');
+    const prod = getEnvConfig('prod');
+    // The spec-required assertion: preprod is multi-AZ like prod.
+    expect(preprod.multiAz).toBe(true);
+    // Full sizing parity so the §10 rehearsal is faithful to production.
+    expect(preprod.multiAz).toBe(prod.multiAz);
+    expect(preprod.maxAzs).toBe(prod.maxAzs);
+    expect(preprod.natGateways).toBe(prod.natGateways);
+    expect(preprod.rdsInstanceClass).toBe(prod.rdsInstanceClass);
+    expect(preprod.alarmsArmed).toBe(prod.alarmsArmed);
+  });
+
+  test('dev stays single-AZ and small (cost), distinct from prod', () => {
+    expect(getEnvConfig('dev').multiAz).toBe(false);
+  });
+
+  test('staging is gone — only dev | preprod | prod exist', () => {
+    expect(() => getEnvConfig('staging' as unknown as EnvName)).toThrow();
+    for (const env of ['dev', 'preprod', 'prod'] as EnvName[]) {
+      expect(getEnvConfig(env).envName).toBe(env);
+    }
+  });
+});
 
 describe('Residency guardrails (§4.2 / LD 21)', () => {
   test('synthesizes a region-lock CfnCondition equal to the offering region', () => {

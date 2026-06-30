@@ -33,7 +33,7 @@ function dnsTemplate() {
   return Template.fromStack(new DnsStack(app, 'Dns', { env: ENV, envConfig: getEnvConfig('dev') }));
 }
 
-function buildWeb(envName: 'dev' | 'staging' | 'prod' = 'dev', paused = false) {
+function buildWeb(envName: 'dev' | 'preprod' | 'prod' = 'dev', paused = false) {
   const app = new App();
   const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig: getEnvConfig(envName) });
   const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig: getEnvConfig(envName) });

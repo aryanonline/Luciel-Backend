@@ -6,9 +6,11 @@
  * actual build/test/deploy steps run in GitHub Actions (Docker-capable runners),
  * which is why the container image is built in the pipeline, not in the sandbox.
  *
- * Promotion model (§4): PR -> CI gate -> build+scan image -> deploy dev -> deploy
- * staging -> MANUAL approval gate -> prod. The manual gate is a GitHub Environment
- * protection rule (configured on the repo), enforced outside CloudFormation.
+ * Promotion model (§4): PR -> CI gate -> build+scan image -> deploy dev. A prod
+ * release stands up an EPHEMERAL prod-shaped preprod, runs the §10 harness as a
+ * HARD gate, then -> MANUAL approval gate -> prod, then tears preprod down. The
+ * manual gate is a GitHub Environment protection rule (configured on the repo),
+ * enforced outside CloudFormation.
  */
 import { Stack, StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';

@@ -5,7 +5,8 @@
  * Builds a full environment as layered stacks (§5 order):
  *   networking -> security -> data -> compute -> edge -> observability
  * Region LOCKED to ca-central-1 for every environment (§4.2 / LD 21).
- * DEV-FIRST: synth/deploy dev; staging/prod reuse the same constructs.
+ * DEV-FIRST: synth/deploy dev; prod (and the ephemeral prod-shaped preprod)
+ * reuse the same constructs.
  *
  * GATE 1 (§2.8): the data/compute/edge stacks carry real recurring cost — do not
  * deploy before the founder approves the dev cost figure.
