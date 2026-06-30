@@ -68,6 +68,7 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   knowledgeBucket: data.knowledgeBucket,
   dbSecretArn: data.db.secret!.secretArn,
   platformSecretArn: sec.platformSecret.secretArn,
+  redisUrl: data.redisUrl,
   backendPath,
   apiCert: dns.apiCert,
   hostedZone: dns.hostedZone,

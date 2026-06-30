@@ -225,6 +225,7 @@ describe('Backend ALB gains the api HTTPS listener (spec §1)', () => {
       knowledgeBucket: data.knowledgeBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
+      redisUrl: data.redisUrl,
       backendPath: path.join(__dirname, '..', '..'),
       apiCert: dns.apiCert,
       hostedZone: dns.hostedZone,

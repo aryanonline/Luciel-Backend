@@ -11,11 +11,12 @@
  * COST: this is the first stack with meaningful recurring cost (RDS instance +
  * storage + backups). It is GATE 1 - do not deploy before founder dollar sign-off.
  */
-import { Stack, StackProps, RemovalPolicy, Duration } from 'aws-cdk-lib';
+import { Stack, StackProps, RemovalPolicy, Duration, CfnOutput } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as elasticache from 'aws-cdk-lib/aws-elasticache';
 import { Construct } from 'constructs';
 import { EnvConfig } from './env-config';
 import { ResidencyGuard } from './residency';
@@ -30,6 +31,12 @@ export class DataStack extends Stack {
   public readonly db: rds.DatabaseInstance;
   public readonly knowledgeBucket: s3.Bucket;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
+  /**
+   * Redis connection URL for the app's `redis_url` (config.py, env prefix LUCIEL_).
+   * `rediss://` because in-transit TLS is enabled on the replication group.
+   * Passed to ComputeStack and injected as LUCIEL_REDIS_URL (mirrors dbSecretArn).
+   */
+  public readonly redisUrl: string;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
@@ -87,5 +94,55 @@ export class DataStack extends Stack {
       removalPolicy:
         envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
     });
+
+    // --- Redis (ElastiCache) — Commitment 9: Redis-backed LLM cap (§9 C9 / §4.6) -- #
+    // Placed in the SAME PRIVATE_ISOLATED data tier as RDS (never public, no internet
+    // route). SG ingress mirrors the RDS pattern: scope to the VPC private CIDR rather
+    // than referencing the compute-stack appSg, which would create a Data<->Compute
+    // dependency cycle. Redis is in PRIVATE_ISOLATED subnets and never public, so
+    // VPC-CIDR ingress on 6379 = app-tier-only in practice. (Caught by CDK tests.)
+    const redisSg = new ec2.SecurityGroup(this, 'RedisSg', {
+      vpc,
+      description: 'Luciel Redis - ingress 6379 from VPC private CIDR only (never public)',
+      allowAllOutbound: false,
+    });
+    redisSg.addIngressRule(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(6379),
+      'app tier (VPC-internal) to redis',
+    );
+
+    // Subnet group over the isolated data subnets so the cluster has no public route.
+    const redisSubnets = new elasticache.CfnSubnetGroup(this, 'RedisSubnets', {
+      description: 'Luciel Redis - isolated data subnets (never public)',
+      subnetIds: vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_ISOLATED }).subnetIds,
+      cacheSubnetGroupName: `luciel-${envConfig.envName}-redis`,
+    });
+
+    // Single small node for dev; staging/prod scale the node type via env if needed.
+    // At-rest encryption uses the CMK; in-transit TLS is ON (so the app uses rediss://).
+    const redis = new elasticache.CfnReplicationGroup(this, 'Redis', {
+      replicationGroupDescription: `Luciel ${envConfig.envName} LLM-cap Redis`,
+      engine: 'redis',
+      cacheNodeType: 'cache.t4g.micro',
+      numCacheClusters: 1, // single node for dev (Redis cannot scale to 0)
+      automaticFailoverEnabled: false,
+      multiAzEnabled: false,
+      atRestEncryptionEnabled: true,
+      kmsKeyId: cmk.keyId,
+      transitEncryptionEnabled: true,
+      cacheSubnetGroupName: redisSubnets.ref,
+      securityGroupIds: [redisSg.securityGroupId],
+      port: 6379,
+    });
+    redis.addDependency(redisSubnets);
+
+    // rediss:// because in-transit TLS is enabled (matches config.py redis_url shape).
+    this.redisUrl = `rediss://${redis.attrPrimaryEndPointAddress}:6379/0`;
+    new CfnOutput(this, 'RedisEndpoint', {
+      value: redis.attrPrimaryEndPointAddress,
+      exportName: `Luciel-${envConfig.envName}-RedisEndpoint`,
+    });
+    new CfnOutput(this, 'RedisUrl', { value: this.redisUrl });
   }
 }

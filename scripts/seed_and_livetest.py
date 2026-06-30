@@ -416,13 +416,25 @@ def test_failsafe_escalation(r: Results, admin_id: uuid.UUID) -> None:
     esc = result.escalation
     fired_cannot_answer = esc is not None and esc.signal == Signal.cannot_answer
     tool_failed = "failed" in result.tool_outcomes
-    below_floor = (result.grounding_score or 1.0) < 0.50
-    ok = fired_cannot_answer and tool_failed and below_floor
+    # BUG FIX: the old `(result.grounding_score or 1.0) < 0.50` treated a *real*
+    # grounding of 0.0 as falsy and defaulted it to 1.0 (ABOVE the floor), so a
+    # correctly-ungrounded turn scored as "not below floor" → a false FAIL. Treat a
+    # missing score as 0.0 (ungrounded) and compare the ACTUAL value, so a genuine
+    # sub-floor 0.0 is recognized as below the 0.50 floor.
+    grounding = result.grounding_score if result.grounding_score is not None else 0.0
+    below_floor = grounding < 0.50
+    # No fabricated answer surfaced: with every tool failed and grounding below the
+    # floor, Luciel must NOT have returned the grounded fact it never retrieved — it
+    # hands off honestly (cannot_answer) rather than inventing a confident answer.
+    no_fabricated_answer = GROUNDED_TOKEN not in (result.reply_text or "")
+    ok = fired_cannot_answer and tool_failed and below_floor and no_fabricated_answer
     r.record(
         "T4 row5-failsafe-escalation",
         ok,
         f"signal={esc.signal.value if esc and esc.signal else None} "
-        f"tool_outcomes={result.tool_outcomes} grounding={result.grounding_score}",
+        f"tool_outcomes={result.tool_outcomes} grounding={result.grounding_score} "
+        f"below_floor={below_floor} no_fabricated_answer={no_fabricated_answer} "
+        f"reply={(result.reply_text or '')[:80]!r}",
     )
 
 

@@ -37,6 +37,11 @@ export interface ComputeStackProps extends StackProps {
   readonly dbSecretArn: string;
   /** Platform secret ARN (imported by ARN to avoid a cross-stack cycle via its KMS key). */
   readonly platformSecretArn: string;
+  /**
+   * Redis connection URL (from DataStack) injected as LUCIEL_REDIS_URL on both planes.
+   * The app reads it as `redis_url` (config.py); the live LLM cap uses it (§9 C9).
+   */
+  readonly redisUrl: string;
   /** Path to the backend repo (contains the Dockerfile). */
   readonly backendPath: string;
   /**
@@ -56,7 +61,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, knowledgeBucket, dbSecretArn, platformSecretArn, backendPath, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, knowledgeBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -189,6 +194,9 @@ export class ComputeStack extends Stack {
           LUCIEL_PLANE: name,
           // Integrations remain MOCK until a gated cutover flips them (GATE 2).
           LUCIEL_INTEGRATION_MODE: integrationMode,
+          // Redis-backed LLM cap (§9 C9). Same URL on both planes (makeTaskDef is
+          // called for data-plane + control-plane). App reads it as redis_url.
+          LUCIEL_REDIS_URL: redisUrl,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
