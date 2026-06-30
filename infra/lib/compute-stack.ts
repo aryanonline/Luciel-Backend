@@ -347,6 +347,9 @@ export class ComputeStack extends Stack {
         LUCIEL_ENV: envConfig.envName,
         // Same gated cutover flag as the app: 'live' exercises real Anthropic/OpenAI.
         LUCIEL_INTEGRATION_MODE: integrationMode,
+        // Wire the real Redis so the cap tests (T2/T3) exercise the Redis-backed
+        // store exactly as the app does, not the in-memory degraded fallback.
+        LUCIEL_REDIS_URL: redisUrl,
       },
     });
     new cdk.CfnOutput(this, 'SeedTestTaskArn', {
