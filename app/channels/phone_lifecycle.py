@@ -1,45 +1,59 @@
-"""Phone number lifecycle (Architecture §3.1.4).
+"""Phone number lifecycle — BYO-only (Architecture §3.1.4 / §3.1.6, Decision #48).
 
-Phone is opt-in via channel selection. Enabling SMS (or Voice) provisions a
-dedicated Twilio number from the pool and records it as an sms_sender connection
-(non_secret_config.destination = the E.164 number). Disabling does NOT release the
-number — the connection row + number are retained so re-enabling needs no re-setup
-(§3.7.1 / §3.8.7 B). If SMS/Voice is not enabled, no number is provisioned and no
-recurring cost accrues.
+Phone is opt-in via channel selection. The platform NEVER provisions, pools, or
+acquires phone numbers — it is not a telephony reseller. The tenant supplies their
+OWN E.164 number (BYO); we record it as an sms_sender connection
+(non_secret_config.destination = the E.164 number). Until a number is supplied the
+channel is NOT live and shows "Action needed: add your number" (§3.1.4).
 
-The Twilio provisioning call is abstracted behind an injected provisioner; real
-binding in deployment.
+Registration split (§3.1.6): the tenant is the Brand; the platform may operate
+carrier registration (A2P 10DLC) as an ISV under the tenant's identity, and carrier
+costs incl. registration are the tenant's. A supplied number is therefore recorded
+as ``pending_carrier_registration`` (honest — the number is attached but carrier
+registration is not yet approved) rather than ``connected``; the registration-status
+poller flips it to ``connected`` on approval. Disabling does NOT release the number —
+the connection row is retained so re-enabling needs no re-setup (§3.7.1 / §3.8.7 B).
 """
 
 from __future__ import annotations
 
+import re
 import uuid
-from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.connection import InstanceConnection
 
-
-class NumberProvisioner(Protocol):
-    async def provision_number(self, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
-        """Provision a dedicated number; return its E.164 string."""
-        ...
+# Basic E.164: leading '+', first digit 1-9, then 7-14 more digits (8-15 total).
+_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
-async def ensure_sms_number(
+def _validate_e164(e164_number: str) -> str:
+    number = e164_number.strip()
+    if not _E164_RE.match(number):
+        raise ValueError(f"invalid E.164 phone number: {e164_number!r}")
+    return number
+
+
+async def attach_sms_number(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
-    provisioner: NumberProvisioner,
+    e164_number: str,
 ) -> InstanceConnection:
-    """Provision (idempotently) the tenant's SMS sender number connection.
+    """Attach the tenant's BYO SMS sender number (idempotent per tenant/instance).
 
-    If a non-revoked sms_sender connection exists, reuse it (retained across
-    disable). Otherwise provision a new number and create the connection row.
+    Validates the E.164 format and creates (or updates, retained across disable) the
+    ``sms_sender`` connection with the supplied number in
+    ``non_secret_config.destination``. NO outbound provisioning call exists — the
+    number is the tenant's own (BYO, §3.1.4). Status is
+    ``pending_carrier_registration`` (§3.1.6) until the carrier approves.
     """
+    number = _validate_e164(e164_number)
+    detail = "Being activated with the carriers (A2P 10DLC) — usually a few business days."
+
     existing = (
         await session.execute(
             select(InstanceConnection).where(
@@ -51,26 +65,52 @@ async def ensure_sms_number(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        # Reuse the retained row; update the destination to the supplied number.
+        existing.provider = "twilio"
+        existing.auth_class = "api_key"
+        existing.non_secret_config = {"destination": number}
+        existing.status = "pending_carrier_registration"
+        existing.status_detail = detail
+        await session.flush()
         return existing
 
-    number = await provisioner.provision_number(admin_id, instance_id)
     conn = InstanceConnection(
         connection_id=uuid.uuid4(),
         admin_id=admin_id,
         instance_id=instance_id,
         connection_type="sms_sender",
-        auth_class="provisioned_resource",
+        # BYO: the admin supplies the number (a tenant-owned resource), so this is an
+        # api_key-class credential intake, not a platform-provisioned resource.
+        auth_class="api_key",
         provider="twilio",
-        # The number exists immediately, but A2P 10DLC carrier registration is not yet
-        # approved, so it cannot send to US recipients (§3.1.6 / Decision §46). Surface
-        # an honest pending status — NOT "connected" — until the carrier approves; the
-        # registration-status poller flips it to "connected" on approval.
         status="pending_carrier_registration",
         non_secret_config={"destination": number},
-        status_detail=(
-            "Being activated with the carriers (A2P 10DLC) — usually a few business days."
-        ),
+        status_detail=detail,
     )
     session.add(conn)
     await session.flush()
     return conn
+
+
+async def sms_number_status(
+    session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> str:
+    """Report the SMS number state for the channel view (§3.1.4).
+
+    Returns the non-revoked ``sms_sender`` connection status when a number has been
+    supplied (``pending_carrier_registration`` / ``connected``), or ``unconfigured``
+    when no number is attached yet — the "Action needed: add your number" state.
+    """
+    existing = (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.instance_id == instance_id,
+                InstanceConnection.connection_type == "sms_sender",
+                InstanceConnection.status != "revoked",
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return "unconfigured"
+    return existing.status

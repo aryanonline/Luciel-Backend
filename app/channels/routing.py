@@ -13,8 +13,9 @@ Channel → resolution key:
   whatsapp/meta: Meta destination id
 
 The destination→tenant mapping lives in instance_connections.non_secret_config for
-provisioned channels (the sms_sender number, the email_sender identity), and in
-the instance's embed_key_public_id for the widget. This module resolves via a
+the configured channels (the tenant's BYO sms_sender number, the email_sender
+identity), and in the instance's embed_key_public_id for the widget. This module
+resolves via a
 SECURITY DEFINER lookup analogous to auth_lookup_account (added in this arc's
 migration) so resolution works before a tenant subject exists.
 """

@@ -31,10 +31,16 @@ class ConnectionOut(WireModel):
 
 
 class StartConnectionRequest(WireModel):
-    """POST body to begin a connect flow: {connectionType, provider} (frozen)."""
+    """POST body to begin a connect flow: {connectionType, provider} (frozen).
+
+    ``phoneNumber`` is an ADDITIVE optional field carrying the tenant's BYO E.164
+    SMS number (§3.1.4): the platform never provisions a number, so for an
+    ``sms_sender`` connect the admin supplies their own. It is non-secret config (a
+    destination), NOT a credential — secret hygiene is preserved (§3.8.3)."""
 
     connection_type: str
     provider: str
+    phone_number: str | None = None
 
 
 class StartConnectionResult(WireModel):

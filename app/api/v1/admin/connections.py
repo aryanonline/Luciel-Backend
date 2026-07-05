@@ -83,6 +83,7 @@ async def start_connection(
             connection_type=req.connection_type,
             provider=req.provider,
             user_id=subject.user_id,
+            phone_number=req.phone_number,
         )
         return StartConnectionResult.model_validate(result)
 

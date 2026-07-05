@@ -12,7 +12,7 @@ import pytest
 from app.channels import rate_limit, routing
 from app.channels.base import InboundMessage, InboundRejected, OutboundMessage
 from app.channels.email_adapter import EmailAdapter
-from app.channels.phone_lifecycle import ensure_sms_number
+from app.channels.phone_lifecycle import attach_sms_number, sms_number_status
 from app.channels.pipeline import AdmissionDenied, OptOutHandled, ingest
 from app.channels.signatures import twilio_signature
 from app.channels.sms_adapter import SmsAdapter
@@ -38,9 +38,7 @@ class FakeSes:
         return "ses-msg-1"
 
 
-class FakeProvisioner:
-    async def provision_number(self, admin_id, instance_id):
-        return "+15551239999"
+BYO_NUMBER = "+15551239999"
 
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
@@ -76,25 +74,60 @@ async def _seed(admin: uuid.UUID) -> uuid.UUID:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_phone_provision_idempotent_and_resolves():
+async def test_byo_number_attach_idempotent_and_resolves():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     async with tenant_session(admin) as s:
-        c1 = await ensure_sms_number(
-            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
-        )
-        c2 = await ensure_sms_number(
-            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
-        )
-        assert c1.connection_id == c2.connection_id  # idempotent — number retained
-        # Axis6-F02 (§3.1.6): the number is provisioned immediately but A2P 10DLC
-        # registration is pending, so the connection is NOT shown as connected/live.
+        # No number supplied yet → "Action needed: add your number" (§3.1.4).
+        assert await sms_number_status(s, admin_id=admin, instance_id=iid) == "unconfigured"
+        # BYO: the tenant supplies their own E.164 number; NO provisioning call exists.
+        c1 = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        c2 = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        assert c1.connection_id == c2.connection_id  # idempotent — row retained
+        # §3.1.6: number supplied but A2P 10DLC carrier registration is pending, so the
+        # connection is NOT shown as connected/live.
         assert c1.status == "pending_carrier_registration"
+        assert c1.auth_class == "api_key"  # tenant-supplied credential class, not provisioned
         number = c1.non_secret_config["destination"]
+        assert number == BYO_NUMBER
+        assert await sms_number_status(s, admin_id=admin, instance_id=iid) == (
+            "pending_carrier_registration"
+        )
     # Destination resolves back to the tenant via the SECURITY DEFINER resolver.
     async with tenant_session(admin) as s:
         ctx = await routing.resolve_destination(s, "sms_sender", number)
         assert ctx.admin_id == admin and ctx.instance_id == iid
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_sms_no_number_supplied_is_action_needed():
+    """SMS enabled but no BYO number supplied → no sms_sender connection, channel not
+    live ("Action needed: add your number", §3.1.4)."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        assert await sms_number_status(s, admin_id=admin, instance_id=iid) == "unconfigured"
+        # No connection row exists (nothing provisioned, nothing attached).
+        from app.models.connection import InstanceConnection
+
+        n = (
+            await s.execute(
+                select(func.count())
+                .select_from(InstanceConnection)
+                .where(InstanceConnection.connection_type == "sms_sender")
+            )
+        ).scalar_one()
+        assert n == 0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_byo_number_malformed_rejected():
+    """A malformed BYO number is rejected at intake (ValueError), never stored."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        with pytest.raises(ValueError):
+            await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number="555-1234")
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -118,9 +151,7 @@ async def test_sms_adapter_signature_verified_inbound_and_send():
     iid = await _seed(admin)
     # provision number so the destination resolves
     async with tenant_session(admin) as s:
-        conn = await ensure_sms_number(
-            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
-        )
+        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
         number = conn.non_secret_config["destination"]
 
     twilio = FakeTwilio()
@@ -170,9 +201,7 @@ async def test_inbound_pipeline_admits_then_blocks_and_audits():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     async with tenant_session(admin) as s:
-        conn = await ensure_sms_number(
-            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
-        )
+        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
         number = conn.non_secret_config["destination"]
 
     rate_limit._store = rate_limit.TokenBucketStore()  # fresh limiter
@@ -224,9 +253,7 @@ async def test_inbound_stop_keyword_suppressed_from_runtime():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     async with tenant_session(admin) as s:
-        conn = await ensure_sms_number(
-            s, admin_id=admin, instance_id=iid, provisioner=FakeProvisioner()
-        )
+        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
         number = conn.non_secret_config["destination"]
 
     rate_limit._store = rate_limit.TokenBucketStore()

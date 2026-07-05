@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.channels.phone_lifecycle import _validate_e164
 from app.connections.secrets import SecretStore, get_secret_store, secret_ref_for
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
@@ -107,15 +108,28 @@ async def start_connection(
     connection_type: str,
     provider: str,
     user_id: uuid.UUID | None,
+    phone_number: str | None = None,
     now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]]:
     """Begin a connect flow: create (or reuse) the row in ``unconfigured`` and return
     the row + StartConnectionResult (§3.8.4 lifecycle starts at unconfigured).
 
     If a non-revoked row of this type already exists we reuse it (single-active per
-    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure."""
+    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure.
+
+    BYO number (§3.1.4): for an ``sms_sender`` connect the platform never provisions a
+    number — the admin supplies their own E.164 number via ``phone_number``. When
+    supplied it is validated and stored as non-secret ``destination`` config and the
+    row goes to ``pending_carrier_registration`` (§3.1.6); when omitted the row stays
+    ``unconfigured`` — the "Action needed: add your number" state (channel not live)."""
     now = now or datetime.now(UTC)
     auth_class = _auth_class_for(connection_type)
+
+    # BYO SMS number intake: validate before touching the row so a malformed number
+    # raises rather than half-configuring the connection (§3.1.4).
+    byo_destination: str | None = None
+    if connection_type == "sms_sender" and phone_number is not None:
+        byo_destination = _validate_e164(phone_number)
 
     existing = await _single_active(session, admin_id, instance_id, connection_type)
     if existing is not None:
@@ -137,6 +151,13 @@ async def start_connection(
             created_by_user_id=user_id,
         )
         session.add(connection)
+
+    if byo_destination is not None:
+        connection.non_secret_config = {"destination": byo_destination}
+        connection.status = "pending_carrier_registration"
+        connection.status_detail = (
+            "Being activated with the carriers (A2P 10DLC) — usually a few business days."
+        )
     await session.flush()
 
     # §3.7.1/§3.8: configuring a dependency is an admin-config event.
