@@ -5,6 +5,8 @@ Implements the frozen admin client (http-admin.ts connections.*) field-for-field
   * POST   /connections {connectionType,...}  → StartConnectionResult
   * POST   /connections/{id}/reconnect        → StartConnectionResult
   * DELETE /connections/{id}                  → 204 (status→revoked + secret cleanup)
+  * GET    /connections/email                 → EmailProvisioning | null (§3.1.6a)
+  * POST   /connections/email {mode,...}       → EmailProvisioning (§3.1.6a)
 
 All endpoints are admin-authed (verified account, §3.7.2) and run inside
 ``tenant_session`` so Layer-3 RLS scopes every row to the caller's tenant. Writes
@@ -28,6 +30,8 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Instance
 from app.schemas_api.connections import (
     ConnectionOut,
+    EmailProvisioningOut,
+    ProvisionEmailRequest,
     StartConnectionRequest,
     StartConnectionResult,
 )
@@ -61,6 +65,27 @@ async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
     return inst
 
 
+async def _instance_row(s: AsyncSession, admin_id: uuid.UUID) -> Instance:
+    inst = (
+        await s.execute(select(Instance).where(Instance.admin_id == admin_id))
+    ).scalar_one_or_none()
+    if inst is None:
+        raise not_found("No Luciel.")
+    return inst
+
+
+def _email_provisioning_out(c: InstanceConnection) -> EmailProvisioningOut:
+    # Non-secret projection (§3.8.3): mode + address + status from non_secret_config;
+    # DNS records are derived (own_domain only). No secret_ref, no auth_class.
+    cfg = c.non_secret_config or {}
+    address = str(cfg.get("address", ""))
+    mode = str(cfg.get("mode", "vm_subdomain"))
+    dns = service.dns_records_for(address) if mode == "own_domain" else None
+    return EmailProvisioningOut.model_validate(
+        {"mode": mode, "emailAddress": address, "status": c.status, "dnsRecords": dns}
+    )
+
+
 @router.get("", response_model=list[ConnectionOut])
 async def list_connections(
     subject: Subject = Depends(current_admin),
@@ -68,6 +93,35 @@ async def list_connections(
     async with tenant_session(subject.admin_id) as s:
         rows = await service.list_connections(s, subject.admin_id)
         return [_connection_out(c) for c in rows]
+
+
+@router.get("/email", response_model=EmailProvisioningOut | None)
+async def get_email_provisioning(
+    subject: Subject = Depends(current_admin),
+) -> EmailProvisioningOut | None:
+    async with tenant_session(subject.admin_id) as s:
+        conn = await service.get_email_provisioning(
+            s, subject.admin_id, await _instance_id(s, subject.admin_id)
+        )
+        return _email_provisioning_out(conn) if conn is not None else None
+
+
+@router.post("/email", response_model=EmailProvisioningOut)
+async def provision_email(
+    req: ProvisionEmailRequest, subject: Subject = Depends(current_admin)
+) -> EmailProvisioningOut:
+    async with tenant_session(subject.admin_id) as s:
+        inst = await _instance_row(s, subject.admin_id)
+        conn = await service.provision_email(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            mode=req.mode,
+            email_address=req.email_address,
+            instance_name=inst.name,
+            user_id=subject.user_id,
+        )
+        return _email_provisioning_out(conn)
 
 
 @router.post("", response_model=StartConnectionResult)

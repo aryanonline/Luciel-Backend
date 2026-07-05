@@ -376,3 +376,139 @@ async def revoke(
         },
     )
     return True
+
+
+# --- Email provisioning (§3.1.6a / Decision #49) ----------------------------------- #
+# The tenant provisions the address Luciel sends + receives on. It lives on the
+# email_sender connection's non_secret_config as {"address", "mode"} — an additive,
+# non-secret passthrough (the same shape family PR #32 used for the SMS phoneNumber).
+# own_domain requires a walked-through DNS/MX routing step (status pending_email_routing,
+# non-silent precondition, same posture as SMS carrier registration); vm_subdomain is a
+# zero-DNS fallback that is immediately connected.
+
+EMAIL_ROUTING_DETAIL = "Action needed: complete email routing"
+_VM_SUBDOMAIN_ZONE = "reply.vantagemind.ai"
+_INBOUND_MX = "inbound.vantagemind.ai"
+
+
+def _slugify(name: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug
+
+
+def vm_subdomain_address(instance_name: str, instance_id: uuid.UUID) -> str:
+    """Derive the zero-DNS VantageMind-subdomain address for an instance.
+
+    A full, valid email address (local-part @ per-tenant subdomain) — it is used as
+    both the SES sender identity and the inbound recipient resolution key, so it must
+    be a real address, not a bare domain."""
+    slug = _slugify(instance_name) or instance_id.hex[:12]
+    return f"luciel@{slug}.{_VM_SUBDOMAIN_ZONE}"
+
+
+def dns_records_for(address: str) -> list[dict[str, object]]:
+    """The DNS records an own-domain admin must add to complete inbound routing.
+    Derived deterministically from the address domain; carries NO secret material."""
+    domain = address.split("@", 1)[1] if "@" in address else address
+    return [
+        {"type": "MX", "host": domain, "value": _INBOUND_MX, "priority": 10},
+        {"type": "TXT", "host": domain, "value": "v=spf1 include:mail.vantagemind.ai ~all"},
+        {"type": "CNAME", "host": f"vm._domainkey.{domain}", "value": "dkim.vantagemind.ai"},
+    ]
+
+
+async def provision_email(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    mode: str,
+    email_address: str | None,
+    instance_name: str,
+    user_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> InstanceConnection:
+    """Provision the tenant's email sender identity (§3.1.6a / Decision #49).
+
+    own_domain — stores the admin-supplied address; status = pending_email_routing
+      until the inbound DNS/MX routing is verified (non-silent precondition).
+    vm_subdomain — derives a zero-DNS subdomain address; immediately connected.
+
+    Reuses the single-active email_sender row (§3.8.2). The address + mode are stored
+    in non_secret_config; NO secret material is written here (§3.8.3)."""
+    now = now or datetime.now(UTC)
+    if mode == "own_domain":
+        address = (email_address or "").strip()
+        if not address:
+            raise ValueError("own_domain requires an email address")
+        status = "pending_email_routing"
+        status_detail: str | None = EMAIL_ROUTING_DETAIL
+    else:  # vm_subdomain
+        address = vm_subdomain_address(instance_name, instance_id)
+        status = "connected"
+        status_detail = None
+
+    existing = await _single_active(session, admin_id, instance_id, "email_sender")
+    if existing is not None:
+        connection = existing
+        connection.provider = "ses"
+        connection.auth_class = _auth_class_for("email_sender")
+    else:
+        connection = InstanceConnection(
+            connection_id=uuid.uuid4(),
+            admin_id=admin_id,
+            instance_id=instance_id,
+            connection_type="email_sender",
+            auth_class=_auth_class_for("email_sender"),
+            provider="ses",
+            secret_ref=secret_ref_for(admin_id, instance_id, "email_sender"),
+            created_by_user_id=user_id,
+        )
+        session.add(connection)
+    connection.status = status
+    connection.status_detail = status_detail
+    connection.non_secret_config = {"address": address, "mode": mode}
+    await session.flush()
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="instance_configured",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "connection_type": "email_sender",
+            "action": "provision_email",
+            "mode": mode,
+            "status": status,
+            # §3.8.3: the address is non-secret config; safe to audit.
+            "address": address,
+        },
+    )
+    return connection
+
+
+async def get_email_provisioning(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> InstanceConnection | None:
+    """The current (non-revoked) email_sender connection, if provisioned."""
+    return await _single_active(session, admin_id, instance_id, "email_sender")
+
+
+async def resolve_email_address(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> str | None:
+    """The tenant's provisioned send+receive address, or None if not provisioned.
+
+    This is the authoritative per-tenant email identity (§3.1.6a) — the EmailAdapter
+    default is only a last-resort fallback, and the prompt composer uses this to tell
+    Luciel its own address."""
+    conn = await _single_active(session, admin_id, instance_id, "email_sender")
+    if conn is None or not conn.non_secret_config:
+        return None
+    address = conn.non_secret_config.get("address")
+    return address if isinstance(address, str) else None

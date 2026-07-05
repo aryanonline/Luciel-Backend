@@ -193,3 +193,70 @@ async def test_connections_require_auth(client):
     # No session cookie → 401/403 (transport maps both to unauthorized).
     r = await client.get("/api/v1/admin/connections")
     assert r.status_code in (401, 403)
+
+
+# --- §3.1.6a: email provisioning wire (matches Luciel-Frontend PR #13) ---------------
+_EMAIL_ALLOWED_KEYS = {"mode", "emailAddress", "status", "dnsRecords"}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_provisioning_absent_before_configured(client):
+    await _ready_account_with_luciel(client)
+    r = await client.get("/api/v1/admin/connections/email")
+    assert r.status_code == 200
+    assert r.json() is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_own_domain_provisioning_is_pending_with_dns(client):
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections/email",
+        json={"mode": "own_domain", "emailAddress": "hello@acme.com"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) <= _EMAIL_ALLOWED_KEYS
+    assert body["mode"] == "own_domain"
+    assert body["emailAddress"] == "hello@acme.com"
+    assert body["status"] == "pending_email_routing"
+    # Own-domain requires walked-through DNS records to complete inbound routing.
+    assert body["dnsRecords"] and len(body["dnsRecords"]) >= 1
+    rec = body["dnsRecords"][0]
+    assert set(rec.keys()) <= {"type", "host", "value", "priority"}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_vm_subdomain_provisioning_is_connected(client):
+    await _ready_account_with_luciel(client)
+    r = await client.post("/api/v1/admin/connections/email", json={"mode": "vm_subdomain"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "vm_subdomain"
+    assert body["status"] == "connected"
+    assert "@" in body["emailAddress"]
+    # Subdomain mode skips DNS entirely.
+    assert body.get("dnsRecords") in (None, [])
+    # GET reflects the provisioned identity.
+    g = await client.get("/api/v1/admin/connections/email")
+    assert g.json()["emailAddress"] == body["emailAddress"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_provisioning_never_leaks_secret_fields(client):
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections/email",
+        json={"mode": "own_domain", "emailAddress": "hi@acme.com"},
+    )
+    body = r.json()
+    assert set(body.keys()) <= _EMAIL_ALLOWED_KEYS, f"unexpected: {set(body) - _EMAIL_ALLOWED_KEYS}"
+    raw = r.text.lower()
+    for forbidden in ("secret_ref", "secretref", "auth_class", "authclass", "vm/"):
+        assert forbidden not in raw
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_provisioning_requires_auth(client):
+    r = await client.get("/api/v1/admin/connections/email")
+    assert r.status_code in (401, 403)

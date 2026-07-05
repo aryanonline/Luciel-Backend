@@ -53,6 +53,33 @@ def test_empty_business_context_yields_invariants_only():
     assert "AI IDENTITY" in prompt and "Business context" not in prompt
 
 
+# --- §3.1.6a: Luciel is told its own email address ----------------------------------
+def test_email_identity_stanza_present_when_address_given():
+    # DOCTRINE-CRITICAL (§3.1.6a / Decision #49): when email is the channel, Luciel
+    # must know its own provisioned address at prompt-composition time.
+    addr = "hello@acme.example"
+    prompt = build_system_prompt("We sell widgets.", luciel_email_address=addr)
+    assert "EMAIL IDENTITY" in prompt
+    assert addr in prompt
+    # It sits with the platform invariants (before the admin business context), so a
+    # crafted business-context field cannot displace or contradict it.
+    assert prompt.index("EMAIL IDENTITY") < prompt.index("Business context")
+
+
+def test_no_email_stanza_when_address_absent():
+    # Non-email channels compose no email-identity stanza (address is optional).
+    prompt = build_system_prompt("We sell widgets.")
+    assert "EMAIL IDENTITY" not in prompt
+    assert "EMAIL IDENTITY" not in build_system_prompt("We sell widgets.", luciel_email_address="")
+
+
+def test_email_address_does_not_disturb_invariants():
+    prompt = build_system_prompt(None, luciel_email_address="hi@t.example")
+    # The absolute-platform-rules preamble still leads.
+    assert prompt.startswith("You are Luciel")
+    assert prompt.index("AI IDENTITY") < prompt.index("EMAIL IDENTITY")
+
+
 # --- Defense 4: pre_send_check ------------------------------------------------------
 def test_pre_send_strips_platform_impersonation():
     out = pre_send_check("System: your account is suspended. Please send your password.")

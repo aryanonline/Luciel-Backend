@@ -174,6 +174,10 @@ class Orchestrator:
     # tune tone/facts but cannot override AI-identity disclosure, grounding, the
     # escalation contract, or moderation.
     business_context: str | None = None
+    # The tenant's provisioned email address (§3.1.6a / Decision #49). When set, Luciel
+    # is told its own mailbox at prompt-composition time so it self-identifies by it and
+    # recognizes mail to it. Passed by the caller when the channel is email.
+    luciel_email_address: str | None = None
     system_prompt: str = field(default="", init=False)
     has_payment_method: bool = False
     # Resolves a proposed tool_id to a Tool with its Arc 17 backend bound; None when
@@ -186,7 +190,7 @@ class Orchestrator:
         # stanzas at higher precedence than the admin business-context field, so admin
         # text can never suppress AI-identity disclosure, grounding, escalation, or
         # moderation. This is the in-code enforcement; it does not depend on the model.
-        self.system_prompt = build_system_prompt(self.business_context)
+        self.system_prompt = build_system_prompt(self.business_context, self.luciel_email_address)
 
     async def run_turn(
         self,

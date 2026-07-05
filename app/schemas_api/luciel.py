@@ -55,6 +55,10 @@ ConnectionStatusWire = Literal[
     # SMS/Voice number provisioned but A2P 10DLC carrier registration not yet
     # approved — the channel is NOT live and must not be shown as connected (§3.1.6).
     "pending_carrier_registration",
+    # Own-domain email address chosen but inbound DNS/MX routing not yet verified —
+    # NOT live; shown as "Action needed: complete email routing" (§3.1.6a, Decision
+    # #49). Subdomain mode skips this and is immediately `connected`.
+    "pending_email_routing",
 ]
 # §3.2.3: paused_reconnect_needed (was needs_reconnect) + error (Axis4-F02).
 KnowledgeSyncStatusWire = Literal["synced", "syncing", "paused_reconnect_needed", "error"]

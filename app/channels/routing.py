@@ -8,7 +8,8 @@ resolves the inbound to its tenant, after which app.admin_id is set to that tena
 
 Channel → resolution key:
   widget: embed key (data-key)
-  email:  recipient address (instance-slug@admin-slug.luciel-mail.com)
+  email:  recipient address — the tenant's provisioned email address (own-domain or
+          VM-subdomain), stored on the email_sender connection (§3.1.6a)
   sms/voice: recipient E.164 phone number
   whatsapp/meta: Meta destination id
 
