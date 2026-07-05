@@ -88,11 +88,48 @@ export class DataStack extends Stack {
     });
 
     // Knowledge / artifact bucket with the full residency envelope.
+    //
+    // STORAGE-COST BOUNDING (Architecture §4.4 / Decision #38, P0-4): the customer-data
+    // bucket carries a lifecycle envelope so its footprint PLATEAUS rather than growing
+    // unbounded — transition cold at 90d, hard-delete at the 1-year retention boundary,
+    // and bound noncurrent versions so prior versions never accumulate.
+    //
+    // TRANSCRIPT-ARCHIVE-BUCKET DECISION (spec step 2): the doctrine's separate
+    // `vm-transcript-archive` bucket is NOT provisioned here. Transcripts currently live
+    // only in Postgres (no hot→cold S3 offload ships yet), so a dedicated archive bucket
+    // would be wired to nothing. Per the "make the minimal honest choice; don't invent an
+    // unused bucket" guidance we apply the lifecycle envelope to the existing customer-data
+    // (knowledge/artifact) bucket now; the dedicated transcript-archive bucket binds — with
+    // this same envelope — when the hot→cold offload lands. The app-side age sweep
+    // (app/lifecycle/retention.py) is the Postgres-side reconciliation of the same policy.
     this.knowledgeBucket = residency.hardenedBucket('Knowledge', {
       key: cmk,
       versioned: envConfig.envName === 'prod',
       removalPolicy:
         envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      lifecycleRules: [
+        {
+          id: 'customer-data-retention-envelope',
+          enabled: true,
+          // Transition current versions to cheaper storage as they age (§4.4).
+          transitions: [
+            {
+              storageClass: s3.StorageClass.INFREQUENT_ACCESS,
+              transitionAfter: Duration.days(90),
+            },
+            {
+              storageClass: s3.StorageClass.GLACIER,
+              transitionAfter: Duration.days(180),
+            },
+          ],
+          // 1-year hard-delete backstop: an object cannot outlive the retention policy.
+          expiration: Duration.days(365),
+          // Bound prior (noncurrent) versions so the versioned bucket doesn't accumulate.
+          noncurrentVersionExpiration: Duration.days(90),
+          // Reap incomplete multipart uploads (cost hygiene, no retention meaning).
+          abortIncompleteMultipartUploadAfter: Duration.days(7),
+        },
+      ],
     });
 
     // --- Redis (ElastiCache) — Commitment 9: Redis-backed LLM cap (§9 C9 / §4.6) -- #

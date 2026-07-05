@@ -30,12 +30,19 @@ unsupported facts by construction.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conversation import SessionSummary, Transcript
 from app.runtime.sessions import can_carry_cross_session_memory
+
+# Cross-session memory INJECTION bound (§3.4.10 / Decision #38): at most N most-recent
+# summaries within a rolling 12-month window, so the injected context — and therefore
+# the footprint — PLATEAUS. Platform constant, not admin-configurable.
+CROSS_SESSION_SUMMARY_LIMIT = 10
+CROSS_SESSION_SUMMARY_WINDOW = timedelta(days=365)
 
 
 async def load_session_history(
@@ -67,7 +74,8 @@ async def load_cross_session_summaries(
     channel: str,
     resolved_lead_id: uuid.UUID | None,
     exclude_session_id: uuid.UUID | None = None,
-    limit: int = 5,
+    limit: int = CROSS_SESSION_SUMMARY_LIMIT,
+    now: datetime | None = None,
 ) -> list[str]:
     """Cross-session memory (§3.4.6): prior-session summaries for this customer.
 
@@ -75,18 +83,25 @@ async def load_cross_session_summaries(
     resolved — a weak widget token never inherits another lead's history. Summaries
     are scoped by (admin_id, instance_id, resolved_lead_id); RLS additionally scopes
     by admin_id so cross-tenant bleed is impossible.
+
+    Injection is bounded (§3.4.10 / Decision #38): at most ``limit`` (default N=10)
+    most-recent summaries WITHIN a rolling 12-month window — summaries older than the
+    window are excluded so injected context, and thus footprint, plateaus.
     """
     if resolved_lead_id is None:
         return []
     # HARD RULE §3.4.9: only strong / platform-scoped-strong identifiers carry memory.
     if not can_carry_cross_session_memory(channel):
         return []
+    now = now or datetime.now(UTC)
+    window_start = now - CROSS_SESSION_SUMMARY_WINDOW
     q = (
         select(SessionSummary)
         .where(
             SessionSummary.admin_id == admin_id,
             SessionSummary.instance_id == instance_id,
             SessionSummary.resolved_lead_id == resolved_lead_id,
+            SessionSummary.created_at >= window_start,
         )
         .order_by(SessionSummary.created_at.desc())
         .limit(limit)

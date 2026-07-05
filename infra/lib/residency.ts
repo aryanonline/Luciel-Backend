@@ -57,6 +57,13 @@ export class ResidencyGuard extends Construct {
       key: kms.IKey;
       versioned?: boolean;
       removalPolicy?: RemovalPolicy;
+      /**
+       * Storage-cost bounding lifecycle rules (Architecture §4.4 / Decision #38).
+       * When provided, the object footprint plateaus instead of accumulating: the
+       * 1-year expiration rule is the backstop that guarantees an object cannot
+       * outlive the retention policy even if an app-side sweep misses it.
+       */
+      lifecycleRules?: s3.LifecycleRule[];
     },
   ): s3.Bucket {
     const bucket = new s3.Bucket(this, id, {
@@ -66,6 +73,7 @@ export class ResidencyGuard extends Construct {
       enforceSSL: true,
       versioned: opts.versioned ?? false,
       removalPolicy: opts.removalPolicy ?? RemovalPolicy.RETAIN,
+      ...(opts.lifecycleRules ? { lifecycleRules: opts.lifecycleRules } : {}),
     });
 
     // Region-Deny: reject any access whose requested region != the offering region.

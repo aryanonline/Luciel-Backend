@@ -73,3 +73,59 @@ async def test_cross_session_summaries_empty_for_weak_widget_channel():
             s, admin_id=admin, instance_id=iid, channel="email", resolved_lead_id=lead
         )
         assert strong == ["prior chat"]
+
+
+def test_cross_session_summary_injection_bound_is_ten():
+    """§3.4.10 / Decision #38: the default injection cap is N=10, a named platform
+    constant — not admin-configurable."""
+    import inspect
+
+    assert memory.CROSS_SESSION_SUMMARY_LIMIT == 10
+    default = inspect.signature(memory.load_cross_session_summaries).parameters["limit"].default
+    assert default == memory.CROSS_SESSION_SUMMARY_LIMIT == 10
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_cross_session_summaries_exclude_older_than_12_months():
+    """Summaries older than the rolling 12-month window are excluded from injection
+    so the injected context — and the footprint — plateaus (§3.4.10)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models.conversation import SessionSummary
+
+    admin, iid, lead = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    now = datetime.now(UTC)
+    async with tenant_session(admin) as s:
+        # One recent summary (in-window) and one older than 12 months (out-of-window).
+        s.add(
+            SessionSummary(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead,
+                session_id=uuid.uuid4(),
+                summary="recent",
+                created_at=now - timedelta(days=30),
+            )
+        )
+        s.add(
+            SessionSummary(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead,
+                session_id=uuid.uuid4(),
+                summary="ancient",
+                created_at=now - timedelta(days=400),
+            )
+        )
+        await s.flush()
+        out = await memory.load_cross_session_summaries(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            channel="email",
+            resolved_lead_id=lead,
+            now=now,
+        )
+        assert out == ["recent"]  # the >12mo summary is excluded

@@ -121,6 +121,24 @@ describe('Data layer (§5.3 / §4.2)', () => {
       }),
     });
   });
+
+  // Storage-cost bounding (§4.4 / Decision #38, P0-4): the customer-data bucket MUST
+  // carry a lifecycle configuration with a 1-year expiration backstop so its footprint
+  // plateaus. This is the CI gate that was missing — without it the bucket returns
+  // NoSuchLifecycleConfiguration and objects accumulate forever.
+  test('knowledge bucket has a lifecycle rule with a 1-year expiration backstop (§4.4)', () => {
+    const t = buildDataStack();
+    t.hasResourceProperties('AWS::S3::Bucket', {
+      LifecycleConfiguration: {
+        Rules: Match.arrayWith([
+          Match.objectLike({
+            Status: 'Enabled',
+            ExpirationInDays: 365,
+          }),
+        ]),
+      },
+    });
+  });
 });
 
 describe('Edge layer / WAF (§5.6 — closes audit M2)', () => {
