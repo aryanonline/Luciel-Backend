@@ -61,6 +61,7 @@ def _budget_out(b: metering.MeteredBudget) -> BudgetOut:
             "billedThisPeriod": b.billed_this_period,
             "periodResetsAt": b.period_resets_at,
             "atCap": b.at_cap,
+            "nearNextBlock": b.near_next_block,
         }
     )
 

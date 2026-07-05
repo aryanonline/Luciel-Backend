@@ -28,6 +28,10 @@ class BudgetOut(WireModel):
     billed_this_period: int
     period_resets_at: datetime
     at_cap: bool
+    # PAYG heads-up (§3.4.1b / Vision §7): true when a payg_enabled account is ~80%+
+    # through its CURRENT billed 100-block, so the dashboard can warn before a new
+    # block is billed. Honest nudge only — NOT a cap. Always false for free_cap.
+    near_next_block: bool = False
 
 
 class PaymentMethodOut(WireModel):

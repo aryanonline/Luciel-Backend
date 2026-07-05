@@ -84,6 +84,8 @@ class MeteredBudget:
     billed_this_period: int  # billed-conversation COUNT above free
     period_resets_at: datetime
     at_cap: bool
+    # PAYG ~80%-through-current-100-block heads-up (§3.4.1b / Vision §7). Nudge, not a cap.
+    near_next_block: bool
 
     # Money side (for Stripe reporting; NOT on the wire Budget shape).
     billed_blocks: int
@@ -150,6 +152,16 @@ async def build_budget(
 
     at_cap = counted >= free and not has_live_card  # at_cap is data (§3.4.1b)
 
+    # PAYG heads-up: only for a live-card account above the free allowance, true when
+    # the account is >=80% through its CURRENT billed 100-block (position WITHIN the
+    # block, not the whole period). e.g. over=80 -> 80/100 -> True; over=100 (a fresh
+    # block just started) -> position 0 -> False. Honest early warning before a new
+    # block is billed; never a cap.
+    near_next_block = False
+    if has_live_card and counted > free:
+        position_in_block = (counted - free) % settings.payg_block_size
+        near_next_block = position_in_block >= int(settings.payg_block_size * 0.8)
+
     # billedThisPeriod (wire COUNT) is only nonzero when billing actually applies —
     # i.e. there is a live card. A cardless account caps at free, so nothing billed.
     billed_count = billed_conversations(counted, free) if has_live_card else 0
@@ -178,6 +190,7 @@ async def build_budget(
         billed_this_period=billed_count,
         period_resets_at=resets_at,
         at_cap=at_cap,
+        near_next_block=near_next_block,
         billed_blocks=blocks,
         billed_cents=cents,
     )

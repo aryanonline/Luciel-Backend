@@ -85,6 +85,8 @@ async def test_get_billing_free_cap_shape(client) -> None:
     assert budget["conversationsThisPeriod"] == 10
     assert budget["billedThisPeriod"] == 0
     assert budget["atCap"] is False
+    # PAYG heads-up is always false for a free_cap account (no billed blocks).
+    assert budget["nearNextBlock"] is False
     assert "periodResetsAt" in budget
     # paymentMethod present ONLY when payg_enabled.
     assert body.get("paymentMethod") is None
@@ -120,6 +122,42 @@ async def test_get_billing_payg_includes_display_payment_method(client) -> None:
     pm = body["paymentMethod"]
     # Display tuple only — exactly the four frozen fields, NO PAN.
     assert pm == {"brand": "visa", "last4": "4242", "expMonth": 12, "expYear": 2028}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payg_near_next_block_nudge(client) -> None:
+    # PAYG heads-up (§3.4.1b / Vision §7): a live-card account >=80% through its
+    # current billed 100-block gets nearNextBlock=True (honest nudge, not a cap).
+    # counted=240 -> over=190 -> position in block = 90 -> True.
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=240)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        acct.pm_exp_month = 12
+        acct.pm_exp_year = 2028
+        await s.flush()
+    r = await client.get("/api/v1/billing")
+    assert r.json()["budget"]["nearNextBlock"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payg_not_near_next_block(client) -> None:
+    # Early in a block -> not near. counted=170 -> over=120 -> position 20 -> False.
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=170)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        acct.pm_exp_month = 12
+        acct.pm_exp_year = 2028
+        await s.flush()
+    r = await client.get("/api/v1/billing")
+    assert r.json()["budget"]["nearNextBlock"] is False
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
