@@ -4,6 +4,7 @@ Implements the frozen admin client (http-admin.ts connections.*) field-for-field
   * GET    /connections                      → Connection[] (non-secret only, §3.8.3)
   * POST   /connections {connectionType,...}  → StartConnectionResult
   * POST   /connections/{id}/reconnect        → StartConnectionResult
+  * POST   /connections/{id}/swap {provider}   → StartConnectionResult (§3.8.7 rule B)
   * DELETE /connections/{id}                  → 204 (status→revoked + secret cleanup)
   * GET    /connections/email                 → EmailProvisioning | null (§3.1.6a)
   * POST   /connections/email {mode,...}       → EmailProvisioning (§3.1.6a)
@@ -34,6 +35,7 @@ from app.schemas_api.connections import (
     ProvisionEmailRequest,
     StartConnectionRequest,
     StartConnectionResult,
+    SwapConnectionRequest,
 )
 
 router = APIRouter(prefix="/api/v1/admin/connections", tags=["connections"])
@@ -151,6 +153,29 @@ async def reconnect_connection(
             s,
             admin_id=subject.admin_id,
             connection_id=connection_id,
+            user_id=subject.user_id,
+        )
+        if out is None:
+            raise not_found("Connection not found.")
+        _, result = out
+        return StartConnectionResult.model_validate(result)
+
+
+@router.post("/{connection_id}/swap", response_model=StartConnectionResult)
+async def swap_connection(
+    connection_id: uuid.UUID,
+    req: SwapConnectionRequest,
+    subject: Subject = Depends(current_admin),
+) -> StartConnectionResult:
+    """Change the connected account (§3.8.7 rule B): re-initiate the connect flow
+    against a (possibly different) provider while the CURRENT connection stays live
+    until the new credential verifies (proven-before-cutover, Decision §45)."""
+    async with tenant_session(subject.admin_id) as s:
+        out = await service.swap(
+            s,
+            admin_id=subject.admin_id,
+            connection_id=connection_id,
+            provider=req.provider,
             user_id=subject.user_id,
         )
         if out is None:

@@ -184,6 +184,14 @@ class Orchestrator:
     # tools are not wired (the default in Arc 14). A None resolution yields a `failed`
     # outcome so the loop reasons about it uniformly (§3.4.1).
     tool_resolver: ToolResolver | None = None
+    # §3.8.7 rule E (Decision #39): the CAPABILITY set of tools enabled when THIS
+    # conversation began, taken from the session's config_snapshot. A tool enabled
+    # AFTER open is an additive change that must apply to the NEXT conversation, not
+    # this one — so a proposed tool_id outside this set is treated as unavailable even
+    # if the live instance now authorizes it. None = no snapshot (older sessions) →
+    # fall back to the broker's live gates alone. This is CAPABILITY=snapshot; the
+    # broker's connection/authorization gates remain LIVE (usability=live, safety wins).
+    snapshot_tool_ids: set[str] | None = None
 
     def __post_init__(self) -> None:
         # Defense 6 (§3.4.14): compose the system prompt with the platform-invariant
@@ -469,6 +477,14 @@ class Orchestrator:
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
             inputs = call.get("inputs", {})
+            # §3.8.7 rule E capability gate: a tool enabled AFTER this conversation
+            # opened is not part of its frozen snapshot capability set, so it is
+            # unavailable to THIS conversation (applies to the next one). Deferred
+            # additive change → structured `failed`, never a silent success-claim
+            # (§3.3.4 rule 1). None snapshot = older session → skip this filter.
+            if self.snapshot_tool_ids is not None and tool_id not in self.snapshot_tool_ids:
+                outcomes.append("failed")
+                continue
             tool = self.tool_resolver(tool_id) if self.tool_resolver else None
             if tool is None:
                 # No backend wired (Arc 17) or unknown tool → structured failure,

@@ -41,7 +41,7 @@ from app.runtime import budget
 from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
-from app.runtime.sessions import resolve_or_open_session
+from app.runtime.sessions import effective_config, resolve_or_open_session
 from app.schemas_api.widget import (
     WidgetBootstrapOut,
     WidgetBootstrapRequest,
@@ -203,6 +203,14 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         # Content flows through wrap_untrusted in the loop (§3.4.14).
         retriever = make_retriever(s, admin_id=ctx.admin_id, instance_id=ctx.instance_id)
 
+        # §3.8.7 rule E (Decision #39): source the additive/neutral effective config
+        # (enabled tools, business-context, enabled channels) from the config snapshot
+        # frozen at session-open, so an additive pillar edit made mid-conversation
+        # applies to the NEXT conversation — not this in-flight one. NULL snapshot
+        # (older sessions) falls back to the LIVE instance config. Connection health +
+        # disable/revoke stay LIVE via the broker gates (safety half wins).
+        effective = effective_config(sess.config_snapshot, inst, always_include_channel=CHANNEL)
+
         # LLM router is mode-aware (GATE 2 cutover, §3.4.3): mock (default) returns the
         # deterministic EchoModel exactly as before; live binds the real Anthropic/
         # OpenAI providers from the platform secret. admin_id flows through so the
@@ -213,11 +221,12 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             retriever=retriever,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
-            enabled_channels={CHANNEL},
+            enabled_channels=effective.enabled_channels,
             # 280-char admin business-context, composed UNDER the platform invariants
             # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
-            business_context=inst.business_one_liner,
+            business_context=effective.business_context,
             has_payment_method=False,
+            snapshot_tool_ids=effective.snapshot_tool_ids,
         )
         result = await orch.run_turn(
             session_id=sess.id,

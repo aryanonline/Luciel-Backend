@@ -231,6 +231,64 @@ async def reconnect(
     return connection, _start_result(connection.auth_class, connection)
 
 
+async def swap(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    provider: str,
+    user_id: uuid.UUID | None,
+) -> tuple[InstanceConnection, dict[str, object]] | None:
+    """Change the connected account: re-initiate a connect flow against a (possibly
+    different) provider WITHOUT taking the current connection offline (§3.8.7 rule B,
+    Decision §45 proven-before-cutover).
+
+    A swap is a reconnect that also re-points ``provider``: the EXISTING credential
+    stays live (status is preserved via the ``reconnect_pending`` marker), the new
+    provider is prepared, and cutover to ``connected`` happens only when the caller
+    invokes ``confirm_reconnect()`` after the new credential health-checks. On probe
+    failure ``confirm_reconnect`` restores the prior status — the old account remains
+    connected. connection_type is unchanged, so ``auth_class`` (and therefore the
+    connect-flow shape) is unchanged. Returns None if no such connection for tenant."""
+    connection = (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if connection is None:
+        return None
+
+    # Proven-before-cutover: record intent + re-point provider without dropping the
+    # live status. The new provider only becomes authoritative once confirm_reconnect
+    # health-checks it; a failed probe rolls back to the prior status (old stays live).
+    old_status = connection.status
+    old_provider = connection.provider
+    connection.provider = provider
+    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
+    await session.flush()
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": old_status,  # preserved — cutover only on health confirm
+            "reason": "swap_pending",
+            "old_provider": old_provider,
+            "new_provider": provider,
+        },
+    )
+    return connection, _start_result(connection.auth_class, connection)
+
+
 async def confirm_reconnect(
     session: AsyncSession,
     *,

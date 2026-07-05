@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +31,12 @@ class Session(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # §3.7.1/§3.8.7 rule E: the EFFECTIVE additive/neutral config (enabled tools,
+    # personality, enabled channels) frozen at session-open. Additive pillar changes
+    # made mid-conversation apply to NEW sessions only — this snapshot is the capability
+    # set the orchestrator reads from. Usability of each capability stays LIVE via the
+    # broker's connection/health gates (safety half wins). NULL → fall back to live config.
+    config_snapshot: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
 
 
 class Transcript(Base, TenantMixin, TimestampMixin):

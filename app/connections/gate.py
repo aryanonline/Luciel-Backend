@@ -11,12 +11,17 @@ connection" (§3.8.5). The Arc 12 tool broker's inline gate-2 is refactored to c
 ``connection_status`` / ``connection_healthy`` here so there is exactly one place
 that decides what "connected" means (§3.8.7 rule A consolidation).
 
-§3.8.7 rule E (config-snapshot, safety side): the gate reads LIVE status straight
-from the row on every call — it never caches or snapshots — so a mid-conversation
-disable/revoke or a health-worker transition to expired/error takes effect on the
-VERY NEXT attempt. This is the safety-critical immediate-effect behavior; the
-deferred additive-snapshot side of rule E (new tools/personality apply to the next
-conversation) is NOT implemented here and is flagged in the PR.
+§3.8.7 rule E (config-snapshot) is split across two layers, and this module owns the
+SAFETY half: the gate reads LIVE status straight from the row on every call — it never
+caches or snapshots — so a mid-conversation disable/revoke or a health-worker
+transition to expired/error takes effect on the VERY NEXT attempt (capability=snapshot,
+usability=live). The deferred additive half of rule E (a newly enabled tool /
+personality / business-context edit applies to the NEXT conversation, not an in-flight
+one) is implemented in the session/orchestrator layer: sessions.resolve_or_open_session
+freezes the effective capability set onto ``sessions.config_snapshot`` at open, and the
+orchestrator sources enabled tools/channels/context from that snapshot. Those two halves
+compose: a tool in the snapshot whose connection is now unhealthy is still blocked HERE
+(safety wins), and a tool enabled after open is not yet a capability for this session.
 """
 
 from __future__ import annotations

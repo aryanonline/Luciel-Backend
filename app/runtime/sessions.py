@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import enum
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import Session
+from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
 
 # Inactivity timeout by channel interaction class (§3.4.8) — platform constants.
@@ -121,10 +124,98 @@ async def resolve_or_open_session(
         counted=False,
         started_at=_now(),
         last_message_at=_now(),
+        # §3.7.1/§3.8.7 rule E: freeze the EFFECTIVE additive/neutral config at open so
+        # later additive pillar edits apply to the NEXT conversation, not this one.
+        config_snapshot=await _build_config_snapshot(
+            session, admin_id=admin_id, instance_id=instance_id
+        ),
     )
     session.add(new_session)
     await session.flush()
     return new_session, True
+
+
+async def _build_config_snapshot(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+) -> dict[str, object] | None:
+    """Snapshot the EFFECTIVE additive/neutral config at session-open (§3.8.7 rule E).
+
+    Captures the CAPABILITY set — which tools/channels are enabled and the personality/
+    business context — as it stood when the conversation began. Usability of each
+    capability is NOT frozen here: connection health + disable/revoke stay LIVE via the
+    broker gates (the safety half must still win). Returns None if the instance is
+    missing so the caller stores NULL and the orchestrator falls back to live config.
+    """
+    inst: Instance | None = (
+        await session.execute(
+            select(Instance).where(Instance.admin_id == admin_id, Instance.id == instance_id)
+        )
+    ).scalar_one_or_none()
+    if inst is None:
+        return None
+    return {
+        "enabled_tools": [
+            str(t["id"]) for t in inst.tools if isinstance(t, dict) and t.get("enabled")
+        ],
+        "enabled_channels": [
+            str(c["id"]) for c in inst.channels if isinstance(c, dict) and c.get("enabled")
+        ],
+        "personality": dict(inst.personality),
+        "business_context": inst.business_one_liner,
+    }
+
+
+@dataclass(frozen=True)
+class EffectiveConfig:
+    """The additive/neutral effective config a turn runs against (§3.8.7 rule E).
+
+    ``snapshot_tool_ids`` is the frozen CAPABILITY set (None = older session with no
+    snapshot → the orchestrator applies no snapshot filter and relies on the broker's
+    live gates). ``business_context`` / ``enabled_channels`` are the neutral tuning
+    captured at open (or live-config fallback when the snapshot is NULL)."""
+
+    enabled_channels: set[str]
+    business_context: str | None
+    snapshot_tool_ids: set[str] | None
+
+
+def effective_config(
+    snapshot: dict[str, object] | None,
+    instance: Instance,
+    *,
+    always_include_channel: str | None = None,
+) -> EffectiveConfig:
+    """Resolve the effective additive/neutral config for a turn (§3.8.7 rule E).
+
+    Prefers the session's ``config_snapshot`` (frozen at open) so additive pillar edits
+    made mid-conversation defer to the NEXT conversation. Falls back to the LIVE
+    instance config when the snapshot is NULL (older sessions still work). Connection
+    health + disable/revoke are NOT resolved here — they stay LIVE in the broker gates
+    (capability=snapshot, usability=live: the safety half must still win)."""
+    business_context: str | None
+    if snapshot:
+        snap_channels = cast("list[object]", snapshot.get("enabled_channels") or [])
+        snap_tools = cast("list[object]", snapshot.get("enabled_tools") or [])
+        channels = {str(ch) for ch in snap_channels}
+        raw_ctx = snapshot.get("business_context")
+        business_context = str(raw_ctx) if raw_ctx is not None else None
+        tool_ids: set[str] | None = {str(t) for t in snap_tools}
+    else:
+        channels = {
+            str(c["id"]) for c in instance.channels if isinstance(c, dict) and c.get("enabled")
+        }
+        business_context = instance.business_one_liner
+        tool_ids = None  # no snapshot → rely on the broker's live gates only
+    if always_include_channel is not None:
+        channels = channels | {always_include_channel}
+    return EffectiveConfig(
+        enabled_channels=channels,
+        business_context=business_context,
+        snapshot_tool_ids=tool_ids,
+    )
 
 
 async def _maybe_reactivate_lead(

@@ -167,6 +167,97 @@ async def test_reconnect_resets_and_returns_result(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_swap_keeps_old_live_until_confirm(client):
+    """§3.8.7 rule B: 'Change connected account' re-initiates the connect flow against a
+    new provider WITHOUT taking the current connection offline (proven-before-cutover).
+    The old provider/status stay live; cutover happens only on confirm_reconnect."""
+    import uuid as _uuid
+
+    from app.auth.tokens import decode_token
+    from app.config import get_settings
+    from app.connections import service
+    from app.db.session import tenant_session
+
+    await _ready_account_with_luciel(client)
+    # Start + drive to connected so there is a LIVE account to swap away from.
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "calendar", "provider": "google_calendar"},
+    )
+    cid = (await client.get("/api/v1/admin/connections")).json()[0]["connectionId"]
+    token = client.cookies.get(get_settings().session_cookie_name)
+    admin_id = _uuid.UUID(decode_token(token)["sub"])
+    async with tenant_session(admin_id) as s:
+        await service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=_uuid.UUID(cid), user_id=None, probe_ok=True
+        )
+
+    # Swap to a different provider — returns authorizeUrl (calendar is OAuth-class).
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/swap", json={"provider": "microsoft_calendar"}
+    )
+    assert r.status_code == 200
+    assert "authorizeUrl" in r.json() and r.json()["authorizeUrl"]
+
+    # PROVEN-BEFORE-CUTOVER: before confirming, the connection is still `connected`
+    # (old account stays live). The provider is re-pointed, but usability is unchanged.
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["status"] == "connected"
+
+    # After a successful confirm, it cuts over to connected on the new provider.
+    async with tenant_session(admin_id) as s:
+        ok, state = await service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=_uuid.UUID(cid), user_id=None, probe_ok=True
+        )
+    assert ok and state == "connected"
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["status"] == "connected"
+    assert row["provider"] == "microsoft_calendar"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_swap_failed_probe_keeps_old_account_live(client):
+    """§3.8.7 rule B: if the new credential fails its health probe, the swap rolls back
+    to the prior status — the old account remains live (never a mid-swap outage)."""
+    import uuid as _uuid
+
+    from app.auth.tokens import decode_token
+    from app.config import get_settings
+    from app.connections import service
+    from app.db.session import tenant_session
+
+    await _ready_account_with_luciel(client)
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "calendar", "provider": "google_calendar"},
+    )
+    cid = (await client.get("/api/v1/admin/connections")).json()[0]["connectionId"]
+    token = client.cookies.get(get_settings().session_cookie_name)
+    admin_id = _uuid.UUID(decode_token(token)["sub"])
+    async with tenant_session(admin_id) as s:
+        await service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=_uuid.UUID(cid), user_id=None, probe_ok=True
+        )
+    await client.post(
+        f"/api/v1/admin/connections/{cid}/swap", json={"provider": "microsoft_calendar"}
+    )
+    # Probe fails → prior status restored; old account stays live (§3.8.7 rule B).
+    async with tenant_session(admin_id) as s:
+        ok, _reason = await service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=_uuid.UUID(cid), user_id=None, probe_ok=False
+        )
+    assert not ok
+    assert (await client.get("/api/v1/admin/connections")).json()[0]["status"] == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_swap_missing_404(client):
+    await _ready_account_with_luciel(client)
+    r = await client.post(f"/api/v1/admin/connections/{uuid.uuid4()}/swap", json={"provider": "x"})
+    assert r.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_disconnect_204_and_hidden_from_list(client):
     await _ready_account_with_luciel(client)
     await client.post(

@@ -54,6 +54,14 @@ class StartConnectionResult(WireModel):
     requires_client_form: bool | None = None
 
 
+class SwapConnectionRequest(WireModel):
+    """POST body for "Change connected account" (§3.8.7 rule B). Swap re-initiates the
+    connect flow against a (possibly different) provider while the CURRENT connection
+    stays live until the new credential verifies (proven-before-cutover)."""
+
+    provider: str
+
+
 # --- Email provisioning (§3.1.6a / Decision #49) ----------------------------------- #
 # The tenant PROVISIONS the address Luciel sends + receives on. Two modes, both LAUNCH
 # capabilities: own_domain (the business's own address; requires inbound DNS/MX routing)
