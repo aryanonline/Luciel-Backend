@@ -99,6 +99,7 @@ class ToolBroker:
         *,
         admin_id: uuid.UUID,
         instance_id: uuid.UUID,
+        resolved_lead_id: uuid.UUID | None = None,
     ) -> ToolResult:
         # Gate 1 — Authorization (default-deny).
         if not await self._authorized(admin_id, instance_id, tool.tool_id):
@@ -153,6 +154,7 @@ class ToolBroker:
             instance_id=instance_id,
             connection_status=conn_status,
             session=self.s,  # §3.3.5: tools that need a durable write receive the session
+            resolved_lead_id=resolved_lead_id,  # §3.3.5: per-lead cap key for schedule_callback
         )
         try:
             result = await tool.execute(inputs, ctx)

@@ -298,7 +298,7 @@ class Orchestrator:
 
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
         resp, iterations, used_fallback, llm_failed = await self._reason(
-            inbound_text, history, wrapped_chunks
+            inbound_text, history, wrapped_chunks, resolved_lead_id=resolved_lead_id
         )
 
         if llm_failed:
@@ -389,7 +389,12 @@ class Orchestrator:
 
     # --- internals ---------------------------------------------------------- #
     async def _reason(
-        self, inbound_text: str, history: list[Transcript], wrapped_chunks: list[str]
+        self,
+        inbound_text: str,
+        history: list[Transcript],
+        wrapped_chunks: list[str],
+        *,
+        resolved_lead_id: uuid.UUID | None = None,
     ) -> tuple[_Reasoned, int, bool, bool]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and
@@ -417,7 +422,9 @@ class Orchestrator:
             last = resp
             # ACT: dispatch any proposed tool calls via the Arc 12 broker contract.
             if resp.tool_calls:
-                outcomes = await self._dispatch_tools(resp.tool_calls)
+                outcomes = await self._dispatch_tools(
+                    resp.tool_calls, resolved_lead_id=resolved_lead_id
+                )
                 tool_outcomes.extend(outcomes)
                 # REFLECT: feed tool outcomes back as untrusted context, iterate.
                 messages.append(
@@ -441,7 +448,12 @@ class Orchestrator:
             False,
         )
 
-    async def _dispatch_tools(self, tool_calls: list[dict[str, object]]) -> list[str]:
+    async def _dispatch_tools(
+        self,
+        tool_calls: list[dict[str, object]],
+        *,
+        resolved_lead_id: uuid.UUID | None = None,
+    ) -> list[str]:
         """Dispatch PLAN tool intents via the Arc 12 broker, returning the
         five-outcome class per call (§3.3.3/§3.3.4). The broker enforces
         default-deny authorization + connection gating in code — the loop never
@@ -464,6 +476,7 @@ class Orchestrator:
                 dict(inputs) if isinstance(inputs, dict) else {},
                 admin_id=self.admin_id,
                 instance_id=self.instance_id,
+                resolved_lead_id=resolved_lead_id,
             )
             outcomes.append(result.outcome.value)
         return outcomes

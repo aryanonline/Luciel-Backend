@@ -77,6 +77,11 @@ class ToolContext:
     # Optional DB session injected by the broker for tools that durably write rows
     # (e.g. ScheduleCallbackTool — §3.3.5). Never used by read-only tools.
     session: Any = None
+    # The resolved lead identity for this turn, when known (§3.3.5): threaded from the
+    # orchestrator so schedule_callback can enforce its per-lead cap. May be None for
+    # sessions whose identity is not yet resolved (e.g. anonymous widget) — the per-lead
+    # cap only applies when a lead key is present; the per-tenant cap always applies.
+    resolved_lead_id: Any = None
 
 
 class Tool(Protocol):

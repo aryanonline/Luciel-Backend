@@ -374,3 +374,134 @@ async def test_schedule_callback_writes_deferred_action_row():
             )
         ).scalar_one()
         assert count == 1, f"Expected 1 DeferredAction row, got {count}"
+
+
+# ---------------------------------------------------------------------------
+# P0-3 (§3.3.5 / Decision #51): schedule_callback rate-limit — enforced at
+# scheduling time, expressed as a structured `failed` reason, no row on reject.
+# ---------------------------------------------------------------------------
+
+
+async def _count_queued_callbacks(s, admin, *, resolved_lead_id=None) -> int:
+    from app.models.deferred import DeferredAction
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    stmt = (
+        sa_select(func.count())
+        .select_from(DeferredAction)
+        .where(
+            DeferredAction.admin_id == admin,
+            DeferredAction.action_type == "schedule_callback",
+            DeferredAction.status == "queued",
+        )
+    )
+    if resolved_lead_id is not None:
+        stmt = stmt.where(DeferredAction.resolved_lead_id == resolved_lead_id)
+    return (await s.execute(stmt)).scalar_one()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_schedule_callback_per_lead_cap_and_no_row_on_reject():
+    """§3.3.5: at the per-lead pending cap (3), the 3rd callback for a lead succeeds
+    and the 4th returns a structured rate_limited:per_lead — with NO row written and
+    the rejection traced."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin, authorize=["schedule_callback"], connect_calendar=None)
+    lead = uuid.uuid4()
+    cap = catalog.SCHEDULE_CALLBACK_PER_LEAD_PENDING_CAP
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        tool = catalog.ScheduleCallbackTool()
+        # First `cap` (3) callbacks for this lead succeed.
+        for i in range(cap):
+            res = await broker.dispatch(
+                tool,
+                {"fire_at": f"2026-06-25T1{i}:00Z", "channel": "email", "message": "follow up"},
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead,
+            )
+            assert res.outcome is Outcome.ok, f"call {i}: {res.reason}"
+
+        # The (cap+1)-th is rate-limited: structured failed reason, not a new Outcome.
+        res = await broker.dispatch(
+            tool,
+            {"fire_at": "2026-06-25T20:00Z", "channel": "email", "message": "follow up"},
+            admin_id=admin,
+            instance_id=iid,
+            resolved_lead_id=lead,
+        )
+        assert res.outcome is Outcome.failed
+        assert res.reason == "rate_limited:per_lead"
+
+        # No row written on rejection — exactly `cap` queued for the lead.
+        assert await _count_queued_callbacks(s, admin, resolved_lead_id=lead) == cap
+        # The rejection was traced (§3.3.4 rule 3).
+        last = broker.traces[-1]
+        assert last["outcome"] == "failed" and last["reason"] == "rate_limited:per_lead"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_schedule_callback_per_lead_cap_isolated_per_lead():
+    """The per-lead cap is scoped per lead: a second lead is unaffected by the first
+    lead being at cap."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin, authorize=["schedule_callback"], connect_calendar=None)
+    lead_a, lead_b = uuid.uuid4(), uuid.uuid4()
+    cap = catalog.SCHEDULE_CALLBACK_PER_LEAD_PENDING_CAP
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        tool = catalog.ScheduleCallbackTool()
+        for i in range(cap):
+            await broker.dispatch(
+                tool,
+                {"fire_at": f"2026-06-25T1{i}:00Z", "channel": "email", "message": "m"},
+                admin_id=admin,
+                instance_id=iid,
+                resolved_lead_id=lead_a,
+            )
+        # lead_a is at cap; lead_b's first callback still succeeds.
+        res = await broker.dispatch(
+            tool,
+            {"fire_at": "2026-06-25T21:00Z", "channel": "email", "message": "m"},
+            admin_id=admin,
+            instance_id=iid,
+            resolved_lead_id=lead_b,
+        )
+        assert res.outcome is Outcome.ok
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_schedule_callback_per_tenant_cap():
+    """§3.3.5: over the per-tenant pending ceiling, schedule_callback returns a
+    structured rate_limited:per_tenant even when no lead key is present (anonymous
+    session) — the per-tenant axis is enforced unconditionally."""
+    from app.connections import deferred_queue
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, authorize=["schedule_callback"], connect_calendar=None)
+    cap = catalog.SCHEDULE_CALLBACK_PER_TENANT_PENDING_CAP
+    async with tenant_session(admin) as s:
+        # Seed the tenant right up to its pending ceiling (distinct anonymous rows).
+        for _ in range(cap):
+            await deferred_queue.enqueue(
+                s,
+                admin_id=admin,
+                instance_id=iid,
+                action_type="schedule_callback",
+                connection_type="email_sender",
+                payload={"fire_at": "2026-06-25T10:00Z", "channel": "email", "message": "m"},
+            )
+        broker = ToolBroker(s)
+        # No resolved_lead_id (anonymous) → per-lead axis skipped, per-tenant fires.
+        res = await broker.dispatch(
+            catalog.ScheduleCallbackTool(),
+            {"fire_at": "2026-06-25T22:00Z", "channel": "email", "message": "m"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+        assert res.outcome is Outcome.failed
+        assert res.reason == "rate_limited:per_tenant"
+        # No row beyond the seeded ceiling.
+        assert await _count_queued_callbacks(s, admin) == cap

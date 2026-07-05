@@ -36,6 +36,10 @@ class DeferredAction(Base, TenantMixin, TimestampMixin):
     # and the connection_type whose health gates its delivery (§3.8.7 rule D / A.2).
     action_type: Mapped[str] = mapped_column(String(64), nullable=False)
     connection_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The resolved lead this action targets, when known (§3.3.5). Nullable: sessions
+    # without a resolved identity (e.g. anonymous widget) carry None. Used to enforce
+    # the schedule_callback per-lead cap; RLS + admin_id still scope every row.
+    resolved_lead_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     # Non-secret payload the delivery needs (recipient, message, fire_at, etc.).
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
     # queued | delivered | abandoned (§3.8.7 rule D terminal states).

@@ -65,13 +65,15 @@ async def enqueue(
     action_type: str,
     connection_type: str,
     payload: dict[str, object],
+    resolved_lead_id: uuid.UUID | None = None,
     now: datetime | None = None,
 ) -> DeferredAction:
     """Queue a deferred action whose delivery connection was unhealthy (§3.8.7 D).
 
     The item is eligible for its first retry immediately (next_attempt_at = now) and
     expires 24h from creation. It is NEVER dropped — that is the whole point of the
-    rule-D queue."""
+    rule-D queue. ``resolved_lead_id`` (when known) is stored so schedule_callback can
+    count pending callbacks per lead (§3.3.5)."""
     now = now or datetime.now(UTC)
     action = DeferredAction(
         id=uuid.uuid4(),
@@ -79,6 +81,7 @@ async def enqueue(
         instance_id=instance_id,
         action_type=action_type,
         connection_type=connection_type,
+        resolved_lead_id=resolved_lead_id,
         payload=payload,
         status="queued",
         attempts=0,

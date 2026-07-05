@@ -9,11 +9,27 @@ providers; the real backends bind via the Connections layer (Arc 17).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from sqlalchemy import func, select
+
 from app.connections import deferred_queue
+from app.models.deferred import DeferredAction
 from app.tools import contract as c
 from app.tools.contract import Outcome, Tool, ToolContext, ToolResult
+
+# --- schedule_callback rate-limit caps (Architecture §3.3.5 / Decision #51) ---- #
+# schedule_callback is the one tool that creates FUTURE outbound sends, so it is
+# rate-limited on two axes AT SCHEDULING TIME (before any DeferredAction row is
+# written). These are PLATFORM CONSTANTS — deliberately NOT admin-configurable — so a
+# tenant (or a misbehaving loop) cannot nag a lead or fan out unbounded future sends.
+# Tunable here as platform policy only.
+SCHEDULE_CALLBACK_PER_LEAD_PENDING_CAP = 3
+SCHEDULE_CALLBACK_PER_LEAD_24H_CAP = 5
+SCHEDULE_CALLBACK_PER_TENANT_PENDING_CAP = 50
+SCHEDULE_CALLBACK_PER_TENANT_24H_CAP = 200
+_ROLLING_WINDOW = timedelta(hours=24)
 
 
 # --- backends (injected; real impls land in Arc 17) ------------------------- #
@@ -157,6 +173,75 @@ class ScheduleCallbackTool:
         "widget": "channel_auth",
     }
 
+    async def _count_pending(
+        self, session: Any, *, instance_id: Any, resolved_lead_id: Any = None
+    ) -> int:
+        """Count queued schedule_callback callbacks for this instance (optionally lead).
+
+        RLS + the tenant session already scope rows to the caller's tenant; we filter
+        by instance_id (and resolved_lead_id when a lead key is present) on top."""
+        stmt = (
+            select(func.count())
+            .select_from(DeferredAction)
+            .where(
+                DeferredAction.instance_id == instance_id,
+                DeferredAction.action_type == "schedule_callback",
+                DeferredAction.status == "queued",
+            )
+        )
+        if resolved_lead_id is not None:
+            stmt = stmt.where(DeferredAction.resolved_lead_id == resolved_lead_id)
+        return int((await session.execute(stmt)).scalar_one())
+
+    async def _count_created_since(
+        self, session: Any, *, instance_id: Any, since: datetime, resolved_lead_id: Any = None
+    ) -> int:
+        """Count schedule_callback rows created within the rolling window (any status)."""
+        stmt = (
+            select(func.count())
+            .select_from(DeferredAction)
+            .where(
+                DeferredAction.instance_id == instance_id,
+                DeferredAction.action_type == "schedule_callback",
+                DeferredAction.created_at >= since,
+            )
+        )
+        if resolved_lead_id is not None:
+            stmt = stmt.where(DeferredAction.resolved_lead_id == resolved_lead_id)
+        return int((await session.execute(stmt)).scalar_one())
+
+    async def _rate_limit_check(self, session: Any, context: ToolContext) -> ToolResult | None:
+        """Two-axis cap (§3.3.5): per-lead (when a lead key is present) + per-tenant,
+        on pending count AND rolling-24h created count. Returns a structured failed
+        outcome when over cap, else None. Counted BEFORE the enqueue write."""
+        instance_id = context.instance_id
+        lead_id = context.resolved_lead_id
+        since = datetime.now(UTC) - _ROLLING_WINDOW
+
+        # Per-lead axis — only when the lead identity is resolved (do NOT fabricate a
+        # key; anonymous/unresolved sessions fall through to the per-tenant axis).
+        if lead_id is not None:
+            lead_pending = await self._count_pending(
+                session, instance_id=instance_id, resolved_lead_id=lead_id
+            )
+            if lead_pending >= SCHEDULE_CALLBACK_PER_LEAD_PENDING_CAP:
+                return c.failed("rate_limited:per_lead")
+            lead_24h = await self._count_created_since(
+                session, instance_id=instance_id, since=since, resolved_lead_id=lead_id
+            )
+            if lead_24h >= SCHEDULE_CALLBACK_PER_LEAD_24H_CAP:
+                return c.failed("rate_limited:per_lead")
+
+        # Per-tenant axis — enforced unconditionally (a ceiling per instance).
+        tenant_pending = await self._count_pending(session, instance_id=instance_id)
+        if tenant_pending >= SCHEDULE_CALLBACK_PER_TENANT_PENDING_CAP:
+            return c.failed("rate_limited:per_tenant")
+        tenant_24h = await self._count_created_since(session, instance_id=instance_id, since=since)
+        if tenant_24h >= SCHEDULE_CALLBACK_PER_TENANT_24H_CAP:
+            return c.failed("rate_limited:per_tenant")
+
+        return None
+
     async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
         """Durably enqueue a DeferredAction row (§3.3.5). ok ONLY after the write."""
         session = context.session
@@ -167,6 +252,15 @@ class ScheduleCallbackTool:
         channel: str = inputs["channel"]
         connection_type = self._CHANNEL_TO_CONNECTION.get(channel, "channel_auth")
 
+        # §3.3.5 / Decision #51: enforce the two-axis rate limit BEFORE the enqueue
+        # write, so an over-cap schedule NEVER persists a row and never nags the lead.
+        # rate_limited is expressed as a STRUCTURED `failed` reason (§3.3.4) the loop
+        # reasons about — NOT a new Outcome enum value (keeps the frozen contract). The
+        # broker traces every outcome including this refusal (§3.3.4 rule 3).
+        rejection = await self._rate_limit_check(session, context)
+        if rejection is not None:
+            return rejection
+
         try:
             await deferred_queue.enqueue(
                 session,
@@ -174,6 +268,7 @@ class ScheduleCallbackTool:
                 instance_id=context.instance_id,
                 action_type="schedule_callback",
                 connection_type=connection_type,
+                resolved_lead_id=context.resolved_lead_id,
                 payload={
                     "fire_at": inputs["fire_at"],
                     "channel": channel,
