@@ -176,6 +176,12 @@ async def _on_payment_failed(
             event_type="dunning_state_changed",
             payload={"from": prev, "to": account.dunning_state, "reason": "payment_failed"},
         )
+        # Legal §A3 / Architecture §3.6.7: reaching `reduced` (day-7 exhaustion) sends
+        # action-tool connections dormant (credentials retained, not purged).
+        if account.dunning_state == dunning.REDUCED:
+            await dunning.set_dormant_for_action_tools(
+                session, admin_id=admin_id, reason="dunning_reduced"
+            )
 
     # Architecture §3.6.7 / Legal §A3: notify admin at each retry attempt and emit
     # lifecycle_notice_sent audit event.
@@ -274,7 +280,11 @@ async def _restore_dormant_connections(session: AsyncSession, *, admin_id: uuid.
 async def _on_pm_detached(
     session: AsyncSession, *, admin_id: uuid.UUID, account: BillingAccount
 ) -> str:
-    """payment_method.detached → free_cap + clear the display tuple (Legal §A3)."""
+    """payment_method.detached → free_cap + clear the display tuple (Legal §A3).
+
+    Also sends action-tool connections dormant (Legal §A3: losing a payment
+    method reverts to free-cap behavior AND "Action-tool connections go dormant").
+    """
     prev_billing_state = account.billing_state
     account.billing_state = "free_cap"
     account.pm_brand = None
@@ -300,4 +310,9 @@ async def _on_pm_detached(
             event_type="lifecycle_transition",
             payload={"from": prev_billing_state, "to": "free_cap", "trigger": "payment_method"},
         )
+    # Legal §A3: the card is gone — action-tool connections go dormant immediately
+    # (not just at day-7 dunning exhaustion; a detached card is an immediate loss).
+    await dunning.set_dormant_for_action_tools(
+        session, admin_id=admin_id, reason="payment_method_detached"
+    )
     return "payment_method.detached"

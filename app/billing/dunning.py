@@ -21,7 +21,15 @@ injected clock — no wall-clock dependency.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
+
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.audit import log as audit
+from app.models.audit import ActorType
+from app.models.connection import InstanceConnection
 
 # Retry days within the retrying window (CJ §6). FULL service through day 7.
 RETRY_DAYS: tuple[int, ...] = (1, 3, 5, 7)
@@ -31,6 +39,15 @@ REDUCED_AFTER_DAYS: int = 7
 NONE = "none"
 RETRYING = "retrying"
 REDUCED = "reduced"
+
+# Action-tool connection types (Architecture §3.8.2 enum) that go dormant on
+# payment loss (Legal §A3: "Action-tool connections go dormant"). Deliberately
+# EXCLUDES `channel_auth` and `knowledge_source` — those are not action tools;
+# Legal §A3 only speaks to action-tool connections, so a channel/knowledge
+# connection stays live through a billing degradation.
+ACTION_TOOL_CONNECTION_TYPES: frozenset[str] = frozenset(
+    {"calendar", "crm", "record_source", "email_sender", "sms_sender", "outbound_webhook"}
+)
 
 
 def on_payment_failed(current_state: str, started_at: datetime | None) -> str:
@@ -72,3 +89,48 @@ def behaves_as_free_cap(dunning_state: str) -> bool:
     """In ``reduced``, the account behaves as free-cap regardless of card on file
     (Legal §A3) — drives the at_cap computation in metering."""
     return dunning_state == REDUCED
+
+
+async def set_dormant_for_action_tools(
+    session: AsyncSession, *, admin_id: uuid.UUID, reason: str
+) -> int:
+    """Transition every connected action-tool connection to ``dormant`` (Legal §A3
+    / Architecture §3.6.7): "Action-tool connections go dormant (credentials
+    retained, not purged)".
+
+    Fires on: dunning reaching ``reduced`` (day-7 exhaustion), the Stripe
+    ``payment_method.detached`` webhook, and the admin's DELETE payment-method
+    call — i.e. every path that removes/loses PAYG capability. Scoped to the
+    ACTION_TOOL_CONNECTION_TYPES set — channel_auth and knowledge_source
+    connections are NOT touched (Legal §A3 only covers action tools). Only rows
+    currently ``connected`` move (an already-dormant/error/expired/revoked row is
+    left alone — this is a downgrade, not a status reset). Idempotent: calling
+    this twice in a row is a no-op the second time (no rows match).
+
+    Emits ``connection_status_changed`` (Architecture §3.8.4) so the existing
+    restore path (``billing.webhooks._restore_dormant_connections``) has
+    something to restore. Returns the number of rows transitioned."""
+    result = await session.execute(
+        update(InstanceConnection)
+        .where(
+            InstanceConnection.admin_id == admin_id,
+            InstanceConnection.connection_type.in_(ACTION_TOOL_CONNECTION_TYPES),
+            InstanceConnection.status == "connected",
+        )
+        .values(status="dormant", status_detail=reason)
+    )
+    changed = int(result.rowcount or 0)  # type: ignore[attr-defined]
+    if changed > 0:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="connection_status_changed",
+            payload={
+                "reason": reason,
+                "count": changed,
+                "new_status": "dormant",
+                "scope": "action_tool_connections",
+            },
+        )
+    return changed

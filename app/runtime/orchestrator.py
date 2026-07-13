@@ -42,11 +42,12 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
-from app.models.conversation import EscalationEvent, Transcript
+from app.models.conversation import EscalationEvent, Session, Transcript
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
@@ -54,10 +55,12 @@ from app.runtime.grounding import score_grounding
 from app.runtime.input_safety import (
     build_system_prompt,
     detect_injection,
+    ensure_ai_identity_disclosure,
     moderate,
     pre_send_check,
     wrap_untrusted,
 )
+from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
 from app.tools.contract import Tool
 
@@ -174,6 +177,11 @@ class Orchestrator:
     # tune tone/facts but cannot override AI-identity disclosure, grounding, the
     # escalation contract, or moderation.
     business_context: str | None = None
+    # Business + assistant display names for the AI-identity disclosure backstop
+    # (§3.4.16). Used to compose the guaranteed first-message disclosure on text
+    # channels when the model's own reply omits it.
+    business_name: str = "this business"
+    assistant_name: str = "the assistant"
     # The tenant's provisioned email address (§3.1.6a / Decision #49). When set, Luciel
     # is told its own mailbox at prompt-composition time so it self-identifies by it and
     # recognizes mail to it. Passed by the caller when the channel is email.
@@ -208,9 +216,12 @@ class Orchestrator:
         channel: str,
         mode: str,
         inbound_text: str,
+        transport_identifier: str | None = None,
     ) -> LoopResult:
         """Run one inbound message through the loop. `mode` is the session's current
-        conversation mode (ai | human_controlled)."""
+        conversation mode (ai | human_controlled). `transport_identifier` is the
+        channel's stable sender key (phone/email/meta-id) used for lead capture +
+        identity resolution (§3.4.4/§3.4.9); None for the weak widget channel."""
         admin_id, instance_id = self.admin_id, self.instance_id
 
         # Human-controlled sessions STOP the loop (§3.4.12): persist the inbound for
@@ -266,6 +277,29 @@ class Orchestrator:
                 at_cap=True,
                 escalation=EscalationDecision(True, Signal.cannot_answer),
             )
+
+        # --- LEAD CAPTURE COGNITION (§3.4.4 / §3.4.9) — always on ------------ #
+        # Write/maintain the platform-owned Lead record and promote a weak widget
+        # token to a real lead once a strong identifier is volunteered. The returned
+        # id (if any) is threaded through escalation payloads + finalization so the
+        # dashboard leads view and escalation notifications are actually populated.
+        sess_obj = (
+            await self.session.execute(
+                select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
+            )
+        ).scalar_one_or_none()
+        if sess_obj is not None:
+            captured = await capture_or_update_lead(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                sess=sess_obj,
+                inbound_text=inbound_text,
+                channel=channel,
+                transport_identifier=transport_identifier,
+            )
+            if captured is not None:
+                resolved_lead_id = captured
 
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
         mod = moderate(inbound_text)
@@ -374,6 +408,17 @@ class Orchestrator:
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
         reply_text = pre_send_check(resp.text)
+        # AI-identity disclosure backstop (§3.4.16): on the FIRST outbound of a new
+        # conversation on a text channel, guarantee the disclosure in code rather than
+        # trusting the model to include it. Surfaced once per conversation — a prior
+        # luciel/human turn in history means it was already disclosed.
+        prior_assistant_turn = any(t.role in ("luciel", "human_agent") for t in history)
+        if not prior_assistant_turn and channel != "voice":
+            reply_text = ensure_ai_identity_disclosure(
+                reply_text,
+                business_name=self.business_name,
+                assistant_name=self.assistant_name,
+            )
         outbound = choose_outbound_channel(
             inbound_channel=channel,
             enabled_channels=self.enabled_channels or {channel},
