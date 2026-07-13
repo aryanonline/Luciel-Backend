@@ -88,7 +88,10 @@ async def test_send_runs_loop_and_returns_camelcase(client):
     assert body["renderState"] == "active"
     assert "sessionId" in body
     assert body["reply"]["role"] == "assistant"
-    assert body["reply"]["text"].startswith("Echo:")
+    # First reply on a new conversation carries the AI-identity disclosure (§3.4.16)
+    # then the (echoed) answer content.
+    assert "ai assistant" in body["reply"]["text"].lower()
+    assert "Echo:" in body["reply"]["text"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
