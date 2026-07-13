@@ -94,10 +94,14 @@ async def test_schedule_callback_refuses_opted_out_lead_regardless_of_caps():
         assert res.reason == "opted_out"
 
         count = (
-            await s.execute(
-                select(DeferredAction).where(DeferredAction.resolved_lead_id == lead_id)
+            (
+                await s.execute(
+                    select(DeferredAction).where(DeferredAction.resolved_lead_id == lead_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(count) == 0
 
         # The refusal is traced (§3.3.4 rule 3).

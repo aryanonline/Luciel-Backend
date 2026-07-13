@@ -50,7 +50,5 @@ def test_backstop_prepends_when_missing():
 
 def test_backstop_noop_when_already_disclosed():
     original = "Hi — I'm Ava, the AI assistant for GTA Premier. Our hours are 9 to 5."
-    out = ensure_ai_identity_disclosure(
-        original, business_name="GTA Premier", assistant_name="Ava"
-    )
+    out = ensure_ai_identity_disclosure(original, business_name="GTA Premier", assistant_name="Ava")
     assert out == original  # surfaced once; not duplicated

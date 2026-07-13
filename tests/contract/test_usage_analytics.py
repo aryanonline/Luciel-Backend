@@ -160,7 +160,9 @@ async def test_usage_export_csv_busiest_times_and_channel_mix(client) -> None:
     assert r_cm.status_code == 200
     assert "widget" in r_cm.text
 
-    r_cc = await client.get("/api/v1/admin/usage/export.csv", params={"view": "conversion_by_channel"})
+    r_cc = await client.get(
+        "/api/v1/admin/usage/export.csv", params={"view": "conversion_by_channel"}
+    )
     assert r_cc.status_code == 200
     assert "conversion_rate" in r_cc.text
 

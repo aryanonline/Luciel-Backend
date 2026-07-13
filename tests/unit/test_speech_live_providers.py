@@ -16,9 +16,9 @@ import pytest
 from app.config import Settings
 from app.runtime.provider_factory import build_speech_providers
 from app.runtime.speech import (
-    ElevenLabsTextToSpeech,
     EchoSpeechToText,
     EchoTextToSpeech,
+    ElevenLabsTextToSpeech,
     SpeechError,
     SynthesizedSpeech,
     Transcription,
@@ -39,7 +39,9 @@ async def test_whisper_stt_transcribes_via_mocked_openai_client():
 
     with (
         patch.object(WhisperSpeechToText, "_get_client", return_value=fake_client),
-        patch.object(WhisperSpeechToText, "_fetch_audio", new=AsyncMock(return_value=b"fake-bytes")),
+        patch.object(
+            WhisperSpeechToText, "_fetch_audio", new=AsyncMock(return_value=b"fake-bytes")
+        ),
     ):
         out = await stt.transcribe("https://example.com/recording.wav")
 
@@ -57,7 +59,9 @@ async def test_whisper_stt_maps_openai_error_to_speech_error():
 
     with (
         patch.object(WhisperSpeechToText, "_get_client", return_value=fake_client),
-        patch.object(WhisperSpeechToText, "_fetch_audio", new=AsyncMock(return_value=b"fake-bytes")),
+        patch.object(
+            WhisperSpeechToText, "_fetch_audio", new=AsyncMock(return_value=b"fake-bytes")
+        ),
     ):
         with pytest.raises(SpeechError):
             await stt.transcribe("https://example.com/recording.wav")

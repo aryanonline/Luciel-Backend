@@ -31,9 +31,7 @@ def upgrade() -> None:
     op.add_column("leads", sa.Column("lead_score", sa.Float(), nullable=True))
     op.add_column(
         "leads",
-        sa.Column(
-            "opted_out", sa.Boolean(), nullable=False, server_default=sa.false()
-        ),
+        sa.Column("opted_out", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
 
 

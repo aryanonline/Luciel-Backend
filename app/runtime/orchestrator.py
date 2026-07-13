@@ -285,9 +285,7 @@ class Orchestrator:
         # dashboard leads view and escalation notifications are actually populated.
         sess_obj = (
             await self.session.execute(
-                select(Session).where(
-                    Session.admin_id == admin_id, Session.id == session_id
-                )
+                select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
             )
         ).scalar_one_or_none()
         if sess_obj is not None:
@@ -414,9 +412,7 @@ class Orchestrator:
         # conversation on a text channel, guarantee the disclosure in code rather than
         # trusting the model to include it. Surfaced once per conversation — a prior
         # luciel/human turn in history means it was already disclosed.
-        prior_assistant_turn = any(
-            t.role in ("luciel", "human_agent") for t in history
-        )
+        prior_assistant_turn = any(t.role in ("luciel", "human_agent") for t in history)
         if not prior_assistant_turn and channel != "voice":
             reply_text = ensure_ai_identity_disclosure(
                 reply_text,

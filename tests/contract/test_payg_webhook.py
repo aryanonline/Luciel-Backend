@@ -12,7 +12,6 @@ import json
 import uuid
 
 import pytest
-
 from app.billing import metering
 from app.billing.metering import get_or_create_billing_account
 from app.billing.stripe_gateway import FakeStripeGateway, build_signature_header, set_stripe_gateway
@@ -67,9 +66,15 @@ async def _seed_instance(admin: uuid.UUID, counted: int) -> uuid.UUID:
     return iid
 
 
-def _signed_webhook(gw: FakeStripeGateway, *, event_id: str, event_type: str, admin: uuid.UUID) -> bytes:
+def _signed_webhook(
+    gw: FakeStripeGateway, *, event_id: str, event_type: str, admin: uuid.UUID
+) -> bytes:
     return json.dumps(
-        {"id": event_id, "type": event_type, "data": {"object": {"metadata": {"admin_id": str(admin)}}}}
+        {
+            "id": event_id,
+            "type": event_type,
+            "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+        }
     ).encode()
 
 
@@ -95,16 +100,12 @@ async def test_payg_math_at_151_conversations_matches_locked_numbers(client) -> 
     assert g.status_code == 200
     budget = g.json()["budget"]
     assert budget["conversationsThisPeriod"] == 151
-    assert budget["billedThisPeriod"] == metering.billed_conversations(
-        151, settings.free_allowance
-    )
+    assert budget["billedThisPeriod"] == metering.billed_conversations(151, settings.free_allowance)
     assert budget["billedThisPeriod"] == 101
 
     # Money side isn't on the wire Budget shape — assert directly via the pure
     # metering function using the same locked constants the wire value came from.
-    assert (
-        metering.billed_blocks(151, settings.free_allowance, settings.payg_block_size) == 2
-    )
+    assert metering.billed_blocks(151, settings.free_allowance, settings.payg_block_size) == 2
     assert (
         metering.billed_cents(
             151,
@@ -129,7 +130,9 @@ async def test_signed_invoice_paid_webhook_resets_budget_no_rollover(client) -> 
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
-        payload = _signed_webhook(gw, event_id="evt_payg_paid", event_type="invoice.paid", admin=admin)
+        payload = _signed_webhook(
+            gw, event_id="evt_payg_paid", event_type="invoice.paid", admin=admin
+        )
         header = build_signature_header(gw.WEBHOOK_SECRET, payload)
         r = await client.post(
             "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
@@ -155,10 +158,16 @@ async def test_unsigned_webhook_cannot_reset_budget(client) -> None:
     set_stripe_gateway(FakeStripeGateway())
     try:
         payload = json.dumps(
-            {"id": "evt_bad", "type": "invoice.paid", "data": {"object": {"metadata": {"admin_id": str(admin)}}}}
+            {
+                "id": "evt_bad",
+                "type": "invoice.paid",
+                "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+            }
         ).encode()
         r = await client.post(
-            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": "t=1,v1=deadbeef"}
+            "/api/v1/webhooks/stripe",
+            content=payload,
+            headers={"Stripe-Signature": "t=1,v1=deadbeef"},
         )
         assert r.status_code == 422
     finally:

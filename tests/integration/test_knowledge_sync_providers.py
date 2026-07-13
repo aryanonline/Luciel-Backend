@@ -104,7 +104,12 @@ async def test_hubspot_provider_add_update_delete_via_sync_engine():
 
     async with tenant_session(admin) as s:
         res = await sync.sync_connection(
-            s, admin_id=admin, instance_id=iid, connection_id=conn_id, origin="crm_kb", provider=provider
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn_id,
+            origin="crm_kb",
+            provider=provider,
         )
         assert set(res.added) == {"1", "2"}
 
@@ -113,14 +118,24 @@ async def test_hubspot_provider_add_update_delete_via_sync_engine():
         [
             {
                 "results": [
-                    {"id": 1, "title": "Return policy", "postBody": "60 days now", "updatedAt": "u2"},
+                    {
+                        "id": 1,
+                        "title": "Return policy",
+                        "postBody": "60 days now",
+                        "updatedAt": "u2",
+                    },
                 ]
             }
         ]
     )
     async with tenant_session(admin) as s:
         res = await sync.sync_connection(
-            s, admin_id=admin, instance_id=iid, connection_id=conn_id, origin="crm_kb", provider=provider
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn_id,
+            origin="crm_kb",
+            provider=provider,
         )
         assert res.updated == ["1"]
         assert res.removed == ["2"]
@@ -129,7 +144,9 @@ async def test_hubspot_provider_add_update_delete_via_sync_engine():
         sources = await service.list_sources(s, admin)
         ext_ids = {x.external_id for x in sources}
         assert ext_ids == {"1"}
-        results = await service.retrieve(s, admin_id=admin, instance_id=iid, query="60 days now", k=3)
+        results = await service.retrieve(
+            s, admin_id=admin, instance_id=iid, query="60 days now", k=3
+        )
         assert results and "60 days" in results[0][0].text
 
 
@@ -155,7 +172,12 @@ async def test_website_crawl_provider_diff_via_sync_engine_no_oauth():
 
     async with tenant_session(admin) as s:
         res = await sync.sync_connection(
-            s, admin_id=admin, instance_id=iid, connection_id=conn_id, origin="website_crawl", provider=provider
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn_id,
+            origin="website_crawl",
+            provider=provider,
         )
         assert res.added == ["https://example.com/faq"]
 
@@ -163,7 +185,12 @@ async def test_website_crawl_provider_diff_via_sync_engine_no_oauth():
     provider._transport = FixedTextTransport("<p>Hours: 9-5 weekdays</p>")
     async with tenant_session(admin) as s:
         res = await sync.sync_connection(
-            s, admin_id=admin, instance_id=iid, connection_id=conn_id, origin="website_crawl", provider=provider
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn_id,
+            origin="website_crawl",
+            provider=provider,
         )
         assert res.added == [] and res.updated == [] and res.removed == []
 
@@ -171,7 +198,12 @@ async def test_website_crawl_provider_diff_via_sync_engine_no_oauth():
     provider._transport = FixedTextTransport("<p>Hours: 8-6 every day now</p>")
     async with tenant_session(admin) as s:
         res = await sync.sync_connection(
-            s, admin_id=admin, instance_id=iid, connection_id=conn_id, origin="website_crawl", provider=provider
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn_id,
+            origin="website_crawl",
+            provider=provider,
         )
         assert res.updated == ["https://example.com/faq"]
 

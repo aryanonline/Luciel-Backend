@@ -344,7 +344,7 @@ async def confirm_reconnect(
         # New credential confirmed healthy — cut over now (proven-before-cutover).
         # This is the ONLY place a swap's staged provider becomes authoritative.
         if pending_provider is not None:
-            connection.provider = pending_provider
+            connection.provider = str(pending_provider)
         connection.non_secret_config = config
         connection.status = "connected"
         connection.status_detail = None

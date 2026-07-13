@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,7 +135,7 @@ CONVERSION_SERVICE_GAP = NotAvailable(
 
 
 async def _escalations_by_signal(
-    s: AsyncSession, *, period_start
+    s: AsyncSession, *, period_start: date
 ) -> list[EscalationSignalCount]:
     rows = (
         await s.execute(
@@ -218,7 +219,7 @@ async def build_overview(
     s: AsyncSession,
     *,
     admin_id: uuid.UUID,
-    period_start,
+    period_start: date,
     conversations_this_period: int,
 ) -> AnalyticsAggregate:
     """Assemble the full analytics overview aggregate (Arch §3.9).
@@ -229,7 +230,9 @@ async def build_overview(
     """
     conversations_total = (await s.execute(select(func.count()).select_from(Session))).scalar_one()
     leads_this_period = (
-        await s.execute(select(func.count()).select_from(Lead).where(Lead.created_at >= period_start))
+        await s.execute(
+            select(func.count()).select_from(Lead).where(Lead.created_at >= period_start)
+        )
     ).scalar_one()
 
     escalations_by_signal = await _escalations_by_signal(s, period_start=period_start)
@@ -289,7 +292,9 @@ def _rows_to_csv(header: list[str], rows: list[list[object]]) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
-def render_csv(view: str, agg: AnalyticsAggregate, audit_rows: list[AdminAuditLog] | None = None) -> str:
+def render_csv(
+    view: str, agg: AnalyticsAggregate, audit_rows: list[AdminAuditLog] | None = None
+) -> str:
     """Render one named analytics view as CSV text (Vision §7 CSV export).
 
     ``view`` must be one of ``CSV_VIEWS``; callers (the endpoint) validate that
@@ -306,11 +311,15 @@ def render_csv(view: str, agg: AnalyticsAggregate, audit_rows: list[AdminAuditLo
             ],
             [
                 "response_time_p50_seconds",
-                agg.response_time_p50_seconds if agg.response_time_p50_seconds is not None else "not_available",
+                agg.response_time_p50_seconds
+                if agg.response_time_p50_seconds is not None
+                else "not_available",
             ],
             [
                 "response_time_p95_seconds",
-                agg.response_time_p95_seconds if agg.response_time_p95_seconds is not None else "not_available",
+                agg.response_time_p95_seconds
+                if agg.response_time_p95_seconds is not None
+                else "not_available",
             ],
         ]
         return _rows_to_csv(header, rows)

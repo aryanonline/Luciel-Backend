@@ -22,6 +22,7 @@ import importlib
 import ipaddress
 import multiprocessing
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from multiprocessing import connection as mp_connection
 from urllib.parse import urlparse
@@ -159,13 +160,16 @@ def _httpx_post_json(
     return resp.status_code, body if isinstance(body, dict) else {}
 
 
-def _resolve_http_call(dotted_path: str):
+def _resolve_http_call(
+    dotted_path: str,
+) -> Callable[..., tuple[int, dict[str, object]]]:
     """Resolve a ``module.sub:attr`` path to the callable. Runs INSIDE the worker
     process only — never touches DB/secrets modules regardless of what the string
     names (tests only ever point this at a hermetic fake function)."""
     module_path, _, attr = dotted_path.partition(":")
     module = importlib.import_module(module_path)
-    return getattr(module, attr)
+    resolved: Callable[..., tuple[int, dict[str, object]]] = getattr(module, attr)
+    return resolved
 
 
 def _subprocess_worker_entrypoint(

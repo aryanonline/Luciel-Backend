@@ -66,7 +66,9 @@ async def test_upload_txt_still_works_like_before(client):
     await _ready_account_with_luciel(client)
     r = await client.post(
         "/api/v1/admin/knowledge/sources/upload",
-        files={"file": ("notes.txt", io.BytesIO(b"Our hours are nine to five weekdays."), "text/plain")},
+        files={
+            "file": ("notes.txt", io.BytesIO(b"Our hours are nine to five weekdays."), "text/plain")
+        },
         data={"name": "Hours"},
     )
     assert r.status_code == 201
@@ -105,9 +107,7 @@ async def test_rename_source(client):
         json={"name": "old name", "text": "starter engagement price 899"},
     )
     source_id = ri.json()["sourceId"]
-    rr = await client.put(
-        f"/api/v1/admin/knowledge/sources/{source_id}", json={"name": "new name"}
-    )
+    rr = await client.put(f"/api/v1/admin/knowledge/sources/{source_id}", json={"name": "new name"})
     assert rr.status_code == 200
     assert rr.json()["name"] == "new name"
 
@@ -118,9 +118,7 @@ async def test_rename_source(client):
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_rename_missing_source_404(client):
     await _ready_account_with_luciel(client)
-    rr = await client.put(
-        f"/api/v1/admin/knowledge/sources/{uuid.uuid4()}", json={"name": "x"}
-    )
+    rr = await client.put(f"/api/v1/admin/knowledge/sources/{uuid.uuid4()}", json={"name": "x"})
     assert rr.status_code == 404
 
 
@@ -135,7 +133,9 @@ async def test_replace_source_reingests_content(client):
 
     rr = await client.post(
         f"/api/v1/admin/knowledge/sources/{source_id}/replace",
-        files={"file": ("new.txt", io.BytesIO(b"corrected fresh content about gadgets"), "text/plain")},
+        files={
+            "file": ("new.txt", io.BytesIO(b"corrected fresh content about gadgets"), "text/plain")
+        },
     )
     assert rr.status_code == 200
     assert rr.json()["sourceId"] == source_id
@@ -200,18 +200,14 @@ async def test_create_oauth_provider_connection_returns_unconfigured_pending_aut
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_create_sync_connection_unknown_provider_422(client):
     await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/knowledge/sync-connections", json={"provider": "myspace"}
-    )
+    r = await client.post("/api/v1/admin/knowledge/sync-connections", json={"provider": "myspace"})
     assert r.status_code == 422
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_trigger_sync_missing_connection_404(client):
     await _ready_account_with_luciel(client)
-    r = await client.post(
-        f"/api/v1/admin/knowledge/sync-connections/{uuid.uuid4()}/sync"
-    )
+    r = await client.post(f"/api/v1/admin/knowledge/sync-connections/{uuid.uuid4()}/sync")
     assert r.status_code == 404
 
 
@@ -228,7 +224,9 @@ async def test_trigger_sync_for_website_crawl_ingests_and_is_idempotent_when_unc
 
     class FakeTransport:
         async def get(self, url, *, headers=None, params=None):
-            return httpx.Response(200, text="<p>Our hours are 9 to 5</p>", request=httpx.Request("GET", url))
+            return httpx.Response(
+                200, text="<p>Our hours are 9 to 5</p>", request=httpx.Request("GET", url)
+            )
 
     original_factory = providers_module.provider_for_connection
 

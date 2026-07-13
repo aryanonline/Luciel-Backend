@@ -189,9 +189,7 @@ class ElevenLabsTextToSpeech:
         headers = {"xi-api-key": self._api_key, "Accept": "audio/mpeg"}
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url, json={"text": text}, headers=headers, timeout=10
-                )
+                resp = await client.post(url, json={"text": text}, headers=headers, timeout=10)
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise SpeechError(f"elevenlabs_error:{type(exc).__name__}") from exc

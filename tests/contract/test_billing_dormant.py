@@ -23,14 +23,13 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
-
 from app.billing import dunning
 from app.billing.metering import get_or_create_billing_account
 from app.billing.stripe_gateway import FakeStripeGateway, build_signature_header, set_stripe_gateway
 from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
+from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -138,7 +137,11 @@ async def test_dunning_reduced_sends_action_tools_dormant_not_channels(client) -
     set_stripe_gateway(gw2)
     try:
         payload2 = json.dumps(
-            {"id": "evt_paid_1", "type": "invoice.paid", "data": {"object": {"metadata": {"admin_id": str(admin)}}}}
+            {
+                "id": "evt_paid_1",
+                "type": "invoice.paid",
+                "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+            }
         ).encode()
         header2 = build_signature_header(gw2.WEBHOOK_SECRET, payload2)
         r2 = await client.post(

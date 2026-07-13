@@ -44,9 +44,7 @@ def export_key_for(admin_id: uuid.UUID, export_id: uuid.UUID) -> str:
 class ExportStore(Protocol):
     """Persist an export ZIP and mint a time-limited download URL (§3.6.6 / §5.10)."""
 
-    async def put_and_presign(
-        self, *, key: str, data: bytes, ttl_days: int
-    ) -> str:
+    async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         """Upload ``data`` under ``key`` and return a presigned URL valid for
         ``ttl_days`` days (§3.6.6: 7-day TTL, ``config.export_link_ttl_days``)."""
         ...
@@ -141,9 +139,7 @@ def get_export_store() -> ExportStore:
 
         settings = get_settings()
         if settings.integration_mode == "live":
-            _default = S3ExportStore(
-                bucket="vm-export-bundles", region_name=settings.aws_region
-            )
+            _default = S3ExportStore(bucket="vm-export-bundles", region_name=settings.aws_region)
         else:
             _default = LocalExportStore()
     return _default

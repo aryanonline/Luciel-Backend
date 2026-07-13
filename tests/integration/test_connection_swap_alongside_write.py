@@ -58,8 +58,12 @@ async def test_swap_does_not_mutate_provider_before_confirm():
     iid = await _seed_tenant(admin)
     async with tenant_session(admin) as s:
         conn, _ = await service.start_connection(
-            s, admin_id=admin, instance_id=iid, connection_type="calendar",
-            provider="google_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="calendar",
+            provider="google_calendar",
+            user_id=None,
         )
         await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True
@@ -67,8 +71,11 @@ async def test_swap_does_not_mutate_provider_before_confirm():
         assert conn.provider == "google_calendar"
 
         swapped, _ = await service.swap(
-            s, admin_id=admin, connection_id=conn.connection_id,
-            provider="microsoft_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            connection_id=conn.connection_id,
+            provider="microsoft_calendar",
+            user_id=None,
         )
         # Alongside-write: the live provider is UNCHANGED until confirm.
         assert swapped.provider == "google_calendar"
@@ -84,19 +91,30 @@ async def test_swap_failed_probe_reverts_provider_to_old_value():
     iid = await _seed_tenant(admin)
     async with tenant_session(admin) as s:
         conn, _ = await service.start_connection(
-            s, admin_id=admin, instance_id=iid, connection_type="calendar",
-            provider="google_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="calendar",
+            provider="google_calendar",
+            user_id=None,
         )
         await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True
         )
         await service.swap(
-            s, admin_id=admin, connection_id=conn.connection_id,
-            provider="microsoft_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            connection_id=conn.connection_id,
+            provider="microsoft_calendar",
+            user_id=None,
         )
         ok, reason = await service.confirm_reconnect(
-            s, admin_id=admin, connection_id=conn.connection_id, user_id=None,
-            probe_ok=False, probe_detail="bad_credentials",
+            s,
+            admin_id=admin,
+            connection_id=conn.connection_id,
+            user_id=None,
+            probe_ok=False,
+            probe_detail="bad_credentials",
         )
         assert not ok and reason == "bad_credentials"
         assert conn.provider == "google_calendar"  # never touched — old stays live
@@ -112,15 +130,22 @@ async def test_swap_confirmed_probe_cuts_over_provider():
     iid = await _seed_tenant(admin)
     async with tenant_session(admin) as s:
         conn, _ = await service.start_connection(
-            s, admin_id=admin, instance_id=iid, connection_type="calendar",
-            provider="google_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="calendar",
+            provider="google_calendar",
+            user_id=None,
         )
         await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True
         )
         await service.swap(
-            s, admin_id=admin, connection_id=conn.connection_id,
-            provider="microsoft_calendar", user_id=None,
+            s,
+            admin_id=admin,
+            connection_id=conn.connection_id,
+            provider="microsoft_calendar",
+            user_id=None,
         )
         ok, state = await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True

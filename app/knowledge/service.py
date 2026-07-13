@@ -355,7 +355,12 @@ async def rename_source(
         actor_user_id=actor_user_id,
         actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
         event_type="knowledge_source_edited",
-        payload={"source_id": str(source_id), "action": "rename", "old_name": old_name, "new_name": new_name},
+        payload={
+            "source_id": str(source_id),
+            "action": "rename",
+            "old_name": old_name,
+            "new_name": new_name,
+        },
     )
     return source
 

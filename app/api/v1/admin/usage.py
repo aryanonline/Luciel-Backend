@@ -162,10 +162,8 @@ async def usage_audit_log(subject: Subject = Depends(current_admin)) -> list[Aud
         ]
 
 
-async def _audit_rows(
-    s: AsyncSession, admin_id: uuid.UUID, *, limit: int
-) -> list[AdminAuditLog]:
-    return (
+async def _audit_rows(s: AsyncSession, admin_id: uuid.UUID, *, limit: int) -> list[AdminAuditLog]:
+    return list(
         (
             await s.execute(
                 select(AdminAuditLog)
@@ -206,7 +204,9 @@ async def usage_export_csv(
 
     async with tenant_session(subject.admin_id) as s:
         _out, agg = await _build_overview_out(s, subject)
-        audit_rows = await _audit_rows(s, subject.admin_id, limit=200) if view == "audit_log" else None
+        audit_rows = (
+            await _audit_rows(s, subject.admin_id, limit=200) if view == "audit_log" else None
+        )
         csv_text = analytics_service.render_csv(view, agg, audit_rows)
 
     period = current_billing_period_start().isoformat()

@@ -28,6 +28,7 @@ from app.knowledge.providers import (
     provider_for_connection,
 )
 
+
 class FakeSecretStore:
     """Minimal in-memory SecretStore fake (Protocol: put/get/delete)."""
 
@@ -125,8 +126,18 @@ async def test_google_drive_provider_snapshot_maps_files(monkeypatch):
     transport = FakeTransport(
         json_body={
             "files": [
-                {"id": "f1", "name": "Playbook", "modifiedTime": "2026-01-01T00:00:00Z", "text": "alpha"},
-                {"id": "f2", "name": "Trashed", "modifiedTime": "2026-01-01T00:00:00Z", "trashed": True},
+                {
+                    "id": "f1",
+                    "name": "Playbook",
+                    "modifiedTime": "2026-01-01T00:00:00Z",
+                    "text": "alpha",
+                },
+                {
+                    "id": "f2",
+                    "name": "Trashed",
+                    "modifiedTime": "2026-01-01T00:00:00Z",
+                    "trashed": True,
+                },
             ]
         }
     )
@@ -150,7 +161,13 @@ async def test_notion_provider_snapshot_excludes_archived(monkeypatch):
         json_body={
             "results": [
                 {"id": "p1", "title": "FAQ", "text": "hours", "last_edited_time": "t1"},
-                {"id": "p2", "title": "Old", "text": "stale", "last_edited_time": "t0", "archived": True},
+                {
+                    "id": "p2",
+                    "title": "Old",
+                    "text": "stale",
+                    "last_edited_time": "t0",
+                    "archived": True,
+                },
             ]
         }
     )
@@ -221,8 +238,10 @@ async def test_salesforce_provider_snapshot_maps_articles():
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_website_crawl_provider_extracts_visible_text_and_hashes_revision():
-    html = "<html><head><style>body{color:red}</style></head>" \
+    html = (
+        "<html><head><style>body{color:red}</style></head>"
         "<body><script>evil()</script><h1>Pricing</h1><p>Starter is $899.</p></body></html>"
+    )
     transport = FakeTransport(text_body=html)
     provider = WebsiteCrawlProvider(urls=["https://example.com/pricing"], transport=transport)
     snap = await provider.snapshot(uuid.uuid4())
@@ -296,10 +315,14 @@ class _FakeConnection:
 
 def test_provider_for_connection_dispatches_each_brand():
     store = FakeSecretStore()
-    assert isinstance(provider_for_connection(_FakeConnection("google_drive"), store), GoogleDriveProvider)
+    assert isinstance(
+        provider_for_connection(_FakeConnection("google_drive"), store), GoogleDriveProvider
+    )
     assert isinstance(provider_for_connection(_FakeConnection("notion"), store), NotionProvider)
     assert isinstance(provider_for_connection(_FakeConnection("hubspot"), store), HubSpotProvider)
-    assert isinstance(provider_for_connection(_FakeConnection("salesforce"), store), SalesforceProvider)
+    assert isinstance(
+        provider_for_connection(_FakeConnection("salesforce"), store), SalesforceProvider
+    )
     crawl = provider_for_connection(
         _FakeConnection("website_crawl", {"crawl_urls": ["https://a.com"]}), store
     )

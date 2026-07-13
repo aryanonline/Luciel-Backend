@@ -108,12 +108,8 @@ async def test_subprocess_executor_maps_worker_exception_to_transport_error():
 async def test_auth_header_attached_by_parent_reaches_worker_as_argument():
     """The auth header is passed to the worker as a plain call argument (parent-
     attached) — never read by the worker from any shared secret/config module."""
-    ex = SubprocessWebhookExecutor(
-        http_call_path=f"{_THIS_MODULE}:_fake_returns_auth_header_only"
-    )
-    status, body = await ex.call(
-        "https://example.com/hook", {}, "Bearer secret-token-123", 10
-    )
+    ex = SubprocessWebhookExecutor(http_call_path=f"{_THIS_MODULE}:_fake_returns_auth_header_only")
+    status, body = await ex.call("https://example.com/hook", {}, "Bearer secret-token-123", 10)
     assert status == 200
     assert body["auth_header_seen"] == "Bearer secret-token-123"
 

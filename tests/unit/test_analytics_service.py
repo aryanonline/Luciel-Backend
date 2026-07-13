@@ -13,7 +13,7 @@ from __future__ import annotations
 import csv
 import io
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from app.analytics import service as analytics_service
@@ -22,6 +22,7 @@ from app.models.conversation import EscalationEvent, Session
 from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
 from app.runtime.budget import current_billing_period_start
+
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()
@@ -99,7 +100,10 @@ async def test_busiest_times_is_real_heatmap() -> None:
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
-            s, admin_id=admin, period_start=current_billing_period_start(), conversations_this_period=3
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=3,
         )
 
     assert agg.busiest_times[1][9] == 2  # Tuesday=1 (Python weekday()), 09:00
@@ -121,7 +125,10 @@ async def test_channel_mix_and_conversion_by_channel_are_real() -> None:
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
-            s, admin_id=admin, period_start=current_billing_period_start(), conversations_this_period=3
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=3,
         )
 
     mix_by_channel = {c.channel: c.fraction for c in agg.channel_mix}
@@ -146,7 +153,10 @@ async def test_escalations_by_signal_real_and_period_scoped() -> None:
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
-            s, admin_id=admin, period_start=current_billing_period_start(), conversations_this_period=0
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=0,
         )
 
     counts = {e.signal: e.count for e in agg.escalations_by_signal}
@@ -163,7 +173,10 @@ async def test_honest_gaps_never_fabricated() -> None:
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
-            s, admin_id=admin, period_start=current_billing_period_start(), conversations_this_period=0
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=0,
         )
 
     assert agg.appointments_booked is None
@@ -192,7 +205,10 @@ async def test_render_csv_all_views_parse(view: str) -> None:
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
-            s, admin_id=admin, period_start=current_billing_period_start(), conversations_this_period=1
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=1,
         )
         audit_rows = [] if view != "audit_log" else []
         text = analytics_service.render_csv(view, agg, audit_rows)
@@ -224,7 +240,9 @@ def test_render_csv_unknown_view_raises() -> None:
 
 
 def test_csv_escape_handles_commas_quotes_newlines() -> None:
-    text = analytics_service._rows_to_csv(["a", "b"], [["has,comma", 'has"quote'], ["has\nnewline", 1]])
+    text = analytics_service._rows_to_csv(
+        ["a", "b"], [["has,comma", 'has"quote'], ["has\nnewline", 1]]
+    )
     reader = csv.reader(io.StringIO(text))
     rows = list(reader)
     assert rows[1] == ["has,comma", 'has"quote']

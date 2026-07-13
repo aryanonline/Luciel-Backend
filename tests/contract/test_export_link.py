@@ -13,11 +13,10 @@ import uuid
 import zipfile
 
 import pytest
-from sqlalchemy import select
-
 from app.db.session import tenant_session
 from app.lifecycle.export_store import LocalExportStore
 from app.models.audit import AdminAuditLog
+from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 

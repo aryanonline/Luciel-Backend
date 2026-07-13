@@ -39,7 +39,7 @@ import httpx
 
 from app.config import get_settings
 from app.connections.secrets import SecretStore, secret_ref_for
-from app.knowledge.sync import RemoteItem, RemoteSnapshot
+from app.knowledge.sync import RemoteItem, RemoteSnapshot, SyncProvider
 
 
 class ProviderUnavailable(Exception):
@@ -93,7 +93,11 @@ class HttpTransport(Protocol):
     with no network call (Build Brief rule 2)."""
 
     async def get(
-        self, url: str, *, headers: dict[str, str] | None = None, params: dict[str, object] | None = None
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, object] | None = None,
     ) -> httpx.Response: ...
 
 
@@ -309,7 +313,6 @@ def _extract_visible_text(html: str) -> str:
     is sufficient and keeps this module dependency-light (Build Brief mock-mode
     rule: no new heavyweight dependency for something this narrow).
     """
-    out: list[str] = []
     in_tag = False
     skip_tag: str | None = None
     buf = ""
@@ -366,7 +369,11 @@ class WebsiteCrawlProvider:
         self._urls = urls
         self._transport = transport
         settings = get_settings()
-        self._timeout = timeout_seconds if timeout_seconds is not None else settings.website_crawl_timeout_seconds
+        self._timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else settings.website_crawl_timeout_seconds
+        )
         self._max_bytes = max_bytes if max_bytes is not None else settings.website_crawl_max_bytes
 
     async def _fetch_one(self, url: str) -> str:
@@ -397,7 +404,7 @@ class WebsiteCrawlProvider:
 # --------------------------------------------------------------------------- #
 # Dispatch: build the real provider for an instance_connections row (§3.2.3/§3.8).
 # --------------------------------------------------------------------------- #
-def provider_for_connection(connection: object, store: SecretStore) -> object:
+def provider_for_connection(connection: object, store: SecretStore) -> SyncProvider:
     """Return the concrete ``SyncProvider`` for a knowledge_source connection row.
 
     ``connection`` is an ``InstanceConnection``; typed as ``object`` here to avoid

@@ -129,9 +129,7 @@ async def capture_or_update_lead(
     if sess.resolved_lead_id is not None:
         lead = (
             await session.execute(
-                select(Lead).where(
-                    Lead.admin_id == admin_id, Lead.id == sess.resolved_lead_id
-                )
+                select(Lead).where(Lead.admin_id == admin_id, Lead.id == sess.resolved_lead_id)
             )
         ).scalar_one_or_none()
         if lead is not None:
@@ -178,9 +176,7 @@ async def capture_or_update_lead(
     return lead_id
 
 
-def _apply_signals(
-    lead: Lead, signals: LeadSignals, inbound_text: str, score: float
-) -> None:
+def _apply_signals(lead: Lead, signals: LeadSignals, inbound_text: str, score: float) -> None:
     """Maintain the lead's record: fill missing contact + keep the latest intent and
     the highest observed high-value score (§3.4.4 maintain-the-record)."""
     if lead.contact_identifier is None and signals.strong_identifier:
