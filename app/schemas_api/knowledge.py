@@ -44,3 +44,52 @@ class KnowledgeQuotaOut(WireModel):
 class PasteIngestRequest(WireModel):
     name: str
     text: str
+
+
+class RenameSourceRequest(WireModel):
+    """PUT /sources/{id} body — the rename affordance (Architecture §3.2.2)."""
+
+    name: str
+
+
+# --- Live-sync connectors (§3.2.3) ------------------------------------------- #
+# Provider is the concrete BRAND (mirrors app.connections.service: connection_type
+# is generic, provider is the brand) — google_drive/notion/website_crawl map 1:1
+# to a source_origin, while hubspot/salesforce both map to source_origin='crm_kb'
+# (§3.2.3 storage entity note: "CRM's KB articles" is one origin, two native
+# connectors, exactly like the Vision §7 "native CRM connectors (HubSpot /
+# Salesforce)" line item).
+KnowledgeSyncProviderWire = Literal[
+    "google_drive", "notion", "hubspot", "salesforce", "website_crawl"
+]
+
+
+class CreateSyncConnectionRequest(WireModel):
+    """POST /sync-connections body: create a knowledge-sync connection (§3.2.3).
+
+    Reuses the Connections layer (§3.8) — this is the knowledge-specific create
+    call that wraps ``connections.start_connection`` with connection_type fixed to
+    'knowledge_source'. ``crawl_urls`` is required (and only meaningful) for
+    provider='website_crawl', which has no OAuth step (§3.2.3 crawl-sync note).
+    """
+
+    provider: KnowledgeSyncProviderWire
+    crawl_urls: list[str] | None = None
+
+
+class SyncConnectionOut(WireModel):
+    """Non-secret view of a knowledge-sync connection (§3.8.3 secret hygiene)."""
+
+    connection_id: uuid.UUID
+    provider: str
+    status: str
+    non_secret_config: dict[str, object] | None = None
+    status_detail: str | None = None
+
+
+class SyncResultOut(WireModel):
+    """Result of a manual sync/crawl trigger: external_ids added/updated/removed."""
+
+    added: list[str]
+    updated: list[str]
+    removed: list[str]

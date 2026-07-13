@@ -33,6 +33,7 @@ from app.audit import log as audit
 from app.connections import gate
 from app.models.audit import ActorType
 from app.models.deferred import DeferredAction
+from app.models.lead import Lead
 
 # §3.8.7 rule D: every queued item carries a 24h max-age TTL (configurable per
 # action class; the platform default is 24h).
@@ -132,6 +133,40 @@ async def run_sweep(
     )
 
     for action in due:
+        # §3.3.5: an opted-out lead's queued schedule_callback is refused/skipped at
+        # delivery time regardless of caps or TTL — checked before the TTL/abandon
+        # branch so an opted-out callback is never delivered even at its last retry.
+        # Only schedule_callback carries this rule (other deferred action types have
+        # no lead opt-out semantics); resolved_lead_id absent (anonymous) skips it.
+        if action.action_type == "schedule_callback" and action.resolved_lead_id is not None:
+            lead = (
+                await session.execute(
+                    select(Lead).where(
+                        Lead.admin_id == admin_id,
+                        Lead.id == action.resolved_lead_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if lead is not None and lead.opted_out:
+                action.status = "abandoned"
+                action.last_error = "opted_out"
+                await audit.emit(
+                    session,
+                    admin_id=action.admin_id,
+                    instance_id=action.instance_id,
+                    actor_type=ActorType.platform,
+                    event_type="connection_status_changed",
+                    payload={
+                        "action": "deferred_abandoned",
+                        "deferred_action_id": str(action.id),
+                        "action_type": action.action_type,
+                        "connection_type": action.connection_type,
+                        "reason": "lead_opted_out",
+                    },
+                )
+                counts["abandoned"] += 1
+                continue
+
         # TTL check FIRST: a customer's follow-up that has been undeliverable > 24h is
         # abandoned with an owner notification, not retried forever (§3.8.7 rule D).
         if now >= action.expires_at:

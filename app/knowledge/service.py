@@ -323,6 +323,139 @@ async def delete_source(
     return True
 
 
+async def rename_source(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    new_name: str,
+    actor_user_id: uuid.UUID | None = None,
+) -> KnowledgeSource | None:
+    """Rename affordance (Architecture §3.2.2: "rename source, re-trigger ingestion,
+    or replace the file"). Chunks/embeddings are untouched — only the display name
+    changes. Returns None if the source does not exist for this tenant."""
+    source = (
+        await session.execute(
+            select(KnowledgeSource).where(
+                KnowledgeSource.admin_id == admin_id,
+                KnowledgeSource.id == source_id,
+                KnowledgeSource.soft_deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        return None
+    old_name = source.name
+    source.name = new_name
+    source.last_updated_at = datetime.now(UTC)
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        actor_user_id=actor_user_id,
+        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+        event_type="knowledge_source_edited",
+        payload={"source_id": str(source_id), "action": "rename", "old_name": old_name, "new_name": new_name},
+    )
+    return source
+
+
+async def replace_source(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    *,
+    text: str,
+    size_bytes: int,
+    actor_user_id: uuid.UUID | None = None,
+    extractor: GraphExtractor | None = None,
+) -> KnowledgeSource | None:
+    """Replace affordance (Architecture §3.2.2): re-ingest a NEW file into an
+    EXISTING source row. The source id/name/place-in-list is preserved but its
+    chunks, embeddings, and graph nodes/edges are fully replaced by the new
+    content — this is the "corrected source is re-ingested, the chunks are
+    updated" root-cause-fix flow (§5.2/§9). Returns None if the source does not
+    exist for this tenant. Quota is re-checked against the NEW size, crediting
+    back the old size first so a same-size or smaller replace never false-fails.
+    """
+    source = (
+        await session.execute(
+            select(KnowledgeSource).where(
+                KnowledgeSource.admin_id == admin_id,
+                KnowledgeSource.id == source_id,
+                KnowledgeSource.soft_deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        return None
+
+    old_size = source.size_bytes
+    if size_bytes > PER_FILE_MAX_BYTES:
+        raise QuotaError("per_file_limit_exceeded")
+    used_without_old = await used_bytes(session, admin_id) - old_size
+    if used_without_old + size_bytes > TOTAL_QUOTA_BYTES:
+        raise QuotaError("total_quota_exceeded")
+
+    # Wipe the old chunks + graph (identical cascade to delete_source, minus the
+    # tombstone) before re-ingesting the new content under the SAME source id.
+    await session.execute(
+        delete(KnowledgeChunk).where(
+            KnowledgeChunk.admin_id == admin_id, KnowledgeChunk.source_id == source_id
+        )
+    )
+    await session.execute(
+        delete(KnowledgeEdge).where(
+            KnowledgeEdge.admin_id == admin_id, KnowledgeEdge.source_id == source_id
+        )
+    )
+    await session.execute(
+        delete(KnowledgeEntity).where(
+            KnowledgeEntity.admin_id == admin_id, KnowledgeEntity.source_id == source_id
+        )
+    )
+
+    chunks = chunk_text(text)
+    if chunks:
+        embedder = get_embedder()
+        vectors = await embedder.embed(chunks)
+        for ordinal, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True)):
+            session.add(
+                KnowledgeChunk(
+                    id=uuid.uuid4(),
+                    admin_id=admin_id,
+                    instance_id=source.instance_id,
+                    source_id=source.id,
+                    ordinal=ordinal,
+                    text=chunk,
+                    embedding=vec,
+                )
+            )
+    await _store_graph(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        source_id=source.id,
+        text=text,
+        extractor=extractor or get_extractor(),
+    )
+
+    source.size_bytes = size_bytes
+    source.ingestion_status = "ready"
+    source.last_updated_at = datetime.now(UTC)
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        actor_user_id=actor_user_id,
+        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+        event_type="knowledge_source_edited",
+        payload={"source_id": str(source_id), "action": "replace", "chunks": len(chunks)},
+    )
+    return source
+
+
 # Retrieval re-rank tuning (Architecture §3.2 retrieval flow, step 3:
 # "Re-rank by recency and chunk-ordinal proximity"). The ANN pass (step 2) is the
 # dominant relevance signal; re-rank is a TIE-BREAK within a small cosine band so it

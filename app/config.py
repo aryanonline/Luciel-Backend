@@ -59,6 +59,17 @@ class Settings(BaseSettings):
     payg_block_size: int = 100
     payg_price_per_block_cents: int = 3900  # $39.00 per 100-block
 
+    # --- Stripe integration posture (Architecture §3.4.1b) ---------------------
+    # Mirrors the LLM GATE 2 cutover shape ("integration_mode") one level down: a
+    # dedicated posture for the Stripe seam so Stripe can move to a real TEST-mode
+    # binding independently of the LLM cutover. Values: "mock" (default —
+    # FakeStripeGateway, no keys, no network) | "test" (RealStripeGateway bound
+    # against Stripe TEST keys — sk_test_/pk_test_/whsec_ — read from the platform
+    # secret, never hardcoded). "live" is DELIBERATELY NOT a supported value here:
+    # this codebase never binds a production Stripe secret key (sk_live_) — that
+    # cutover is out of scope / owner-gated and not implemented by this seam.
+    stripe_integration_posture: str = "mock"
+
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
 
@@ -103,6 +114,32 @@ class Settings(BaseSettings):
 
     # Upper bound on generated tokens per LLM call (platform cost control).
     llm_max_output_tokens: int = 1024
+
+    # --- Knowledge-sync connector OAuth (Architecture §3.2.3 / §3.8.3) ---------
+    # Client id/secret + redirect URI per OAuth-class knowledge-sync provider
+    # (Google Drive, HubSpot, Salesforce). These are the APPLICATION's OAuth-client
+    # registration values (who the app claims to be to the provider) — NOT the
+    # per-tenant access/refresh token, which is real secret material and lives in
+    # the SecretStore (§3.8.3), never here. Still never hardcoded: sourced from env
+    # (LUCIEL_ prefix) which in production is injected from Secrets Manager, exactly
+    # like ``platform_secret`` above. Defaults are empty so mock-mode/CI never needs
+    # them and a live OAuth flow fails closed (no authorize URL) rather than using a
+    # placeholder client id.
+    google_drive_client_id: str = ""
+    google_drive_client_secret: str = ""  # noqa: S105 — empty default, not a secret literal
+    google_drive_redirect_uri: str = ""
+    hubspot_client_id: str = ""
+    hubspot_client_secret: str = ""  # noqa: S105
+    hubspot_redirect_uri: str = ""
+    salesforce_consumer_key: str = ""
+    salesforce_consumer_secret: str = ""  # noqa: S105
+    salesforce_redirect_uri: str = ""
+
+    # --- Website crawl (§3.2.3 crawl-sync note) ---------------------------------
+    # No OAuth — just an httpx fetch. Bounded so a misconfigured crawl target can
+    # never hang a sync worker or pull in an unbounded page.
+    website_crawl_timeout_seconds: float = 10.0
+    website_crawl_max_bytes: int = 5_000_000
 
 
 def parse_platform_secret(raw: str) -> dict[str, str]:
