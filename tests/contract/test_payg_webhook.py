@@ -1,0 +1,177 @@
+"""Confirms PAYG math (billedThisPeriod / blocks / cents, the locked $39-per-100
+numbers — Vision §7 / §3.4.1b) together with the period-reset behavior, both
+DRIVEN BY SIGNED Stripe webhooks (verify-before-route, HARD CONSTRAINT #4).
+
+FakeStripeGateway only — every webhook is HMAC-signed with its WEBHOOK_SECRET.
+NO real Stripe network call anywhere in this file.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+
+import pytest
+from app.billing import metering
+from app.billing.metering import get_or_create_billing_account
+from app.billing.stripe_gateway import FakeStripeGateway, build_signature_header, set_stripe_gateway
+from app.config import get_settings
+from app.db.session import tenant_session
+from app.models.budget import ConversationBudget
+from app.models.instance import Instance, LucielState
+from app.runtime.budget import current_billing_period_start
+
+pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+
+
+async def _signup_verify_login(client) -> uuid.UUID:
+    from app.auth import access
+
+    email = f"payg-{uuid.uuid4().hex[:8]}@x.com"
+    await client.post(
+        "/api/v1/auth/signup",
+        json={"email": email, "password": "pw-123456", "captchaToken": "t"},
+    )
+    acct, token = await access.signup(email, "pw-123456")
+    await client.post("/api/v1/auth/verify-email", json={"token": token})
+    await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
+    return acct.id
+
+
+async def _seed_instance(admin: uuid.UUID, counted: int) -> uuid.UUID:
+    iid = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="L",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=current_billing_period_start(),
+                counted_conversations=counted,
+                counted_session_ids=[str(uuid.uuid4()) for _ in range(counted)],
+            )
+        )
+    return iid
+
+
+def _signed_webhook(
+    gw: FakeStripeGateway, *, event_id: str, event_type: str, admin: uuid.UUID
+) -> bytes:
+    return json.dumps(
+        {
+            "id": event_id,
+            "type": event_type,
+            "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+        }
+    ).encode()
+
+
+async def _make_payg_enabled(admin: uuid.UUID) -> None:
+    """billedThisPeriod is only nonzero with a live card (metering.build_budget) —
+    flip billing_state directly (equivalent to a prior payment_method.attached)."""
+    async with tenant_session(admin) as s:
+        acct = await get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        await s.flush()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payg_math_at_151_conversations_matches_locked_numbers(client) -> None:
+    """151 counted → 101 billed-over, ceil(101/100)=2 blocks, 2*3900=7800¢ — the
+    locked boundary case (50→$0, 51→$39, 150→$39, 151→$78, Vision §7)."""
+    settings = get_settings()
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=151)
+    await _make_payg_enabled(admin)
+
+    g = await client.get("/api/v1/billing")
+    assert g.status_code == 200
+    budget = g.json()["budget"]
+    assert budget["conversationsThisPeriod"] == 151
+    assert budget["billedThisPeriod"] == metering.billed_conversations(151, settings.free_allowance)
+    assert budget["billedThisPeriod"] == 101
+
+    # Money side isn't on the wire Budget shape — assert directly via the pure
+    # metering function using the same locked constants the wire value came from.
+    assert metering.billed_blocks(151, settings.free_allowance, settings.payg_block_size) == 2
+    assert (
+        metering.billed_cents(
+            151,
+            settings.free_allowance,
+            settings.payg_block_size,
+            settings.payg_price_per_block_cents,
+        )
+        == 7800
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_signed_invoice_paid_webhook_resets_budget_no_rollover(client) -> None:
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=240)  # well above free_allowance=50
+    await _make_payg_enabled(admin)
+
+    g = await client.get("/api/v1/billing")
+    assert g.json()["budget"]["conversationsThisPeriod"] == 240
+    assert g.json()["budget"]["billedThisPeriod"] == 190
+
+    gw = FakeStripeGateway()
+    set_stripe_gateway(gw)
+    try:
+        payload = _signed_webhook(
+            gw, event_id="evt_payg_paid", event_type="invoice.paid", admin=admin
+        )
+        header = build_signature_header(gw.WEBHOOK_SECRET, payload)
+        r = await client.post(
+            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+        )
+        assert r.status_code == 200
+        assert r.json()["action"] == "invoice_paid"
+    finally:
+        set_stripe_gateway(None)
+
+    g2 = await client.get("/api/v1/billing")
+    # Reset to zero, NO rollover of the prior 240 (§3.4.1b).
+    assert g2.json()["budget"]["conversationsThisPeriod"] == 0
+    assert g2.json()["budget"]["billedThisPeriod"] == 0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_unsigned_webhook_cannot_reset_budget(client) -> None:
+    """Verify-before-route: an unsigned/garbled Stripe-Signature must be rejected
+    BEFORE the reset logic runs — the budget must be untouched."""
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=240)
+
+    set_stripe_gateway(FakeStripeGateway())
+    try:
+        payload = json.dumps(
+            {
+                "id": "evt_bad",
+                "type": "invoice.paid",
+                "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+            }
+        ).encode()
+        r = await client.post(
+            "/api/v1/webhooks/stripe",
+            content=payload,
+            headers={"Stripe-Signature": "t=1,v1=deadbeef"},
+        )
+        assert r.status_code == 422
+    finally:
+        set_stripe_gateway(None)
+
+    g = await client.get("/api/v1/billing")
+    assert g.json()["budget"]["conversationsThisPeriod"] == 240  # untouched

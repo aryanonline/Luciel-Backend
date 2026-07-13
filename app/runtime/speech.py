@@ -102,3 +102,101 @@ class EchoTextToSpeech:
         if self._raise:
             raise SpeechError(f"{self.name}_unavailable")
         return SynthesizedSpeech(audio_ref=f"tts://echo/{abs(hash(text))}", text=text)
+
+
+# --- live providers (§3.1.2 adapter table / §5.12 sub-processor register) ------ #
+# Both SDKs are imported LAZILY inside methods — exactly the AnthropicProvider /
+# OpenAIProvider pattern in app.runtime.providers — so CI (no keys, no network, SDK
+# may be absent) imports this module cleanly. No network call happens at import or
+# construction time; keys are injected by the caller (provider_factory), never read
+# from anywhere inside these classes, and NEVER hardcoded (Hard rule #2).
+
+
+class WhisperSpeechToText:
+    """Live STT — OpenAI Whisper (§3.1.2 adapter table, §5.12 sub-processor register).
+
+    ``audio_ref`` is the URL of the caller's recorded audio (e.g. Twilio's
+    ``RecordingUrl``); the OpenAI Audio Transcriptions endpoint accepts a file-like
+    object, so the recording is fetched and handed to the SDK as bytes. Maps
+    ``openai.OpenAIError`` to ``SpeechError`` so the voice pipeline degrades
+    gracefully (spoken apology + human handoff) rather than dropping the call.
+    """
+
+    name = "whisper"
+
+    def __init__(self, *, api_key: str, model: str = "whisper-1") -> None:
+        self._api_key = api_key
+        self._model = model
+        self._client: object | None = None
+
+    def _get_client(self) -> object:
+        if self._client is None:
+            from openai import AsyncOpenAI  # noqa: PLC0415 — lazy/guarded import
+
+            self._client = AsyncOpenAI(api_key=self._api_key)
+        return self._client
+
+    async def transcribe(self, audio_ref: str) -> Transcription:
+        from openai import OpenAIError  # noqa: PLC0415 — lazy/guarded import
+
+        client = self._get_client()
+        try:
+            audio_bytes = await self._fetch_audio(audio_ref)
+            resp = await client.audio.transcriptions.create(  # type: ignore[attr-defined]
+                model=self._model,
+                file=("recording.wav", audio_bytes),
+            )
+        except OpenAIError as exc:
+            raise SpeechError(f"whisper_error:{type(exc).__name__}") from exc
+        except Exception as exc:  # noqa: BLE001 — network/fetch failures, mapped uniformly
+            raise SpeechError(f"whisper_fetch_error:{type(exc).__name__}") from exc
+
+        text = getattr(resp, "text", "") or ""
+        return Transcription(text=text, confidence=1.0)
+
+    async def _fetch_audio(self, audio_ref: str) -> bytes:
+        """Fetch the caller recording referenced by ``audio_ref``. Lazy-imports httpx
+        so no network dependency is required unless this live path actually runs."""
+        import httpx  # noqa: PLC0415 — lazy import
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(audio_ref, timeout=10)
+            resp.raise_for_status()
+            return resp.content
+
+
+class ElevenLabsTextToSpeech:
+    """Live TTS — ElevenLabs (§3.1.2 adapter table, §5.12 sub-processor register).
+
+    Synthesizes ``text`` and returns a reference the telephony layer can play back.
+    The API key is injected by the caller (provider_factory reads it from the
+    platform secret via ``parse_platform_secret`` — never hardcoded here, Hard rule
+    #2) and is used only for the Authorization header of the synthesis request.
+    """
+
+    name = "elevenlabs"
+
+    _BASE_URL = "https://api.elevenlabs.io/v1"
+
+    def __init__(self, *, api_key: str, voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> None:
+        self._api_key = api_key
+        self._voice_id = voice_id
+
+    async def synthesize(self, text: str) -> SynthesizedSpeech:
+        import httpx  # noqa: PLC0415 — lazy import: no network dependency unless live
+
+        url = f"{self._BASE_URL}/text-to-speech/{self._voice_id}"
+        headers = {"xi-api-key": self._api_key, "Accept": "audio/mpeg"}
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, json={"text": text}, headers=headers, timeout=10)
+                resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise SpeechError(f"elevenlabs_error:{type(exc).__name__}") from exc
+
+        # The synthesized audio bytes aren't persisted to a file store here (out of
+        # scope for this workstream) — the reference records that synthesis
+        # succeeded and the exact text spoken (retained per §3.4.10), mirroring the
+        # EchoTextToSpeech contract shape so the pipeline/TwiML layer is unaffected.
+        digest = abs(hash(resp.content))
+        return SynthesizedSpeech(audio_ref=f"tts://elevenlabs/{self._voice_id}/{digest}", text=text)

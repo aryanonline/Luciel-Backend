@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 
 from app.connections import deferred_queue
 from app.models.deferred import DeferredAction
+from app.models.lead import Lead
 from app.tools import contract as c
 from app.tools.contract import Outcome, Tool, ToolContext, ToolResult
 
@@ -210,6 +211,29 @@ class ScheduleCallbackTool:
             stmt = stmt.where(DeferredAction.resolved_lead_id == resolved_lead_id)
         return int((await session.execute(stmt)).scalar_one())
 
+    async def _opted_out_check(self, session: Any, context: ToolContext) -> ToolResult | None:
+        """Refuse a callback for an opted-out lead, REGARDLESS of caps (§3.3.5).
+
+        Lead.opted_out (STOP/HELP for SMS, §3.1.6) is read-only here — the column is
+        owned/added by the core loop (migration 0017). Checked BEFORE the rate-limit
+        axes and BEFORE the enqueue write, so an opted-out lead never gets a queued
+        row no matter how far under cap the tenant/lead is. When resolved_lead_id is
+        absent (anonymous session) there is no lead to check — falls through."""
+        lead_id = context.resolved_lead_id
+        if lead_id is None:
+            return None
+        lead = (
+            await session.execute(
+                select(Lead).where(
+                    Lead.admin_id == context.admin_id,
+                    Lead.id == lead_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if lead is not None and lead.opted_out:
+            return c.failed("opted_out")
+        return None
+
     async def _rate_limit_check(self, session: Any, context: ToolContext) -> ToolResult | None:
         """Two-axis cap (§3.3.5): per-lead (when a lead key is present) + per-tenant,
         on pending count AND rolling-24h created count. Returns a structured failed
@@ -251,6 +275,12 @@ class ScheduleCallbackTool:
 
         channel: str = inputs["channel"]
         connection_type = self._CHANNEL_TO_CONNECTION.get(channel, "channel_auth")
+
+        # §3.3.5: an opted-out lead is NEVER sent a scheduled callback, regardless of
+        # caps — checked first so opt-out always wins over an under-cap lead/tenant.
+        opt_out_rejection = await self._opted_out_check(session, context)
+        if opt_out_rejection is not None:
+            return opt_out_rejection
 
         # §3.3.5 / Decision #51: enforce the two-axis rate limit BEFORE the enqueue
         # write, so an over-cap schedule NEVER persists a row and never nags the lead.
