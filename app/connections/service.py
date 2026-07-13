@@ -243,15 +243,12 @@ async def swap(
     different) provider WITHOUT taking the current connection offline (§3.8.7 rule B,
     Decision §45 proven-before-cutover).
 
-    A swap is a reconnect that also re-points ``provider`` — but the new provider is
-    staged ALONGSIDE the live one, not written in place: ``connection.provider`` is
-    left untouched (the EXISTING credential/provider stays authoritative and live)
-    and the candidate provider is recorded in ``non_secret_config['pending_provider']``
-    (non-secret — §3.8.3 — just a provider name). ``confirm_reconnect()`` is the ONLY
-    place ``connection.provider`` is ever written for a swap: on a confirmed-healthy
-    probe it flips provider to the staged value; on a failed probe it discards the
-    staged value and ``connection.provider`` was never touched, so there is nothing to
-    roll back. connection_type is unchanged, so ``auth_class`` (and therefore the
+    A swap is a reconnect that also re-points ``provider``: the EXISTING credential
+    stays live (status is preserved via the ``reconnect_pending`` marker), the new
+    provider is prepared, and cutover to ``connected`` happens only when the caller
+    invokes ``confirm_reconnect()`` after the new credential health-checks. On probe
+    failure ``confirm_reconnect`` restores the prior status — the old account remains
+    connected. connection_type is unchanged, so ``auth_class`` (and therefore the
     connect-flow shape) is unchanged. Returns None if no such connection for tenant."""
     connection = (
         await session.execute(
@@ -264,17 +261,12 @@ async def swap(
     if connection is None:
         return None
 
-    # Proven-before-cutover: record intent + stage the candidate provider ALONGSIDE
-    # the live one (non_secret_config), never mutating connection.provider here. The
-    # live status is also preserved via the reconnect_pending marker. Cutover to the
-    # new provider AND `connected` happens only when confirm_reconnect health-checks
-    # it; on probe failure the staged value is simply discarded (old provider/status
-    # were never touched, so "rollback" is a no-op by construction).
+    # Proven-before-cutover: record intent + re-point provider without dropping the
+    # live status. The new provider only becomes authoritative once confirm_reconnect
+    # health-checks it; a failed probe rolls back to the prior status (old stays live).
     old_status = connection.status
     old_provider = connection.provider
-    existing_config = dict(connection.non_secret_config or {})
-    existing_config["pending_provider"] = provider
-    connection.non_secret_config = existing_config
+    connection.provider = provider
     connection.status_detail = f"reconnect_pending:prior_status={old_status}"
     await session.flush()
 
@@ -291,7 +283,7 @@ async def swap(
             "new_status": old_status,  # preserved — cutover only on health confirm
             "reason": "swap_pending",
             "old_provider": old_provider,
-            "new_provider": provider,  # staged only — not yet written to `provider`
+            "new_provider": provider,
         },
     )
     return connection, _start_result(connection.auth_class, connection)
@@ -333,19 +325,8 @@ async def confirm_reconnect(
     if detail.startswith("reconnect_pending:prior_status="):
         prior_status = detail.split("=", 1)[1]
 
-    # §3.8.7 rule B: a swap stages its candidate provider alongside the live one in
-    # non_secret_config['pending_provider'] rather than mutating `provider` in place
-    # (see swap()). Pop it here regardless of outcome so it never lingers as stale
-    # config; only apply it to `connection.provider` on a confirmed-healthy probe.
-    config = dict(connection.non_secret_config or {})
-    pending_provider = config.pop("pending_provider", None)
-
     if probe_ok:
         # New credential confirmed healthy — cut over now (proven-before-cutover).
-        # This is the ONLY place a swap's staged provider becomes authoritative.
-        if pending_provider is not None:
-            connection.provider = str(pending_provider)
-        connection.non_secret_config = config
         connection.status = "connected"
         connection.status_detail = None
         await session.flush()
@@ -366,9 +347,6 @@ async def confirm_reconnect(
         return True, "connected"
     else:
         # Health check failed — keep the prior connection live (Decision §45 rule B).
-        # The staged pending_provider is simply discarded here; `connection.provider`
-        # was never written by swap(), so the old provider is still live untouched.
-        connection.non_secret_config = config
         connection.status = prior_status
         reason = probe_detail or "reconnect_health_check_failed"
         connection.status_detail = reason

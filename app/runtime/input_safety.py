@@ -152,38 +152,6 @@ _BUSINESS_CONTEXT_HEADER = (
 # Defensive cap mirroring Vision §3.5 (the field is tweet-sized).
 BUSINESS_CONTEXT_MAX_CHARS = 280
 
-# --- AI-identity disclosure backstop (§3.4.16) ------------------------------------
-# The markers an opening disclosure carries on any text channel. Mirrors the voice
-# adapter's mandatory-facts guard (§3.1.2) on the text side.
-_AI_IDENTITY_MARKERS = ("ai assistant", "ai-powered assistant", "automated assistant")
-
-
-def disclosure_present(text: str) -> bool:
-    """True iff the outbound text already discloses AI identity (§3.4.16)."""
-    lowered = (text or "").lower()
-    return any(m in lowered for m in _AI_IDENTITY_MARKERS)
-
-
-def ensure_ai_identity_disclosure(
-    reply_text: str, *, business_name: str, assistant_name: str
-) -> str:
-    """Backstop the first-message AI-identity disclosure in CODE (§3.4.16).
-
-    If the model's first-turn reply on a text channel already discloses AI identity,
-    it is returned unchanged (disclosure is surfaced once per conversation, not on
-    every message). If it does NOT, a compact platform disclosure line is prepended,
-    so the disclosure is guaranteed regardless of model behavior. This is the in-code
-    enforcement of the 'cannot be disabled' invariant — it does not rely on the LLM.
-    """
-    if disclosure_present(reply_text):
-        return reply_text
-    line = (
-        f"Hi — I'm {assistant_name}, the AI assistant for {business_name}. "
-        "I can help answer questions, book, or connect you to a person."
-    )
-    reply = (reply_text or "").strip()
-    return f"{line}\n\n{reply}" if reply else line
-
 
 def build_system_prompt(
     business_context: str | None, luciel_email_address: str | None = None

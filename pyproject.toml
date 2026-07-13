@@ -41,11 +41,6 @@ dependencies = [
     "anthropic>=0.40",
     "openai>=1.55",
     "boto3>=1.35",
-    # Knowledge file parsers (Architecture §3.2.3 / §3.2 ingestion pipeline): PDF and
-    # DOCX text extraction for the upload path. Pure-Python, no native deps, so the
-    # image build stays simple; CSV/TXT need no extra library (stdlib csv + decode).
-    "pypdf>=5.1",
-    "python-docx>=1.1",
 ]
 
 [project.optional-dependencies]

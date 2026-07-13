@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import Subject, current_admin
 from app.api.errors import not_found
 from app.audit import log as audit
-from app.billing import dunning, metering
+from app.billing import metering
 from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.db.session import tenant_session
 from app.models.audit import ActorType
@@ -152,12 +152,6 @@ async def remove_payment_method(
             actor_user_id=subject.user_id,
             event_type="payment_method_removed",
             payload={"reason": "admin_removed"},
-        )
-        # Legal §A3 / Architecture §3.6.7: an admin-initiated payment-method removal
-        # is a loss of PAYG capability just like a Stripe-side detach — action-tool
-        # connections go dormant (credentials retained, not purged).
-        await dunning.set_dormant_for_action_tools(
-            s, admin_id=subject.admin_id, reason="payment_method_removed"
         )
         instance_id = await _instance_id(s, subject.admin_id)
         budget = await metering.build_budget(s, admin_id=subject.admin_id, instance_id=instance_id)

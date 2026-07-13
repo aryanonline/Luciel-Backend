@@ -50,18 +50,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/admin/knowledge/sources"),
         ("POST", "/api/v1/admin/knowledge/sources/paste"),
         ("POST", "/api/v1/admin/knowledge/sources/upload"),
-        ("POST", "/api/v1/admin/knowledge/sources/csv"),
         ("DELETE", "/api/v1/admin/knowledge/sources/{source_id}"),
-        ("PUT", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("GET", "/api/v1/admin/knowledge/sources/{source_id}/chunks"),
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/resync"),
-        ("POST", "/api/v1/admin/knowledge/sources/{source_id}/replace"),
-        # admin/knowledge — live-sync connectors (Architecture §3.2.3, this build).
-        # FLAGGED per Build Brief rule 5: new knowledge routes added to this frozen
-        # registry as part of the KNOWLEDGE workstream (Arc 11b sync connectors).
-        ("GET", "/api/v1/admin/knowledge/sync-connections"),
-        ("POST", "/api/v1/admin/knowledge/sync-connections"),
-        ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/sync"),
         # admin/account
         ("POST", "/api/v1/admin/account/close"),
         ("POST", "/api/v1/admin/account/export"),
@@ -76,9 +67,6 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # admin/usage
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),
-        # ANALYTICS WORKSTREAM addition (Vision §7 CSV export, Arch §3.9) — flagged
-        # per BUILD_BRIEF.md's one allowed cross-file exception.
-        ("GET", "/api/v1/admin/usage/export.csv"),
         # dashboard
         ("GET", "/api/v1/dashboard/conversations"),
         ("POST", "/api/v1/dashboard/conversations/{session_id}/hand-back"),

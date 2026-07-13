@@ -210,7 +210,6 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         # (older sessions) falls back to the LIVE instance config. Connection health +
         # disable/revoke stay LIVE via the broker gates (safety half wins).
         effective = effective_config(sess.config_snapshot, inst, always_include_channel=CHANNEL)
-        business, assistant = _names(inst)
 
         # LLM router is mode-aware (GATE 2 cutover, §3.4.3): mock (default) returns the
         # deterministic EchoModel exactly as before; live binds the real Anthropic/
@@ -223,9 +222,6 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels=effective.enabled_channels,
-            # Names for the first-message AI-identity disclosure backstop (§3.4.16).
-            business_name=business,
-            assistant_name=assistant,
             # 280-char admin business-context, composed UNDER the platform invariants
             # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
             business_context=effective.business_context,

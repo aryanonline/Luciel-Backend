@@ -67,17 +67,12 @@ class LLMRouter:
         primary: LLMProvider,
         fallback: LLMProvider,
         admin_id: uuid.UUID | None = None,
-        fast: LLMProvider | None = None,
     ) -> None:
         self._primary = primary
         self._fallback = fallback
         # admin_id is used for the per-tenant LLM concurrency cap (§9 C9).
         # When None (legacy or test construction), the cap is skipped.
         self._admin_id = admin_id
-        # Optional Haiku-class fast/cheap provider (§3.4.3 / §7 #9). When unbound
-        # (None), routing is 100% unchanged from pre-fast-routing behavior — the
-        # gate in .complete() below can never select fast without a bound provider.
-        self._fast = fast
 
     async def complete(
         self,
@@ -85,25 +80,12 @@ class LLMRouter:
         messages: list[dict[str, str]],
         *,
         admin_id: uuid.UUID | None = None,
-        requires_tools: bool = True,
-        context_tokens: int = CONTEXT_TOKEN_BUDGET_FAST + 1,
-        complexity: float = 1.0,
     ) -> LLMResponse:
         """Complete with per-admin_id LLM concurrency cap enforcement (§9 C9).
 
         ``admin_id`` kwarg overrides the instance-level admin_id; both are optional
         for backwards compatibility (existing callers that don't pass admin_id skip
         the cap — they should be updated to pass admin_id).
-
-        ``requires_tools`` / ``context_tokens`` / ``complexity`` are routing hints for
-        the intra-session fast/cheap gate (§3.4.3 / §7 #9). Their defaults are
-        deliberately chosen so that a caller who omits them (e.g. orchestrator.py's
-        existing ``self.router.complete(self.system_prompt, messages)`` call site)
-        NEVER triggers fast routing — behavior for existing callers is unchanged
-        byte-for-byte. Only a caller that explicitly passes fast-eligible hints, AND
-        only when a fast provider is bound (``fast=`` at construction), can route to
-        the fast model. Anthropic-primary/OpenAI-fallback doctrine and the NO-retry-
-        on-primary failover behavior are unaffected either way.
         """
         effective_admin_id = admin_id if admin_id is not None else self._admin_id
         if effective_admin_id is not None:
@@ -111,23 +93,6 @@ class LLMRouter:
             from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415
 
             admit_llm_call(effective_admin_id)
-
-        use_fast = self._fast is not None and should_route_fast(
-            requires_tools=requires_tools,
-            context_tokens=context_tokens,
-            complexity=complexity,
-        )
-        if use_fast:
-            try:
-                resp = await self._fast.complete(system_prompt, messages)  # type: ignore[union-attr]
-                resp.model_class = ModelClass.fast
-                resp.used_fallback = False
-                return resp
-            except ProviderError:
-                # Fast provider failing is NOT the primary/fallback doctrine (§3.4.3
-                # governs primary→fallback only) — fall through to the normal primary
-                # path below rather than treating this as a tenant-visible failure.
-                pass
 
         try:
             resp = await self._primary.complete(system_prompt, messages)

@@ -8,7 +8,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, String, func
+from sqlalchemy import DateTime, Enum, String, func
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,12 +31,6 @@ class Lead(Base, TenantMixin, TimestampMixin):
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     contact_identifier: Mapped[str | None] = mapped_column(String(512), nullable=True)
     intent: Mapped[str | None] = mapped_column(String(2048), nullable=True)
-    # Normalized high-value-lead score at capture time (§3.4.5); nullable when a lead
-    # was captured without a scored high-value signal.
-    lead_score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # Channel opt-out (STOP/HELP for SMS, §3.1.6). An opted-out lead is NEVER sent a
-    # scheduled callback regardless of caps (§3.3.5) — read by the callback dispatcher.
-    opted_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     state: Mapped[LeadState] = mapped_column(
         Enum(LeadState, name="lead_state"), default=LeadState.active, nullable=False
     )

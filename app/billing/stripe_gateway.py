@@ -5,16 +5,11 @@ swappable seam (HARD CONSTRAINT, Arc 18 objective #1):
 
   * CI / every test uses :class:`FakeStripeGateway` — a DETERMINISTIC, in-process
     fake. There is NO real Stripe network call anywhere in the test path.
-  * A real stripe-python TEST-MODE impl (:class:`RealStripeGateway`, below) binds
-    behind the same interface when ``config.stripe_integration_posture == "test"``.
-    It reads the Stripe TEST secret/publishable/webhook-signing keys from the
-    platform secret blob (mirrors ``app.runtime.provider_factory``'s LLM GATE 2
-    cutover shape) — NEVER a hardcoded literal, and NEVER the sk_live_ key (that
-    binding does not exist in this codebase). It is NOT invoked by the test suite
-    (tests always inject FakeStripeGateway); CI leaves ``stripe_integration_posture``
-    at its "mock" default so no key is read and no network call is possible.
-  * NO live/production Stripe — ever (objective DO-NOT); "live" is not a value
-    ``stripe_integration_posture`` accepts.
+  * A real stripe-python TEST-MODE impl (:class:`RealStripeGateway`, below) may
+    bind behind the same interface, but is NOT invoked by tests and requires a
+    Stripe secret key that is deliberately ABSENT in CI. It is gated on owner
+    approval (infra-deferred seam, mirrors the connections OAuth/AWS seam).
+  * NO live/production Stripe — ever (objective DO-NOT).
 
 Card-data hygiene (HARD CONSTRAINT #2): the gateway returns ONLY a display tuple
 (brand + last4 + expMonth + expYear) plus Stripe ids (customer / payment-method).
@@ -205,176 +200,18 @@ class FakeStripeGateway:
         )
 
 
-class RealStripeGateway:
-    """Real stripe-python binding, TEST MODE ONLY (Architecture §3.4.1b).
-
-    Bound ONLY when ``config.stripe_integration_posture == "test"`` (never "live" —
-    that value/binding does not exist here). Keys are read from the platform secret
-    blob (``LUCIEL_PLATFORM_SECRET``, the same JSON-blob-from-Secrets-Manager shape
-    ``app.runtime.provider_factory`` uses for the LLM keys) under:
-      * ``STRIPE_TEST_SECRET_KEY``      (sk_test_...)
-      * ``STRIPE_TEST_PUBLISHABLE_KEY`` (pk_test_...) — handed to the frontend only
-      * ``STRIPE_TEST_WEBHOOK_SECRET``  (whsec_...)   — verifies Stripe-Signature
-
-    NEVER hardcode a key literal here — construction fails loudly (RuntimeError,
-    naming only the missing key names, never a value) if a required key is absent,
-    mirroring ``provider_factory._build_live_router``'s fail-closed discipline.
-    The ``stripe`` package itself is imported LAZILY so CI (no stripe-python
-    installed, no network) still imports this module cleanly — it is never invoked
-    by the test suite, which always injects :class:`FakeStripeGateway`.
-
-    ``verify_and_parse`` uses the SAME v1 HMAC-SHA256 scheme as the fake (Stripe's
-    real wire format), keyed by ``STRIPE_TEST_WEBHOOK_SECRET`` — the webhook route's
-    verify-before-route discipline (HARD CONSTRAINT #4) is identical for both.
-    """
-
-    def __init__(self, *, secret_key: str, publishable_key: str, webhook_secret: str) -> None:
-        if not secret_key.startswith("sk_test_"):
-            # Hard fail-closed: refuse anything that is not a recognizable TEST key
-            # (in particular, this rejects an sk_live_ key outright — objective
-            # DO-NOT — without ever logging the value itself).
-            raise RuntimeError(
-                "RealStripeGateway requires a Stripe TEST secret key (sk_test_...); "
-                "refusing to bind a non-test-mode key."
-            )
-        self._secret_key = secret_key
-        self._publishable_key = publishable_key
-        self._webhook_secret = webhook_secret
-        self._client: object | None = None
-
-    def _get_client(self) -> object:
-        if self._client is None:
-            import stripe  # noqa: PLC0415 — lazy/guarded import (CI has no stripe-python)
-
-            stripe.api_key = self._secret_key
-            self._client = stripe
-        return self._client
-
-    async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
-        client = self._get_client()
-        customer = client.Customer.create(  # type: ignore[attr-defined]
-            email=email, metadata={"admin_id": str(admin_id)}
-        )
-        return str(customer["id"])
-
-    async def create_checkout_session(
-        self, *, customer_id: str, success_url: str, cancel_url: str
-    ) -> CheckoutSession:
-        client = self._get_client()
-        session = client.checkout.Session.create(  # type: ignore[attr-defined]
-            customer=customer_id,
-            mode="setup",  # add-a-card, NO charge at save (CJ §6)
-            payment_method_types=["card"],
-            success_url=success_url,
-            cancel_url=cancel_url,
-        )
-        return CheckoutSession(url=str(session["url"]), session_id=str(session["id"]))
-
-    async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str
-    ) -> bool:
-        client = self._get_client()
-        client.SubscriptionItem.create_usage_record(  # type: ignore[attr-defined]
-            subscription_id,
-            quantity=quantity,
-            idempotency_key=idempotency_key,
-        )
-        return True
-
-    async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
-        client = self._get_client()
-        customer = client.Customer.retrieve(customer_id)  # type: ignore[attr-defined]
-        pm_id = customer.get("invoice_settings", {}).get("default_payment_method")
-        if not pm_id:
-            return None
-        pm = client.PaymentMethod.retrieve(pm_id)  # type: ignore[attr-defined]
-        card = pm.get("card", {})
-        return PaymentMethodDisplay(
-            brand=str(card.get("brand")),
-            last4=str(card.get("last4")),
-            exp_month=int(card.get("exp_month")),
-            exp_year=int(card.get("exp_year")),
-        )
-
-    async def remove_payment_method(self, *, customer_id: str) -> bool:
-        client = self._get_client()
-        customer = client.Customer.retrieve(customer_id)  # type: ignore[attr-defined]
-        pm_id = customer.get("invoice_settings", {}).get("default_payment_method")
-        if not pm_id:
-            return False
-        client.PaymentMethod.detach(pm_id)  # type: ignore[attr-defined]
-        return True
-
-    def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
-        # HARD CONSTRAINT #4: verify BEFORE parsing/acting. Same v1 scheme as the
-        # fake, keyed by the TEST webhook signing secret (never the live one).
-        ts, sigs = _parse_signature_header(signature_header)
-        if ts is None or not sigs:
-            raise SignatureError("Missing Stripe-Signature components.")
-        expected = _compute_signature(self._webhook_secret, ts, payload)
-        if not any(hmac.compare_digest(expected, s) for s in sigs):
-            raise SignatureError("Stripe signature mismatch.")
-        body = json.loads(payload.decode("utf-8"))
-        return StripeEvent(
-            event_id=str(body["id"]),
-            type=str(body["type"]),
-            data=dict(body.get("data", {}).get("object", {})),
-        )
-
-
-def _build_test_gateway() -> RealStripeGateway:
-    """Build the TEST-posture RealStripeGateway from the platform secret blob.
-
-    Fails loudly (RuntimeError naming only the missing key names — NEVER a value)
-    if a required TEST key is absent, mirroring
-    ``app.runtime.provider_factory._build_live_router``'s fail-closed discipline.
-    """
-    from app.config import get_settings, parse_platform_secret  # noqa: PLC0415
-
-    settings = get_settings()
-    secret = parse_platform_secret(settings.platform_secret)
-    secret_key = secret.get("STRIPE_TEST_SECRET_KEY", "")
-    publishable_key = secret.get("STRIPE_TEST_PUBLISHABLE_KEY", "")
-    webhook_secret = secret.get("STRIPE_TEST_WEBHOOK_SECRET", "")
-    missing = [
-        n
-        for n, v in (
-            ("STRIPE_TEST_SECRET_KEY", secret_key),
-            ("STRIPE_TEST_PUBLISHABLE_KEY", publishable_key),
-            ("STRIPE_TEST_WEBHOOK_SECRET", webhook_secret),
-        )
-        if not v
-    ]
-    if missing:
-        raise RuntimeError(
-            "stripe_integration_posture=test but the platform secret is missing keys: "
-            f"{', '.join(missing)}"
-        )
-    return RealStripeGateway(
-        secret_key=secret_key, publishable_key=publishable_key, webhook_secret=webhook_secret
-    )
-
-
 _gateway: StripeGateway | None = None
 
 
 def get_stripe_gateway() -> StripeGateway:
     """Return the process gateway singleton (the fake by default).
 
-    ``stripe_integration_posture`` gates the binding exactly like the LLM GATE 2
-    cutover: "mock" (default) → :class:`FakeStripeGateway`, no keys, no network —
-    every test stays on this path. "test" → :class:`RealStripeGateway` bound
-    against the Stripe TEST keys (never sk_live_). This is the swappable seam —
-    flagged per the objective."""
+    The real stripe-python TEST-MODE binding (:class:`RealStripeGateway`) installs
+    here on owner approval when a Stripe key is present; CI leaves the fake. This
+    is the swappable seam — flagged per the objective."""
     global _gateway
     if _gateway is None:
-        from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
-
-        settings = get_settings()
-        if settings.stripe_integration_posture == "test":
-            _gateway = _build_test_gateway()
-        else:
-            _gateway = FakeStripeGateway()
+        _gateway = FakeStripeGateway()
     return _gateway
 
 

@@ -59,10 +59,7 @@ async def test_normal_turn_answers_and_counts_once():
             mode="ai",
             inbound_text="Do you have any openings?",
         )
-        # First turn on a text channel carries the AI-identity disclosure backstop
-        # (§3.4.16), then the (echoed) answer content.
-        assert "ai assistant" in result.reply_text.lower()
-        assert "Echo:" in result.reply_text
+        assert result.reply_text.startswith("Echo:")
         assert result.counted is True
         assert result.at_cap is False
         # The transcript persisted both the lead message and the luciel reply.
