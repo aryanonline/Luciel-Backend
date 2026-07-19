@@ -257,3 +257,212 @@ async def test_trigger_sync_for_website_crawl_ingests_and_is_idempotent_when_unc
     assert r2.status_code == 200
     assert r2.json()["added"] == []
     assert r2.json()["updated"] == []  # unchanged content -> no-op, not a re-ingest
+
+
+# --- OAuth code->token callback (the previously-MISSING link) --------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_token(
+    client, monkeypatch
+):
+    """Full round trip through the real admin API: create an OAuth-class
+    sync-connection (starts 'unconfigured'), call the new oauth-callback with a
+    fake transport standing in for the provider's token endpoint, assert the
+    connection flips to 'connected' and a token is retrievable from the secret
+    store, then trigger a sync (also against a fake transport) and assert the
+    stored token is what the provider actually sends as the Authorization
+    header — proving connect -> callback -> sync is wired end-to-end."""
+    import app.api.v1.admin.knowledge as knowledge_api
+    import httpx
+    from app.connections.secrets import secret_ref_for
+
+    class FakeTokenTransport:
+        """Stands in for the real oauth2.googleapis.com/token endpoint."""
+
+        async def post(self, url, *, data=None, headers=None):
+            assert url == "https://oauth2.googleapis.com/token"
+            assert data["code"] == "auth-code-xyz"
+            return httpx.Response(
+                200,
+                json={"access_token": "gd-tok-from-callback", "refresh_token": "gd-r"},
+                request=httpx.Request("POST", url),
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(knowledge_api, "oauth_transport", lambda: FakeTokenTransport())
+
+    from app.config import Settings
+    from app.knowledge import providers as providers_module
+
+    configured = Settings(
+        google_drive_client_id="gcid",
+        google_drive_client_secret="gcsecret",
+        google_drive_redirect_uri="https://api.example.com/gd-callback",
+    )
+    monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
+
+    admin_id, instance_id = await _ready_account_with_luciel_capturing_ids(client)
+    rc = await client.post(
+        "/api/v1/admin/knowledge/sync-connections", json={"provider": "google_drive"}
+    )
+    assert rc.status_code == 201
+    conn_body = rc.json()
+    assert conn_body["status"] == "unconfigured"
+    connection_id = conn_body["connectionId"]
+
+    rcb = await client.post(
+        f"/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback",
+        json={"code": "auth-code-xyz"},
+    )
+    assert rcb.status_code == 200, rcb.text
+    cb_body = rcb.json()
+    assert cb_body["status"] == "connected"
+
+    # The secret_ref convention is tenant-scoped (§3.8.3) — read it back via the
+    # SAME secret store the app uses in mock mode to prove the write really
+    # happened (not just that the endpoint returned 200). admin_id/instance_id
+    # are never returned over the wire (§3.8.3), so we captured them directly
+    # from account creation above instead of round-tripping the API for them.
+    from app.connections.secrets import get_secret_store
+
+    store = get_secret_store()
+    material = await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
+    assert material is not None
+    assert material["access_token"] == "gd-tok-from-callback"
+
+    # Now trigger a sync — the GoogleDriveProvider should read that exact stored
+    # token and send it as the Authorization header (closing the loop).
+    class FakeSyncTransport:
+        def __init__(self):
+            self.seen_auth = None
+
+        async def get(self, url, *, headers=None, params=None):
+            self.seen_auth = headers.get("Authorization") if headers else None
+            return httpx.Response(200, json={"files": []}, request=httpx.Request("GET", url))
+
+    fake_sync_transport = FakeSyncTransport()
+    original_factory = providers_module.provider_for_connection
+
+    def patched_factory(connection, secret_store):
+        p = original_factory(connection, secret_store)
+        if isinstance(p, providers_module.GoogleDriveProvider):
+            p._transport = fake_sync_transport
+        return p
+
+    monkeypatch.setattr(providers_module, "provider_for_connection", patched_factory)
+    monkeypatch.setattr(knowledge_api, "provider_for_connection", patched_factory)
+
+    rs = await client.post(f"/api/v1/admin/knowledge/sync-connections/{connection_id}/sync")
+    assert rs.status_code == 200, rs.text
+    assert fake_sync_transport.seen_auth == "Bearer gd-tok-from-callback"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oauth_callback_rejected_code_is_clean_409_not_500(client, monkeypatch):
+    """A revoked/expired/invalid code from the provider must surface as a clean
+    4xx via OAuthExchangeError, never an unhandled 500."""
+    import app.api.v1.admin.knowledge as knowledge_api
+    import httpx
+
+    class FailingTokenTransport:
+        async def post(self, url, *, data=None, headers=None):
+            return httpx.Response(
+                400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(knowledge_api, "oauth_transport", lambda: FailingTokenTransport())
+
+    from app.config import Settings
+    from app.knowledge import providers as providers_module
+
+    configured = Settings(
+        hubspot_client_id="hcid",
+        hubspot_client_secret="hcsecret",
+        hubspot_redirect_uri="https://api.example.com/hs-callback",
+    )
+    monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
+
+    await _ready_account_with_luciel(client)
+    rc = await client.post("/api/v1/admin/knowledge/sync-connections", json={"provider": "hubspot"})
+    connection_id = rc.json()["connectionId"]
+
+    rcb = await client.post(
+        f"/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback",
+        json={"code": "expired-code"},
+    )
+    assert rcb.status_code == 409
+    assert "hubspot" in rcb.json()["message"].lower() or "exchange" in rcb.json()["message"].lower()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_trigger_sync_on_never_connected_oauth_connection_is_clean_409_not_500(client):
+    """A sync-connection that never completed oauth-callback has no token on
+    file. Triggering sync on it must surface a clean structured error (the
+    ProviderUnavailable the provider layer raises), never an unhandled 500."""
+    await _ready_account_with_luciel(client)
+    rc = await client.post(
+        "/api/v1/admin/knowledge/sync-connections", json={"provider": "google_drive"}
+    )
+    connection_id = rc.json()["connectionId"]
+    assert rc.json()["status"] == "unconfigured"
+
+    rs = await client.post(f"/api/v1/admin/knowledge/sync-connections/{connection_id}/sync")
+    assert rs.status_code == 409
+    assert rs.json()["message"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oauth_callback_missing_connection_404(client):
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        f"/api/v1/admin/knowledge/sync-connections/{uuid.uuid4()}/oauth-callback",
+        json={"code": "whatever"},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oauth_callback_on_non_oauth_provider_is_422(client):
+    """website_crawl has no OAuth step — calling the callback on it is a client
+    error (wrong connection type), not a crash."""
+    await _ready_account_with_luciel(client)
+    rc = await client.post(
+        "/api/v1/admin/knowledge/sync-connections",
+        json={"provider": "website_crawl", "crawlUrls": ["https://example.com/faq"]},
+    )
+    connection_id = rc.json()["connectionId"]
+    r = await client.post(
+        f"/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback",
+        json={"code": "whatever"},
+    )
+    assert r.status_code == 422
+
+
+async def _ready_account_with_luciel_capturing_ids(client) -> tuple[uuid.UUID, uuid.UUID]:
+    """Same setup as ``_ready_account_with_luciel`` but also returns
+    (admin_id, instance_id) so a test can verify the SecretStore write directly
+    — those ids are deliberately never present in wire responses (§3.8.3)."""
+    from app.auth import access
+
+    email = f"kb-oauth-{uuid.uuid4().hex[:8]}@x.com"
+    await client.post(
+        "/api/v1/auth/signup", json={"email": email, "password": "pw-123456", "captchaToken": "t"}
+    )
+    acct, token = await access.signup(email, "pw-123456")
+    await client.post("/api/v1/auth/verify-email", json={"token": token})
+    await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
+    r = await client.post(
+        "/api/v1/admin/luciel", json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"}
+    )
+    instance_id = uuid.UUID(r.json()["instanceId"])
+    return acct.id, instance_id

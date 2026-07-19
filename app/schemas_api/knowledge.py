@@ -93,3 +93,17 @@ class SyncResultOut(WireModel):
     added: list[str]
     updated: list[str]
     removed: list[str]
+
+
+class OAuthCallbackRequest(WireModel):
+    """POST /sync-connections/{id}/oauth-callback body (§3.8.3/§3.2.3).
+
+    The provider consent-screen redirect lands the admin's browser back on the
+    frontend with ``code`` (and the ``state`` it round-tripped, for CSRF binding
+    to the connection being completed); the frontend forwards both here so the
+    backend — never the browser — holds the client_secret needed to exchange
+    the code for a token.
+    """
+
+    code: str
+    state: str | None = None

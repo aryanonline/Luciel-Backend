@@ -1,0 +1,175 @@
+"""Notification dispatch (Architecture §3.6.7 / §3.5 / §5.10 / §3.4.5).
+
+Renders the doc-mandated customer/admin notifications and delivers them via the
+injected EmailSender, THEN writes the durable audit record. Delivery may degrade to
+NullEmailSender (mock/CI or unconfigured live) — the audit event is still written, so
+the compliance artifact (cadence, recipient, purpose) is never lost. This is the real
+send that the notifier's AWS-DEFERRED seam described.
+
+All sends go through ``_dispatch`` so every notification is uniformly audited with a
+``delivery_status`` of ``sent`` (real message id) or ``recorded`` (Null fallback).
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.audit import log as audit
+from app.models.audit import ActorType
+from app.notifications.email_sender import EmailSender, NullEmailSender, build_email_sender
+
+
+async def _dispatch(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    subject: str,
+    body: str,
+    notice_type: str,
+    audit_event: str,
+    extra_payload: dict[str, object] | None = None,
+    sender: EmailSender | None = None,
+) -> str | None:
+    sender = sender or build_email_sender()
+    message_id: str | None = None
+    delivery_status = "recorded"
+    try:
+        message_id = await sender.send(to=to, subject=subject, body_text=body)
+        delivery_status = "sent" if not isinstance(sender, NullEmailSender) else "recorded"
+    except Exception as exc:  # noqa: BLE001 — never let a delivery error break the flow
+        delivery_status = "failed"
+        extra_payload = {**(extra_payload or {}), "delivery_error": type(exc).__name__}
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type=audit_event,
+        payload={
+            "notice_type": notice_type,
+            "recipient": to,
+            "delivery_method": "email",
+            "delivery_status": delivery_status,
+            "message_id": message_id,
+            "sent_at": datetime.now(UTC).isoformat(),
+            **(extra_payload or {}),
+        },
+    )
+    return message_id
+
+
+# --- concrete notifications ------------------------------------------------------- #
+
+
+async def send_verify_email(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    verify_url: str,
+    sender: EmailSender | None = None,
+) -> str | None:
+    """Signup verification link (CJ Phase 2). The link is emailed, never returned."""
+    body = (
+        "Welcome to VantageMind.\n\n"
+        "Confirm your email to activate your account:\n\n"
+        f"{verify_url}\n\n"
+        "This link expires in 24 hours. If you didn't sign up, ignore this email."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Confirm your VantageMind email",
+        body=body,
+        notice_type="verify_email",
+        audit_event="verification_resent",
+        sender=sender,
+    )
+
+
+async def send_export_ready(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    download_url: str,
+    ttl_days: int,
+    sender: EmailSender | None = None,
+) -> str | None:
+    """Email the data-export download link (§5.10). Delivery-ONLY: the caller (export
+    flow) already emits the ``data_export_ready`` audit event with the link, so this
+    must NOT emit a second one — it just sends the email."""
+    body = (
+        "Your VantageMind data export is ready.\n\n"
+        f"Download it here (link valid for {ttl_days} days):\n\n{download_url}\n\n"
+        "For your security the link expires; request a new export if it lapses."
+    )
+    sender = sender or build_email_sender()
+    try:
+        return await sender.send(to=to, subject="Your data export is ready", body_text=body)
+    except Exception:  # noqa: BLE001 — delivery failure never breaks the export flow
+        return None
+
+
+async def send_payment_failed(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    dunning_state: str,
+    attempt_number: int,
+    sender: EmailSender | None = None,
+) -> str | None:
+    """Dunning retry notice (Legal §A3 / §3.6.7 — a notice at each retry)."""
+    body = (
+        "We couldn't process your latest VantageMind payment.\n\n"
+        f"This was retry attempt {attempt_number}. We'll try again automatically.\n"
+        "Please check your payment method to avoid an interruption to your service."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Action needed: payment issue on your VantageMind account",
+        body=body,
+        notice_type="payment_failed_retry",
+        audit_event="lifecycle_notice_sent",
+        extra_payload={"dunning_state": dunning_state, "attempt_number": attempt_number},
+        sender=sender,
+    )
+
+
+async def send_escalation_notice(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    signal: str,
+    conversation_ref: str,
+    sender: EmailSender | None = None,
+) -> str | None:
+    """Escalation → owner notification (§3.4.5: Luciel pings the owner to act)."""
+    body = (
+        "Luciel escalated a conversation that needs your attention.\n\n"
+        f"Reason: {signal}\n"
+        f"Conversation: {conversation_ref}\n\n"
+        "Open your dashboard to review and take over if needed."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Luciel needs you: a conversation was escalated",
+        body=body,
+        notice_type="escalation",
+        audit_event="escalation_notification_sent",
+        # §5.2: escalation audit payloads carry non-identifying refs only — never the
+        # lead's raw contact. conversation_ref is a non-PII session handle.
+        extra_payload={"signal": signal, "conversation_ref": conversation_ref},
+        sender=sender,
+    )

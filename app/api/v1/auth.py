@@ -17,11 +17,13 @@ from app.api.deps import Subject, current_session_subject
 from app.api.errors import unauthorized, validation_error
 from app.audit import log as audit
 from app.auth import access
+from app.auth.captcha import verify_captcha
 from app.auth.tokens import decode_token
 from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 from app.models.instance import Account
+from app.notifications import email_dispatcher
 from app.schemas_api.auth import (
     AccountOut,
     ForgotPasswordRequest,
@@ -80,10 +82,19 @@ async def _has_luciel(admin_id: uuid.UUID) -> bool:
 
 @router.post("/signup", response_model=SignupResult)
 async def signup(req: SignupRequest) -> SignupResult:
-    # captcha_token is required by shape; verification of the captcha provider is
-    # an integration detail (hCaptcha) wired in deployment — accepted as present here.
-    acct, _token = await access.signup(req.email, req.password)
-    # NOTE: in production the verify link/token is emailed, never returned in the body.
+    # Verify the captcha with the provider (hCaptcha) BEFORE creating the account
+    # (§3.7.1a bot-protection). In mock/unconfigured mode this is a no-op pass.
+    await verify_captcha(req.captcha_token)
+    acct, token = await access.signup(req.email, req.password)
+    # Email the verification link (never returned in the body). Degrades to audit-
+    # only if email isn't configured (NullEmailSender).
+    if token:
+        settings = get_settings()
+        verify_url = f"{settings.app_base_url}/verify-email?token={token}"
+        async with tenant_session(acct.id) as s:
+            await email_dispatcher.send_verify_email(
+                s, admin_id=acct.id, to=acct.email, verify_url=verify_url
+            )
     return SignupResult(account=_account_out(acct, has_luciel=False))
 
 

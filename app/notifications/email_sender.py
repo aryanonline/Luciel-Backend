@@ -1,0 +1,88 @@
+"""Real email delivery via Amazon SES (Architecture §3.1.2 / §3.6.7 / §3.5).
+
+Closes the AWS-DEFERRED notifier seam. Two implementations behind one Protocol:
+
+- ``SesEmailSender``   — live: sends through Amazon SES (SESv2). Bound in live mode
+  by ``build_email_sender`` from the platform config.
+- ``NullEmailSender``  — mock/CI: records sends in-memory, makes NO network call, so
+  the suite stays hermetic and deterministic. This is the default.
+
+The dispatcher (``email_dispatcher.py``) renders templates and calls this; the
+notifier/auth/lifecycle/export code call the dispatcher. Secrets are never logged.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class SentEmail:
+    to: str
+    subject: str
+    body: str
+    message_id: str
+
+
+class EmailSender(Protocol):
+    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+        """Send an email; return a provider message id. Raises on hard failure."""
+        ...
+
+
+class NullEmailSender:
+    """Mock/CI sender — records intent, no network. Inspectable in tests."""
+
+    def __init__(self) -> None:
+        self.sent: list[SentEmail] = []
+
+    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+        mid = f"null-{len(self.sent) + 1}"
+        self.sent.append(SentEmail(to=to, subject=subject, body=body_text, message_id=mid))
+        return mid
+
+
+@dataclass
+class SesEmailSender:
+    """Live SES sender (SESv2). Lazy boto3 import so CI without AWS never imports it."""
+
+    sender_identity: str
+    region_name: str
+    _client: object | None = field(default=None, repr=False)
+
+    def _get_client(self) -> object:
+        if self._client is None:
+            import boto3  # noqa: PLC0415 — lazy/guarded (CI has no AWS)
+
+            self._client = boto3.client("sesv2", region_name=self.region_name)
+        return self._client
+
+    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+        client = self._get_client()
+        resp = client.send_email(  # type: ignore[attr-defined]
+            FromEmailAddress=self.sender_identity,
+            Destination={"ToAddresses": [to]},
+            Content={
+                "Simple": {
+                    "Subject": {"Data": subject, "Charset": "UTF-8"},
+                    "Body": {"Text": {"Data": body_text, "Charset": "UTF-8"}},
+                }
+            },
+        )
+        return str(resp.get("MessageId", ""))
+
+
+def build_email_sender() -> EmailSender:
+    """Return the SES sender in live mode, else the Null sender (mock/CI).
+
+    Live requires a configured platform sender identity; if absent, we fall back to
+    Null and the dispatcher records the send as audit-only (honest degradation rather
+    than a crash) — matching the codebase's integration-mode seam pattern.
+    """
+    from app.config import get_settings
+
+    s = get_settings()
+    if s.integration_mode == "live" and s.platform_email_sender:
+        return SesEmailSender(sender_identity=s.platform_email_sender, region_name=s.aws_region)
+    return NullEmailSender()

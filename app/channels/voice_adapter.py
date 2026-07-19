@@ -135,6 +135,11 @@ class VoiceSender:  # pragma: no cover - interface marker
     The Voice channel responds in-band (TwiML on the webhook response), so there is no
     separate async send like SMS. send() is provided to satisfy the ChannelAdapter
     Protocol; it formats an outbound spoken turn as TwiML in the receipt detail.
+
+    This is NOT a deferred stub: unlike SMS (which needs a real Twilio REST push,
+    see ``app/channels/twilio_sender.py``), Twilio Voice's outbound reply IS the
+    TwiML returned on the webhook response — there is no separate outbound call to
+    make, so no sender/credential is needed on the voice send path (§3.1.2).
     """
 
 

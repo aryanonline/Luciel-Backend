@@ -40,17 +40,38 @@ async def notify_payment_failed(
     obligation.  When SES/Twilio land, the real send fires here before the audit emit.
     """
     now = now or datetime.now(UTC)
-    # AWS-DEFERRED SEAM: real_send(admin_id, template="payment_failed", ...) goes here.
-    await audit.emit(
-        session,
-        admin_id=admin_id,
-        actor_type=ActorType.platform,
-        event_type="lifecycle_notice_sent",
-        payload={
-            "notice_type": "payment_failed_retry",
-            "dunning_state": dunning_state,
-            "attempt_number": attempt_number,
-            "delivery_method": "email",  # real delivery wired in Arc 13/14
-            "sent_at": now.isoformat(),
-        },
-    )
+    # Real send now wired: email the owner via the dispatcher (which writes the
+    # lifecycle_notice_sent audit record with delivery_status). Degrades to audit-
+    # only when email isn't configured, preserving the compliance artifact.
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.instance import Account  # noqa: PLC0415 (avoid import cycle)
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+
+    owner_email = (
+        await session.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    if owner_email:
+        await email_dispatcher.send_payment_failed(
+            session,
+            admin_id=admin_id,
+            to=owner_email,
+            dunning_state=dunning_state,
+            attempt_number=attempt_number,
+        )
+    else:
+        # No email on file — still write the durable compliance record (Legal §A3).
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="lifecycle_notice_sent",
+            payload={
+                "notice_type": "payment_failed_retry",
+                "dunning_state": dunning_state,
+                "attempt_number": attempt_number,
+                "delivery_method": "email",
+                "delivery_status": "recorded",
+                "sent_at": now.isoformat(),
+            },
+        )

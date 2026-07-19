@@ -58,7 +58,15 @@ class SmsSender(Protocol):
 class SmsAdapter:
     channel_id = "sms"
 
-    def __init__(self, sender: SmsSender) -> None:
+    def __init__(self, sender: SmsSender | None = None) -> None:
+        # Default wires the real Twilio-backed factory (§3.1.4): live+configured ->
+        # TwilioSmsSender, else NullSmsSender (mock/CI, no network). Callers/tests
+        # may still inject their own sender (e.g. FakeTwilio) as before — the
+        # factory is only consulted when no sender is explicitly supplied.
+        if sender is None:
+            from app.channels.twilio_sender import build_sms_sender
+
+            sender = build_sms_sender()
         self._sender = sender
 
     async def verify_inbound(self, request: dict[str, Any]) -> InstanceContext:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, Response
+from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
@@ -15,9 +17,19 @@ from app.lifecycle import cascade
 from app.lifecycle.export_bundle import build_export_zip
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
 from app.models.audit import ActorType
-from app.schemas_api.auth import OkResult
+from app.models.instance import Account
+from app.notifications import email_dispatcher
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
+
+
+class ExportResult(BaseModel):
+    """Export response — carries the time-limited download link so the customer can
+    actually retrieve their bundle (§5.10). Also emailed to the account owner."""
+
+    ok: bool = True
+    download_url: str
+    ttl_days: int
 
 
 async def _build_upload_and_notify(
@@ -60,14 +72,27 @@ async def _build_upload_and_notify(
         event_type="data_export_ready",
         payload=payload,
     )
+    # Deliver the link to the account owner by email (§5.10 — the admin receives the
+    # time-limited link). Degrades to audit-only if email isn't configured.
+    owner_email = (
+        await s.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    if owner_email:
+        await email_dispatcher.send_export_ready(
+            s,
+            admin_id=admin_id,
+            to=owner_email,
+            download_url=url,
+            ttl_days=settings.export_link_ttl_days,
+        )
     return url
 
 
-@router.post("/export", response_model=OkResult)
+@router.post("/export", response_model=ExportResult)
 async def request_export(
     subject: Subject = Depends(current_admin),
     store: ExportStore = Depends(get_export_store),
-) -> OkResult:
+) -> ExportResult:
     """Self-serve export (all accounts, any time — §5.10).
 
     Builds the bundle, uploads it to the ExportStore (S3 ``vm-export-bundles`` in
@@ -83,10 +108,11 @@ async def request_export(
             actor_type=ActorType.admin_user,
             event_type="data_export_self_serve",
         )
-        await _build_upload_and_notify(
+        url = await _build_upload_and_notify(
             s, admin_id=subject.admin_id, actor_user_id=subject.user_id, store=store
         )
-    return OkResult(ok=True)
+        ttl = get_settings().export_link_ttl_days
+    return ExportResult(ok=True, download_url=url, ttl_days=ttl)
 
 
 @router.post("/close", status_code=204)

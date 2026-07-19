@@ -100,12 +100,126 @@ class HttpTransport(Protocol):
         params: dict[str, object] | None = None,
     ) -> httpx.Response: ...
 
+    async def post(
+        self,
+        url: str,
+        *,
+        data: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response: ...
+
 
 async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
     material = await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
     if not material or not material.get("access_token"):
         raise ProviderUnavailable("No access token on file for this knowledge-sync connection.")
     return material["access_token"]
+
+
+# --------------------------------------------------------------------------- #
+# OAuth CODE -> TOKEN exchange (§3.8.3 / Architecture §3.2.3): completes the
+# authorize-URL half of the connect flow that ``connections.service.start_connection``
+# already returns. This is the piece that was MISSING end-to-end: there was an
+# authorize URL and a bearer-token consumer, but nothing that turned a provider's
+# `code` into an access token and wrote it to the SecretStore as a tenant-scoped
+# secret_ref. Every provider's token endpoint is a plain `POST application/x-www-
+# form-urlencoded` -> JSON call, so ONE function covers all three OAuth-class
+# providers (google_drive/hubspot/salesforce) — only the endpoint URL and the
+# extra `instance_url` Salesforce returns differ.
+#
+# The real provider round-trip (POST to accounts.google.com / hubspot / salesforce
+# login) is the one genuinely-external step that cannot be exercised in this arc
+# without a real consent click-through — exactly like the authorize URL redirect
+# itself. It is exercised here against the SAME FAKE ``HttpTransport`` seam the
+# read-side providers already use, so the whole code->token->secret_ref->sync
+# chain is provably wired end-to-end in mock mode; only the provider's own HTTP
+# round-trip is the documented manual seam (see gap_oauth.md).
+# --------------------------------------------------------------------------- #
+_TOKEN_ENDPOINTS: dict[str, str] = {
+    "google_drive": "https://oauth2.googleapis.com/token",
+    "hubspot": "https://api.hubapi.com/oauth/v1/token",
+    "salesforce": "https://login.salesforce.com/services/oauth2/token",
+}
+
+
+class OAuthExchangeError(Exception):
+    """Raised when the provider rejects the code (revoked/expired/invalid grant).
+
+    Callers (the oauth-callback admin handler) MUST turn this into a clean 4xx
+    ApiError, never let it propagate as an unhandled 500 (Build Brief rule: a
+    revoked/expired credential surfaces a clean error, not a crash)."""
+
+
+async def exchange_code_for_token(
+    provider: str,
+    *,
+    code: str,
+    transport: HttpTransport,
+) -> dict[str, str]:
+    """Exchange an OAuth ``code`` for an access token via the provider's token
+    endpoint, through the SAME ``HttpTransport`` seam ``snapshot()`` uses (a real
+    impl is ``httpx.AsyncClient``; tests inject a FAKE — no real network call).
+
+    Returns the material dict to hand to ``SecretStore.put`` verbatim (never
+    logged, never returned over the wire — §3.8.3 rule 4). Raises
+    ``OAuthExchangeError`` on a non-2xx / error-shaped response (revoked,
+    expired, or invalid code) so the caller can surface a clean 4xx rather than
+    crash on a KeyError/HTTPStatusError.
+    """
+    cfg = oauth_client_config(provider)
+    if not cfg.configured:
+        raise ProviderUnavailable(
+            f"OAuth client for '{provider}' is not configured (missing client_id/secret)."
+        )
+    endpoint = _TOKEN_ENDPOINTS.get(provider)
+    if endpoint is None:
+        raise ProviderUnavailable(f"No token endpoint registered for provider '{provider}'.")
+
+    resp = await transport.post(
+        endpoint,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "redirect_uri": cfg.redirect_uri,
+        },
+        headers={"Accept": "application/json"},
+    )
+    if resp.status_code >= 400:
+        raise OAuthExchangeError(
+            f"{provider} token exchange failed (HTTP {resp.status_code}): "
+            f"code likely revoked, expired, or invalid."
+        )
+    data = resp.json()
+    if "error" in data or not data.get("access_token"):
+        reason = data.get("error", "no access_token in response")
+        raise OAuthExchangeError(f"{provider} token exchange rejected: {reason}")
+    material: dict[str, str] = {"access_token": str(data["access_token"])}
+    if data.get("refresh_token"):
+        material["refresh_token"] = str(data["refresh_token"])
+    if data.get("instance_url"):  # Salesforce returns the org's API base URL.
+        material["instance_url"] = str(data["instance_url"])
+    return material
+
+
+async def store_oauth_token(
+    store: SecretStore,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    material: dict[str, str],
+) -> str:
+    """Write exchanged token material to the tenant-scoped secret_ref (§3.8.3).
+
+    Uses the SAME ``secret_ref_for(admin_id, instance_id, "knowledge_source")``
+    convention the sync-time ``_bearer_token`` reader consumes, so a token
+    written here is immediately usable by the next sync run with no other
+    wiring — this is the link that closes connect -> callback -> sync.
+    """
+    ref = secret_ref_for(admin_id, instance_id, "knowledge_source")
+    await store.put(ref, material)
+    return ref
 
 
 # --------------------------------------------------------------------------- #

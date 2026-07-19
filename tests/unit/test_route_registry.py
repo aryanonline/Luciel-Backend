@@ -62,6 +62,7 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/admin/knowledge/sync-connections"),
         ("POST", "/api/v1/admin/knowledge/sync-connections"),
         ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/sync"),
+        ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback"),
         # admin/account
         ("POST", "/api/v1/admin/account/close"),
         ("POST", "/api/v1/admin/account/export"),

@@ -14,20 +14,31 @@ flows are real product behavior these back.
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
+from app.audit import log as audit
 from app.connections import service as connections_service
 from app.connections.secrets import get_secret_store
 from app.db.session import tenant_session
 from app.knowledge import service, sync
 from app.knowledge.parsers import ParseError, parse_file
-from app.knowledge.providers import provider_for_connection
+from app.knowledge.providers import (
+    HttpTransport,
+    OAuthExchangeError,
+    ProviderUnavailable,
+    exchange_code_for_token,
+    provider_for_connection,
+    store_oauth_token,
+)
 from app.knowledge.service import QuotaError
+from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance
 from app.models.knowledge import KnowledgeSource
@@ -36,6 +47,7 @@ from app.schemas_api.knowledge import (
     KnowledgeChunkOut,
     KnowledgeQuotaOut,
     KnowledgeSourceOut,
+    OAuthCallbackRequest,
     PasteIngestRequest,
     RenameSourceRequest,
     SyncConnectionOut,
@@ -43,6 +55,20 @@ from app.schemas_api.knowledge import (
 )
 
 router = APIRouter(prefix="/api/v1/admin/knowledge", tags=["knowledge"])
+
+
+def oauth_transport() -> httpx.AsyncClient:
+    """Factory for the OAuth token-exchange HTTP transport (§3.2.3/§3.8.3 seam).
+
+    A plain function (not a hardcoded ``httpx.AsyncClient()`` call site) so tests
+    can monkeypatch this name to a FAKE async-context-manager transport with no
+    real network call — the same pattern ``provider_for_connection`` already
+    uses for the read-side sync providers in
+    ``tests/contract/test_knowledge_sync_and_edit.py``. Production leaves this
+    untouched and gets a real ``httpx.AsyncClient``.
+    """
+    return httpx.AsyncClient()
+
 
 # provider (brand) -> source_origin (wire vocabulary, §3.2.3 storage entity note).
 # hubspot/salesforce both map to the generic 'crm_kb' origin (Vision §7 "native CRM
@@ -157,14 +183,22 @@ async def resync_source(
             if conn is None:
                 raise not_found("Connection not found.")
             provider = provider_for_connection(conn, get_secret_store())
-            await sync.sync_connection(
-                s,
-                admin_id=subject.admin_id,
-                instance_id=src.instance_id,
-                connection_id=conn.connection_id,
-                origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                provider=provider,
-            )
+            try:
+                await sync.sync_connection(
+                    s,
+                    admin_id=subject.admin_id,
+                    instance_id=src.instance_id,
+                    connection_id=conn.connection_id,
+                    origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
+                    provider=provider,
+                )
+            except ProviderUnavailable as exc:
+                # Same clean-error rule as trigger_sync: a revoked/expired/never-
+                # connected credential surfaces a structured 409, never a crash.
+                await sync.pause_sync_on_revocation(
+                    s, admin_id=subject.admin_id, connection_id=conn.connection_id
+                )
+                raise conflict(f"Sync unavailable: {exc}") from exc
             refreshed = (
                 await s.execute(
                     select(KnowledgeSource).where(
@@ -421,14 +455,103 @@ async def trigger_sync(
             raise conflict("Connection is revoked; reconnect before syncing.")
         instance_id = await _instance_id(s, subject.admin_id)
         provider = provider_for_connection(conn, get_secret_store())
-        result = await sync.sync_connection(
-            s,
-            admin_id=subject.admin_id,
-            instance_id=instance_id,
-            connection_id=conn.connection_id,
-            origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-            provider=provider,
-        )
+        try:
+            result = await sync.sync_connection(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                connection_id=conn.connection_id,
+                origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
+                provider=provider,
+            )
+        except ProviderUnavailable as exc:
+            # No token on file (never connected / revoked / expired) or the
+            # provider's live call isn't reachable in this posture: surface a
+            # clean, structured error — never a 500 crash (§3.2.3 "never
+            # fabricate freshness"). Flag the connection itself so the raw
+            # knowledge view shows the honest state rather than silently
+            # reporting an empty sync result.
+            await sync.pause_sync_on_revocation(
+                s, admin_id=subject.admin_id, connection_id=conn.connection_id
+            )
+            raise conflict(f"Sync unavailable: {exc}") from exc
         return SyncResultOut.model_validate(
             {"added": result.added, "updated": result.updated, "removed": result.removed}
         )
+
+
+@router.post("/sync-connections/{connection_id}/oauth-callback", response_model=SyncConnectionOut)
+async def oauth_callback(
+    connection_id: uuid.UUID,
+    req: OAuthCallbackRequest,
+    subject: Subject = Depends(current_admin),
+) -> SyncConnectionOut:
+    """Complete the OAuth connect flow (§3.2.3/§3.8.3): exchange the provider's
+    ``code`` for an access token and write it to the SecretStore as this
+    connection's tenant-scoped secret_ref, then mark the connection connected.
+
+    This is the link that was missing between ``start_connection``'s
+    authorizeUrl and the sync engine's ``_bearer_token`` read: without it, a
+    live-sync OAuth connection could never leave ``unconfigured`` because
+    nothing ever wrote a token to the SecretStore. The provider's own consent
+    screen and code issuance is the one step this endpoint cannot exercise
+    without a real click-through (see gap_oauth.md) — everything downstream of
+    receiving a ``code`` is real code, exercised in tests against a FAKE
+    HttpTransport per the Build Brief's no-real-network-call rule.
+
+    A revoked/expired/invalid code is surfaced as a clean 409 (never a crash).
+    """
+    async with tenant_session(subject.admin_id) as s:
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                    InstanceConnection.connection_type == "knowledge_source",
+                )
+            )
+        ).scalar_one_or_none()
+        if conn is None:
+            raise not_found("Sync connection not found.")
+        if conn.provider not in ("google_drive", "hubspot", "salesforce"):
+            raise validation_error(
+                f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
+            )
+        instance_id = await _instance_id(s, subject.admin_id)
+        store = get_secret_store()
+        async with oauth_transport() as transport:
+            try:
+                # httpx.AsyncClient structurally satisfies HttpTransport at runtime
+                # (get/post); cast for the type checker (the Protocol is intentionally
+                # narrower than AsyncClient's full signature).
+                material = await exchange_code_for_token(
+                    conn.provider,
+                    code=req.code,
+                    transport=cast("HttpTransport", transport),
+                )
+            except OAuthExchangeError as exc:
+                conn.status_detail = f"oauth_exchange_failed: {exc}"
+                await s.flush()
+                raise conflict(f"OAuth token exchange failed: {exc}") from exc
+        await store_oauth_token(
+            store, admin_id=subject.admin_id, instance_id=instance_id, material=material
+        )
+        old_status = conn.status
+        conn.status = "connected"
+        conn.status_detail = None
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "old_status": old_status,
+                "new_status": "connected",
+                "reason": "oauth_callback_token_exchanged",
+            },
+        )
+        return _sync_connection_out(conn)

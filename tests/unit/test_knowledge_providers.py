@@ -21,11 +21,14 @@ from app.knowledge.providers import (
     HubSpotProvider,
     NotionProvider,
     OAuthClientConfig,
+    OAuthExchangeError,
     ProviderUnavailable,
     SalesforceProvider,
     WebsiteCrawlProvider,
+    exchange_code_for_token,
     oauth_client_config,
     provider_for_connection,
+    store_oauth_token,
 )
 
 
@@ -54,6 +57,7 @@ class FakeTransport:
         self.last_url: str | None = None
         self.last_headers: dict[str, str] | None = None
         self.last_params: dict[str, object] | None = None
+        self.last_data: dict[str, object] | None = None
 
     async def get(self, url, *, headers=None, params=None):
         self.last_url = url
@@ -62,6 +66,15 @@ class FakeTransport:
         if self._text_body is not None:
             return httpx.Response(200, text=self._text_body, request=httpx.Request("GET", url))
         return httpx.Response(200, json=self._json_body, request=httpx.Request("GET", url))
+
+    async def post(self, url, *, data=None, headers=None):
+        self.last_url = url
+        self.last_headers = headers
+        self.last_data = data
+        status = getattr(self, "_status", 200)
+        if self._text_body is not None:
+            return httpx.Response(status, text=self._text_body, request=httpx.Request("POST", url))
+        return httpx.Response(status, json=self._json_body, request=httpx.Request("POST", url))
 
 
 def _secret_ref(admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
@@ -334,3 +347,119 @@ def test_provider_for_connection_unknown_provider_raises():
     store = FakeSecretStore()
     with pytest.raises(ProviderUnavailable):
         provider_for_connection(_FakeConnection("carrier_pigeon"), store)
+
+
+# --------------------------------------------------------------------------- #
+# OAuth code -> token exchange (the link that was MISSING end-to-end: an
+# authorize URL and a bearer-token reader existed, but nothing turned a
+# provider `code` into a token and wrote it to the SecretStore). Exercised
+# against the SAME FakeTransport seam as the read-side providers — no real
+# network call anywhere (Build Brief rule 2).
+# --------------------------------------------------------------------------- #
+def _configured_settings(monkeypatch, provider_module):
+    fresh = Settings(
+        google_drive_client_id="gcid",
+        google_drive_client_secret="gcsecret",
+        google_drive_redirect_uri="https://api.example.com/gd-callback",
+        hubspot_client_id="hcid",
+        hubspot_client_secret="hcsecret",
+        hubspot_redirect_uri="https://api.example.com/hs-callback",
+        salesforce_consumer_key="scid",
+        salesforce_consumer_secret="scsecret",
+        salesforce_redirect_uri="https://api.example.com/sf-callback",
+    )
+    monkeypatch.setattr(provider_module, "get_settings", lambda: fresh)
+    return fresh
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_google_drive_success(monkeypatch):
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(json_body={"access_token": "gd-access-1", "refresh_token": "gd-r1"})
+    material = await exchange_code_for_token("google_drive", code="authcode-1", transport=transport)
+    assert material == {"access_token": "gd-access-1", "refresh_token": "gd-r1"}
+    assert transport.last_url == "https://oauth2.googleapis.com/token"
+    assert transport.last_data["code"] == "authcode-1"
+    assert transport.last_data["client_id"] == "gcid"
+    assert transport.last_data["client_secret"] == "gcsecret"
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_salesforce_captures_instance_url(monkeypatch):
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(
+        json_body={
+            "access_token": "sf-access-1",
+            "instance_url": "https://myorg.my.salesforce.com",
+        }
+    )
+    material = await exchange_code_for_token("salesforce", code="authcode-2", transport=transport)
+    assert material["access_token"] == "sf-access-1"
+    assert material["instance_url"] == "https://myorg.my.salesforce.com"
+    assert transport.last_url == "https://login.salesforce.com/services/oauth2/token"
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_unconfigured_client_raises_provider_unavailable(
+    monkeypatch,
+):
+    from app.knowledge import providers as providers_module
+
+    monkeypatch.setattr(providers_module, "get_settings", lambda: Settings())
+    transport = FakeTransport(json_body={"access_token": "x"})
+    with pytest.raises(ProviderUnavailable):
+        await exchange_code_for_token("hubspot", code="c", transport=transport)
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_revoked_or_expired_code_raises_clean_error(monkeypatch):
+    """A revoked/expired/invalid code must surface a typed OAuthExchangeError —
+    never a raw KeyError/HTTPStatusError — so the API layer can turn it into a
+    clean 4xx instead of crashing (Build Brief requirement)."""
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(json_body={"error": "invalid_grant"})
+    transport._status = 400
+    with pytest.raises(OAuthExchangeError):
+        await exchange_code_for_token("google_drive", code="expired-code", transport=transport)
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_error_shaped_200_still_raises(monkeypatch):
+    """Some providers return HTTP 200 with an error shape in the body — must
+    still be treated as a clean failure, not a fabricated token."""
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(json_body={"error": "invalid_grant", "error_description": "expired"})
+    with pytest.raises(OAuthExchangeError):
+        await exchange_code_for_token("hubspot", code="bad", transport=transport)
+
+
+@pytest.mark.asyncio
+async def test_store_oauth_token_writes_tenant_scoped_secret_ref_reusable_by_sync(monkeypatch):
+    """Proves the closing link: material written by ``store_oauth_token`` is
+    immediately readable by the SAME ``secret_ref`` convention the sync-time
+    ``GoogleDriveProvider`` reads from — i.e. a callback-stored token actually
+    powers the next sync run with no extra wiring."""
+    admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
+    store = FakeSecretStore()
+    ref = await store_oauth_token(
+        store,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        material={"access_token": "tok-from-callback"},
+    )
+    assert ref == _secret_ref(admin_id, instance_id)
+
+    transport = FakeTransport(json_body={"files": []})
+    provider = GoogleDriveProvider(
+        admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+    )
+    await provider.snapshot(uuid.uuid4())
+    assert transport.last_headers["Authorization"] == "Bearer tok-from-callback"

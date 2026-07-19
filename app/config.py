@@ -99,6 +99,23 @@ class Settings(BaseSettings):
     # Defaults to ca-central-1: residency lock (DEVOPS §2.1, LD 21) — a missing env
     # must never point the secret backend out of region.
     aws_region: str = "ca-central-1"
+    # Platform sender identity for outbound notification email (verify-email,
+    # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
+    # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).
+    platform_email_sender: str = ""
+    # Public base URL used to build customer-facing links in emails (verify link,
+    # export download). Falls back to a dev localhost for local runs.
+    app_base_url: str = "http://127.0.0.1:3000"
+    # hCaptcha signup bot-protection (§3.7.1a). Empty -> verification is a no-op
+    # (mock/CI/local); set in live mode to enforce siteverify on signup.
+    hcaptcha_secret_key: str = ""
+    hcaptcha_site_key: str = ""
+    # Twilio SMS/voice send (§3.1.4). REST auth needs the Account SID (AC...) plus an
+    # API key SID (SK...) + secret. Empty -> NullSmsSender (mock/CI/unconfigured).
+    # NOTE: live SMS is blocked until the Account SID (AC...) is provided.
+    twilio_account_sid: str = ""
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
 
     # --- LLM model IDs (platform-controlled, §7 #11 — single source of truth) --
     # Centralized here so the cutover changes model selection in ONE place and an
@@ -167,6 +184,13 @@ class Settings(BaseSettings):
             "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
             "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",
             "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
+            "PLATFORM_EMAIL_SENDER": "platform_email_sender",
+            "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",
+            "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
+            "TWILIO_ACCOUNT_SID": "twilio_account_sid",
+            "TWILIO_API_KEY_SID": "twilio_api_key_sid",
+            "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",
+            "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",
         }
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
