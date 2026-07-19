@@ -175,3 +175,54 @@ def test_remove_payment_method_idempotent() -> None:
     first, second = asyncio.run(run())
     assert first is True  # had a card (checkout attached one)
     assert second is False  # already removed → idempotent
+
+
+def test_get_payment_method_handles_stripe_object_not_dict() -> None:
+    """Regression: stripe-python returns StripeObject (subscriptable) whose nested
+    members do NOT support .get() — the code must use subscript access, not chained
+    .get(). This reproduced a live 500 (AttributeError) the dict-based fake hid."""
+    import asyncio
+
+    class SObj(dict):
+        # Subscriptable like a dict, but .get on NESTED access is unavailable —
+        # emulate StripeObject by removing .get from nested objects.
+        pass
+
+    class NoGet:
+        def __init__(self, d):
+            self._d = d
+
+        def __contains__(self, k):
+            return k in self._d
+
+        def __getitem__(self, k):
+            return self._d[k]
+
+        # deliberately NO .get
+
+    class FakeClient:
+        class Customer:
+            @staticmethod
+            def retrieve(cid):
+                return NoGet({"invoice_settings": NoGet({"default_payment_method": "pm_x"})})
+
+        class PaymentMethod:
+            @staticmethod
+            def retrieve(pmid):
+                return NoGet(
+                    {
+                        "card": NoGet(
+                            {"brand": "visa", "last4": "4242", "exp_month": 7, "exp_year": 2030}
+                        )
+                    }
+                )
+
+    from app.billing.stripe_gateway import RealStripeGateway
+
+    gw = RealStripeGateway(
+        secret_key="sk_test_x", publishable_key="pk_test_x", webhook_secret="whsec_x"
+    )
+    gw._client = FakeClient()  # inject; no network
+    disp = asyncio.get_event_loop().run_until_complete(gw.get_payment_method(customer_id="cus_x"))
+    assert disp is not None
+    assert disp.brand == "visa" and disp.last4 == "4242"

@@ -284,22 +284,29 @@ class RealStripeGateway:
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
         client = self._get_client()
         customer = client.Customer.retrieve(customer_id)  # type: ignore[attr-defined]
-        pm_id = customer.get("invoice_settings", {}).get("default_payment_method")
+        # stripe-python returns StripeObject (subscriptable) not dict: use subscript
+        # access with guards, NOT nested .get() (which AttributeErrors on the real
+        # object — the fake/mock used plain dicts, hiding this in the suite).
+        inv = customer["invoice_settings"] if "invoice_settings" in customer else None
+        pm_id = inv["default_payment_method"] if inv and "default_payment_method" in inv else None
         if not pm_id:
             return None
         pm = client.PaymentMethod.retrieve(pm_id)  # type: ignore[attr-defined]
-        card = pm.get("card", {})
+        card = pm["card"] if "card" in pm else None
+        if not card:
+            return None
         return PaymentMethodDisplay(
-            brand=str(card.get("brand")),
-            last4=str(card.get("last4")),
-            exp_month=int(card.get("exp_month")),
-            exp_year=int(card.get("exp_year")),
+            brand=str(card["brand"]),
+            last4=str(card["last4"]),
+            exp_month=int(card["exp_month"]),
+            exp_year=int(card["exp_year"]),
         )
 
     async def remove_payment_method(self, *, customer_id: str) -> bool:
         client = self._get_client()
         customer = client.Customer.retrieve(customer_id)  # type: ignore[attr-defined]
-        pm_id = customer.get("invoice_settings", {}).get("default_payment_method")
+        inv = customer["invoice_settings"] if "invoice_settings" in customer else None
+        pm_id = inv["default_payment_method"] if inv and "default_payment_method" in inv else None
         if not pm_id:
             return False
         client.PaymentMethod.detach(pm_id)  # type: ignore[attr-defined]
