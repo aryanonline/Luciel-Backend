@@ -141,6 +141,37 @@ class Settings(BaseSettings):
     website_crawl_timeout_seconds: float = 10.0
     website_crawl_max_bytes: int = 5_000_000
 
+    def model_post_init(self, __context: object) -> None:
+        """Overlay platform-owned OAuth app credentials from the platform-secret
+        blob onto the (empty) config fields (§3.8.3 platform-owned class).
+
+        Per Architecture §3.8.3, platform-owned API keys are delivered via Secrets
+        Manager. The OAuth *app* client secrets are the same class, so in live mode
+        they arrive inside ``LUCIEL_PLATFORM_SECRET`` (the injected blob) rather than
+        as separate env vars. A direct env var (LUCIEL_GOOGLE_DRIVE_CLIENT_ID, ...)
+        still wins when set (local/CI); the blob only fills a field left empty. The
+        per-tenant OAuth *tokens* are NOT touched here — those are real secret
+        material stored as tenant-scoped secret_ref ARNs by the connections layer.
+        """
+        blob = parse_platform_secret(self.platform_secret)
+        if not blob:
+            return
+        # blob key -> settings attribute. Only platform-owned APP credentials.
+        overlay = {
+            "GOOGLE_DRIVE_CLIENT_ID": "google_drive_client_id",
+            "GOOGLE_DRIVE_CLIENT_SECRET": "google_drive_client_secret",
+            "GOOGLE_DRIVE_REDIRECT_URI": "google_drive_redirect_uri",
+            "HUBSPOT_CLIENT_ID": "hubspot_client_id",
+            "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",
+            "HUBSPOT_REDIRECT_URI": "hubspot_redirect_uri",
+            "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
+            "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",
+            "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
+        }
+        for blob_key, attr in overlay.items():
+            if not getattr(self, attr, "") and blob.get(blob_key):
+                object.__setattr__(self, attr, blob[blob_key])
+
 
 def parse_platform_secret(raw: str) -> dict[str, str]:
     """Parse the LUCIEL_PLATFORM_SECRET JSON blob into a flat str->str mapping.

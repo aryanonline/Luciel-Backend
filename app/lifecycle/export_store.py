@@ -102,8 +102,22 @@ class S3ExportStore:
     def _get_client(self) -> object:
         if self._client is None:
             import boto3  # noqa: PLC0415 — lazy/guarded import (CI has no AWS)
+            from botocore.config import Config  # noqa: PLC0415
 
-            self._client = boto3.client("s3", region_name=self._region_name)
+            # Pin the REGIONAL endpoint + SigV4 virtual-host addressing. Without
+            # this, boto3's default (global) endpoint mints presigned URLs that
+            # fail SigV4 verification for a regional bucket (403 SignatureDoesNot-
+            # Match on the browser GET). Verified against the live ca-central-1
+            # vm-export-bundles bucket.
+            self._client = boto3.client(
+                "s3",
+                region_name=self._region_name,
+                endpoint_url=f"https://s3.{self._region_name}.amazonaws.com",
+                config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "virtual"},
+                ),
+            )
         return self._client
 
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
