@@ -64,9 +64,7 @@ class MetaMessagingAdapter:
         ctx: InstanceContext = await resolve("channel_auth", destination_id)
         return ctx
 
-    async def receive(
-        self, request: dict[str, Any], ctx: InstanceContext
-    ) -> InboundMessage:
+    async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_messaging_event(request["payload"])
         assert parsed is not None
         event = parsed["event"]

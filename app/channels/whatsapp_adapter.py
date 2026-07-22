@@ -44,9 +44,7 @@ class NullMetaSender:
     async def send_message(
         self, *, channel: str, sender_id: str, recipient_id: str, body: str
     ) -> str | None:
-        self.sent.append(
-            {"channel": channel, "from": sender_id, "to": recipient_id, "body": body}
-        )
+        self.sent.append({"channel": channel, "from": sender_id, "to": recipient_id, "body": body})
         return f"null-meta-{len(self.sent)}"
 
 
@@ -90,9 +88,7 @@ class WhatsAppAdapter:
         ctx: InstanceContext = await resolve("channel_auth", phone_number_id)
         return ctx
 
-    async def receive(
-        self, request: dict[str, Any], ctx: InstanceContext
-    ) -> InboundMessage:
+    async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_message(request["payload"])
         assert parsed is not None  # verify_inbound already guaranteed this
         msg = parsed["message"]
@@ -107,9 +103,7 @@ class WhatsAppAdapter:
             body=body,
             channel_metadata={
                 "wa_message_id": msg.get("id"),
-                "phone_number_id": parsed["value"].get("metadata", {}).get(
-                    "phone_number_id"
-                ),
+                "phone_number_id": parsed["value"].get("metadata", {}).get("phone_number_id"),
             },
             received_at=datetime.now(UTC),
         )

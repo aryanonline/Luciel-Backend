@@ -43,6 +43,7 @@ def create_app() -> FastAPI:
     from app.api.v1.billing import router as billing_router
     from app.api.v1.chat_widget import router as chat_widget_router
     from app.api.v1.dashboard import router as dashboard_router
+    from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
 
     app.include_router(auth_router)
@@ -60,6 +61,9 @@ def create_app() -> FastAPI:
     app.include_router(usage_router)
     # Stripe webhooks: signature-verified before routing (§3.4.1b, HARD CONSTRAINT #4).
     app.include_router(stripe_webhook_router)
+    # Inbound channel webhooks: SMS/email/Meta — signature-verified before tenant
+    # lookup (§3.1.3), pre-budget admission (§3.1.5), then the agentic loop (§3.4.1).
+    app.include_router(channels_webhook_router)
 
     return app
 

@@ -92,8 +92,10 @@ async def test_whatsapp_bad_signature_rejected():
     adapter = WhatsAppAdapter(NullMetaSender())
     body = json.dumps(_wa_payload()).encode()
     request = {
-        "app_secret": APP_SECRET, "raw_body": body,
-        "x_hub_signature_256": "sha256=deadbeef", "payload": _wa_payload(),
+        "app_secret": APP_SECRET,
+        "raw_body": body,
+        "x_hub_signature_256": "sha256=deadbeef",
+        "payload": _wa_payload(),
         "resolve": _resolve,
     }
     with pytest.raises(InboundRejected) as e:
@@ -107,8 +109,12 @@ async def test_whatsapp_send_via_null_sender():
     from app.channels.base import OutboundMessage
 
     receipt = await adapter.send(
-        OutboundMessage(channel="whatsapp", to="+14165550143", body="Yes, we are open!",
-                        metadata={"phone_number_id": "PN123"})
+        OutboundMessage(
+            channel="whatsapp",
+            to="+14165550143",
+            body="Yes, we are open!",
+            metadata={"phone_number_id": "PN123"},
+        )
     )
     assert receipt.accepted
     assert sender.sent[0]["to"] == "+14165550143"
@@ -126,8 +132,10 @@ async def test_meta_messaging_verifies_and_normalizes():
     adapter = MetaMessagingAdapter(NullMetaSender())
     body = json.dumps(_meta_payload()).encode()
     request = {
-        "app_secret": APP_SECRET, "raw_body": body,
-        "x_hub_signature_256": _sig(body), "payload": _meta_payload(),
+        "app_secret": APP_SECRET,
+        "raw_body": body,
+        "x_hub_signature_256": _sig(body),
+        "payload": _meta_payload(),
         "resolve": _resolve,
     }
     ctx = await adapter.verify_inbound(request)
@@ -141,11 +149,15 @@ async def test_meta_messaging_bad_signature_rejected():
     adapter = MetaMessagingAdapter(NullMetaSender())
     body = json.dumps(_meta_payload()).encode()
     with pytest.raises(InboundRejected):
-        await adapter.verify_inbound({
-            "app_secret": APP_SECRET, "raw_body": body,
-            "x_hub_signature_256": "sha256=wrong", "payload": _meta_payload(),
-            "resolve": _resolve,
-        })
+        await adapter.verify_inbound(
+            {
+                "app_secret": APP_SECRET,
+                "raw_body": body,
+                "x_hub_signature_256": "sha256=wrong",
+                "payload": _meta_payload(),
+                "resolve": _resolve,
+            }
+        )
 
 
 def test_build_meta_sender_defaults_to_null_in_mock():

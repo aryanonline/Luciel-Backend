@@ -102,6 +102,10 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/v1/billing/payment-method"),
         # webhooks
         ("POST", "/api/v1/webhooks/stripe"),
+        ("POST", "/api/v1/webhooks/twilio/sms"),
+        ("POST", "/api/v1/webhooks/ses/inbound"),
+        ("GET", "/api/v1/webhooks/meta"),
+        ("POST", "/api/v1/webhooks/meta"),
     }
 )
 

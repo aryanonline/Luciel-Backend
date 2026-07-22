@@ -123,6 +123,13 @@ class Settings(BaseSettings):
     # this platform-level token covers the shared Graph app.
     meta_app_secret: str = ""
     meta_access_token: str = ""
+    # Meta webhook GET-challenge verify token (owner-chosen string, set in the Meta
+    # app webhook config and matched on hub.verify_token).
+    meta_verify_token: str = ""
+    # Twilio ACCOUNT Auth Token (32-hex) — required for INBOUND X-Twilio-Signature
+    # verification (distinct from the API-Key used for sending). Empty -> inbound
+    # signature verification cannot pass in live mode (documented dependency).
+    twilio_auth_token: str = ""
 
     # --- LLM model IDs (platform-controlled, §7 #11 — single source of truth) --
     # Centralized here so the cutover changes model selection in ONE place and an
@@ -200,6 +207,8 @@ class Settings(BaseSettings):
             "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",
             "META_APP_SECRET": "meta_app_secret",
             "META_ACCESS_TOKEN": "meta_access_token",
+            "META_VERIFY_TOKEN": "meta_verify_token",
+            "TWILIO_AUTH_TOKEN": "twilio_auth_token",
         }
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
