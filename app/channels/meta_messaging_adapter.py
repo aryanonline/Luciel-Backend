@@ -66,7 +66,10 @@ class MetaMessagingAdapter:
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_messaging_event(request["payload"])
-        assert parsed is not None
+        if parsed is None:
+            # verify_inbound already guaranteed a message event; a None here means the
+            # payload changed between verify and receive. Reject rather than crash.
+            raise InboundRejected("meta_no_message")
         event = parsed["event"]
         body = (event.get("message") or {}).get("text", "")
         return InboundMessage(

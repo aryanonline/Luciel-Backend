@@ -90,7 +90,10 @@ class WhatsAppAdapter:
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_message(request["payload"])
-        assert parsed is not None  # verify_inbound already guaranteed this
+        if parsed is None:
+            # verify_inbound already guaranteed a message; a None here means the payload
+            # changed between verify and receive. Reject rather than crash.
+            raise InboundRejected("whatsapp_no_message")
         msg = parsed["message"]
         # WhatsApp text lives at message.text.body; the sender is message.from (E.164).
         body = (msg.get("text") or {}).get("body", "")
