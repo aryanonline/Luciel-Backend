@@ -42,3 +42,17 @@ async def dispose_engine() -> None:
         await _engine.dispose()
     _engine = None
     _sessionmaker = None
+
+
+def reset_engine_cache() -> None:
+    """Drop the cached engine/sessionmaker WITHOUT awaiting an async dispose.
+
+    Used by the test harness at the start of each async test: the previous test's engine
+    is bound to a now-closed event loop, so ``await _engine.dispose()`` would itself touch
+    that dead loop. Clearing the module globals lets ``get_engine()`` build a fresh engine
+    on the current loop; the orphaned engine's pool is closed by GC/loop teardown. Safe
+    because tests never share a live engine across loops by design.
+    """
+    global _engine, _sessionmaker
+    _engine = None
+    _sessionmaker = None

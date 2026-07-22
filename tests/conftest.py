@@ -236,6 +236,28 @@ def _reset_rate_limiter() -> None:
 
 
 @pytest_asyncio.fixture(autouse=True)
+async def _fresh_engine_per_test() -> AsyncIterator[None]:
+    """Dispose the module-level async engine at the START of every async test.
+
+    Root-cause fix for the intermittent ``got Future ... attached to a different loop`` /
+    ``Event loop is closed`` error at fixture setup (seen deterministically on
+    test_audit_chain in the full-suite run): the engine is a module-level singleton, but
+    ``asyncio_mode=auto`` gives each async test its OWN event loop. An engine built in a
+    prior test's loop keeps pool connections bound to that (now closed) loop; the next
+    test reusing it via ``get_engine()`` explodes. This autouse fixture runs BEFORE the
+    named per-test fixtures (e.g. ``assert_no_bypass``), so every test starts with no
+    cached engine and builds a fresh one on its own loop. Idempotent + cheap (no engine
+    cached -> no-op).
+    """
+    from app.db.engine import reset_engine_cache
+
+    # Non-awaiting reset: the stale engine is bound to a prior (closed) loop, so we must
+    # NOT await its async dispose here. Just clear the cache; get_engine() rebuilds fresh.
+    reset_engine_cache()
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _clean_tables() -> AsyncIterator[None]:
     """Truncate tenant tables between tests using a superuser path (bypasses RLS)."""
     yield
