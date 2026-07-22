@@ -188,27 +188,30 @@ class Settings(BaseSettings):
         if not blob:
             return
         # blob key -> settings attribute. Only platform-owned APP credentials.
+        # NOTE: the dict VALUES are Pydantic field NAMES (not secret values); bandit's
+        # B105 heuristic flags the name strings ending in secret/token/key, hence the
+        # per-line `# nosec B105` on those entries. No secret material is hardcoded here.
         overlay = {
             "GOOGLE_DRIVE_CLIENT_ID": "google_drive_client_id",
-            "GOOGLE_DRIVE_CLIENT_SECRET": "google_drive_client_secret",
+            "GOOGLE_DRIVE_CLIENT_SECRET": "google_drive_client_secret",  # nosec B105
             "GOOGLE_DRIVE_REDIRECT_URI": "google_drive_redirect_uri",
             "HUBSPOT_CLIENT_ID": "hubspot_client_id",
-            "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",
+            "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",  # nosec B105
             "HUBSPOT_REDIRECT_URI": "hubspot_redirect_uri",
             "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
-            "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",
+            "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
             "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
-            "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",
+            "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
             "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
             "TWILIO_ACCOUNT_SID": "twilio_account_sid",
             "TWILIO_API_KEY_SID": "twilio_api_key_sid",
-            "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",
-            "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",
-            "META_APP_SECRET": "meta_app_secret",
-            "META_ACCESS_TOKEN": "meta_access_token",
-            "META_VERIFY_TOKEN": "meta_verify_token",
-            "TWILIO_AUTH_TOKEN": "twilio_auth_token",
+            "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
+            "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
+            "META_APP_SECRET": "meta_app_secret",  # nosec B105
+            "META_ACCESS_TOKEN": "meta_access_token",  # nosec B105
+            "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
+            "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
         }
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
