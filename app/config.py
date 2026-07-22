@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_api_key_sid: str = ""
     twilio_api_key_secret: str = ""
+    # Meta channels (WhatsApp, Instagram DM, Messenger — §3.1.2). App secret verifies
+    # inbound X-Hub-Signature-256; access token authorizes Graph API sends. Empty ->
+    # NullMetaSender + inbound signature check can't pass (mock/CI/unconfigured).
+    # Per-tenant page/WA tokens live on the channel_auth connection in full deploy;
+    # this platform-level token covers the shared Graph app.
+    meta_app_secret: str = ""
+    meta_access_token: str = ""
 
     # --- LLM model IDs (platform-controlled, §7 #11 — single source of truth) --
     # Centralized here so the cutover changes model selection in ONE place and an
@@ -191,6 +198,8 @@ class Settings(BaseSettings):
             "TWILIO_API_KEY_SID": "twilio_api_key_sid",
             "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",
             "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",
+            "META_APP_SECRET": "meta_app_secret",
+            "META_ACCESS_TOKEN": "meta_access_token",
         }
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
