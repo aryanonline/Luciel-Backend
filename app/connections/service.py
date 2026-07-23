@@ -25,7 +25,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
-from app.channels.phone_lifecycle import _validate_e164
 from app.connections.secrets import SecretStore, get_secret_store, secret_ref_for
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
@@ -125,11 +124,37 @@ async def start_connection(
     now = now or datetime.now(UTC)
     auth_class = _auth_class_for(connection_type)
 
-    # BYO SMS number intake: validate before touching the row so a malformed number
-    # raises rather than half-configuring the connection (§3.1.4).
-    byo_destination: str | None = None
+    # BYO SMS number intake (§3.1.4): delegate to the single source of truth in
+    # phone_lifecycle so the operability gate + honest statuses apply on EVERY attach
+    # path (this API path AND any direct caller) — no duplicated status logic, no gap
+    # where one path gates and another does not. attach_sms_number validates E.164,
+    # probes Twilio operability, and sets pending_carrier_registration (operable) or
+    # not_operable_hosting_required (not) with honest detail. It also handles the
+    # number-change invalidation (a changed number re-runs the gate from scratch).
     if connection_type == "sms_sender" and phone_number is not None:
-        byo_destination = _validate_e164(phone_number)
+        from app.channels.phone_lifecycle import attach_sms_number
+
+        connection = await attach_sms_number(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            e164_number=phone_number,
+        )
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="instance_configured",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "connection_type": connection_type,
+                "provider": provider,
+                "action": "start_connection",
+            },
+        )
+        return connection, _start_result(connection.auth_class, connection)
 
     existing = await _single_active(session, admin_id, instance_id, connection_type)
     if existing is not None:
@@ -152,12 +177,6 @@ async def start_connection(
         )
         session.add(connection)
 
-    if byo_destination is not None:
-        connection.non_secret_config = {"destination": byo_destination}
-        connection.status = "pending_carrier_registration"
-        connection.status_detail = (
-            "Being activated with the carriers (A2P 10DLC) — usually a few business days."
-        )
     await session.flush()
 
     # §3.7.1/§3.8: configuring a dependency is an admin-config event.

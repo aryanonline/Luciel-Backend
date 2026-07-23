@@ -74,6 +74,7 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/v1/admin/connections/{connection_id}"),
         ("POST", "/api/v1/admin/connections/{connection_id}/reconnect"),
         ("POST", "/api/v1/admin/connections/{connection_id}/swap"),
+        ("POST", "/api/v1/admin/connections/sms/reverify"),
         # admin/usage
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),

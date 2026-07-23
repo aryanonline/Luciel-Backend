@@ -351,3 +351,42 @@ async def test_email_provisioning_never_leaks_secret_fields(client):
 async def test_email_provisioning_requires_auth(client):
     r = await client.get("/api/v1/admin/connections/email")
     assert r.status_code in (401, 403)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_sms_reverify_without_number_is_404(client):
+    """Re-verify with no attached number → 404 (nothing to re-verify)."""
+    await _ready_account_with_luciel(client)
+    r = await client.post("/api/v1/admin/connections/sms/reverify")
+    assert r.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_sms_attach_then_reverify_is_honest_in_mock(client):
+    """In mock mode the operability probe is the hermetic Null probe (no number is
+    operable), so attaching a BYO number lands in not_operable_hosting_required — NOT a
+    'being activated' live state — and re-verify repeatably reports the same honest
+    state. This is the anti-silent-failure invariant at the HTTP surface."""
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "sms_sender", "provider": "twilio", "phoneNumber": "+14155550111"},
+    )
+    assert r.status_code == 200
+    # Status lives on the ConnectionOut (GET /connections), not the StartConnectionResult.
+    g = await client.get("/api/v1/admin/connections")
+    sms = [c for c in g.json() if c["connectionType"] == "sms_sender"]
+    assert sms and sms[0]["status"] == "not_operable_hosting_required"
+    # Re-verify: still not operable (mock), repeatable, never flips to live on a click.
+    rv = await client.post("/api/v1/admin/connections/sms/reverify")
+    assert rv.status_code == 200
+    assert rv.json().get("status") == "not_operable_hosting_required"
+    rv2 = await client.post("/api/v1/admin/connections/sms/reverify")
+    assert rv2.status_code == 200
+    assert rv2.json().get("status") == "not_operable_hosting_required"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_sms_reverify_requires_auth(client):
+    r = await client.post("/api/v1/admin/connections/sms/reverify")
+    assert r.status_code in (401, 403)

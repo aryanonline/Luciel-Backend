@@ -12,6 +12,7 @@ import pytest
 from app.channels import rate_limit, routing
 from app.channels.base import InboundMessage, InboundRejected, OutboundMessage
 from app.channels.email_adapter import EmailAdapter
+from app.channels.number_operability import NullOperabilityProbe
 from app.channels.phone_lifecycle import attach_sms_number, sms_number_status
 from app.channels.pipeline import AdmissionDenied, OptOutHandled, ingest
 from app.channels.signatures import twilio_signature
@@ -22,6 +23,11 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import func, select
 
 pytestmark = [pytest.mark.asyncio]
+
+
+def _operable(*numbers: str) -> NullOperabilityProbe:
+    """A mock probe that reports the given numbers as Twilio-operable."""
+    return NullOperabilityProbe(operable_numbers=set(numbers))
 
 
 class FakeTwilio:
@@ -81,8 +87,13 @@ async def test_byo_number_attach_idempotent_and_resolves():
         # No number supplied yet → "Action needed: add your number" (§3.1.4).
         assert await sms_number_status(s, admin_id=admin, instance_id=iid) == "unconfigured"
         # BYO: the tenant supplies their own E.164 number; NO provisioning call exists.
-        c1 = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
-        c2 = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        # The number is operable (in the account) → pending carrier registration.
+        c1 = await attach_sms_number(
+            s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER, probe=_operable(BYO_NUMBER)
+        )
+        c2 = await attach_sms_number(
+            s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER, probe=_operable(BYO_NUMBER)
+        )
         assert c1.connection_id == c2.connection_id  # idempotent — row retained
         # §3.1.6: number supplied but A2P 10DLC carrier registration is pending, so the
         # connection is NOT shown as connected/live.
@@ -151,7 +162,9 @@ async def test_sms_adapter_signature_verified_inbound_and_send():
     iid = await _seed(admin)
     # provision number so the destination resolves
     async with tenant_session(admin) as s:
-        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        conn = await attach_sms_number(
+            s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER, probe=_operable(BYO_NUMBER)
+        )
         number = conn.non_secret_config["destination"]
 
     twilio = FakeTwilio()
@@ -201,7 +214,9 @@ async def test_inbound_pipeline_admits_then_blocks_and_audits():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     async with tenant_session(admin) as s:
-        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        conn = await attach_sms_number(
+            s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER, probe=_operable(BYO_NUMBER)
+        )
         number = conn.non_secret_config["destination"]
 
     rate_limit._store = rate_limit.TokenBucketStore()  # fresh limiter
@@ -253,7 +268,9 @@ async def test_inbound_stop_keyword_suppressed_from_runtime():
     admin = uuid.uuid4()
     iid = await _seed(admin)
     async with tenant_session(admin) as s:
-        conn = await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        conn = await attach_sms_number(
+            s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER, probe=_operable(BYO_NUMBER)
+        )
         number = conn.non_secret_config["destination"]
 
     rate_limit._store = rate_limit.TokenBucketStore()

@@ -15,6 +15,7 @@ import uuid
 
 import pytest
 from app.channels import routing
+from app.channels.number_operability import NullOperabilityProbe
 from app.channels.phone_lifecycle import attach_sms_number
 from app.channels.signatures import twilio_signature
 from app.config import get_settings
@@ -111,7 +112,13 @@ async def test_twilio_sms_valid_signature_reaches_runtime(client, monkeypatch):
     monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
     admin, iid = await _seed_active_instance()
     async with tenant_session(admin) as s:
-        await attach_sms_number(s, admin_id=admin, instance_id=iid, e164_number=BYO_NUMBER)
+        await attach_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            e164_number=BYO_NUMBER,
+            probe=NullOperabilityProbe(operable_numbers={BYO_NUMBER}),
+        )
     # Confirm it resolves (guards the test setup).
     async with tenant_session(admin) as s:
         ctx = await routing.resolve_destination(s, "sms_sender", BYO_NUMBER)

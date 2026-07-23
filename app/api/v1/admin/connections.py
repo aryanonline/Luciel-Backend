@@ -161,6 +161,24 @@ async def reconnect_connection(
         return StartConnectionResult.model_validate(result)
 
 
+@router.post("/sms/reverify", response_model=ConnectionOut)
+async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> ConnectionOut:
+    """Re-run the Twilio operability probe against the tenant's CURRENTLY attached SMS
+    number (§3.1.4). Stateless + repeatable (no background poller, no expiry): the
+    tenant clicks this after hosting/registering their number. Transitions to operable
+    only on a confirmed live result; a still-non-operable number stays in the honest
+    ``not_operable_hosting_required`` state. Reads the current number live, so a
+    swapped-in number is what gets checked."""
+    from app.channels.phone_lifecycle import reverify_sms_number as _reverify
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
+        if conn is None:
+            raise not_found("No SMS number attached to re-verify.")
+        return _connection_out(conn)
+
+
 @router.post("/{connection_id}/swap", response_model=StartConnectionResult)
 async def swap_connection(
     connection_id: uuid.UUID,
