@@ -13,12 +13,23 @@ Secrets are read from config (bridged from the platform secret / env); never log
 
 from __future__ import annotations
 
+import hmac
+
 import httpx
 
 from app.api.errors import validation_error
 from app.config import get_settings
 
 _HCAPTCHA_VERIFY_URL = "https://api.hcaptcha.com/siteverify"
+
+# Fixed token the non-production seed/live-test harness (§10) sends so it can create
+# synthetic accounts through the REAL signup API path. A real hCaptcha token cannot be
+# produced headlessly, so live-configured dev/preprod would otherwise be un-seedable
+# (and the prod-release verification gate, which runs the same harness, would fail at
+# signup). This bypass is accepted ONLY when `allow_captcha_bypass_token` is explicitly
+# enabled in config (default False), so production — which never sets it — can never honor
+# it even if the token is sent. Fail-safe: absent/false config = no bypass.
+_SEEDTEST_BYPASS_TOKEN = "dev-seedtest-token"  # noqa: S105 # nosec B105 - not a secret; flag-gated
 
 
 async def verify_captcha(token: str | None) -> None:
@@ -31,6 +42,13 @@ async def verify_captcha(token: str | None) -> None:
     secret = settings.hcaptcha_secret_key
     if settings.integration_mode != "live" or not secret:
         return  # seam: bot-protection binds only when configured (like SES/Twilio)
+
+    # Non-production seed/live-test bypass (see _SEEDTEST_BYPASS_TOKEN). Only honored
+    # when explicitly enabled in config; prod never enables it. Constant-time compare so
+    # the flag+token check is not a timing oracle.
+    if getattr(settings, "allow_captcha_bypass_token", False) and token is not None:
+        if hmac.compare_digest(token, _SEEDTEST_BYPASS_TOKEN):
+            return
 
     if not token:
         raise validation_error("Captcha verification required.")

@@ -40,3 +40,49 @@ async def test_captcha_enforced_when_live_and_configured(monkeypatch):
         await verify_captcha(None)
 
     get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_captcha_bypass_rejected_when_flag_off(monkeypatch):
+    """Fail-safe: the seedtest bypass token must NOT pass when the flag is off, even in
+    live+configured mode (this is the prod posture — prod never sets the flag)."""
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    monkeypatch.delenv("LUCIEL_ALLOW_CAPTCHA_BYPASS_TOKEN", raising=False)
+    from app.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    # Bypass token with flag OFF -> falls through to real siteverify (network), which
+    # for a fake token+secret will fail closed. Either a validation error or a network
+    # error is acceptable; what matters is it does NOT silently pass.
+    with pytest.raises(Exception):
+        await verify_captcha("dev-seedtest-token")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_captcha_bypass_passes_when_flag_on(monkeypatch):
+    """Non-prod seam: with the flag ON, the exact bypass token passes with no network."""
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    monkeypatch.setenv("LUCIEL_ALLOW_CAPTCHA_BYPASS_TOKEN", "true")
+    from app.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    # Exact bypass token -> passes (returns None, no exception, no network).
+    await verify_captcha("dev-seedtest-token")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_captcha_wrong_token_still_rejected_when_flag_on(monkeypatch):
+    """Flag ON but a token that isn't the bypass constant must not shortcut."""
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    monkeypatch.setenv("LUCIEL_ALLOW_CAPTCHA_BYPASS_TOKEN", "true")
+    from app.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    with pytest.raises(Exception):
+        await verify_captcha("not-the-bypass-token")
+    get_settings.cache_clear()  # type: ignore[attr-defined]

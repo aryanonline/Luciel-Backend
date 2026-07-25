@@ -110,6 +110,11 @@ class Settings(BaseSettings):
     # (mock/CI/local); set in live mode to enforce siteverify on signup.
     hcaptcha_secret_key: str = ""
     hcaptcha_site_key: str = ""
+    # Non-production ONLY: when True, the signup captcha check accepts the fixed
+    # seed/live-test bypass token so the §10 harness can create synthetic accounts
+    # through the real API in a live-configured dev/preprod. MUST remain False in prod
+    # (prod never sets it) — default False is the fail-safe. See app/auth/captcha.py.
+    allow_captcha_bypass_token: bool = False
     # Twilio SMS/voice send (§3.1.4). REST auth needs the Account SID (AC...) plus an
     # API key SID (SK...) + secret. Empty -> NullSmsSender (mock/CI/unconfigured).
     # NOTE: live SMS is blocked until the Account SID (AC...) is provided.
@@ -216,6 +221,16 @@ class Settings(BaseSettings):
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
+
+        # Bool bridge (non-production seam): the platform secret may carry the
+        # captcha-bypass flag as a string; coerce it. Absent -> stays False (fail-safe).
+        bypass_raw = blob.get("ALLOW_CAPTCHA_BYPASS_TOKEN")
+        if bypass_raw is not None and not self.allow_captcha_bypass_token:
+            object.__setattr__(
+                self,
+                "allow_captcha_bypass_token",
+                str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
+            )
 
 
 def parse_platform_secret(raw: str) -> dict[str, str]:
