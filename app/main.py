@@ -24,7 +24,12 @@ def create_app() -> FastAPI:
         allow_origins=settings.dashboard_origins,
         allow_credentials=True,  # required for the httpOnly session cookie
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["content-type", "authorization"],
+        # content-type + authorization are the app's own headers. sentry-trace + baggage
+        # are injected automatically by the frontend's Sentry browser SDK on every fetch
+        # (distributed tracing); without them in the allow-list the CORS preflight fails
+        # with 'Disallowed CORS headers' (400) and every browser API call is blocked
+        # — which silently broke signup/login from the real site.
+        allow_headers=["content-type", "authorization", "sentry-trace", "baggage"],
     )
 
     register_error_handlers(app)
