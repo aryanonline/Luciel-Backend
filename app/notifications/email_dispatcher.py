@@ -1,5 +1,4 @@
 """Notification dispatch (Architecture §3.6.7 / §3.5 / §5.10 / §3.4.5).
-import logging
 
 Renders the doc-mandated customer/admin notifications and delivers them via the
 injected EmailSender, THEN writes the durable audit record. Delivery may degrade to
@@ -13,6 +12,7 @@ All sends go through ``_dispatch`` so every notification is uniformly audited wi
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
