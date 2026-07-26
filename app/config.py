@@ -225,6 +225,21 @@ class Settings(BaseSettings):
         if blob.get("APP_BASE_URL"):
             object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
 
+        # JWT signing key: security-critical. Bridge it from the platform secret; it has
+        # a KNOWN dev-default (published in source), so in live mode we must FAIL CLOSED
+        # if it wasn't overridden — a forgeable-session vuln must never reach a real env.
+        if blob.get("JWT_SIGNING_KEY"):
+            object.__setattr__(self, "jwt_signing_key", blob["JWT_SIGNING_KEY"])
+        if (
+            self.integration_mode == "live"
+            and self.jwt_signing_key == "dev-only-not-a-secret-rotate-in-prod"
+        ):
+            raise RuntimeError(
+                "JWT_SIGNING_KEY is still the insecure dev default in live mode — refusing "
+                "to start (would make all session tokens forgeable). Set JWT_SIGNING_KEY "
+                "in the platform secret."
+            )
+
         # CORS allowed origins (dashboard_origins) also default to localhost, so the
         # deployed frontend origin must be added or the browser blocks every API call
         # from the real site (login/signup fetch fails silently at the CORS preflight).

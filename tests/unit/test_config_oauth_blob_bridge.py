@@ -80,3 +80,23 @@ def test_blob_dashboard_origins_explicit_list():
     s = Settings(platform_secret=json.dumps({"DASHBOARD_ORIGINS": "https://a.com, https://b.com"}))
     assert "https://a.com" in s.dashboard_origins
     assert "https://b.com" in s.dashboard_origins
+
+
+def test_jwt_signing_key_bridges_from_blob():
+    s = Settings(platform_secret=json.dumps({"JWT_SIGNING_KEY": "strong-real-key-123456"}))
+    assert s.jwt_signing_key == "strong-real-key-123456"
+
+
+def test_jwt_dev_default_fails_closed_in_live(monkeypatch):
+    """Security: live mode must REFUSE to start on the published dev JWT default
+    (else all session tokens are forgeable). Found in the config-bridge audit."""
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="JWT_SIGNING_KEY"):
+        Settings(platform_secret=json.dumps({"PLATFORM_EMAIL_SENDER": "info@vantagemind.ai"}))
+
+
+def test_jwt_dev_default_allowed_in_mock():
+    s = Settings(platform_secret="{}")  # mock/local: dev default is fine
+    assert s.jwt_signing_key == "dev-only-not-a-secret-rotate-in-prod"
