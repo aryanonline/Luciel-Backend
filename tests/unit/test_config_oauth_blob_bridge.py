@@ -63,3 +63,20 @@ def test_blob_app_base_url_overrides_localhost_default():
 def test_app_base_url_falls_back_to_default_when_blob_absent():
     s = Settings(platform_secret="{}")
     assert s.app_base_url == "http://127.0.0.1:3000"
+
+
+def test_blob_adds_frontend_origin_to_cors():
+    """Regression: dashboard_origins (CORS allow-list) defaults to localhost only, so a
+    deployed frontend origin must be folded in from the blob — else the browser blocks
+    every API call from the real site at the CORS preflight ('click login, nothing
+    happens'). app_base_url's origin is always included."""
+    s = Settings(platform_secret=json.dumps({"APP_BASE_URL": "https://vantagemind.ai"}))
+    assert "https://vantagemind.ai" in s.dashboard_origins
+    # localhost defaults preserved for local dev
+    assert "http://localhost:3000" in s.dashboard_origins
+
+
+def test_blob_dashboard_origins_explicit_list():
+    s = Settings(platform_secret=json.dumps({"DASHBOARD_ORIGINS": "https://a.com, https://b.com"}))
+    assert "https://a.com" in s.dashboard_origins
+    assert "https://b.com" in s.dashboard_origins

@@ -224,6 +224,22 @@ class Settings(BaseSettings):
         # email link) must override the localhost default in deployed environments.
         if blob.get("APP_BASE_URL"):
             object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
+
+        # CORS allowed origins (dashboard_origins) also default to localhost, so the
+        # deployed frontend origin must be added or the browser blocks every API call
+        # from the real site (login/signup fetch fails silently at the CORS preflight).
+        # DASHBOARD_ORIGINS in the secret is a comma-separated list; we also always fold
+        # in the app_base_url origin so the public frontend can call the API.
+        origins: list[str] = []
+        raw_origins = blob.get("DASHBOARD_ORIGINS")
+        if raw_origins:
+            origins.extend(o.strip() for o in str(raw_origins).split(",") if o.strip())
+        if blob.get("APP_BASE_URL"):
+            origins.append(str(blob["APP_BASE_URL"]).rstrip("/"))
+        if origins:
+            # De-dupe while preserving order; keep localhost defaults for local dev too.
+            merged = list(dict.fromkeys([*origins, *self.dashboard_origins]))
+            object.__setattr__(self, "dashboard_origins", merged)
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
