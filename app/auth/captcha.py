@@ -14,6 +14,7 @@ Secrets are read from config (bridged from the platform secret / env); never log
 from __future__ import annotations
 
 import hmac
+import logging
 
 import httpx
 
@@ -65,4 +66,10 @@ async def verify_captcha(token: str | None) -> None:
         raise validation_error("Captcha verification failed.") from exc
 
     if not data.get("success", False):
+        # Log hCaptcha's error-codes so a solved-but-rejected captcha is diagnosable
+        # (e.g. sitekey-secret-mismatch, invalid-input-secret, bad domain, expired/
+        # already-seen token). Previously swallowed -> impossible to diagnose.
+        logging.getLogger(__name__).warning(
+            "hcaptcha verify failed: error-codes=%s", data.get("error-codes")
+        )
         raise validation_error("Captcha verification failed.")
