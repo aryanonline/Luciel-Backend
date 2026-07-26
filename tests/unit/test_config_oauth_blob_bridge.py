@@ -100,3 +100,19 @@ def test_jwt_dev_default_fails_closed_in_live(monkeypatch):
 def test_jwt_dev_default_allowed_in_mock():
     s = Settings(platform_secret="{}")  # mock/local: dev default is fine
     assert s.jwt_signing_key == "dev-only-not-a-secret-rotate-in-prod"
+
+
+def test_app_base_url_folds_in_www_variant():
+    """Real bug: browser on www.vantagemind.ai was blocked by CORS (preflight 400)
+    because dashboard_origins only had the apex host. Both must be present."""
+    blob = json.dumps({"APP_BASE_URL": "https://vantagemind.ai"})
+    s = Settings(platform_secret=blob)
+    assert "https://vantagemind.ai" in s.dashboard_origins
+    assert "https://www.vantagemind.ai" in s.dashboard_origins
+
+
+def test_www_origin_folds_in_apex_variant():
+    blob = json.dumps({"DASHBOARD_ORIGINS": "https://www.vantagemind.ai"})
+    s = Settings(platform_secret=blob)
+    assert "https://www.vantagemind.ai" in s.dashboard_origins
+    assert "https://vantagemind.ai" in s.dashboard_origins

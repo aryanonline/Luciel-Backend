@@ -251,6 +251,26 @@ class Settings(BaseSettings):
             origins.extend(o.strip() for o in str(raw_origins).split(",") if o.strip())
         if blob.get("APP_BASE_URL"):
             origins.append(str(blob["APP_BASE_URL"]).rstrip("/"))
+
+        # Fold in the www<->apex counterpart of every https origin. CORS origin matching
+        # is exact, so allowing https://vantagemind.ai does NOT allow
+        # https://www.vantagemind.ai (or vice versa). Users landing on the www host had
+        # every API call blocked at the preflight (signup/login 'Something went wrong').
+        # Generating both variants makes the canonical + www hosts both work regardless
+        # of which one the browser is on.
+        def _with_www_variants(items: list[str]) -> list[str]:
+            out: list[str] = []
+            for o in items:
+                out.append(o)
+                if o.startswith("https://"):
+                    host = o[len("https://") :]
+                    if host.startswith("www."):
+                        out.append("https://" + host[len("www.") :])
+                    else:
+                        out.append("https://www." + host)
+            return out
+
+        origins = _with_www_variants(origins)
         if origins:
             # De-dupe while preserving order; keep localhost defaults for local dev too.
             merged = list(dict.fromkeys([*origins, *self.dashboard_origins]))
