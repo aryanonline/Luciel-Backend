@@ -1,4 +1,5 @@
 """Notification dispatch (Architecture §3.6.7 / §3.5 / §5.10 / §3.4.5).
+import logging
 
 Renders the doc-mandated customer/admin notifications and delivers them via the
 injected EmailSender, THEN writes the durable audit record. Delivery may degrade to
@@ -43,6 +44,15 @@ async def _dispatch(
     except Exception as exc:  # noqa: BLE001 — never let a delivery error break the flow
         delivery_status = "failed"
         extra_payload = {**(extra_payload or {}), "delivery_error": type(exc).__name__}
+        # Observability: a swallowed delivery error was previously invisible in logs
+        # (only the exception CLASS was written to the audit payload). Log the full
+        # error so email-delivery failures are diagnosable in CloudWatch.
+        logging.getLogger(__name__).exception(
+            "email delivery failed: notice_type=%s recipient=%s error=%s",
+            notice_type,
+            to,
+            exc,
+        )
 
     await audit.emit(
         session,
