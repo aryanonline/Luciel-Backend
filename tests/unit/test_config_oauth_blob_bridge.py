@@ -116,3 +116,20 @@ def test_www_origin_folds_in_apex_variant():
     s = Settings(platform_secret=blob)
     assert "https://www.vantagemind.ai" in s.dashboard_origins
     assert "https://vantagemind.ai" in s.dashboard_origins
+
+
+def test_cookie_domain_derived_from_app_base_url():
+    """Real bug: frontend (www.vantagemind.ai) and API (api.vantagemind.ai) are
+    different hosts; a host-only session cookie was invisible to the frontend, so the
+    Next middleware bounced logged-in users back to /login. The cookie must be scoped to
+    the parent domain so both hosts can read it."""
+    s = Settings(platform_secret=json.dumps({"APP_BASE_URL": "https://vantagemind.ai"}))
+    assert s.cookie_domain == ".vantagemind.ai"
+    s2 = Settings(platform_secret=json.dumps({"APP_BASE_URL": "https://api.vantagemind.ai"}))
+    assert s2.cookie_domain == ".vantagemind.ai"
+
+
+def test_cookie_domain_empty_for_localhost():
+    s = Settings(platform_secret=json.dumps({"APP_BASE_URL": "http://localhost:3000"}))
+    assert s.cookie_domain == ""
+    assert Settings().cookie_domain == ""

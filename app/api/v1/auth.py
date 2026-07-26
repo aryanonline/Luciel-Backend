@@ -50,12 +50,16 @@ def _set_session_cookie(response: Response, token: str) -> None:
         samesite=s.cookie_samesite,  # type: ignore[arg-type]
         max_age=s.session_ttl_seconds,
         path="/",
+        # Parent-domain cookie so BOTH the frontend host (www./apex) and the API host
+        # can read the session. Empty in local dev => host-only (Starlette omits Domain).
+        domain=s.cookie_domain or None,
     )
 
 
 def _clear_session_cookie(response: Response) -> None:
     s = get_settings()
-    response.delete_cookie(key=s.session_cookie_name, path="/")
+    # Domain must match the one used when setting, or the browser won't clear it.
+    response.delete_cookie(key=s.session_cookie_name, path="/", domain=s.cookie_domain or None)
 
 
 def _account_out(acct: Account, *, has_luciel: bool) -> AccountOut:

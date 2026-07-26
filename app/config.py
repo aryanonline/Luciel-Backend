@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # Secure flag is True in prod; allow override to False for local http dev.
     cookie_secure: bool = True
     cookie_samesite: str = "lax"
+    # Parent domain for the session cookie, e.g. ".vantagemind.ai". REQUIRED when the
+    # frontend and API live on different hosts of the same site (www.vantagemind.ai vs
+    # api.vantagemind.ai): without it the cookie is host-only to the API host, so the
+    # frontend host never receives it and the Next middleware bounces every logged-in
+    # user back to /login. Empty => host-only cookie (correct for localhost dev).
+    cookie_domain: str = ""
 
     # --- CORS (dashboard origin runs on its own origin; credentials:'include') ---
     dashboard_origins: list[str] = Field(
@@ -275,6 +281,24 @@ class Settings(BaseSettings):
             # De-dupe while preserving order; keep localhost defaults for local dev too.
             merged = list(dict.fromkeys([*origins, *self.dashboard_origins]))
             object.__setattr__(self, "dashboard_origins", merged)
+
+        # Derive the session-cookie parent domain from APP_BASE_URL when the frontend and
+        # API share a registrable domain but sit on different hosts (www./api.). Setting
+        # Domain=.<parent> lets BOTH hosts read the session cookie (same-site, so
+        # SameSite=Lax still applies) — otherwise the cookie is host-only to the API and
+        # the frontend bounces logged-in users back to /login. Skipped for localhost/IPs
+        # (no dotted registrable domain) and never overrides an explicit cookie_domain.
+        if not self.cookie_domain:
+            base = str(blob.get("APP_BASE_URL") or "").strip()
+            host = base.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+            labels = host.split(".")
+            is_ip = host.replace(".", "").isdigit()
+            if host and not is_ip and host != "localhost" and len(labels) >= 2:
+                # Registrable domain = last two labels (api.vantagemind.ai ->
+                # vantagemind.ai; vantagemind.ai -> vantagemind.ai). Good enough for the
+                # single-level TLDs this product uses.
+                parent = ".".join(labels[-2:])
+                object.__setattr__(self, "cookie_domain", "." + parent)
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
