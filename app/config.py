@@ -218,6 +218,12 @@ class Settings(BaseSettings):
             "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
             "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
         }
+        # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
+        # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
+        # (the public frontend origin used in customer-facing links, e.g. the verify
+        # email link) must override the localhost default in deployed environments.
+        if blob.get("APP_BASE_URL"):
+            object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
         for blob_key, attr in overlay.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])

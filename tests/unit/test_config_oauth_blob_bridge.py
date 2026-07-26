@@ -48,3 +48,18 @@ def test_per_tenant_token_keys_are_not_bridged():
     blob = json.dumps({"SOME_TENANT_ACCESS_TOKEN": "should-not-appear"})
     s = Settings(platform_secret=blob)
     assert not hasattr(s, "some_tenant_access_token")
+
+
+def test_blob_app_base_url_overrides_localhost_default():
+    """Regression: app_base_url has a non-empty localhost DEFAULT, so the generic
+    'fill only if empty' overlay guard would SKIP it — leaving customer-facing links
+    (e.g. the verify email link) pointing at 127.0.0.1 in production. It must bridge
+    explicitly. (Real bug: emailed verify link opened http://127.0.0.1:3000 and failed
+    with ERR_CONNECTION_REFUSED.)"""
+    s = Settings(platform_secret=json.dumps({"APP_BASE_URL": "https://vantagemind.ai"}))
+    assert s.app_base_url == "https://vantagemind.ai"
+
+
+def test_app_base_url_falls_back_to_default_when_blob_absent():
+    s = Settings(platform_secret="{}")
+    assert s.app_base_url == "http://127.0.0.1:3000"
