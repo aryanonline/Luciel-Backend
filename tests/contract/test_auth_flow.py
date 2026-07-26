@@ -311,3 +311,36 @@ async def test_reaper_spares_fresh_and_verified_accounts():
 
     assert fresh not in reaped, "Fresh unverified account (inside window) must NOT be reaped"
     assert verified not in reaped, "Verified account must NOT be reaped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_signup_verify_link_targets_frontend_verify_route(client, monkeypatch):
+    """Regression: the emailed verification link must point at the FRONTEND page
+    (app_base_url + /verify?token=...), not the API host or /verify-email. A wrong
+    host or path makes the customer's email link 404 (found in live dev testing)."""
+    captured: dict[str, str] = {}
+
+    async def _capture(session, *, admin_id, to, verify_url):
+        captured["url"] = verify_url
+
+    monkeypatch.setattr("app.api.v1.auth.email_dispatcher.send_verify_email", _capture)
+    monkeypatch.setenv("LUCIEL_APP_BASE_URL", "https://vantagemind.ai")
+    from app.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    r = await client.post(
+        "/api/v1/auth/signup",
+        json={
+            "email": "linkcheck@example.com",
+            "password": "LinkCheck!2026xy",
+            "captchaToken": "x",
+        },
+    )
+    assert r.status_code == 200
+    assert "url" in captured, "verify email was not dispatched"
+    url = captured["url"]
+    assert url.startswith("https://vantagemind.ai/verify?token="), url
+    assert "/verify-email?" not in url, f"link uses wrong path: {url}"
+    get_settings.cache_clear()  # type: ignore[attr-defined]

@@ -90,7 +90,10 @@ async def signup(req: SignupRequest) -> SignupResult:
     # only if email isn't configured (NullEmailSender).
     if token:
         settings = get_settings()
-        verify_url = f"{settings.app_base_url}/verify-email?token={token}"
+        # Frontend route is /verify?token=... (apps/web (auth)/verify/page.tsx), served
+        # on the public web host (app_base_url), NOT the API host. Must match the
+        # frontend path exactly or the emailed link 404s.
+        verify_url = f"{settings.app_base_url}/verify?token={token}"
         async with tenant_session(acct.id) as s:
             await email_dispatcher.send_verify_email(
                 s, admin_id=acct.id, to=acct.email, verify_url=verify_url
