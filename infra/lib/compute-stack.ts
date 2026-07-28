@@ -19,6 +19,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
+import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
@@ -376,6 +377,138 @@ export class ComputeStack extends Stack {
       value: seedTestTask.taskDefinitionArn,
       exportName: `Luciel-${envConfig.envName}-SeedTestTaskArn`,
     });
+
+    // --- Scheduled background sweeps (Legal §B5 / §A3) -----------------------------
+    // Before this, the repo had NO scheduler of any kind, so four compliance sweeps
+    // whose logic was fully implemented never ran: retention hard-delete, day-30
+    // grace-window purge, close-account purge, and the day-7 dunning advance. Each is
+    // one invocation of `python -m app.jobs <sweep>` against the SAME image and the
+    // same non-superuser DB role the app uses, so RLS applies to the sweeps exactly as
+    // it does to a request (the sweeps do per-tenant work in per-tenant transactions).
+    const sweepTask = new ecs.FargateTaskDefinition(this, 'SweepTask', {
+      cpu: 256,
+      memoryLimitMiB: 512,
+      taskRole,
+    });
+    sweepTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['kms:Decrypt', 'kms:DescribeKey'],
+        resources: [cmk.keyArn],
+      }),
+    );
+    sweepTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [dbSecret.secretArn, platformSecret.secretArn],
+      }),
+    );
+    const sweepContainerName = 'SweepContainer';
+    sweepTask.addContainer(sweepContainerName, {
+      image: containerImage,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-sweep' }),
+      // Placeholder command; every schedule overrides it with its own sweep name so
+      // one task definition backs all four schedules.
+      command: ['bash', '-lc', 'scripts/run-sweep.sh retention'],
+      secrets: {
+        LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
+        LUCIEL_PLATFORM_SECRET: ecs.Secret.fromSecretsManager(platformSecret),
+      },
+      environment: {
+        LUCIEL_ENV: envConfig.envName,
+        LUCIEL_PLANE: 'sweep',
+        LUCIEL_INTEGRATION_MODE: integrationMode,
+        LUCIEL_REDIS_URL: redisUrl,
+      },
+    });
+
+    // Role EventBridge Scheduler assumes to RunTask. Separate from the task role: the
+    // scheduler needs ecs:RunTask + iam:PassRole for the task/execution roles and
+    // nothing else. NEW IAM — note for the deploy step.
+    const schedulerRole = new iam.Role(this, 'SweepSchedulerRole', {
+      assumedBy: new iam.ServicePrincipal('scheduler.amazonaws.com', {
+        conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+      }),
+      description: 'EventBridge Scheduler -> ECS RunTask for the Luciel compliance sweeps',
+    });
+    schedulerRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['ecs:RunTask'],
+        resources: [sweepTask.taskDefinitionArn],
+        conditions: { ArnEquals: { 'ecs:cluster': this.cluster.clusterArn } },
+      }),
+    );
+    schedulerRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['iam:PassRole'],
+        resources: [taskRole.roleArn, sweepTask.executionRole!.roleArn],
+        conditions: { StringLike: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' } },
+      }),
+    );
+
+    const sweepSubnets = vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS });
+    // Staggered off-peak UTC so two sweeps never contend for the same DB, and so the
+    // grace/close purges run AFTER the retention prune has trimmed the same tables.
+    const sweepSchedules: { name: string; cron: string; description: string }[] = [
+      {
+        name: 'retention',
+        cron: 'cron(15 3 * * ? *)',
+        description: 'Hard-delete transcripts/summaries past the 1-year retention (Legal §B5)',
+      },
+      {
+        name: 'grace_expiry',
+        cron: 'cron(45 3 * * ? *)',
+        description: 'Fire the delete cascade at day 30 of the grace window (Legal §B5)',
+      },
+      {
+        name: 'close_purge',
+        cron: 'cron(15 4 * * ? *)',
+        description: 'Purge closed-account shells past their 30-day window (Legal §B5)',
+      },
+      {
+        name: 'dunning',
+        cron: 'cron(45 4 * * ? *)',
+        description: 'Advance day-7 dunning retrying -> reduced (Legal §A3)',
+      },
+    ];
+    for (const sweep of sweepSchedules) {
+      new scheduler.CfnSchedule(this, `Sweep-${sweep.name}`, {
+        name: `Luciel-${envConfig.envName}-sweep-${sweep.name}`,
+        description: sweep.description,
+        flexibleTimeWindow: { mode: 'OFF' },
+        scheduleExpression: sweep.cron,
+        scheduleExpressionTimezone: 'UTC',
+        // Paused envs stop the sweeps with everything else (cheap-idle switch).
+        state: envConfig.paused ? 'DISABLED' : 'ENABLED',
+        target: {
+          arn: this.cluster.clusterArn,
+          roleArn: schedulerRole.roleArn,
+          ecsParameters: {
+            taskDefinitionArn: sweepTask.taskDefinitionArn,
+            launchType: 'FARGATE',
+            taskCount: 1,
+            networkConfiguration: {
+              awsvpcConfiguration: {
+                subnets: sweepSubnets.subnetIds,
+                securityGroups: [appSg.securityGroupId],
+                assignPublicIp: 'DISABLED',
+              },
+            },
+          },
+          // The sweep name is the ONLY thing that differs per schedule.
+          input: JSON.stringify({
+            containerOverrides: [
+              {
+                name: sweepContainerName,
+                command: ['bash', '-lc', `scripts/run-sweep.sh ${sweep.name}`],
+              },
+            ],
+          }),
+          // Sweeps are idempotent, so a retry is safe; without a retry policy a
+          // transient DB blip would silently skip a compliance sweep for a day.
+          retryPolicy: { maximumRetryAttempts: 3, maximumEventAgeInSeconds: 3600 },
+        },
+      });
+    }
 
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,

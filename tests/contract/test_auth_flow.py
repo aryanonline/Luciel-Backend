@@ -65,7 +65,9 @@ async def test_login_sets_httponly_cookie_and_session_shape(client):
     r = await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
     assert r.status_code == 200
     body = r.json()
-    assert set(body.keys()) == {"account", "nextRoute"}
+    # notices[] is always present (Legal §A5 in-dashboard notice), empty when none pending.
+    assert set(body.keys()) == {"account", "nextRoute", "notices"}
+    assert body["notices"] == []
     assert body["nextRoute"] in {"first_run", "dashboard"}
     # httpOnly session cookie set
     set_cookie = r.headers.get("set-cookie", "")

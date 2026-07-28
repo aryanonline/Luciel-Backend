@@ -76,6 +76,9 @@ class ChannelConfigOut(WireModel):
     enabled: bool
     connection_status: ConnectionStatusWire | None = None
     voice_consent_acknowledged_at: datetime | None = None
+    # A2P 10DLC / sender-of-record / STOP-HELP ack (Legal §A2, §A6). Server-stamped when
+    # SMS is first enabled; read-only on the wire.
+    sms_compliance_acknowledged_at: datetime | None = None
 
 
 class AddonToolOut(WireModel):
@@ -148,6 +151,10 @@ class ChannelConfigIn(StrictWireModel):
     enabled: bool
     connection_status: ConnectionStatusWire | None = None
     voice_consent_acknowledged_at: datetime | None = None
+    # Accepted so the client can echo back the value it read from GET without a 422
+    # (StrictWireModel forbids extras), but the endpoint DISCARDS it: the ack instant is
+    # server-owned, so an admin cannot backdate or forge their A2P acknowledgment.
+    sms_compliance_acknowledged_at: datetime | None = None
 
 
 class AddonToolIn(StrictWireModel):

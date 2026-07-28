@@ -10,8 +10,6 @@ unchanged regardless of whether a fast provider is bound.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 from app.config import Settings
 from app.runtime.llm_router import (
@@ -23,6 +21,8 @@ from app.runtime.llm_router import (
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.providers import AnthropicProvider
 from app.runtime.testing import EchoModel
+
+from tests.unit.live_settings import live_settings
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -139,10 +139,9 @@ def test_mock_provider_factory_binds_named_fast_echo() -> None:
 
 
 def test_live_provider_factory_binds_anthropic_fast_model_id() -> None:
-    secret = json.dumps(
-        {"ANTHROPIC_API_KEY": "fake-anthropic-key", "OPENAI_API_KEY": "fake-openai-key"}
+    settings = live_settings(
+        ANTHROPIC_API_KEY="fake-anthropic-key", OPENAI_API_KEY="fake-openai-key"
     )
-    settings = Settings(integration_mode="live", platform_secret=secret)
     router = build_llm_router(settings)
     assert isinstance(router._fast, AnthropicProvider)
     assert router._fast._model == settings.llm_anthropic_fast_model

@@ -9,7 +9,6 @@ test body — never read from Credentials.docx or hardcoded anywhere in source.
 
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +23,8 @@ from app.runtime.speech import (
     Transcription,
     WhisperSpeechToText,
 )
+
+from tests.unit.live_settings import live_settings
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -143,14 +144,11 @@ def test_default_mode_is_mock_for_speech_too():
 
 
 def test_live_mode_builds_whisper_and_elevenlabs_from_secret():
-    secret = json.dumps(
-        {
-            "ANTHROPIC_API_KEY": "fake-anthropic-key",
-            "OPENAI_API_KEY": "fake-openai-key",
-            "ELEVENLABS_API_KEY": "fake-elevenlabs-key",
-        }
+    settings = live_settings(
+        ANTHROPIC_API_KEY="fake-anthropic-key",
+        OPENAI_API_KEY="fake-openai-key",
+        ELEVENLABS_API_KEY="fake-elevenlabs-key",
     )
-    settings = Settings(integration_mode="live", platform_secret=secret)
     stt, tts = build_speech_providers(settings)
     assert isinstance(stt, WhisperSpeechToText)
     assert isinstance(tts, ElevenLabsTextToSpeech)
@@ -159,8 +157,7 @@ def test_live_mode_builds_whisper_and_elevenlabs_from_secret():
 
 
 def test_live_mode_missing_elevenlabs_key_raises_without_echoing_value():
-    secret = json.dumps({"OPENAI_API_KEY": "fake-openai-key"})
-    settings = Settings(integration_mode="live", platform_secret=secret)
+    settings = live_settings(OPENAI_API_KEY="fake-openai-key")
     with pytest.raises(RuntimeError) as exc:
         build_speech_providers(settings)
     assert "ELEVENLABS_API_KEY" in str(exc.value)
@@ -168,8 +165,7 @@ def test_live_mode_missing_elevenlabs_key_raises_without_echoing_value():
 
 
 def test_live_mode_missing_openai_key_raises():
-    secret = json.dumps({"ELEVENLABS_API_KEY": "fake-elevenlabs-key"})
-    settings = Settings(integration_mode="live", platform_secret=secret)
+    settings = live_settings(ELEVENLABS_API_KEY="fake-elevenlabs-key")
     with pytest.raises(RuntimeError) as exc:
         build_speech_providers(settings)
     assert "OPENAI_API_KEY" in str(exc.value)

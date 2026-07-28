@@ -19,12 +19,14 @@ from app.audit import log as audit
 from app.auth import access
 from app.auth.captcha import verify_captcha
 from app.auth.tokens import decode_token
+from app.billing import notices
 from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 from app.models.instance import Account
 from app.notifications import email_dispatcher
 from app.schemas_api.auth import (
+    AccountNoticeOut,
     AccountOut,
     ForgotPasswordRequest,
     LoginRequest,
@@ -75,6 +77,12 @@ def _account_out(acct: Account, *, has_luciel: bool) -> AccountOut:
     )
 
 
+def _notices_out() -> list[AccountNoticeOut]:
+    """Notices ride the session payload the dashboard shell already reads, so they need no
+    second request and are there on next login (Legal §A5). Normally empty."""
+    return [AccountNoticeOut.model_validate(vars(n)) for n in notices.account_notices()]
+
+
 async def _has_luciel(admin_id: uuid.UUID) -> bool:
     from app.models.instance import Instance
 
@@ -121,7 +129,11 @@ async def login(req: LoginRequest, response: Response) -> SessionOut:
     acct, token, next_route = result
     _set_session_cookie(response, token)
     has_luciel = await _has_luciel(acct.id)
-    return SessionOut(account=_account_out(acct, has_luciel=has_luciel), next_route=next_route)
+    return SessionOut(
+        account=_account_out(acct, has_luciel=has_luciel),
+        next_route=next_route,
+        notices=_notices_out(),
+    )
 
 
 @router.post("/logout", status_code=204)
@@ -151,7 +163,11 @@ async def me(subject: Subject = Depends(current_session_subject)) -> SessionOut:
         acct = (await s.execute(select(Account).where(Account.id == subject.admin_id))).scalar_one()
     has_luciel = await _has_luciel(subject.admin_id)
     next_route = access.next_route_for_state(acct.state, acct.email_verified, has_luciel)
-    return SessionOut(account=_account_out(acct, has_luciel=has_luciel), next_route=next_route)
+    return SessionOut(
+        account=_account_out(acct, has_luciel=has_luciel),
+        next_route=next_route,
+        notices=_notices_out(),
+    )
 
 
 @router.post("/verify-email", response_model=SessionOut)

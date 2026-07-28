@@ -38,6 +38,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from app.config import FAKE_STRIPE_WEBHOOK_SECRET
+
 
 @dataclass(frozen=True)
 class PaymentMethodDisplay:
@@ -145,13 +147,17 @@ class FakeStripeGateway:
 
     # Test-only signing secret — NOT a real Stripe secret (no live keys in code,
     # config §3.4). detect-secrets pragma: this is a deterministic fixture value.
-    WEBHOOK_SECRET = "whsec_fake_test_only"  # noqa: S105 # nosec B105
+    WEBHOOK_SECRET = FAKE_STRIPE_WEBHOOK_SECRET
 
-    def __init__(self) -> None:
+    def __init__(self, *, webhook_secret: str | None = None) -> None:
         # customer_id -> display tuple (or None when no card attached).
         self._cards: dict[str, PaymentMethodDisplay | None] = {}
         # idempotency_key -> reported (dedup ledger so retries never double-bill).
         self._usage_keys: set[str] = set()
+        # A provisioned secret WINS over the published constant, so an environment that
+        # runs the fake gateway but has a real whsec_ in its platform secret still only
+        # accepts events Stripe actually signed. Tests pass nothing and keep the constant.
+        self._webhook_secret = webhook_secret or self.WEBHOOK_SECRET
 
     async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
         # Deterministic id derived from the tenant so repeated calls are stable.
@@ -194,7 +200,7 @@ class FakeStripeGateway:
         ts, sigs = _parse_signature_header(signature_header)
         if ts is None or not sigs:
             raise SignatureError("Missing Stripe-Signature components.")
-        expected = _compute_signature(self.WEBHOOK_SECRET, ts, payload)
+        expected = _compute_signature(self._webhook_secret, ts, payload)
         if not any(hmac.compare_digest(expected, s) for s in sigs):
             raise SignatureError("Stripe signature mismatch.")
         body = json.loads(payload.decode("utf-8"))
@@ -381,7 +387,7 @@ def get_stripe_gateway() -> StripeGateway:
         if settings.stripe_integration_posture == "test":
             _gateway = _build_test_gateway()
         else:
-            _gateway = FakeStripeGateway()
+            _gateway = FakeStripeGateway(webhook_secret=settings.stripe_webhook_secret or None)
     return _gateway
 
 

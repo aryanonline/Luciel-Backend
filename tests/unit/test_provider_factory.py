@@ -7,14 +7,14 @@ without importing keys from anywhere but the secret JSON, and with no network.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 from app.config import Settings
 from app.runtime.llm_router import LLMRouter
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.providers import AnthropicProvider, OpenAIProvider
 from app.runtime.testing import EchoModel
+
+from tests.unit.live_settings import live_settings
 
 
 def test_mock_mode_builds_echo_router() -> None:
@@ -34,10 +34,9 @@ def test_default_mode_is_mock() -> None:
 
 
 def test_live_mode_builds_real_providers_from_secret() -> None:
-    secret = json.dumps(
-        {"ANTHROPIC_API_KEY": "fake-anthropic-key", "OPENAI_API_KEY": "fake-openai-key"}
+    settings = live_settings(
+        ANTHROPIC_API_KEY="fake-anthropic-key", OPENAI_API_KEY="fake-openai-key"
     )
-    settings = Settings(integration_mode="live", platform_secret=secret)
     router = build_llm_router(settings)
     assert isinstance(router._primary, AnthropicProvider)
     assert isinstance(router._fallback, OpenAIProvider)

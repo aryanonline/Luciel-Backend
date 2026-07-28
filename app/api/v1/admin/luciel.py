@@ -27,6 +27,7 @@ from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
 from app.schemas_api.luciel import (
+    ChannelConfigIn,
     CreateLucielRequest,
     LucielOut,
     UpdateChannelsRequest,
@@ -175,9 +176,38 @@ async def update_channels(
     def _build(inst: Instance) -> object:
         # Voice-enable requires prior consent-ack (Vision §3.1, Arch §3.1.2).
         validate_channels(req, inst)
-        return [c.model_dump(by_alias=True, exclude_none=True) for c in req.channels]
+        return _stamp_sms_compliance_ack(req.channels, inst)
 
     return await _update_config(subject.admin_id, subject.user_id, "channels", _build)
+
+
+SMS_ACK_FIELD = "smsComplianceAcknowledgedAt"
+
+
+def _stamp_sms_compliance_ack(
+    channels: list[ChannelConfigIn], inst: Instance
+) -> list[dict[str, object]]:
+    """Persist the A2P 10DLC / sender-of-record / STOP-HELP ack instant (Legal §A2, §A6).
+
+    Enabling SMS is only reachable through the acknowledgment modal, so the first write
+    that turns SMS on IS the acknowledgment — recording the timestamp here makes it
+    durable across sessions instead of living in client state. The value is server-owned:
+    whatever the client sent is dropped, an existing stamp is never overwritten (the ack
+    happened once), and it is never cleared by a later disable, so the audit trail of
+    "they accepted the carrier obligations" survives SMS being toggled off.
+    """
+    prior = {c.get("id"): c for c in (inst.channels or [])}
+    now = datetime.now(UTC).isoformat()
+    out: list[dict[str, object]] = []
+    for ch in channels:
+        dumped = ch.model_dump(by_alias=True, exclude_none=True)
+        if ch.id == "sms":
+            dumped.pop(SMS_ACK_FIELD, None)
+            stamp = prior.get("sms", {}).get(SMS_ACK_FIELD) or (now if ch.enabled else None)
+            if stamp:
+                dumped[SMS_ACK_FIELD] = stamp
+        out.append(dumped)
+    return out
 
 
 @router.put("/tools", response_model=LucielOut)

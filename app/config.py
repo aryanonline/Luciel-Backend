@@ -16,6 +16,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
+# The deterministic signing secret the in-process Stripe fake verifies against. It lives
+# here (not only in app.billing.stripe_gateway) because live-mode startup must be able to
+# REFUSE it: it is published in this repo, so anything it verifies is forgeable. Defined
+# in config to keep the fail-closed check free of a billing import cycle.
+FAKE_STRIPE_WEBHOOK_SECRET = "whsec_fake_test_only"  # noqa: S105 # nosec B105
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LUCIEL_", env_file=".env", extra="ignore")
@@ -65,6 +71,16 @@ class Settings(BaseSettings):
     payg_block_size: int = 100
     payg_price_per_block_cents: int = 3900  # $39.00 per 100-block
 
+    # --- Pending free-allowance reduction (Legal §A5) -------------------------
+    # A REDUCTION to the free starter allowance owes every existing account 30 days'
+    # notice delivered BOTH by email and in-dashboard on next login (the in-dashboard
+    # half exists because a registered address may have gone stale). The platform
+    # operator announces a pending reduction by setting these two; empty/0 means no
+    # change is pending, which is why every account's notices[] is empty by default.
+    # An INCREASE needs no notice, so it is never announced here.
+    free_allowance_reduction_effective_at: str = ""  # ISO-8601 instant
+    free_allowance_reduction_to: int = 0  # the new, lower allowance
+
     # --- Stripe integration posture (Architecture §3.4.1b) ---------------------
     # Mirrors the LLM GATE 2 cutover shape ("integration_mode") one level down: a
     # dedicated posture for the Stripe seam so Stripe can move to a real TEST-mode
@@ -75,6 +91,13 @@ class Settings(BaseSettings):
     # this codebase never binds a production Stripe secret key (sk_live_) — that
     # cutover is out of scope / owner-gated and not implemented by this seam.
     stripe_integration_posture: str = "mock"
+
+    # Stripe webhook signing secret (whsec_...) — the ONLY thing standing between the
+    # billing webhook and a forged event, so it is platform-owned secret material like
+    # jwt_signing_key: delivered in the platform secret, never in source. Empty default
+    # means "no configured secret", which keeps mock/CI on the deterministic fake
+    # constant; live mode fails closed instead (see ``_apply_platform_secret``).
+    stripe_webhook_secret: str = ""  # noqa: S105 — empty placeholder, not a secret
 
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
@@ -244,6 +267,25 @@ class Settings(BaseSettings):
                 "JWT_SIGNING_KEY is still the insecure dev default in live mode — refusing "
                 "to start (would make all session tokens forgeable). Set JWT_SIGNING_KEY "
                 "in the platform secret."
+            )
+
+        # Stripe webhook signing secret: same class as the JWT key. The fake's secret is
+        # published in this repo, so accepting it in live mode would let anyone forge a
+        # billing event (state changes, dunning exits) — fail closed exactly as above.
+        # STRIPE_TEST_WEBHOOK_SECRET is accepted as an alias so the "test" posture keys
+        # already provisioned in the blob also arm the webhook route.
+        for key in ("STRIPE_WEBHOOK_SECRET", "STRIPE_TEST_WEBHOOK_SECRET"):
+            if blob.get(key):
+                object.__setattr__(self, "stripe_webhook_secret", blob[key])
+                break
+        if self.integration_mode == "live" and self.stripe_webhook_secret in (
+            "",
+            FAKE_STRIPE_WEBHOOK_SECRET,
+        ):
+            raise RuntimeError(
+                "STRIPE_WEBHOOK_SECRET is unset (or still the published test constant) in "
+                "live mode — refusing to start (would make billing webhook events "
+                "forgeable). Set STRIPE_WEBHOOK_SECRET in the platform secret."
             )
 
         # CORS allowed origins (dashboard_origins) also default to localhost, so the

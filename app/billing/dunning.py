@@ -22,13 +22,14 @@ injected clock — no wall-clock dependency.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
+from app.models.billing import BillingAccount
 from app.models.connection import InstanceConnection
 
 # Retry days within the retrying window (CJ §6). FULL service through day 7.
@@ -89,6 +90,50 @@ def behaves_as_free_cap(dunning_state: str) -> bool:
     """In ``reduced``, the account behaves as free-cap regardless of card on file
     (Legal §A3) — drives the at_cap computation in metering."""
     return dunning_state == REDUCED
+
+
+async def advance_if_due(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+) -> str | None:
+    """Apply the TIME-driven dunning transition for ONE tenant (CJ §6 / Legal §A3).
+
+    :func:`advance` is otherwise only reached from the ``invoice.payment_failed``
+    webhook, so a tenant whose card keeps failing but whose Stripe retries go quiet
+    sat in ``retrying`` — full service, unpaid — indefinitely. This is the scheduled
+    counterpart: it reads ``dunning_started_at`` and, once day 7 has passed, drops the
+    account to ``reduced`` (free-cap behavior) and sends action-tool connections
+    dormant, exactly as the webhook path does.
+
+    Returns the new state when a transition happened, else None. Idempotent — a second
+    run finds the account already ``reduced`` and changes nothing. Must be called
+    inside a tenant-scoped session for ``admin_id`` so RLS scopes the read + write.
+    """
+    now = now or datetime.now(UTC)
+    account = (
+        await session.execute(select(BillingAccount).where(BillingAccount.admin_id == admin_id))
+    ).scalar_one_or_none()
+    if account is None:
+        return None
+    prev = account.dunning_state
+    new_state = advance(prev, account.dunning_started_at, now)
+    if new_state == prev:
+        return None
+
+    account.dunning_state = new_state
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type="dunning_state_changed",
+        payload={"from": prev, "to": new_state, "reason": "dunning_schedule_elapsed"},
+    )
+    if new_state == REDUCED:
+        await set_dormant_for_action_tools(session, admin_id=admin_id, reason="dunning_reduced")
+    return new_state
 
 
 async def set_dormant_for_action_tools(

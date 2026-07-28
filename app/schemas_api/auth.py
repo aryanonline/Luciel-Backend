@@ -25,9 +25,24 @@ class AccountOut(WireModel):
     has_luciel: bool
 
 
+AccountNoticeKind = Literal["allowance_reduction", "price_change", "terms_change"]
+
+
+class AccountNoticeOut(WireModel):
+    notice_id: str
+    kind: AccountNoticeKind
+    title: str
+    body: str
+    effective_at: datetime | None = None
+    learn_more_href: str | None = None
+
+
 class SessionOut(WireModel):
     account: AccountOut
     next_route: NextRoute
+    # In-dashboard notices (Legal §A5, §A10, §B10). Defaults empty, which is the normal
+    # state — a notice appears only while a platform-wide change is pending.
+    notices: list[AccountNoticeOut] = Field(default_factory=list)
 
 
 class SignupRequest(WireModel):
