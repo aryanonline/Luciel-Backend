@@ -9,7 +9,13 @@ set -euo pipefail
 
 SWEEP="${1:?usage: run-sweep.sh <retention|grace_expiry|close_purge|dunning>}"
 
-eval "$(python3 - <<'PY'
+# Absolute venv interpreter, never a bare `python3`: the scheduler runs this script
+# through a LOGIN shell (`bash -lc`), and /etc/profile resets PATH to the system
+# default, dropping the /opt/venv/bin that the image's ENV puts in front. A bare
+# `python3` would resolve to the system interpreter, which has none of the app deps.
+VENV_PY=/opt/venv/bin/python3
+
+eval "$("$VENV_PY" - <<'PY'
 import json, os, hashlib
 s = json.loads(os.environ["LUCIEL_DB_SECRET"])
 host = s["host"]; port = s.get("port", 5432)
@@ -21,4 +27,4 @@ print(f'export LUCIEL_DATABASE_URL_SYNC="postgresql+psycopg://{base}"')
 PY
 )"
 
-exec python3 -m app.jobs "$SWEEP"
+exec "$VENV_PY" -m app.jobs "$SWEEP"
