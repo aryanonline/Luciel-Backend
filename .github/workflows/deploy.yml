@@ -97,12 +97,15 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy infra stacks (Compute/Edge/Observability) with the built image
+      - name: Deploy infra stacks (Compute/Edge/Observability/Widget) with the built image
         working-directory: infra
         run: |
           npm ci
+          # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
+          # crossRegionReferences; the CDK app wires that, so naming both is enough.
           npx cdk deploy "Luciel-dev-Compute" "Luciel-dev-Edge" \
             "Luciel-dev-Observability" \
+            "Luciel-dev-WidgetCert" "Luciel-dev-Widget" \
             -c env=dev -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             --require-approval never
@@ -221,12 +224,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy prod infra stacks (Compute/Edge/Observability) with the built image
+      - name: Deploy prod infra stacks (Compute/Edge/Observability/Widget) with the built image
         working-directory: infra
         run: |
           npm ci
           npx cdk deploy "Luciel-prod-Compute" "Luciel-prod-Edge" \
             "Luciel-prod-Observability" \
+            "Luciel-prod-WidgetCert" "Luciel-prod-Widget" \
             -c env=prod -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             --require-approval never
