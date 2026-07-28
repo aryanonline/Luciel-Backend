@@ -26,6 +26,8 @@ import enum
 import re
 from dataclasses import dataclass
 
+from app.runtime.personality import compose_personality_stanza
+
 UNTRUSTED_OPEN = "<<<UNTRUSTED_DATA_BEGIN>>>"
 UNTRUSTED_CLOSE = "<<<UNTRUSTED_DATA_END>>>"
 
@@ -186,7 +188,9 @@ def ensure_ai_identity_disclosure(
 
 
 def build_system_prompt(
-    business_context: str | None, luciel_email_address: str | None = None
+    business_context: str | None,
+    luciel_email_address: str | None = None,
+    personality: dict[str, object] | None = None,
 ) -> str:
     """Compose the system prompt with platform invariants at higher precedence than
     the admin's business-context field (Defense 6, §3.4.14).
@@ -201,11 +205,18 @@ def build_system_prompt(
     so Luciel knows its own mailbox — it refers to itself by that address and recognizes
     mail addressed to it. This is platform-RESOLVED data (not admin free text), so it is
     NOT wrapped as untrusted; it must not disturb the invariant stanzas above.
+
+    ``personality`` is the admin's personality pillar (preset or custom axes, Vision
+    §3.5). It composes into a platform-authored stanza below the invariants: the admin
+    chooses the shape, the platform writes the words, so it tunes delivery without
+    becoming a raw prompt-authoring surface. Platform-RESOLVED, so not wrapped as
+    untrusted.
     """
     prompt = _INVARIANT_STANZAS
     addr = (luciel_email_address or "").strip()
     if addr:
         prompt = prompt + _EMAIL_IDENTITY_STANZA.format(address=addr)
+    prompt = prompt + compose_personality_stanza(personality)
     ctx = (business_context or "").strip()
     if ctx:
         ctx = ctx[:BUSINESS_CONTEXT_MAX_CHARS]

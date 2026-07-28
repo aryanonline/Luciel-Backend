@@ -50,6 +50,7 @@ from app.schemas_api.widget import (
     WidgetSendRequest,
     WidgetSendResult,
 )
+from app.tools.registry import make_tool_resolver
 
 router = APIRouter(prefix="/api/v1/chat-widget", tags=["chat-widget"])
 
@@ -242,10 +243,14 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             # 280-char admin business-context, composed UNDER the platform invariants
             # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
             business_context=effective.business_context,
+            # Vision §3.5: the selected preset / custom axes compose into the system
+            # prompt, so the personality pillar actually changes how Luciel talks.
+            personality=effective.personality,
             # Real card state, not a literal False: a PAYG tenant must keep serving past
             # the free 50 (§12.9 / Vision §7).
             has_payment_method=await metering.has_live_card(s, admin_id=ctx.admin_id),
             snapshot_tool_ids=effective.snapshot_tool_ids,
+            tool_resolver=make_tool_resolver(),
         )
         result = await orch.run_turn(
             session_id=sess.id,

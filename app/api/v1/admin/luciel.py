@@ -7,11 +7,12 @@ PUT channels/tools wrap arrays; lifecycle posts return the updated Luciel.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found
@@ -35,6 +36,7 @@ from app.schemas_api.luciel import (
     UpdatePersonalityRequest,
     UpdateToolsRequest,
 )
+from app.tools.authorization import sync_tool_authorizations
 
 router = APIRouter(prefix="/api/v1/admin/luciel", tags=["luciel"])
 
@@ -137,6 +139,7 @@ async def _update_config(
     user_id: uuid.UUID,
     field: str,
     build_value: Callable[[Instance], object],
+    after: Callable[[AsyncSession, Instance], Awaitable[None]] | None = None,
 ) -> LucielOut:
     """Validated full-replace of one pillar's JSONB blob.
 
@@ -145,6 +148,10 @@ async def _update_config(
     state-dependent invariant checks against the loaded ``inst`` and returns the value
     to persist. Only after all checks pass do we overwrite (full-replace, matching the
     frozen mock-admin.ts semantics) and emit the audit event.
+
+    ``after`` runs inside the same transaction for pillars whose config also drives a
+    relational table (tools → ``instance_tool_authorizations``), so the JSONB blob and
+    the table it gates can never be written apart.
     """
     async with tenant_session(admin_id) as s:
         inst = (
@@ -157,6 +164,8 @@ async def _update_config(
         value = build_value(inst)
         setattr(inst, field, value)
         await s.flush()
+        if after is not None:
+            await after(s, inst)
         await audit.emit(
             s,
             admin_id=admin_id,
@@ -222,7 +231,19 @@ async def update_tools(
     def _build(_: Instance) -> object:
         return [t.model_dump(by_alias=True, exclude_none=True) for t in req.tools]
 
-    return await _update_config(subject.admin_id, subject.user_id, "tools", _build)
+    # The JSONB blob is the config surface the dashboard reads back; the broker's
+    # default-deny gate 1 reads instance_tool_authorizations (Arch §3.3.3). Both must
+    # move together or an admin toggling a tool on still gets `not_authorized` at
+    # dispatch — write them in the same transaction so they can never diverge.
+    return await _update_config(
+        subject.admin_id,
+        subject.user_id,
+        "tools",
+        _build,
+        after=lambda s, inst: sync_tool_authorizations(
+            s, admin_id=subject.admin_id, instance_id=inst.id, tools=req.tools
+        ),
+    )
 
 
 @router.put("/escalation", response_model=LucielOut)

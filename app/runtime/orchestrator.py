@@ -210,6 +210,10 @@ class Orchestrator:
     # is told its own mailbox at prompt-composition time so it self-identifies by it and
     # recognizes mail to it. Passed by the caller when the channel is email.
     luciel_email_address: str | None = None
+    # The admin's personality pillar (preset or custom axes, Vision §3.5). Composed
+    # into a platform-authored stanza under the invariants so the selected preset
+    # actually shapes how Luciel talks. None = the default preset.
+    personality: dict[str, object] | None = None
     system_prompt: str = field(default="", init=False)
     has_payment_method: bool = False
     # Resolves a proposed tool_id to a Tool with its Arc 17 backend bound; None when
@@ -230,7 +234,9 @@ class Orchestrator:
         # stanzas at higher precedence than the admin business-context field, so admin
         # text can never suppress AI-identity disclosure, grounding, escalation, or
         # moderation. This is the in-code enforcement; it does not depend on the model.
-        self.system_prompt = build_system_prompt(self.business_context, self.luciel_email_address)
+        self.system_prompt = build_system_prompt(
+            self.business_context, self.luciel_email_address, self.personality
+        )
 
     async def run_turn(
         self,
@@ -402,6 +408,15 @@ class Orchestrator:
         counted = await budget.count_session_once(
             self.session, admin_id=admin_id, instance_id=instance_id, session_id=session_id
         )
+        if counted:
+            # PAYG usage is billed in arrears from this counter (Vision §7): report the
+            # new block to Stripe as it opens, so overage past the free 50 is actually
+            # billed rather than only computed.
+            from app.billing import metering  # noqa: PLC0415 — avoids an import cycle
+
+            await metering.report_usage_after_count(
+                self.session, admin_id=admin_id, instance_id=instance_id
+            )
 
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
         tool_succeeded = any(o == "ok" for o in resp.tool_outcomes)

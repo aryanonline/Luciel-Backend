@@ -60,6 +60,16 @@ class CheckoutSession:
 
 
 @dataclass(frozen=True)
+class UsageRecord:
+    """One accepted metered-usage report (§3.4.1b). Quantity is 100-conversation
+    blocks, never a dollar amount — Stripe multiplies by the metered price."""
+
+    subscription_id: str
+    quantity: int
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
 class StripeEvent:
     """A verified, parsed Stripe webhook event (signature already checked)."""
 
@@ -84,6 +94,15 @@ class StripeGateway(Protocol):
         self, *, customer_id: str, success_url: str, cancel_url: str
     ) -> CheckoutSession:
         """Hosted Checkout to add a card — NO charge at save (CJ §6)."""
+        ...
+
+    async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
+        """Return the customer's PAYG metered subscription id, creating it if absent.
+
+        Called the first time a tenant has billable overage (§3.4.1b): usage can only
+        be reported against a subscription item, so the subscription must exist before
+        the first report. Returns None when the platform has no metered price bound —
+        the caller then reports nothing rather than guessing at a price."""
         ...
 
     async def report_metered_usage(
@@ -158,6 +177,12 @@ class FakeStripeGateway:
         # runs the fake gateway but has a real whsec_ in its platform secret still only
         # accepts events Stripe actually signed. Tests pass nothing and keep the constant.
         self._webhook_secret = webhook_secret or self.WEBHOOK_SECRET
+        # customer_id -> metered subscription id.
+        self._subscriptions: dict[str, str] = {}
+        # Every usage record accepted, in order — the assertion surface for tests that
+        # need to prove usage was reported at the right threshold, not just that the
+        # call did not raise.
+        self.usage_records: list[UsageRecord] = []
 
     async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
         # Deterministic id derived from the tenant so repeated calls are stable.
@@ -177,6 +202,13 @@ class FakeStripeGateway:
         )
         return CheckoutSession(url=f"https://checkout.stripe.com/c/pay/{sid}", session_id=sid)
 
+    async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
+        # Deterministic id derived from the customer so repeated calls are stable and
+        # the mock never mints a second subscription for the same tenant.
+        sub_id = f"sub_fake_{customer_id.removeprefix('cus_fake_')}"
+        self._subscriptions[customer_id] = sub_id
+        return sub_id
+
     async def report_metered_usage(
         self, *, subscription_id: str, quantity: int, idempotency_key: str
     ) -> bool:
@@ -185,6 +217,13 @@ class FakeStripeGateway:
         if idempotency_key in self._usage_keys:
             return False
         self._usage_keys.add(idempotency_key)
+        self.usage_records.append(
+            UsageRecord(
+                subscription_id=subscription_id,
+                quantity=quantity,
+                idempotency_key=idempotency_key,
+            )
+        )
         return True
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
@@ -276,12 +315,46 @@ class RealStripeGateway:
         )
         return CheckoutSession(url=str(session["url"]), session_id=str(session["id"]))
 
+    async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
+        """Find or create the customer's PAYG metered subscription.
+
+        The metered price id is read with ``getattr`` so this module never requires a
+        config.py field that may not be bound yet; with no price id we return None and
+        the caller reports nothing rather than creating a subscription against a guessed
+        price (a wrong price is worse than no bill — it is an incorrect charge).
+        """
+        from app.config import get_settings  # noqa: PLC0415 — avoids an import cycle
+
+        price_id = getattr(get_settings(), "stripe_payg_price_id", "") or ""
+        if not price_id:
+            return None
+        client = self._get_client()
+        existing = client.Subscription.list(customer=customer_id, status="active", limit=1)  # type: ignore[attr-defined]
+        items = existing["data"] if "data" in existing else []
+        if items:
+            return str(items[0]["id"])
+        created = client.Subscription.create(  # type: ignore[attr-defined]
+            customer=customer_id,
+            items=[{"price": price_id}],
+            # Idempotent per customer so a retry cannot create a second subscription.
+            idempotency_key=f"payg-sub:{customer_id}",
+        )
+        return str(created["id"])
+
     async def report_metered_usage(
         self, *, subscription_id: str, quantity: int, idempotency_key: str
     ) -> bool:
         client = self._get_client()
+        # Usage attaches to the subscription ITEM, not the subscription: resolve the
+        # single metered item before reporting (the prior code passed the subscription
+        # id straight to SubscriptionItem, which Stripe rejects).
+        sub = client.Subscription.retrieve(subscription_id)  # type: ignore[attr-defined]
+        sub_items = sub["items"] if "items" in sub else None
+        rows = sub_items["data"] if sub_items and "data" in sub_items else []
+        if not rows:
+            return False
         client.SubscriptionItem.create_usage_record(  # type: ignore[attr-defined]
-            subscription_id,
+            str(rows[0]["id"]),
             quantity=quantity,
             idempotency_key=idempotency_key,
         )

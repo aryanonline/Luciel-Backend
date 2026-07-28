@@ -65,3 +65,34 @@ def test_idempotency_key_stable_for_same_period_quantity() -> None:
     k3 = metering.usage_idempotency_key(admin_id=a, period_start=ps, quantity=3)
     assert k1 == k2  # same (period, quantity) → same key → dedup, no double-bill
     assert k1 != k3  # different quantity → distinct key
+
+
+@pytest.mark.parametrize(
+    ("counted", "crosses"),
+    [
+        (0, False),
+        (1, False),
+        (50, False),  # still inside the free 50 — nothing billable yet
+        (51, True),  # opens billable block 1
+        (52, False),
+        (150, False),
+        (151, True),  # opens billable block 2
+        (152, False),
+        (251, True),  # block 3
+    ],
+)
+def test_block_boundary_is_the_only_reporting_trigger(counted: int, crosses: bool) -> None:
+    """One Stripe call per 100-block, not one per conversation. The reportable
+    quantity only changes when a new block opens (Vision §7)."""
+    assert metering.crosses_block_boundary(counted, FREE, BLOCK) is crosses
+
+
+def test_boundary_crossings_line_up_with_the_block_count() -> None:
+    """Every crossing increments billed_blocks by exactly one — so reporting only at
+    crossings never skips a block."""
+    crossings = [n for n in range(1, 400) if metering.crosses_block_boundary(n, FREE, BLOCK)]
+    assert crossings == [51, 151, 251, 351]
+    for n in crossings:
+        assert (
+            metering.billed_blocks(n, FREE, BLOCK) == metering.billed_blocks(n - 1, FREE, BLOCK) + 1
+        )

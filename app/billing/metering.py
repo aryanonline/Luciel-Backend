@@ -217,6 +217,45 @@ def usage_idempotency_key(*, admin_id: uuid.UUID, period_start: datetime, quanti
     return f"usage:{admin_id}:{period_start.date().isoformat()}:{quantity}"
 
 
+def crosses_block_boundary(counted: int, free_allowance: int, block_size: int) -> bool:
+    """True when the conversation that brought the count to ``counted`` opened a NEW
+    billable 100-block — i.e. the moment the reportable quantity changes.
+
+    With free=50/block=100 this is true at 51 (block 1) and 151 (block 2) and false in
+    between. Reporting only here keeps one Stripe call per block instead of one per
+    conversation; reporting is idempotent on (period, quantity) either way, so a
+    duplicate is harmless but a per-conversation call would be wasteful."""
+    over = billed_conversations(counted, free_allowance)
+    return over > 0 and over % block_size == 1
+
+
+async def report_usage_after_count(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    now: datetime | None = None,
+) -> int:
+    """Report metered usage if the conversation just counted opened a new billable block.
+
+    Called from the runtime immediately after the fire-once counter increments — this is
+    what actually connects the (already correct) metering math to Stripe. A Stripe
+    failure must never fail the lead's turn: the next boundary crossing and the
+    idempotency key make a missed report recoverable, so it is swallowed here.
+    """
+    settings = get_settings()
+    now = now or datetime.now(UTC)
+    budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
+    if not crosses_block_boundary(
+        budget.conversations_this_period, settings.free_allowance, settings.payg_block_size
+    ):
+        return 0
+    try:
+        return await report_usage(session, admin_id=admin_id, instance_id=instance_id, now=now)
+    except Exception:  # noqa: BLE001 — never let billing break a conversation
+        return 0
+
+
 async def report_usage(
     session: AsyncSession,
     *,
@@ -233,13 +272,28 @@ async def report_usage(
     gateway = gateway or get_stripe_gateway()
     now = now or datetime.now(UTC)
     account = await get_or_create_billing_account(session, admin_id=admin_id)
-    if account.stripe_subscription_id is None:
-        return 0  # no metered subscription yet → nothing to report
 
     budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
     quantity = budget.billed_blocks
     if quantity == 0:
         return 0
+
+    # PAYG is what makes usage billable: a free_cap tenant is blocked at the cap
+    # instead (Vision §7), so there is nothing to meter.
+    if account.billing_state != "payg_enabled":
+        return 0
+
+    if account.stripe_subscription_id is None:
+        # First billable block for this tenant: the metered subscription has to exist
+        # before usage can attach to it. Bound lazily here rather than at card-attach
+        # so a tenant who never exceeds the free 50 never gets a subscription.
+        if account.stripe_customer_id is None:
+            return 0
+        sub_id = await gateway.ensure_metered_subscription(customer_id=account.stripe_customer_id)
+        if sub_id is None:
+            return 0  # no metered price bound → report nothing rather than mis-bill
+        account.stripe_subscription_id = sub_id
+        await session.flush()
 
     period_start = account.period_start or datetime(now.year, now.month, 1, tzinfo=UTC)
     key = usage_idempotency_key(admin_id=admin_id, period_start=period_start, quantity=quantity)

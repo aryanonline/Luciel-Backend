@@ -28,6 +28,7 @@ from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import effective_config, resolve_or_open_session
+from app.tools.registry import make_tool_resolver
 
 # Strong-identity channels: the transport identifier IS a stable lead key, so it is
 # passed to the loop for lead capture + identity resolution (§3.4.4/§3.4.9). The widget
@@ -88,10 +89,12 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         business_name=business,
         assistant_name=assistant,
         business_context=effective.business_context,
+        personality=effective.personality,
         # Real card state, not a literal False: a PAYG tenant must keep serving past the
         # free 50 on every channel (§12.9 / Vision §7).
         has_payment_method=await metering.has_live_card(session, admin_id=msg.admin_id),
         snapshot_tool_ids=effective.snapshot_tool_ids,
+        tool_resolver=make_tool_resolver(),
     )
 
     transport_identifier = (

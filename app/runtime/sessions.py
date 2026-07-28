@@ -28,6 +28,7 @@ from app.models.audit import ActorType
 from app.models.conversation import Session
 from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
+from app.runtime.personality import business_context_of
 
 # Inactivity timeout by channel interaction class (§3.4.8) — platform constants.
 INACTIVITY_TIMEOUT = {
@@ -184,7 +185,10 @@ async def _build_config_snapshot(
             str(c["id"]) for c in inst.channels if isinstance(c, dict) and c.get("enabled")
         ],
         "personality": dict(inst.personality),
-        "business_context": inst.business_one_liner,
+        # The admin-editable 280-char personality.businessContext is the runtime
+        # business-context field (Vision §3.5); the immutable signup one-liner is only
+        # the fallback for an account that never filled the box in.
+        "business_context": business_context_of(inst.personality) or inst.business_one_liner,
     }
 
 
@@ -200,6 +204,9 @@ class EffectiveConfig:
     enabled_channels: set[str]
     business_context: str | None
     snapshot_tool_ids: set[str] | None
+    # The personality pillar frozen at open (additive/neutral per rule E, so a preset
+    # swap mid-conversation applies to the NEXT conversation).
+    personality: dict[str, object]
 
 
 def effective_config(
@@ -216,18 +223,22 @@ def effective_config(
     health + disable/revoke are NOT resolved here — they stay LIVE in the broker gates
     (capability=snapshot, usability=live: the safety half must still win)."""
     business_context: str | None
+    personality: dict[str, object]
     if snapshot:
         snap_channels = cast("list[object]", snapshot.get("enabled_channels") or [])
         snap_tools = cast("list[object]", snapshot.get("enabled_tools") or [])
         channels = {str(ch) for ch in snap_channels}
         raw_ctx = snapshot.get("business_context")
         business_context = str(raw_ctx) if raw_ctx is not None else None
+        raw_personality = snapshot.get("personality")
+        personality = dict(raw_personality) if isinstance(raw_personality, dict) else {}
         tool_ids: set[str] | None = {str(t) for t in snap_tools}
     else:
         channels = {
             str(c["id"]) for c in instance.channels if isinstance(c, dict) and c.get("enabled")
         }
-        business_context = instance.business_one_liner
+        business_context = business_context_of(instance.personality) or instance.business_one_liner
+        personality = dict(instance.personality or {})
         tool_ids = None  # no snapshot → rely on the broker's live gates only
     if always_include_channel is not None:
         channels = channels | {always_include_channel}
@@ -235,6 +246,7 @@ def effective_config(
         enabled_channels=channels,
         business_context=business_context,
         snapshot_tool_ids=tool_ids,
+        personality=personality,
     )
 
 

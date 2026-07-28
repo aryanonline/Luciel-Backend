@@ -113,6 +113,10 @@ class PersonalityConfigWire(WireModel):
     preset: PersonalityPresetWire
     axes: PersonalityAxes | None = None
     business_context: str | None = Field(default=None, max_length=280)
+    # The runtime already reads assistantName for the AI-identity disclosure (§3.4.16);
+    # declaring it makes it settable instead of always falling back to
+    # "<business>'s assistant".
+    assistant_name: str | None = Field(default=None, max_length=80)
 
 
 class LucielOut(WireModel):
@@ -215,3 +219,4 @@ class UpdatePersonalityRequest(StrictWireModel):
     preset: PersonalityPresetWire
     axes: PersonalityAxesIn | None = None
     business_context: str | None = Field(default=None, max_length=280)
+    assistant_name: str | None = Field(default=None, max_length=80)
