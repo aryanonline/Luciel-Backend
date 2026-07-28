@@ -8,6 +8,11 @@ Postgres-side reconciliation — the application sweep that deletes aged
 ``Transcript`` and ``SessionSummary`` rows on LIVE (non-deleted) tenants and
 emits a ``data_retention_hard_delete`` audit event per data class.
 
+Captured Leads are NOT on that platform timer (Legal §B5 makes them Admin-managed
+business data). They get a second, opt-in policy in the same sweep —
+``prune_stale_leads`` acts only for a tenant that set ``leadRetentionDays`` itself
+(§3.4.10a) — so the platform still never timer-deletes leads the Admin did not ask it to.
+
 This is distinct from the account-CLOSE cascade (``app/lifecycle/cascade.py``),
 which destroys everything for a tenant being torn down. This sweep runs on
 ACTIVE tenants and only removes rows past the age boundary, so an active Luciel's
@@ -33,6 +38,7 @@ from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import SessionSummary, Transcript
 from app.models.instance import Instance
+from app.models.lead import Lead, LeadState
 
 # §3.4.10 / §4.4 / Decision #38: 1-year retention for transcripts + session
 # summaries. Platform policy, not admin-configurable (default; overridable per call
@@ -108,6 +114,67 @@ async def expire_aged_data(
     return counts
 
 
+async def prune_stale_leads(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+) -> int:
+    """Apply the tenant's OPT-IN lead auto-prune rule, if it has one (§3.4.10a).
+
+    Captured Leads are the Admin's own business data, so unlike transcripts they are
+    never on a platform timer (Legal §B5). This runs only when the Admin has set
+    ``instances.lead_retention_days``; a NULL window is the default and prunes nothing.
+
+    Staleness is INACTIVITY, not age: §3.4.10a defines a stale lead as one with "no
+    activity (no conversation, no update) for a configurable window", so the cutoff is
+    against ``last_activity_at``. Archived leads are exempt — §B5 offers archive as the
+    alternative to deletion, so an auto-rule that deleted archived rows anyway would
+    make the Admin's choice to archive meaningless.
+
+    Emits one ``lead_pruned`` event per deleted lead carrying only the HASHED lead id,
+    matching the manual prune path so erasure-by-key-destruction still holds against the
+    immutable log (§3.4.11 / §5.3). Returns the number of leads pruned.
+    """
+    now = now or datetime.now(UTC)
+    inst = (
+        await session.execute(select(Instance).where(Instance.admin_id == admin_id))
+    ).scalar_one_or_none()
+    if inst is None or inst.lead_retention_days is None:
+        return 0
+
+    cutoff = now - timedelta(days=inst.lead_retention_days)
+    stale = (
+        (
+            await session.execute(
+                select(Lead).where(
+                    Lead.admin_id == admin_id,
+                    Lead.state != LeadState.archived,
+                    Lead.last_activity_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for lead in stale:
+        lead_id = lead.id
+        await session.delete(lead)
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=lead.instance_id,
+            actor_type=ActorType.platform,
+            event_type="lead_pruned",
+            payload={
+                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                "retention_policy": f"lead_auto_prune:{inst.lead_retention_days}d",
+            },
+        )
+    await session.flush()
+    return len(stale)
+
+
 async def run_retention_sweep(
     candidate_admin_ids: list[uuid.UUID],
     *,
@@ -134,6 +201,9 @@ async def run_retention_sweep(
             counts = await expire_aged_data(
                 s, admin_id=admin_id, now=now, retention_days=retention_days
             )
+            # Same transaction as the platform sweep, but a different policy: this one
+            # only acts for tenants that opted in (§3.4.10a).
+            counts["lead"] = await prune_stale_leads(s, admin_id=admin_id, now=now)
         if any(counts.values()):
             swept[str(admin_id)] = counts
     return swept

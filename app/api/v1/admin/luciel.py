@@ -33,6 +33,7 @@ from app.schemas_api.luciel import (
     LucielOut,
     UpdateChannelsRequest,
     UpdateEscalationRequest,
+    UpdateLeadRetentionRequest,
     UpdatePersonalityRequest,
     UpdateToolsRequest,
 )
@@ -72,6 +73,7 @@ def _to_out(inst: Instance) -> LucielOut:
             "tools": inst.tools or [],
             "escalation": inst.escalation or {},
             "personality": inst.personality or {"preset": "warm_concierge"},
+            "leadRetentionDays": inst.lead_retention_days,
             "graceWindowStartedAt": (
                 inst.grace_window_started_at.isoformat() if inst.grace_window_started_at else None
             ),
@@ -259,6 +261,23 @@ async def update_escalation(
         return req.model_dump(by_alias=True, exclude_none=True)
 
     return await _update_config(subject.admin_id, subject.user_id, "escalation", _build)
+
+
+@router.put("/lead-retention", response_model=LucielOut)
+async def update_lead_retention(
+    req: UpdateLeadRetentionRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """Set (or clear) the Admin's opt-in lead auto-prune rule (§3.4.10a, Legal §B5).
+
+    ``leadRetentionDays: null`` turns the rule off. Turning it on is the Admin's own
+    retention choice over their own business data: it is reversible as a setting, but the
+    deletions the sweep then performs are permanent.
+    """
+
+    def _build(_: Instance) -> object:
+        return req.lead_retention_days
+
+    return await _update_config(subject.admin_id, subject.user_id, "lead_retention_days", _build)
 
 
 @router.put("/personality", response_model=LucielOut)

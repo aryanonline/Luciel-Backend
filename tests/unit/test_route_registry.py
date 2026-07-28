@@ -39,6 +39,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/api/v1/admin/luciel/channels"),
         ("POST", "/api/v1/admin/luciel/delete"),
         ("PUT", "/api/v1/admin/luciel/escalation"),
+        # The Admin's opt-in lead auto-prune rule (§3.4.10a) — intentional addition.
+        ("PUT", "/api/v1/admin/luciel/lead-retention"),
         ("POST", "/api/v1/admin/luciel/pause"),
         ("PUT", "/api/v1/admin/luciel/personality"),
         ("POST", "/api/v1/admin/luciel/restore"),
@@ -92,6 +94,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/dashboard/conversations/{session_id}/take-over"),
         ("GET", "/api/v1/dashboard/escalations"),
         ("GET", "/api/v1/dashboard/leads"),
+        # Lead portability (§3.4.10a "exportable", Legal §A7) — intentional addition.
+        ("GET", "/api/v1/dashboard/leads/export"),
         ("POST", "/api/v1/dashboard/leads/prune"),
         ("DELETE", "/api/v1/dashboard/leads/{lead_id}"),
         ("POST", "/api/v1/dashboard/leads/{lead_id}/archive"),

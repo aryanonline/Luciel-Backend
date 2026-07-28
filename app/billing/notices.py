@@ -11,18 +11,37 @@ one platform-wide event, identical for every tenant, so there is no per-account 
 store. Notices carry no tenant data, which is why this needs no session and no RLS.
 Dismissal is visit-scoped in the client (Legal §A5 wants it back on next login), so
 nothing here is persisted per account.
+
+There are two sources, in precedence order:
+
+  1. ``platform_notices`` — a JSON array the operator PUBLISHES (also readable from the
+     platform secret, so an announcement needs no redeploy). This is what makes §A10
+     price changes and §B6 sub-processor additions publishable at all: their copy is
+     operator-authored, so nothing could derive it.
+  2. the DERIVED allowance-reduction notice, computed from the pending-reduction
+     settings, whose copy the platform can write itself from the two numbers. It is
+     appended only when the operator has not published their own §A5 notice.
+
+Both are filtered on the same rule: a change that has already taken effect is the
+current terms, not news.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 ALLOWANCE_REDUCTION = "allowance_reduction"
 PRICE_CHANGE = "price_change"
 TERMS_CHANGE = "terms_change"
+# The closed set AccountNoticeOut.kind accepts; anything else cannot be serialised.
+KINDS: frozenset[str] = frozenset({ALLOWANCE_REDUCTION, PRICE_CHANGE, TERMS_CHANGE})
 
 # Legal §A5 / §A10 minimum lead time between announcing a reduction and it taking effect.
 NOTICE_LEAD_DAYS = 30
@@ -77,8 +96,67 @@ def _allowance_reduction_notice(now: datetime) -> AccountNotice | None:
     )
 
 
+def _published_notices(now: datetime) -> list[AccountNotice]:
+    """Parse the operator-published notice array from settings (Legal §A5 / §A10 / §B6).
+
+    Fail-open by entry: a malformed announcement is dropped with a warning instead of
+    raising, because this is read on the login path — a typo in one notice must not lock
+    every Admin out of their dashboard. An unknown ``kind`` is dropped for the same
+    reason it must be: ``AccountNoticeOut.kind`` is a closed Literal, so letting one
+    through would fail response validation and 500 the session payload.
+    """
+    raw = get_settings().platform_notices
+    if not raw or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("platform_notices is not valid JSON; publishing no notices")
+        return []
+    if not isinstance(parsed, list):
+        logger.warning("platform_notices did not decode to a list; publishing no notices")
+        return []
+
+    out: list[AccountNotice] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            logger.warning("platform_notices entry is not an object; skipping it")
+            continue
+        notice_id = str(entry.get("noticeId") or "")
+        kind = str(entry.get("kind") or "")
+        title = str(entry.get("title") or "")
+        body = str(entry.get("body") or "")
+        if not notice_id or not title or not body or kind not in KINDS:
+            logger.warning("platform_notices entry %r is incomplete; skipping it", notice_id)
+            continue
+        effective_raw = entry.get("effectiveAt")
+        effective_at = _parse_effective_at(str(effective_raw)) if effective_raw else None
+        # A change that has already landed is the current terms, not news (same rule the
+        # derived allowance notice follows). A notice with no date runs until unpublished.
+        if effective_at is not None and now >= effective_at:
+            continue
+        href = entry.get("learnMoreHref")
+        out.append(
+            AccountNotice(
+                notice_id=notice_id,
+                kind=kind,
+                title=title,
+                body=body,
+                effective_at=effective_at,
+                learn_more_href=str(href) if href else None,
+            )
+        )
+    return out
+
+
 def account_notices(*, now: datetime | None = None) -> list[AccountNotice]:
     """Notices to surface on this account's next login. Empty when nothing is pending."""
     now = now or datetime.now(UTC)
-    notice = _allowance_reduction_notice(now)
-    return [notice] if notice else []
+    published = _published_notices(now)
+    # An operator-authored allowance-reduction notice SUPERSEDES the derived one: the
+    # numbers are the same announcement, so surfacing both would double-banner it, and
+    # the hand-written copy is the one the operator meant to send.
+    derived = _allowance_reduction_notice(now)
+    if derived is not None and not any(n.kind == ALLOWANCE_REDUCTION for n in published):
+        published.append(derived)
+    return published

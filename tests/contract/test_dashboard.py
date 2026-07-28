@@ -311,6 +311,81 @@ async def test_prune_deletes_named_leads(client):
         assert rows == []  # prune = permanent delete (§3.4.10a)
 
 
+# --- lead export (§3.4.10a "exportable", Legal §A7 portability) -------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_export_leads_as_csv_by_default(client):
+    admin = await _signup_verify_login(client)
+    lead_id = await _seed_lead(admin)
+    r = await client.get("/api/v1/dashboard/leads/export")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert "leads.csv" in r.headers["content-disposition"]
+    header, row = r.text.strip().splitlines()[:2]
+    assert header.split(",")[0] == "leadId"
+    assert str(lead_id) in row
+    assert "jane@x.com" in row
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_export_leads_as_json(client):
+    admin = await _signup_verify_login(client)
+    lead_id = await _seed_lead(admin)
+    r = await client.get("/api/v1/dashboard/leads/export?format=json")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    assert "leads.json" in r.headers["content-disposition"]
+    (row,) = r.json()
+    assert row == {
+        "leadId": str(lead_id),
+        "name": "Jane",
+        "contactIdentifier": "jane@x.com",
+        "intent": "quote",
+        "state": "active",
+        "lastActivityAt": row["lastActivityAt"],
+    }
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_export_rejects_an_unknown_format(client):
+    await _signup_verify_login(client)
+    r = await client.get("/api/v1/dashboard/leads/export?format=xlsx")
+    assert r.status_code == 422  # open formats only
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_export_leads_requires_a_session(client):
+    r = await client.get("/api/v1/dashboard/leads/export")
+    assert r.status_code == 401
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_export_leads_carries_only_the_caller_s_tenant(client):
+    """The export is a bulk read of Customer Content, so it is the worst place for an RLS
+    gap: one wrong row here is another business's lead list leaving the platform."""
+    other = uuid.uuid4()
+    async with tenant_session(other) as s:
+        s.add(
+            Lead(
+                id=uuid.uuid4(),
+                admin_id=other,
+                instance_id=uuid.uuid4(),
+                name="NotYours",
+                contact_identifier="other@x.com",
+                state=LeadState.active,
+            )
+        )
+        await s.flush()
+
+    admin = await _signup_verify_login(client)
+    mine = await _seed_lead(admin)
+
+    r = await client.get("/api/v1/dashboard/leads/export?format=json")
+    assert [row["leadId"] for row in r.json()] == [str(mine)]
+    assert "other@x.com" not in r.text
+
+
 # ---------------------------------------------------------------------------
 # Regression tests for Axis3-F01 (lead erasure cascade)
 # ---------------------------------------------------------------------------

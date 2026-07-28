@@ -129,6 +129,8 @@ class LucielOut(WireModel):
     tools: list[AddonToolOut]
     escalation: EscalationContactWire
     personality: PersonalityConfigWire
+    # Opt-in lead auto-prune window in days; null means the rule is off (§3.4.10a).
+    lead_retention_days: int | None = None
     grace_window_started_at: datetime | None = None
 
 
@@ -220,3 +222,11 @@ class UpdatePersonalityRequest(StrictWireModel):
     axes: PersonalityAxesIn | None = None
     business_context: str | None = Field(default=None, max_length=280)
     assistant_name: str | None = Field(default=None, max_length=80)
+
+
+class UpdateLeadRetentionRequest(StrictWireModel):
+    # The Admin's own lead auto-prune rule (§3.4.10a). null turns it OFF, which is the
+    # default and the only value the platform ever assumes on the Admin's behalf. A
+    # positive window is required when on: 0 would mean "delete every lead the moment it
+    # stops being active", which no Admin means to ask for.
+    lead_retention_days: int | None = Field(default=None, ge=1)

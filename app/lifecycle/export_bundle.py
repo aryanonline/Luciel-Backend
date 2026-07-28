@@ -17,6 +17,7 @@ import io
 import json
 import uuid
 import zipfile
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -41,6 +42,27 @@ Layout:
                       Secret material (OAuth tokens, API keys) is NEVER included.
   audit_log.jsonl     your audit log within the retention window.
 """
+
+
+def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
+    """The wire shape for an exported lead record, shared by the full account bundle and
+    the standalone lead export (§3.4.10a "exportable"), so the two cannot drift apart.
+
+    Lead records are Customer Content the Admin owns (Legal §A7) and carry no secret
+    material, so every column is exportable — the "config, not secrets" rule that strips
+    connection credentials from ``instance.json`` has nothing to strip here.
+    """
+    return [
+        {
+            "leadId": str(le.id),
+            "name": le.name,
+            "contactIdentifier": le.contact_identifier,
+            "intent": le.intent,
+            "state": le.state.value,
+            "lastActivityAt": le.last_activity_at.isoformat(),
+        }
+        for le in leads
+    ]
 
 
 async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
@@ -91,25 +113,15 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                     "summary": conv["summary"] or "",
                 }
             )
-        z.writestr("conversations/conversations.csv", _csv(conv_rows))
+        z.writestr("conversations/conversations.csv", to_csv(conv_rows))
 
         # leads
         leads = (
             (await session.execute(select(Lead).where(Lead.admin_id == admin_id))).scalars().all()
         )
-        lead_dicts = [
-            {
-                "leadId": str(le.id),
-                "name": le.name,
-                "contactIdentifier": le.contact_identifier,
-                "intent": le.intent,
-                "state": le.state.value,
-                "lastActivityAt": le.last_activity_at.isoformat(),
-            }
-            for le in leads
-        ]
+        lead_dicts = lead_export_rows(leads)
         z.writestr("leads.json", json.dumps(lead_dicts, indent=2))
-        z.writestr("leads.csv", _csv(lead_dicts))
+        z.writestr("leads.csv", to_csv(lead_dicts))
 
         # knowledge manifest (original files would be copied from S3 in prod)
         from app.models.knowledge import KnowledgeSource
@@ -197,7 +209,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
     return buf.getvalue()
 
 
-def _csv(rows: list[dict[str, object]] | list[dict[str, str | None]]) -> str:
+def to_csv(rows: list[dict[str, object]] | list[dict[str, str | None]]) -> str:
     if not rows:
         return ""
     out = io.StringIO()

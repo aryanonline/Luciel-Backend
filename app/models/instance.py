@@ -97,5 +97,11 @@ class Instance(Base, TenantMixin, TimestampMixin):
     tools: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False, default=list)
     escalation: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
     personality: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Opt-in lead auto-prune rule (§3.4.10a / Legal §B5). NULL means OFF, and off is the
+    # default: captured Leads are the Admin's own business data, so the platform never
+    # timer-deletes them unless the Admin asked it to. When set, it is the Admin's own
+    # retention choice — leads with no activity for this many days are pruned by the
+    # retention sweep.
+    lead_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Soft-delete marker mirrored onto the state machine (grace window).
     soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

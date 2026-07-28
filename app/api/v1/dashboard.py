@@ -12,10 +12,11 @@ Sources: Architecture §3.4.7 (summary list), §3.4.12 (take-over / hand-back),
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import cast
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +25,7 @@ from app.api.errors import not_found, validation_error
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
+from app.lifecycle.export_bundle import lead_export_rows, to_csv
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, SessionSummary, Transcript
 from app.models.conversation import Session as SessionModel
@@ -375,6 +377,54 @@ async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]
             )
             for r in rows
         ]
+
+
+@router.get("/leads/export")
+async def export_leads(
+    fmt: str = Query(
+        "csv", alias="format", description="Export format: 'csv' (default) or 'json'."
+    ),
+    subject: Subject = Depends(current_admin),
+) -> Response:
+    """Download this tenant's lead records (§3.4.10a "exportable", Legal §A7 portability).
+
+    Leads are the Admin's own business data, and §B5 makes export one of the three tools
+    the platform owes them alongside prune and the auto-prune rule — an Admin cannot be
+    asked to prune what they cannot first take with them. Open formats only.
+
+    Rows come from the same builder as the full account bundle's ``leads.csv``
+    (``lead_export_rows``), so the two exports cannot drift. RLS scopes the read to the
+    caller's tenant. Read-only, so no audit event is emitted here — the §5.2
+    ``data_export_*`` events describe the lifecycle export BUNDLE, not a row-dump.
+    """
+    if fmt not in ("csv", "json"):
+        raise validation_error("format must be 'csv' or 'json'.")
+
+    async with tenant_session(subject.admin_id) as s:
+        leads = (
+            (
+                await s.execute(
+                    select(Lead)
+                    .where(Lead.admin_id == subject.admin_id)
+                    .order_by(Lead.last_activity_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = lead_export_rows(leads)
+
+    if fmt == "json":
+        return Response(
+            content=json.dumps(rows, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="leads.json"'},
+        )
+    return Response(
+        content=to_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="leads.csv"'},
+    )
 
 
 async def _require_lead(s: AsyncSession, *, admin_id: uuid.UUID, lead_id: uuid.UUID) -> Lead:

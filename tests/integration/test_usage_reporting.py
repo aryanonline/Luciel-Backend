@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 import pytest
 from app.billing import metering
 from app.billing.stripe_gateway import FakeStripeGateway, set_stripe_gateway
+from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.budget import ConversationBudget
 from app.models.instance import Account, AccountState, Instance, LucielState
@@ -23,10 +24,20 @@ from app.runtime.budget import current_billing_period_start
 pytestmark = [pytest.mark.asyncio]
 
 
+PAYG_PRICE = "price_test_payg_block"
+
+
 @pytest.fixture
-def gateway() -> FakeStripeGateway:
+def gateway(monkeypatch) -> FakeStripeGateway:
     """Install the fake as the process gateway so the runtime entry point — which
-    resolves the gateway itself rather than taking one — is exercised as written."""
+    resolves the gateway itself rather than taking one — is exercised as written.
+
+    The metered price is bound here because the fake gates on it exactly as the real
+    gateway does: an unbound price means no subscription and therefore no usage at all
+    (§3.4.1b). These tests are about the metering math for a PAYG-configured platform, so
+    they need that configuration; the unbound case is asserted separately below.
+    """
+    monkeypatch.setattr(get_settings(), "stripe_payg_price_id", PAYG_PRICE)
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     yield gw
@@ -185,6 +196,43 @@ async def test_metered_subscription_is_bound_lazily_at_the_first_block(
         acct = await metering.get_or_create_billing_account(s, admin_id=admin)
         assert acct.stripe_subscription_id == f"sub_fake_{admin.hex[:16]}"
     assert gateway.usage_records[0].subscription_id == f"sub_fake_{admin.hex[:16]}"
+
+
+# --- the metered price binding --------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_configured_price_reaches_the_usage_record(
+    gateway: FakeStripeGateway,
+) -> None:
+    """The operator-supplied metered price is what the usage lands against. Nothing else
+    proves the configured id is actually consumed rather than merely validated — a report
+    against the wrong price is a wrong invoice, not an error."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=51, subscription_id=None)
+    assert await _report(admin, iid) == 1
+    assert gateway.usage_records[0].price_id == PAYG_PRICE
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_no_configured_price_reports_nothing(monkeypatch) -> None:
+    """The unconfigured default (§3.4.1b): with no metered price the gateway binds no
+    subscription, so overage is NOT billed at a guessed price — it is not billed at all.
+    This is the deploy-step failure mode, so it is asserted through the setting itself
+    rather than through a stubbed gateway."""
+    monkeypatch.setattr(get_settings(), "stripe_payg_price_id", "")
+    gw = FakeStripeGateway()
+    set_stripe_gateway(gw)
+    try:
+        admin = uuid.uuid4()
+        iid = await _seed(admin, counted=51, subscription_id=None)
+        assert await _report(admin, iid) == 0
+        assert gw.usage_records == []
+        async with tenant_session(admin) as s:
+            acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+            assert acct.stripe_subscription_id is None
+    finally:
+        set_stripe_gateway(None)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

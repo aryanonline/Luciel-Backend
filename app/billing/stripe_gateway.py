@@ -67,6 +67,22 @@ class UsageRecord:
     subscription_id: str
     quantity: int
     idempotency_key: str
+    # The metered price the reported-against subscription item is bound to. Carried so a
+    # test can prove the configured price actually reached the report rather than the
+    # quantity landing against whatever price happened to be on the subscription.
+    price_id: str = ""
+
+
+def payg_price_id() -> str:
+    """The configured Stripe metered price for PAYG overage, or "" when unbound.
+
+    Empty is the honest default: the price is an account-specific Stripe object id, so
+    there is nothing sane to fall back to. Callers must treat "" as "report no usage"
+    (§3.4.1b) — see :meth:`StripeGateway.ensure_metered_subscription`.
+    """
+    from app.config import get_settings  # noqa: PLC0415 — avoids an import cycle
+
+    return get_settings().stripe_payg_price_id or ""
 
 
 @dataclass(frozen=True)
@@ -179,6 +195,8 @@ class FakeStripeGateway:
         self._webhook_secret = webhook_secret or self.WEBHOOK_SECRET
         # customer_id -> metered subscription id.
         self._subscriptions: dict[str, str] = {}
+        # subscription id -> the metered price it was bound to at creation.
+        self._subscription_prices: dict[str, str] = {}
         # Every usage record accepted, in order — the assertion surface for tests that
         # need to prove usage was reported at the right threshold, not just that the
         # call did not raise.
@@ -203,10 +221,17 @@ class FakeStripeGateway:
         return CheckoutSession(url=f"https://checkout.stripe.com/c/pay/{sid}", session_id=sid)
 
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
+        # Same price-id gate as RealStripeGateway: a fake that happily minted a
+        # subscription with no price bound would report usage in tests on a path that is
+        # silent in production, hiding exactly the misconfiguration this gate exists for.
+        price_id = payg_price_id()
+        if not price_id:
+            return None
         # Deterministic id derived from the customer so repeated calls are stable and
         # the mock never mints a second subscription for the same tenant.
         sub_id = f"sub_fake_{customer_id.removeprefix('cus_fake_')}"
         self._subscriptions[customer_id] = sub_id
+        self._subscription_prices[sub_id] = price_id
         return sub_id
 
     async def report_metered_usage(
@@ -222,6 +247,9 @@ class FakeStripeGateway:
                 subscription_id=subscription_id,
                 quantity=quantity,
                 idempotency_key=idempotency_key,
+                # Mirrors the real path, where usage attaches to the subscription ITEM
+                # the price created — so the recorded price is the one that will bill.
+                price_id=self._subscription_prices.get(subscription_id, payg_price_id()),
             )
         )
         return True
@@ -318,14 +346,11 @@ class RealStripeGateway:
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
         """Find or create the customer's PAYG metered subscription.
 
-        The metered price id is read with ``getattr`` so this module never requires a
-        config.py field that may not be bound yet; with no price id we return None and
-        the caller reports nothing rather than creating a subscription against a guessed
-        price (a wrong price is worse than no bill — it is an incorrect charge).
+        With no metered price configured we return None and the caller reports nothing
+        rather than creating a subscription against a guessed price (a wrong price is
+        worse than no bill — it is an incorrect charge).
         """
-        from app.config import get_settings  # noqa: PLC0415 — avoids an import cycle
-
-        price_id = getattr(get_settings(), "stripe_payg_price_id", "") or ""
+        price_id = payg_price_id()
         if not price_id:
             return None
         client = self._get_client()

@@ -1,14 +1,20 @@
-"""Derivation rules for the in-dashboard allowance-reduction notice (Legal §A5).
+"""The two sources of in-dashboard notices (Legal §A5 / §A10 / §B6).
 
 §A5 owes notice for a REDUCTION only, with the effective date the Admin needs in order to
-act on it. Everything here is about not crying wolf: no announcement means no banner, an
-increase means no banner, and a change that has already landed is the current allowance
-rather than news. The wire shape on ``/api/v1/auth/me`` is covered in
-tests/contract/test_account_notices.py.
+act on it. Much of this is about not crying wolf: no announcement means no banner, an
+increase means no banner, and a change that has already landed is the current terms rather
+than news.
+
+The second half covers the operator PUBLISH path, which is what makes §A10 price changes
+and §B6 sub-processor additions deliverable at all — their copy is operator-authored, so
+nothing could derive it. Its two hard requirements are that a bad entry can never break
+the login payload, and that noticeId stays stable (it is the client's dismissal key). The
+wire shape on ``/api/v1/auth/me`` is covered in tests/contract/test_account_notices.py.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 from app.billing import notices
@@ -79,3 +85,106 @@ def test_a_naive_announcement_instant_is_treated_as_utc(monkeypatch):
     _announce(monkeypatch, to=25, effective_at="2026-07-11T00:00:00")
     (notice,) = notices.account_notices(now=NOW)
     assert notice.effective_at == datetime(2026, 7, 11, tzinfo=UTC)
+
+
+# --- operator-PUBLISHED notices (Legal §A5 / §A10 / §B6) --------------------- #
+
+
+def _publish(monkeypatch, entries) -> None:
+    monkeypatch.setattr(get_settings(), "platform_notices", json.dumps(entries))
+
+
+def _entry(**over) -> dict:
+    base = {
+        "noticeId": "price:2026-09-01",
+        "kind": notices.PRICE_CHANGE,
+        "title": "Pay-as-you-go pricing is changing",
+        "body": "From 1 September the PAYG block is $39 per 100 conversations.",
+        "effectiveAt": (NOW + timedelta(days=45)).isoformat(),
+    }
+    base.update(over)
+    return base
+
+
+def test_a_published_notice_surfaces_with_its_full_shape(monkeypatch):
+    """§A10 price changes and §B6 sub-processor additions have operator-authored copy, so
+    nothing could derive them — a publish path is the only way they reach an Admin."""
+    _publish(monkeypatch, [_entry(learnMoreHref="/billing")])
+
+    (notice,) = notices.account_notices(now=NOW)
+    assert notice.notice_id == "price:2026-09-01"
+    assert notice.kind == notices.PRICE_CHANGE
+    assert notice.title.startswith("Pay-as-you-go")
+    assert "$39" in notice.body
+    assert notice.effective_at == NOW + timedelta(days=45)
+    assert notice.learn_more_href == "/billing"
+
+
+def test_a_published_notice_id_is_stable_across_renders(monkeypatch):
+    """The noticeId is the dismissal key, so the same announcement re-read on a later
+    request must not resurrect a banner the Admin already dismissed this visit."""
+    _publish(monkeypatch, [_entry()])
+    first = notices.account_notices(now=NOW)[0].notice_id
+    later = notices.account_notices(now=NOW + timedelta(days=3))[0].notice_id
+    assert later == first == "price:2026-09-01"
+
+
+def test_a_published_notice_with_no_date_runs_until_unpublished(monkeypatch):
+    _publish(monkeypatch, [_entry(kind=notices.TERMS_CHANGE, effectiveAt=None)])
+    (notice,) = notices.account_notices(now=NOW)
+    assert notice.effective_at is None
+
+
+def test_a_published_notice_stops_once_it_has_taken_effect(monkeypatch):
+    """Same rule as the derived notice: a change that already landed is the current terms."""
+    _publish(monkeypatch, [_entry()])
+    assert notices.account_notices(now=NOW + timedelta(days=46)) == []
+
+
+def test_an_unknown_kind_is_dropped_rather_than_500ing_the_session(monkeypatch):
+    """AccountNoticeOut.kind is a closed Literal, so letting an unknown kind through would
+    fail response validation and take the whole login payload down with it."""
+    _publish(monkeypatch, [_entry(kind="marketing_blast")])
+    assert notices.account_notices(now=NOW) == []
+
+
+def test_an_incomplete_or_malformed_entry_is_skipped_not_raised(monkeypatch):
+    """Fail-open per entry: this is read on the login path, so a typo in one announcement
+    must not lock every Admin out of their dashboard."""
+    _publish(monkeypatch, [_entry(noticeId=""), "not-an-object", _entry(body="")])
+    assert notices.account_notices(now=NOW) == []
+
+    monkeypatch.setattr(get_settings(), "platform_notices", "{not json")
+    assert notices.account_notices(now=NOW) == []
+
+    monkeypatch.setattr(get_settings(), "platform_notices", json.dumps({"noticeId": "x"}))
+    assert notices.account_notices(now=NOW) == []
+
+
+def test_a_good_entry_still_publishes_alongside_a_bad_one(monkeypatch):
+    _publish(monkeypatch, ["junk", _entry()])
+    (notice,) = notices.account_notices(now=NOW)
+    assert notice.notice_id == "price:2026-09-01"
+
+
+def test_a_published_allowance_notice_is_the_one_that_surfaces(monkeypatch):
+    """§A5 can be satisfied by hand-written copy. Both sources describe the SAME
+    announcement, so surfacing both would double-banner the reduction."""
+    _announce(monkeypatch, to=25, effective_at=(NOW + timedelta(days=40)).isoformat())
+    _publish(
+        monkeypatch,
+        [_entry(noticeId="allowance:2026-07-11", kind=notices.ALLOWANCE_REDUCTION)],
+    )
+
+    (notice,) = notices.account_notices(now=NOW)
+    assert notice.notice_id == "allowance:2026-07-11"
+
+
+def test_a_published_price_notice_does_not_suppress_the_derived_allowance_one(monkeypatch):
+    """Only an allowance notice supersedes the derived allowance notice — an unrelated
+    §A10 announcement must not swallow the §A5 obligation."""
+    _announce(monkeypatch, to=25, effective_at=(NOW + timedelta(days=40)).isoformat())
+    _publish(monkeypatch, [_entry()])
+
+    kinds = {n.kind for n in notices.account_notices(now=NOW)}
+    assert kinds == {notices.PRICE_CHANGE, notices.ALLOWANCE_REDUCTION}

@@ -159,6 +159,77 @@ def test_test_posture_fails_closed_when_a_key_is_missing(monkeypatch) -> None:
         get_settings.cache_clear()
 
 
+# --- the PAYG metered price binding (never hardcoded) ------------------------ #
+
+
+def test_payg_price_id_is_empty_by_default() -> None:
+    """No default is possible: a Stripe price id is an account-specific object id, so a
+    literal here would bill some other account's price. Empty means "report nothing"."""
+    from app.billing.stripe_gateway import payg_price_id
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert payg_price_id() == ""
+    finally:
+        get_settings.cache_clear()
+
+
+def test_payg_price_id_comes_from_the_platform_secret(monkeypatch) -> None:
+    """Publishing the price through the platform secret is what lets the operator bind
+    PAYG billing by rotating the secret instead of shipping a task-definition change."""
+    from app.billing.stripe_gateway import payg_price_id
+    from app.config import get_settings
+
+    monkeypatch.setenv(
+        "LUCIEL_PLATFORM_SECRET", json.dumps({"STRIPE_PAYG_PRICE_ID": "price_from_secret"})
+    )
+    get_settings.cache_clear()
+    try:
+        assert payg_price_id() == "price_from_secret"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_an_explicit_env_price_beats_the_platform_secret(monkeypatch) -> None:
+    """Overlay precedence: the blob fills an EMPTY setting, so an operator who pins the
+    price per environment is not silently overridden by the shared secret."""
+    from app.billing.stripe_gateway import payg_price_id
+    from app.config import get_settings
+
+    monkeypatch.setenv("LUCIEL_STRIPE_PAYG_PRICE_ID", "price_from_env")
+    monkeypatch.setenv(
+        "LUCIEL_PLATFORM_SECRET", json.dumps({"STRIPE_PAYG_PRICE_ID": "price_from_secret"})
+    )
+    get_settings.cache_clear()
+    try:
+        assert payg_price_id() == "price_from_env"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_fake_gateway_binds_no_subscription_without_a_price(monkeypatch) -> None:
+    """The fake gates on the price exactly as the real gateway does. If it did not, the
+    suite would keep proving usage flows on a path that is silent in production."""
+    from app.billing.stripe_gateway import payg_price_id
+    from app.config import get_settings
+
+    gw = FakeStripeGateway()
+
+    async def run(expected: str) -> str | None:
+        assert payg_price_id() == expected
+        return await gw.ensure_metered_subscription(customer_id="cus_fake_abc")
+
+    get_settings.cache_clear()
+    try:
+        assert asyncio.run(run("")) is None
+    finally:
+        get_settings.cache_clear()
+
+    monkeypatch.setattr(get_settings(), "stripe_payg_price_id", "price_bound")
+    assert asyncio.run(run("price_bound")) == "sub_fake_abc"
+
+
 def test_remove_payment_method_idempotent() -> None:
     gw = FakeStripeGateway()
 

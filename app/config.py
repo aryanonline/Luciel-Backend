@@ -81,6 +81,22 @@ class Settings(BaseSettings):
     free_allowance_reduction_effective_at: str = ""  # ISO-8601 instant
     free_allowance_reduction_to: int = 0  # the new, lower allowance
 
+    # --- Published in-dashboard notices (Legal §A5 / §A10 / §B6) --------------------
+    # The two fields above let the platform DERIVE the allowance-reduction notice, whose
+    # copy it can write itself from the numbers. They are not a general notice source:
+    # §A10's price change and §B6's sub-processor addition also owe an advance
+    # in-dashboard notice, and their copy is operator-authored, so nothing could publish
+    # them. This is that source — a JSON ARRAY of notice objects:
+    #   [{"noticeId": "...", "kind": "price_change", "title": "...", "body": "...",
+    #     "effectiveAt": "2026-09-01T00:00:00Z", "learnMoreHref": "/billing"}]
+    # ``kind`` must be one of allowance_reduction | price_change | terms_change, and
+    # ``noticeId`` must be STABLE for a given announcement (it is the key the dashboard
+    # dismisses on). Malformed entries are dropped with a warning rather than breaking
+    # every login. Empty (the default) means no notice is published, so notices[] is
+    # empty — the normal state. Also readable from the platform secret's
+    # PLATFORM_NOTICES so an announcement can be published without a redeploy.
+    platform_notices: str = ""
+
     # --- Stripe integration posture (Architecture §3.4.1b) ---------------------
     # Mirrors the LLM GATE 2 cutover shape ("integration_mode") one level down: a
     # dedicated posture for the Stripe seam so Stripe can move to a real TEST-mode
@@ -98,6 +114,16 @@ class Settings(BaseSettings):
     # means "no configured secret", which keeps mock/CI on the deterministic fake
     # constant; live mode fails closed instead (see ``_apply_platform_secret``).
     stripe_webhook_secret: str = ""  # noqa: S105 — empty placeholder, not a secret
+
+    # The Stripe metered PRICE the PAYG subscription item is bound to (``price_...``).
+    # Usage can only be reported against a subscription item, and an item only exists
+    # against a price, so with this empty the gateway returns no subscription and
+    # reporting stays SILENT rather than billing at a guessed price (§3.4.1b). It is an
+    # account-specific Stripe object id, never a constant, so it can never be hardcoded
+    # here: the operator supplies it per environment via LUCIEL_STRIPE_PAYG_PRICE_ID or
+    # the platform secret's STRIPE_PAYG_PRICE_ID. Empty is correct for mock mode, where
+    # nothing is billed at all.
+    stripe_payg_price_id: str = ""
 
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
@@ -245,6 +271,13 @@ class Settings(BaseSettings):
             "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
             "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
+            # Not secret material, but it is per-environment Stripe account state that
+            # travels with the Stripe keys — so it is rotated in the same blob rather
+            # than pinned in a task definition.
+            "STRIPE_PAYG_PRICE_ID": "stripe_payg_price_id",
+            # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret,
+            # rather than needing a task-definition change to reach every account.
+            "PLATFORM_NOTICES": "platform_notices",
             "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
             "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
             "TWILIO_ACCOUNT_SID": "twilio_account_sid",

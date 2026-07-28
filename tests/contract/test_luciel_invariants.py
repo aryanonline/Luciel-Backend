@@ -324,3 +324,55 @@ async def test_config_mutation_allowed_while_paused(client):
     )
     assert r.status_code == 200
     assert r.json()["personality"]["preset"] == "friendly_expert"
+
+
+# --- the lead auto-prune rule is OPT-IN and off by default (§3.4.10a, Legal §B5) --- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_lead_retention_is_off_until_the_admin_sets_it(client):
+    """Off is the DEFAULT, and it is the only value the platform assumes on the Admin's
+    behalf — captured Leads are their business data, never on a platform timer."""
+    await _signup_verify_login(client)
+    await _create(client)
+    r = await client.get("/api/v1/admin/luciel")
+    assert r.status_code == 200
+    assert r.json()["leadRetentionDays"] is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_lead_retention_round_trips_and_can_be_turned_back_off(client):
+    await _signup_verify_login(client)
+    await _create(client)
+    r = await client.put("/api/v1/admin/luciel/lead-retention", json={"leadRetentionDays": 180})
+    assert r.status_code == 200
+    assert r.json()["leadRetentionDays"] == 180
+    assert (await client.get("/api/v1/admin/luciel")).json()["leadRetentionDays"] == 180
+
+    # The rule must be reversible as a setting even though its deletions are not.
+    off = await client.put("/api/v1/admin/luciel/lead-retention", json={"leadRetentionDays": None})
+    assert off.json()["leadRetentionDays"] is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_zero_or_negative_retention_window_is_rejected(client):
+    """A 0-day window means "delete every lead the moment it stops being active", which no
+    Admin means to ask for — ``null`` is how you turn the rule off."""
+    await _signup_verify_login(client)
+    await _create(client)
+    for days in (0, -1):
+        r = await client.put(
+            "/api/v1/admin/luciel/lead-retention", json={"leadRetentionDays": days}
+        )
+        assert r.status_code == 422, f"accepted leadRetentionDays={days}"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_lead_retention_forbids_unknown_fields_like_every_pillar(client):
+    await _signup_verify_login(client)
+    await _create(client)
+    r = await client.put(
+        "/api/v1/admin/luciel/lead-retention",
+        json={"leadRetentionDays": 90, "purgeArchived": True},
+    )
+    assert r.status_code == 422

@@ -10,6 +10,7 @@ The derivation rules live in tests/unit/test_account_notices.py.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -19,7 +20,7 @@ from app.config import get_settings
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
 
-async def _login(client) -> None:
+async def _login(client):
     from app.auth import access
 
     email = f"notice-{uuid.uuid4().hex[:8]}@x.com"
@@ -29,7 +30,7 @@ async def _login(client) -> None:
     )
     _acct, token = await access.signup(email, "pw-123456")
     await client.post("/api/v1/auth/verify-email", json={"token": token})
-    await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
+    return await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
 
 
 @pytest.fixture
@@ -71,3 +72,36 @@ async def test_pending_allowance_reduction_is_surfaced_with_its_effective_date(c
     assert "25" in notice["body"]
     assert effective.date().isoformat() in notice["body"]
     assert notice["effectiveAt"].startswith(effective.date().isoformat())
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_published_notice_reaches_both_login_and_me(client, monkeypatch):
+    """§A5 wants the notice "visible on next login", so the LOGIN response has to carry it
+    too — an Admin who lands straight on the dashboard must not have to reload to see it."""
+    effective = datetime.now(UTC) + timedelta(days=45)
+    monkeypatch.setattr(
+        get_settings(),
+        "platform_notices",
+        json.dumps(
+            [
+                {
+                    "noticeId": "terms:2026-09-01",
+                    "kind": "terms_change",
+                    "title": "Updated Terms of Service",
+                    "body": "We are adding a new sub-processor for transactional email.",
+                    "effectiveAt": effective.isoformat(),
+                    "learnMoreHref": "/legal/terms",
+                }
+            ]
+        ),
+    )
+
+    login = await _login(client)
+    for payload in (login.json(), (await client.get("/api/v1/auth/me")).json()):
+        (notice,) = payload["notices"]
+        assert notice["noticeId"] == "terms:2026-09-01"
+        assert notice["kind"] == "terms_change"
+        assert notice["title"] == "Updated Terms of Service"
+        assert notice["body"].startswith("We are adding")
+        assert notice["effectiveAt"].startswith(effective.date().isoformat())
+        assert notice["learnMoreHref"] == "/legal/terms"

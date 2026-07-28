@@ -5,9 +5,11 @@ did not exist was anything that CALLED it, so four compliance commitments never 
 This module is the missing half: cross-tenant candidate DISCOVERY plus the four
 entrypoints EventBridge Scheduler invokes (see ``infra/lib/compute-stack.ts``).
 
-  * ``retention``    — hard-delete transcripts/summaries past 1 year (Legal §B5).
-                       Captured Leads are deliberately NOT swept: §B5 makes them
-                       Admin-managed business data, not timer-deleted.
+  * ``retention``    — hard-delete transcripts/summaries past 1 year (Legal §B5), then
+                       apply each tenant's OPT-IN lead auto-prune rule. Captured Leads
+                       are never on the platform's timer — §B5 makes them Admin-managed
+                       business data — so leads are pruned only for a tenant that set
+                       ``leadRetentionDays`` itself (§3.4.10a); NULL is off and default.
   * ``grace_expiry`` — fire the delete cascade at day 30 of the grace window (§B5).
   * ``close_purge``  — destroy a closed account's shell after its 30-day window (§B5).
   * ``dunning``      — day-7 retrying → reduced when Stripe retries go quiet (§A3).
@@ -62,7 +64,7 @@ async def sweep_candidates(kind: str) -> list[uuid.UUID]:
 
 
 async def run_retention_prune(*, now: datetime | None = None) -> dict[str, dict[str, int]]:
-    """Sweep aged transcripts + session summaries on every live tenant (Legal §B5)."""
+    """Sweep aged transcripts + summaries, and opted-in stale leads, per tenant (§B5)."""
     return await retention.run_retention_sweep(await sweep_candidates(RETENTION), now=now)
 
 
