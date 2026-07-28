@@ -1,18 +1,26 @@
-"""Outbound dispatch for admin-authored replies (Architecture §3.4.12 / §11.5-11.7).
+"""Outbound reply dispatch for the non-widget channels (Architecture §3.4.12 / §3.1.2).
 
-When an admin takes over a conversation and types a reply, the message must reach the
-customer on the SAME channel they wrote in on — persisting a transcript row alone would
-leave the customer waiting forever. This module is the one place that turns
-"(channel, recipient, text)" into a real send through the existing channel adapters.
+One place that turns "(channel, recipient, text)" into a real send through the existing
+channel adapters, used by BOTH replies that a customer can receive:
 
-Push vs poll (the honest limitation): SMS / WhatsApp / Instagram-Messenger / email all
-have a provider push API, so the reply is delivered. The **widget** has no push
-transport — the browser holds the connection, not us — so a widget reply is persisted
-and picked up by the widget's next history fetch. Callers must surface that difference
-rather than claim delivery (``delivered=False`` + ``detail="widget_poll_only"``).
+- Luciel's own answer on an inbound channel whose provider needs an out-of-band push
+  (email, WhatsApp, Instagram DM / Messenger). SMS is the exception — Twilio delivers
+  Luciel's answer in the TwiML response to the webhook, so it must NOT be pushed twice.
+- An admin's ``human_agent`` reply during live takeover (§3.4.12), which arrives long
+  after the inbound request is gone and therefore has no response body to ride on.
 
-Every send goes through the adapter that already owns the provider quirks; in mock/CI
-the adapters bind their Null senders, so this module makes no network call.
+Both paths reply to the identifier the lead actually wrote in from (§3.4.9) — the verified
+From address for email, the platform-scoped IG/page-scoped id for Meta. A stored contact is
+never used as an outbound destination on a different channel: those identities merge only
+when the lead volunteers the linking contact info in-conversation.
+
+Push vs poll (the honest limitation): the **widget** has no push transport — the browser
+holds the connection, not us — so a widget reply is persisted and picked up by the widget's
+next history fetch. Callers must surface that difference rather than claim delivery
+(``delivered=False`` + ``detail="widget_poll_only"``).
+
+Every send goes through the adapter that already owns the provider quirks; in mock/CI the
+adapters bind their Null senders, so this module makes no network call.
 """
 
 from __future__ import annotations
@@ -21,14 +29,18 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.channels.base import OutboundMessage
-from app.models.connection import InstanceConnection
+from app.channels.base import DeliveryReceipt, OutboundMessage
 
 # Channels the customer reads by polling us; we cannot push to them (§11.7).
 POLL_ONLY_CHANNELS = frozenset({"widget"})
+
+# Twilio delivers Luciel's answer inline via TwiML, so the runtime reply on this channel is
+# already on the wire by the time the webhook returns (§3.1.4).
+INLINE_REPLY_CHANNELS = frozenset({"sms"})
+
+DEFAULT_EMAIL_SUBJECT = "Re: your inquiry"
 
 
 @dataclass(frozen=True)
@@ -43,29 +55,7 @@ class OutboundResult:
     detail: str | None = None
 
 
-async def _connection_config(
-    session: AsyncSession,
-    *,
-    admin_id: uuid.UUID,
-    instance_id: uuid.UUID,
-    connection_type: str,
-) -> dict[str, object]:
-    conn: InstanceConnection | None = (
-        await session.execute(
-            select(InstanceConnection).where(
-                InstanceConnection.admin_id == admin_id,
-                InstanceConnection.instance_id == instance_id,
-                InstanceConnection.connection_type == connection_type,
-                InstanceConnection.status != "revoked",
-            )
-        )
-    ).scalar_one_or_none()
-    if conn is None or not conn.non_secret_config:
-        return {}
-    return dict(conn.non_secret_config)
-
-
-async def send_human_reply(
+async def send_outbound_reply(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
@@ -73,12 +63,19 @@ async def send_human_reply(
     channel: str,
     to: str | None,
     body: str,
+    subject: str | None = None,
+    sender_id: str | None = None,
 ) -> OutboundResult:
-    """Push one admin-authored reply to the customer on ``channel`` (§3.4.12).
+    """Push one reply to the customer on ``channel``.
+
+    ``subject`` threads an email reply onto the lead's own subject line; ``sender_id`` is
+    the tenant's channel identity carried straight off the inbound message (Meta page/IG
+    id, WhatsApp phone-number id) and falls back to the provisioned connection when the
+    caller has no inbound context — i.e. on the takeover path.
 
     Never raises for a delivery problem — an undeliverable reply is reported as data so
-    the dashboard can tell the admin the truth instead of failing the whole request
-    after the transcript row is already written.
+    the caller can tell the admin the truth instead of failing the whole request after the
+    transcript row is already written.
     """
     if channel in POLL_ONLY_CHANNELS:
         return OutboundResult(channel=channel, delivered=False, detail="widget_poll_only")
@@ -86,51 +83,14 @@ async def send_human_reply(
         return OutboundResult(channel=channel, delivered=False, detail="no_recipient")
 
     if channel in ("sms", "voice"):
-        from app.channels.sms_adapter import SmsAdapter
-
-        cfg = await _connection_config(
-            session, admin_id=admin_id, instance_id=instance_id, connection_type="sms_sender"
-        )
-        from_number = cfg.get("destination")
-        if not isinstance(from_number, str) or not from_number:
-            return OutboundResult(
-                channel=channel, delivered=False, detail="channel_not_provisioned"
-            )
-        receipt = await SmsAdapter().send(
-            OutboundMessage(channel="sms", to=to, body=body, metadata={"from_number": from_number})
-        )
+        receipt = await _send_sms(session, admin_id, instance_id, to=to, body=body)
     elif channel == "email":
-        from app.channels.email_adapter import EmailAdapter
-        from app.connections.service import resolve_email_address
-
-        address = await resolve_email_address(session, admin_id, instance_id)
-        if not address:
-            return OutboundResult(
-                channel=channel, delivered=False, detail="channel_not_provisioned"
-            )
-        receipt = await EmailAdapter(_PlatformSesSender(), _NoInboundVerifier()).send(
-            OutboundMessage(
-                channel="email",
-                to=to,
-                body=body,
-                metadata={"sender_identity": address, "subject": "Re: your inquiry"},
-            )
+        receipt = await _send_email(
+            session, admin_id, instance_id, to=to, body=body, subject=subject
         )
     elif channel in ("whatsapp", "instagram_messenger"):
-        from app.channels.whatsapp_adapter import WhatsAppAdapter
-
-        cfg = await _connection_config(
-            session, admin_id=admin_id, instance_id=instance_id, connection_type="channel_auth"
-        )
-        sender_id = cfg.get("destination")
-        if not isinstance(sender_id, str) or not sender_id:
-            return OutboundResult(
-                channel=channel, delivered=False, detail="channel_not_provisioned"
-            )
-        receipt = await WhatsAppAdapter().send(
-            OutboundMessage(
-                channel=channel, to=to, body=body, metadata={"phone_number_id": sender_id}
-            )
+        receipt = await _send_meta(
+            session, admin_id, instance_id, channel=channel, to=to, body=body, sender_id=sender_id
         )
     else:
         return OutboundResult(channel=channel, delivered=False, detail="unsupported_channel")
@@ -141,6 +101,94 @@ async def send_human_reply(
         provider_message_id=receipt.provider_message_id,
         detail=receipt.detail,
     )
+
+
+_NOT_PROVISIONED = DeliveryReceipt(accepted=False, detail="channel_not_provisioned")
+
+
+async def _send_sms(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    to: str,
+    body: str,
+) -> DeliveryReceipt:
+    from app.channels.sms_adapter import SmsAdapter
+    from app.connections.service import resolve_sms_number
+
+    from_number = await resolve_sms_number(session, admin_id, instance_id)
+    if not from_number:
+        return _NOT_PROVISIONED
+    return await SmsAdapter().send(
+        OutboundMessage(channel="sms", to=to, body=body, metadata={"from_number": from_number})
+    )
+
+
+async def _send_email(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    to: str,
+    body: str,
+    subject: str | None,
+) -> DeliveryReceipt:
+    from app.channels.email_adapter import EmailAdapter
+    from app.connections.service import resolve_email_address
+
+    address = await resolve_email_address(session, admin_id, instance_id)
+    if not address:
+        return _NOT_PROVISIONED
+    return await EmailAdapter(_PlatformSesSender(), _NoInboundVerifier()).send(
+        OutboundMessage(
+            channel="email",
+            to=to,
+            body=body,
+            # The tenant's provisioned address is the FROM identity (§3.1.6a) — a reply
+            # from a platform address would be unreplyable and unrecognizable.
+            metadata={"sender_identity": address, "subject": _reply_subject(subject)},
+        )
+    )
+
+
+async def _send_meta(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    channel: str,
+    to: str,
+    body: str,
+    sender_id: str | None,
+) -> DeliveryReceipt:
+    from app.connections.service import resolve_meta_destination
+
+    identity = sender_id or await resolve_meta_destination(session, admin_id, instance_id)
+    if not identity:
+        return _NOT_PROVISIONED
+    if channel == "whatsapp":
+        from app.channels.whatsapp_adapter import WhatsAppAdapter
+
+        # WhatsApp Cloud API sends from a phone-number id.
+        return await WhatsAppAdapter().send(
+            OutboundMessage(
+                channel=channel, to=to, body=body, metadata={"phone_number_id": identity}
+            )
+        )
+    from app.channels.meta_messaging_adapter import MetaMessagingAdapter
+
+    # IG DM / Messenger send from the IG-account / page id, on the Messenger send API —
+    # a different Graph shape from WhatsApp, hence a different adapter (§3.1.2).
+    return await MetaMessagingAdapter().send(
+        OutboundMessage(channel=channel, to=to, body=body, metadata={"destination_id": identity})
+    )
+
+
+def _reply_subject(subject: str | None) -> str:
+    if not subject:
+        return DEFAULT_EMAIL_SUBJECT
+    return subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
 
 class _NoInboundVerifier:
@@ -160,4 +208,6 @@ class _PlatformSesSender:
     async def send_email(self, sender: str, to: str, subject: str, body: str) -> str | None:
         from app.notifications.email_sender import build_email_sender
 
-        return await build_email_sender().send(to=to, subject=subject, body_text=body)
+        return await build_email_sender().send(
+            to=to, subject=subject, body_text=body, from_address=sender
+        )

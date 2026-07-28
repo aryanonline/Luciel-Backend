@@ -14,18 +14,24 @@ Channels:
                      POST /api/v1/webhooks/meta         (X-Hub-Signature-256; async, 200)
 
 Runtime replies: SMS returns TwiML so Twilio delivers the reply on the same channel;
-Meta/email send asynchronously via their adapters (the platform posts back out-of-band),
-so these return a bare 200 (the provider only needs an ack).
+Meta/email have no reply channel in the webhook response, so the platform pushes Luciel's
+answer back out through the channel adapter (``channels.outbound``) before returning the
+bare 200 the provider needs as an ack.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+from email import message_from_bytes
+from email import policy as email_policy
+from email.utils import parseaddr
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request, Response
 
-from app.channels import pipeline, routing
+from app.channels import outbound, pipeline, routing
 from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected, InstanceContext
 from app.channels.meta_messaging_adapter import MetaMessagingAdapter
 from app.channels.runtime_entry import run_inbound_message
@@ -47,9 +53,30 @@ async def _resolve(connection_type: str, destination: str) -> InstanceContext:
 
 
 async def _run_and_reply(msg: InboundMessage) -> str:
-    """Run an admitted InboundMessage through the runtime; return the reply text."""
+    """Run an admitted InboundMessage through the runtime and deliver Luciel's answer.
+
+    SMS rides back in the TwiML response the caller builds, so it is left alone here.
+    Every other channel's provider needs an out-of-band push, so the reply is sent through
+    the channel adapter before the webhook acks — otherwise the lead gets silence.
+    """
     async with tenant_session(msg.admin_id) as s:
         reply = await run_inbound_message(s, msg)
+        if reply.reply_text and msg.channel not in outbound.INLINE_REPLY_CHANNELS:
+            await outbound.send_outbound_reply(
+                s,
+                admin_id=msg.admin_id,
+                instance_id=msg.instance_id,
+                channel=msg.channel,
+                # Reply to the identifier the lead wrote in from (§3.4.9), never a stored
+                # contact on another channel.
+                to=msg.customer_identifier,
+                body=reply.reply_text,
+                subject=msg.channel_metadata.get("subject"),
+                sender_id=(
+                    msg.channel_metadata.get("destination_id")
+                    or msg.channel_metadata.get("phone_number_id")
+                ),
+            )
         return reply.reply_text
 
 
@@ -95,11 +122,10 @@ async def ses_inbound(request: Request) -> dict[str, str]:
     # SNS subscription confirmation handshake (one-time, on subscribe).
     if sns_message.get("Type") == "SubscriptionConfirmation":
         return {"status": "subscription_confirmation_received"}
-    recipient = _extract_email_recipient(sns_message)
     req: dict[str, Any] = {
         "sns_message": sns_message,
-        "recipient": recipient,
         "resolve": _resolve,
+        **_parse_ses_inbound(sns_message),
     }
     result = await _dispatch(_build_email_adapter(), req)
     return {"status": "ok" if isinstance(result, str) else "not_routed"}
@@ -141,7 +167,8 @@ async def meta_inbound(request: Request) -> dict[str, str]:
         "resolve": _resolve,
     }
     result = await _dispatch(adapter, req)
-    # Meta only needs a 200 ack; the reply is sent out-of-band via the Graph sender.
+    # Meta only needs a 200 ack; Luciel's reply was pushed via the Graph sender in
+    # _run_and_reply (the webhook response body cannot carry it).
     return {"status": "ok" if isinstance(result, str) else "not_routed"}
 
 
@@ -205,11 +232,51 @@ def _xml_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _extract_email_recipient(sns_message: dict[str, Any]) -> str:
-    """Pull the destination address out of an SES→SNS notification envelope."""
+def _parse_ses_inbound(sns_message: dict[str, Any]) -> dict[str, Any]:
+    """Flatten an SES→SNS "Received" notification into the EmailAdapter's request keys.
+
+    The adapter needs the sender, subject and body to normalize an InboundMessage — without
+    them the email channel can resolve a tenant but has nothing to answer. The From address
+    is reduced to the bare RFC5322 address because that address IS the lead's identity key
+    (§3.4.9), and a display name would fragment one lead into many.
+    """
     try:
         inner = json.loads(sns_message.get("Message", "{}"))
-        recipients = inner.get("mail", {}).get("destination", [])
-        return str(recipients[0]) if recipients else ""
-    except (ValueError, KeyError, IndexError):
+    except ValueError:
+        inner = {}
+    mail = inner.get("mail") or {}
+    headers = mail.get("commonHeaders") or {}
+    receipt = inner.get("receipt") or {}
+    destination = mail.get("destination") or []
+    from_header = (headers.get("from") or [None])[0] or mail.get("source") or ""
+    return {
+        "recipient": str(destination[0]) if destination else "",
+        "from_address": parseaddr(str(from_header))[1],
+        "subject": headers.get("subject"),
+        "text": _plain_text_body(inner.get("content")),
+        # SES's authentication verdicts (§3.1.5). They inform trust, and NEVER authorize
+        # PII disclosure back to the lead (§3.4.9).
+        "spf": (receipt.get("spfVerdict") or {}).get("status"),
+        "dkim": (receipt.get("dkimVerdict") or {}).get("status"),
+        "dmarc": (receipt.get("dmarcVerdict") or {}).get("status"),
+    }
+
+
+def _plain_text_body(content: str | None) -> str:
+    """The text/plain part of the base64 MIME message SES inlines in the notification.
+
+    Empty when SES stored the body in S3 instead of inlining it: an empty body is admitted
+    and handled downstream rather than 500-ing the provider's webhook.
+    """
+    if not content:
         return ""
+    try:
+        raw = base64.b64decode(content, validate=False)
+    except (ValueError, binascii.Error):
+        return ""
+    parsed = message_from_bytes(raw, policy=email_policy.default)
+    body = parsed.get_body(preferencelist=("plain",))
+    if body is None:
+        return ""
+    payload = body.get_content()
+    return payload if isinstance(payload, str) else ""

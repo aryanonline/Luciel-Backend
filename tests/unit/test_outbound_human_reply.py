@@ -42,7 +42,7 @@ async def test_widget_reply_is_poll_only_not_a_claimed_send():
     """The browser holds the widget connection, not us — there is nothing to push to."""
     admin, instance = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
-        result = await outbound.send_human_reply(
+        result = await outbound.send_outbound_reply(
             s, admin_id=admin, instance_id=instance, channel="widget", to=None, body="hi"
         )
     assert result.delivered is False
@@ -67,7 +67,7 @@ async def test_sms_reply_goes_through_the_adapter_with_the_tenant_number(monkeyp
     admin, instance = uuid.uuid4(), uuid.uuid4()
     await _seed_sms_sender(admin, instance, "+15550001111")
     async with tenant_session(admin) as s:
-        result = await outbound.send_human_reply(
+        result = await outbound.send_outbound_reply(
             s,
             admin_id=admin,
             instance_id=instance,
@@ -90,7 +90,7 @@ async def test_sms_reply_without_a_provisioned_number_is_reported_not_raised():
     written by the time we get here, so failing the request would lose the reply."""
     admin, instance = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
-        result = await outbound.send_human_reply(
+        result = await outbound.send_outbound_reply(
             s, admin_id=admin, instance_id=instance, channel="sms", to="+15557778888", body="hi"
         )
     assert result.delivered is False
@@ -101,7 +101,7 @@ async def test_sms_reply_without_a_provisioned_number_is_reported_not_raised():
 async def test_reply_with_no_recipient_on_file_is_reported():
     admin, instance = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
-        result = await outbound.send_human_reply(
+        result = await outbound.send_outbound_reply(
             s, admin_id=admin, instance_id=instance, channel="sms", to=None, body="hi"
         )
     assert result.delivered is False

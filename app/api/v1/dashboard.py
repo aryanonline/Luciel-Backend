@@ -161,7 +161,7 @@ async def send_human_message(
             ).scalar_one_or_none()
             recipient = lead.contact_identifier if lead is not None else None
 
-        result = await outbound.send_human_reply(
+        result = await outbound.send_outbound_reply(
             s,
             admin_id=subject.admin_id,
             instance_id=sess.instance_id,
