@@ -212,34 +212,3 @@ async def send_payment_failed(
         extra_payload={"dunning_state": dunning_state, "attempt_number": attempt_number},
         sender=sender,
     )
-
-
-async def send_escalation_notice(
-    session: AsyncSession,
-    *,
-    admin_id: uuid.UUID,
-    to: str,
-    signal: str,
-    conversation_ref: str,
-    sender: EmailSender | None = None,
-) -> DeliveryOutcome:
-    """Escalation → owner notification (§3.4.5: Luciel pings the owner to act)."""
-    body = (
-        "Luciel escalated a conversation that needs your attention.\n\n"
-        f"Reason: {signal}\n"
-        f"Conversation: {conversation_ref}\n\n"
-        "Open your dashboard to review and take over if needed."
-    )
-    return await _dispatch(
-        session,
-        admin_id=admin_id,
-        to=to,
-        subject="Luciel needs you: a conversation was escalated",
-        body=body,
-        notice_type="escalation",
-        audit_event="escalation_notification_sent",
-        # §5.2: escalation audit payloads carry non-identifying refs only — never the
-        # lead's raw contact. conversation_ref is a non-PII session handle.
-        extra_payload={"signal": signal, "conversation_ref": conversation_ref},
-        sender=sender,
-    )

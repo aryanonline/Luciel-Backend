@@ -649,3 +649,34 @@ async def resolve_email_address(
         return None
     address = conn.non_secret_config.get("address")
     return address if isinstance(address, str) else None
+
+
+async def _resolve_destination(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
+) -> str | None:
+    conn = await _single_active(session, admin_id, instance_id, connection_type)
+    if conn is None or not conn.non_secret_config:
+        return None
+    destination = conn.non_secret_config.get("destination")
+    return destination if isinstance(destination, str) and destination else None
+
+
+async def resolve_sms_number(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> str | None:
+    """The tenant's provisioned SMS sending number (E.164), or None (§3.1.4 BYO).
+
+    This is the FROM identity for every outbound SMS on the tenant's behalf — a customer
+    reply and an escalation page both have to come from the tenant's own number."""
+    return await _resolve_destination(session, admin_id, instance_id, "sms_sender")
+
+
+async def resolve_meta_destination(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> str | None:
+    """The tenant's Meta sender id, or None if the channel is not provisioned.
+
+    For WhatsApp this is the WhatsApp phone-number id; for Instagram DM / Messenger it is
+    the IG-account / Facebook-page id (§3.1.3 — these channels bind to a page/account, not
+    a phone number). Both ride the same ``channel_auth`` connection."""
+    return await _resolve_destination(session, admin_id, instance_id, "channel_auth")

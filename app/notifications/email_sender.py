@@ -23,11 +23,20 @@ class SentEmail:
     subject: str
     body: str
     message_id: str
+    from_address: str | None = None
 
 
 class EmailSender(Protocol):
-    async def send(self, *, to: str, subject: str, body_text: str) -> str:
-        """Send an email; return a provider message id. Raises on hard failure."""
+    async def send(
+        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+    ) -> str:
+        """Send an email; return a provider message id. Raises on hard failure.
+
+        ``from_address`` overrides the platform identity for one message. A customer-facing
+        channel reply must come FROM the tenant's own provisioned address (§3.1.6a); a
+        platform notice (verification, dunning, escalation) omits it and uses the platform
+        identity.
+        """
         ...
 
 
@@ -37,9 +46,19 @@ class NullEmailSender:
     def __init__(self) -> None:
         self.sent: list[SentEmail] = []
 
-    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+    async def send(
+        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+    ) -> str:
         mid = f"null-{len(self.sent) + 1}"
-        self.sent.append(SentEmail(to=to, subject=subject, body=body_text, message_id=mid))
+        self.sent.append(
+            SentEmail(
+                to=to,
+                subject=subject,
+                body=body_text,
+                message_id=mid,
+                from_address=from_address,
+            )
+        )
         return mid
 
 
@@ -58,10 +77,12 @@ class SesEmailSender:
             self._client = boto3.client("sesv2", region_name=self.region_name)
         return self._client
 
-    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+    async def send(
+        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+    ) -> str:
         client = self._get_client()
         resp = client.send_email(  # type: ignore[attr-defined]
-            FromEmailAddress=self.sender_identity,
+            FromEmailAddress=from_address or self.sender_identity,
             Destination={"ToAddresses": [to]},
             Content={
                 "Simple": {

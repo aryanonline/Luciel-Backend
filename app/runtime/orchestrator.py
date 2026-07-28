@@ -29,9 +29,11 @@ The LLM's instructions are NOT a security boundary (§3.4.14 / §7 #36): tenant
 isolation (RLS), tool authorization (broker default-deny), and budget all hold in
 code regardless of what the model is convinced to say.
 
-FLAGGED: escalation NOTIFICATION DELIVERY (admin email/SMS routing, §3.5) is Arc 15
-— here an escalation writes the escalation_events row + the audit event; the
-delivery worker binds later. Vector RETRIEVAL is Arc 11 and graph/hybrid is Arc 16
+An escalation writes the escalation_events row + audit event and THEN notifies the
+admin's configured contact (§3.5.3, app/notifications/escalation_dispatch.py); delivery
+is best-effort against the row and never blocks the lead's turn (§3.5.4).
+
+FLAGGED: Vector RETRIEVAL is Arc 11 and graph/hybrid is Arc 16
 — the loop calls a retrieval callable injected by the caller so it is testable now
 and the production retriever binds behind the same signature.
 """
@@ -48,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, Session, Transcript
+from app.notifications.escalation_dispatch import notify_escalation_safely
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
@@ -141,10 +144,11 @@ async def _record_escalation(
     gate: str,
     score: float | None,
 ) -> None:
-    """Write the escalation_events row + the audit event (§3.5.2 / §5.2).
+    """Write the escalation_events row + the audit event, then notify (§3.5.2 / §5.2).
 
-    Notification delivery to the admin's configured channel is Arc 15 (§3.5) —
-    flagged in the module docstring."""
+    The row is written and flushed FIRST: it is the authoritative record and delivery is
+    best-effort against it (§3.5.2). Notification never blocks or breaks the lead's turn
+    (§3.5.4)."""
     session.add(
         EscalationEvent(
             escalation_id=uuid.uuid4(),
@@ -167,6 +171,16 @@ async def _record_escalation(
         payload={"signal": signal, "gate": gate, "session_id": str(session_id)},
     )
     await session.flush()
+    await notify_escalation_safely(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+    )
 
 
 @dataclass
