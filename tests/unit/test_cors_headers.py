@@ -44,3 +44,50 @@ def test_preflight_allows_arbitrary_headers_but_locks_origin():
         },
     )
     assert bad.headers.get("access-control-allow-origin") != "https://evil.example.com"
+
+
+def test_widget_plane_accepts_any_embedding_origin_without_credentials():
+    """§9.6: the widget is embedded on arbitrary customer sites, so its origin can never
+    be allow-listed in advance. The data plane must therefore accept any origin — and
+    must NOT grant credentials, because a wildcard origin plus credentials would let any
+    site drive a cookie-authenticated request."""
+    client = TestClient(create_app())
+
+    pre = client.options(
+        "/api/v1/chat-widget/bootstrap",
+        headers={
+            "Origin": "https://some-customer-shop.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert pre.status_code == 200, pre.text
+    assert pre.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-credentials" not in pre.headers
+
+
+def test_control_plane_stays_credentialed_and_allow_listed():
+    """The split must not loosen the dashboard: the admin session is an httpOnly cookie,
+    so its plane keeps credentials AND a strict origin allow-list."""
+    client = TestClient(create_app())
+
+    ok = client.options(
+        "/api/v1/dashboard/conversations",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert ok.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert ok.headers.get("access-control-allow-credentials") == "true"
+
+    bad = client.options(
+        "/api/v1/dashboard/conversations",
+        headers={
+            "Origin": "https://some-customer-shop.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert bad.headers.get("access-control-allow-origin") is None

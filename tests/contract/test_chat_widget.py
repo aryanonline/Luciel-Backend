@@ -130,6 +130,85 @@ async def test_history_maps_roles_to_visitor_assistant(client):
     assert roles <= {"visitor", "assistant"}
 
 
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_widget_second_turn_resumes_the_same_session(client):
+    """§9.5: a visitor's second message must continue the SAME conversation.
+
+    Gating session lookup on resolved_lead_id meant a weak-identity widget visitor
+    never matched anything, so every turn opened a fresh session — no memory, the
+    disclosure re-sent on every reply, and each turn billed as its own conversation.
+    """
+    from app.models.conversation import Session as SessionModel
+    from sqlalchemy import func, select
+
+    admin, embed_key = await _seed_active_instance()
+
+    first = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "text": "Do you have openings?"},
+    )
+    sid = first.json()["sessionId"]
+
+    second = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "sessionId": sid, "text": "What about Tuesday?"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["sessionId"] == sid, "second turn opened a new session"
+
+    # The AI-identity disclosure is a first-contact obligation (§3.4.16); repeating it
+    # every turn is the visible symptom of a session that never resumed.
+    assert "ai assistant" not in second.json()["reply"]["text"].lower()
+
+    # One session row, and the whole exchange lives in it.
+    async with tenant_session(admin) as s:
+        count = (
+            await s.execute(
+                select(func.count()).select_from(SessionModel).where(SessionModel.admin_id == admin)
+            )
+        ).scalar_one()
+        assert count == 1, f"expected one session for the conversation, got {count}"
+
+    history = await client.get(f"/api/v1/chat-widget/sessions/{sid}?embedKey={embed_key}")
+    texts = [m["text"] for m in history.json()]
+    assert any("Do you have openings?" in t for t in texts)
+    assert any("What about Tuesday?" in t for t in texts)
+
+    # §3.4.1b: a conversation is ONE budget unit however many turns it takes.
+    async with tenant_session(admin) as s:
+        state = await budget.check_budget(s, admin_id=admin, instance_id=admin)
+    assert state.counted == 1, "a resumed session must not re-count against the budget"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payg_account_with_card_is_not_capped_past_the_free_allowance(client):
+    """§12.9 / Vision §7: the free 50 is a cap only for accounts with no card.
+
+    Every serving path used to pass has_payment_method=False, so a paying customer's
+    widget went to at_cap at 50 — the exact opposite of what they are paying for.
+    """
+    from app.billing.metering import get_or_create_billing_account
+
+    admin, embed_key = await _seed_active_instance()
+    async with tenant_session(admin) as s:
+        account = await get_or_create_billing_account(s, admin_id=admin)
+        account.billing_state = "payg_enabled"
+        state0 = await budget.check_budget(s, admin_id=admin, instance_id=admin)
+        for _ in range(state0.free_allowance):
+            await budget.count_session_once(
+                s, admin_id=admin, instance_id=admin, session_id=uuid.uuid4()
+            )
+
+    r = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "text": "hello"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["renderState"] == "active", "a card on file must lift the free-50 cap"
+    assert "Echo:" in body["reply"]["text"], "the tenant must still be served, not deflected"
+
+
 async def test_widget_flood_is_rate_limited_before_budget(client):
     """B3 regression (Architecture §3.1.5): the widget /messages endpoint must run
     the pre-budget abuse gate BEFORE the budget gate / any LLM call, so a flood from

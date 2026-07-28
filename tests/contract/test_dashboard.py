@@ -124,6 +124,66 @@ async def test_take_over_then_hand_back(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_human_reply_requires_takeover_first(client):
+    """§3.4.12: outside human_controlled, Luciel owns the reply. Letting the admin
+    interleave would make the transcript lie about who is speaking."""
+    admin = await _signup_verify_login(client)
+    _iid, sid, _mid = await _seed_conversation(admin)
+    r = await client.post(
+        f"/api/v1/dashboard/conversations/{sid}/messages", json={"text": "Hi, Ana here."}
+    )
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_human_reply_persists_and_reports_widget_poll_only(client):
+    """§11.5-11.7: the admin could take a conversation over but had no way to speak.
+
+    The reply is persisted as a human_agent turn and appears in the transcript. The
+    widget has no outbound push transport, so the result must say so honestly rather
+    than claim a send the visitor never received.
+    """
+    from app.models.audit import AdminAuditLog
+
+    admin = await _signup_verify_login(client)
+    _iid, sid, _mid = await _seed_conversation(admin)
+    await client.post(f"/api/v1/dashboard/conversations/{sid}/take-over")
+
+    r = await client.post(
+        f"/api/v1/dashboard/conversations/{sid}/messages",
+        json={"text": "Hi, Ana here - happy to help with pricing."},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["message"]["role"] == "human_agent"
+    assert body["message"]["text"] == "Hi, Ana here - happy to help with pricing."
+    assert body["message"]["at"]
+    assert body["delivered"] is False
+    assert body["deliveryDetail"] == "widget_poll_only"
+
+    msgs = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
+    assert [m["role"] for m in msgs.json()] == ["luciel", "human_agent"]
+
+    # The audit trail records the delivery outcome but never the message text (§3.4.11).
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.event_type == "human_agent_message_sent"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    payload = rows[0].event_payload
+    assert payload["delivered"] is False
+    assert "Ana here" not in str(payload)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_missing_conversation_is_404(client):
     await _signup_verify_login(client)
     r = await client.get(f"/api/v1/dashboard/conversations/{uuid.uuid4()}/messages")
