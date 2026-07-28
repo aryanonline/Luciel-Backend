@@ -30,6 +30,7 @@ from sqlalchemy import select
 
 from app.api.errors import not_found, rate_limited
 from app.audit import log as audit
+from app.billing import metering
 from app.channels import rate_limit
 from app.channels.base import InboundRejected, InstanceContext
 from app.channels.routing import resolve_widget
@@ -142,8 +143,13 @@ async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
                 ai_assistant_label="AI assistant",
                 powered_by_vantage_mind=True,
             )
+        # A card on file lifts the free-50 cap (Vision §7 PAYG). Hardcoding False here
+        # rendered a paying tenant's widget as at_cap, inverting the PAYG promise (§12.9).
         state = await budget.check_budget(
-            s, admin_id=ctx.admin_id, instance_id=ctx.instance_id, has_payment_method=False
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            has_payment_method=await metering.has_live_card(s, admin_id=ctx.admin_id),
         )
         return WidgetBootstrapOut(
             render_state="at_cap" if state.at_cap else "active",
@@ -189,12 +195,19 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         # Widget identity is WEAK (§3.4.9): no resolved lead is inherited from a prior
         # session. A lead is created/linked by the identity arc; here resolved_lead_id
         # stays None so cross-session memory is never carried (HARD RULE §3.4.9).
+        #
+        # The client-supplied sessionId is how a weak-identity visitor resumes its OWN
+        # conversation across turns; without it every message opened a fresh session, so
+        # the widget had no multi-turn memory and each turn counted as a new conversation
+        # (§9.5). Matching is scoped to this tenant/instance/channel, and the §3.4.9 rule
+        # still holds — a resumed session replays only its own transcript.
         sess, _is_new = await resolve_or_open_session(
             s,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             channel=CHANNEL,
             resolved_lead_id=None,
+            session_id=body.session_id,
         )
 
         # Arc 16 binds the production hybrid retriever (vector + intent-gated graph,
@@ -229,12 +242,14 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             # 280-char admin business-context, composed UNDER the platform invariants
             # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
             business_context=effective.business_context,
-            has_payment_method=False,
+            # Real card state, not a literal False: a PAYG tenant must keep serving past
+            # the free 50 (§12.9 / Vision §7).
+            has_payment_method=await metering.has_live_card(s, admin_id=ctx.admin_id),
             snapshot_tool_ids=effective.snapshot_tool_ids,
         )
         result = await orch.run_turn(
             session_id=sess.id,
-            resolved_lead_id=None,
+            resolved_lead_id=sess.resolved_lead_id,
             channel=CHANNEL,
             mode=sess.mode,
             inbound_text=body.text,

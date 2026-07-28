@@ -38,6 +38,10 @@ class SignupRequest(WireModel):
 
 class SignupResult(WireModel):
     account: AccountOut
+    # True when the verification mail did not leave the system. The account exists but
+    # is hard-gated until verified, so the UI must offer a resend instead of implying
+    # "check your inbox". Never carries the provider error.
+    email_delivery_degraded: bool = False
 
 
 class LoginRequest(WireModel):
@@ -61,6 +65,7 @@ class VerifyEmailRequest(WireModel):
 class ResendVerificationResult(WireModel):
     ok: bool
     cooldown_seconds_remaining: int | None = None
+    email_delivery_degraded: bool = False
 
 
 class OkResult(WireModel):

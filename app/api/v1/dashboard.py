@@ -13,24 +13,30 @@ Sources: Architecture §3.4.7 (summary list), §3.4.12 (take-over / hand-back),
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import not_found
+from app.api.errors import not_found, validation_error
 from app.audit import log as audit
+from app.channels import outbound
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, SessionSummary, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
+from app.runtime.orchestrator import persist_turn
 from app.schemas_api.conversations import (
     AnswerEvidenceOut,
     ConversationSummaryOut,
+    DeliveryDetailWire,
     EscalationEventOut,
+    HumanReplyRequest,
+    HumanReplyResult,
     LeadOut,
     MessageOut,
     PruneRequest,
@@ -108,6 +114,99 @@ async def get_messages(
             .all()
         )
         return [MessageOut(message_id=r.id, role=r.role, text=r.text, at=r.at) for r in rows]
+
+
+@router.post("/conversations/{session_id}/messages", response_model=HumanReplyResult)
+async def send_human_message(
+    session_id: uuid.UUID,
+    body: HumanReplyRequest,
+    subject: Subject = Depends(current_admin),
+) -> HumanReplyResult:
+    """Admin sends a reply while holding the conversation (§3.4.12 / §11.5-11.7).
+
+    Only valid in ``human_controlled`` mode — outside takeover Luciel owns the reply,
+    and letting the admin interleave would make the transcript lie about who is
+    speaking. The row is persisted with role ``human_agent`` through the SAME writer
+    the loop uses, then pushed on the customer's channel.
+
+    The widget cannot be pushed to (no outbound transport): the reply is persisted and
+    the visitor receives it on the widget's next history fetch. That is reported
+    honestly as ``delivered: false`` / ``deliveryDetail: "widget_poll_only"`` rather
+    than claiming a send.
+    """
+    async with tenant_session(subject.admin_id) as s:
+        sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
+        if sess.mode != "human_controlled":
+            raise validation_error("Take over the conversation before replying.")
+
+        row = await persist_turn(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=sess.instance_id,
+            session_id=session_id,
+            role="human_agent",
+            text=body.text,
+        )
+        await s.refresh(row)  # `at` is a server default — read it back before echoing it
+        sess.last_message_at = row.at
+
+        recipient = None
+        if sess.resolved_lead_id is not None:
+            lead = (
+                await s.execute(
+                    select(Lead).where(
+                        Lead.admin_id == subject.admin_id, Lead.id == sess.resolved_lead_id
+                    )
+                )
+            ).scalar_one_or_none()
+            recipient = lead.contact_identifier if lead is not None else None
+
+        result = await outbound.send_human_reply(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=sess.instance_id,
+            channel=sess.channel,
+            to=recipient,
+            body=body.text,
+        )
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=sess.instance_id,
+            event_type="human_agent_message_sent",
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            # No message text in the chained payload (§3.4.11 — no raw PII).
+            payload={
+                "session_id": str(session_id),
+                "message_id": str(row.id),
+                "channel": sess.channel,
+                "delivered": result.delivered,
+                "delivery_detail": result.detail,
+            },
+        )
+        detail = result.detail if not result.delivered else None
+        return HumanReplyResult(
+            message=MessageOut(message_id=row.id, role="human_agent", text=row.text, at=row.at),
+            delivered=result.delivered,
+            delivery_detail=_delivery_detail(detail),
+        )
+
+
+# The adapter can return a provider-specific failure string (e.g. "twilio_error:...").
+# The wire vocabulary is a closed set, so anything unrecognized collapses to send_failed
+# — the admin learns it did not go out; the provider detail stays in the audit log.
+_WIRE_DELIVERY_DETAILS = frozenset(
+    {"widget_poll_only", "no_recipient", "channel_not_provisioned", "unsupported_channel"}
+)
+
+
+def _delivery_detail(detail: str | None) -> DeliveryDetailWire | None:
+    if detail is None:
+        return None
+    if detail in _WIRE_DELIVERY_DETAILS:
+        return cast("DeliveryDetailWire", detail)
+    return "send_failed"
 
 
 @router.post("/conversations/{session_id}/take-over", response_model=ConversationSummaryOut)

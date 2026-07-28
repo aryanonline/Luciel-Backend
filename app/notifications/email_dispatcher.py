@@ -8,19 +8,49 @@ send that the notifier's AWS-DEFERRED seam described.
 
 All sends go through ``_dispatch`` so every notification is uniformly audited with a
 ``delivery_status`` of ``sent`` (real message id) or ``recorded`` (Null fallback).
+
+A delivery error must never break the calling flow (signup still creates the account),
+but it must not be invisible either: ``_dispatch`` returns a ``DeliveryOutcome`` whose
+``degraded`` flag lets the caller tell the client that the mail did not leave the
+system, without leaking the provider error.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.config import get_settings
 from app.models.audit import ActorType
 from app.notifications.email_sender import EmailSender, NullEmailSender, build_email_sender
+
+DeliveryStatus = Literal["sent", "recorded", "failed"]
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    """The result of one notification dispatch.
+
+    ``degraded`` is True whenever the platform intended to put mail on the wire and
+    it did not get there — a hard send failure in any mode, or a live deployment that
+    silently fell back to ``NullEmailSender`` because no sender identity is bound. In
+    mock/CI the Null fallback is the expected posture and is NOT degraded.
+    """
+
+    status: DeliveryStatus
+    message_id: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        if self.status == "failed":
+            return True
+        return self.status != "sent" and get_settings().integration_mode == "live"
 
 
 async def _dispatch(
@@ -34,10 +64,10 @@ async def _dispatch(
     audit_event: str,
     extra_payload: dict[str, object] | None = None,
     sender: EmailSender | None = None,
-) -> str | None:
+) -> DeliveryOutcome:
     sender = sender or build_email_sender()
     message_id: str | None = None
-    delivery_status = "recorded"
+    delivery_status: DeliveryStatus = "recorded"
     try:
         message_id = await sender.send(to=to, subject=subject, body_text=body)
         delivery_status = "sent" if not isinstance(sender, NullEmailSender) else "recorded"
@@ -54,6 +84,7 @@ async def _dispatch(
             exc,
         )
 
+    outcome = DeliveryOutcome(status=delivery_status, message_id=message_id)
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -64,12 +95,13 @@ async def _dispatch(
             "recipient": to,
             "delivery_method": "email",
             "delivery_status": delivery_status,
+            "delivery_degraded": outcome.degraded,
             "message_id": message_id,
             "sent_at": datetime.now(UTC).isoformat(),
             **(extra_payload or {}),
         },
     )
-    return message_id
+    return outcome
 
 
 # --- concrete notifications ------------------------------------------------------- #
@@ -82,7 +114,7 @@ async def send_verify_email(
     to: str,
     verify_url: str,
     sender: EmailSender | None = None,
-) -> str | None:
+) -> DeliveryOutcome:
     """Signup verification link (CJ Phase 2). The link is emailed, never returned."""
     body = (
         "Welcome to VantageMind.\n\n"
@@ -98,6 +130,34 @@ async def send_verify_email(
         body=body,
         notice_type="verify_email",
         audit_event="verification_resent",
+        sender=sender,
+    )
+
+
+async def send_reset_email(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    reset_url: str,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Password-reset link (CJ Phase 2). The link is emailed, never returned."""
+    body = (
+        "We received a request to reset your VantageMind password.\n\n"
+        "Choose a new password here:\n\n"
+        f"{reset_url}\n\n"
+        "This link expires in 1 hour and can only be used once. If you didn't ask "
+        "for a reset, ignore this email — your password is unchanged."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Reset your VantageMind password",
+        body=body,
+        notice_type="password_reset",
+        audit_event="password_reset_requested",
         sender=sender,
     )
 
@@ -134,7 +194,7 @@ async def send_payment_failed(
     dunning_state: str,
     attempt_number: int,
     sender: EmailSender | None = None,
-) -> str | None:
+) -> DeliveryOutcome:
     """Dunning retry notice (Legal §A3 / §3.6.7 — a notice at each retry)."""
     body = (
         "We couldn't process your latest VantageMind payment.\n\n"
@@ -162,7 +222,7 @@ async def send_escalation_notice(
     signal: str,
     conversation_ref: str,
     sender: EmailSender | None = None,
-) -> str | None:
+) -> DeliveryOutcome:
     """Escalation → owner notification (§3.4.5: Luciel pings the owner to act)."""
     body = (
         "Luciel escalated a conversation that needs your attention.\n\n"

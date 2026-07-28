@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from pydantic import Field
+
 from app.schemas_api.common import WireModel
 
 ConversationModeWire = Literal["ai", "human_controlled"]
@@ -45,6 +47,36 @@ class MessageOut(WireModel):
     role: MessageRoleWire
     text: str
     at: datetime
+
+
+class HumanReplyRequest(WireModel):
+    """Admin-authored reply while the conversation is human_controlled (§3.4.12)."""
+
+    text: str = Field(min_length=1, max_length=4000)
+
+
+DeliveryDetailWire = Literal[
+    "widget_poll_only",
+    "no_recipient",
+    "channel_not_provisioned",
+    "unsupported_channel",
+    "send_failed",
+]
+
+
+class HumanReplyResult(WireModel):
+    """The persisted reply plus an HONEST outbound-delivery signal (§11.5-11.7).
+
+    ``delivered`` is False whenever the reply did not reach the customer's transport.
+    The widget is the expected case: it has no push channel, so the message is stored
+    and the visitor sees it on the widget's next history fetch
+    (``deliveryDetail == "widget_poll_only"``). The dashboard must not claim "sent" for
+    a reply whose ``delivered`` is False.
+    """
+
+    message: MessageOut
+    delivered: bool
+    delivery_detail: DeliveryDetailWire | None = None
 
 
 class SourceChunkOut(WireModel):

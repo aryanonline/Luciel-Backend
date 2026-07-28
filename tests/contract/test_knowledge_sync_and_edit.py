@@ -13,6 +13,17 @@ import pytest
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
 
+def _state_from(conn_body: dict) -> str:
+    """The signed ``state`` the connect-start minted, read off the authorizeUrl (§5.1).
+
+    The callback only redeems a code carrying THIS attempt's state, so a test that
+    completes the flow has to go through the authorize URL like the admin's browser."""
+    from urllib.parse import parse_qs, urlparse
+
+    url = (conn_body["nonSecretConfig"] or {})["authorize_url"]
+    return parse_qs(urlparse(url).query)["state"][0]
+
+
 async def _ready_account_with_luciel(client) -> None:
     from app.auth import access
 
@@ -316,7 +327,7 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
 
     rcb = await client.post(
         f"/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback",
-        json={"code": "auth-code-xyz"},
+        json={"code": "auth-code-xyz", "state": _state_from(conn_body)},
     )
     assert rcb.status_code == 200, rcb.text
     cb_body = rcb.json()
@@ -398,7 +409,7 @@ async def test_oauth_callback_rejected_code_is_clean_409_not_500(client, monkeyp
 
     rcb = await client.post(
         f"/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback",
-        json={"code": "expired-code"},
+        json={"code": "expired-code", "state": _state_from(rc.json())},
     )
     assert rcb.status_code == 409
     assert "hubspot" in rcb.json()["message"].lower() or "exchange" in rcb.json()["message"].lower()

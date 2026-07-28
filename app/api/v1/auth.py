@@ -92,6 +92,7 @@ async def signup(req: SignupRequest) -> SignupResult:
     acct, token = await access.signup(req.email, req.password)
     # Email the verification link (never returned in the body). Degrades to audit-
     # only if email isn't configured (NullEmailSender).
+    degraded = False
     if token:
         settings = get_settings()
         # Frontend route is /verify?token=... (apps/web (auth)/verify/page.tsx), served
@@ -99,10 +100,17 @@ async def signup(req: SignupRequest) -> SignupResult:
         # frontend path exactly or the emailed link 404s.
         verify_url = f"{settings.app_base_url}/verify?token={token}"
         async with tenant_session(acct.id) as s:
-            await email_dispatcher.send_verify_email(
+            outcome = await email_dispatcher.send_verify_email(
                 s, admin_id=acct.id, to=acct.email, verify_url=verify_url
             )
-    return SignupResult(account=_account_out(acct, has_luciel=False))
+        # Unverified accounts are hard-gated (deps.py), so a silently-undelivered
+        # verification mail strands the customer with a 200 and no way forward. Tell
+        # the client the mail did not leave the system so it can offer a resend —
+        # the provider error itself stays in the log/audit trail, never on the wire.
+        degraded = outcome.degraded
+    return SignupResult(
+        account=_account_out(acct, has_luciel=False), email_delivery_degraded=degraded
+    )
 
 
 @router.post("/login", response_model=SessionOut)
@@ -171,15 +179,38 @@ async def verify_email(req: VerifyEmailRequest, response: Response) -> SessionOu
 async def resend_verification(
     subject: Subject = Depends(current_session_subject),
 ) -> ResendVerificationResult:
-    _token, cooldown = await access.reissue_verification(subject.admin_id)
+    token, cooldown = await access.reissue_verification(subject.admin_id)
     if cooldown is not None:
         return ResendVerificationResult(ok=False, cooldown_seconds_remaining=cooldown)
-    return ResendVerificationResult(ok=True)
+    if token is None:
+        # Already verified (or no such account) — nothing to resend, still non-enumerating.
+        return ResendVerificationResult(ok=True)
+    settings = get_settings()
+    verify_url = f"{settings.app_base_url}/verify?token={token}"
+    async with tenant_session(subject.admin_id) as s:
+        acct = (await s.execute(select(Account).where(Account.id == subject.admin_id))).scalar_one()
+        outcome = await email_dispatcher.send_verify_email(
+            s, admin_id=subject.admin_id, to=acct.email, verify_url=verify_url
+        )
+    return ResendVerificationResult(ok=True, email_delivery_degraded=outcome.degraded)
 
 
 @router.post("/forgot-password", response_model=OkResult)
 async def forgot_password(req: ForgotPasswordRequest) -> OkResult:
-    await access.request_reset(req.email)  # non-enumerating
+    token = await access.request_reset(req.email)  # non-enumerating
+    if token is not None:
+        settings = get_settings()
+        # Frontend route is /reset?token=... (apps/web (auth)/reset/page.tsx), served
+        # on the public web host. Must match the frontend path exactly or the link 404s.
+        reset_url = f"{settings.app_base_url}/reset?token={token}"
+        claims = decode_token(token)
+        admin_id = uuid.UUID(claims["sub"])
+        async with tenant_session(admin_id) as s:
+            await email_dispatcher.send_reset_email(
+                s, admin_id=admin_id, to=req.email, reset_url=reset_url
+            )
+    # Always the same shape: a delivery signal here would leak whether the address
+    # is registered (§3.7.1a non-enumeration).
     return OkResult(ok=True)
 
 

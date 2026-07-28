@@ -155,10 +155,15 @@ async def exchange_code_for_token(
     *,
     code: str,
     transport: HttpTransport,
+    code_verifier: str | None = None,
 ) -> dict[str, str]:
     """Exchange an OAuth ``code`` for an access token via the provider's token
     endpoint, through the SAME ``HttpTransport`` seam ``snapshot()`` uses (a real
     impl is ``httpx.AsyncClient``; tests inject a FAKE — no real network call).
+
+    ``code_verifier`` completes the PKCE exchange for providers whose authorize
+    request carried a challenge (§5.1); omitting it for those providers makes the
+    provider reject the code. Non-PKCE providers must not receive it.
 
     Returns the material dict to hand to ``SecretStore.put`` verbatim (never
     logged, never returned over the wire — §3.8.3 rule 4). Raises
@@ -175,15 +180,19 @@ async def exchange_code_for_token(
     if endpoint is None:
         raise ProviderUnavailable(f"No token endpoint registered for provider '{provider}'.")
 
+    form: dict[str, object] = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": cfg.client_id,
+        "client_secret": cfg.client_secret,
+        "redirect_uri": cfg.redirect_uri,
+    }
+    if code_verifier:
+        form["code_verifier"] = code_verifier
+
     resp = await transport.post(
         endpoint,
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": cfg.client_id,
-            "client_secret": cfg.client_secret,
-            "redirect_uri": cfg.redirect_uri,
-        },
+        data=form,
         headers={"Accept": "application/json"},
     )
     if resp.status_code >= 400:

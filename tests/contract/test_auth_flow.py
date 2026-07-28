@@ -16,6 +16,7 @@ import uuid
 
 import pytest
 from app.auth.tokens import decode_token
+from app.notifications.email_dispatcher import DeliveryOutcome
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -323,6 +324,7 @@ async def test_signup_verify_link_targets_frontend_verify_route(client, monkeypa
 
     async def _capture(session, *, admin_id, to, verify_url):
         captured["url"] = verify_url
+        return DeliveryOutcome(status="sent")
 
     monkeypatch.setattr("app.api.v1.auth.email_dispatcher.send_verify_email", _capture)
     monkeypatch.setenv("LUCIEL_APP_BASE_URL", "https://vantagemind.ai")

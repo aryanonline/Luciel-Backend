@@ -111,6 +111,20 @@ async def get_or_create_billing_account(
     return row
 
 
+async def has_live_card(session: AsyncSession, *, admin_id: uuid.UUID) -> bool:
+    """Whether the tenant can be served past the free allowance (Vision §7 PAYG).
+
+    True only when a card is on file AND dunning has not reverted the account to
+    free-cap behaviour (Legal §A3). This is the value every serving path must pass as
+    ``has_payment_method`` — passing a literal False caps a paying customer at 50,
+    inverting the PAYG promise (§12.9).
+    """
+    account = await get_or_create_billing_account(session, admin_id=admin_id)
+    return account.billing_state == "payg_enabled" and not dunning.behaves_as_free_cap(
+        account.dunning_state
+    )
+
+
 async def build_budget(
     session: AsyncSession,
     *,
@@ -146,11 +160,11 @@ async def build_budget(
 
     # Effective card: payg only if a card is on file AND dunning hasn't reduced us
     # to free-cap behavior (Legal §A3). reduced = behave as if cardless.
-    has_live_card = account.billing_state == "payg_enabled" and not dunning.behaves_as_free_cap(
+    live_card = account.billing_state == "payg_enabled" and not dunning.behaves_as_free_cap(
         account.dunning_state
     )
 
-    at_cap = counted >= free and not has_live_card  # at_cap is data (§3.4.1b)
+    at_cap = counted >= free and not live_card  # at_cap is data (§3.4.1b)
 
     # PAYG heads-up: only for a live-card account above the free allowance, true when
     # the account is >=80% through its CURRENT billed 100-block (position WITHIN the
@@ -158,17 +172,17 @@ async def build_budget(
     # block just started) -> position 0 -> False. Honest early warning before a new
     # block is billed; never a cap.
     near_next_block = False
-    if has_live_card and counted > free:
+    if live_card and counted > free:
         position_in_block = (counted - free) % settings.payg_block_size
         near_next_block = position_in_block >= int(settings.payg_block_size * 0.8)
 
     # billedThisPeriod (wire COUNT) is only nonzero when billing actually applies —
     # i.e. there is a live card. A cardless account caps at free, so nothing billed.
-    billed_count = billed_conversations(counted, free) if has_live_card else 0
-    blocks = billed_blocks(counted, free, settings.payg_block_size) if has_live_card else 0
+    billed_count = billed_conversations(counted, free) if live_card else 0
+    blocks = billed_blocks(counted, free, settings.payg_block_size) if live_card else 0
     cents = (
         billed_cents(counted, free, settings.payg_block_size, settings.payg_price_per_block_cents)
-        if has_live_card
+        if live_card
         else 0
     )
 

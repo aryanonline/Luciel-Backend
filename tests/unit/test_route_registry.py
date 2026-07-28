@@ -85,6 +85,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/dashboard/conversations"),
         ("POST", "/api/v1/dashboard/conversations/{session_id}/hand-back"),
         ("GET", "/api/v1/dashboard/conversations/{session_id}/messages"),
+        # Admin-authored reply during takeover (§3.4.12 / §11.5-11.7).
+        ("POST", "/api/v1/dashboard/conversations/{session_id}/messages"),
         ("GET", "/api/v1/dashboard/conversations/{session_id}/messages/{message_id}/evidence"),
         ("POST", "/api/v1/dashboard/conversations/{session_id}/messages/{message_id}/flag"),
         ("POST", "/api/v1/dashboard/conversations/{session_id}/take-over"),

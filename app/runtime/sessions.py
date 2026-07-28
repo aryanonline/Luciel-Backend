@@ -76,12 +76,21 @@ async def resolve_or_open_session(
     instance_id: uuid.UUID,
     channel: str,
     resolved_lead_id: uuid.UUID | None,
+    session_id: uuid.UUID | None = None,
 ) -> tuple[Session, bool]:
     """Return (session, is_new). Finds a live session for the key, else opens one.
 
     Liveness is determined deterministically by the channel inactivity timeout —
     a session whose last_message_at is older than the timeout is considered closed,
     and a new inbound opens a fresh session (a new budget unit, §3.4.8).
+
+    ``session_id`` is the client-supplied conversation handle (the widget's signed
+    embed session id, §3.4.9 widget row). It is the ONLY way a weak-identity channel
+    can resume its own conversation, and it is matched inside the already-resolved
+    (admin_id, instance_id, channel) scope so it can never reach another tenant. This
+    does NOT weaken the §3.4.9 HARD RULE: a resumed widget session inherits only its
+    OWN transcript, and ``can_carry_cross_session_memory('widget')`` still blocks any
+    other lead's cross-session history.
 
     Architecture §3.4.10a: if the resolved lead is in ``archived`` state, it is
     automatically reactivated (archived → active) and a ``lead_reactivated`` audit
@@ -95,7 +104,18 @@ async def resolve_or_open_session(
         await _maybe_reactivate_lead(session, admin_id=admin_id, lead_id=resolved_lead_id)
 
     existing = None
-    if resolved_lead_id is not None:
+    if session_id is not None:
+        existing = (
+            await session.execute(
+                select(Session).where(
+                    Session.admin_id == admin_id,
+                    Session.instance_id == instance_id,
+                    Session.channel == channel,
+                    Session.id == session_id,
+                )
+            )
+        ).scalar_one_or_none()
+    if existing is None and resolved_lead_id is not None:
         existing = (
             await session.execute(
                 select(Session)

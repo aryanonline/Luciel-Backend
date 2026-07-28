@@ -98,7 +98,10 @@ class LoopResult:
     tool_outcomes: list[str] = field(default_factory=list)
 
 
-async def _persist_turn(
+TRANSCRIPT_ROLES = frozenset({"lead", "luciel", "human_agent", "system"})
+
+
+async def persist_turn(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
@@ -106,18 +109,25 @@ async def _persist_turn(
     session_id: uuid.UUID,
     role: str,
     text: str,
-) -> None:
-    session.add(
-        Transcript(
-            id=uuid.uuid4(),
-            admin_id=admin_id,
-            instance_id=instance_id,
-            session_id=session_id,
-            role=role,
-            text=text,
-        )
+) -> Transcript:
+    """Append one message to the session transcript and return the persisted row.
+
+    Public because the takeover reply path (§3.4.12) writes ``human_agent`` rows through
+    the SAME function the loop uses — one transcript writer, so an admin reply and a
+    Luciel reply are indistinguishable in ordering/tenancy handling."""
+    if role not in TRANSCRIPT_ROLES:
+        raise ValueError(f"unknown transcript role: {role}")
+    row = Transcript(
+        id=uuid.uuid4(),
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        role=role,
+        text=text,
     )
+    session.add(row)
     await session.flush()
+    return row
 
 
 async def _record_escalation(
@@ -227,7 +237,7 @@ class Orchestrator:
         # Human-controlled sessions STOP the loop (§3.4.12): persist the inbound for
         # the dashboard live feed, make no LLM call.
         if not handoff.loop_should_run(mode):
-            await _persist_turn(
+            await persist_turn(
                 self.session,
                 admin_id=admin_id,
                 instance_id=instance_id,
@@ -242,7 +252,7 @@ class Orchestrator:
                 handed_off=True,
             )
 
-        await _persist_turn(
+        await persist_turn(
             self.session,
             admin_id=admin_id,
             instance_id=instance_id,
@@ -262,7 +272,7 @@ class Orchestrator:
             # Graceful single-turn reply WITHOUT an LLM call; cannot_answer with
             # reason budget_exhausted; counter does NOT increment (§3.4.1b).
             await self._emit_budget_exhausted(session_id, resolved_lead_id)
-            await _persist_turn(
+            await persist_turn(
                 self.session,
                 admin_id=admin_id,
                 instance_id=instance_id,
@@ -354,7 +364,7 @@ class Orchestrator:
                 "I'm having a brief technical issue — I've flagged this so a person "
                 "can follow up with you shortly."
             )
-            await _persist_turn(
+            await persist_turn(
                 self.session,
                 admin_id=admin_id,
                 instance_id=instance_id,
@@ -425,7 +435,7 @@ class Orchestrator:
             response_length=len(reply_text),
             is_urgent_escalation=outcome.fired,
         )
-        await _persist_turn(
+        await persist_turn(
             self.session,
             admin_id=admin_id,
             instance_id=instance_id,
@@ -570,7 +580,7 @@ class Orchestrator:
             gate=gate,
             score=score,
         )
-        await _persist_turn(
+        await persist_turn(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,

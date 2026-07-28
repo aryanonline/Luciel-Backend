@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
 from app.audit import log as audit
+from app.connections import oauth_flow
 from app.connections import service as connections_service
 from app.connections.secrets import get_secret_store
 from app.db.session import tenant_session
@@ -499,6 +500,12 @@ async def oauth_callback(
     receiving a ``code`` is real code, exercised in tests against a FAKE
     HttpTransport per the Build Brief's no-real-network-call rule.
 
+    The ``state`` is MANDATORY and must be the single-use one this connection's
+    connect-start minted (§5.1). Without that check the endpoint would redeem a code
+    obtained from any site that could drive the admin's browser here — CSRF straight
+    into a tenant's connection. Redeeming clears the pending attempt, so a replayed
+    callback finds nothing to complete.
+
     A revoked/expired/invalid code is surfaced as a clean 409 (never a crash).
     """
     async with tenant_session(subject.admin_id) as s:
@@ -517,6 +524,27 @@ async def oauth_callback(
             raise validation_error(
                 f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
             )
+        # Single-use: read-and-clear BEFORE the exchange, so a code replayed against a
+        # concurrent/retried callback cannot find a live attempt to ride.
+        expected_jti = connections_service.consume_oauth_state(conn)
+        try:
+            oauth_flow.verify_state(
+                req.state,
+                admin_id=subject.admin_id,
+                connection_id=conn.connection_id,
+                expected_jti=expected_jti,
+            )
+        except oauth_flow.StateRejected as exc:
+            await s.flush()
+            raise validation_error(str(exc)) from exc
+
+        spec = oauth_flow.PROVIDER_AUTHORIZE.get(conn.provider)
+        verifier = (
+            oauth_flow.verifier_for_jti(expected_jti)
+            if spec is not None and spec.supports_pkce and expected_jti
+            else None
+        )
+
         instance_id = await _instance_id(s, subject.admin_id)
         store = get_secret_store()
         async with oauth_transport() as transport:
@@ -528,6 +556,7 @@ async def oauth_callback(
                     conn.provider,
                     code=req.code,
                     transport=cast("HttpTransport", transport),
+                    code_verifier=verifier,
                 )
             except OAuthExchangeError as exc:
                 conn.status_detail = f"oauth_exchange_failed: {exc}"

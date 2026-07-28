@@ -159,6 +159,26 @@ export class ComputeStack extends Stack {
         resources: [cmk.keyArn],
       }),
     );
+    // Transactional email (Arch §3.1.2 / §3.6.7): verification, password reset, export
+    // links and dunning notices all go out through SESv2 (app/notifications/
+    // email_sender.py). Without this grant a live-mode send returns AccessDenied and
+    // no customer can complete signup, since unverified accounts are hard-gated.
+    // Scoped to the offering region + this account's identities for the founder domain
+    // — never a wildcard identity, so the task can only send AS VantageMind.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'SendPlatformEmail',
+        actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+        resources: [
+          // Domain identity (covers every address under it), subdomain identities
+          // (e.g. inbound.vantagemind.ai), and individually-verified addresses.
+          `arn:aws:ses:${this.region}:${this.account}:identity/${DOMAINS.apex}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/*.${DOMAINS.apex}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/*@${DOMAINS.apex}`,
+          `arn:aws:ses:${this.region}:${this.account}:configuration-set/*`,
+        ],
+      }),
+    );
 
     const makeTaskDef = (name: string) => {
       const td = new ecs.FargateTaskDefinition(this, `${name}Task`, {

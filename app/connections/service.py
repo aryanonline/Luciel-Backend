@@ -4,10 +4,10 @@ ONE mechanism for every external dependency — tools, channels, knowledge sourc
 escalation delivery all reuse ``instance_connections`` (§3.8: no second pillar).
 
 Connect-flow shape (frozen StartConnectionResult):
-  * OAuth-class providers return ``authorizeUrl`` — the UI redirects the admin to
-    the provider consent screen; the callback completion that exchanges the code
-    for tokens and writes them to the SecretStore is an AWS/provider-DEFERRED SEAM
-    (no real OAuth round-trip in this arc).
+  * OAuth-class providers return ``authorizeUrl`` — the provider's real consent URL
+    when its OAuth client is registered in config (§5.1, see ``oauth_flow``), or an
+    internal placeholder plus an "action needed" status_detail when it is not. The
+    callback that exchanges the code for tokens lives in the knowledge API.
   * Non-OAuth providers (CSV upload, raw webhook URL, pasted API key) return
     ``requiresClientForm: true`` — the UI collects the fields client-side and the
     secret is handed to the SecretStore server-side later.
@@ -53,15 +53,53 @@ def _auth_class_for(connection_type: str) -> str:
     return _AUTH_CLASS_BY_TYPE.get(connection_type, "api_key")
 
 
-def _start_result(auth_class: str, connection: InstanceConnection) -> dict[str, object]:
-    """Frozen StartConnectionResult: authorizeUrl (OAuth) xor requiresClientForm."""
-    if auth_class in _OAUTH_CLASSES:
-        # AWS/provider-DEFERRED SEAM: the real provider authorize URL (client_id,
-        # scopes, PKCE, signed state) binds when OAuth lands. Here we hand back a
-        # deterministic internal placeholder the UI can redirect to; the callback
-        # that completes the exchange is likewise deferred.
-        return {"authorize_url": f"/api/v1/admin/connections/{connection.connection_id}/authorize"}
-    return {"requires_client_form": True}
+def _start_result(
+    auth_class: str, connection: InstanceConnection, *, admin_id: uuid.UUID
+) -> dict[str, object]:
+    """Frozen StartConnectionResult: authorizeUrl (OAuth) xor requiresClientForm.
+
+    For OAuth-class rows this also BEGINS the attempt — the returned authorizeUrl is the
+    provider's real consent URL (client_id, scopes, PKCE challenge, signed state), and
+    the attempt's single-use state jti is parked on the row for the callback to check
+    (§5.1). Doing it here means every entry point (start / reconnect / swap) mints a
+    fresh state; a stale URL from a previous attempt can never be replayed."""
+    if auth_class not in _OAUTH_CLASSES:
+        return {"requires_client_form": True}
+
+    from app.connections.oauth_flow import UNCONFIGURED_DETAIL, build_authorize_start
+
+    cfg = dict(connection.non_secret_config or {})
+    # Swap stages the new provider without cutting over (§3.8.7 rule B) — consent must
+    # be sought from the provider the admin is moving TO.
+    pending = cfg.get("pending_provider")
+    provider = pending if isinstance(pending, str) and pending else connection.provider
+
+    start = build_authorize_start(
+        provider=provider,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        connection_id=connection.connection_id,
+    )
+    cfg["authorize_url"] = start.authorize_url
+    cfg["oauth_state_jti"] = start.state_jti
+    connection.non_secret_config = cfg
+    # The reconnect_pending marker carries the prior status that confirm_reconnect rolls
+    # back to; overwriting it would lose the rollback target on a failed probe.
+    mid_reconnect = (connection.status_detail or "").startswith("reconnect_pending:")
+    if start.unconfigured and not mid_reconnect:
+        connection.status_detail = UNCONFIGURED_DETAIL
+    return {"authorize_url": start.authorize_url}
+
+
+def consume_oauth_state(connection: InstanceConnection) -> str | None:
+    """Read and CLEAR this connection's pending state ``jti``.
+
+    Clearing is what makes a state single-use: a replayed callback finds no pending
+    attempt and is rejected."""
+    cfg = dict(connection.non_secret_config or {})
+    jti = cfg.pop("oauth_state_jti", None)
+    connection.non_secret_config = cfg
+    return jti if isinstance(jti, str) else None
 
 
 async def _single_active(
@@ -154,7 +192,7 @@ async def start_connection(
                 "action": "start_connection",
             },
         )
-        return connection, _start_result(connection.auth_class, connection)
+        return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
     existing = await _single_active(session, admin_id, instance_id, connection_type)
     if existing is not None:
@@ -194,7 +232,7 @@ async def start_connection(
             "action": "start_connection",
         },
     )
-    return connection, _start_result(auth_class, connection)
+    return connection, _start_result(auth_class, connection, admin_id=admin_id)
 
 
 async def reconnect(
@@ -247,7 +285,7 @@ async def reconnect(
             "reason": "reconnect_pending",
         },
     )
-    return connection, _start_result(connection.auth_class, connection)
+    return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
 
 async def swap(
@@ -313,7 +351,7 @@ async def swap(
             "new_provider": provider,  # staged only — not yet written to `provider`
         },
     )
-    return connection, _start_result(connection.auth_class, connection)
+    return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
 
 async def confirm_reconnect(

@@ -44,6 +44,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "byo_webhook_circuit_open",
         "human_takeover_started",
         "human_takeover_ended",
+        # Admin-authored reply sent during takeover (§3.4.12) — carries the delivery
+        # outcome, never the message text.
+        "human_agent_message_sent",
         "answer_flagged_by_admin",
         # Credential-lifecycle events (Architecture §3.7.1a)
         "account_created",
