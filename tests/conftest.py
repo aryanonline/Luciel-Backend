@@ -262,6 +262,14 @@ async def _clean_tables() -> AsyncIterator[None]:
     """Truncate tenant tables between tests using a superuser path (bypasses RLS)."""
     yield
     # Cleanup after each test. Use the postgres superuser to truncate regardless of RLS.
+    # admin_audit_log carries a statement-level BEFORE TRUNCATE guard (§5.3, migration
+    # 0019) that does not exempt superusers — wiping an audit table is meant to require
+    # an explicit, visible act. Disabling the guard around the fixture's own TRUNCATE is
+    # that act, and mirrors what the tamper tests do with the row-level guard.
+    _admin_psql(
+        "ALTER TABLE admin_audit_log DISABLE TRIGGER trg_audit_no_truncate",
+        db=TEST_DB,
+    )
     _admin_psql(
         "TRUNCATE leads, instances, accounts, admin_audit_log, knowledge_sources, "
         "knowledge_chunks, knowledge_entities, knowledge_edges, sessions, transcripts, "
@@ -269,5 +277,9 @@ async def _clean_tables() -> AsyncIterator[None]:
         "instance_tool_authorizations, conversation_budgets, voice_call_records, "
         "deferred_actions, billing_accounts "
         "RESTART IDENTITY CASCADE",
+        db=TEST_DB,
+    )
+    _admin_psql(
+        "ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate",
         db=TEST_DB,
     )

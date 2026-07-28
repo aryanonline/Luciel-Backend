@@ -133,7 +133,7 @@ async def sync_connection(
                 )
             )
             from app.knowledge.chunking import chunk_text
-            from app.runtime.embeddings import get_embedder
+            from app.knowledge.embeddings import get_embedder
 
             chunks = chunk_text(item.text)
             vectors = await get_embedder().embed(chunks) if chunks else []

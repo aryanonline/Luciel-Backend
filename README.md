@@ -18,13 +18,18 @@ Alembic, Pydantic v2, Redis, pgvector. Built arc-by-arc (Architecture §6).
   2. Postgres RLS (`ENABLE` + `FORCE`; policy `admin_id = current_setting('app.admin_id')`),
   3. per-request `app.admin_id` set once from the authenticated subject.
   Proven by `tests/isolation/` — the non-overridable CI gate.
-- **Append-only, hash-chained audit log** (§5.2/§5.3): `admin_audit_log` is owned
+- **Append-only, hash-chained audit log** (§5.2/§5.3) **and operator-access log**
+  (§5.11 / Commitment C23): `admin_audit_log` and `internal_access_log` are both owned
   by `luciel_audit_owner` (a NOLOGIN role the app role is **not** a member of) with
-  the app role granted only INSERT+SELECT and an owner-owned `BEFORE UPDATE OR DELETE`
-  guard trigger — so immutability is a true lock, not a revocable grant (the app role
-  cannot re-grant itself UPDATE/DELETE nor drop the guard). SHA-256 `prev_hash` per
-  `admin_id`. The ownership transfer + guard install runs as a superuser **after**
-  `alembic upgrade head` via `scripts/lock_audit_log.sql` (Docker/CI/ops post-migrate step).
+  the app role granted only INSERT+SELECT, an owner-owned `BEFORE UPDATE OR DELETE`
+  row guard, and a statement-level `BEFORE TRUNCATE` guard — so immutability is a true
+  lock, not a revocable grant (the app role cannot re-grant itself UPDATE/DELETE/TRUNCATE
+  nor drop the guards). TRUNCATE needs both: it is a privilege of its own that `REVOKE
+  UPDATE, DELETE` does not touch, is inherent to the table owner, and never fires a
+  row-level trigger. SHA-256 `prev_hash` per `admin_id`. The ownership transfer + guard
+  install runs as a superuser **after** `alembic upgrade head` via
+  `scripts/lock_audit_log.sql` (Docker/CI/ops post-migrate step); `scripts/verify_probe.sql`
+  re-checks it (rows 3d/3e) on a deployed database.
 
 ## Local development
 

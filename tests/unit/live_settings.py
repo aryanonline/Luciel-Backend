@@ -1,10 +1,14 @@
 """Build a live-mode ``Settings`` for provider-binding tests.
 
 Live mode fails closed on the platform-wide secrets whose defaults are published in this
-repo — the JWT signing key and the Stripe webhook signing secret — so any non-empty
+repo — the JWT signing key and the Stripe webhook signing secret — so a live-mode
 platform-secret blob must carry them or ``Settings`` refuses to construct. Those guards are
 not what the provider tests are exercising, so this supplies them and lets each test pass
 only the provider keys it actually cares about.
+
+An EMPTY blob is no exception: it used to skip both guards, which is the whole reason a
+live deploy could boot with a forgeable session key. Tests that reach live mode through
+the environment rather than by constructing ``Settings`` need ``LIVE_PLATFORM_SECRET``.
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ REQUIRED_IN_LIVE_MODE = {
     "JWT_SIGNING_KEY": "unit-test-signing-key",
     "STRIPE_WEBHOOK_SECRET": "whsec_unit_test_not_the_published_constant",
 }
+
+LIVE_PLATFORM_SECRET = json.dumps(REQUIRED_IN_LIVE_MODE)
 
 
 def live_settings(**blob: str) -> Settings:

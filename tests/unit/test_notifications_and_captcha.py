@@ -6,6 +6,20 @@ import pytest
 from app.auth.captcha import verify_captcha
 from app.notifications.email_sender import NullEmailSender, build_email_sender
 
+from tests.unit.live_settings import LIVE_PLATFORM_SECRET
+
+
+def _live_captcha_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live mode + a configured hCaptcha secret, and nothing else failing closed.
+
+    Live mode refuses to boot without the platform-wide secrets, so they have to be
+    provisioned here or every assertion below passes on the boot guard instead of on the
+    captcha behaviour it is meant to pin.
+    """
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    monkeypatch.setenv("LUCIEL_PLATFORM_SECRET", LIVE_PLATFORM_SECRET)
+    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+
 
 async def test_null_sender_records_without_network():
     s = NullEmailSender()
@@ -29,8 +43,7 @@ async def test_captcha_noop_when_unconfigured():
 
 
 async def test_captcha_enforced_when_live_and_configured(monkeypatch):
-    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
-    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    _live_captcha_env(monkeypatch)
     from app.config import get_settings
 
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -46,8 +59,7 @@ async def test_captcha_enforced_when_live_and_configured(monkeypatch):
 async def test_captcha_bypass_rejected_when_flag_off(monkeypatch):
     """Fail-safe: the seedtest bypass token must NOT pass when the flag is off, even in
     live+configured mode (this is the prod posture — prod never sets the flag)."""
-    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
-    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    _live_captcha_env(monkeypatch)
     monkeypatch.delenv("LUCIEL_ALLOW_CAPTCHA_BYPASS_TOKEN", raising=False)
     from app.config import get_settings
 
@@ -63,8 +75,7 @@ async def test_captcha_bypass_rejected_when_flag_off(monkeypatch):
 @pytest.mark.asyncio
 async def test_captcha_bypass_passes_when_flag_on(monkeypatch):
     """Non-prod seam: with the flag ON, the exact bypass token passes with no network."""
-    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
-    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    _live_captcha_env(monkeypatch)
     monkeypatch.setenv("LUCIEL_ALLOW_CAPTCHA_BYPASS_TOKEN", "true")
     from app.config import get_settings
 

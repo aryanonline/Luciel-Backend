@@ -46,7 +46,9 @@ def test_live_mode_builds_real_providers_from_secret() -> None:
 
 
 def test_live_mode_missing_keys_raises() -> None:
-    settings = Settings(integration_mode="live", platform_secret="{}")
+    # Only the platform-wide secrets are provisioned: live mode now refuses to construct
+    # Settings at all on an empty blob, so the provider keys must be the sole omission.
+    settings = live_settings()
     with pytest.raises(RuntimeError) as exc:
         build_llm_router(settings)
     # The error names the missing keys but never echoes any value.

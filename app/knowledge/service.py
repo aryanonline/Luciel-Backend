@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.knowledge.chunking import chunk_text
+from app.knowledge.embeddings import get_embedder
 from app.knowledge.graph_extract import GraphExtractor, get_extractor
 from app.models.audit import ActorType
 from app.models.knowledge import (
@@ -27,7 +28,6 @@ from app.models.knowledge import (
     KnowledgeEntity,
     KnowledgeSource,
 )
-from app.runtime.embeddings import get_embedder
 
 TOTAL_QUOTA_BYTES = 5 * 1000 * 1000 * 1000  # 5 GB (Vision §7)
 PER_FILE_MAX_BYTES = 50 * 1000 * 1000  # 50 MB

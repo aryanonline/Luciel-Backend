@@ -47,6 +47,44 @@ BEGIN
   IF su THEN RAISE EXCEPTION 'ROW4-FAIL: app role % is superuser', current_user; END IF;
 END $$;
 
+-- ROW 3d: TRUNCATE on either append-only artifact MUST be rejected. This is the probe
+-- whose absence let the internal_access_log gap (B4) ship: TRUNCATE is a separate
+-- privilege, inherent to the table owner, and row-level guards never fire on it — so
+-- an ownership regression is invisible to the UPDATE/DELETE probes above. If the
+-- TRUNCATE is ALLOWED we raise, which aborts the script and rolls the TRUNCATE back
+-- with the failed transaction.
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['admin_audit_log', 'internal_access_log'] LOOP
+    BEGIN
+      EXECUTE format('TRUNCATE TABLE %I', t);
+      RAISE EXCEPTION 'ROW3-FAIL: TRUNCATE on % was ALLOWED', t;
+    EXCEPTION
+      WHEN insufficient_privilege OR raise_exception OR others THEN
+        IF SQLERRM LIKE 'ROW3-FAIL%' THEN RAISE;  -- re-raise our own failure
+        END IF;  -- otherwise the rejection is the PASS path
+    END;
+  END LOOP;
+END $$;
+
+-- ROW 3e: neither audit artifact may be owned by the app role — ownership is what
+-- actually removes TRUNCATE and DDL (a REVOKE is a speed-bump, see lock_audit_log.sql).
+DO $$
+DECLARE bad text;
+BEGIN
+  SELECT string_agg(c.relname, ', ') INTO bad
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_roles r ON r.oid = c.relowner
+   WHERE n.nspname = 'public'
+     AND c.relname IN ('admin_audit_log', 'internal_access_log')
+     AND r.rolname = current_user;
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'ROW3-FAIL: app role % still OWNS audit table(s): %', current_user, bad;
+  END IF;
+END $$;
+
 -- ROW 4: no raw-credential columns in instance_connections (pointer-only). Fail hard.
 DO $$
 DECLARE bad int;
@@ -63,5 +101,8 @@ SELECT current_user AS app_role,
        (SELECT rolsuper FROM pg_roles WHERE rolname=current_user) AS is_superuser,
        (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
           WHERE c.relname='admin_audit_log' AND NOT t.tgisinternal) AS audit_guard_triggers,
+       (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+          WHERE c.relname='internal_access_log' AND NOT t.tgisinternal)
+         AS internal_access_guard_triggers,
        (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
           WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity) AS rls_enabled_tables;

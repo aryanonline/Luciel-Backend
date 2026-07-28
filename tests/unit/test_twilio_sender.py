@@ -21,6 +21,8 @@ from app.channels.twilio_sender import (
 )
 from app.config import get_settings
 
+from tests.unit.live_settings import LIVE_PLATFORM_SECRET
+
 
 @pytest.mark.asyncio
 async def test_null_sms_sender_records_send_no_network():
@@ -61,6 +63,9 @@ def test_build_sms_sender_stays_null_when_live_but_no_account_sid(monkeypatch):
     must honestly degrade to NullSmsSender rather than construct a broken/half
     configured live sender (see gap_twilio.md)."""
     monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
+    # Live mode fails closed without the platform-wide secrets; provision them so the
+    # assertion below lands on the SMS factory rather than on the boot guard.
+    monkeypatch.setenv("LUCIEL_PLATFORM_SECRET", LIVE_PLATFORM_SECRET)
     monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SID", "SK00000000000000000000000000000000")
     monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SECRET", "fixture-api-key-secret")
     # Deliberately NOT setting LUCIEL_TWILIO_ACCOUNT_SID — that field does not

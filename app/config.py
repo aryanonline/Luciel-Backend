@@ -180,6 +180,10 @@ class Settings(BaseSettings):
     # Upper bound on generated tokens per LLM call (platform cost control).
     llm_max_output_tokens: int = 1024
 
+    # Knowledge embedding model (§3.2.2). Native 1536 dims matches the
+    # `vector(1536)` column, so the model can be swapped without a reindex migration.
+    knowledge_embedding_model: str = "text-embedding-3-small"
+
     # --- Knowledge-sync connector OAuth (Architecture §3.2.3 / §3.8.3) ---------
     # Client id/secret + redirect URI per OAuth-class knowledge-sync provider
     # (Google Drive, HubSpot, Salesforce). These are the APPLICATION's OAuth-client
@@ -218,9 +222,14 @@ class Settings(BaseSettings):
         per-tenant OAuth *tokens* are NOT touched here — those are real secret
         material stored as tenant-scoped secret_ref ARNs by the connections layer.
         """
+        # NB: an EMPTY blob must NOT short-circuit this method. The fail-closed checks
+        # below (JWT signing key, Stripe webhook secret) are exactly the checks a
+        # live deploy with an unprovisioned secret needs, and an early `return` here
+        # meant `platform_secret="{}"` — or whitespace, or unparsable JSON — sailed
+        # past both of them and booted live with a forgeable session key. Every
+        # overlay below is already written as `blob.get(...)`, so an empty mapping is
+        # a no-op for them; only the guards change behaviour.
         blob = parse_platform_secret(self.platform_secret)
-        if not blob:
-            return
         # blob key -> settings attribute. Only platform-owned APP credentials.
         # NOTE: the dict VALUES are Pydantic field NAMES (not secret values); bandit's
         # B105 heuristic flags the name strings ending in secret/token/key, hence the
