@@ -475,3 +475,248 @@ async def test_switch_missing_connection_is_404(client):
         f"/api/v1/admin/connections/{uuid.uuid4()}/switch", json={"provider": "calendly"}
     )
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Decision #7 — the GENERIC OAuth code-for-token callback. Meta's channel_auth
+# connect could previously reach a consent screen but never leave `unconfigured`,
+# because a callback existed only for knowledge sync. One route now completes any
+# registered OAuth provider, on any connection type, with no per-provider branch.
+# --------------------------------------------------------------------------- #
+def _meta_settings():
+    from app.config import Settings
+
+    return Settings(
+        meta_app_id="meta-cid",
+        meta_app_secret="meta-csecret",  # noqa: S106 — test fixture, not a real secret
+        meta_redirect_uri="https://api.example.com/meta-callback",
+    )
+
+
+def _configure_meta(monkeypatch) -> None:
+    """Point every settings read the flow makes at a configured Meta app.
+
+    The registry resolves the OAuth app credential (Decision #6) and the exchange reads
+    the same config, so both modules have to see it or connect-start silently degrades
+    to `requiresClientForm`."""
+    from app.connections import registry as registry_module
+    from app.knowledge import providers as providers_module
+
+    settings = _meta_settings()
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
+
+
+def _fake_meta_transport(expected_code: str, monkeypatch):
+    """Stand in for graph.facebook.com's token endpoint, asserting the registry's
+    exchange_endpoint is what gets called."""
+    import app.api.v1.admin.connections as connections_api
+    import httpx
+
+    class FakeTokenTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def post(self, url, *, data=None, headers=None):
+            self.calls.append((url, dict(data or {})))
+            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert data["code"] == expected_code
+            return httpx.Response(
+                200,
+                json={"access_token": "meta-tok-1", "expires_in": 5184000},
+                request=httpx.Request("POST", url),
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    transport = FakeTokenTransport()
+    monkeypatch.setattr(connections_api, "oauth_transport", lambda: transport)
+    return transport
+
+
+def _state_from_authorize_url(url: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    return parse_qs(urlparse(url).query)["state"][0]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_meta_oauth_callback_stores_the_token_and_connects(client, monkeypatch):
+    """The full Meta round trip through the public API: connect-start mints the state,
+    the callback redeems the code, and the token lands in the SecretStore under the
+    CHANNEL_AUTH ref — not the knowledge ref the old callback hardcoded (§3.8.3)."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    _configure_meta(monkeypatch)
+    transport = _fake_meta_transport("meta-code-1", monkeypatch)
+
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    instance_id = await _instance_id(admin_id)
+
+    rs = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+    )
+    assert rs.status_code == 200, rs.text
+    authorize_url = rs.json()["authorizeUrl"]
+    assert authorize_url, rs.json()
+
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    conn = next(c for c in listed if c["connectionType"] == "channel_auth")
+    assert conn["status"] == "unconfigured"
+
+    rcb = await client.post(
+        f"/api/v1/admin/connections/{conn['connectionId']}/oauth-callback",
+        json={"code": "meta-code-1", "state": _state_from_authorize_url(authorize_url)},
+    )
+    assert rcb.status_code == 200, rcb.text
+    body = rcb.json()
+    assert body["status"] == "connected"
+    assert body["statusDetail"] is None
+    # Secret material must never ride the wire (§3.8.3).
+    assert "secretRef" not in body
+    assert "access_token" not in rcb.text
+
+    stored = await get_secret_store().get(secret_ref_for(admin_id, instance_id, "channel_auth"))
+    assert stored is not None, "the callback must persist the token for the channel"
+    assert stored["access_token"] == "meta-tok-1"
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_meta_oauth_callback_audits_the_status_change(client, monkeypatch):
+    from app.db.session import tenant_session
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select
+
+    _configure_meta(monkeypatch)
+    _fake_meta_transport("meta-code-2", monkeypatch)
+
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    rs = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "channel_auth", "provider": "meta_instagram"},
+    )
+    state = _state_from_authorize_url(rs.json()["authorizeUrl"])
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/oauth-callback",
+        json={"code": "meta-code-2", "state": state},
+    )
+    assert r.status_code == 200, r.text
+
+    async with tenant_session(admin_id) as s:
+        rows = (
+            await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin_id))
+        ).scalars()
+        connects = [
+            e
+            for e in rows
+            if e.event_type == "connection_status_changed"
+            and (e.event_payload or {}).get("reason") == "oauth_callback_token_exchanged"
+        ]
+    assert len(connects) == 1
+    assert connects[0].event_payload["new_status"] == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_meta_oauth_callback_rejects_a_replayed_state(client, monkeypatch):
+    """``state`` is single-use (§5.1): it is consumed BEFORE the exchange, so a second
+    callback carrying the same state finds no live attempt to ride. Without this a site
+    that can drive the admin's browser here could graft its own account onto the tenant."""
+    _configure_meta(monkeypatch)
+    _fake_meta_transport("meta-code-3", monkeypatch)
+
+    await _ready_account_with_luciel(client)
+    rs = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+    )
+    state = _state_from_authorize_url(rs.json()["authorizeUrl"])
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+    path = f"/api/v1/admin/connections/{cid}/oauth-callback"
+
+    body = {"code": "meta-code-3", "state": state}
+    assert (await client.post(path, json=body)).status_code == 200
+    replay = await client.post(path, json=body)
+    assert replay.status_code == 422, replay.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_meta_oauth_callback_surfaces_a_rejected_code_as_conflict(client, monkeypatch):
+    """A provider that refuses the code is a clean 409 with the reason recorded on the
+    row — never a 500, and never a connection left claiming to be connected."""
+    import app.api.v1.admin.connections as connections_api
+    import httpx
+
+    class FailingTokenTransport:
+        async def post(self, url, *, data=None, headers=None):
+            return httpx.Response(
+                400,
+                json={"error": {"message": "This authorization code has expired."}},
+                request=httpx.Request("POST", url),
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    _configure_meta(monkeypatch)
+    monkeypatch.setattr(connections_api, "oauth_transport", lambda: FailingTokenTransport())
+
+    await _ready_account_with_luciel(client)
+    rs = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+    )
+    state = _state_from_authorize_url(rs.json()["authorizeUrl"])
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/oauth-callback",
+        json={"code": "expired", "state": state},
+    )
+    assert r.status_code == 409, r.text
+
+    after = (await client.get("/api/v1/admin/connections")).json()
+    row = next(c for c in after if c["connectionType"] == "channel_auth")
+    assert row["status"] != "connected"
+    assert "oauth_exchange_failed" in (row["statusDetail"] or "")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oauth_callback_rejects_a_non_oauth_provider_and_a_foreign_id(client, monkeypatch):
+    """The route is generic, not universal: a credential-form provider has no code to
+    redeem, and a connection id belonging to someone else is simply not found."""
+    _configure_meta(monkeypatch)
+
+    await _ready_account_with_luciel(client)
+    r404 = await client.post(
+        f"/api/v1/admin/connections/{uuid.uuid4()}/oauth-callback",
+        json={"code": "c", "state": "s"},
+    )
+    assert r404.status_code == 404
+
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "crm", "provider": "custom_webhook"},
+    )
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "crm")
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/oauth-callback", json={"code": "c", "state": "s"}
+    )
+    assert r.status_code == 422, r.text
+    assert "no OAuth callback" in r.text

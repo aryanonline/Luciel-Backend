@@ -46,6 +46,9 @@ class ProviderAuthorize:
     endpoint: str
     scopes: str
     supports_pkce: bool
+    # Where the ``code`` is redeemed. Registering it here (rather than in a map beside
+    # the exchange code) is what makes a new OAuth provider pure configuration.
+    exchange_endpoint: str | None = None
     # Provider-specific params that are part of OUR request, not the user's choice
     # (e.g. Google only returns a refresh_token for an offline+consent request).
     extra: dict[str, str] = field(default_factory=dict)
@@ -112,6 +115,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            exchange_endpoint="https://oauth2.googleapis.com/token",
             scopes="https://www.googleapis.com/auth/calendar.events",
             supports_pkce=True,
             extra={"access_type": "offline", "prompt": "consent"},
@@ -128,6 +132,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://auth.calendly.com/oauth/authorize",
+            exchange_endpoint="https://auth.calendly.com/oauth/token",
             scopes="default",
             supports_pkce=True,
         ),
@@ -144,6 +149,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://app.hubspot.com/oauth/authorize",
+            exchange_endpoint="https://api.hubapi.com/oauth/v1/token",
             scopes="crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read",
             # HubSpot's authorize endpoint rejects unknown query params, and it does not
             # implement PKCE — sending a code_challenge fails the request outright.
@@ -161,6 +167,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://login.salesforce.com/services/oauth2/authorize",
+            exchange_endpoint="https://login.salesforce.com/services/oauth2/token",
             scopes="api refresh_token",
             supports_pkce=True,
         ),
@@ -211,6 +218,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            exchange_endpoint="https://oauth2.googleapis.com/token",
             scopes="https://www.googleapis.com/auth/drive.readonly",
             supports_pkce=True,
             extra={
@@ -232,6 +240,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://api.notion.com/v1/oauth/authorize",
+            exchange_endpoint="https://api.notion.com/v1/oauth/token",
             scopes="",
             supports_pkce=False,
             extra={"owner": "user"},
@@ -254,6 +263,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://www.facebook.com/v19.0/dialog/oauth",
+            exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
             scopes="whatsapp_business_messaging,whatsapp_business_management,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
             supports_pkce=False,
@@ -270,6 +280,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://www.facebook.com/v19.0/dialog/oauth",
+            exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
             scopes="instagram_basic,instagram_manage_messages,pages_messaging,"
             "pages_show_list,business_management",
             supports_pkce=False,

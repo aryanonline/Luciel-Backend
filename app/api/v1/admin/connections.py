@@ -8,6 +8,7 @@ Implements the frozen admin client (http-admin.ts connections.*) field-for-field
   * GET    /connections/providers             → ConnectionProviders[] (Decision #6)
   * POST   /connections/{id}/disconnect       → DisconnectResult (Decision #5b)
   * POST   /connections/{id}/switch {provider} → StartConnectionResult (Decision #5c)
+  * POST   /connections/{id}/oauth-callback   → Connection (Decision #7, any provider)
   * DELETE /connections/{id}                  → 204 (status→revoked + secret cleanup)
   * GET    /connections/email                 → EmailProvisioning | null (§3.1.6a)
   * POST   /connections/email {mode,...}       → EmailProvisioning (§3.1.6a)
@@ -21,15 +22,27 @@ here — the wire model has no field for it (§3.8.3).
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
+import httpx
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import not_found, validation_error
-from app.connections import registry, service
+from app.api.errors import conflict, not_found, validation_error
+from app.audit import log as audit
+from app.connections import oauth_flow, registry, service
+from app.connections.secrets import get_secret_store
 from app.db.session import tenant_session
+from app.knowledge.providers import (
+    HttpTransport,
+    OAuthExchangeError,
+    ProviderUnavailable,
+    exchange_code_for_token,
+    store_oauth_token,
+)
+from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance
 from app.schemas_api.connections import (
@@ -44,8 +57,15 @@ from app.schemas_api.connections import (
     SwapConnectionRequest,
     SwitchConnectionRequest,
 )
+from app.schemas_api.knowledge import OAuthCallbackRequest
 
 router = APIRouter(prefix="/api/v1/admin/connections", tags=["connections"])
+
+
+def oauth_transport() -> httpx.AsyncClient:
+    """Factory for the token-exchange transport, so tests can substitute a FAKE with no
+    real network call (same seam the knowledge callback uses)."""
+    return httpx.AsyncClient(timeout=15.0)
 
 
 def _connection_out(c: InstanceConnection) -> ConnectionOut:
@@ -81,6 +101,24 @@ async def _instance_row(s: AsyncSession, admin_id: uuid.UUID) -> Instance:
     if inst is None:
         raise not_found("No Luciel.")
     return inst
+
+
+async def _tenant_connection(
+    s: AsyncSession, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> InstanceConnection:
+    """This tenant's connection row, or 404. RLS already scopes the session; the explicit
+    ``admin_id`` predicate keeps the query honest on its own terms."""
+    conn = (
+        await s.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if conn is None:
+        raise not_found("Connection not found.")
+    return conn
 
 
 def _email_provisioning_out(c: InstanceConnection) -> EmailProvisioningOut:
@@ -320,6 +358,111 @@ async def switch_connection(
             raise not_found("Connection not found.")
         _, result = out
         return StartConnectionResult.model_validate(result)
+
+
+@router.post("/{connection_id}/oauth-callback", response_model=ConnectionOut)
+async def oauth_callback(
+    connection_id: uuid.UUID,
+    req: OAuthCallbackRequest,
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Complete an OAuth connect for any registry provider (Decisions #5/#7).
+
+    Knowledge sync had its own callback; the Meta channels (and every future OAuth
+    provider on a non-knowledge connection type) had none, so a `channel_auth` connect
+    could reach a consent screen but never leave ``unconfigured``. This is the generic
+    half: the token endpoint, PKCE posture, and secret-ref convention all come from the
+    registry, so the route needs no per-provider branch.
+
+    ``state`` is MANDATORY and single-use (§5.1): it is read-and-cleared BEFORE the
+    exchange, so a replayed callback finds no live attempt to ride. Without that check
+    the endpoint would redeem a code obtained by any site that could drive the admin's
+    browser here — CSRF straight into a tenant's connection.
+
+    The exchange runs BETWEEN two committed transactions rather than inside one. The
+    single transaction it replaces rolled back on any failure, which silently undid both
+    the state consumption (so a burnt state came back to life) and the recorded reason —
+    leaving the owner staring at a 409 and a connection that claimed nothing was wrong.
+
+    A rejected code surfaces as a clean 409, never a crash.
+    """
+    async with tenant_session(subject.admin_id) as s:
+        conn = await _tenant_connection(s, subject.admin_id, connection_id)
+        spec = registry.get_provider(conn.provider)
+        if spec is None or not spec.is_oauth:
+            raise validation_error(
+                f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
+            )
+        provider = conn.provider
+        connection_type = conn.connection_type
+        instance_id = await _instance_id(s, subject.admin_id)
+        expected_jti = service.consume_oauth_state(conn)
+        state_rejected = None
+        try:
+            oauth_flow.verify_state(
+                req.state,
+                admin_id=subject.admin_id,
+                connection_id=conn.connection_id,
+                expected_jti=expected_jti,
+            )
+        except oauth_flow.StateRejected as exc:
+            state_rejected = str(exc)
+        # Commit the consumption either way: a state that has been offered once is spent,
+        # whether or not it verified.
+    if state_rejected is not None:
+        raise validation_error(state_rejected)
+
+    authorize = spec.authorize
+    verifier = (
+        oauth_flow.verifier_for_jti(expected_jti)
+        if authorize is not None and authorize.supports_pkce and expected_jti
+        else None
+    )
+    async with oauth_transport() as transport:
+        try:
+            material = await exchange_code_for_token(
+                provider,
+                code=req.code,
+                transport=cast("HttpTransport", transport),
+                code_verifier=verifier,
+            )
+        except OAuthExchangeError as exc:
+            await service.record_exchange_failure(subject.admin_id, connection_id, str(exc))
+            raise conflict(f"OAuth token exchange failed: {exc}") from exc
+        except ProviderUnavailable as exc:
+            await service.record_exchange_failure(subject.admin_id, connection_id, str(exc))
+            raise conflict(str(exc)) from exc
+
+    # The token is durable before the row claims to be connected, so a crash in between
+    # leaves a retryable "not connected yet" rather than a connection with no credential.
+    await store_oauth_token(
+        get_secret_store(),
+        admin_id=subject.admin_id,
+        instance_id=instance_id,
+        material=material,
+        connection_type=connection_type,
+    )
+    async with tenant_session(subject.admin_id) as s:
+        conn = await _tenant_connection(s, subject.admin_id, connection_id)
+        old_status = conn.status
+        conn.status = "connected"
+        conn.status_detail = None
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "old_status": old_status,
+                "new_status": "connected",
+                "reason": "oauth_callback_token_exchanged",
+            },
+        )
+        return _connection_out(conn)
 
 
 @router.delete("/{connection_id}", status_code=204)

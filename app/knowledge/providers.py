@@ -38,6 +38,7 @@ from typing import Protocol
 import httpx
 
 from app.config import get_settings
+from app.connections import registry
 from app.connections.registry import oauth_client_config
 from app.connections.secrets import SecretStore, secret_ref_for
 from app.knowledge import scope
@@ -98,11 +99,13 @@ async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uu
 # chain is provably wired end-to-end in mock mode; only the provider's own HTTP
 # round-trip is the documented manual seam (see gap_oauth.md).
 # --------------------------------------------------------------------------- #
-_TOKEN_ENDPOINTS: dict[str, str] = {
-    "google_drive": "https://oauth2.googleapis.com/token",
-    "hubspot": "https://api.hubapi.com/oauth/v1/token",
-    "salesforce": "https://login.salesforce.com/services/oauth2/token",
-}
+def _exchange_endpoint(provider: str) -> str | None:
+    """Where a provider's ``code`` is redeemed, per the registry (Decision #6).
+
+    Registered as configuration rather than a module-local map, so a newly registered
+    provider is exchangeable without editing this file."""
+    spec = registry.get_provider(provider)
+    return spec.authorize.exchange_endpoint if spec is not None and spec.authorize else None
 
 
 class OAuthExchangeError(Exception):
@@ -139,7 +142,7 @@ async def exchange_code_for_token(
         raise ProviderUnavailable(
             f"OAuth client for '{provider}' is not configured (missing client_id/secret)."
         )
-    endpoint = _TOKEN_ENDPOINTS.get(provider)
+    endpoint = _exchange_endpoint(provider)
     if endpoint is None:
         raise ProviderUnavailable(f"No token endpoint registered for provider '{provider}'.")
 
@@ -181,15 +184,17 @@ async def store_oauth_token(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     material: dict[str, str],
+    connection_type: str = "knowledge_source",
 ) -> str:
     """Write exchanged token material to the tenant-scoped secret_ref (§3.8.3).
 
-    Uses the SAME ``secret_ref_for(admin_id, instance_id, "knowledge_source")``
-    convention the sync-time ``_bearer_token`` reader consumes, so a token
-    written here is immediately usable by the next sync run with no other
-    wiring — this is the link that closes connect -> callback -> sync.
+    Uses the SAME ``secret_ref_for(admin_id, instance_id, connection_type)``
+    convention the readers consume, so a token written here is immediately usable
+    with no other wiring — this is the link that closes connect -> callback -> use.
+    ``connection_type`` defaults to knowledge sync, and is ``channel_auth`` for the
+    Meta channel callback (Decision #7).
     """
-    ref = secret_ref_for(admin_id, instance_id, "knowledge_source")
+    ref = secret_ref_for(admin_id, instance_id, connection_type)
     await store.put(ref, material)
     return ref
 

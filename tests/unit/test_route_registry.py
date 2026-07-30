@@ -86,6 +86,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/admin/connections/providers"),
         ("POST", "/api/v1/admin/connections/{connection_id}/disconnect"),
         ("POST", "/api/v1/admin/connections/{connection_id}/switch"),
+        # Generic OAuth code-for-token callback (Decision #7): the Meta channels — and
+        # every future OAuth provider on a non-knowledge connection type — complete here.
+        ("POST", "/api/v1/admin/connections/{connection_id}/oauth-callback"),
         # admin/usage
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),

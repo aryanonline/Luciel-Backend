@@ -118,6 +118,30 @@ def consume_oauth_state(connection: InstanceConnection) -> str | None:
     return jti if isinstance(jti, str) else None
 
 
+async def record_exchange_failure(
+    admin_id: uuid.UUID, connection_id: uuid.UUID, detail: str
+) -> None:
+    """Persist WHY a token exchange failed, in its OWN committed transaction.
+
+    The reason has to outlive the request that discovered it. Callers raise a 409 straight
+    afterwards, so writing it to the transaction being abandoned would discard the
+    diagnostic along with the rollback, leaving the owner an error toast and a row that
+    still claims nothing is wrong."""
+    from app.db.session import tenant_session
+
+    async with tenant_session(admin_id) as s:
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if conn is not None:
+            conn.status_detail = f"oauth_exchange_failed: {detail}"
+
+
 async def _single_active(
     session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
 ) -> InstanceConnection | None:
