@@ -153,6 +153,30 @@ export class ComputeStack extends Stack {
         resources: [platformSecret.secretArn, dbSecret.secretArn],
       }),
     );
+    // Per-tenant connection credentials (Arch §3.8.3). app/connections/secrets.py
+    // SecretsManagerStore creates/reads/rotates/deletes one secret per connection at
+    // `vm/{admin_id}/{instance_id}/{connection_type}`. The ReadSecrets grant above
+    // covers only the platform + DB secrets, so without this every credential submit
+    // fails AccessDenied -> 500. Scoped to the `vm/` tenant prefix, never `*`, so the
+    // task can reach connection secrets and nothing else in the account (§3.8.3 rule 5).
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ManageTenantConnectionSecrets',
+        actions: [
+          'secretsmanager:CreateSecret',
+          'secretsmanager:PutSecretValue',
+          'secretsmanager:GetSecretValue',
+          'secretsmanager:DescribeSecret',
+          'secretsmanager:DeleteSecret',
+          // CreateSecret with tags is authorized against TagResource; harmless today
+          // (no Tags are passed) and required the moment tenant tagging is added.
+          'secretsmanager:TagResource',
+        ],
+        // Secrets Manager appends a 6-char suffix to the name in the ARN, so the
+        // prefix match is `secret:vm/*`.
+        resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:vm/*`],
+      }),
+    );
     taskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'UseCmk',
