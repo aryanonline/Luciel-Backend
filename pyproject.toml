@@ -41,6 +41,14 @@ dependencies = [
     "anthropic>=0.40",
     "openai>=1.55",
     "boto3>=1.35",
+    # SMS/Voice transport (Architecture §3.1.4 BYO-number). Runtime dependency, not
+    # optional: the tenant send path, credential verification and the number
+    # operability probe all construct `twilio.rest.Client`. Those imports are lazy and
+    # ImportError-guarded, so a missing package degrades SILENTLY — an unverifiable
+    # number reported as `not_operable_hosting_required` — rather than crashing. Major
+    # 9 is the line the `Client(sid, token)` / `Client(key_sid, key_secret, account_sid)`
+    # constructors and the `incoming_phone_numbers` / `api.accounts()` resources match.
+    "twilio>=9.0,<10",
     # Knowledge file parsers (Architecture §3.2.3 / §3.2 ingestion pipeline): PDF and
     # DOCX text extraction for the upload path. Pure-Python, no native deps, so the
     # image build stays simple; CSV/TXT need no extra library (stdlib csv + decode).

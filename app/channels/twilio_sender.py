@@ -10,16 +10,15 @@ Closes the SMS/voice SEND-path deferred stub. Two implementations behind the
 - ``NullSmsSender``   — mock/CI: records sends in-memory, makes NO network call,
   so the suite stays hermetic and deterministic. This is the default.
 
-KNOWN GAP (see gap_twilio.md): the provided Twilio credential is an API-Key SID
-(``SK...``) + secret + a Client ID, but the Twilio REST client (``twilio.rest.Client``)
-REQUIRES an Account SID (``AC...``) — an API-Key SID cannot substitute for it (Twilio
-authenticates API-Key/secret pairs *against* an Account SID, it does not replace it).
-So ``TwilioSmsSender`` accepts an ``account_sid`` field and ``build_sms_sender()``
-only binds the real sender when one is configured; live SMS sending is BLOCKED until
-the owner supplies the Twilio Account SID. Until then ``build_sms_sender()`` returns
-``NullSmsSender`` even if ``integration_mode == \"live\"`` — honest degradation,
-matching the codebase's existing integration-mode seam pattern (see
-``build_email_sender`` in ``app/notifications/email_sender.py``).
+An Account SID (``AC...``) is always mandatory: an API-Key SID (``SK...``) + secret is
+an alternative to the Account auth token, not a replacement for the Account SID —
+Twilio authenticates API-Key pairs *against* an account. In the BYO model (§3.1.4) the
+tenant supplies their own Account SID with their ``sms_sender`` connection, so the
+customer-facing path (``app.channels.tenant_twilio``) is fully satisfied. The
+platform-level ``build_sms_sender()`` below still degrades to ``NullSmsSender`` when no
+platform Account SID is configured — honest degradation, matching the codebase's
+integration-mode seam pattern (see ``build_email_sender`` in
+``app/notifications/email_sender.py``).
 
 Twilio magic test numbers (https://www.twilio.com/docs/iam/test-credentials) are
 used in tests/mock mode (e.g. ``from=+15005550006``) so the send *shape* is
@@ -55,8 +54,7 @@ class SmsSenderProtocol(Protocol):
 class NullSmsSender:
     """Mock/CI sender — records intent, no network. Inspectable in tests.
 
-    Default sender when Twilio is not configured for live sending (§3.1.4) —
-    including the current Account-SID-missing blocker (see module docstring).
+    Default sender when Twilio is not configured for live sending (§3.1.4).
     """
 
     def __init__(self) -> None:
@@ -93,7 +91,7 @@ class TwilioSmsSender:
         if not self.account_sid:
             raise RuntimeError(
                 "TwilioSmsSender requires a Twilio Account SID (AC...); only an "
-                "API-Key SID/secret was configured. See gap_twilio.md."
+                "API-Key SID/secret was configured."
             )
         if not self.auth_token and not (self.api_key_sid and self.api_key_secret):
             raise RuntimeError("TwilioSmsSender requires an Auth Token or an API Key SID + secret.")
@@ -125,16 +123,13 @@ def build_sms_sender() -> SmsSenderProtocol:
     (returns Null in mock/CI, which is every non-live environment).
 
     Requires ALL of: ``integration_mode == \"live\"``, a Twilio API-Key SID +
-    secret, AND a Twilio Account SID. The Account SID is the current known gap
-    (see module docstring / gap_twilio.md) — the provided credential has no
-    ``AC...`` value, so this factory returns ``NullSmsSender`` even in live mode
-    until the owner supplies one. This mirrors ``build_email_sender``'s honest
+    secret, AND a Twilio Account SID. With any of them absent this factory returns
+    ``NullSmsSender`` even in live mode, mirroring ``build_email_sender``'s honest
     degradation to Null rather than crashing when a live prerequisite is absent.
 
     Config field names read (getattr-guarded so this module never requires the
-    parent's config.py change to already exist — see gap_twilio.md for the exact
-    field names the parent must add):
-      - ``twilio_account_sid``    (AC... — MISSING today, the blocker)
+    corresponding config.py fields to already exist):
+      - ``twilio_account_sid``    (AC...)
       - ``twilio_api_key_sid``    (SK...)
       - ``twilio_api_key_secret``
     """

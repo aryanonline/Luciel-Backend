@@ -3,9 +3,8 @@
 NO real Twilio network call anywhere in this file. ``NullSmsSender`` records
 sends in-memory; ``build_sms_sender()`` is exercised only in mock config (its
 default) and in a live-but-missing-Account-SID config, which must still resolve
-to Null (the current known blocker — see gap_twilio.md). ``TwilioSmsSender`` is
-exercised for construction-time validation and the Twilio magic test number
-shape only, never a live SDK call.
+to Null. ``TwilioSmsSender`` is exercised for construction-time validation and
+the Twilio magic test number shape only, never a live SDK call.
 """
 
 from __future__ import annotations
@@ -58,19 +57,17 @@ def test_build_sms_sender_defaults_to_null_in_mock(monkeypatch):
 
 
 def test_build_sms_sender_stays_null_when_live_but_no_account_sid(monkeypatch):
-    """KNOWN GAP: even in live mode with an API-Key SID/secret configured, the
-    Account SID (AC...) is absent from the provided credential, so the factory
-    must honestly degrade to NullSmsSender rather than construct a broken/half
-    configured live sender (see gap_twilio.md)."""
+    """In live mode with an API-Key SID/secret configured but no Account SID, the
+    factory must honestly degrade to NullSmsSender rather than construct a
+    broken/half configured live sender."""
     monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "live")
     # Live mode fails closed without the platform-wide secrets; provision them so the
     # assertion below lands on the SMS factory rather than on the boot guard.
     monkeypatch.setenv("LUCIEL_PLATFORM_SECRET", LIVE_PLATFORM_SECRET)
     monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SID", "SK00000000000000000000000000000000")
     monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SECRET", "fixture-api-key-secret")
-    # Deliberately NOT setting LUCIEL_TWILIO_ACCOUNT_SID — that field does not
-    # exist on Settings yet (parent must add it; see gap_twilio.md). getattr()
-    # guards mean this test is correct today AND once the field is added+empty.
+    # Deliberately NOT setting LUCIEL_TWILIO_ACCOUNT_SID. getattr() guards mean this
+    # test is correct whether or not the field exists on Settings.
     get_settings.cache_clear()
     try:
         sender = build_sms_sender()
