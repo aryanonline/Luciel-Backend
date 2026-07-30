@@ -16,11 +16,11 @@ import uuid
 import httpx
 import pytest
 from app.config import Settings
+from app.connections.registry import OAuthClientConfig
 from app.knowledge.providers import (
     GoogleDriveProvider,
     HubSpotProvider,
     NotionProvider,
-    OAuthClientConfig,
     OAuthExchangeError,
     ProviderUnavailable,
     SalesforceProvider,
@@ -87,31 +87,31 @@ def _secret_ref(admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
 # OAuth client config wiring — read from Settings/env, never hardcoded.
 # --------------------------------------------------------------------------- #
 def test_oauth_client_config_reads_from_settings(monkeypatch):
-    from app.knowledge import providers as providers_module
+    from app.connections import registry as registry_module
 
     fresh = Settings(
         google_drive_client_id="cid",
         google_drive_client_secret="csecret",
         google_drive_redirect_uri="https://api.example.com/callback",
     )
-    monkeypatch.setattr(providers_module, "get_settings", lambda: fresh)
+    monkeypatch.setattr(registry_module, "get_settings", lambda: fresh)
     cfg = oauth_client_config("google_drive")
     assert cfg == OAuthClientConfig("cid", "csecret", "https://api.example.com/callback")
     assert cfg.configured
 
 
 def test_oauth_client_config_empty_by_default_is_unconfigured(monkeypatch):
-    from app.knowledge import providers as providers_module
+    from app.connections import registry as registry_module
 
-    monkeypatch.setattr(providers_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(registry_module, "get_settings", lambda: Settings())
     cfg = oauth_client_config("hubspot")
     assert cfg.configured is False
 
 
 def test_oauth_client_config_unknown_provider_returns_empty(monkeypatch):
-    from app.knowledge import providers as providers_module
+    from app.connections import registry as registry_module
 
-    monkeypatch.setattr(providers_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(registry_module, "get_settings", lambda: Settings())
     cfg = oauth_client_config("totally_unknown_provider")
     assert cfg == OAuthClientConfig("", "", "")
 
@@ -369,6 +369,11 @@ def _configured_settings(monkeypatch, provider_module):
         salesforce_redirect_uri="https://api.example.com/sf-callback",
     )
     monkeypatch.setattr(provider_module, "get_settings", lambda: fresh)
+    # The OAuth app-credential lookup reads settings through the provider registry, so
+    # a configured-client test has to patch it there too.
+    from app.connections import registry as registry_module
+
+    monkeypatch.setattr(registry_module, "get_settings", lambda: fresh)
     return fresh
 
 

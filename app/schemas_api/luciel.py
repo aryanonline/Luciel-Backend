@@ -38,6 +38,11 @@ ChannelIdWire = Literal["widget", "email", "sms", "voice", "whatsapp", "instagra
 AddonToolIdWire = Literal[
     "check_availability",
     "book_appointment",
+    # Scheduling is ONE capability over the SINGLE calendar connection (Decision #8):
+    # offering a time and moving/cancelling that time ride the same connection, so these
+    # connect once with check_availability/book_appointment and are gated together.
+    "reschedule_appointment",
+    "cancel_appointment",
     "send_email",
     "send_sms",
     "lookup_record",
@@ -52,6 +57,10 @@ ConnectionStatusWire = Literal[
     "expired",
     "revoked",
     "dormant",
+    # The owner handed the connection back (Decision #5b): the stored credential is
+    # destroyed and the row is in a clean, RECONNECTABLE state. Distinct from `revoked`
+    # (terminal, account teardown) and from `unconfigured` (never connected).
+    "not_connected",
     # SMS/Voice number provisioned but A2P 10DLC carrier registration not yet
     # approved — the channel is NOT live and must not be shown as connected (§3.1.6).
     "pending_carrier_registration",
@@ -85,6 +94,10 @@ class AddonToolOut(WireModel):
     id: AddonToolIdWire
     enabled: bool
     connection_status: ConnectionStatusWire | None = None
+    # Set by the platform when a tool was switched off as a CONSEQUENCE of something else
+    # — today, its connection being disconnected (Decision #5b). The owner is told why
+    # scheduling went away instead of finding a silently-off toggle. Server-derived.
+    disabled_reason: str | None = None
 
 
 class EscalationRoutingRule(WireModel):
@@ -164,13 +177,16 @@ class ChannelConfigIn(StrictWireModel):
 
 
 class AddonToolIn(StrictWireModel):
-    # AddonToolIdWire pins the 8 frozen addon ids; the 4 builtin cognition items
+    # AddonToolIdWire pins the frozen addon ids; the 4 builtin cognition items
     # (capture_leads/escalate/handoff/summarize) are NOT in that Literal, so naming one
     # is already a 422 — but the validators layer also rejects them explicitly with a
     # clear message (Vision §3.2, Arch §3.8.7: cognition is non-interactive, never an addon).
     id: AddonToolIdWire
     enabled: bool
     connection_status: ConnectionStatusWire | None = None
+    # Accepted (and ignored) so a client can PUT back a tool list it just read. The
+    # platform owns this field; an admin re-enabling the tool simply clears it.
+    disabled_reason: str | None = None
 
 
 class EscalationRoutingRuleIn(StrictWireModel):

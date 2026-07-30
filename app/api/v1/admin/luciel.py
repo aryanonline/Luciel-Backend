@@ -37,6 +37,7 @@ from app.schemas_api.luciel import (
     UpdatePersonalityRequest,
     UpdateToolsRequest,
 )
+from app.tools import catalog
 from app.tools.authorization import sync_tool_authorizations
 
 router = APIRouter(prefix="/api/v1/admin/luciel", tags=["luciel"])
@@ -49,16 +50,9 @@ DEFAULT_CHANNELS = [
     {"id": "whatsapp", "enabled": False},
     {"id": "instagram_messenger", "enabled": False},
 ]
-DEFAULT_TOOLS = [
-    {"id": "check_availability", "enabled": False},
-    {"id": "book_appointment", "enabled": False},
-    {"id": "send_email", "enabled": False},
-    {"id": "send_sms", "enabled": False},
-    {"id": "lookup_record", "enabled": False},
-    {"id": "schedule_callback", "enabled": False},
-    {"id": "push_to_crm", "enabled": False},
-    {"id": "bring_your_own_webhook", "enabled": False},
-]
+# Derived from the tool catalog so a newly registered addon tool cannot be missing from a
+# freshly created Luciel — default-off, per §3.3.3 default-deny.
+DEFAULT_TOOLS = [{"id": tool_id, "enabled": False} for tool_id in catalog.ALL_TOOL_IDS]
 
 
 def _to_out(inst: Instance) -> LucielOut:

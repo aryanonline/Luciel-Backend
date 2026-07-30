@@ -72,6 +72,19 @@ class _UnavailableExternalBackend:
     async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         raise BackendNotConnected("calendar_backend_unavailable")
 
+    async def find_bookings(
+        self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
+    ) -> list[dict[str, Any]]:
+        raise BackendNotConnected("calendar_backend_unavailable")
+
+    async def reschedule(
+        self, ctx: ToolContext, booking_ref: str, slot: str
+    ) -> dict[str, Any] | None:
+        raise BackendNotConnected("calendar_backend_unavailable")
+
+    async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
+        raise BackendNotConnected("calendar_backend_unavailable")
+
     async def lookup(self, ctx: ToolContext, query: str) -> list[dict[str, Any]]:
         raise BackendNotConnected("record_source_backend_unavailable")
 
@@ -187,6 +200,10 @@ def build_tool(tool_id: str) -> Tool | None:
         return catalog.CheckAvailabilityTool(unavailable)
     if tool_id == "book_appointment":
         return catalog.BookAppointmentTool(unavailable)
+    if tool_id == "reschedule_appointment":
+        return catalog.RescheduleAppointmentTool(unavailable)
+    if tool_id == "cancel_appointment":
+        return catalog.CancelAppointmentTool(unavailable)
     if tool_id == "lookup_record":
         return catalog.LookupRecordTool(unavailable)
     if tool_id == "push_to_crm":

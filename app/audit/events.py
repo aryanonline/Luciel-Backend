@@ -16,6 +16,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "knowledge_source_viewed",
         "knowledge_source_edited",
         "knowledge_source_deleted",
+        # Which folders/pages of a connected source Luciel may read (Decision #9).
+        # Widening the scope is as consequential as narrowing it, so both are audited.
+        "knowledge_source_scope_changed",
         "escalation_fired",
         "escalation_notification_sent",
         "escalation_delivery_failed",

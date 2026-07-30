@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.connections import registry
 from app.connections.secrets import SecretStore, get_secret_store, secret_ref_for
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
@@ -42,14 +43,29 @@ _AUTH_CLASS_BY_TYPE: dict[str, str] = {
     "record_source": "provisioned_resource",
     "outbound_webhook": "long_lived_token",
 }
+
+
+class ProviderNotRegistered(ValueError):
+    """The requested provider is not registered for this connection type (§3.8.2)."""
+
+
 # OAuth-class connect flows return an authorizeUrl; everything else collects fields
 # client-side (requiresClientForm). Keyed on auth_class so the catalog can grow.
 _OAUTH_CLASSES = frozenset({"oauth_token"})
 
 
-def _auth_class_for(connection_type: str) -> str:
-    # Unknown types fall back to api_key (safe, 60-min cadence) rather than erroring,
-    # so the catalog can add a type before this map is updated (§3.8.5 cadence table).
+def _auth_class_for(connection_type: str, provider: str | None = None) -> str:
+    """The behavior key for this connection (§3.8.5 health cadence + refresh).
+
+    The registered PROVIDER wins when there is one, because the auth class is a property
+    of the integration and not of the slot it fills: a CRM connection is oauth_token via
+    HubSpot but long_lived_token via a custom webhook (Decision #6), and giving both the
+    type's default would put the webhook on a token-refresh cadence it has no token for.
+    Unknown types fall back to api_key (safe, 60-min cadence) rather than erroring, so the
+    catalog can add a type before this map is updated."""
+    spec = registry.get_provider(provider) if provider else None
+    if spec is not None and spec.connection_type == connection_type:
+        return spec.auth_class
     return _AUTH_CLASS_BY_TYPE.get(connection_type, "api_key")
 
 
@@ -160,7 +176,17 @@ async def start_connection(
     row goes to ``pending_carrier_registration`` (§3.1.6); when omitted the row stays
     ``unconfigured`` — the "Action needed: add your number" state (channel not live)."""
     now = now or datetime.now(UTC)
-    auth_class = _auth_class_for(connection_type)
+    # Decision #6: the chosen provider must be one the registry offers for this type.
+    # Validated BEFORE any row is written so a bad selection cannot leave a half-created
+    # connection behind, and so the provider string can never steer the authorize URL
+    # (built from the registry entry) at an endpoint we did not register.
+    if registry.has_choice(connection_type) and not registry.is_valid_provider(
+        connection_type, provider
+    ):
+        raise ProviderNotRegistered(
+            f"'{provider}' is not an available provider for {connection_type}."
+        )
+    auth_class = _auth_class_for(connection_type, provider)
 
     # BYO SMS number intake (§3.1.4): delegate to the single source of truth in
     # phone_lifecycle so the operability gate + honest statuses apply on EVERY attach
@@ -513,6 +539,286 @@ async def revoke(
         },
     )
     return True
+
+
+# --- Uniform lifecycle: DISCONNECT + SWITCH (Decision #5) --------------------------- #
+# Connect and reconnect already existed; the owner had no way to hand a connection BACK
+# or to move it to a different account. These two verbs complete the lifecycle on the
+# SAME surface for every connection type, driven by the provider registry.
+#
+# `revoke` above is the ACCOUNT-CLOSURE path: the row goes to terminal `revoked` and
+# disappears from the live list, which is right when a Luciel is deleted (see
+# lifecycle.state_machine) but wrong for "I want to hook up a different calendar" —
+# the owner would be left with no row to reconnect and the UI would forget the
+# capability existed. `disconnect` is the owner-facing verb: same secret destruction,
+# but the row survives in a clean, reconnectable NOT_CONNECTED state.
+
+NOT_CONNECTED = "not_connected"
+DISCONNECTED_DETAIL = "Not connected"
+
+
+async def _load(
+    session: AsyncSession, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> InstanceConnection | None:
+    return (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _cascade_dependents(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    *,
+    admin_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+) -> dict[str, list[str]]:
+    """Disable what depended on this connection, with a reason (Decision #5b).
+
+    Fail-safe: leaving `book_appointment` switched ON after the calendar is gone means
+    the owner reads "Appointment scheduling: on" while every dispatch fails the §3.8.7
+    gate. So the dependents are switched OFF for real — in BOTH places that hold tool
+    state (the relational authorization rows the broker's default-deny gate reads, and
+    the Instance JSONB the dashboard reads back), because those two diverging is exactly
+    the bug the tools endpoint warns about. The disabled_reason rides on the JSONB entry
+    so the UI can say WHY rather than just showing a silently-off toggle.
+
+    Returns {"tools": [...], "channels": [...]} — what was actually turned off."""
+    from app.models.instance import Instance
+    from app.models.tool_auth import InstanceToolAuthorization
+
+    tool_ids, channel_ids = registry.dependents_of(connection.connection_type)
+    reason = f"{connection.connection_type}_disconnected"
+    disabled_tools: list[str] = []
+    disabled_channels: list[str] = []
+
+    if tool_ids:
+        rows = (
+            (
+                await session.execute(
+                    select(InstanceToolAuthorization).where(
+                        InstanceToolAuthorization.admin_id == admin_id,
+                        InstanceToolAuthorization.instance_id == connection.instance_id,
+                        InstanceToolAuthorization.tool_id.in_(tool_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            if row.enabled:
+                row.enabled = False
+                disabled_tools.append(row.tool_id)
+
+    instance = (
+        await session.execute(
+            select(Instance).where(
+                Instance.admin_id == admin_id, Instance.id == connection.instance_id
+            )
+        )
+    ).scalar_one_or_none()
+    if instance is not None:
+        if tool_ids:
+            tools = [dict(t) for t in (instance.tools or [])]
+            for entry in tools:
+                if entry.get("id") in tool_ids and entry.get("enabled"):
+                    entry["enabled"] = False
+                    entry["disabledReason"] = reason
+                    if entry["id"] not in disabled_tools:
+                        disabled_tools.append(str(entry["id"]))
+            # Reassign (not mutate in place) so SQLAlchemy sees the JSONB change.
+            instance.tools = tools
+        if channel_ids:
+            channels = [dict(c) for c in (instance.channels or [])]
+            for entry in channels:
+                if entry.get("id") in channel_ids and entry.get("enabled"):
+                    entry["enabled"] = False
+                    entry["disabledReason"] = reason
+                    disabled_channels.append(str(entry["id"]))
+            instance.channels = channels
+
+    await session.flush()
+    if disabled_tools or disabled_channels:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=connection.instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="instance_configured",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "connection_type": connection.connection_type,
+                "action": "dependents_disabled",
+                "reason": reason,
+                "tools": disabled_tools,
+                "channels": disabled_channels,
+            },
+        )
+    return {"tools": disabled_tools, "channels": disabled_channels}
+
+
+async def disconnect(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    store: SecretStore | None = None,
+) -> dict[str, object] | None:
+    """Hand a connection back: destroy the credential, return to a clean, reconnectable
+    ``not_connected`` state, and disable whatever depended on it (Decision #5b).
+
+    Credential destruction is the point, so it happens unconditionally and idempotently
+    against the SecretStore (§3.6.3) — after this call there is no token on file, and a
+    later reconnect starts from a fresh consent. Any half-finished connect attempt is
+    swept with it: a parked ``oauth_state_jti`` would otherwise let a callback that is
+    still in flight re-credential a connection the owner just disconnected, and a staged
+    ``pending_provider`` would silently resurrect on the next confirm.
+
+    Non-secret operational config (a BYO phone number, a provisioned email address) is
+    KEPT: it is not credential material, and making the owner retype their own number to
+    re-link a calendar-adjacent channel is the "demo, not a product" feeling this pass
+    exists to remove. Scope selections are kept for the same reason.
+
+    Returns a summary dict, or None if no such connection for this tenant."""
+    store = store or get_secret_store()
+    connection = await _load(session, admin_id, connection_id)
+    if connection is None:
+        return None
+
+    old_status = connection.status
+    cfg = dict(connection.non_secret_config or {})
+    for ephemeral in ("oauth_state_jti", "authorize_url", "pending_provider"):
+        cfg.pop(ephemeral, None)
+    connection.non_secret_config = cfg
+    connection.status = NOT_CONNECTED
+    connection.status_detail = DISCONNECTED_DETAIL
+    connection.last_health_check_at = None
+    await session.flush()
+
+    deleted = False
+    if connection.secret_ref is not None:
+        deleted = await store.delete(connection.secret_ref)
+
+    cascaded = await _cascade_dependents(session, connection, admin_id=admin_id, user_id=user_id)
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": NOT_CONNECTED,
+            "reason": "disconnect",
+            "disabled_tools": cascaded["tools"],
+            "disabled_channels": cascaded["channels"],
+        },
+    )
+    # §3.8.3 rule 4: cleanup audit carries NO secret material — only the ref + result.
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_secret_cleanup",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "secret_ref": connection.secret_ref,
+            "deleted": deleted,
+        },
+    )
+    return {
+        "connection": connection,
+        "secret_deleted": deleted,
+        "disabled_tools": cascaded["tools"],
+        "disabled_channels": cascaded["channels"],
+    }
+
+
+async def switch(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    provider: str | None,
+    user_id: uuid.UUID | None,
+    store: SecretStore | None = None,
+) -> tuple[InstanceConnection, dict[str, object]] | None:
+    """Move a connection to a different account and/or provider (Decision #5c).
+
+    SWITCH = disconnect + reconnect on one call: the old credential is destroyed first,
+    then a fresh connect flow begins against the chosen provider. That ordering is the
+    whole point of the verb — the owner asking to switch has ALREADY decided the current
+    account is wrong, and several providers only ever issue one active grant per app, so
+    holding the old token would either block the new consent or silently keep serving
+    from the account the owner is trying to leave.
+
+    This is deliberately a different trade-off from ``swap``, which stages the candidate
+    provider alongside a still-live connection (proven-before-cutover, §3.8.7 rule B) and
+    is the right verb for re-credentialing an account that currently WORKS. Switch is for
+    "use a different account", and it accepts a momentary not-connected window — audited,
+    with dependents disabled — rather than serving from the wrong account.
+
+    ``provider`` may be omitted to switch accounts within the SAME provider. When given,
+    it must be registered for this connection type (Decision #6) — otherwise an
+    admin-supplied string could steer a connect flow at an arbitrary endpoint.
+
+    Returns (connection, StartConnectionResult), or None if not found for this tenant."""
+    connection = await _load(session, admin_id, connection_id)
+    if connection is None:
+        return None
+
+    target = provider or connection.provider
+    if not registry.is_valid_provider(connection.connection_type, target):
+        raise ProviderNotRegistered(
+            f"'{target}' is not an available provider for {connection.connection_type}."
+        )
+
+    old_provider = connection.provider
+    await disconnect(
+        session,
+        admin_id=admin_id,
+        connection_id=connection_id,
+        user_id=user_id,
+        store=store,
+    )
+
+    spec = registry.get_provider(target)
+    connection.provider = target
+    if spec is not None:
+        connection.auth_class = spec.auth_class
+    connection.status = "unconfigured"
+    connection.status_detail = None
+    await session.flush()
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": NOT_CONNECTED,
+            "new_status": "unconfigured",
+            "reason": "switch",
+            "old_provider": old_provider,
+            "new_provider": target,
+        },
+    )
+    return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
 
 # --- Email provisioning (§3.1.6a / Decision #49) ----------------------------------- #

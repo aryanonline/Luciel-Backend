@@ -34,7 +34,15 @@ from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
 
 ACTION_TOOLS = frozenset(
-    {"book_appointment", "send_email", "send_sms", "schedule_callback", "push_to_crm"}
+    {
+        "book_appointment",
+        "reschedule_appointment",
+        "cancel_appointment",
+        "send_email",
+        "send_sms",
+        "schedule_callback",
+        "push_to_crm",
+    }
 )
 
 

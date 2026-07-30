@@ -62,6 +62,61 @@ class SwapConnectionRequest(WireModel):
     provider: str
 
 
+class SwitchConnectionRequest(WireModel):
+    """POST body for "Use a different account" (Decision #5c). ``provider`` may be
+    omitted to switch accounts within the same provider; when given it must be one the
+    registry offers for this connection type (Decision #6)."""
+
+    provider: str | None = None
+
+
+class DisconnectResult(WireModel):
+    """What a disconnect actually did (Decision #5b), so the UI can say so plainly.
+
+    ``disabledTools`` / ``disabledChannels`` are the dependents switched off as a
+    consequence — an owner disconnecting the calendar should be TOLD that scheduling went
+    with it, not discover it later from a booking that fails."""
+
+    connection: ConnectionOut
+    secret_deleted: bool
+    disabled_tools: list[str]
+    disabled_channels: list[str]
+
+
+class ProviderCredentialFieldOut(WireModel):
+    """One field a non-OAuth provider's connect form must collect."""
+
+    name: str
+    label: str
+    secret: bool
+    required: bool
+
+
+class ProviderOptionOut(WireModel):
+    """One selectable provider for a connection type (Decision #6).
+
+    The UI renders the choice from this list instead of hardcoding a vendor. NO secret
+    material: ``configured`` is a boolean derived from whether the platform's OAuth app
+    credential is present — never the credential itself (§3.8.3)."""
+
+    provider: str
+    display_name: str
+    auth_kind: str
+    help_text: str
+    configured: bool
+    credential_fields: list[ProviderCredentialFieldOut]
+    # 'drive_folders' | 'notion_pages' | null — whether the owner may narrow this
+    # connection's knowledge scope after connecting (Decision #9).
+    scope_kind: str | None = None
+
+
+class ConnectionProvidersOut(WireModel):
+    """The provider choices for one connection type, in display order."""
+
+    connection_type: str
+    providers: list[ProviderOptionOut]
+
+
 # --- Email provisioning (§3.1.6a / Decision #49) ----------------------------------- #
 # The tenant PROVISIONS the address Luciel sends + receives on. Two modes, both LAUNCH
 # capabilities: own_domain (the business's own address; requires inbound DNS/MX routing)

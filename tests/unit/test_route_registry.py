@@ -65,6 +65,10 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/admin/knowledge/sync-connections"),
         ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/sync"),
         ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback"),
+        # Knowledge SCOPE selection (Decision #9): which folders/pages Luciel may read.
+        ("GET", "/api/v1/admin/knowledge/sync-connections/{connection_id}/scope"),
+        ("PUT", "/api/v1/admin/knowledge/sync-connections/{connection_id}/scope"),
+        ("GET", "/api/v1/admin/knowledge/sync-connections/{connection_id}/scope/candidates"),
         # admin/account
         ("POST", "/api/v1/admin/account/close"),
         ("POST", "/api/v1/admin/account/export"),
@@ -77,6 +81,11 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/admin/connections/{connection_id}/reconnect"),
         ("POST", "/api/v1/admin/connections/{connection_id}/swap"),
         ("POST", "/api/v1/admin/connections/sms/reverify"),
+        # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every
+        # connection type is connect / disconnect / switch-able through these three.
+        ("GET", "/api/v1/admin/connections/providers"),
+        ("POST", "/api/v1/admin/connections/{connection_id}/disconnect"),
+        ("POST", "/api/v1/admin/connections/{connection_id}/switch"),
         # admin/usage
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),

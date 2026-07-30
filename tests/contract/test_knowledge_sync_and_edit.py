@@ -307,6 +307,7 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
     monkeypatch.setattr(knowledge_api, "oauth_transport", lambda: FakeTokenTransport())
 
     from app.config import Settings
+    from app.connections import registry as registry_module
     from app.knowledge import providers as providers_module
 
     configured = Settings(
@@ -315,6 +316,9 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
         google_drive_redirect_uri="https://api.example.com/gd-callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
+    # The OAuth app credential is resolved through the provider REGISTRY now (Decision #6),
+    # so the registry is the module whose settings read must see the test config.
+    monkeypatch.setattr(registry_module, "get_settings", lambda: configured)
 
     admin_id, instance_id = await _ready_account_with_luciel_capturing_ids(client)
     rc = await client.post(
@@ -394,6 +398,7 @@ async def test_oauth_callback_rejected_code_is_clean_409_not_500(client, monkeyp
     monkeypatch.setattr(knowledge_api, "oauth_transport", lambda: FailingTokenTransport())
 
     from app.config import Settings
+    from app.connections import registry as registry_module
     from app.knowledge import providers as providers_module
 
     configured = Settings(
@@ -402,6 +407,9 @@ async def test_oauth_callback_rejected_code_is_clean_409_not_500(client, monkeyp
         hubspot_redirect_uri="https://api.example.com/hs-callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
+    # The OAuth app credential is resolved through the provider REGISTRY now (Decision #6),
+    # so the registry is the module whose settings read must see the test config.
+    monkeypatch.setattr(registry_module, "get_settings", lambda: configured)
 
     await _ready_account_with_luciel(client)
     rc = await client.post("/api/v1/admin/knowledge/sync-connections", json={"provider": "hubspot"})

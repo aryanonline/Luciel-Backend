@@ -24,10 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
 from app.audit import log as audit
-from app.connections import oauth_flow
+from app.connections import oauth_flow, registry
 from app.connections import service as connections_service
 from app.connections.secrets import get_secret_store
 from app.db.session import tenant_session
+from app.knowledge import scope as knowledge_scope
 from app.knowledge import service, sync
 from app.knowledge.parsers import ParseError, parse_file
 from app.knowledge.providers import (
@@ -35,6 +36,7 @@ from app.knowledge.providers import (
     OAuthExchangeError,
     ProviderUnavailable,
     exchange_code_for_token,
+    list_scope_candidates,
     provider_for_connection,
     store_oauth_token,
 )
@@ -47,10 +49,13 @@ from app.schemas_api.knowledge import (
     CreateSyncConnectionRequest,
     KnowledgeChunkOut,
     KnowledgeQuotaOut,
+    KnowledgeScopeOut,
     KnowledgeSourceOut,
     OAuthCallbackRequest,
     PasteIngestRequest,
     RenameSourceRequest,
+    SaveScopeRequest,
+    ScopeCandidateOut,
     SyncConnectionOut,
     SyncResultOut,
 )
@@ -481,6 +486,118 @@ async def trigger_sync(
         )
 
 
+# --- knowledge SCOPE selection (Decision #9) ------------------------------------ #
+async def _scoped_connection(s: AsyncSession, admin_id: uuid.UUID, connection_id: uuid.UUID):
+    conn = (
+        await s.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+                InstanceConnection.connection_type == "knowledge_source",
+            )
+        )
+    ).scalar_one_or_none()
+    if conn is None:
+        raise not_found("Sync connection not found.")
+    return conn
+
+
+def _scope_out(conn: InstanceConnection) -> KnowledgeScopeOut:
+    spec = registry.get_provider(conn.provider)
+    selections = knowledge_scope.scope_of(conn).get("selections") or []
+    return KnowledgeScopeOut.model_validate(
+        {
+            "connectionId": conn.connection_id,
+            "provider": conn.provider,
+            "scopeKind": spec.scope_kind if spec is not None else None,
+            "selections": [
+                {"id": str(sel["id"]), "name": str(sel.get("name", sel["id"])), "kind": "selected"}
+                for sel in selections
+                if isinstance(sel, dict) and sel.get("id")
+            ],
+            "wholeAccount": not knowledge_scope.scope_ids(conn),
+        }
+    )
+
+
+@router.get(
+    "/sync-connections/{connection_id}/scope/candidates",
+    response_model=list[ScopeCandidateOut],
+)
+async def list_scope_candidates_endpoint(
+    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> list[ScopeCandidateOut]:
+    """The folders (Drive) or pages/databases (Notion) the owner may narrow Luciel to
+    (Decision #9). Non-secret: ids and display names only (§3.8.3)."""
+    async with tenant_session(subject.admin_id) as s:
+        conn = await _scoped_connection(s, subject.admin_id, connection_id)
+        if conn.status == "revoked":
+            raise conflict("Connection is revoked; reconnect before choosing a scope.")
+        transport = oauth_transport()
+        try:
+            candidates = await list_scope_candidates(conn, get_secret_store(), transport)
+        except ProviderUnavailable as exc:
+            # No token on file, or a provider with nothing to narrow — a clean 409/422,
+            # never an empty list that reads as "your Drive has no folders".
+            raise conflict(f"Scope unavailable: {exc}") from exc
+        finally:
+            aclose = getattr(transport, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        return [ScopeCandidateOut.model_validate(c) for c in candidates]
+
+
+@router.get("/sync-connections/{connection_id}/scope", response_model=KnowledgeScopeOut)
+async def get_scope(
+    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> KnowledgeScopeOut:
+    async with tenant_session(subject.admin_id) as s:
+        return _scope_out(await _scoped_connection(s, subject.admin_id, connection_id))
+
+
+@router.put("/sync-connections/{connection_id}/scope", response_model=KnowledgeScopeOut)
+async def save_scope(
+    connection_id: uuid.UUID,
+    req: SaveScopeRequest,
+    subject: Subject = Depends(current_admin),
+) -> KnowledgeScopeOut:
+    """Save which folders/pages Luciel may read (Decision #9).
+
+    The scope lands in the connection's ``non_secret_config`` — a list of ids is a POINTER,
+    not a credential, so this adds no secret surface (§3.8.3). It takes effect on the NEXT
+    sync; already-ingested out-of-scope sources are removed by that sync's own deletion
+    propagation, because the narrowed snapshot no longer contains them.
+
+    An empty ``selections`` list CLEARS the scope, meaning the whole connected account."""
+    async with tenant_session(subject.admin_id) as s:
+        conn = await _scoped_connection(s, subject.admin_id, connection_id)
+        spec = registry.get_provider(conn.provider)
+        if spec is None or spec.scope_kind is None:
+            raise validation_error(f"'{conn.provider}' has no selectable scope.")
+        knowledge_scope.write_scope(
+            conn,
+            kind=spec.scope_kind,
+            selections=[{"id": sel.id, "name": sel.name or sel.id} for sel in req.selections],
+        )
+        instance_id = await _instance_id(s, subject.admin_id)
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="knowledge_source_scope_changed",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "provider": conn.provider,
+                "scope_kind": spec.scope_kind,
+                "selected_ids": knowledge_scope.scope_ids(conn),
+            },
+        )
+        return _scope_out(conn)
+
+
 @router.post("/sync-connections/{connection_id}/oauth-callback", response_model=SyncConnectionOut)
 async def oauth_callback(
     connection_id: uuid.UUID,
@@ -538,7 +655,7 @@ async def oauth_callback(
             await s.flush()
             raise validation_error(str(exc)) from exc
 
-        spec = oauth_flow.PROVIDER_AUTHORIZE.get(conn.provider)
+        spec = oauth_flow.authorize_spec(conn.provider)
         verifier = (
             oauth_flow.verifier_for_jti(expected_jti)
             if spec is not None and spec.supports_pkce and expected_jti

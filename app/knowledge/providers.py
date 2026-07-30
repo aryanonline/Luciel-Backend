@@ -24,21 +24,23 @@ Connections layer's own authorize/callback flow) — the DELTA-SYNC CONTRACT log
 the part this arc must prove, and it is fully exercised against a FAKE transport in
 tests, per the Build Brief.
 
-OAuth CLIENT registration (id/secret/redirect) is read from ``app.config.Settings``
-— see ``oauth_client_config`` below — which is itself sourced from the environment
-(Secrets Manager/SSM in production). NEVER hardcoded here.
+OAuth CLIENT registration (id/secret/redirect) is read from ``app.config.Settings`` via
+``connections.registry.oauth_client_config`` — the registry names the settings fields
+per provider, and those are themselves sourced from the environment (Secrets
+Manager/SSM in production). NEVER hardcoded here.
 """
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 
 from app.config import get_settings
+from app.connections.registry import oauth_client_config
 from app.connections.secrets import SecretStore, secret_ref_for
+from app.knowledge import scope
 from app.knowledge.sync import RemoteItem, RemoteSnapshot, SyncProvider
 
 
@@ -46,45 +48,6 @@ class ProviderUnavailable(Exception):
     """Raised when a live provider call cannot proceed (no token, or the provider
     OAuth client isn't configured). Callers surface this as a sync error status,
     never as a silent empty snapshot (§3.2.3: never fabricate freshness)."""
-
-
-@dataclass(frozen=True)
-class OAuthClientConfig:
-    """The application's OAuth-client registration for one provider (§3.8.3: this
-    is NOT the per-tenant token — it's who the app claims to be to the provider)."""
-
-    client_id: str
-    client_secret: str
-    redirect_uri: str
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
-
-
-def oauth_client_config(provider: str) -> OAuthClientConfig:
-    """Read the OAuth client registration for a provider from config/Secrets
-    Manager (never hardcoded, Build Brief rule 2). Unknown providers return an
-    unconfigured (empty) config rather than raising, so the catalog can grow.
-    """
-    s = get_settings()
-    if provider == "google_drive":
-        return OAuthClientConfig(
-            s.google_drive_client_id, s.google_drive_client_secret, s.google_drive_redirect_uri
-        )
-    if provider in ("hubspot", "crm_kb"):
-        # crm_kb is the §3.2.3 wire origin; hubspot/salesforce are the concrete
-        # native-CRM providers behind it (Vision §7 "native CRM connectors").
-        return OAuthClientConfig(
-            s.hubspot_client_id, s.hubspot_client_secret, s.hubspot_redirect_uri
-        )
-    if provider == "salesforce":
-        return OAuthClientConfig(
-            s.salesforce_consumer_key,
-            s.salesforce_consumer_secret,
-            s.salesforce_redirect_uri,
-        )
-    return OAuthClientConfig("", "", "")
 
 
 class HttpTransport(Protocol):
@@ -247,11 +210,14 @@ class GoogleDriveProvider:
         instance_id: uuid.UUID,
         store: SecretStore,
         transport: HttpTransport | None = None,
+        scope_ids: list[str] | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._transport = transport
+        # Selected folder ids (Decision #9); empty = the whole connected account.
+        self._scope_ids = list(scope_ids or [])
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
         token = await _bearer_token(self._store, self._admin_id, self._instance_id)
@@ -264,7 +230,12 @@ class GoogleDriveProvider:
         resp = await transport.get(
             "https://www.googleapis.com/drive/v3/files",
             headers={"Authorization": f"Bearer {token}"},
-            params={"q": "trashed=false", "fields": "files(id,name,modifiedTime,trashed)"},
+            params={
+                "q": scope.drive_query(self._scope_ids),
+                # `parents` is requested so the scope can be re-checked locally: a shared or
+                # shortcut file can satisfy the query without living under a chosen folder.
+                "fields": "files(id,name,modifiedTime,trashed,parents)",
+            },
         )
         data = resp.json()
         items = [
@@ -275,7 +246,7 @@ class GoogleDriveProvider:
                 revision=f.get("modifiedTime", ""),
             )
             for f in data.get("files", [])
-            if not f.get("trashed")
+            if not f.get("trashed") and scope.in_scope(f, self._scope_ids, parent_keys=("parents",))
         ]
         return RemoteSnapshot(items=items)
 
@@ -295,11 +266,14 @@ class NotionProvider:
         instance_id: uuid.UUID,
         store: SecretStore,
         transport: HttpTransport | None = None,
+        scope_ids: list[str] | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._transport = transport
+        # Selected page/database ids (Decision #9); empty = every page the grant reaches.
+        self._scope_ids = list(scope_ids or [])
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
         token = await _bearer_token(self._store, self._admin_id, self._instance_id)
@@ -315,6 +289,8 @@ class NotionProvider:
             params={"filter": "page"},
         )
         data = resp.json()
+        # Notion's search endpoint has NO ancestor filter, so the scope can only be
+        # enforced on the results — which is why ``in_scope`` is not merely a backstop here.
         items = [
             RemoteItem(
                 external_id=p["id"],
@@ -324,6 +300,7 @@ class NotionProvider:
             )
             for p in data.get("results", [])
             if not p.get("archived")
+            and scope.in_scope(p, self._scope_ids, parent_keys=("parent", "parent_id"))
         ]
         return RemoteSnapshot(items=items)
 
@@ -525,6 +502,53 @@ class WebsiteCrawlProvider:
 
 
 # --------------------------------------------------------------------------- #
+# Scope CANDIDATES (Decision #9): what the owner may choose from.
+# --------------------------------------------------------------------------- #
+async def list_scope_candidates(
+    connection: object, store: SecretStore, transport: HttpTransport
+) -> list[dict[str, str]]:
+    """The folders (Drive) or pages/databases (Notion) the owner may narrow the scope to.
+
+    Read-only and non-secret: returns ids and display names only, so the choice can be
+    rendered without the UI ever holding credential material (§3.8.3). Raises
+    ``ProviderUnavailable`` for providers that have nothing to narrow — an owner should get a
+    clean 422, not an empty list that looks like "your Drive has no folders"."""
+    provider_name = connection.provider  # type: ignore[attr-defined]
+    admin_id = connection.admin_id  # type: ignore[attr-defined]
+    instance_id = connection.instance_id  # type: ignore[attr-defined]
+    token = await _bearer_token(store, admin_id, instance_id)
+    if provider_name == "google_drive":
+        resp = await transport.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "q": "mimeType='application/vnd.google-apps.folder' and trashed=false",
+                "fields": "files(id,name)",
+            },
+        )
+        return [
+            {"id": str(f["id"]), "name": str(f.get("name", f["id"])), "kind": "folder"}
+            for f in resp.json().get("files", [])
+        ]
+    if provider_name == "notion":
+        resp = await transport.get(
+            "https://api.notion.com/v1/search",
+            headers={"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28"},
+            params={},
+        )
+        return [
+            {
+                "id": str(p["id"]),
+                "name": str(p.get("title", p["id"])),
+                "kind": "database" if p.get("object") == "database" else "page",
+            }
+            for p in resp.json().get("results", [])
+            if not p.get("archived")
+        ]
+    raise ProviderUnavailable(f"'{provider_name}' has no selectable scope.")
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch: build the real provider for an instance_connections row (§3.2.3/§3.8).
 # --------------------------------------------------------------------------- #
 def provider_for_connection(connection: object, store: SecretStore) -> SyncProvider:
@@ -538,10 +562,18 @@ def provider_for_connection(connection: object, store: SecretStore) -> SyncProvi
     provider_name = connection.provider  # type: ignore[attr-defined]
     admin_id = connection.admin_id  # type: ignore[attr-defined]
     instance_id = connection.instance_id  # type: ignore[attr-defined]
+    # The owner's chosen scope is read HERE, off the live connection row, so every sync
+    # path (first sync, manual re-sync, scheduled re-sync) honours it without each caller
+    # having to remember to pass it (Decision #9).
+    selected = scope.scope_ids(connection)
     if provider_name == "google_drive":
-        return GoogleDriveProvider(admin_id=admin_id, instance_id=instance_id, store=store)
+        return GoogleDriveProvider(
+            admin_id=admin_id, instance_id=instance_id, store=store, scope_ids=selected
+        )
     if provider_name == "notion":
-        return NotionProvider(admin_id=admin_id, instance_id=instance_id, store=store)
+        return NotionProvider(
+            admin_id=admin_id, instance_id=instance_id, store=store, scope_ids=selected
+        )
     if provider_name == "hubspot":
         return HubSpotProvider(admin_id=admin_id, instance_id=instance_id, store=store)
     if provider_name == "salesforce":

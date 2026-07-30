@@ -32,7 +32,7 @@ from urllib.parse import urlencode
 import jwt
 
 from app.config import get_settings
-from app.knowledge.providers import oauth_client_config
+from app.connections.registry import PROVIDERS, ProviderAuthorize, oauth_client_config
 
 STATE_TTL_SECONDS = 600  # a consent click-through is minutes, not hours
 STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, not a secret
@@ -40,40 +40,14 @@ STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, n
 UNCONFIGURED_DETAIL = "Action needed: this provider's OAuth client is not configured yet"
 
 
-@dataclass(frozen=True)
-class ProviderAuthorize:
-    """One provider's authorize endpoint + the scopes this platform requests."""
+def authorize_spec(provider: str) -> ProviderAuthorize | None:
+    """This provider's authorize endpoint/scopes/PKCE posture, from the registry.
 
-    endpoint: str
-    scopes: str
-    supports_pkce: bool
-    # Provider-specific params that are part of OUR request, not the user's choice
-    # (e.g. Google only returns a refresh_token for an offline+consent request).
-    extra: dict[str, str]
-
-
-PROVIDER_AUTHORIZE: dict[str, ProviderAuthorize] = {
-    "google_drive": ProviderAuthorize(
-        endpoint="https://accounts.google.com/o/oauth2/v2/auth",
-        scopes="https://www.googleapis.com/auth/drive.readonly",
-        supports_pkce=True,
-        extra={"access_type": "offline", "prompt": "consent", "include_granted_scopes": "true"},
-    ),
-    "hubspot": ProviderAuthorize(
-        endpoint="https://app.hubspot.com/oauth/authorize",
-        scopes="crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read",
-        # HubSpot's authorize endpoint rejects unknown query params, and it does not
-        # implement PKCE — sending a code_challenge fails the request outright.
-        supports_pkce=False,
-        extra={},
-    ),
-    "salesforce": ProviderAuthorize(
-        endpoint="https://login.salesforce.com/services/oauth2/authorize",
-        scopes="api refresh_token",
-        supports_pkce=True,
-        extra={},
-    ),
-}
+    The table used to live here; it now lives in ``connections.registry`` alongside the
+    provider's credential source and health class, so registering a provider is one
+    entry rather than edits in three files."""
+    spec = PROVIDERS.get(provider)
+    return spec.authorize if spec is not None else None
 
 
 def _now() -> datetime:
@@ -175,7 +149,7 @@ def build_authorize_start(
 
     Falls back to the internal placeholder for providers with no registered OAuth
     client — see the module docstring for why that is a fallback and not an error."""
-    spec = PROVIDER_AUTHORIZE.get(provider)
+    spec = authorize_spec(provider)
     cfg = oauth_client_config(provider)
     if spec is None or not cfg.configured or not cfg.redirect_uri:
         return AuthorizeStart(

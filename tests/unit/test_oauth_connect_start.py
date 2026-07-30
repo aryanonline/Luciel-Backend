@@ -19,6 +19,7 @@ from app.connections import oauth_flow
 @pytest.fixture
 def configured(monkeypatch):
     """Register OAuth clients for the three providers whose credentials exist."""
+    from app.connections import registry as registry_module
     from app.knowledge import providers as providers_module
 
     settings = Settings(
@@ -33,6 +34,9 @@ def configured(monkeypatch):
         salesforce_redirect_uri="https://api.vantagemind.ai/oauth/salesforce",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
+    # The OAuth app credential for a provider is resolved through the provider REGISTRY
+    # now (Decision #6), so that is the module whose settings read must see this config.
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     return settings
 
 

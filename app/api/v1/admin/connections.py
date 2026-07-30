@@ -5,6 +5,9 @@ Implements the frozen admin client (http-admin.ts connections.*) field-for-field
   * POST   /connections {connectionType,...}  → StartConnectionResult
   * POST   /connections/{id}/reconnect        → StartConnectionResult
   * POST   /connections/{id}/swap {provider}   → StartConnectionResult (§3.8.7 rule B)
+  * GET    /connections/providers             → ConnectionProviders[] (Decision #6)
+  * POST   /connections/{id}/disconnect       → DisconnectResult (Decision #5b)
+  * POST   /connections/{id}/switch {provider} → StartConnectionResult (Decision #5c)
   * DELETE /connections/{id}                  → 204 (status→revoked + secret cleanup)
   * GET    /connections/email                 → EmailProvisioning | null (§3.1.6a)
   * POST   /connections/email {mode,...}       → EmailProvisioning (§3.1.6a)
@@ -24,18 +27,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import not_found
-from app.connections import service
+from app.api.errors import not_found, validation_error
+from app.connections import registry, service
 from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance
 from app.schemas_api.connections import (
     ConnectionOut,
+    ConnectionProvidersOut,
+    DisconnectResult,
     EmailProvisioningOut,
+    ProviderOptionOut,
     ProvisionEmailRequest,
     StartConnectionRequest,
     StartConnectionResult,
     SwapConnectionRequest,
+    SwitchConnectionRequest,
 )
 
 router = APIRouter(prefix="/api/v1/admin/connections", tags=["connections"])
@@ -132,15 +139,18 @@ async def start_connection(
 ) -> StartConnectionResult:
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
-        _, result = await service.start_connection(
-            s,
-            admin_id=subject.admin_id,
-            instance_id=instance_id,
-            connection_type=req.connection_type,
-            provider=req.provider,
-            user_id=subject.user_id,
-            phone_number=req.phone_number,
-        )
+        try:
+            _, result = await service.start_connection(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                connection_type=req.connection_type,
+                provider=req.provider,
+                user_id=subject.user_id,
+                phone_number=req.phone_number,
+            )
+        except service.ProviderNotRegistered as exc:
+            raise validation_error(str(exc)) from exc
         return StartConnectionResult.model_validate(result)
 
 
@@ -196,6 +206,116 @@ async def swap_connection(
             provider=req.provider,
             user_id=subject.user_id,
         )
+        if out is None:
+            raise not_found("Connection not found.")
+        _, result = out
+        return StartConnectionResult.model_validate(result)
+
+
+@router.get("/providers", response_model=list[ConnectionProvidersOut])
+async def list_providers(
+    connection_type: str | None = None,
+    subject: Subject = Depends(current_admin),
+) -> list[ConnectionProvidersOut]:
+    """The provider CHOICES the owner may pick from, per connection type (Decision #6).
+
+    The UI used to hardcode HubSpot for push_to_crm and Salesforce for lookup_record, so a
+    customer on a different CRM was simply stuck. This is the registry projected onto the
+    wire so the choice is rendered from server truth. Non-secret by construction: only a
+    ``configured`` boolean is derived from the platform OAuth credential (§3.8.3).
+
+    Read-only over static registry data, so it needs no tenant session — but it stays
+    admin-authed because the set of integrations we offer is not public information."""
+    del subject
+    types = [connection_type] if connection_type else sorted(registry.CHOICE_TYPES)
+    return [
+        ConnectionProvidersOut.model_validate(
+            {
+                "connectionType": ct,
+                "providers": [
+                    ProviderOptionOut.model_validate(
+                        {
+                            "provider": spec.provider,
+                            "displayName": spec.display_name,
+                            "authKind": spec.auth_kind,
+                            "helpText": spec.help_text,
+                            "configured": registry.oauth_client_config(spec.provider).configured
+                            if spec.is_oauth
+                            else True,
+                            "credentialFields": [
+                                {
+                                    "name": f.name,
+                                    "label": f.label,
+                                    "secret": f.secret,
+                                    "required": f.required,
+                                }
+                                for f in spec.credential_fields
+                            ],
+                            "scopeKind": spec.scope_kind,
+                        }
+                    )
+                    for spec in registry.providers_for(ct)
+                ],
+            }
+        )
+        for ct in types
+    ]
+
+
+@router.post("/{connection_id}/disconnect", response_model=DisconnectResult)
+async def disconnect_connection_post(
+    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> DisconnectResult:
+    """Hand a connection back (Decision #5b): destroy the stored credential, return the
+    connection to a clean ``not_connected`` state it can be reconnected from, and disable
+    the tools/channels that depended on it — reporting exactly which ones, so the owner is
+    told that (e.g.) disconnecting the calendar took scheduling with it.
+
+    Distinct from ``DELETE /{id}``, which drives the row to terminal ``revoked`` for
+    account/Luciel teardown; that state is not reconnectable and is hidden from the list."""
+    async with tenant_session(subject.admin_id) as s:
+        out = await service.disconnect(
+            s,
+            admin_id=subject.admin_id,
+            connection_id=connection_id,
+            user_id=subject.user_id,
+        )
+        if out is None:
+            raise not_found("Connection not found.")
+        return DisconnectResult.model_validate(
+            {
+                "connection": _connection_out(out["connection"]),
+                "secretDeleted": out["secret_deleted"],
+                "disabledTools": out["disabled_tools"],
+                "disabledChannels": out["disabled_channels"],
+            }
+        )
+
+
+@router.post("/{connection_id}/switch", response_model=StartConnectionResult)
+async def switch_connection(
+    connection_id: uuid.UUID,
+    req: SwitchConnectionRequest,
+    subject: Subject = Depends(current_admin),
+) -> StartConnectionResult:
+    """Use a different account and/or provider (Decision #5c): disconnect, then begin a
+    fresh connect flow against the chosen provider.
+
+    Use this when the owner has decided the CURRENT account is wrong — the old credential
+    is destroyed first, so nothing keeps serving from the account being left behind. Use
+    ``/swap`` instead to re-credential an account that currently works, which keeps it
+    live until the new credential verifies (§3.8.7 rule B)."""
+    async with tenant_session(subject.admin_id) as s:
+        try:
+            out = await service.switch(
+                s,
+                admin_id=subject.admin_id,
+                connection_id=connection_id,
+                provider=req.provider,
+                user_id=subject.user_id,
+            )
+        except service.ProviderNotRegistered as exc:
+            raise validation_error(str(exc)) from exc
         if out is None:
             raise not_found("Connection not found.")
         _, result = out

@@ -37,6 +37,15 @@ _ROLLING_WINDOW = timedelta(hours=24)
 class CalendarBackend(Protocol):
     async def free_busy(self, ctx: ToolContext, window: str) -> list[str]: ...
     async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None: ...
+    # Reschedule/cancel are READ-BEFORE-WRITE (§3.3.6): find the existing booking first,
+    # then act on the reference it returns. Never guess which booking the caller meant.
+    async def find_bookings(
+        self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    async def reschedule(
+        self, ctx: ToolContext, booking_ref: str, slot: str
+    ) -> dict[str, Any] | None: ...
+    async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None: ...
 
 
 class RecordBackend(Protocol):
@@ -97,6 +106,98 @@ class BookAppointmentTool:
             # slot taken between read and write — conflict (§3.3.6); never claim success.
             return c.failed("slot_conflict")
         return c.ok(booking)  # carries confirmed time + booking reference
+
+
+_BOOKING_REF_KEYS = ("bookingRef", "booking_ref", "id")
+
+
+def _booking_ref(booking: dict[str, Any]) -> str | None:
+    for key in _BOOKING_REF_KEYS:
+        value = booking.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+async def _resolve_booking_ref(
+    backend: CalendarBackend, inputs: dict[str, Any], context: ToolContext
+) -> tuple[str | None, ToolResult | None]:
+    """READ half of read-before-write (§3.3.6): find the ONE booking this turn means.
+
+    Returns ``(booking_ref, None)`` on a single confident match, else ``(None, result)``
+    with the outcome to return verbatim. Rescheduling or cancelling the wrong appointment
+    is worse than asking, so a multi-match is ``ambiguous`` — the conversation loop asks
+    which one rather than the tool picking the first."""
+    ref = inputs.get("booking_ref") or None
+    try:
+        matches = await backend.find_bookings(
+            context, email=inputs["email"], booking_ref=str(ref) if ref else None
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, c.failed(f"calendar_error: {type(exc).__name__}")
+    if not matches:
+        return None, c.empty({"email": inputs["email"]})
+    if len(matches) > 1:
+        return None, c.ambiguous(matches)
+    resolved = _booking_ref(matches[0])
+    if resolved is None:
+        # A match we cannot address is not a match we may write against.
+        return None, c.missing_input(["booking_ref"])
+    return resolved, None
+
+
+class RescheduleAppointmentTool:
+    tool_id = "reschedule_appointment"
+    display_name = "Reschedule an appointment"
+    description = "Move an existing booking on the connected calendar to a new slot."
+    requires_connection = "calendar"
+    requires_channels: frozenset[str] = frozenset()
+    execution_mode = "in_process"
+    # booking_ref is OPTIONAL: supplied it disambiguates, absent the tool reads first.
+    required_inputs: frozenset[str] = frozenset({"email", "slot"})
+
+    def __init__(self, backend: CalendarBackend) -> None:
+        self.backend = backend
+
+    async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
+        ref, early = await _resolve_booking_ref(self.backend, inputs, context)
+        if ref is None:
+            return early if early is not None else c.failed("booking_unresolved")
+        try:
+            moved = await self.backend.reschedule(context, ref, inputs["slot"])
+        except Exception as exc:  # noqa: BLE001
+            return c.failed(f"calendar_error: {type(exc).__name__}")
+        if moved is None:
+            # New slot taken between the read and the write — same conflict discipline as
+            # book_appointment: never claim a move that did not happen (§3.3.6).
+            return c.failed("slot_conflict")
+        return c.ok(moved)
+
+
+class CancelAppointmentTool:
+    tool_id = "cancel_appointment"
+    display_name = "Cancel an appointment"
+    description = "Cancel an existing booking on the connected calendar."
+    requires_connection = "calendar"
+    requires_channels: frozenset[str] = frozenset()
+    execution_mode = "in_process"
+    required_inputs: frozenset[str] = frozenset({"email"})
+
+    def __init__(self, backend: CalendarBackend) -> None:
+        self.backend = backend
+
+    async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
+        ref, early = await _resolve_booking_ref(self.backend, inputs, context)
+        if ref is None:
+            return early if early is not None else c.failed("booking_unresolved")
+        try:
+            cancelled = await self.backend.cancel(context, ref)
+        except Exception as exc:  # noqa: BLE001
+            return c.failed(f"calendar_error: {type(exc).__name__}")
+        if cancelled is None:
+            # Already gone on the provider side, or the provider refused the delete.
+            return c.failed("cancel_rejected")
+        return c.ok(cancelled)
 
 
 class LookupRecordTool:
@@ -346,6 +447,8 @@ class PushToCrmTool:
 ALL_TOOL_IDS = (
     "check_availability",
     "book_appointment",
+    "reschedule_appointment",
+    "cancel_appointment",
     "send_email",
     "send_sms",
     "lookup_record",
@@ -358,6 +461,8 @@ ALL_TOOL_IDS = (
 TOOL_CONNECTION_TYPE: dict[str, str | None] = {
     "check_availability": "calendar",
     "book_appointment": "calendar",
+    "reschedule_appointment": "calendar",
+    "cancel_appointment": "calendar",
     "send_email": "email_sender",
     "send_sms": "sms_sender",
     "lookup_record": "record_source",
@@ -368,6 +473,8 @@ TOOL_CONNECTION_TYPE: dict[str, str | None] = {
 TOOL_REQUIRED_INPUTS: dict[str, frozenset[str]] = {
     "check_availability": frozenset({"window"}),
     "book_appointment": frozenset({"slot", "email"}),
+    "reschedule_appointment": frozenset({"email", "slot"}),
+    "cancel_appointment": frozenset({"email"}),
     "send_email": frozenset({"to", "body"}),
     "send_sms": frozenset({"to", "body"}),
     "lookup_record": frozenset({"query"}),
@@ -376,9 +483,38 @@ TOOL_REQUIRED_INPUTS: dict[str, frozenset[str]] = {
     "bring_your_own_webhook": frozenset({"payload"}),
 }
 
+# --- capability grouping (Decision #8) ---------------------------------------- #
+# SCHEDULING IS ONE CAPABILITY, not four unrelated toggles. All four scheduling tools
+# read and write the SINGLE ``calendar`` connection (§3.8.2 allows one active connection
+# per type), so they connect once and are gated together: the connection that lets Luciel
+# offer a time is the same one that lets it move or cancel that time. Grouping them here
+# keeps that truth in one place — the UI renders the group, and the disconnect cascade
+# (Decision #5b) disables the whole group when the calendar goes away.
+SCHEDULING_TOOL_IDS: tuple[str, ...] = (
+    "check_availability",
+    "book_appointment",
+    "reschedule_appointment",
+    "cancel_appointment",
+)
+
+CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
+    "scheduling": SCHEDULING_TOOL_IDS,
+}
+
+
+def capability_of(tool_id: str) -> str | None:
+    """The capability group a tool belongs to, or None if it stands alone."""
+    for capability, tool_ids in CAPABILITY_GROUPS.items():
+        if tool_id in tool_ids:
+            return capability
+    return None
+
+
 __all__ = [
     "CheckAvailabilityTool",
     "BookAppointmentTool",
+    "RescheduleAppointmentTool",
+    "CancelAppointmentTool",
     "LookupRecordTool",
     "SendEmailTool",
     "SendSmsTool",
@@ -387,6 +523,9 @@ __all__ = [
     "ALL_TOOL_IDS",
     "TOOL_CONNECTION_TYPE",
     "TOOL_REQUIRED_INPUTS",
+    "SCHEDULING_TOOL_IDS",
+    "CAPABILITY_GROUPS",
+    "capability_of",
     "Outcome",
     "Tool",
 ]

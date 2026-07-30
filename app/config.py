@@ -229,6 +229,20 @@ class Settings(BaseSettings):
     salesforce_consumer_key: str = ""
     salesforce_consumer_secret: str = ""  # noqa: S105
     salesforce_redirect_uri: str = ""
+    google_calendar_client_id: str = ""
+    google_calendar_client_secret: str = ""  # noqa: S105
+    google_calendar_redirect_uri: str = ""
+    calendly_client_id: str = ""
+    calendly_client_secret: str = ""  # noqa: S105
+    calendly_redirect_uri: str = ""
+    notion_client_id: str = ""
+    notion_client_secret: str = ""  # noqa: S105
+    notion_redirect_uri: str = ""
+    # Meta OAuth app (Decision #7). The app SECRET already arrives in the platform blob
+    # for inbound X-Hub-Signature verification; the app ID and redirect complete the
+    # authorization-code flow for the WhatsApp / Instagram channel connect.
+    meta_app_id: str = ""
+    meta_redirect_uri: str = ""
 
     # --- Website crawl (§3.2.3 crawl-sync note) ---------------------------------
     # No OAuth — just an httpx fetch. Bounded so a misconfigured crawl target can
@@ -270,6 +284,17 @@ class Settings(BaseSettings):
             "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
             "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
             "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
+            "GOOGLE_CALENDAR_CLIENT_ID": "google_calendar_client_id",
+            "GOOGLE_CALENDAR_CLIENT_SECRET": "google_calendar_client_secret",  # nosec B105
+            "GOOGLE_CALENDAR_REDIRECT_URI": "google_calendar_redirect_uri",
+            "CALENDLY_CLIENT_ID": "calendly_client_id",
+            "CALENDLY_CLIENT_SECRET": "calendly_client_secret",  # nosec B105
+            "CALENDLY_REDIRECT_URI": "calendly_redirect_uri",
+            "NOTION_CLIENT_ID": "notion_client_id",
+            "NOTION_CLIENT_SECRET": "notion_client_secret",  # nosec B105
+            "NOTION_REDIRECT_URI": "notion_redirect_uri",
+            "META_APP_ID": "meta_app_id",
+            "META_REDIRECT_URI": "meta_redirect_uri",
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
             # Not secret material, but it is per-environment Stripe account state that
             # travels with the Stripe keys — so it is rotated in the same blob rather

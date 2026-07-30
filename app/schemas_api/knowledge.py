@@ -95,6 +95,49 @@ class SyncResultOut(WireModel):
     removed: list[str]
 
 
+# --- Knowledge SCOPE selection (Decision #9) --------------------------------- #
+# "Connect Google Drive" used to mean "read everything this token can reach". These
+# shapes let the owner pick the folders (Drive) or pages/databases (Notion) Luciel may
+# read. All non-secret: ids and display names only (§3.8.3).
+
+
+class ScopeCandidateOut(WireModel):
+    """One folder/page/database the owner may select."""
+
+    id: str
+    name: str
+    # 'folder' (Drive) | 'page' | 'database' (Notion).
+    kind: str
+
+
+class ScopeSelectionIn(WireModel):
+    """One selected folder/page id. ``name`` is stored for display only."""
+
+    id: str
+    name: str | None = None
+
+
+class SaveScopeRequest(WireModel):
+    """PUT /sync-connections/{id}/scope body.
+
+    An EMPTY ``selections`` list clears the scope, which means the WHOLE connected
+    account — the pre-Decision-#9 behavior — not "nothing"."""
+
+    selections: list[ScopeSelectionIn]
+
+
+class KnowledgeScopeOut(WireModel):
+    """The scope currently in force for one knowledge-sync connection."""
+
+    connection_id: uuid.UUID
+    provider: str
+    # 'drive_folders' | 'notion_pages' | null when the provider has no selectable scope.
+    scope_kind: str | None = None
+    selections: list[ScopeCandidateOut]
+    # True when nothing is selected: Luciel reads the whole connected account.
+    whole_account: bool
+
+
 class OAuthCallbackRequest(WireModel):
     """POST /sync-connections/{id}/oauth-callback body (§3.8.3/§3.2.3).
 
