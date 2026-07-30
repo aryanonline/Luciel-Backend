@@ -86,6 +86,11 @@ async def _seed(
                     auth_class="api_key",
                     provider="platform",
                     status="connected",
+                    # BYO (§3.1.4): an sms_sender with no designated number has nothing to
+                    # send FROM, so the tool correctly refuses. Seed the designation.
+                    non_secret_config=(
+                        {"destination": "+15550009999"} if conn_type == "sms_sender" else None
+                    ),
                 )
             )
         await s.flush()
@@ -298,6 +303,44 @@ async def test_send_sms_executes_when_the_sms_channel_is_enabled() -> None:
         )
         assert res.outcome is Outcome.ok
         assert res.payload["providerMessageId"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_send_sms_fails_when_the_tenant_has_designated_no_number() -> None:
+    """§3.1.4 BYO: the platform owns no number to fall back on, so a connected Twilio with
+    no designated from-number cannot text anyone. Failing is the honest outcome — sending
+    from a platform number would put VantageMind in the tenant's telephony path and reach
+    the lead from a stranger's number."""
+    admin = uuid.uuid4()
+    iid = await _seed(
+        admin,
+        authorize=["send_sms"],
+        channels=[{"id": "sms", "enabled": True}],
+        connections=[],
+    )
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="sms_sender",
+                auth_class="api_key",
+                provider="twilio",
+                status="connected",
+                non_secret_config={"accountSid": "AC" + "9" * 30},
+            )
+        )
+        await s.flush()
+
+    tool = build_tool("send_sms")
+    assert tool is not None
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool, {"to": "+15550001111", "body": "Hi"}, admin_id=admin, instance_id=iid
+        )
+        assert res.outcome is Outcome.failed
+        assert res.payload == {}
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

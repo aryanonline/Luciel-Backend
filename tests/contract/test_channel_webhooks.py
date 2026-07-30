@@ -137,6 +137,43 @@ async def test_twilio_sms_valid_signature_reaches_runtime(client, monkeypatch):
     assert "<Response>" in r.text
 
 
+async def test_twilio_sms_is_verified_with_the_tenants_own_auth_token(client, monkeypatch):
+    """BYO (§3.1.4): the receiving number lives in the TENANT's Twilio account, so Twilio
+    signs the webhook with THEIR auth token. Verifying against the platform's would reject
+    every real inbound — the whole channel would look silently dead."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    tenant_token = "tenant-authtok"  # noqa: S105 — test fixture, not a real secret
+    # The platform token is deliberately DIFFERENT: if the edge fell back to it, the
+    # signature below would not verify and the assertion at the end would fail.
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", "platform-authtok", raising=False)
+
+    admin, iid = await _seed_active_instance()
+    async with tenant_session(admin) as s:
+        conn = await attach_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            e164_number=BYO_NUMBER,
+            probe=NullOperabilityProbe(operable_numbers={BYO_NUMBER}),
+        )
+        conn.secret_ref = secret_ref_for(admin, iid, "sms_sender")
+        conn.non_secret_config = {**(conn.non_secret_config or {}), "accountSid": "AC" + "7" * 30}
+    await get_secret_store().put(
+        secret_ref_for(admin, iid, "sms_sender"), {"authToken": tenant_token}
+    )
+
+    url = "http://test/api/v1/webhooks/twilio/sms"
+    params = {"From": "+14155559999", "To": BYO_NUMBER, "Body": "hello"}
+    r = await client.post(
+        "/api/v1/webhooks/twilio/sms",
+        data=params,
+        headers={"X-Twilio-Signature": twilio_signature(tenant_token, url, params)},
+    )
+    assert r.status_code == 200
+    assert "<Response>" in r.text
+
+
 async def test_twilio_sms_unresolvable_number_is_clean_ack(client, monkeypatch):
     """Valid signature but a number no tenant owns → clean 200 no-op, not a crash."""
     auth_token = "authtok-x"
