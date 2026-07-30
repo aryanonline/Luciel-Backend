@@ -21,6 +21,10 @@ from app.schemas_api.common import WireModel
 
 EmailProvisioningModeWire = Literal["own_domain", "vm_subdomain"]
 
+# The three channels one Meta connection serves (§3.1.4/§3.8.1). Each designates its own
+# destination on that single connection — they are not separate connections.
+MetaChannelWire = Literal["whatsapp", "instagram", "messenger"]
+
 
 class ConnectionOut(WireModel):
     """Non-secret view of one instance_connections row (§3.8.3). NO secret field."""
@@ -56,6 +60,17 @@ class StartConnectionResult(WireModel):
     requires_client_form: bool | None = None
 
 
+class SubmitCredentialsRequest(WireModel):
+    """POST body completing a ``requiresClientForm`` connect: the form's field values.
+
+    Keys are the ``credentialFields[].name`` values the providers endpoint advertised for
+    the connection's provider. This is the ONE surface that accepts secret material, and
+    it is write-only: fields the registry marks ``secret`` go straight to the SecretStore
+    and are never echoed back on any response (§3.8.3)."""
+
+    fields: dict[str, str]
+
+
 class SwapConnectionRequest(WireModel):
     """POST body for "Change connected account" (§3.8.7 rule B). Swap re-initiates the
     connect flow against a (possibly different) provider while the CURRENT connection
@@ -77,12 +92,19 @@ class BindDestinationRequest(WireModel):
 
     An OAuth token proves the owner authorized us; it does not say which of their
     WhatsApp numbers or Pages this Luciel serves. Inbound routing resolves a tenant by
-    ``non_secret_config.destination`` alone, so until this is bound a `connected` Meta
-    channel cannot receive a single message. This is a destination identifier
-    (phone_number_id / Page id), NOT a credential — no secret hygiene concern (§3.8.3).
+    the destination alone, so until this is bound a `connected` Meta channel cannot
+    receive a single message. This is a destination identifier (phone_number_id / Page
+    id), NOT a credential — no secret hygiene concern (§3.8.3).
+
+    ``channel`` names WHICH of the three Meta channels the asset belongs to
+    (``whatsapp`` = WhatsApp-eligible number id, ``instagram`` = the IG-linked Page id,
+    ``messenger`` = the Page id). One Meta grant serves all three, so they are stored
+    side by side and binding one never clears another. Omitting it writes the single
+    legacy destination, which is still what the SMS/email senders use.
     """
 
     destination: str = Field(min_length=1, max_length=128)
+    channel: MetaChannelWire | None = None
 
 
 class DisconnectResult(WireModel):

@@ -51,7 +51,11 @@ def senders(monkeypatch) -> tuple[FakeEmailSender, FakeSmsSender]:
     """Bind both notification transports to in-memory fakes (no network, no AWS)."""
     email_fake, sms_fake = FakeEmailSender(), FakeSmsSender()
     monkeypatch.setattr(email_notifier, "build_email_sender", lambda: email_fake)
-    monkeypatch.setattr(sms_notifier, "build_sms_sender", lambda: sms_fake)
+
+    async def _tenant_sender(*a, **kw):
+        return sms_fake
+
+    monkeypatch.setattr(sms_notifier, "build_tenant_sms_sender", _tenant_sender)
     return email_fake, sms_fake
 
 

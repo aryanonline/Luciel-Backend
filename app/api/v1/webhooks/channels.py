@@ -52,6 +52,24 @@ async def _resolve(connection_type: str, destination: str) -> InstanceContext:
         return await routing.resolve_destination(s, connection_type, destination)
 
 
+async def _tenant_twilio_auth_token(to_number: str) -> str | None:
+    """The receiving tenant's own Twilio Auth Token, or None if they have not connected
+    one. Resolving the destination BEFORE verification is safe: it is the same
+    SECURITY DEFINER lookup routing performs, reads nothing but the tenant's own stored
+    credential, and an unresolvable number simply yields the platform fallback and then
+    fails the signature check as before."""
+    from app.channels.tenant_twilio import tenant_auth_token
+
+    if not to_number:
+        return None
+    try:
+        ctx = await _resolve("sms_sender", to_number)
+    except InboundRejected:
+        return None
+    async with tenant_session(ctx.admin_id) as s:
+        return await tenant_auth_token(s, ctx.admin_id, ctx.instance_id)
+
+
 async def _run_and_reply(msg: InboundMessage) -> str:
     """Run an admitted InboundMessage through the runtime and deliver Luciel's answer.
 
@@ -90,7 +108,11 @@ async def twilio_sms_inbound(request: Request) -> Response:
     params: dict[str, str] = {k: str(v) for k, v in form.items()}
     req: dict[str, Any] = {
         # Account Auth Token for X-Twilio-Signature (distinct from the send API key).
-        "auth_token": settings.twilio_auth_token,
+        # Under BYO (§3.1.4) the receiving number belongs to the TENANT's Twilio account,
+        # so Twilio signs with THEIR auth token — verifying against the platform's would
+        # reject every real inbound. The platform token remains the dev/mock fallback.
+        "auth_token": await _tenant_twilio_auth_token(params.get("To", ""))
+        or settings.twilio_auth_token,
         "url": str(request.url),
         "params": params,
         "x_twilio_signature": request.headers.get("X-Twilio-Signature", ""),

@@ -60,9 +60,12 @@ async def test_sms_reply_goes_through_the_adapter_with_the_tenant_number(monkeyp
             sent.update(from_number=from_number, to=to, body=body)
             return "SM-123"
 
-    from app.channels import twilio_sender
+    from app.channels import tenant_twilio
 
-    monkeypatch.setattr(twilio_sender, "build_sms_sender", lambda: FakeSender())
+    async def _tenant_sender(*a, **kw):
+        return FakeSender()
+
+    monkeypatch.setattr(tenant_twilio, "build_tenant_sms_sender", _tenant_sender)
 
     admin, instance = uuid.uuid4(), uuid.uuid4()
     await _seed_sms_sender(admin, instance, "+15550001111")

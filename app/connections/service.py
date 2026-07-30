@@ -285,6 +285,120 @@ async def start_connection(
     return connection, _start_result(auth_class, connection, admin_id=admin_id)
 
 
+class CredentialRejected(ValueError):
+    """The submitted connect-form credential is missing, malformed, or refused."""
+
+
+# The "add your number" state (§3.1.4): the Twilio account is connected but Luciel has
+# no number to send FROM, so the channel is not live and says so.
+_SMS_NEEDS_NUMBER = (
+    "Action needed: add your number. Your Twilio account is connected — designate the "
+    "number Luciel should text from to bring the channel live."
+)
+
+
+async def submit_credentials(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    fields: dict[str, str],
+    user_id: uuid.UUID | None,
+    store: SecretStore | None = None,
+) -> InstanceConnection | None:
+    """Complete a credential-form connect: verify, store the secret, connect the row.
+
+    This is the non-OAuth counterpart to the OAuth callback, and it was the missing half
+    of the flow — ``requiresClientForm: true`` told the UI to collect fields that had
+    nowhere to go. Secret hygiene is the same on both paths (§3.8.3): fields the registry
+    marks ``secret`` are handed to the SecretStore under the row's ``secret_ref`` and
+    never touch Postgres; the rest land in ``non_secret_config``.
+
+    Verification happens BEFORE the row claims to be connected, so a credential the
+    provider would refuse cannot produce a healthy-looking connection."""
+    connection = (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if connection is None:
+        return None
+
+    spec = registry.get_provider(connection.provider)
+    if spec is None or spec.auth_kind != registry.AUTH_CREDENTIAL_FORM:
+        raise CredentialRejected(
+            f"Provider '{connection.provider}' does not take a credential form."
+        )
+    known = {f.name: f for f in spec.credential_fields}
+    unknown = sorted(set(fields) - set(known))
+    if unknown:
+        raise CredentialRejected(f"Unknown field(s) for {spec.provider}: {', '.join(unknown)}.")
+    missing = sorted(
+        f.name for f in spec.credential_fields if f.required and not (fields.get(f.name) or "")
+    )
+    if missing:
+        raise CredentialRejected(f"Missing required field(s): {', '.join(missing)}.")
+
+    if spec.provider == "twilio":
+        from app.channels.tenant_twilio import (
+            InvalidTwilioCredentials,
+            secret_material,
+            validate_submitted_credentials,
+            verify_credentials,
+        )
+
+        try:
+            creds = validate_submitted_credentials(fields)
+            await verify_credentials(creds)
+        except InvalidTwilioCredentials as exc:
+            raise CredentialRejected(str(exc)) from exc
+        material = secret_material(creds)
+        non_secret = {"accountSid": creds.account_sid}
+    else:
+        material = {n: v for n, v in fields.items() if known[n].secret and v}
+        non_secret = {n: v for n, v in fields.items() if not known[n].secret}
+
+    if not connection.secret_ref:
+        connection.secret_ref = secret_ref_for(
+            admin_id, connection.instance_id, connection.connection_type
+        )
+    await (store or get_secret_store()).put(connection.secret_ref, material)
+    connection.non_secret_config = {**(connection.non_secret_config or {}), **non_secret}
+
+    # A BYO SMS account with no designated number cannot send, so it must not claim to be
+    # connected — the channel row shows "add your number" instead (§3.1.4).
+    needs_number = connection.connection_type == "sms_sender" and not (
+        connection.non_secret_config or {}
+    ).get("destination")
+    old_status = connection.status
+    if needs_number:
+        connection.status = "unconfigured"
+        connection.status_detail = _SMS_NEEDS_NUMBER
+    else:
+        connection.status = "connected"
+        connection.status_detail = None
+    await session.flush()
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": connection.status,
+            "reason": "credentials_submitted",
+        },
+    )
+    return connection
+
+
 async def reconnect(
     session: AsyncSession,
     *,
@@ -1001,12 +1115,39 @@ async def resolve_sms_number(
     return await _resolve_destination(session, admin_id, instance_id, "sms_sender")
 
 
+# Which destination key(s) a runtime channel may bind on the ONE Meta connection.
+# ``instagram_messenger`` is one channel id in this codebase but two Meta assets, so it
+# accepts either — an IG-only tenant and a Page-only tenant both resolve.
+META_CHANNEL_DESTINATION_KEYS: dict[str, tuple[str, ...]] = {
+    "whatsapp": ("whatsapp",),
+    "instagram_messenger": ("instagram", "messenger"),
+}
+
+
 async def resolve_meta_destination(
-    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    channel: str | None = None,
 ) -> str | None:
-    """The tenant's Meta sender id, or None if the channel is not provisioned.
+    """The tenant's Meta sender id for ``channel``, or None if it is not bound.
 
     For WhatsApp this is the WhatsApp phone-number id; for Instagram DM / Messenger it is
     the IG-account / Facebook-page id (§3.1.3 — these channels bind to a page/account, not
-    a phone number). Both ride the same ``channel_auth`` connection."""
-    return await _resolve_destination(session, admin_id, instance_id, "channel_auth")
+    a phone number). All three ride the SAME ``channel_auth`` connection and each names its
+    own asset under ``non_secret_config['destinations']``, so binding Messenger never
+    unbinds WhatsApp. Falls back to the single legacy ``destination`` for connections bound
+    before per-channel destinations existed.
+    """
+    conn = await _single_active(session, admin_id, instance_id, "channel_auth")
+    if conn is None or not conn.non_secret_config:
+        return None
+    config = conn.non_secret_config
+    destinations = config.get("destinations")
+    if channel and isinstance(destinations, dict):
+        for key in META_CHANNEL_DESTINATION_KEYS.get(channel, (channel,)):
+            value = destinations.get(key)
+            if isinstance(value, str) and value:
+                return value
+    legacy = config.get("destination")
+    return legacy if isinstance(legacy, str) and legacy else None

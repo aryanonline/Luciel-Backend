@@ -498,6 +498,7 @@ SCHEDULING_TOOL_IDS: tuple[str, ...] = (
     "cancel_appointment",
 )
 
+
 @dataclass(frozen=True)
 class CapabilitySpec:
     """One owner-facing capability and the tool ids that implement it.

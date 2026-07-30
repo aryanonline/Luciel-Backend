@@ -72,8 +72,9 @@ class TwilioOperabilityProbe:
     so mock/CI never needs it (mirrors ``TwilioSmsSender``)."""
 
     account_sid: str
-    api_key_sid: str
-    api_key_secret: str
+    api_key_sid: str = ""
+    api_key_secret: str = ""
+    auth_token: str = ""
 
     async def check(self, e164_number: str) -> OperabilityResult:
         try:
@@ -81,7 +82,11 @@ class TwilioOperabilityProbe:
         except ImportError:
             return OperabilityResult.UNKNOWN
         try:
-            client = Client(self.api_key_sid, self.api_key_secret, self.account_sid)
+            client = (
+                Client(self.api_key_sid, self.api_key_secret, self.account_sid)
+                if self.api_key_sid and self.api_key_secret
+                else Client(self.account_sid, self.auth_token)
+            )
             # Exact-match filter; a number in/hosted-by the account returns >=1 row.
             matches = await _to_thread(
                 lambda: client.incoming_phone_numbers.list(phone_number=e164_number, limit=1)

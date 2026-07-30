@@ -91,6 +91,7 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Generic OAuth code-for-token callback (Decision #7): the Meta channels — and
         # every future OAuth provider on a non-knowledge connection type — complete here.
         ("POST", "/api/v1/admin/connections/{connection_id}/oauth-callback"),
+        ("POST", "/api/v1/admin/connections/{connection_id}/credentials"),
         # Decision #7: which WhatsApp number / Page this Luciel answers on. Without it a
         # `connected` Meta channel resolves to no tenant and receives nothing.
         ("PUT", "/api/v1/admin/connections/{connection_id}/destination"),

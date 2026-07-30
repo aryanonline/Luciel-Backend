@@ -94,7 +94,8 @@ async def test_providers_endpoint_offers_the_decision_6_choices(client):
     assert [p["provider"] for p in by_type["record_source"]] == ["live_connector", "csv"]
     assert [p["provider"] for p in by_type["calendar"]] == ["google_calendar", "calendly"]
     # Decision #7: the Meta channels are registry entries like everything else.
-    assert [p["provider"] for p in by_type["channel_auth"]] == ["meta_whatsapp", "meta_instagram"]
+    # §3.8.1: ONE Meta grant powers WhatsApp, Instagram and Messenger — one provider.
+    assert [p["provider"] for p in by_type["channel_auth"]] == ["meta"]
 
     # Every option carries what the UI needs to render the choice.
     hubspot = next(p for p in by_type["crm"] if p["provider"] == "hubspot")
@@ -164,8 +165,8 @@ async def test_meta_channel_connect_start_uses_meta_oauth(client):
 
     await _ready_account_with_luciel(client)
     for provider, scope_probe in (
-        ("meta_whatsapp", "whatsapp_business_messaging"),
-        ("meta_instagram", "instagram_manage_messages"),
+        ("meta", "whatsapp_business_messaging"),
+        ("meta", "instagram_manage_messages"),
     ):
         spec = oauth_flow.authorize_spec(provider)
         assert spec is not None, provider
@@ -560,7 +561,7 @@ async def test_meta_oauth_callback_stores_the_token_and_connects(client, monkeyp
 
     rs = await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+        json={"connectionType": "channel_auth", "provider": "meta"},
     )
     assert rs.status_code == 200, rs.text
     authorize_url = rs.json()["authorizeUrl"]
@@ -601,7 +602,7 @@ async def test_meta_oauth_callback_audits_the_status_change(client, monkeypatch)
     admin_id = _admin_id(client)
     rs = await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "channel_auth", "provider": "meta_instagram"},
+        json={"connectionType": "channel_auth", "provider": "meta"},
     )
     state = _state_from_authorize_url(rs.json()["authorizeUrl"])
     listed = (await client.get("/api/v1/admin/connections")).json()
@@ -638,7 +639,7 @@ async def test_meta_oauth_callback_rejects_a_replayed_state(client, monkeypatch)
     await _ready_account_with_luciel(client)
     rs = await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+        json={"connectionType": "channel_auth", "provider": "meta"},
     )
     state = _state_from_authorize_url(rs.json()["authorizeUrl"])
     listed = (await client.get("/api/v1/admin/connections")).json()
@@ -678,7 +679,7 @@ async def test_meta_oauth_callback_surfaces_a_rejected_code_as_conflict(client, 
     await _ready_account_with_luciel(client)
     rs = await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "channel_auth", "provider": "meta_whatsapp"},
+        json={"connectionType": "channel_auth", "provider": "meta"},
     )
     state = _state_from_authorize_url(rs.json()["authorizeUrl"])
     listed = (await client.get("/api/v1/admin/connections")).json()
@@ -729,7 +730,7 @@ async def test_oauth_callback_rejects_a_non_oauth_provider_and_a_foreign_id(clie
 # that actually finishes the connect, and these tests pin it end to end.
 
 
-async def _connected_meta(client, monkeypatch, provider: str = "meta_whatsapp") -> str:
+async def _connected_meta(client, monkeypatch, provider: str = "meta") -> str:
     """Drive a Meta channel_auth connection to `connected` and return its id."""
     _configure_meta(monkeypatch)
     code = f"meta-{uuid.uuid4().hex[:6]}"
@@ -801,7 +802,7 @@ async def test_a_destination_another_account_already_holds_is_refused(client, mo
     await _ready_account_with_luciel(client)
     second_admin = _admin_id(client)
     assert second_admin != first_admin
-    second_cid = await _connected_meta(client, monkeypatch, provider="meta_instagram")
+    second_cid = await _connected_meta(client, monkeypatch, provider="meta")
 
     clash = await client.put(
         f"/api/v1/admin/connections/{second_cid}/destination", json={"destination": shared}

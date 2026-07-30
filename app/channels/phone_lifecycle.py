@@ -45,11 +45,8 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.channels.number_operability import (
-    NumberOperabilityProbe,
-    OperabilityResult,
-    build_operability_probe,
-)
+from app.channels.number_operability import NumberOperabilityProbe, OperabilityResult
+from app.channels.tenant_twilio import build_tenant_operability_probe
 from app.models.connection import InstanceConnection
 
 # Basic E.164: leading '+', first digit 1-9, then 7-14 more digits (8-15 total).
@@ -128,7 +125,7 @@ async def attach_sms_number(
     number never inherits the old number's status. Idempotent per tenant/instance.
     """
     number = _validate_e164(e164_number)
-    probe = probe or build_operability_probe()
+    probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(number)
     status, detail = _status_for(result)
 
@@ -136,7 +133,9 @@ async def attach_sms_number(
     if existing is not None:
         existing.provider = "twilio"
         existing.auth_class = "api_key"
-        existing.non_secret_config = {"destination": number}
+        # Merge, don't replace: the BYO Twilio account id (§3.1.4) also lives here, and
+        # designating a number must not silently unbind the account it belongs to.
+        existing.non_secret_config = {**(existing.non_secret_config or {}), "destination": number}
         existing.status = status
         existing.status_detail = detail
         await session.flush()
@@ -179,7 +178,7 @@ async def reverify_sms_number(
     if not destination:
         return None
 
-    probe = probe or build_operability_probe()
+    probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(str(destination))
     status, detail = _status_for(result)
     existing.status = status

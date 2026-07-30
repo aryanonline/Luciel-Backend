@@ -14,7 +14,8 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.base import DeliveryReceipt
-from app.channels.twilio_sender import NullSmsSender, build_sms_sender
+from app.channels.tenant_twilio import build_tenant_sms_sender
+from app.channels.twilio_sender import NullSmsSender
 from app.config import get_settings
 from app.connections.service import resolve_sms_number
 from app.notifications.base import EscalationNotification
@@ -54,7 +55,11 @@ class SmsNotifier:
         )
         if not from_number:
             return DeliveryReceipt(accepted=False, detail="sms_channel_not_provisioned")
-        sender = build_sms_sender()
+        # BYO (§3.1.4): the page goes out through the tenant's OWN Twilio account, the
+        # same one their customer SMS rides — the platform is not in the billing path.
+        sender = await build_tenant_sms_sender(
+            session, notification.admin_id, notification.instance_id
+        )
         try:
             sid = await sender.send_sms(from_number, to, self.format(notification))
         except Exception as exc:  # noqa: BLE001 — a send failure is data, not a raise

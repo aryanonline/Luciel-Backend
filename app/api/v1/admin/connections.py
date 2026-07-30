@@ -23,10 +23,10 @@ here — the wire model has no field for it (§3.8.3).
 from __future__ import annotations
 
 import uuid
-from typing import cast
+from typing import Annotated, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +57,7 @@ from app.schemas_api.connections import (
     ProvisionEmailRequest,
     StartConnectionRequest,
     StartConnectionResult,
+    SubmitCredentialsRequest,
     SwapConnectionRequest,
     SwitchConnectionRequest,
 )
@@ -195,6 +196,37 @@ async def start_connection(
         return StartConnectionResult.model_validate(result)
 
 
+@router.post("/{connection_id}/credentials", response_model=ConnectionOut)
+async def submit_credentials(
+    connection_id: uuid.UUID,
+    req: SubmitCredentialsRequest,
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Finish a ``requiresClientForm`` connect by handing over the credential.
+
+    The OAuth half of the lifecycle had a callback; the credential-form half had nothing,
+    so a customer's own Twilio / webhook / live-connector credential had no way into the
+    system and BYO telephony fell back to the platform's account. Same lifecycle either
+    way: verify first, store the secret behind ``secret_ref``, then move the status.
+
+    Write-only for secrets (§3.8.3): the response is the ordinary non-secret connection
+    projection, so nothing submitted here can be read back out."""
+    async with tenant_session(subject.admin_id) as s:
+        try:
+            conn = await service.submit_credentials(
+                s,
+                admin_id=subject.admin_id,
+                connection_id=connection_id,
+                fields=req.fields,
+                user_id=subject.user_id,
+            )
+        except service.CredentialRejected as exc:
+            raise validation_error(str(exc)) from exc
+        if conn is None:
+            raise not_found("Connection not found.")
+        return _connection_out(conn)
+
+
 @router.post("/{connection_id}/reconnect", response_model=StartConnectionResult)
 async def reconnect_connection(
     connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
@@ -255,7 +287,8 @@ async def swap_connection(
 
 @router.get("/providers", response_model=list[ConnectionProvidersOut])
 async def list_providers(
-    connection_type: str | None = None,
+    connection_type: Annotated[str | None, Query()] = None,
+    connection_type_camel: Annotated[str | None, Query(alias="connectionType")] = None,
     subject: Subject = Depends(current_admin),
 ) -> list[ConnectionProvidersOut]:
     """The provider CHOICES the owner may pick from, per connection type (Decision #6).
@@ -265,10 +298,17 @@ async def list_providers(
     wire so the choice is rendered from server truth. Non-secret by construction: only a
     ``configured`` boolean is derived from the platform OAuth credential (§3.8.3).
 
+    BOTH spellings of the filter are accepted. Every other field on this API is camelCase,
+    so callers reasonably send ``connectionType``; the original snake_case-only parameter
+    meant an unknown query param was silently dropped and the WHOLE catalog came back —
+    which is how Google Calendar ended up rendered under CRM, look-up and the channels.
+    An ignored filter must not be able to widen a response, so both names bind here.
+
     Read-only over static registry data, so it needs no tenant session — but it stays
     admin-authed because the set of integrations we offer is not public information."""
     del subject
-    types = [connection_type] if connection_type else sorted(registry.CHOICE_TYPES)
+    selected = connection_type or connection_type_camel
+    types = [selected] if selected else sorted(registry.CHOICE_TYPES)
     return [
         ConnectionProvidersOut.model_validate(
             {
@@ -491,6 +531,11 @@ async def bind_destination(
     ``sms_sender`` is deliberately NOT bindable here: its number goes through
     ``attach_sms_number``, which also runs the Twilio operability + A2P status gate
     (§3.1.6). Allowing a raw write here would be a way around that gate.
+
+    Per-channel by design (§3.1.4/§3.8.1): the ONE Meta grant authorizes WhatsApp,
+    Instagram and Messenger, and each names its own asset under ``destinations``.
+    Enabling a second Meta channel therefore adds a destination rather than replacing
+    one — the eviction that used to happen when they were separate connections.
     """
     async with tenant_session(subject.admin_id) as s:
         conn = await _tenant_connection(s, subject.admin_id, connection_id)
@@ -506,10 +551,19 @@ async def bind_destination(
                 "That Meta destination is already connected to another account. "
                 "Disconnect it there first."
             )
-        previous = (conn.non_secret_config or {}).get("destination")
+        cfg = dict(conn.non_secret_config or {})
+        if req.channel:
+            existing_map = cfg.get("destinations")
+            destinations = dict(existing_map) if isinstance(existing_map, dict) else {}
+            previous = destinations.get(req.channel)
+            destinations[req.channel] = req.destination
+            cfg["destinations"] = destinations
+        else:
+            previous = cfg.get("destination")
+            cfg["destination"] = req.destination
         # New dict, not an in-place edit: the JSONB column is not a MutableDict, so
         # mutating the existing one would not be flushed.
-        conn.non_secret_config = {**(conn.non_secret_config or {}), "destination": req.destination}
+        conn.non_secret_config = cfg
         await s.flush()
         await audit.emit(
             s,
@@ -523,6 +577,7 @@ async def bind_destination(
                 "connection_type": conn.connection_type,
                 "provider": conn.provider,
                 "action": "bind_destination",
+                "channel": req.channel,
                 "old_destination": previous,
                 "new_destination": req.destination,
             },

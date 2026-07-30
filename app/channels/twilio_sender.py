@@ -77,28 +77,35 @@ class TwilioSmsSender:
     Twilio's REST client authenticates as an Account (``account_sid``); an
     API-Key SID (``SK...``) + secret is a valid alternative to the Account auth
     token but the Account SID itself is still mandatory — there is no Twilio
-    REST call that omits it. See module docstring for the current blocker.
+    REST call that omits it. Either credential shape is accepted, because a
+    customer bringing their own account (§3.1.4) may hand us either one.
     """
 
     account_sid: str
-    api_key_sid: str
-    api_key_secret: str
+    api_key_sid: str = ""
+    api_key_secret: str = ""
+    auth_token: str = ""
     _client: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        # Fail closed at construction, never at send time mid-conversation —
+        # matches RealStripeGateway's fail-loudly-at-construction posture.
         if not self.account_sid:
-            # Fail closed at construction, never at send time mid-conversation —
-            # matches RealStripeGateway's fail-loudly-at-construction posture.
             raise RuntimeError(
                 "TwilioSmsSender requires a Twilio Account SID (AC...); only an "
                 "API-Key SID/secret was configured. See gap_twilio.md."
             )
+        if not self.auth_token and not (self.api_key_sid and self.api_key_secret):
+            raise RuntimeError("TwilioSmsSender requires an Auth Token or an API Key SID + secret.")
 
     def _get_client(self) -> object:
         if self._client is None:
             from twilio.rest import Client  # noqa: PLC0415 — lazy/guarded (CI has no network)
 
-            self._client = Client(self.api_key_sid, self.api_key_secret, self.account_sid)
+            if self.api_key_sid and self.api_key_secret:
+                self._client = Client(self.api_key_sid, self.api_key_secret, self.account_sid)
+            else:
+                self._client = Client(self.account_sid, self.auth_token)
         return self._client
 
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None:
@@ -108,7 +115,14 @@ class TwilioSmsSender:
 
 
 def build_sms_sender() -> SmsSenderProtocol:
-    """Return the Twilio sender in live mode when fully configured, else Null.
+    """PLATFORM Twilio sender — dev/mock fallback ONLY (§3.1.4).
+
+    The customer-facing send path goes through
+    ``app.channels.tenant_twilio.build_tenant_sms_sender``, which binds the TENANT's own
+    Twilio credentials from their ``sms_sender`` connection. This factory reads the
+    platform's account, which must never be the sender in the BYO model — VantageMind is
+    not in the telephony billing path. It survives as the no-tenant-context fallback
+    (returns Null in mock/CI, which is every non-live environment).
 
     Requires ALL of: ``integration_mode == \"live\"``, a Twilio API-Key SID +
     secret, AND a Twilio Account SID. The Account SID is the current known gap

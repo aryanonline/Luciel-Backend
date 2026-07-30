@@ -110,16 +110,26 @@ class _EmailMessengerBackend:
 
 
 class _SmsMessengerBackend:
-    """MessengerBackend over the platform SMS sender (Twilio live / Null in mock).
+    """MessengerBackend over the TENANT's own Twilio account (§3.1.4 BYO).
 
-    ``from_number`` is resolved by the SMS sender itself in live mode; the tool has no
-    per-lead sender choice to make, and gate 2 has already proved the SMS channel is
-    enabled before this runs (the send_sms↔SMS-channel coupling, §3.3.3 gate 2).
+    The tool has no per-lead sender choice to make, and gate 2 has already proved the SMS
+    channel is enabled before this runs (the send_sms↔SMS-channel coupling, §3.3.3 gate
+    2). Which ACCOUNT it sends through is not a platform choice either: it is the Twilio
+    the admin connected, sending from the number they designated. Without a session the
+    tenant's credential cannot be read, so the platform fallback stays (Null in mock).
     """
 
     async def send(self, ctx: ToolContext, to: str, body: str) -> str | None:
-        sender = build_sms_sender()
-        return await sender.send_sms("", to, body)
+        if ctx.session is None:
+            return await build_sms_sender().send_sms("", to, body)
+        from app.channels.tenant_twilio import build_tenant_sms_sender
+        from app.connections.service import resolve_sms_number
+
+        from_number = await resolve_sms_number(ctx.session, ctx.admin_id, ctx.instance_id)
+        if not from_number:
+            return None
+        sender = await build_tenant_sms_sender(ctx.session, ctx.admin_id, ctx.instance_id)
+        return await sender.send_sms(from_number, to, body)
 
 
 class BringYourOwnWebhookTool:

@@ -115,12 +115,15 @@ async def _send_sms(
     body: str,
 ) -> DeliveryReceipt:
     from app.channels.sms_adapter import SmsAdapter
+    from app.channels.tenant_twilio import build_tenant_sms_sender
     from app.connections.service import resolve_sms_number
 
     from_number = await resolve_sms_number(session, admin_id, instance_id)
     if not from_number:
         return _NOT_PROVISIONED
-    return await SmsAdapter().send(
+    # BYO (§3.1.4): send through the tenant's OWN Twilio, never the platform's.
+    sender = await build_tenant_sms_sender(session, admin_id, instance_id)
+    return await SmsAdapter(sender).send(
         OutboundMessage(channel="sms", to=to, body=body, metadata={"from_number": from_number})
     )
 
@@ -164,7 +167,11 @@ async def _send_meta(
 ) -> DeliveryReceipt:
     from app.connections.service import resolve_meta_destination
 
-    identity = sender_id or await resolve_meta_destination(session, admin_id, instance_id)
+    # Per-channel (§3.8.1): the one Meta connection binds a WhatsApp number id, an IG page
+    # id and a Messenger page id side by side, so the reply must pick its own.
+    identity = sender_id or await resolve_meta_destination(
+        session, admin_id, instance_id, channel=channel
+    )
     if not identity:
         return _NOT_PROVISIONED
     if channel == "whatsapp":

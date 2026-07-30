@@ -252,43 +252,31 @@ PROVIDERS: dict[str, ProviderSpec] = {
         help_text="Choose which pages or databases Luciel may read.",
     ),
     # --- Meta channels (Decision #7) ----------------------------------------------
-    # WhatsApp and Instagram/Messenger both ride the single ``channel_auth`` connection
-    # (§3.1.3) — they bind to a WhatsApp phone-number id / IG-account or Page id, not to
-    # a phone number of ours. Both are Meta OAuth against the same Graph app, differing
-    # only in the scopes requested, which is exactly what a registry entry expresses.
-    "meta_whatsapp": ProviderSpec(
-        provider="meta_whatsapp",
+    # ONE connection, three channels. WhatsApp, Instagram DM and Messenger all bind to the
+    # SAME Meta Business account (§3.1.4/§3.8.1), and ``instance_connections`` allows one
+    # active row per connection_type — so modelling them as separate providers meant
+    # connecting Instagram silently evicted WhatsApp. A single Meta OAuth grant, carrying
+    # the union of the three channels' scopes, authorizes all of them; which asset each
+    # ENABLED channel answers on is then named per channel via PUT /destination.
+    "meta": ProviderSpec(
+        provider="meta",
         connection_type="channel_auth",
-        display_name="WhatsApp Business",
+        display_name="Meta (WhatsApp, Instagram & Messenger)",
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://www.facebook.com/v19.0/dialog/oauth",
             exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
-            scopes="whatsapp_business_messaging,whatsapp_business_management,business_management",
+            scopes="whatsapp_business_messaging,whatsapp_business_management,"
+            "instagram_basic,instagram_manage_messages,pages_messaging,"
+            "pages_show_list,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
             supports_pkce=False,
         ),
         client_id_setting="meta_app_id",
         client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME
         redirect_uri_setting="meta_redirect_uri",
-        help_text="Reply on WhatsApp from your WhatsApp Business number.",
-    ),
-    "meta_instagram": ProviderSpec(
-        provider="meta_instagram",
-        connection_type="channel_auth",
-        display_name="Instagram DM & Messenger",
-        auth_kind=AUTH_OAUTH,
-        authorize=ProviderAuthorize(
-            endpoint="https://www.facebook.com/v19.0/dialog/oauth",
-            exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
-            scopes="instagram_basic,instagram_manage_messages,pages_messaging,"
-            "pages_show_list,business_management",
-            supports_pkce=False,
-        ),
-        client_id_setting="meta_app_id",
-        client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME
-        redirect_uri_setting="meta_redirect_uri",
-        help_text="Reply to Instagram DMs and Facebook Messenger from your Page.",
+        help_text="Connect your Meta Business account once — it powers WhatsApp, "
+        "Instagram DMs and Messenger.",
     ),
     # --- Senders (provisioned / platform-owned, no owner-facing choice) -----------
     "ses": ProviderSpec(
@@ -299,13 +287,26 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_class="api_key",
         help_text="The address Luciel sends and receives on.",
     ),
+    # BYO telephony (§3.1.4): the customer connects their OWN Twilio account and Luciel
+    # texts/calls through it. VantageMind is never in the telephony billing path, which is
+    # only true if the credential on the send path is theirs — so this is a real
+    # credential-form connection, not a platform-owned provisioned sender. It is ALWAYS
+    # available: the customer supplies the credential, so there is no platform OAuth app
+    # to be missing (that is what ``configured`` gates, and it does not apply here).
     "twilio": ProviderSpec(
         provider="twilio",
         connection_type="sms_sender",
-        display_name="Your own phone number",
-        auth_kind=AUTH_PROVISIONED,
+        display_name="Your Twilio account",
+        auth_kind=AUTH_CREDENTIAL_FORM,
+        credential_fields=(
+            CredentialField("accountSid", "Twilio Account SID (AC…)"),
+            CredentialField("authToken", "Twilio Auth Token", secret=True, required=False),
+            CredentialField("apiKeySid", "API Key SID (SK…)", required=False),
+            CredentialField("apiKeySecret", "API Key Secret", secret=True, required=False),
+        ),
         auth_class="api_key",
-        help_text="Bring your own number; Luciel texts from it.",
+        help_text="Connect your Twilio account so Luciel can text from your business "
+        "number. Carrier costs stay on your own Twilio bill.",
     ),
     "outbound_webhook": ProviderSpec(
         provider="outbound_webhook",
@@ -328,8 +329,19 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "crm": ("hubspot", "salesforce", "custom_webhook"),
     "record_source": ("live_connector", "csv"),
     "knowledge_source": ("google_drive", "notion"),
-    "channel_auth": ("meta_whatsapp", "meta_instagram"),
+    "channel_auth": ("meta",),
+    "sms_sender": ("twilio",),
 }
+
+# Provider ids that were split before the single-Meta correction. Rows already written
+# under them keep resolving (and normalize to ``meta`` on the next connect) instead of
+# turning into an unregistered provider with no OAuth config.
+_ALIASES: dict[str, str] = {"meta_whatsapp": "meta", "meta_instagram": "meta"}
+
+
+def canonical_provider(provider: str) -> str:
+    """The registered id for a provider string, collapsing superseded aliases."""
+    return _ALIASES.get(provider, provider)
 
 
 # The connection types that present the owner a provider choice (Decision #6).
@@ -348,7 +360,7 @@ _ALSO_ACCEPTED: dict[str, frozenset[str]] = {
 
 def get_provider(provider: str) -> ProviderSpec | None:
     """The spec for a provider id, or None if it is not registered."""
-    return PROVIDERS.get(provider)
+    return PROVIDERS.get(canonical_provider(provider))
 
 
 def providers_for(connection_type: str) -> list[ProviderSpec]:
@@ -371,11 +383,11 @@ def default_provider(connection_type: str) -> str | None:
 def has_choice(connection_type: str) -> bool:
     """True iff this type presents the owner a PROVIDER CHOICE (Decision #6).
 
-    Only these types are validated against the registry on connect. The provisioned
-    senders (email/SMS) have no owner-facing choice — their ``provider`` column is just a
-    brand label for the platform-owned integration behind them, so pinning it to a
-    registry entry would reject labels already in the field for no safety gain. Where a
-    choice EXISTS the string steers a real OAuth endpoint, so it is validated."""
+    Only these types are validated against the registry on connect. ``email_sender`` is
+    the remaining exception — it is platform-provisioned, so its ``provider`` column is
+    just a brand label and pinning it to a registry entry would reject labels already in
+    the field for no safety gain. Everywhere a choice EXISTS the string steers a real
+    OAuth endpoint or credential form, so it is validated."""
     return connection_type in _ORDER
 
 
@@ -386,7 +398,7 @@ def is_valid_provider(connection_type: str, provider: str) -> bool:
     string from steering a connect flow at an arbitrary endpoint."""
     if provider in _ALSO_ACCEPTED.get(connection_type, frozenset()):
         return True
-    spec = PROVIDERS.get(provider)
+    spec = get_provider(provider)
     return spec is not None and spec.connection_type == connection_type
 
 
@@ -397,7 +409,7 @@ def oauth_client_config(provider: str) -> OAuthClientConfig:
     without a per-provider branch — that is what makes adding a provider config rather
     than code. Unregistered/non-OAuth providers return an unconfigured (empty) config
     rather than raising, so the catalog can grow and a live flow fails closed."""
-    spec = PROVIDERS.get(provider)
+    spec = get_provider(provider)
     if spec is None:
         # §3.2.3 wire origin `crm_kb` resolves to the native-CRM default so the
         # knowledge-side CRM sync keeps its existing credential lookup.
@@ -438,7 +450,8 @@ DEPENDENT_TOOLS: dict[str, tuple[str, ...]] = {
 DEPENDENT_CHANNELS: dict[str, tuple[str, ...]] = {
     "email_sender": ("email",),
     "sms_sender": ("sms", "voice"),
-    "channel_auth": ("whatsapp", "instagram"),
+    # One Meta grant powers all three Meta channels, so handing it back takes all three.
+    "channel_auth": ("whatsapp", "instagram_messenger"),
 }
 
 
