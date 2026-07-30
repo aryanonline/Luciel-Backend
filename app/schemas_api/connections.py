@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from pydantic import Field
+
 from app.schemas_api.common import WireModel
 
 EmailProvisioningModeWire = Literal["own_domain", "vm_subdomain"]
@@ -68,6 +70,19 @@ class SwitchConnectionRequest(WireModel):
     registry offers for this connection type (Decision #6)."""
 
     provider: str | None = None
+
+
+class BindDestinationRequest(WireModel):
+    """PUT body naming WHICH Meta asset this Luciel answers on (Decision #7).
+
+    An OAuth token proves the owner authorized us; it does not say which of their
+    WhatsApp numbers or Pages this Luciel serves. Inbound routing resolves a tenant by
+    ``non_secret_config.destination`` alone, so until this is bound a `connected` Meta
+    channel cannot receive a single message. This is a destination identifier
+    (phone_number_id / Page id), NOT a credential — no secret hygiene concern (§3.8.3).
+    """
+
+    destination: str = Field(min_length=1, max_length=128)
 
 
 class DisconnectResult(WireModel):

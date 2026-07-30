@@ -23,6 +23,8 @@ migration) so resolution works before a tenant subject exists.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,3 +60,20 @@ async def resolve_destination(
     if row is None:
         raise InboundRejected(f"unresolvable_destination:{connection_type}")
     return InstanceContext(admin_id=row.admin_id, instance_id=row.instance_id)
+
+
+async def owner_of_destination(
+    session: AsyncSession, connection_type: str, destination: str
+) -> uuid.UUID | None:
+    """Which tenant currently holds this destination, if any (None = unclaimed).
+
+    Used when an admin CLAIMS a destination, to reject one another tenant already holds.
+    It goes through the same SECURITY DEFINER resolver as inbound routing on purpose: RLS
+    hides other tenants' rows from an ordinary query, so a plain SELECT would report every
+    foreign claim as unclaimed. Sharing the resolver also means the answer cannot disagree
+    with the row ``resolve_destination`` will actually pick at delivery time.
+    """
+    try:
+        return (await resolve_destination(session, connection_type, destination)).admin_id
+    except InboundRejected:
+        return None

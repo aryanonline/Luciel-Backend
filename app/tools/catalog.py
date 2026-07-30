@@ -9,6 +9,7 @@ providers; the real backends bind via the Connections layer (Arc 17).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -497,8 +498,38 @@ SCHEDULING_TOOL_IDS: tuple[str, ...] = (
     "cancel_appointment",
 )
 
+@dataclass(frozen=True)
+class CapabilitySpec:
+    """One owner-facing capability and the tool ids that implement it.
+
+    ``connection_type`` is DERIVED from TOOL_CONNECTION_TYPE rather than restated, so a
+    group can never drift from the connection its tools actually use.
+    """
+
+    capability: str
+    label: str
+    help_text: str
+    tool_ids: tuple[str, ...]
+
+    @property
+    def connection_type(self) -> str | None:
+        return TOOL_CONNECTION_TYPE[self.tool_ids[0]]
+
+
+CAPABILITIES: tuple[CapabilitySpec, ...] = (
+    CapabilitySpec(
+        capability="scheduling",
+        label="Appointment scheduling",
+        help_text=(
+            "Luciel can offer open times, book an appointment, and move or cancel one "
+            "it already booked — all on the calendar you connect here."
+        ),
+        tool_ids=SCHEDULING_TOOL_IDS,
+    ),
+)
+
 CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
-    "scheduling": SCHEDULING_TOOL_IDS,
+    spec.capability: spec.tool_ids for spec in CAPABILITIES
 }
 
 
@@ -524,6 +555,8 @@ __all__ = [
     "TOOL_CONNECTION_TYPE",
     "TOOL_REQUIRED_INPUTS",
     "SCHEDULING_TOOL_IDS",
+    "CapabilitySpec",
+    "CAPABILITIES",
     "CAPABILITY_GROUPS",
     "capability_of",
     "Outcome",

@@ -36,6 +36,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # admin/luciel
         ("GET", "/api/v1/admin/luciel"),
         ("POST", "/api/v1/admin/luciel"),
+        # Decision #8: the owner-facing capability grouping (scheduling is ONE capability).
+        ("GET", "/api/v1/admin/luciel/capabilities"),
         ("PUT", "/api/v1/admin/luciel/channels"),
         ("POST", "/api/v1/admin/luciel/delete"),
         ("PUT", "/api/v1/admin/luciel/escalation"),
@@ -89,6 +91,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Generic OAuth code-for-token callback (Decision #7): the Meta channels — and
         # every future OAuth provider on a non-knowledge connection type — complete here.
         ("POST", "/api/v1/admin/connections/{connection_id}/oauth-callback"),
+        # Decision #7: which WhatsApp number / Page this Luciel answers on. Without it a
+        # `connected` Meta channel resolves to no tenant and receives nothing.
+        ("PUT", "/api/v1/admin/connections/{connection_id}/destination"),
         # admin/usage
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),

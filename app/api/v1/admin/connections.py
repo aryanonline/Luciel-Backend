@@ -9,6 +9,7 @@ Implements the frozen admin client (http-admin.ts connections.*) field-for-field
   * POST   /connections/{id}/disconnect       → DisconnectResult (Decision #5b)
   * POST   /connections/{id}/switch {provider} → StartConnectionResult (Decision #5c)
   * POST   /connections/{id}/oauth-callback   → Connection (Decision #7, any provider)
+  * PUT    /connections/{id}/destination      → Connection (Decision #7, Meta asset)
   * DELETE /connections/{id}                  → 204 (status→revoked + secret cleanup)
   * GET    /connections/email                 → EmailProvisioning | null (§3.1.6a)
   * POST   /connections/email {mode,...}       → EmailProvisioning (§3.1.6a)
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
 from app.audit import log as audit
+from app.channels import routing
 from app.connections import oauth_flow, registry, service
 from app.connections.secrets import get_secret_store
 from app.db.session import tenant_session
@@ -46,6 +48,7 @@ from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance
 from app.schemas_api.connections import (
+    BindDestinationRequest,
     ConnectionOut,
     ConnectionProvidersOut,
     DisconnectResult,
@@ -460,6 +463,68 @@ async def oauth_callback(
                 "old_status": old_status,
                 "new_status": "connected",
                 "reason": "oauth_callback_token_exchanged",
+            },
+        )
+        return _connection_out(conn)
+
+
+@router.put("/{connection_id}/destination", response_model=ConnectionOut)
+async def bind_destination(
+    connection_id: uuid.UUID,
+    req: BindDestinationRequest,
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Name the Meta asset this Luciel answers on (Decision #7, completes the connect).
+
+    The OAuth callback stores the token and the row says `connected`, but inbound routing
+    resolves a tenant SOLELY by ``non_secret_config.destination`` (channels/routing.py) —
+    so without this the owner has an authorized channel that silently receives nothing.
+    Meta cannot supply it for us: an authorized user may own several WhatsApp numbers and
+    several Pages, and only the owner knows which one this Luciel serves.
+
+    The destination must be UNIQUE across tenants, and that is a security boundary rather
+    than a tidiness rule: ``channel_resolve_destination`` returns the first matching row,
+    so a tenant permitted to claim an id another tenant already holds could capture their
+    inbound conversations. The check runs through that same resolver — the only thing that
+    can see across tenants — so what we validate is exactly what routing will do.
+
+    ``sms_sender`` is deliberately NOT bindable here: its number goes through
+    ``attach_sms_number``, which also runs the Twilio operability + A2P status gate
+    (§3.1.6). Allowing a raw write here would be a way around that gate.
+    """
+    async with tenant_session(subject.admin_id) as s:
+        conn = await _tenant_connection(s, subject.admin_id, connection_id)
+        if conn.connection_type != "channel_auth":
+            raise validation_error(
+                f"'{conn.connection_type}' destinations are not bound here "
+                "(only channel_auth; an SMS number is attached via POST /connections)."
+            )
+        instance_id = await _instance_id(s, subject.admin_id)
+        owner = await routing.owner_of_destination(s, "channel_auth", req.destination)
+        if owner is not None and owner != subject.admin_id:
+            raise conflict(
+                "That Meta destination is already connected to another account. "
+                "Disconnect it there first."
+            )
+        previous = (conn.non_secret_config or {}).get("destination")
+        # New dict, not an in-place edit: the JSONB column is not a MutableDict, so
+        # mutating the existing one would not be flushed.
+        conn.non_secret_config = {**(conn.non_secret_config or {}), "destination": req.destination}
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="instance_configured",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "connection_type": conn.connection_type,
+                "provider": conn.provider,
+                "action": "bind_destination",
+                "old_destination": previous,
+                "new_destination": req.destination,
             },
         )
         return _connection_out(conn)

@@ -100,6 +100,25 @@ class AddonToolOut(WireModel):
     disabled_reason: str | None = None
 
 
+class CapabilityGroupOut(WireModel):
+    """One owner-facing capability that several tool ids implement (Decision #8).
+
+    Scheduling is ONE capability over the SINGLE calendar connection: read-before-write
+    is an internal mechanic, so the owner sees "Appointment scheduling", not four
+    toggles. The group is served rather than hardcoded in the UI so adding a tool to a
+    capability stays a backend catalog change.
+    """
+
+    capability: str
+    label: str
+    help_text: str
+    tool_ids: list[AddonToolIdWire]
+    # The single connection type the whole group is gated on — disconnecting it disables
+    # every tool in the group (Decision #5b cascade). null for a group whose tools need no
+    # external connection.
+    connection_type: str | None = None
+
+
 class EscalationRoutingRule(WireModel):
     signal: EscalationSignalWire
     channel: NotificationChannelWire

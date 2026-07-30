@@ -28,6 +28,7 @@ from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
 from app.schemas_api.luciel import (
+    CapabilityGroupOut,
     ChannelConfigIn,
     CreateLucielRequest,
     LucielOut,
@@ -87,6 +88,34 @@ async def get_luciel(subject: Subject = Depends(current_admin)) -> LucielOut | N
     inst = await _load(subject.admin_id)
     # Contract: returns JSON null (200) when the account is empty — NOT 404.
     return _to_out(inst) if inst is not None else None
+
+
+@router.get("/capabilities", response_model=list[CapabilityGroupOut])
+async def list_capabilities(
+    subject: Subject = Depends(current_admin),
+) -> list[CapabilityGroupOut]:
+    """The owner-facing capability groups the tools roll up into (Decision #8).
+
+    Scheduling is ONE capability over the SINGLE calendar connection — read-before-write
+    is an internal mechanic, not two toggles, and moving or cancelling a booking rides the
+    same connection that made it. Serving the grouping means the UI renders one control
+    from server truth instead of hardcoding which tool ids belong together, so adding a
+    tool to a capability stays a catalog change.
+
+    Static catalog data, so no tenant session is needed; admin-authed like /providers
+    because the shape of what we offer is not public.
+    """
+    del subject
+    return [
+        CapabilityGroupOut(
+            capability=spec.capability,
+            label=spec.label,
+            help_text=spec.help_text,
+            tool_ids=list(spec.tool_ids),
+            connection_type=spec.connection_type,
+        )
+        for spec in catalog.CAPABILITIES
+    ]
 
 
 @router.post("", response_model=LucielOut)

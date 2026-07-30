@@ -720,3 +720,172 @@ async def test_oauth_callback_rejects_a_non_oauth_provider_and_a_foreign_id(clie
     )
     assert r.status_code == 422, r.text
     assert "no OAuth callback" in r.text
+
+
+# --- Decision #7: which Meta asset this Luciel answers on ------------------------- #
+# The OAuth callback proves the owner authorized us and flips the row to `connected`, but
+# inbound routing resolves a tenant SOLELY by non_secret_config.destination. Until that is
+# bound, a Meta channel that looks connected receives nothing — so binding is the step
+# that actually finishes the connect, and these tests pin it end to end.
+
+
+async def _connected_meta(client, monkeypatch, provider: str = "meta_whatsapp") -> str:
+    """Drive a Meta channel_auth connection to `connected` and return its id."""
+    _configure_meta(monkeypatch)
+    code = f"meta-{uuid.uuid4().hex[:6]}"
+    _fake_meta_transport(code, monkeypatch)
+    rs = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "channel_auth", "provider": provider},
+    )
+    state = _state_from_authorize_url(rs.json()["authorizeUrl"])
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/oauth-callback", json={"code": code, "state": state}
+    )
+    assert r.status_code == 200, r.text
+    return cid
+
+
+async def _resolves_to(admin_id: uuid.UUID, destination: str) -> uuid.UUID | None:
+    from app.channels import routing
+    from app.db.session import tenant_session
+
+    async with tenant_session(admin_id) as s:
+        return await routing.owner_of_destination(s, "channel_auth", destination)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_binding_the_destination_is_what_makes_an_inbound_meta_message_routable(
+    client, monkeypatch
+):
+    """A token alone cannot deliver a message: routing needs the destination id."""
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    cid = await _connected_meta(client, monkeypatch)
+
+    phone_number_id = f"pnid-{uuid.uuid4().hex[:10]}"
+    # Authorized but not yet bound: no tenant owns the id, so inbound cannot be routed.
+    assert await _resolves_to(admin_id, phone_number_id) is None
+
+    r = await client.put(
+        f"/api/v1/admin/connections/{cid}/destination", json={"destination": phone_number_id}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["nonSecretConfig"]["destination"] == phone_number_id
+    # Secret hygiene is unchanged by this write (§3.8.3).
+    assert "secretRef" not in r.text
+
+    assert await _resolves_to(admin_id, phone_number_id) == admin_id
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_destination_another_account_already_holds_is_refused(client, monkeypatch):
+    """Uniqueness here is a tenant boundary, not tidiness.
+
+    ``channel_resolve_destination`` returns the FIRST matching row, so if a second account
+    could claim an id the first already holds, whose conversations arrive where becomes a
+    race — one tenant could capture another's inbound messages. The claim is refused."""
+    await _ready_account_with_luciel(client)
+    first_admin = _admin_id(client)
+    first_cid = await _connected_meta(client, monkeypatch)
+    shared = f"pnid-{uuid.uuid4().hex[:10]}"
+    assert (
+        await client.put(
+            f"/api/v1/admin/connections/{first_cid}/destination", json={"destination": shared}
+        )
+    ).status_code == 200
+
+    # A DIFFERENT account (fresh signup replaces the session cookie) tries to claim it.
+    await _ready_account_with_luciel(client)
+    second_admin = _admin_id(client)
+    assert second_admin != first_admin
+    second_cid = await _connected_meta(client, monkeypatch, provider="meta_instagram")
+
+    clash = await client.put(
+        f"/api/v1/admin/connections/{second_cid}/destination", json={"destination": shared}
+    )
+    assert clash.status_code == 409, clash.text
+    assert "another account" in clash.text
+
+    # The refusal left the first tenant's binding intact and the second's unbound.
+    assert await _resolves_to(first_admin, shared) == first_admin
+    row = next(
+        c
+        for c in (await client.get("/api/v1/admin/connections")).json()
+        if c["connectionId"] == second_cid
+    )
+    assert (row["nonSecretConfig"] or {}).get("destination") is None
+
+    # Its OWN id is still claimable — the rule is about collisions, not about locking a
+    # second tenant out of the channel.
+    own = f"pnid-{uuid.uuid4().hex[:10]}"
+    ok = await client.put(
+        f"/api/v1/admin/connections/{second_cid}/destination", json={"destination": own}
+    )
+    assert ok.status_code == 200, ok.text
+    assert await _resolves_to(second_admin, own) == second_admin
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_rebinding_to_a_different_number_is_audited_with_both_values(client, monkeypatch):
+    """Moving Luciel to another number reroutes a live channel, so the change — and what
+    it moved away from — has to be in the audit log, not just the new value."""
+    from app.db.session import tenant_session
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select
+
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    cid = await _connected_meta(client, monkeypatch)
+    first, second = f"pnid-a-{uuid.uuid4().hex[:6]}", f"pnid-b-{uuid.uuid4().hex[:6]}"
+    path = f"/api/v1/admin/connections/{cid}/destination"
+
+    assert (await client.put(path, json={"destination": first})).status_code == 200
+    assert (await client.put(path, json={"destination": second})).status_code == 200
+
+    # The old id no longer routes anywhere; the new one routes here.
+    assert await _resolves_to(admin_id, first) is None
+    assert await _resolves_to(admin_id, second) == admin_id
+
+    async with tenant_session(admin_id) as s:
+        rows = (
+            await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin_id))
+        ).scalars()
+        binds = [e for e in rows if (e.event_payload or {}).get("action") == "bind_destination"]
+    assert len(binds) == 2
+    payloads = [
+        (e.event_payload["old_destination"], e.event_payload["new_destination"]) for e in binds
+    ]
+    assert (None, first) in payloads
+    assert (first, second) in payloads
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_only_channel_connections_bind_a_destination_here(client, monkeypatch):
+    """An SMS number must keep going through attach_sms_number, which also runs the
+    Twilio operability + A2P gate (§3.1.6). A raw destination write here would be a way
+    around that gate, so non-channel types are refused outright."""
+    await _ready_account_with_luciel(client)
+    _cid, _admin, _inst = await _connect_calendar(client)
+    del monkeypatch
+
+    r = await client.put(f"/api/v1/admin/connections/{_cid}/destination", json={"destination": "x"})
+    assert r.status_code == 422, r.text
+    assert "not bound here" in r.text
+
+    r404 = await client.put(
+        f"/api/v1/admin/connections/{uuid.uuid4()}/destination", json={"destination": "x"}
+    )
+    assert r404.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_empty_destination_is_rejected_at_parse_time(client, monkeypatch):
+    """Binding "" would write a destination that matches nothing, leaving a channel that
+    claims to be configured and still cannot receive a message."""
+    await _ready_account_with_luciel(client)
+    cid = await _connected_meta(client, monkeypatch)
+    r = await client.put(f"/api/v1/admin/connections/{cid}/destination", json={"destination": ""})
+    assert r.status_code == 422, r.text
