@@ -30,6 +30,7 @@ function buildCompute() {
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
     knowledgeBucket: data.knowledgeBucket,
+    exportBucket: data.exportBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
@@ -50,6 +51,7 @@ const SWEEPS = [
   'unverified_reap',
   'deferred',
   'health',
+  'audit_retention',
 ];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {

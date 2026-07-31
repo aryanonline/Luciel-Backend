@@ -28,6 +28,7 @@ function buildCompute(envName: EnvName) {
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
     knowledgeBucket: data.knowledgeBucket,
+    exportBucket: data.exportBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,

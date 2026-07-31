@@ -223,6 +223,7 @@ describe('Backend ALB gains the api HTTPS listener (spec §1)', () => {
       vpc: net.vpc,
       cmkArn: sec.cmk.keyArn,
       knowledgeBucket: data.knowledgeBucket,
+      exportBucket: data.exportBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
       redisUrl: data.redisUrl,
