@@ -192,12 +192,14 @@ async def run_retention_sweep(
     the infra phase. Importing the session module here would create a load cycle, so
     the driver takes the candidate list as input and keeps this module pure.
     """
-    from app.db.session import tenant_session
+    from app.db.session import claim_sweep_lock, tenant_session
 
     now = now or datetime.now(UTC)
     swept: dict[str, dict[str, int]] = {}
     for admin_id in candidate_admin_ids:
         async with tenant_session(admin_id) as s:
+            if not await claim_sweep_lock(s, "retention", admin_id):
+                continue
             counts = await expire_aged_data(
                 s, admin_id=admin_id, now=now, retention_days=retention_days
             )

@@ -57,7 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import reaper
 from app.billing import dunning, metering
 from app.connections import deferred_queue, health
-from app.db.session import tenant_session, untenanted_session
+from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
 from app.lifecycle import grace_expiry, retention
 from app.lifecycle.close_purge import purge_closed_account_if_due
 
@@ -115,12 +115,15 @@ async def _per_tenant(
     """Run ``work`` for each candidate in its OWN tenant-scoped transaction.
 
     Returns the admin_ids where the work reported a change (truthy result), which is
-    what the job log surfaces as "what this run actually did".
+    what the job log surfaces as "what this run actually did". A tenant another run
+    already holds is skipped rather than waited for (P2-7).
     """
     now = now or datetime.now(UTC)
     acted: list[str] = []
     for admin_id in await sweep_candidates(kind):
         async with tenant_session(admin_id) as s:
+            if not await claim_sweep_lock(s, kind, admin_id):
+                continue
             result = await work(s, admin_id=admin_id, now=now)
         if result:
             acted.append(str(admin_id))

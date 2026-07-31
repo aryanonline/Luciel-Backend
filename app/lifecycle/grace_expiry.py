@@ -101,12 +101,18 @@ async def run_grace_expiry_sweep(
     driver takes the candidate list as input and keeps this module pure.
     """
     # Local import avoids a module-load cycle (session -> engine) at import time.
-    from app.db.session import tenant_session
+    from app.db.session import claim_sweep_lock, tenant_session
 
     now = now or datetime.now(UTC)
     deleted: dict[str, dict[str, int]] = {}
     for admin_id in candidate_admin_ids:
         async with tenant_session(admin_id) as s:
+            # The cascade emits audit rows and deletes Secrets Manager entries, neither
+            # of which is guarded by a uniqueness constraint, so two overlapping runs
+            # would each do it (P2-7). A tenant another run holds is skipped, not waited
+            # for: by the time the lock frees the winner has already expired it.
+            if not await claim_sweep_lock(s, "grace_expiry", admin_id):
+                continue
             counts = await expire_grace_window_if_due(s, admin_id=admin_id, now=now)
         if counts is not None:
             deleted[str(admin_id)] = counts
