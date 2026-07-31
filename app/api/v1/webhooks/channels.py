@@ -36,6 +36,7 @@ from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected, I
 from app.channels.meta_messaging_adapter import MetaMessagingAdapter
 from app.channels.runtime_entry import run_inbound_message
 from app.channels.sms_adapter import SmsAdapter
+from app.channels.sns_verification import ConfigGatedSnsVerifier, confirm_subscription
 from app.channels.whatsapp_adapter import WhatsAppAdapter
 from app.config import get_settings
 from app.db.session import tenant_session, untenanted_session
@@ -141,9 +142,16 @@ async def ses_inbound(request: Request) -> dict[str, str]:
         sns_message = json.loads(raw or b"{}")
     except ValueError:
         return {"status": "ignored", "reason": "bad_sns_envelope"}
-    # SNS subscription confirmation handshake (one-time, on subscribe).
+    # SNS subscription confirmation handshake (one-time, on subscribe). Verified with
+    # the SAME verifier as a notification before we act on it: confirming an unverified
+    # subscription would let anyone bind this endpoint to a topic they control, which is
+    # the injection P0-7 exists to close, just one step earlier.
     if sns_message.get("Type") == "SubscriptionConfirmation":
-        return {"status": "subscription_confirmation_received"}
+        verifier = ConfigGatedSnsVerifier()
+        if not verifier.verify(sns_message):
+            return {"status": "rejected", "reason": "sns_signature_invalid"}
+        confirmed = get_settings().integration_mode == "live" and confirm_subscription(sns_message)
+        return {"status": "subscription_confirmed" if confirmed else "subscription_acknowledged"}
     req: dict[str, Any] = {
         "sns_message": sns_message,
         "resolve": _resolve,
@@ -220,21 +228,11 @@ async def _dispatch(adapter: ChannelAdapter, req: dict[str, Any]) -> str | None:
 def _build_email_adapter() -> EmailAdapter:
     """Construct the EmailAdapter with the SES sender + SNS verifier.
 
-    SNS signature verification is a deployment-time seam (cert-chain validation, per
-    the original audit §3.7.2 note). In live mode with a configured verifier this is
-    real; in mock/CI it accepts (hermetic). We source the sender from the notification
-    layer built last session."""
+    The verifier does real certificate-pinned RSA verification in live mode (P0-7) and
+    accepts in mock/CI so tests stay hermetic. We source the sender from the
+    notification layer."""
     from app.channels.email_adapter import EmailAdapter
     from app.notifications.email_sender import build_email_sender
-
-    class _ConfigGatedSnsVerifier:
-        def verify(self, message: dict[str, Any]) -> bool:
-            # In a full deploy this validates the SNS cert chain + signature. Until that
-            # deployment seam is wired, accept in non-live and reject unsigned in live.
-            s = get_settings()
-            if s.integration_mode != "live":
-                return True
-            return bool(message.get("Signature"))
 
     class _ChannelEmailSender:
         """Adapt the notification EmailSender (send(to, subject, body_text)) to the
@@ -247,7 +245,7 @@ def _build_email_adapter() -> EmailAdapter:
         async def send_email(self, sender: str, to: str, subject: str, body: str) -> str | None:
             return await self._inner.send(to=to, subject=subject, body_text=body)
 
-    return EmailAdapter(sender=_ChannelEmailSender(), sns_verifier=_ConfigGatedSnsVerifier())
+    return EmailAdapter(sender=_ChannelEmailSender(), sns_verifier=ConfigGatedSnsVerifier())
 
 
 def _xml_escape(text: str) -> str:

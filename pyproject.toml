@@ -49,6 +49,11 @@ dependencies = [
     # 9 is the line the `Client(sid, token)` / `Client(key_sid, key_secret, account_sid)`
     # constructors and the `incoming_phone_numbers` / `api.accounts()` resources match.
     "twilio>=9.0,<10",
+    # SNS message signature verification for inbound SES email (P0-7). X.509 certificate
+    # parsing + RSA PKCS#1 v1.5 verification against the AWS-hosted signing cert; the
+    # stdlib offers neither. Imported lazily inside app/channels/sns_verification.py so
+    # mock mode never loads it.
+    "cryptography>=44",
     # Knowledge file parsers (Architecture §3.2.3 / §3.2 ingestion pipeline): PDF and
     # DOCX text extraction for the upload path. Pure-Python, no native deps, so the
     # image build stays simple; CSV/TXT need no extra library (stdlib csv + decode).
