@@ -26,6 +26,13 @@ entrypoints EventBridge Scheduler invokes (see ``infra/lib/compute-stack.ts``).
                        that, abandoned WITH an owner notification. With no worker calling
                        it, neither half happened: every queued callback sat at attempt 0
                        forever, which is the silent drop the rule forbids.
+  * ``audit_retention`` — delete audit rows past the published 1-year retention
+                       (§B5, ruling 6). Every other data class had an enforcer; the
+                       audit log was append-only with no ceiling, which made the
+                       published retention a commitment a tenant could disprove by
+                       waiting. The delete itself is a SECURITY DEFINER procedure owned
+                       by ``luciel_audit_owner`` — the app role has no DELETE on that
+                       table and must not.
   * ``health``       — re-check every non-revoked connection and transition it (§3.8.5).
                        The dormant/expired/error states this produces are what the
                        universal gate reads before it lets a tool run, so an unswept
@@ -58,7 +65,7 @@ from app.auth import reaper
 from app.billing import dunning, metering
 from app.connections import deferred_queue, health
 from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
-from app.lifecycle import grace_expiry, retention
+from app.lifecycle import audit_retention, grace_expiry, retention
 from app.lifecycle.close_purge import purge_closed_account_if_due
 
 RETENTION = "retention"
@@ -69,6 +76,7 @@ USAGE_RECONCILE = "usage_reconcile"
 UNVERIFIED_REAP = "unverified_reap"
 DEFERRED = "deferred"
 HEALTH = "health"
+AUDIT_RETENTION = "audit_retention"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -79,6 +87,7 @@ SWEEP_KINDS: tuple[str, ...] = (
     UNVERIFIED_REAP,
     DEFERRED,
     HEALTH,
+    AUDIT_RETENTION,
 )
 
 
@@ -203,6 +212,11 @@ async def run_connection_health(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(HEALTH, _check_connections, now)
 
 
+async def run_audit_retention(*, now: datetime | None = None) -> list[str]:
+    """Delete audit rows past the published 1-year retention (§B5, ruling 6)."""
+    return await _per_tenant(AUDIT_RETENTION, audit_retention.prune_audit_log_if_due, now)
+
+
 SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -212,4 +226,5 @@ SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     UNVERIFIED_REAP: run_unverified_reap,
     DEFERRED: run_deferred_retry,
     HEALTH: run_connection_health,
+    AUDIT_RETENTION: run_audit_retention,
 }

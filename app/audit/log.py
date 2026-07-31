@@ -110,7 +110,13 @@ async def verify_chain(session: AsyncSession, admin_id: uuid.UUID) -> bool:
         .scalars()
         .all()
     )
-    expected_prev: str | None = None
+    # Anchored on the OLDEST SURVIVING row rather than on NULL. Once the 1-year
+    # retention has pruned a tenant's aged prefix (§B5, P1-15), that row still carries
+    # the hash of a row that no longer exists, and demanding a NULL head here would
+    # report every long-lived tenant as tampered with. Verifying linkage from the
+    # anchor still catches what immutability is about — a row removed or rewritten
+    # inside the surviving span — while accepting the one truncation §B5 authorizes.
+    expected_prev: str | None = rows[0].prev_hash if rows else None
     for row in rows:
         if row.prev_hash != expected_prev:
             return False

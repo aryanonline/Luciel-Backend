@@ -43,6 +43,24 @@
 CREATE OR REPLACE FUNCTION _audit_append_only_guard() RETURNS trigger
   LANGUAGE plpgsql AS $$
 BEGIN
+  -- The ONE authorized deletion (ruling 6 / P1-15): the published 1-year audit
+  -- retention. Without an exemption that commitment cannot be kept at all, and
+  -- "append-only forever" is not what §B5 promises.
+  --
+  -- Exempted on IDENTITY, not on a flag. current_user is luciel_audit_owner only
+  -- inside a SECURITY DEFINER function that role owns, and luciel_app is deliberately
+  -- not a member of it (scripts/bootstrap_roles.sql). A GUC or a session setting would
+  -- be settable by the app role and so would be no lock at all.
+  --
+  -- The age test is repeated HERE rather than trusted from the procedure, so what
+  -- makes "only rows older than 365 days" true is the trigger — the same object that
+  -- makes append-only true — and not a function body that could later be replaced.
+  IF TG_OP = 'DELETE' AND current_user = 'luciel_audit_owner' THEN
+    IF OLD.created_at < now() - interval '365 days' THEN
+      RETURN OLD;
+    END IF;
+  END IF;
+
   RAISE EXCEPTION
     '% is append-only (Architecture §5.3/§5.11): % is not permitted',
     TG_TABLE_NAME, TG_OP
@@ -50,6 +68,36 @@ BEGIN
 END;
 $$;
 ALTER FUNCTION _audit_append_only_guard() OWNER TO luciel_audit_owner;
+
+-- 1b) The retention procedure the exemption above exists for (ruling 6 / P1-15).
+--
+-- Narrow on every axis: one table, one tenant per call, a floor of 365 days that a
+-- caller cannot argue down, and no way to name the rows. It is SECURITY DEFINER so
+-- that calling it is the ONLY way luciel_app can reach a DELETE on admin_audit_log —
+-- the app role holds EXECUTE on this function and nothing else.
+--
+-- RLS is FORCE'd on admin_audit_log and the tenant_isolation policy is TO PUBLIC, so
+-- it binds the audit owner too: the DELETE is scoped by app.admin_id as well as by
+-- p_admin_id. The explicit predicate is the belt to RLS's braces, as everywhere else.
+CREATE OR REPLACE FUNCTION audit_retention_prune(p_admin_id uuid, p_retention_days int DEFAULT 365)
+  RETURNS bigint
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  -- A floor, not a default: passing 30 prunes at 365 anyway. The published commitment
+  -- is a minimum retention, so the only direction a caller may move it is longer.
+  v_days int := GREATEST(COALESCE(p_retention_days, 365), 365);
+  v_deleted bigint;
+BEGIN
+  DELETE FROM admin_audit_log
+   WHERE admin_id = p_admin_id
+     AND created_at < now() - make_interval(days => v_days);
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+ALTER FUNCTION audit_retention_prune(uuid, int) OWNER TO luciel_audit_owner;
+REVOKE ALL ON FUNCTION audit_retention_prune(uuid, int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION audit_retention_prune(uuid, int) TO luciel_app;
 
 -- 2) admin_audit_log (§5.3): row guard + TRUNCATE guard, then ownership + grants.
 DROP TRIGGER IF EXISTS trg_audit_append_only ON admin_audit_log;
@@ -66,6 +114,12 @@ CREATE TRIGGER trg_audit_no_truncate
 ALTER TABLE admin_audit_log OWNER TO luciel_audit_owner;
 REVOKE ALL ON admin_audit_log FROM luciel_app;
 GRANT SELECT, INSERT ON admin_audit_log TO luciel_app;
+
+-- Granted AFTER the ownership transfer so it cannot be re-attributed by it. The owner
+-- needs DELETE for audit_retention_prune to do anything, and that is safe only because
+-- of the row guard: with the trigger in place, the widest thing this grant can express
+-- is "delete rows older than a year" — which is the retention commitment itself.
+GRANT DELETE ON admin_audit_log TO luciel_audit_owner;
 
 -- admin_audit_log.seq defaults to nextval('admin_audit_log_seq'), so the append path
 -- still needs USAGE on that sequence after the grant reset above — the sequence is a

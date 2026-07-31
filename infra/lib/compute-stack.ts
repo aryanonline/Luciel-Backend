@@ -524,6 +524,14 @@ export class ComputeStack extends Stack {
         cron: 'cron(40 */6 * * ? *)',
         description: 'Re-check non-revoked connections and transition them (§3.8.5)',
       },
+      {
+        // Weekly rather than nightly: the boundary is a year, so a few days of lag
+        // costs nothing, and unlike the other sweeps this one visits every tenant
+        // rather than a due-list.
+        name: 'audit_retention',
+        cron: 'cron(30 6 ? * SUN *)',
+        description: 'Delete audit rows past the published 1-year retention (Legal §B5)',
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack
