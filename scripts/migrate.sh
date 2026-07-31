@@ -44,7 +44,14 @@ export LUCIEL_DATABASE_URL_SYNC="postgresql+psycopg://luciel_app:${APP_PASSWORD}
 export LUCIEL_DATABASE_URL="postgresql+asyncpg://luciel_app:${APP_PASSWORD}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE}"
 alembic upgrade head
 
-echo "[migrate] 3/3 lock audit log (master, post-migrate)"
+echo "[migrate] 3/4 lock audit log (master, post-migrate)"
 python3 scripts/run_sql.py --dsn "$MASTER_DSN" --file scripts/lock_audit_log.sql
 
-echo "[migrate] done — schema, RLS, grants, and audit-log lock applied."
+# The lock is the one part of the schema alembic cannot install (it must be owned by
+# luciel_audit_owner, and alembic runs as luciel_app). Without this gate a deploy that
+# skipped or half-applied step 3 still reports success, and the omission surfaces days
+# later as `undefined_function` in the nightly audit_retention sweep.
+echo "[migrate] 4/4 verify the audit-log lock"
+python3 scripts/verify_audit_lock.py --dsn "$MASTER_DSN"
+
+echo "[migrate] done — schema, RLS, grants, and audit-log lock applied and verified."

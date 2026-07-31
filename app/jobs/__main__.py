@@ -13,7 +13,23 @@ import asyncio
 import json
 import sys
 
-from app.jobs.sweeps import SWEEPS
+from app.jobs.sweeps import AUDIT_RETENTION, SWEEPS
+
+
+async def _preflight_audit_lock() -> list[str]:
+    """Names of the audit-lock checks that do not hold, or [] if the lock is intact.
+
+    The audit sweep's only real work is a call to ``audit_retention_prune``, which
+    ``scripts/lock_audit_log.sql`` installs and no migration can (see
+    ``app.lifecycle.audit_retention``). Without this, a deploy that ran migrations and
+    nothing else fails here with a bare ``undefined_function`` from four frames deep,
+    on a nightly schedule nobody is watching.
+    """
+    from app.db.session import untenanted_session
+    from app.lifecycle.audit_retention import audit_lock_results, lock_failures
+
+    async with untenanted_session() as session:
+        return lock_failures(await audit_lock_results(session))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +38,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"usage: python -m app.jobs {{{'|'.join(SWEEPS)}}}", file=sys.stderr)
         return 2
     name = args[0]
+
+    if name == AUDIT_RETENTION and (failed := asyncio.run(_preflight_audit_lock())):
+        from app.lifecycle.audit_retention import AUDIT_LOCK_REMEDY
+
+        print(
+            f"[{name}] refusing to run: the audit-log lock is not applied.\n"
+            + "".join(f"  FAIL {check}\n" for check in failed)
+            + AUDIT_LOCK_REMEDY,
+            file=sys.stderr,
+        )
+        return 1
+
     result = asyncio.run(SWEEPS[name]())
     print(json.dumps({"sweep": name, "result": result}, default=str))
     return 0
