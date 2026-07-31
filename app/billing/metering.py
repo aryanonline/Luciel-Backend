@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +40,7 @@ from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.config import get_settings
 from app.models.billing import BillingAccount
 from app.models.budget import ConversationBudget
-from app.runtime.budget import current_billing_period_start
+from app.runtime.budget import period_start_for
 
 
 # --- pure metering math (the locked-number core) ---------------------------- #
@@ -146,7 +146,8 @@ async def build_budget(
     account = await get_or_create_billing_account(session, admin_id=admin_id)
 
     # Read the counter from the Arc 14 source of truth — do NOT recount (§3.4.1b).
-    period = current_billing_period_start(now)
+    # Same anchor the counter was written under, so the read cannot miss the row.
+    period = period_start_for(account, now)
     budget_row = (
         await session.execute(
             select(ConversationBudget).where(
@@ -211,10 +212,15 @@ async def build_budget(
 
 
 # --- idempotent Stripe metered-usage reporting (HARD CONSTRAINT #3) --------- #
-def usage_idempotency_key(*, admin_id: uuid.UUID, period_start: datetime, quantity: int) -> str:
+def usage_idempotency_key(*, admin_id: uuid.UUID, period_start: date, quantity: int) -> str:
     """Idempotency key per (tenant, period, quantity) so a retry / webhook
-    redelivery never double-bills (§3.4.1b)."""
-    return f"usage:{admin_id}:{period_start.date().isoformat()}:{quantity}"
+    redelivery never double-bills (§3.4.1b).
+
+    ``period_start`` must be the same anchor the counter is keyed on
+    (``period_start_for``); if the key names a different period than the quantity was
+    counted under, a genuinely new block reuses a spent key and is silently dropped.
+    """
+    return f"usage:{admin_id}:{period_start.isoformat()}:{quantity}"
 
 
 def crosses_block_boundary(counted: int, free_allowance: int, block_size: int) -> bool:
@@ -295,8 +301,9 @@ async def report_usage(
         account.stripe_subscription_id = sub_id
         await session.flush()
 
-    period_start = account.period_start or datetime(now.year, now.month, 1, tzinfo=UTC)
-    key = usage_idempotency_key(admin_id=admin_id, period_start=period_start, quantity=quantity)
+    key = usage_idempotency_key(
+        admin_id=admin_id, period_start=period_start_for(account, now), quantity=quantity
+    )
     await gateway.report_metered_usage(
         subscription_id=account.stripe_subscription_id,
         quantity=quantity,

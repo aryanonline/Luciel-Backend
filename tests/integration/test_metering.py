@@ -10,7 +10,7 @@ reporting (no double-bill).
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 from app.billing import metering
@@ -22,6 +22,10 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime.budget import current_billing_period_start
 
 pytestmark = [pytest.mark.asyncio]
+
+# The Stripe anchor and the counter row must name the SAME period (P0-4) — a report keyed
+# on a period the counter was not written under reads an empty counter.
+STRIPE_PERIOD_START = datetime.combine(current_billing_period_start(), time.min, tzinfo=UTC)
 
 
 async def _seed_tenant(admin: uuid.UUID, counted: int = 0) -> uuid.UUID:
@@ -232,7 +236,7 @@ async def test_idempotent_metered_reporting_no_double_bill() -> None:
         acct = await metering.get_or_create_billing_account(s, admin_id=admin)
         acct.billing_state = "payg_enabled"
         acct.stripe_subscription_id = "sub_test"
-        acct.period_start = datetime(2026, 6, 1, tzinfo=UTC)
+        acct.period_start = STRIPE_PERIOD_START
         await s.flush()
     # Report twice with the same (period, quantity) — the second is a dedup no-op.
     async with tenant_session(admin) as s:

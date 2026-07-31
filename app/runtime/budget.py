@@ -36,16 +36,48 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.models.billing import BillingAccount
 from app.models.budget import ConversationBudget
 
 
 def current_billing_period_start(now: datetime | None = None) -> date:
-    """Current period anchor. Reset is driven by Stripe invoice.paid in Arc 18, not
-    the calendar boundary (§3.4.1b); until metering lands we anchor on the calendar
-    month so the gate has a stable, testable key. Flagged: replace with the Stripe
-    period anchor in Arc 18."""
+    """Calendar-month anchor — the fallback for a tenant Stripe has never invoiced.
+
+    Only correct before a Stripe period exists. Once one does, ``period_start_for``
+    uses it instead; see that function for why the two must not diverge."""
     now = now or datetime.now(UTC)
     return date(now.year, now.month, 1)
+
+
+def period_start_for(account: BillingAccount | None, now: datetime | None = None) -> date:
+    """The period the conversation counter is keyed on (§3.4.1b).
+
+    Reset is driven by Stripe ``invoice.paid``, so the anchor is the account's
+    Stripe-anchored ``period_start``; the calendar month is used only when no billing
+    account exists yet and there is therefore no Stripe period to anchor on.
+
+    Keying on the calendar instead zeroed the counter on the 1st for a tenant whose
+    Stripe period runs (say) the 15th to the 15th — a second free 50 every month — while
+    the Stripe usage idempotency key still named the Stripe period, so the second block
+    crossed in the same Stripe period reused a spent key and was never billed at all.
+    """
+    if account is not None and account.period_start is not None:
+        return account.period_start.astimezone(UTC).date()
+    return current_billing_period_start(now)
+
+
+async def resolve_billing_period_start(
+    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime | None = None
+) -> date:
+    """``period_start_for`` against the tenant's billing account, read not created.
+
+    The gate runs on every turn and must not conjure a billing account as a side
+    effect — a tenant with no account simply gets the calendar fallback.
+    """
+    account = (
+        await session.execute(select(BillingAccount).where(BillingAccount.admin_id == admin_id))
+    ).scalar_one_or_none()
+    return period_start_for(account, now)
 
 
 @dataclass
@@ -102,7 +134,7 @@ async def check_budget(
     report not-at-cap so the loop semantics are correct once metering lands, but the
     actual overage billing is Arc 18 (flagged above)."""
     settings = get_settings()
-    period = current_billing_period_start()
+    period = await resolve_billing_period_start(session, admin_id=admin_id)
     row = await _get_or_create_row(
         session, admin_id=admin_id, instance_id=instance_id, period=period
     )
@@ -125,7 +157,7 @@ async def count_session_once(
     human-controlled handoff before any model call. Write-through to the Postgres
     source of truth happens here (synchronously, before serving).
     """
-    period = current_billing_period_start()
+    period = await resolve_billing_period_start(session, admin_id=admin_id)
     row = await _get_or_create_row(
         session, admin_id=admin_id, instance_id=instance_id, period=period
     )

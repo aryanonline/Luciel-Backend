@@ -32,7 +32,7 @@ from app.billing import metering
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.instance import Instance
-from app.runtime.budget import current_billing_period_start
+from app.runtime.budget import resolve_billing_period_start
 from app.schemas_api.usage import (
     AnalyticsOverviewOut,
     AuditEventOut,
@@ -58,7 +58,7 @@ async def _build_overview_out(
 
     # conversationsThisPeriod comes from the budget counter (the single source
     # of the count, §3.4.1b) — NOT recomputed from sessions.
-    period = current_billing_period_start()
+    period = await resolve_billing_period_start(s, admin_id=subject.admin_id)
     conversations_this_period = 0
     budget_util = 0.0
     if instance_id is not None:
@@ -208,8 +208,8 @@ async def usage_export_csv(
             await _audit_rows(s, subject.admin_id, limit=200) if view == "audit_log" else None
         )
         csv_text = analytics_service.render_csv(view, agg, audit_rows)
+        period = (await resolve_billing_period_start(s, admin_id=subject.admin_id)).isoformat()
 
-    period = current_billing_period_start().isoformat()
     filename = f"analytics_{view}_{period}.csv"
     return Response(
         content=csv_text,

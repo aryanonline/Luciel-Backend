@@ -56,10 +56,10 @@ def test_billed_blocks_boundaries(counted: int, expected_blocks: int) -> None:
 
 def test_idempotency_key_stable_for_same_period_quantity() -> None:
     import uuid
-    from datetime import UTC, datetime
+    from datetime import date
 
     a = uuid.uuid4()
-    ps = datetime(2026, 6, 1, tzinfo=UTC)
+    ps = date(2026, 6, 1)
     k1 = metering.usage_idempotency_key(admin_id=a, period_start=ps, quantity=2)
     k2 = metering.usage_idempotency_key(admin_id=a, period_start=ps, quantity=2)
     k3 = metering.usage_idempotency_key(admin_id=a, period_start=ps, quantity=3)

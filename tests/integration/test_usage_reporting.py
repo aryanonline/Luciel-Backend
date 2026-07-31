@@ -10,7 +10,7 @@ as importantly, that they do NOT land anywhere else.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 
 import pytest
 from app.billing import metering
@@ -25,6 +25,10 @@ pytestmark = [pytest.mark.asyncio]
 
 
 PAYG_PRICE = "price_test_payg_block"
+
+# The counter is keyed on the account's Stripe period (P0-4), so the seed writes one
+# anchor to both places; a hardcoded date here would silently seed an empty counter.
+STRIPE_PERIOD_START = datetime.combine(current_billing_period_start(), time.min, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -51,6 +55,7 @@ async def _seed(
     billing_state: str = "payg_enabled",
     with_customer: bool = True,
     subscription_id: str | None = None,
+    period_start: datetime = STRIPE_PERIOD_START,
 ) -> uuid.UUID:
     iid = uuid.uuid4()
     async with tenant_session(admin) as s:
@@ -84,7 +89,7 @@ async def _seed(
                     id=uuid.uuid4(),
                     admin_id=admin,
                     instance_id=iid,
-                    billing_period_start=current_billing_period_start(),
+                    billing_period_start=period_start.date(),
                     counted_conversations=counted,
                     counted_session_ids=[str(uuid.uuid4()) for _ in range(counted)],
                 )
@@ -94,7 +99,7 @@ async def _seed(
         acct.billing_state = billing_state
         acct.stripe_customer_id = f"cus_fake_{admin.hex[:16]}" if with_customer else None
         acct.stripe_subscription_id = subscription_id
-        acct.period_start = datetime(2026, 7, 1, tzinfo=UTC)
+        acct.period_start = period_start
         await s.flush()
     return iid
 
@@ -203,6 +208,35 @@ async def test_successive_blocks_bill_the_period_total_not_their_sum(
     assert {r.action for r in gateway.usage_records} == {"set"}
     # 3 blocks of usage == 3 blocks invoiced. Under increment this is 6.
     assert gateway.billed_quantity("sub_test") == 3
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_mid_month_stripe_period_bills_the_counter_it_actually_counted(
+    gateway: FakeStripeGateway,
+) -> None:
+    """The counter and the idempotency key must name the SAME period (P0-4).
+
+    They used to disagree: the counter was keyed on the calendar month while the key was
+    keyed on the Stripe period. A tenant billed on the 15th therefore got their counter
+    zeroed on the 1st — a second free 50 every month — and the block they crossed after
+    the rollover was quantity 1 again, reusing the key already spent on the first block.
+    Stripe deduped it, so that block was never invoiced at all.
+    """
+    anchor = datetime(2026, 5, 15, tzinfo=UTC)
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=51, subscription_id="sub_test", period_start=anchor)
+
+    assert await _report(admin, iid) == 1
+    await _set_counted(admin, iid, 151)
+    assert await _report(admin, iid) == 2
+
+    assert [r.quantity for r in gateway.usage_records] == [1, 2]
+    assert gateway.billed_quantity("sub_test") == 2
+    # The key names the Stripe anchor the counter is keyed on, not the calendar month.
+    assert [r.idempotency_key for r in gateway.usage_records] == [
+        f"usage:{admin}:2026-05-15:1",
+        f"usage:{admin}:2026-05-15:2",
+    ]
 
 
 # --- who is billable ------------------------------------------------------- #
