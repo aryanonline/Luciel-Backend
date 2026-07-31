@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import metering
 from app.channels.base import InboundMessage
-from app.models.instance import Instance
+from app.models.instance import Instance, is_paused
 from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
@@ -63,8 +63,9 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         # Should not happen post-resolution, but never route into a missing instance.
         return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
-    # Paused → no session, no LLM (§3.6.2).
-    if getattr(inst, "status", None) == "paused" or getattr(inst, "paused_at", None):
+    # Paused → no session, no LLM (§3.6.2). Same predicate the widget and voice paths
+    # use: an owner who pauses Luciel must be paused on every channel, not just the web.
+    if is_paused(inst):
         return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
     sess, _is_new = await resolve_or_open_session(

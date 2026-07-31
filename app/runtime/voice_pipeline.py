@@ -43,7 +43,7 @@ from app.channels.voice_adapter import (
     reply_twiml,
 )
 from app.models.audit import ActorType
-from app.models.instance import Instance, LucielState
+from app.models.instance import Instance, is_paused
 from app.models.voice import VoiceCallRecord
 from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.llm_router import LLMRouter
@@ -68,14 +68,6 @@ def shape_for_voice(text: str) -> str:
     if len(cleaned) > VOICE_REPLY_MAX_CHARS:
         cleaned = cleaned[: VOICE_REPLY_MAX_CHARS - 1].rstrip() + "…"
     return cleaned
-
-
-def _is_paused(inst: Instance) -> bool:
-    return inst.state in (
-        LucielState.paused,
-        LucielState.luciel_grace_window,
-        LucielState.luciel_hard_deleted,
-    )
 
 
 @dataclass
@@ -160,7 +152,7 @@ async def handle_turn(
 ) -> VoiceTurnResult:
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
     # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.
-    if _is_paused(instance):
+    if is_paused(instance):
         await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
         return VoiceTurnResult(
             twiml=reply_twiml(VOICE_UNAVAILABLE_REPLY, action_url, hang_up=True),

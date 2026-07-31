@@ -37,7 +37,7 @@ from app.channels.routing import resolve_widget
 from app.db.session import tenant_session, untenanted_session
 from app.models.audit import ActorType
 from app.models.conversation import Transcript
-from app.models.instance import Instance, LucielState
+from app.models.instance import Instance, is_paused
 from app.runtime import budget
 from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
@@ -114,15 +114,6 @@ def _names(inst: Instance) -> tuple[str, str]:
     return business, assistant
 
 
-def _is_paused(inst: Instance) -> bool:
-    # Paused / soft-deleted Luciel renders an empty widget (§3.6.2) — no chat, no error.
-    return inst.state in (
-        LucielState.paused,
-        LucielState.luciel_grace_window,
-        LucielState.luciel_hard_deleted,
-    )
-
-
 @router.post("/bootstrap", response_model=WidgetBootstrapOut)
 async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
     """Resolve the host page's embed key → render directive + disclosure (§3.6.2/§3.4.16)."""
@@ -134,7 +125,7 @@ async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
         if inst is None:
             raise not_found("Unknown widget.")
         business, assistant = _names(inst)
-        if _is_paused(inst):
+        if is_paused(inst):
             # Paused → the widget renders an empty <div>; still honest literals.
             return WidgetBootstrapOut(
                 render_state="paused",
@@ -180,7 +171,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         if inst is None:
             raise not_found("Unknown widget.")
 
-        if _is_paused(inst):
+        if is_paused(inst):
             # Empty render directive — no session opened, no LLM (§3.6.2).
             return WidgetSendResult(
                 session_id=body.session_id or uuid.uuid4(),

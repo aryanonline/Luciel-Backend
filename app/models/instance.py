@@ -39,6 +39,18 @@ class LucielState(str, enum.Enum):
     luciel_hard_deleted = "luciel_hard_deleted"
 
 
+#: States in which Luciel must not answer a customer (§3.6.2). ``active`` is the only
+#: serving state; everything else is paused, mid-grace, or gone.
+NON_SERVING_STATES = frozenset(
+    {LucielState.paused, LucielState.luciel_grace_window, LucielState.luciel_hard_deleted}
+)
+
+
+def is_paused(inst: Instance) -> bool:
+    """True when the instance must not run a turn on any channel."""
+    return inst.state in NON_SERVING_STATES
+
+
 class Account(Base, TenantMixin, TimestampMixin):
     """The single account owner. ``admin_id`` mirrors the primary key (self-tenant)."""
 
