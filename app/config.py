@@ -167,8 +167,10 @@ class Settings(BaseSettings):
     app_base_url: str = "http://127.0.0.1:3000"
     # Dashboard page the provider's OAuth callback bounces the browser back to, relative
     # to app_base_url. Settable because the redirect URIs registered with the providers
-    # are frozen but the frontend's route is not.
-    oauth_return_path: str = "/dashboard/connections"
+    # are frozen but the frontend's route is not. Must name a route the frontend actually
+    # serves: connections live on the Configure page, and pointing this at a non-existent
+    # /dashboard/connections 404'd the admin immediately after they granted consent.
+    oauth_return_path: str = "/dashboard/configure"
     # hCaptcha signup bot-protection (§3.7.1a). Empty -> verification is a no-op
     # (mock/CI/local); set in live mode to enforce siteverify on signup.
     hcaptcha_secret_key: str = ""

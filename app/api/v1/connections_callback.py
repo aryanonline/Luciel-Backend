@@ -45,7 +45,7 @@ router = APIRouter(prefix="/api/v1/connections", tags=["connections"])
 
 
 def _return_to(**params: str) -> RedirectResponse:
-    """302 back to the dashboard connections page carrying the outcome."""
+    """302 back to the dashboard page that owns connections, carrying the outcome."""
     s = get_settings()
     base = f"{s.app_base_url.rstrip('/')}{s.oauth_return_path}"
     # 303: the browser arrived here by GET and must continue by GET. 302 is ambiguous

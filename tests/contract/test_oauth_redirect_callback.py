@@ -124,11 +124,14 @@ async def _start_calendar_connect(client) -> tuple[str, str]:
     return state, connection_id
 
 
+RETURN_URL = "http://127.0.0.1:3000/dashboard/configure"
+
+
 def _redirect_params(response) -> dict[str, str]:
     assert response.status_code in (302, 303), f"{response.status_code}: {response.text[:200]}"
     location = response.headers["location"]
     # Always back to the FRONTEND origin, never left on the API host.
-    assert location.startswith("http://127.0.0.1:3000/dashboard/connections?"), location
+    assert location.startswith(f"{RETURN_URL}?"), location
     return {k: v[0] for k, v in parse_qs(urlparse(location).query).items()}
 
 
@@ -312,3 +315,28 @@ async def test_the_callback_needs_no_admin_session(client, monkeypatch):
     r = await client.get(CALLBACK, params={"code": "g-code-1", "state": state})
     assert _redirect_params(r)["status"] == "connected"
     assert _redirect_params(r)["connectionId"] == connection_id
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_both_outcomes_land_on_the_configure_page(client, monkeypatch):
+    """The return path must name a route the frontend actually serves.
+
+    It pointed at ``/dashboard/connections``, which no longer exists: the admin granted
+    consent, the connection stored fine, and the 303 dropped them on a 404. Connections
+    live on the Configure page, so both outcomes are pinned to it here — a redirect to a
+    dead route is invisible to every other assertion in this file.
+    """
+    _configure_google(monkeypatch)
+    _fake_google_transport(monkeypatch)
+
+    await _ready_account_with_luciel(client)
+    state, _cid = await _start_calendar_connect(client)
+
+    ok = await client.get(CALLBACK, params={"code": "g-code-1", "state": state})
+    denied = await client.get(CALLBACK, params={"error": "access_denied", "state": "anything"})
+
+    for r in (ok, denied):
+        assert urlparse(r.headers["location"]).path == "/dashboard/configure"
+    # The outcome still rides along; the path change must not cost the query params.
+    assert _redirect_params(ok)["status"] == "connected"
+    assert _redirect_params(denied)["status"] == "error"
