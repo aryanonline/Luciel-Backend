@@ -193,8 +193,14 @@ async def meta_inbound(request: Request) -> dict[str, str]:
     # WhatsApp uses object=="whatsapp_business_account"; IG/Messenger use page/instagram.
     obj = payload.get("object", "")
     adapter = WhatsAppAdapter() if obj == "whatsapp_business_account" else MetaMessagingAdapter()
+    # Instagram Login is a separate Meta app, so its webhooks are signed with a separate
+    # app secret. Falling back to the Facebook one keeps tenants whose IG still rides the
+    # Facebook app working while the Instagram app is unprovisioned.
+    app_secret = settings.meta_app_secret
+    if obj == "instagram" and settings.instagram_app_secret:
+        app_secret = settings.instagram_app_secret
     req: dict[str, Any] = {
-        "app_secret": settings.meta_app_secret,
+        "app_secret": app_secret,
         "raw_body": raw,
         "x_hub_signature_256": request.headers.get("X-Hub-Signature-256", ""),
         "payload": payload,

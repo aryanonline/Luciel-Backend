@@ -256,6 +256,14 @@ class Settings(BaseSettings):
     # authorization-code flow for the WhatsApp / Instagram channel connect.
     meta_app_id: str = ""
     meta_redirect_uri: str = ""
+    # Instagram is a SEPARATE Meta app (the "Instagram API with Business Login for
+    # Instagram" product), with its own app id/secret and its own OAuth host — the
+    # Facebook dialog rejects the instagram_* scopes outright. Empty -> the Instagram
+    # connection reports configured=false and offers no authorize URL, exactly like an
+    # unprovisioned Calendly; it is not a boot failure. See connections.registry.
+    instagram_app_id: str = ""
+    instagram_app_secret: str = ""  # noqa: S105
+    instagram_redirect_uri: str = ""
 
     # --- Website crawl (§3.2.3 crawl-sync note) ---------------------------------
     # No OAuth — just an httpx fetch. Bounded so a misconfigured crawl target can
@@ -311,6 +319,8 @@ class Settings(BaseSettings):
             "NOTION_REDIRECT_URI": "notion_redirect_uri",
             "META_APP_ID": "meta_app_id",
             "META_REDIRECT_URI": "meta_redirect_uri",
+            "INSTAGRAM_APP_ID": "instagram_app_id",
+            "INSTAGRAM_REDIRECT_URI": "instagram_redirect_uri",
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
             # Not secret material, but it is per-environment Stripe account state that
             # travels with the Stripe keys — so it is rotated in the same blob rather
@@ -327,6 +337,7 @@ class Settings(BaseSettings):
             "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
             "META_APP_SECRET": "meta_app_secret",  # nosec B105
             "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
+            "INSTAGRAM_APP_SECRET": "instagram_app_secret",  # nosec B105
             "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
         }
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
@@ -449,6 +460,15 @@ class Settings(BaseSettings):
                 )
                 if not value
             ]
+            # INSTAGRAM_APP_SECRET is conditional, and the condition is the point. An
+            # absent Instagram app is a supported posture — the connection reports
+            # configured=false and the owner sees a disabled tile. A HALF-provisioned one
+            # is not: the authorize URL builds from the app id and sends the owner to a
+            # real consent screen whose code can then never be redeemed.
+            if (self.instagram_app_id or self.instagram_redirect_uri) and not (
+                self.instagram_app_secret
+            ):
+                missing.append("INSTAGRAM_APP_SECRET")
             if missing:
                 raise RuntimeError(
                     "live mode is missing required platform secret(s): "

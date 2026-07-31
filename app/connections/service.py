@@ -37,6 +37,7 @@ _AUTH_CLASS_BY_TYPE: dict[str, str] = {
     "calendar": "oauth_token",
     "crm": "oauth_token",
     "channel_auth": "oauth_token",
+    "instagram_auth": "oauth_token",
     "knowledge_source": "oauth_token",
     "email_sender": "api_key",
     "sms_sender": "api_key",
@@ -1115,12 +1116,17 @@ async def resolve_sms_number(
     return await _resolve_destination(session, admin_id, instance_id, "sms_sender")
 
 
-# Which destination key(s) a runtime channel may bind on the ONE Meta connection.
-# ``instagram_messenger`` is one channel id in this codebase but two Meta assets, so it
-# accepts either — an IG-only tenant and a Page-only tenant both resolve.
-META_CHANNEL_DESTINATION_KEYS: dict[str, tuple[str, ...]] = {
-    "whatsapp": ("whatsapp",),
-    "instagram_messenger": ("instagram", "messenger"),
+# Which connection + destination key(s) a runtime channel may bind, in the order tried.
+# ``instagram_messenger`` is one channel id in this codebase but two assets on two
+# DIFFERENT grants since the Instagram Login split, so it spans both connections — an
+# IG-only tenant and a Page-only tenant each resolve through the one they connected.
+INSTAGRAM_CONNECTION_TYPE = "instagram_auth"
+META_CHANNEL_DESTINATION_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    "whatsapp": (("channel_auth", "whatsapp"),),
+    "instagram_messenger": (
+        (INSTAGRAM_CONNECTION_TYPE, "instagram"),
+        ("channel_auth", "messenger"),
+    ),
 }
 
 
@@ -1130,24 +1136,47 @@ async def resolve_meta_destination(
     instance_id: uuid.UUID,
     channel: str | None = None,
 ) -> str | None:
-    """The tenant's Meta sender id for ``channel``, or None if it is not bound.
+    """The tenant's Meta/Instagram sender id for ``channel``, or None if not bound.
 
     For WhatsApp this is the WhatsApp phone-number id; for Instagram DM / Messenger it is
     the IG-account / Facebook-page id (§3.1.3 — these channels bind to a page/account, not
-    a phone number). All three ride the SAME ``channel_auth`` connection and each names its
-    own asset under ``non_secret_config['destinations']``, so binding Messenger never
-    unbinds WhatsApp. Falls back to the single legacy ``destination`` for connections bound
-    before per-channel destinations existed.
+    a phone number). Each channel names its own asset under
+    ``non_secret_config['destinations']`` on its grant's connection, so binding Messenger
+    never unbinds WhatsApp. Falls back to the single legacy ``destination`` on the Facebook
+    connection for rows bound before per-channel destinations existed.
     """
+    for connection_type, key in META_CHANNEL_DESTINATION_KEYS.get(channel or "", ()):
+        conn = await _single_active(session, admin_id, instance_id, connection_type)
+        destinations = (conn.non_secret_config or {}).get("destinations") if conn else None
+        value = destinations.get(key) if isinstance(destinations, dict) else None
+        if isinstance(value, str) and value:
+            return value
+
     conn = await _single_active(session, admin_id, instance_id, "channel_auth")
-    if conn is None or not conn.non_secret_config:
-        return None
-    config = conn.non_secret_config
-    destinations = config.get("destinations")
-    if channel and isinstance(destinations, dict):
-        for key in META_CHANNEL_DESTINATION_KEYS.get(channel, (channel,)):
-            value = destinations.get(key)
-            if isinstance(value, str) and value:
-                return value
-    legacy = config.get("destination")
+    legacy = (conn.non_secret_config or {}).get("destination") if conn else None
     return legacy if isinstance(legacy, str) and legacy else None
+
+
+async def meta_grant_for_destination(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    channel: str,
+    destination: str,
+) -> str:
+    """Which connection holds the token allowed to send AS ``destination``.
+
+    ``instagram_messenger`` spans two grants, and the asset decides which one: an IG
+    account id is only sendable with the Instagram Login token and a Page id only with the
+    Facebook one. Pairing them by asset rather than by channel is what stops a Messenger
+    reply going out on the Instagram grant (and being rejected) for a tenant who connected
+    both. Unbound assets fall back to the Facebook grant, which is where the legacy
+    single-``destination`` rows live.
+    """
+    for connection_type, key in META_CHANNEL_DESTINATION_KEYS.get(channel, ()):
+        conn = await _single_active(session, admin_id, instance_id, connection_type)
+        destinations = (conn.non_secret_config or {}).get("destinations") if conn else None
+        if isinstance(destinations, dict) and destinations.get(key) == destination:
+            return connection_type
+    return "channel_auth"

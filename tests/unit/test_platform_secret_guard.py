@@ -22,7 +22,7 @@ import json
 import pytest
 from app.config import PlatformSecretError, Settings
 
-from tests.unit.live_settings import REQUIRED_IN_LIVE_MODE
+from tests.unit.live_settings import REQUIRED_IN_LIVE_MODE, live_settings
 
 REAL_JWT = "not-the-published-dev-default"  # noqa: S105 — test fixture value
 REAL_WEBHOOK = "whsec_provisioned_by_secrets_manager"  # noqa: S105 — test fixture value
@@ -137,3 +137,34 @@ def test_an_empty_blob_leaves_overlay_fields_untouched():
     for field in ("app_base_url", "cookie_domain", "hcaptcha_secret_key", "dashboard_origins"):
         assert getattr(empty, field) == getattr(default, field)
     assert empty.allow_captcha_bypass_token is False
+
+
+def test_an_absent_instagram_app_still_boots_in_live_mode():
+    """Not every deployment connects Instagram, and the ones that do not must boot. The
+    connection reports ``configured=false`` and the owner sees a disabled tile — the same
+    honest-disabled posture Meta had before its app was provisioned."""
+    s = live_settings()
+    assert s.instagram_app_id == ""
+    assert s.instagram_app_secret == ""
+
+
+def test_a_half_provisioned_instagram_app_refuses_to_boot_in_live_mode():
+    """An app id with no secret is the posture that must fail closed: the authorize URL
+    builds from the id alone, so the owner is sent to a real Instagram consent screen whose
+    code the exchange can then never redeem. Failing at boot names the missing key; failing
+    at the callback shows the owner "exchange_failed" and nothing actionable."""
+    with pytest.raises(RuntimeError, match="INSTAGRAM_APP_SECRET"):
+        live_settings(INSTAGRAM_APP_ID="ig-cid")
+
+    with pytest.raises(RuntimeError, match="INSTAGRAM_APP_SECRET"):
+        live_settings(INSTAGRAM_REDIRECT_URI="https://api.example.com/cb")
+
+
+def test_a_fully_provisioned_instagram_app_boots():
+    s = live_settings(
+        INSTAGRAM_APP_ID="ig-cid",
+        INSTAGRAM_APP_SECRET="ig-csecret",
+        INSTAGRAM_REDIRECT_URI="https://api.example.com/cb",
+    )
+    assert s.instagram_app_id == "ig-cid"
+    assert s.instagram_app_secret == "ig-csecret"  # noqa: S105 — test fixture

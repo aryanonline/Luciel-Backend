@@ -549,6 +549,14 @@ async def oauth_callback(
         raise conflict(str(exc)) from exc
 
 
+# Which channels may name an asset on which grant. Two entries rather than one because
+# Instagram Login is a separate Meta app with a separate token (see connections.registry).
+_BINDABLE_CHANNELS: dict[str, frozenset[str]] = {
+    "channel_auth": frozenset({"whatsapp", "messenger"}),
+    "instagram_auth": frozenset({"instagram"}),
+}
+
+
 @router.put("/{connection_id}/destination", response_model=ConnectionOut)
 async def bind_destination(
     connection_id: uuid.UUID,
@@ -573,20 +581,30 @@ async def bind_destination(
     ``attach_sms_number``, which also runs the Twilio operability + A2P status gate
     (§3.1.6). Allowing a raw write here would be a way around that gate.
 
-    Per-channel by design (§3.1.4/§3.8.1): the ONE Meta grant authorizes WhatsApp,
-    Instagram and Messenger, and each names its own asset under ``destinations``.
-    Enabling a second Meta channel therefore adds a destination rather than replacing
-    one — the eviction that used to happen when they were separate connections.
+    Per-channel by design (§3.1.4/§3.8.1): the Facebook grant authorizes WhatsApp and
+    Messenger, and each names its own asset under ``destinations``. Enabling a second
+    channel on a grant therefore adds a destination rather than replacing one — the
+    eviction that used to happen when they were separate connections. Instagram rides its
+    own grant (``instagram_auth``) and so binds on its own connection; the channel is
+    checked against the connection's grant here, because a page id written under the wrong
+    one resolves to no tenant at delivery time and the owner is told nothing.
     """
     async with tenant_session(subject.admin_id) as s:
         conn = await _tenant_connection(s, subject.admin_id, connection_id)
-        if conn.connection_type != "channel_auth":
+        allowed = _BINDABLE_CHANNELS.get(conn.connection_type)
+        if allowed is None:
             raise validation_error(
-                f"'{conn.connection_type}' destinations are not bound here "
-                "(only channel_auth; an SMS number is attached via POST /connections)."
+                f"'{conn.connection_type}' destinations are not bound here (only "
+                "channel_auth and instagram_auth; an SMS number is attached via "
+                "POST /connections)."
+            )
+        if req.channel and req.channel not in allowed:
+            raise validation_error(
+                f"'{req.channel}' is not a channel on this connection — it binds on the "
+                f"{'Instagram' if req.channel == 'instagram' else 'Meta'} connection."
             )
         instance_id = await _instance_id(s, subject.admin_id)
-        owner = await routing.owner_of_destination(s, "channel_auth", req.destination)
+        owner = await routing.owner_of_destination(s, conn.connection_type, req.destination)
         if owner is not None and owner != subject.admin_id:
             raise conflict(
                 "That Meta destination is already connected to another account. "

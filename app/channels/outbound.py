@@ -184,19 +184,25 @@ async def _send_meta(
     sender_id: str | None,
 ) -> DeliveryReceipt:
     from app.channels.meta_sender import build_tenant_meta_sender
-    from app.connections.service import resolve_meta_destination
+    from app.connections.service import meta_grant_for_destination, resolve_meta_destination
     from app.runtime.integration_status import null_in_live
 
-    # Per-channel (§3.8.1): the one Meta connection binds a WhatsApp number id, an IG page
-    # id and a Messenger page id side by side, so the reply must pick its own.
+    # Per-channel (§3.8.1): a WhatsApp number id, an IG account id and a Messenger page id
+    # are bound side by side, so the reply must pick its own.
     identity = sender_id or await resolve_meta_destination(
         session, admin_id, instance_id, channel=channel
     )
     if not identity:
         return _NOT_PROVISIONED
-    # The token comes off the SAME channel_auth connection the identity above came from
-    # (P1-1): the asset we send AS and the grant we send WITH must belong to one tenant.
-    meta_sender = await build_tenant_meta_sender(session, admin_id, instance_id)
+    # The token comes off the connection that OWNS this asset (P1-1): the asset we send AS
+    # and the grant we send WITH must belong to one tenant — and, since the Instagram Login
+    # split, to one app.
+    grant = await meta_grant_for_destination(
+        session, admin_id, instance_id, channel=channel, destination=identity
+    )
+    meta_sender = await build_tenant_meta_sender(
+        session, admin_id, instance_id, connection_type=grant
+    )
     if null_in_live(meta_sender):
         return _sender_not_provisioned("meta")
     if channel == "whatsapp":

@@ -133,7 +133,7 @@ async def test_unconfigured_oauth_providers_report_configured_false(client):
     r = await client.get("/api/v1/admin/connections/providers")
     by_provider = {p["provider"]: p for row in r.json() for p in row["providers"]}
 
-    for provider in ("google_calendar", "calendly", "meta"):
+    for provider in ("google_calendar", "calendly", "meta", "instagram"):
         assert by_provider[provider]["configured"] is False, provider
 
     for provider in ("twilio", "custom_webhook", "csv", "live_connector"):
@@ -364,10 +364,11 @@ async def test_a_twilio_credential_without_an_account_sid_is_refused(client):
 # ITEM C — ONE Meta grant for WhatsApp + Instagram + Messenger
 # --------------------------------------------------------------------------- #
 def _configure_meta(monkeypatch) -> None:
-    """Point every settings read the connect flow makes at a configured Meta app.
+    """Point every settings read the connect flow makes at configured Meta apps.
 
     Dev has no Meta OAuth app (which is exactly why ``configured`` is false above), so the
-    flow has to be handed one or connect-start degrades to ``requiresClientForm``."""
+    flow has to be handed one or connect-start degrades to ``requiresClientForm``. Instagram
+    messaging is a SECOND app under Meta's use-case model, hence a second id/secret pair."""
     from app.config import Settings
     from app.connections import registry as registry_module
     from app.knowledge import providers as providers_module
@@ -376,22 +377,39 @@ def _configure_meta(monkeypatch) -> None:
         meta_app_id="meta-cid",
         meta_app_secret="meta-csecret",  # noqa: S106 — test fixture, not a real secret
         meta_redirect_uri="https://api.vantagemind.ai/meta-callback",
+        instagram_app_id="ig-cid",
+        instagram_app_secret="ig-csecret",  # noqa: S106 — test fixture, not a real secret
+        instagram_redirect_uri="https://api.vantagemind.ai/instagram-callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
 
 
 def _fake_meta_token_exchange(expected_code: str, monkeypatch) -> None:
+    """A transport standing in for both Meta token servers.
+
+    Facebook returns a long-lived token from the code alone; Instagram Login returns a
+    SHORT-lived one and requires the ``ig_exchange_token`` GET to upgrade it, so the fake
+    has to answer both verbs or the Instagram callback path is never exercised.
+    """
     import app.api.v1.admin.connections as connections_api
     import httpx
 
     class _Transport:
         async def post(self, url, *, data=None, headers=None):
             assert data["code"] == expected_code
+            body: dict[str, object] = {"access_token": "meta-tok", "expires_in": 5184000}
+            if "instagram" in url:
+                body = {"access_token": "ig-short-tok", "user_id": "17841400000000000"}
+            return httpx.Response(200, json=body, request=httpx.Request("POST", url))
+
+        async def get(self, url, *, params=None, headers=None):
+            assert params["grant_type"] == "ig_exchange_token"
+            assert params["access_token"] == "ig-short-tok"
             return httpx.Response(
                 200,
-                json={"access_token": "meta-tok", "expires_in": 5184000},
-                request=httpx.Request("POST", url),
+                json={"access_token": "ig-long-tok", "expires_in": 5184000},
+                request=httpx.Request("GET", url),
             )
 
         async def __aenter__(self):
@@ -403,22 +421,23 @@ def _fake_meta_token_exchange(expected_code: str, monkeypatch) -> None:
     monkeypatch.setattr(connections_api, "oauth_transport", _Transport)
 
 
-async def _connected_meta(client, monkeypatch) -> str:
-    """Drive the single Meta channel_auth connection to `connected` and return its id."""
+async def _connect_oauth(client, monkeypatch, connection_type: str, provider: str) -> str:
+    """Drive one OAuth channel connection to `connected` and return its id."""
     from urllib.parse import parse_qs, urlparse
 
     _configure_meta(monkeypatch)
-    code = f"meta-{uuid.uuid4().hex[:6]}"
+    code = f"{provider}-{uuid.uuid4().hex[:6]}"
     _fake_meta_token_exchange(code, monkeypatch)
     rs = await client.post(
-        "/api/v1/admin/connections", json={"connectionType": "channel_auth", "provider": "meta"}
+        "/api/v1/admin/connections",
+        json={"connectionType": connection_type, "provider": provider},
     )
     assert rs.status_code == 200, rs.text
     state = parse_qs(urlparse(rs.json()["authorizeUrl"]).query)["state"][0]
     cid = next(
         c["connectionId"]
         for c in (await client.get("/api/v1/admin/connections")).json()
-        if c["connectionType"] == "channel_auth"
+        if c["connectionType"] == connection_type
     )
     cb = await client.post(
         f"/api/v1/admin/connections/{cid}/oauth-callback", json={"code": code, "state": state}
@@ -427,20 +446,27 @@ async def _connected_meta(client, monkeypatch) -> str:
     return cid
 
 
+async def _connected_meta(client, monkeypatch) -> str:
+    return await _connect_oauth(client, monkeypatch, "channel_auth", "meta")
+
+
+async def _connected_instagram(client, monkeypatch) -> str:
+    return await _connect_oauth(client, monkeypatch, "instagram_auth", "instagram")
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_one_meta_connection_binds_all_three_channels_without_evicting_each_other(
+async def test_one_meta_connection_binds_both_facebook_channels_without_evicting_each_other(
     client, monkeypatch
 ):
-    """The defect this replaces: WhatsApp and Instagram were separate connections of the
+    """The defect this replaces: WhatsApp and Messenger were separate connections of the
     same single-active type, so connecting the second REVOKED the first — an owner who
-    turned on Messenger silently lost WhatsApp. One grant, three destinations."""
+    turned on Messenger silently lost WhatsApp. One Facebook grant, both destinations."""
     await _ready_account_with_luciel(client)
     cid = await _connected_meta(client, monkeypatch)
 
     bound = {}
     for channel, destination in (
         ("whatsapp", f"pnid-{uuid.uuid4().hex[:8]}"),
-        ("instagram", f"igid-{uuid.uuid4().hex[:8]}"),
         ("messenger", f"pgid-{uuid.uuid4().hex[:8]}"),
     ):
         r = await client.put(
@@ -465,6 +491,50 @@ async def test_one_meta_connection_binds_all_three_channels_without_evicting_eac
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_instagram_binds_on_its_own_grant_and_the_two_coexist(client, monkeypatch):
+    """Instagram messaging moved to its own Meta app, so it is its own connection — but the
+    original eviction defect must not come back through the side door: connecting Instagram
+    has to leave the Facebook grant (WhatsApp + Messenger) alive and bound.
+
+    The channel is also refused on the wrong grant. Binding an IG account under the Facebook
+    connection would store a destination whose token lives on the other app, and the send
+    would fail at Graph long after the owner was told it was connected."""
+    await _ready_account_with_luciel(client)
+    meta_cid = await _connected_meta(client, monkeypatch)
+    wa = f"pnid-{uuid.uuid4().hex[:8]}"
+    assert (
+        await client.put(
+            f"/api/v1/admin/connections/{meta_cid}/destination",
+            json={"destination": wa, "channel": "whatsapp"},
+        )
+    ).status_code == 200
+
+    ig = f"igid-{uuid.uuid4().hex[:8]}"
+    assert (
+        await client.put(
+            f"/api/v1/admin/connections/{meta_cid}/destination",
+            json={"destination": ig, "channel": "instagram"},
+        )
+    ).status_code == 422
+
+    ig_cid = await _connected_instagram(client, monkeypatch)
+    assert ig_cid != meta_cid
+    r = await client.put(
+        f"/api/v1/admin/connections/{ig_cid}/destination",
+        json={"destination": ig, "channel": "instagram"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["nonSecretConfig"]["destinations"] == {"instagram": ig}
+
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    by_type = {c["connectionType"]: c for c in listed}
+    assert by_type["channel_auth"]["status"] == "connected"
+    assert by_type["channel_auth"]["nonSecretConfig"]["destinations"] == {"whatsapp": wa}
+    assert by_type["instagram_auth"]["provider"] == "instagram"
+    assert by_type["instagram_auth"]["status"] == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_inbound_routing_resolves_each_meta_channel_by_its_own_destination(
     client, monkeypatch
 ):
@@ -478,20 +548,31 @@ async def test_inbound_routing_resolves_each_meta_channel_by_its_own_destination
     await _ready_account_with_luciel(client)
     admin_id = _admin_id(client)
     cid = await _connected_meta(client, monkeypatch)
+    ig_cid = await _connected_instagram(client, monkeypatch)
     wa = f"pnid-{uuid.uuid4().hex[:8]}"
+    page = f"pgid-{uuid.uuid4().hex[:8]}"
     ig = f"igid-{uuid.uuid4().hex[:8]}"
-    for channel, destination in (("whatsapp", wa), ("instagram", ig)):
+    for conn, channel, destination in (
+        (cid, "whatsapp", wa),
+        (cid, "messenger", page),
+        (ig_cid, "instagram", ig),
+    ):
         assert (
             await client.put(
-                f"/api/v1/admin/connections/{cid}/destination",
+                f"/api/v1/admin/connections/{conn}/destination",
                 json={"destination": destination, "channel": channel},
             )
         ).status_code == 200
 
     async with tenant_session(admin_id) as s:
         assert await routing.owner_of_destination(s, "channel_auth", wa) == admin_id
-        assert await routing.owner_of_destination(s, "channel_auth", ig) == admin_id
+        assert await routing.owner_of_destination(s, "channel_auth", page) == admin_id
+        assert await routing.owner_of_destination(s, "instagram_auth", ig) == admin_id
         assert await routing.owner_of_destination(s, "channel_auth", "pnid-nobody") is None
+        # The grants do not see each other's assets: a destination is owned by the app whose
+        # token can actually send as it.
+        assert await routing.owner_of_destination(s, "channel_auth", ig) is None
+        assert await routing.owner_of_destination(s, "instagram_auth", wa) is None
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

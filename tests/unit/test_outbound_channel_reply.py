@@ -41,6 +41,7 @@ class FakeEmailSender:
 class FakeMetaSender:
     def __init__(self) -> None:
         self.sent: list[dict[str, str]] = []
+        self.grants: list[str] = []
 
     async def send_message(self, *, channel, sender_id, recipient_id, body):
         self.sent.append(
@@ -69,7 +70,10 @@ def meta_sender(monkeypatch) -> FakeMetaSender:
 
     fake = FakeMetaSender()
 
-    async def _build(session, admin_id, instance_id, *, store=None):
+    async def _build(session, admin_id, instance_id, *, connection_type="channel_auth", store=None):
+        # The grant the sender was built from decides which Meta app's token signs the
+        # send, so the tests assert on it (see ``grants`` below).
+        fake.grants.append(connection_type)
         return fake
 
     monkeypatch.setattr(sender_mod, "build_tenant_meta_sender", _build)
@@ -235,6 +239,37 @@ async def test_meta_takeover_reply_falls_back_to_the_provisioned_channel_identit
 
     assert result.delivered is True
     assert meta_sender.sent[0]["sender_id"] == PAGE_ID
+    # A Page is a Facebook asset, so the Facebook grant's token is the one that can send
+    # as it — even though the channel it rides is shared with Instagram.
+    assert meta_sender.grants == ["channel_auth"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_instagram_asset_sends_with_the_instagram_grants_token(meta_sender):
+    """instagram_messenger is one channel over two Meta APPS. The asset we send AS and the
+    token we send WITH have to come from the same app, or Graph rejects the call: an
+    Instagram Login token is not a Facebook token and is not even accepted at the same
+    host. So the grant is chosen by which connection owns the destination, not by channel.
+    """
+    admin, instance = uuid.uuid4(), uuid.uuid4()
+    ig_account = "ig-account-1"
+    await _seed_connection(
+        admin,
+        instance,
+        connection_type="instagram_auth",
+        auth_class="oauth_token",
+        provider="instagram",
+        non_secret_config={"destinations": {"instagram": ig_account}},
+    )
+    await _seed_meta_channel(admin, instance)
+
+    result = await _reply(
+        admin, instance, channel="instagram_messenger", to="ig-user-1", body="Sam here."
+    )
+
+    assert result.delivered is True
+    assert meta_sender.sent[0]["sender_id"] == ig_account
+    assert meta_sender.grants == ["instagram_auth"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

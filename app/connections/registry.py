@@ -52,6 +52,15 @@ class ProviderAuthorize:
     # Provider-specific params that are part of OUR request, not the user's choice
     # (e.g. Google only returns a refresh_token for an offline+consent request).
     extra: dict[str, str] = field(default_factory=dict)
+    # Response keys BEYOND access_token/refresh_token that this provider returns and we
+    # must keep (Salesforce's org API base, Instagram's account id). Declared here so the
+    # one exchange function stays provider-agnostic.
+    token_fields: tuple[str, ...] = ()
+    # Meta's token-exchange family issues a SHORT-lived token from the code and requires a
+    # second call to upgrade it. Set both to make the exchange perform that upgrade; the
+    # short-lived token is then never stored, because it expires in about an hour.
+    long_lived_endpoint: str | None = None
+    long_lived_grant_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +188,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             exchange_endpoint="https://login.salesforce.com/services/oauth2/token",
             scopes="api refresh_token",
             supports_pkce=True,
+            token_fields=("instance_url",),  # the org's API base, needed on every call
         ),
         client_id_setting="salesforce_consumer_key",
         client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME
@@ -261,31 +271,70 @@ PROVIDERS: dict[str, ProviderSpec] = {
         help_text="Choose which pages or databases Luciel may read.",
     ),
     # --- Meta channels (Decision #7) ----------------------------------------------
-    # ONE connection, three channels. WhatsApp, Instagram DM and Messenger all bind to the
-    # SAME Meta Business account (§3.1.4/§3.8.1), and ``instance_connections`` allows one
-    # active row per connection_type — so modelling them as separate providers meant
-    # connecting Instagram silently evicted WhatsApp. A single Meta OAuth grant, carrying
-    # the union of the three channels' scopes, authorizes all of them; which asset each
-    # ENABLED channel answers on is then named per channel via PUT /destination.
+    # ONE Facebook grant, TWO channels: WhatsApp and Messenger both bind to the same Meta
+    # Business account (§3.1.4/§3.8.1), and ``instance_connections`` allows one active row
+    # per connection_type — so modelling them as separate providers meant connecting one
+    # silently evicted the other. A single Meta OAuth grant carrying the union of their
+    # scopes authorizes both; which asset each ENABLED channel answers on is then named
+    # per channel via PUT /destination.
+    #
+    # Instagram is NOT on this grant. Facebook rejects the whole authorize request with
+    # "Invalid Scopes: instagram_basic, instagram_manage_messages" — under Meta's
+    # use-case app model, Instagram messaging is a separate product ("Instagram API with
+    # Business Login for Instagram") with its own app id and its own OAuth host. Asking
+    # for those scopes here does not degrade to a partial grant; it fails the dialog
+    # outright, so WhatsApp and Messenger could not be connected either. See the
+    # ``instagram`` entry below.
     "meta": ProviderSpec(
         provider="meta",
         connection_type="channel_auth",
-        display_name="Meta (WhatsApp, Instagram & Messenger)",
+        display_name="Meta (WhatsApp & Messenger)",
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://www.facebook.com/v19.0/dialog/oauth",
             exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
             scopes="whatsapp_business_messaging,whatsapp_business_management,"
-            "instagram_basic,instagram_manage_messages,pages_messaging,"
-            "pages_show_list,business_management",
+            "pages_messaging,pages_show_list,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
             supports_pkce=False,
         ),
         client_id_setting="meta_app_id",
         client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME
         redirect_uri_setting="meta_redirect_uri",
-        help_text="Connect your Meta Business account once — it powers WhatsApp, "
-        "Instagram DMs and Messenger.",
+        help_text="Connect your Meta Business account once — it powers WhatsApp and "
+        "Facebook Messenger. Instagram is connected separately.",
+    ),
+    # --- Instagram (Business Login for Instagram) ----------------------------------
+    # A SECOND connection type rather than a second ``channel_auth`` provider, and that is
+    # forced by the storage model, not a preference: ``_single_active`` and
+    # ``secret_ref_for`` are both keyed on connection_type alone, so a second channel_auth
+    # row would collide on the secret ref and make the single-active lookup ambiguous —
+    # reintroducing exactly the eviction the single-Meta correction removed. Instagram
+    # genuinely IS a separate grant (separate app id, separate OAuth host, separate token
+    # endpoint), so it gets its own row and the two coexist.
+    "instagram": ProviderSpec(
+        provider="instagram",
+        connection_type="instagram_auth",
+        display_name="Instagram",
+        auth_kind=AUTH_OAUTH,
+        authorize=ProviderAuthorize(
+            endpoint="https://www.instagram.com/oauth/authorize",
+            exchange_endpoint="https://api.instagram.com/oauth/access_token",
+            scopes="instagram_business_basic,instagram_business_manage_messages",
+            supports_pkce=False,
+            # The code redeems to a ~1-hour token; graph.instagram.com upgrades it to a
+            # 60-day one. Storing the short-lived token would leave every tenant
+            # disconnected an hour after they connected.
+            long_lived_endpoint="https://graph.instagram.com/access_token",
+            long_lived_grant_type="ig_exchange_token",  # noqa: S106 — a grant type
+            # Which IG account authorized; the owner still names the asset via
+            # PUT /destination, but this is what lets us tell them if they picked another.
+            token_fields=("user_id",),
+        ),
+        client_id_setting="instagram_app_id",
+        client_secret_setting="instagram_app_secret",  # noqa: S106 — field NAME
+        redirect_uri_setting="instagram_redirect_uri",
+        help_text="Connect the Instagram professional account Luciel answers DMs on.",
     ),
     # --- Senders (provisioned / platform-owned, no owner-facing choice) -----------
     "ses": ProviderSpec(
@@ -339,6 +388,7 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "record_source": ("live_connector", "csv"),
     "knowledge_source": ("google_drive", "notion"),
     "channel_auth": ("meta",),
+    "instagram_auth": ("instagram",),
     "sms_sender": ("twilio",),
 }
 
@@ -425,7 +475,7 @@ def oauth_client_label(provider: str) -> str:
     setting = spec.client_id_setting if spec is not None else None
     if not setting:
         return ""
-    for suffix in ("_client_id", "_consumer_key"):
+    for suffix in ("_client_id", "_consumer_key", "_app_id"):
         if setting.endswith(suffix):
             return setting[: -len(suffix)]
     return setting
@@ -479,8 +529,12 @@ DEPENDENT_TOOLS: dict[str, tuple[str, ...]] = {
 DEPENDENT_CHANNELS: dict[str, tuple[str, ...]] = {
     "email_sender": ("email",),
     "sms_sender": ("sms", "voice"),
-    # One Meta grant powers all three Meta channels, so handing it back takes all three.
+    # The Facebook grant powers WhatsApp and the Messenger half of instagram_messenger.
     "channel_auth": ("whatsapp", "instagram_messenger"),
+    # ``instagram_messenger`` is one channel id covering two assets, so either grant going
+    # away takes it down. Overstating the loss is the safe direction: the alternative
+    # leaves the channel switched on with only half its senders resolvable.
+    "instagram_auth": ("instagram_messenger",),
 }
 
 

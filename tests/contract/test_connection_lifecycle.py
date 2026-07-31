@@ -94,8 +94,10 @@ async def test_providers_endpoint_offers_the_decision_6_choices(client):
     assert [p["provider"] for p in by_type["record_source"]] == ["live_connector", "csv"]
     assert [p["provider"] for p in by_type["calendar"]] == ["google_calendar", "calendly"]
     # Decision #7: the Meta channels are registry entries like everything else.
-    # §3.8.1: ONE Meta grant powers WhatsApp, Instagram and Messenger — one provider.
+    # §3.8.1: one Facebook grant powers WhatsApp AND Messenger; Instagram messaging is a
+    # separate Meta app with its own login, so it is its own connection type.
     assert [p["provider"] for p in by_type["channel_auth"]] == ["meta"]
+    assert [p["provider"] for p in by_type["instagram_auth"]] == ["instagram"]
 
     # Every option carries what the UI needs to render the choice.
     hubspot = next(p for p in by_type["crm"] if p["provider"] == "hubspot")
@@ -191,24 +193,61 @@ async def test_connect_accepts_each_offered_crm_provider(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_meta_channel_connect_start_uses_meta_oauth(client):
-    """Decision #7: WhatsApp / Instagram get a REAL connect flow through the registry —
-    the same uniform surface, with Meta's dialog endpoint and channel scopes."""
+    """Decision #7: the messaging channels get a REAL connect flow through the registry —
+    the same uniform surface, each with its own dialog endpoint and channel scopes.
+
+    Two grants, not one: Facebook's dialog covers WhatsApp + Messenger, and Instagram
+    messaging rides Business Login for Instagram on instagram.com."""
     from app.connections import oauth_flow
 
     await _ready_account_with_luciel(client)
-    for provider, scope_probe in (
-        ("meta", "whatsapp_business_messaging"),
-        ("meta", "instagram_manage_messages"),
+    for connection_type, provider, host, scope_probe in (
+        ("channel_auth", "meta", "https://www.facebook.com/", "whatsapp_business_messaging"),
+        ("channel_auth", "meta", "https://www.facebook.com/", "pages_messaging"),
+        (
+            "instagram_auth",
+            "instagram",
+            "https://www.instagram.com/",
+            "instagram_business_manage_messages",
+        ),
     ):
         spec = oauth_flow.authorize_spec(provider)
         assert spec is not None, provider
-        assert spec.endpoint.startswith("https://www.facebook.com/")
+        assert spec.endpoint.startswith(host)
         assert scope_probe in spec.scopes
         r = await client.post(
             "/api/v1/admin/connections",
-            json={"connectionType": "channel_auth", "provider": provider},
+            json={"connectionType": connection_type, "provider": provider},
         )
         assert r.status_code == 200, provider
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_facebook_dialog_never_requests_instagram_scopes_again(client):
+    """Regression floor for a live outage: Facebook rejected the WHOLE authorize request
+    with "Invalid Scopes: instagram_basic, instagram_manage_messages" — under the use-case
+    app model those permissions belong to the separate Instagram app, so asking for them on
+    the Facebook dialog does not degrade to a partial grant, it breaks Meta connect
+    entirely. Instagram messaging scopes must only ever appear on the instagram client."""
+    from app.connections import oauth_flow
+
+    meta = oauth_flow.authorize_spec("meta")
+    assert meta is not None
+    assert "instagram" not in meta.scopes
+    assert set(meta.scopes.split(",")) == {
+        "whatsapp_business_messaging",
+        "whatsapp_business_management",
+        "pages_messaging",
+        "pages_show_list",
+        "business_management",
+    }
+
+    instagram = oauth_flow.authorize_spec("instagram")
+    assert instagram is not None
+    assert set(instagram.scopes.split(",")) == {
+        "instagram_business_basic",
+        "instagram_business_manage_messages",
+    }
 
 
 # --------------------------------------------------------------------------- #

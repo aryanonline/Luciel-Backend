@@ -22,7 +22,9 @@ def _sig(body: bytes) -> str:
 
 
 async def _resolve(connection_type: str, destination: str) -> InstanceContext:
-    assert connection_type == "channel_auth"
+    # Since the Instagram Login split, an IG-account id is bound on ``instagram_auth`` and a
+    # Page id on ``channel_auth``, and the webhook entry does not say which it carries.
+    assert connection_type in ("channel_auth", "instagram_auth")
     assert destination  # non-empty resolution key
     return InstanceContext(admin_id=ADMIN, instance_id=INSTANCE)
 
@@ -142,6 +144,50 @@ async def test_meta_messaging_verifies_and_normalizes():
     assert msg.channel == "instagram_messenger"
     assert msg.customer_identifier == "PSID_1"
     assert msg.body == "Do you deliver?"
+
+
+async def test_meta_messaging_falls_back_to_the_facebook_grant():
+    """Instagram DMs and Messenger share one channel but not one grant: an IG account is
+    bound on the Instagram Login connection and a Page on the Facebook one. The adapter
+    must try both, or a tenant who connected only Facebook stops receiving Messenger."""
+    tried: list[str] = []
+
+    async def _resolve_page_only(connection_type: str, destination: str) -> InstanceContext:
+        tried.append(connection_type)
+        if connection_type != "channel_auth":
+            raise InboundRejected(f"unresolvable_destination:{connection_type}")
+        return InstanceContext(admin_id=ADMIN, instance_id=INSTANCE)
+
+    body = json.dumps(_meta_payload()).encode()
+    ctx = await MetaMessagingAdapter(NullMetaSender()).verify_inbound(
+        {
+            "app_secret": APP_SECRET,
+            "raw_body": body,
+            "x_hub_signature_256": _sig(body),
+            "payload": _meta_payload(),
+            "resolve": _resolve_page_only,
+        }
+    )
+    assert ctx.admin_id == ADMIN
+    assert tried == ["instagram_auth", "channel_auth"]
+
+
+async def test_meta_messaging_rejects_when_no_grant_owns_the_destination():
+    async def _resolve_nobody(connection_type: str, destination: str) -> InstanceContext:
+        raise InboundRejected(f"unresolvable_destination:{connection_type}")
+
+    body = json.dumps(_meta_payload()).encode()
+    with pytest.raises(InboundRejected) as e:
+        await MetaMessagingAdapter(NullMetaSender()).verify_inbound(
+            {
+                "app_secret": APP_SECRET,
+                "raw_body": body,
+                "x_hub_signature_256": _sig(body),
+                "payload": _meta_payload(),
+                "resolve": _resolve_nobody,
+            }
+        )
+    assert e.value.reason == "unresolvable_destination:instagram_messenger"
 
 
 async def test_meta_messaging_bad_signature_rejected():

@@ -61,9 +61,18 @@ class MetaMessagingAdapter:
         destination_id = parsed["entry"].get("id")
         if not destination_id:
             raise InboundRejected("meta_no_destination")
+        # An IG account id is bound on the Instagram grant and a Page id on the Facebook
+        # one, and the webhook entry does not say which kind of id it is carrying. Try
+        # both: guessing from the payload's ``object`` would misroute a tenant who has
+        # connected only one of the two.
         resolve = request["resolve"]
-        ctx: InstanceContext = await resolve("channel_auth", destination_id)
-        return ctx
+        for connection_type in ("instagram_auth", "channel_auth"):
+            try:
+                ctx: InstanceContext = await resolve(connection_type, destination_id)
+            except InboundRejected:
+                continue
+            return ctx
+        raise InboundRejected("unresolvable_destination:instagram_messenger")
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_messaging_event(request["payload"])

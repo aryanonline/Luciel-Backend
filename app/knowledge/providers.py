@@ -174,13 +174,13 @@ async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uu
 # chain is provably wired end-to-end in mock mode; only the provider's own HTTP
 # round-trip is the documented manual seam (see gap_oauth.md).
 # --------------------------------------------------------------------------- #
-def _exchange_endpoint(provider: str) -> str | None:
-    """Where a provider's ``code`` is redeemed, per the registry (Decision #6).
+def _authorize_spec(provider: str) -> registry.ProviderAuthorize | None:
+    """A provider's exchange endpoint, extra token fields, and long-lived upgrade.
 
-    Registered as configuration rather than a module-local map, so a newly registered
+    Registered as configuration rather than module-local maps, so a newly registered
     provider is exchangeable without editing this file."""
     spec = registry.get_provider(provider)
-    return spec.authorize.exchange_endpoint if spec is not None and spec.authorize else None
+    return spec.authorize if spec is not None else None
 
 
 class OAuthExchangeError(Exception):
@@ -217,8 +217,9 @@ async def exchange_code_for_token(
         raise ProviderUnavailable(
             f"OAuth client for '{provider}' is not configured (missing client_id/secret)."
         )
-    endpoint = _exchange_endpoint(provider)
-    if endpoint is None:
+    authorize = _authorize_spec(provider)
+    endpoint = authorize.exchange_endpoint if authorize is not None else None
+    if authorize is None or endpoint is None:
         raise ProviderUnavailable(f"No token endpoint registered for provider '{provider}'.")
 
     form: dict[str, object] = {
@@ -248,9 +249,56 @@ async def exchange_code_for_token(
     material: dict[str, str] = {"access_token": str(data["access_token"])}
     if data.get("refresh_token"):
         material["refresh_token"] = str(data["refresh_token"])
-    if data.get("instance_url"):  # Salesforce returns the org's API base URL.
-        material["instance_url"] = str(data["instance_url"])
+    for extra in authorize.token_fields:
+        if data.get(extra):
+            material[extra] = str(data[extra])
+
+    if authorize.long_lived_endpoint and authorize.long_lived_grant_type:
+        material["access_token"] = await _upgrade_to_long_lived(
+            provider,
+            authorize,
+            client_secret=cfg.client_secret,
+            short_lived=material["access_token"],
+            transport=transport,
+        )
     return material
+
+
+async def _upgrade_to_long_lived(
+    provider: str,
+    authorize: registry.ProviderAuthorize,
+    *,
+    client_secret: str,
+    short_lived: str,
+    transport: HttpTransport,
+) -> str:
+    """Trade a short-lived token for a long-lived one (Instagram Login, §3.8.3).
+
+    Raises ``OAuthExchangeError`` rather than falling back to the short-lived token: the
+    fallback would look like a successful connect and then break about an hour later, with
+    nothing in the connection's status to explain why.
+    """
+    resp = await transport.get(
+        str(authorize.long_lived_endpoint),
+        params={
+            "grant_type": str(authorize.long_lived_grant_type),
+            "client_secret": client_secret,
+            "access_token": short_lived,
+        },
+        headers={"Accept": "application/json"},
+    )
+    if resp.status_code >= 400:
+        raise OAuthExchangeError(
+            f"{provider} long-lived token exchange failed (HTTP {resp.status_code})."
+        )
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise OAuthExchangeError(
+            f"{provider} long-lived token exchange returned no access_token "
+            f"({data.get('error', 'no reason given')})."
+        )
+    return str(token)
 
 
 async def store_oauth_token(
