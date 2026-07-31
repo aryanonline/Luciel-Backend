@@ -61,9 +61,14 @@ class NullSmsSender:
         self.sent: list[SentSms] = []
 
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None:
+        from app.config import live_mode  # noqa: PLC0415 — avoids an import cycle
+
         sid = f"SMnull{len(self.sent) + 1:022d}"
         self.sent.append(SentSms(from_number=from_number, to=to, body=body, message_sid=sid))
-        return sid
+        # Every adapter above reads a non-None id as an accepted delivery. In live mode
+        # nothing left the system, so handing back the fake sid would tell the owner a
+        # lead was answered when they were never reached.
+        return None if live_mode() else sid
 
 
 @dataclass

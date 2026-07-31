@@ -44,8 +44,12 @@ class NullMetaSender:
     async def send_message(
         self, *, channel: str, sender_id: str, recipient_id: str, body: str
     ) -> str | None:
+        from app.config import live_mode  # noqa: PLC0415 — avoids an import cycle
+
         self.sent.append({"channel": channel, "from": sender_id, "to": recipient_id, "body": body})
-        return f"null-meta-{len(self.sent)}"
+        # Live mode with no Meta token bound: nothing left the system, and a fake id
+        # would be read as accepted=True by every adapter above (see NullSmsSender).
+        return None if live_mode() else f"null-meta-{len(self.sent)}"
 
 
 def _first_message(payload: dict[str, Any]) -> dict[str, Any] | None:

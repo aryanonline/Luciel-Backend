@@ -29,8 +29,9 @@ class SentEmail:
 class EmailSender(Protocol):
     async def send(
         self, *, to: str, subject: str, body_text: str, from_address: str | None = None
-    ) -> str:
-        """Send an email; return a provider message id. Raises on hard failure.
+    ) -> str | None:
+        """Send an email; return a provider message id, or None when nothing was put on
+        the wire. Raises on hard failure.
 
         ``from_address`` overrides the platform identity for one message. A customer-facing
         channel reply must come FROM the tenant's own provisioned address (§3.1.6a); a
@@ -48,7 +49,9 @@ class NullEmailSender:
 
     async def send(
         self, *, to: str, subject: str, body_text: str, from_address: str | None = None
-    ) -> str:
+    ) -> str | None:
+        from app.config import live_mode  # noqa: PLC0415 — avoids an import cycle
+
         mid = f"null-{len(self.sent) + 1}"
         self.sent.append(
             SentEmail(
@@ -59,7 +62,10 @@ class NullEmailSender:
                 from_address=from_address,
             )
         )
-        return mid
+        # Live mode with no verified sender identity: nothing left the system, and the
+        # tool contract maps a non-None id to ok/accepted_for_delivery, which would have
+        # Luciel say out loud that it sent an email it did not send.
+        return None if live_mode() else mid
 
 
 @dataclass
@@ -79,7 +85,7 @@ class SesEmailSender:
 
     async def send(
         self, *, to: str, subject: str, body_text: str, from_address: str | None = None
-    ) -> str:
+    ) -> str | None:
         client = self._get_client()
         resp = client.send_email(  # type: ignore[attr-defined]
             FromEmailAddress=from_address or self.sender_identity,

@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.errors import register_error_handlers
 from app.config import get_settings
+from app.runtime.integration_status import degraded_bindings, log_resolved_bindings
 
 # Data plane: the embeddable widget is loaded on ARBITRARY customer websites, so its
 # origin can never be allow-listed in advance (§1.2, §9.6).
@@ -84,9 +85,19 @@ def create_app() -> FastAPI:
 
     register_error_handlers(app)
 
+    # State the resolved integration mode once, at boot. A stack that fabricates every
+    # send otherwise looks identical to a working one from the outside.
+    log_resolved_bindings()
+
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    async def healthz() -> dict[str, object]:
+        # Binding NAMES only — never a credential and never whether a given secret is
+        # set. ``degraded`` non-empty in live mode means sends are being fabricated.
+        return {
+            "status": "ok",
+            "integrationMode": settings.integration_mode,
+            "degraded": degraded_bindings(),
+        }
 
     # v1 routers (mounted as arcs land).
     from app.api.v1.admin.account import router as account_router

@@ -38,6 +38,7 @@ from typing import Any
 from app.channels.twilio_sender import build_sms_sender
 from app.connections import sandbox
 from app.notifications.email_sender import build_email_sender
+from app.runtime.integration_status import null_in_live
 from app.tools import calendar_backend, catalog
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
@@ -177,6 +178,11 @@ class _EmailMessengerBackend:
 
     async def send(self, ctx: ToolContext, to: str, body: str) -> str | None:
         sender = build_email_sender()
+        # A Null sender in live mode cannot put anything on the wire. Returning an id
+        # would make the tool answer ok/accepted_for_delivery and Luciel would tell the
+        # lead out loud that the email was sent (§3.3.4 faithful readback).
+        if null_in_live(sender):
+            return None
         return await sender.send(to=to, subject=self.SUBJECT, body_text=body) or None
 
 
@@ -192,7 +198,10 @@ class _SmsMessengerBackend:
 
     async def send(self, ctx: ToolContext, to: str, body: str) -> str | None:
         if ctx.session is None:
-            return await build_sms_sender().send_sms("", to, body)
+            platform_sender = build_sms_sender()
+            if null_in_live(platform_sender):
+                return None
+            return await platform_sender.send_sms("", to, body)
         from app.channels.tenant_twilio import build_tenant_sms_sender
         from app.connections.service import resolve_sms_number
 
@@ -200,6 +209,10 @@ class _SmsMessengerBackend:
         if not from_number:
             return None
         sender = await build_tenant_sms_sender(ctx.session, ctx.admin_id, ctx.instance_id)
+        # See _EmailMessengerBackend: an unusable tenant credential must surface as
+        # provider_rejected, never as a fabricated accepted-for-delivery.
+        if null_in_live(sender):
+            return None
         return await sender.send_sms(from_number, to, body)
 
 

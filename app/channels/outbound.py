@@ -32,6 +32,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.base import DeliveryReceipt, OutboundMessage
+from app.notifications.email_sender import EmailSender as EmailSenderProtocol
 
 # Channels the customer reads by polling us; we cannot push to them (§11.7).
 POLL_ONLY_CHANNELS = frozenset({"widget"})
@@ -106,6 +107,15 @@ async def send_outbound_reply(
 _NOT_PROVISIONED = DeliveryReceipt(accepted=False, detail="channel_not_provisioned")
 
 
+def _sender_not_provisioned(seam: str) -> DeliveryReceipt:
+    """A live deployment whose delivery seam resolved to a Null sender.
+
+    Nothing can leave the system, so the reply is reported as an actionable failure
+    rather than a delivery — the same posture ``email_notifier``/``sms_notifier`` take.
+    """
+    return DeliveryReceipt(accepted=False, detail=f"{seam}_sender_not_provisioned")
+
+
 async def _send_sms(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -117,12 +127,15 @@ async def _send_sms(
     from app.channels.sms_adapter import SmsAdapter
     from app.channels.tenant_twilio import build_tenant_sms_sender
     from app.connections.service import resolve_sms_number
+    from app.runtime.integration_status import null_in_live
 
     from_number = await resolve_sms_number(session, admin_id, instance_id)
     if not from_number:
         return _NOT_PROVISIONED
     # BYO (§3.1.4): send through the tenant's OWN Twilio, never the platform's.
     sender = await build_tenant_sms_sender(session, admin_id, instance_id)
+    if null_in_live(sender):
+        return _sender_not_provisioned("sms")
     return await SmsAdapter(sender).send(
         OutboundMessage(channel="sms", to=to, body=body, metadata={"from_number": from_number})
     )
@@ -139,11 +152,16 @@ async def _send_email(
 ) -> DeliveryReceipt:
     from app.channels.email_adapter import EmailAdapter
     from app.connections.service import resolve_email_address
+    from app.notifications.email_sender import build_email_sender
+    from app.runtime.integration_status import null_in_live
 
     address = await resolve_email_address(session, admin_id, instance_id)
     if not address:
         return _NOT_PROVISIONED
-    return await EmailAdapter(_PlatformSesSender(), _NoInboundVerifier()).send(
+    email_sender = build_email_sender()
+    if null_in_live(email_sender):
+        return _sender_not_provisioned("email")
+    return await EmailAdapter(_PlatformSesSender(email_sender), _NoInboundVerifier()).send(
         OutboundMessage(
             channel="email",
             to=to,
@@ -165,7 +183,9 @@ async def _send_meta(
     body: str,
     sender_id: str | None,
 ) -> DeliveryReceipt:
+    from app.channels.meta_sender import build_meta_sender
     from app.connections.service import resolve_meta_destination
+    from app.runtime.integration_status import null_in_live
 
     # Per-channel (§3.8.1): the one Meta connection binds a WhatsApp number id, an IG page
     # id and a Messenger page id side by side, so the reply must pick its own.
@@ -174,11 +194,14 @@ async def _send_meta(
     )
     if not identity:
         return _NOT_PROVISIONED
+    meta_sender = build_meta_sender()
+    if null_in_live(meta_sender):
+        return _sender_not_provisioned("meta")
     if channel == "whatsapp":
         from app.channels.whatsapp_adapter import WhatsAppAdapter
 
         # WhatsApp Cloud API sends from a phone-number id.
-        return await WhatsAppAdapter().send(
+        return await WhatsAppAdapter(meta_sender).send(
             OutboundMessage(
                 channel=channel, to=to, body=body, metadata={"phone_number_id": identity}
             )
@@ -187,7 +210,7 @@ async def _send_meta(
 
     # IG DM / Messenger send from the IG-account / page id, on the Messenger send API —
     # a different Graph shape from WhatsApp, hence a different adapter (§3.1.2).
-    return await MetaMessagingAdapter().send(
+    return await MetaMessagingAdapter(meta_sender).send(
         OutboundMessage(channel=channel, to=to, body=body, metadata={"destination_id": identity})
     )
 
@@ -207,14 +230,10 @@ class _NoInboundVerifier:
 
 
 class _PlatformSesSender:
-    """Adapt the platform SES sender to the channel EmailAdapter's send_email shape.
+    """Adapt the platform SES sender to the channel EmailAdapter's send_email shape."""
 
-    Binds SES in live mode and the in-memory Null sender in mock/CI (the same
-    integration-mode seam the notification path uses)."""
+    def __init__(self, sender: EmailSenderProtocol) -> None:
+        self._sender = sender
 
     async def send_email(self, sender: str, to: str, subject: str, body: str) -> str | None:
-        from app.notifications.email_sender import build_email_sender
-
-        return await build_email_sender().send(
-            to=to, subject=subject, body_text=body, from_address=sender
-        )
+        return await self._sender.send(to=to, subject=subject, body_text=body, from_address=sender)

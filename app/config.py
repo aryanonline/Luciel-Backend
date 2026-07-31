@@ -458,3 +458,12 @@ def parse_platform_secret(raw: str) -> dict[str, str]:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def live_mode() -> bool:
+    """True when this process is bound to real providers rather than mock/CI stubs.
+
+    The one predicate every honest-degradation seam asks. Kept here so a module can ask
+    it without importing anything heavier than config.
+    """
+    return get_settings().integration_mode == "live"
