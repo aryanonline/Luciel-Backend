@@ -1,22 +1,42 @@
 """Meta Graph API sender for WhatsApp + Instagram/Messenger (Architecture §3.1.2/§5.12).
 
-Two implementations behind the MetaSender Protocol, mirroring the SES/Twilio pattern:
+The sending credential belongs to the TENANT, not to VantageMind (P1-1). WhatsApp,
+Instagram DM and Messenger all ride the one ``channel_auth`` connection the admin
+completes via Meta OAuth (Decision #7), and the access token that grant returns lives in
+the SecretStore under that connection's ``secret_ref`` (§3.8.3, never in Postgres). This
+mirrors ``tenant_twilio`` exactly, for the same reason: a send authorized by a
+platform-wide token would go out from a Meta asset the customer never connected, billed
+against an app they do not own, and would reach every tenant's recipients through one
+credential.
 
-- ``GraphMetaSender`` — live: posts to the Meta Graph API. Lazy httpx use; the page/
-  WhatsApp access token is read from config (bridged from the platform secret / the
-  per-tenant channel_auth connection in a full deployment).
-- ``NullMetaSender``  — mock/CI: records sends in-memory, no network. Default.
+There is deliberately no platform-token fallback. The previous ``build_meta_sender()``
+read ``settings.meta_access_token`` and returned a live sender from it, which meant a
+single environment variable silently became the sender for every tenant on the box; that
+path is gone rather than deprecated, so it cannot be reached by accident.
 
-Live send is gated on Meta credentials the owner must provision (App secret + access
-token); until then ``build_meta_sender`` returns the Null sender so the suite and dev
-stay hermetic.
+Two implementations behind the MetaSender Protocol:
+
+- ``GraphMetaSender`` — live: posts to the Meta Graph API with the tenant's token.
+- ``NullMetaSender``  — mock/CI, or a tenant who has not connected Meta: records sends
+  in-memory, no network. ``null_in_live`` turns the second case into a refusal with a
+  specific reason instead of a fabricated delivery.
 """
 
 from __future__ import annotations
 
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
+from app.connections.secrets import SecretStore, get_secret_store
+from app.models.connection import InstanceConnection
 
 _GRAPH_BASE = "https://graph.facebook.com/v19.0"
+
+#: The key ``exchange_code_for_token`` writes the Graph token under.
+FIELD_ACCESS_TOKEN = "access_token"  # noqa: S105 — field NAME, not a credential
 
 
 class GraphMetaSender:
@@ -59,12 +79,56 @@ class GraphMetaSender:
         return str(data.get("message_id")) if data.get("message_id") else None
 
 
-def build_meta_sender() -> MetaSender:
-    """Live GraphMetaSender when configured, else NullMetaSender (mock/CI)."""
+async def _channel_auth_row(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> InstanceConnection | None:
+    return (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.instance_id == instance_id,
+                InstanceConnection.connection_type == "channel_auth",
+                InstanceConnection.status != "revoked",
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def load_tenant_meta_token(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+) -> str | None:
+    """The tenant's Meta Graph access token, or None if they have not connected Meta."""
+    conn = await _channel_auth_row(session, admin_id, instance_id)
+    if conn is None or not conn.secret_ref:
+        return None
+    material = await (store or get_secret_store()).get(conn.secret_ref) or {}
+    token = material.get(FIELD_ACCESS_TOKEN, "")
+    return token or None
+
+
+async def build_tenant_meta_sender(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+) -> MetaSender:
+    """The sender for this tenant's WhatsApp/IG/Messenger traffic: THEIR Meta grant.
+
+    Outside live mode the hermetic Null sender is returned, so dev/CI never reaches the
+    network even with a real token stored. In live mode a tenant with no connection also
+    gets Null — ``null_in_live`` then refuses the send with ``meta_sender_not_provisioned``
+    rather than letting it look delivered.
+    """
     from app.config import get_settings
 
-    s = get_settings()
-    token = getattr(s, "meta_access_token", "") or ""
-    if s.integration_mode == "live" and token:
-        return GraphMetaSender(access_token=token)
-    return NullMetaSender()
+    if get_settings().integration_mode != "live":
+        return NullMetaSender()
+    token = await load_tenant_meta_token(session, admin_id, instance_id, store=store)
+    if not token:
+        return NullMetaSender()
+    return GraphMetaSender(access_token=token)

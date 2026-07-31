@@ -10,7 +10,6 @@ import uuid
 import pytest
 from app.channels.base import InboundRejected, InstanceContext
 from app.channels.meta_messaging_adapter import MetaMessagingAdapter
-from app.channels.meta_sender import build_meta_sender
 from app.channels.whatsapp_adapter import NullMetaSender, WhatsAppAdapter
 
 APP_SECRET = "meta-app-secret"
@@ -160,8 +159,8 @@ async def test_meta_messaging_bad_signature_rejected():
         )
 
 
-def test_build_meta_sender_defaults_to_null_in_mock():
-    from app.config import get_settings
-
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    assert isinstance(build_meta_sender(), NullMetaSender)
+def test_an_adapter_built_without_a_sender_never_reaches_the_network():
+    """The Graph token is per-tenant (P1-1), so a session-less adapter has no way to
+    resolve one. It must default to Null rather than to a platform credential."""
+    assert isinstance(WhatsAppAdapter()._sender, NullMetaSender)
+    assert isinstance(MetaMessagingAdapter()._sender, NullMetaSender)

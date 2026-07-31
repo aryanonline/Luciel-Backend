@@ -183,7 +183,7 @@ async def _send_meta(
     body: str,
     sender_id: str | None,
 ) -> DeliveryReceipt:
-    from app.channels.meta_sender import build_meta_sender
+    from app.channels.meta_sender import build_tenant_meta_sender
     from app.connections.service import resolve_meta_destination
     from app.runtime.integration_status import null_in_live
 
@@ -194,7 +194,9 @@ async def _send_meta(
     )
     if not identity:
         return _NOT_PROVISIONED
-    meta_sender = build_meta_sender()
+    # The token comes off the SAME channel_auth connection the identity above came from
+    # (P1-1): the asset we send AS and the grant we send WITH must belong to one tenant.
+    meta_sender = await build_tenant_meta_sender(session, admin_id, instance_id)
     if null_in_live(meta_sender):
         return _sender_not_provisioned("meta")
     if channel == "whatsapp":

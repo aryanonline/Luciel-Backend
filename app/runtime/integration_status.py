@@ -68,17 +68,19 @@ def null_in_live(sender: object) -> bool:
 
 def degraded_bindings() -> list[str]:
     """Every seam currently bound to a Null / in-process implementation."""
-    from app.channels.meta_sender import build_meta_sender
     from app.channels.twilio_sender import build_sms_sender
     from app.connections.secrets import get_secret_store
     from app.notifications.email_sender import build_email_sender
     from app.tools.calendar_backend import build_calendar_api
 
     settings = get_settings()
+    # No ``meta_sender`` seam: since P1-1 the Graph token is per-tenant, so there is no
+    # process-wide Meta binding to report on. Whether a given tenant can send is a
+    # property of their channel_auth connection and surfaces on that connection's status,
+    # not here — listing it would report every deployment as degraded forever.
     seams: tuple[tuple[str, object], ...] = (
         ("platform_email", build_email_sender()),
         ("platform_sms", build_sms_sender()),
-        ("meta_sender", build_meta_sender()),
         ("secret_store", get_secret_store()),
         ("calendar_api", build_calendar_api()),
     )

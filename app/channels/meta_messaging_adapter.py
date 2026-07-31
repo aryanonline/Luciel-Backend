@@ -22,7 +22,7 @@ from app.channels.base import (
     OutboundMessage,
 )
 from app.channels.signatures import verify_hmac_shared_secret
-from app.channels.whatsapp_adapter import MetaSender
+from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
 
 
 def _first_messaging_event(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -43,7 +43,8 @@ class MetaMessagingAdapter:
     channel_id = "instagram_messenger"
 
     def __init__(self, sender: MetaSender | None = None) -> None:
-        self._sender = sender or _build_meta_sender()
+        # Per-tenant Graph token (P1-1) — see the note in ``WhatsAppAdapter.__init__``.
+        self._sender = sender or NullMetaSender()
 
     async def verify_inbound(self, request: dict[str, Any]) -> InstanceContext:
         # Signature FIRST (§3.1.3): X-Hub-Signature-256 HMAC-SHA256 over the raw body.
@@ -100,9 +101,3 @@ class MetaMessagingAdapter:
         if mid is None:
             return DeliveryReceipt(accepted=False, detail="meta_rejected")
         return DeliveryReceipt(accepted=True, provider_message_id=mid)
-
-
-def _build_meta_sender() -> MetaSender:
-    from app.channels.meta_sender import build_meta_sender
-
-    return build_meta_sender()

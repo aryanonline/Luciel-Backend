@@ -68,7 +68,11 @@ def meta_sender(monkeypatch) -> FakeMetaSender:
     from app.channels import meta_sender as sender_mod
 
     fake = FakeMetaSender()
-    monkeypatch.setattr(sender_mod, "build_meta_sender", lambda: fake)
+
+    async def _build(session, admin_id, instance_id, *, store=None):
+        return fake
+
+    monkeypatch.setattr(sender_mod, "build_tenant_meta_sender", _build)
     return fake
 
 

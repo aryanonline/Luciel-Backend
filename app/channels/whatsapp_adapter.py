@@ -71,7 +71,11 @@ class WhatsAppAdapter:
     channel_id = "whatsapp"
 
     def __init__(self, sender: MetaSender | None = None) -> None:
-        self._sender = sender or _build_meta_sender()
+        # No implicit live sender: the Graph token is per-tenant (P1-1), so it cannot be
+        # resolved without a session. The send path builds one via
+        # ``meta_sender.build_tenant_meta_sender``; anything that omits it gets the
+        # hermetic Null rather than a platform credential.
+        self._sender = sender or NullMetaSender()
 
     async def verify_inbound(self, request: dict[str, Any]) -> InstanceContext:
         # Signature FIRST (§3.1.3): HMAC-SHA256 over the raw body via X-Hub-Signature-256.
@@ -129,11 +133,3 @@ class WhatsAppAdapter:
         if mid is None:
             return DeliveryReceipt(accepted=False, detail="meta_rejected")
         return DeliveryReceipt(accepted=True, provider_message_id=mid)
-
-
-def _build_meta_sender() -> MetaSender:
-    """Live Meta Graph sender when configured, else Null (mock/CI). Imported lazily
-    to avoid a hard dependency in CI."""
-    from app.channels.meta_sender import build_meta_sender
-
-    return build_meta_sender()

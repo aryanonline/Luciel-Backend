@@ -180,13 +180,15 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_api_key_sid: str = ""
     twilio_api_key_secret: str = ""
-    # Meta channels (WhatsApp, Instagram DM, Messenger — §3.1.2). App secret verifies
-    # inbound X-Hub-Signature-256; access token authorizes Graph API sends. Empty ->
-    # NullMetaSender + inbound signature check can't pass (mock/CI/unconfigured).
-    # Per-tenant page/WA tokens live on the channel_auth connection in full deploy;
-    # this platform-level token covers the shared Graph app.
+    # Meta channels (WhatsApp, Instagram DM, Messenger — §3.1.2). The App secret is a
+    # property of the shared Graph APP and stays platform-level: it verifies the inbound
+    # X-Hub-Signature-256 on webhooks Meta delivers to one URL for every tenant. Empty ->
+    # the inbound signature check cannot pass (mock/CI/unconfigured).
+    #
+    # There is deliberately no platform ACCESS token here. Sending authority is per-tenant
+    # (P1-1) and comes off the tenant's channel_auth connection secret_ref; a platform-wide
+    # token would make one env var the sender for every tenant on the box.
     meta_app_secret: str = ""
-    meta_access_token: str = ""
     # Meta webhook GET-challenge verify token (owner-chosen string, set in the Meta
     # app webhook config and matched on hub.verify_token).
     meta_verify_token: str = ""
@@ -318,7 +320,6 @@ class Settings(BaseSettings):
             "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
             "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
             "META_APP_SECRET": "meta_app_secret",  # nosec B105
-            "META_ACCESS_TOKEN": "meta_access_token",  # nosec B105
             "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
             "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
         }

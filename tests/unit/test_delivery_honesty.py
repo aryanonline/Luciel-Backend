@@ -1,7 +1,7 @@
 """A live deployment must never report a send it did not make (§3.3.4, §3.4.3).
 
 The delivery seams all fail OPEN: ``build_email_sender`` / ``build_sms_sender`` /
-``build_meta_sender`` return a Null implementation when their provider is unconfigured,
+``build_tenant_meta_sender`` return a Null implementation when their provider is unconfigured,
 and the Null implementations used to hand back a plausible provider message id. Every
 layer above reads a non-None id as proof of delivery — the channel adapters set
 ``accepted=True``, the tool catalog answers ``ok / accepted_for_delivery``, and Luciel
@@ -269,7 +269,10 @@ def test_degraded_bindings_names_every_null_seam_in_mock_mode():
     get_settings.cache_clear()  # type: ignore[attr-defined]
     degraded = degraded_bindings()
     seams = {entry.split(":", 1)[0] for entry in degraded}
-    assert {"platform_email", "platform_sms", "meta_sender", "secret_store"} <= seams
+    assert {"platform_email", "platform_sms", "secret_store"} <= seams
+    # meta_sender is NOT a seam: the Graph token is per-tenant (P1-1), so there is no
+    # process-wide binding whose degradation would mean anything.
+    assert "meta_sender" not in seams
     # seam:ImplClass — a class NAME, never a value.
     assert all(entry.count(":") == 1 and entry.split(":", 1)[1] for entry in degraded)
 
