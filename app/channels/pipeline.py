@@ -113,8 +113,9 @@ async def record_inbound_rejection(
     logged — only the channel, the rejection reason, and an OPTIONAL caller-supplied
     hash hint (never the raw source identifier). Audit finding Axis6-F06.
     """
+    # Interpolated into the message, not passed via ``extra=``: nothing configures a
+    # formatter that renders extras, so those fields never reached CloudWatch.
     logger.warning(
-        "inbound_rejected",
-        extra={"channel": channel, "reason": reason, "source_hint": source_hint},
+        "inbound_rejected channel=%s reason=%s source_hint=%s", channel, reason, source_hint
     )
     return None

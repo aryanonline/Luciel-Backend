@@ -39,4 +39,8 @@ ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 USER luciel
 EXPOSE 8000
 # Health: GET /healthz (see app/main.py). ALB target group checks this path.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers: the ALB terminates TLS, so without it request.url reconstructs
+# as http:// and Twilio's X-Twilio-Signature (signed over the https:// webhook URL)
+# never matches. Trusting XFF from any peer is safe here because tasks are only
+# reachable from the ALB security group. Keep in sync with scripts/app-entrypoint.sh.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

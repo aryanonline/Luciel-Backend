@@ -18,4 +18,8 @@ print(f'export LUCIEL_DATABASE_URL_SYNC="postgresql+psycopg://{base}"')
 PY
 )"
 
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+# --proxy-headers: the ALB terminates TLS, so without it request.url reconstructs
+# as http:// and Twilio's X-Twilio-Signature (signed over the https:// webhook URL)
+# never matches. Trusting XFF from any peer is safe here because tasks are only
+# reachable from the ALB security group. Keep in sync with the Dockerfile CMD.
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "*"

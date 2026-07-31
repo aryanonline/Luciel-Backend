@@ -318,7 +318,7 @@ async def _on_pm_detached(
         await metering.report_accrued_usage(session, admin_id=admin_id)
     except Exception:  # noqa: BLE001 — a Stripe blip must not strand the detach event
         # The watermark is unmoved, so the reconcile sweep picks this tenant up again.
-        _log.exception("accrued usage flush failed at detach", extra={"admin_id": str(admin_id)})
+        _log.exception("accrued usage flush failed at detach admin_id=%s", admin_id)
 
     prev_billing_state = account.billing_state
     account.billing_state = "free_cap"
