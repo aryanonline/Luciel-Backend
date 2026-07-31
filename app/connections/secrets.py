@@ -35,6 +35,17 @@ def secret_ref_for(admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type:
     return f"vm/{admin_id}/{instance_id}/{connection_type}"
 
 
+def tenant_secret_prefix(admin_id: uuid.UUID) -> str:
+    """Every secret this tenant can own lives under this prefix (§3.8.3 rule 5).
+
+    Deleting a tenant by walking ``instance_connections.secret_ref`` only reaches secrets
+    a surviving row still points at. A row deleted earlier, or re-keyed to a different
+    connection type, leaves its credential behind in the backend with nothing left in
+    Postgres to name it — so tenant deletion sweeps the prefix instead (P0-9).
+    """
+    return f"vm/{admin_id}/"
+
+
 @runtime_checkable
 class SecretStore(Protocol):
     """Put/get/delete a credential by opaque ref (§3.8.3).
@@ -49,6 +60,13 @@ class SecretStore(Protocol):
     async def delete(self, secret_ref: str) -> bool:
         """Delete by ref. Idempotent: deleting an absent ref returns False, not an
         error (§3.6.3 cleanup pattern — a revoke that runs twice must not fault)."""
+        ...
+
+    async def delete_prefix(self, prefix: str) -> int:
+        """Delete every secret whose ref starts with ``prefix``; return how many.
+
+        Used by tenant deletion to reach credentials no surviving row points at.
+        Idempotent for the same reason ``delete`` is."""
         ...
 
 
@@ -78,6 +96,14 @@ class LocalSecretStore:
     async def delete(self, secret_ref: str) -> bool:
         with self._lock:
             return type(self)._store.pop(secret_ref, None) is not None
+
+    async def delete_prefix(self, prefix: str) -> int:
+        with self._lock:
+            store = type(self)._store
+            doomed = [ref for ref in store if ref.startswith(prefix)]
+            for ref in doomed:
+                del store[ref]
+            return len(doomed)
 
     @classmethod
     def reset(cls) -> None:
@@ -144,6 +170,27 @@ class SecretsManagerStore:
             # (§3.6.3 cleanup pattern — a revoke that runs twice must not fault).
             return False
         return True
+
+    async def delete_prefix(self, prefix: str) -> int:
+        client = self._get_client()
+        paginator = client.get_paginator("list_secrets")  # type: ignore[attr-defined]
+        # ListSecrets has no prefix operator, only "begins-with on any word", so the
+        # server-side filter narrows the page set and the exact prefix is re-checked
+        # here. Deleting on a looser match than the caller asked for would cross the
+        # tenant boundary this prefix exists to draw.
+        refs = [
+            name
+            for page in paginator.paginate(
+                Filters=[{"Key": "name", "Values": [prefix.rstrip("/")]}]
+            )
+            for secret in page.get("SecretList", [])
+            if (name := secret.get("Name", "")).startswith(prefix)
+        ]
+        deleted = 0
+        for ref in refs:
+            if await self.delete(ref):
+                deleted += 1
+        return deleted
 
 
 _default: SecretStore | None = None
