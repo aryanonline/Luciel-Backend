@@ -350,6 +350,107 @@ def test_provider_for_connection_unknown_provider_raises():
 
 
 # --------------------------------------------------------------------------- #
+# P1-2: the live half of the transport seam.
+#
+# Every OAuth-class provider was written against ``HttpTransport`` and nothing ever
+# bound a real implementation, so ``provider_for_connection`` handed back a provider
+# with ``transport=None`` in live mode too — and an admin who completed a real Drive
+# consent got a connection that synced nothing while reporting itself as a
+# "provider-deferred seam". These tests pin the binding, not just the class.
+# --------------------------------------------------------------------------- #
+def _live(monkeypatch):
+    from app.knowledge import providers as providers_module
+
+    from tests.unit.live_settings import live_settings
+
+    monkeypatch.setattr(providers_module, "get_settings", live_settings)
+
+
+def test_live_mode_binds_a_real_transport_to_every_oauth_provider(monkeypatch):
+    from app.knowledge.providers import HttpxTransport
+
+    _live(monkeypatch)
+    store = FakeSecretStore()
+    for brand in ("google_drive", "notion", "hubspot", "salesforce"):
+        provider = provider_for_connection(_FakeConnection(brand), store)
+        assert isinstance(provider._transport, HttpxTransport), brand
+
+
+def test_mock_mode_leaves_the_transport_unbound_so_injected_fakes_still_win(monkeypatch):
+    """``None`` is exactly what the providers' "inject an HttpTransport" guards read,
+    so binding the live half must not change what mock mode hands back."""
+    from app.knowledge import providers as providers_module
+
+    monkeypatch.setattr(providers_module, "get_settings", Settings)
+    store = FakeSecretStore()
+    for brand in ("google_drive", "notion", "hubspot", "salesforce"):
+        assert provider_for_connection(_FakeConnection(brand), store)._transport is None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_call_surfaces_as_provider_unavailable_not_a_json_key_error(monkeypatch):
+    """Callers go straight to ``resp.json()``, so a revoked token has to be turned into
+    a typed error here or it becomes a KeyError deep inside a list comprehension."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.knowledge.providers import HttpxTransport
+
+    url = "https://www.googleapis.com/drive/v3/files"
+    refused = httpx.Response(
+        401, json={"error": "invalid_grant"}, request=httpx.Request("GET", url)
+    )
+    fake_client = AsyncMock()
+    fake_client.request = AsyncMock(return_value=refused)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("httpx.AsyncClient", return_value=fake_client):
+        with pytest.raises(ProviderUnavailable) as exc:
+            await HttpxTransport().get(url, headers={"Authorization": "Bearer tok-secret"})
+    assert "googleapis.com" in str(exc.value)
+    assert "tok-secret" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_host_surfaces_as_provider_unavailable():
+    from unittest.mock import AsyncMock, patch
+
+    from app.knowledge.providers import HttpxTransport
+
+    fake_client = AsyncMock()
+    fake_client.request = AsyncMock(side_effect=httpx.ConnectError("no route"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("httpx.AsyncClient", return_value=fake_client):
+        with pytest.raises(ProviderUnavailable):
+            await HttpxTransport().get("https://api.notion.com/v1/search")
+
+
+@pytest.mark.asyncio
+async def test_salesforce_queries_the_org_host_recorded_at_consent_not_the_login_host():
+    """Salesforce is the one provider with no fixed API host: login.salesforce.com serves
+    the login flow only, so a live query against it 404s for every real org. The per-org
+    host exists only in the material the token exchange stored."""
+    admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
+    store = FakeSecretStore(
+        {
+            _secret_ref(admin_id, instance_id): {
+                "access_token": "tok-sf",
+                "instance_url": "https://myorg.my.salesforce.com",
+            }
+        }
+    )
+    transport = FakeTransport(json_body={"records": []})
+    provider = SalesforceProvider(
+        admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+    )
+    await provider.snapshot(uuid.uuid4())
+    assert transport.last_url.startswith("https://myorg.my.salesforce.com/")
+    assert "login.salesforce.com" not in transport.last_url
+
+
+# --------------------------------------------------------------------------- #
 # OAuth code -> token exchange (the link that was MISSING end-to-end: an
 # authorize URL and a bearer-token reader existed, but nothing turned a
 # provider `code` into a token and wrote it to the SecretStore). Exercised

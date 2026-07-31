@@ -16,13 +16,17 @@ from the injected ``SecretStore`` at call time (§3.8.3: the secret never touche
 Postgres, never touches this constructor's arguments as a literal) and make their
 provider API call through an injected ``httpx.AsyncClient``-shaped transport so
 they are unit-testable against a FAKE transport with NO real network call, per the
-Build Brief's "everything runnable in mock mode" rule. In this arc's default (mock)
-posture, the real HTTP call sites raise ``ProviderUnavailable`` when no token is on
-file (a live OAuth round-trip is a provider-deferred seam exactly like the
-Connections layer's own authorize/callback flow) — the DELTA-SYNC CONTRACT logic
-(pagination cursor, updatedAt/last_edited_time comparison, deletion propagation) is
-the part this arc must prove, and it is fully exercised against a FAKE transport in
-tests, per the Build Brief.
+Build Brief's "everything runnable in mock mode" rule. Which transport that is comes
+from :func:`live_http_transport`: a real :class:`HttpxTransport` in live mode, ``None``
+everywhere else, so mock mode keeps the fakes and the DELTA-SYNC CONTRACT logic
+(pagination cursor, updatedAt/last_edited_time comparison, deletion propagation) stays
+fully exercised with no network call.
+
+Until P1-2 nothing bound the live half at all. ``provider_for_connection`` constructed
+every provider with ``transport=None``, so an admin who completed a real Drive consent
+got a connection that synced nothing and reported itself as a "provider-deferred seam
+in this arc" — a description of the code's own missing wiring, surfaced to the customer
+as if it were a property of the provider.
 
 OAuth CLIENT registration (id/secret/redirect) is read from ``app.config.Settings`` via
 ``connections.registry.oauth_client_config`` — the registry names the settings fields
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import uuid
 from typing import Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -73,11 +78,81 @@ class HttpTransport(Protocol):
     ) -> httpx.Response: ...
 
 
-async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
+class HttpxTransport:
+    """The real backend behind :class:`HttpTransport` (P1-2, ruling 4).
+
+    Every OAuth-class provider was written against the seam and NOTHING ever bound a
+    real implementation to it, so in live mode each one raised "inject an HttpTransport"
+    — a connected Drive that never synced, reported as a provider-deferred seam rather
+    than as the missing wiring it was.
+
+    A client per request rather than a shared pooled one: a sync is a handful of calls
+    minutes apart, so there is no pool to amortize, and a module-global AsyncClient
+    would outlive the event loop it was created on (the sweep and the request path do
+    not share one).
+
+    A non-2xx is raised as :class:`ProviderUnavailable` here rather than handed back as
+    a Response, because the callers all go straight to ``resp.json()``: a revoked token
+    would otherwise surface as a KeyError deep in a list comprehension instead of the
+    clean "reconnect this source" the sync status is meant to show.
+    """
+
+    def __init__(self, *, timeout: float = 30.0) -> None:
+        self._timeout = timeout
+
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, object] | None = None,
+    ) -> httpx.Response:
+        return await self._send("GET", url, headers=headers, params=params)
+
+    async def post(
+        self,
+        url: str,
+        *,
+        data: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        return await self._send("POST", url, headers=headers, data=data)
+
+    async def _send(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.request(method, url, **kwargs)  # type: ignore[arg-type]
+                resp.raise_for_status()
+                return resp
+        except httpx.HTTPStatusError as exc:
+            raise ProviderUnavailable(
+                f"{urlparse(url).hostname} refused the request ({exc.response.status_code}); "
+                "the connection may need to be re-authorized."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailable(f"{urlparse(url).hostname} is unreachable: {exc}") from exc
+
+
+def live_http_transport() -> HttpTransport | None:
+    """The real transport in live mode, ``None`` in every other mode (ruling 4).
+
+    ``None`` is what the existing "inject an HttpTransport" guards read, so mock mode
+    keeps behaving exactly as it did and every test that injects a fake is unaffected.
+    """
+    return HttpxTransport() if get_settings().integration_mode == "live" else None
+
+
+async def _token_material(
+    store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> dict[str, str]:
     material = await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
     if not material or not material.get("access_token"):
         raise ProviderUnavailable("No access token on file for this knowledge-sync connection.")
-    return material["access_token"]
+    return material
+
+
+async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
+    return (await _token_material(store, admin_id, instance_id))["access_token"]
 
 
 # --------------------------------------------------------------------------- #
@@ -368,7 +443,7 @@ class SalesforceProvider:
         admin_id: uuid.UUID,
         instance_id: uuid.UUID,
         store: SecretStore,
-        instance_url: str = "https://login.salesforce.com",
+        instance_url: str | None = None,
         transport: HttpTransport | None = None,
     ) -> None:
         self._admin_id = admin_id
@@ -378,7 +453,14 @@ class SalesforceProvider:
         self._transport = transport
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        token = await _bearer_token(self._store, self._admin_id, self._instance_id)
+        material = await _token_material(self._store, self._admin_id, self._instance_id)
+        token = material["access_token"]
+        # Salesforce is the one provider with no fixed API host: the token exchange
+        # returns the org's own ``instance_url``, and login.salesforce.com serves the
+        # login flow only — querying it would 404 for every real customer. Read from
+        # the stored material rather than a constructor default, which is the only
+        # place the per-org value exists (P1-2).
+        base = self._instance_url or material.get("instance_url") or "https://login.salesforce.com"
         transport = self._transport
         if transport is None:
             raise ProviderUnavailable(
@@ -390,7 +472,7 @@ class SalesforceProvider:
             "WHERE PublishStatus = 'Online'"
         )
         resp = await transport.get(
-            f"{self._instance_url}/services/data/v58.0/query",
+            f"{base}/services/data/v58.0/query",
             headers={"Authorization": f"Bearer {token}"},
             params={"q": query},
         )
@@ -580,18 +662,35 @@ def provider_for_connection(connection: object, store: SecretStore) -> SyncProvi
     # path (first sync, manual re-sync, scheduled re-sync) honours it without each caller
     # having to remember to pass it (Decision #9).
     selected = scope.scope_ids(connection)
+    # None outside live mode, which is what every provider's "inject an HttpTransport"
+    # guard already reads — so mock mode is unchanged and the fakes tests inject still
+    # win. In live mode this is the binding whose absence made every OAuth-class sync
+    # report itself as a deferred seam (P1-2).
+    transport = live_http_transport()
     if provider_name == "google_drive":
         return GoogleDriveProvider(
-            admin_id=admin_id, instance_id=instance_id, store=store, scope_ids=selected
+            admin_id=admin_id,
+            instance_id=instance_id,
+            store=store,
+            scope_ids=selected,
+            transport=transport,
         )
     if provider_name == "notion":
         return NotionProvider(
-            admin_id=admin_id, instance_id=instance_id, store=store, scope_ids=selected
+            admin_id=admin_id,
+            instance_id=instance_id,
+            store=store,
+            scope_ids=selected,
+            transport=transport,
         )
     if provider_name == "hubspot":
-        return HubSpotProvider(admin_id=admin_id, instance_id=instance_id, store=store)
+        return HubSpotProvider(
+            admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+        )
     if provider_name == "salesforce":
-        return SalesforceProvider(admin_id=admin_id, instance_id=instance_id, store=store)
+        return SalesforceProvider(
+            admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+        )
     if provider_name == "website_crawl":
         cfg = connection.non_secret_config or {}  # type: ignore[attr-defined]
         urls = cfg.get("crawl_urls") or []
