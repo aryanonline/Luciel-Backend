@@ -22,6 +22,8 @@ from app.billing.stripe_gateway import (
 )
 from app.config import FAKE_STRIPE_WEBHOOK_SECRET, Settings
 
+from tests.unit.live_settings import live_settings
+
 EVENT = json.dumps({"id": "evt_1", "type": "invoice.paid", "data": {"object": {}}}).encode()
 REAL = "whsec_provisioned_by_secrets_manager"  # noqa: S105 — test fixture value
 
@@ -64,12 +66,7 @@ def test_live_mode_refuses_to_boot_with_the_published_fake_secret():
 
 
 def test_live_mode_boots_with_a_real_webhook_secret():
-    s = Settings(
-        integration_mode="live",
-        platform_secret=json.dumps(
-            {"JWT_SIGNING_KEY": "real-signing-key", "STRIPE_WEBHOOK_SECRET": REAL}
-        ),
-    )
+    s = live_settings(STRIPE_WEBHOOK_SECRET=REAL)
     assert s.stripe_webhook_secret == REAL
 
 

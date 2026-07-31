@@ -20,6 +20,12 @@ from app.config import Settings
 REQUIRED_IN_LIVE_MODE = {
     "JWT_SIGNING_KEY": "unit-test-signing-key",
     "STRIPE_WEBHOOK_SECRET": "whsec_unit_test_not_the_published_constant",
+    # The inbound-webhook HMAC keys and the platform sender identity fail closed too:
+    # an empty HMAC key verifies forged webhooks, and an unset sender identity drops
+    # every platform email silently.
+    "TWILIO_AUTH_TOKEN": "unit-test-twilio-auth-token",
+    "META_APP_SECRET": "unit-test-meta-app-secret",
+    "PLATFORM_EMAIL_SENDER": "no-reply@unit.test",
 }
 
 LIVE_PLATFORM_SECRET = json.dumps(REQUIRED_IN_LIVE_MODE)

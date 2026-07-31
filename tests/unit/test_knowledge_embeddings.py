@@ -24,10 +24,7 @@ from app.knowledge.embeddings import (
     get_embedder,
 )
 
-REQUIRED_IN_LIVE_MODE = {
-    "JWT_SIGNING_KEY": "unit-test-signing-key",
-    "STRIPE_WEBHOOK_SECRET": "whsec_unit_test_not_the_published_constant",
-}
+from tests.unit.live_settings import REQUIRED_IN_LIVE_MODE
 
 
 def _settings(**blob: str) -> Settings:

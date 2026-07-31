@@ -420,6 +420,36 @@ class Settings(BaseSettings):
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
 
+        # Delivery/verification secrets, checked AFTER the overlay bridge above so the
+        # blob has already been applied. These fail closed in live mode for two distinct
+        # reasons, both of which are silent in a running system:
+        #
+        #  * TWILIO_AUTH_TOKEN / META_APP_SECRET are the HMAC keys the inbound channel
+        #    webhooks verify with. Empty-string keys do not disable verification — they
+        #    make it succeed for anyone who can compute an HMAC with a key they also
+        #    know is "" (P1-9). A forged webhook is an inbound message attributed to a
+        #    tenant.
+        #  * PLATFORM_EMAIL_SENDER decides whether ``build_email_sender`` binds SES or
+        #    the Null sender. Unset, every platform email (verification, reset, dunning,
+        #    escalation, export-ready) is recorded and dropped (P1-10).
+        if self.integration_mode == "live":
+            missing = [
+                name
+                for name, value in (
+                    ("TWILIO_AUTH_TOKEN", self.twilio_auth_token),
+                    ("META_APP_SECRET", self.meta_app_secret),
+                    ("PLATFORM_EMAIL_SENDER", self.platform_email_sender),
+                )
+                if not value
+            ]
+            if missing:
+                raise RuntimeError(
+                    "live mode is missing required platform secret(s): "
+                    f"{', '.join(missing)} — refusing to start (unset webhook HMAC keys "
+                    "accept forged inbound messages; an unset sender identity drops every "
+                    "platform email). Set them in the platform secret."
+                )
+
         # Bool bridge (non-production seam): the platform secret may carry the
         # captcha-bypass flag as a string; coerce it. Absent -> stays False (fail-safe).
         bypass_raw = blob.get("ALLOW_CAPTCHA_BYPASS_TOKEN")

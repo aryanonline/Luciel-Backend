@@ -19,8 +19,15 @@ import json
 import pytest
 from app.config import Settings
 
+from tests.unit.live_settings import REQUIRED_IN_LIVE_MODE
+
 REAL_JWT = "not-the-published-dev-default"  # noqa: S105 — test fixture value
 REAL_WEBHOOK = "whsec_provisioned_by_secrets_manager"  # noqa: S105 — test fixture value
+
+# The delivery/HMAC secrets fail closed in live mode too, so a blob that is meant to get
+# PAST the guards has to carry them; tests targeting one guard supply the rest.
+_GUARDED_ELSEWHERE = ("JWT_SIGNING_KEY", "STRIPE_WEBHOOK_SECRET")
+OTHER_REQUIRED = {k: v for k, v in REQUIRED_IN_LIVE_MODE.items() if k not in _GUARDED_ELSEWHERE}
 
 # Every input that parses to an empty blob, i.e. every way of saying "not provisioned".
 EMPTY_BLOBS = ["{}", "", "   ", "\n\t ", "not json at all", "[]", "null"]
@@ -45,11 +52,50 @@ def test_live_mode_boots_with_a_fully_populated_blob():
     s = Settings(
         integration_mode="live",
         platform_secret=json.dumps(
-            {"JWT_SIGNING_KEY": REAL_JWT, "STRIPE_WEBHOOK_SECRET": REAL_WEBHOOK}
+            {"JWT_SIGNING_KEY": REAL_JWT, "STRIPE_WEBHOOK_SECRET": REAL_WEBHOOK, **OTHER_REQUIRED}
         ),
     )
     assert s.jwt_signing_key == REAL_JWT
     assert s.stripe_webhook_secret == REAL_WEBHOOK
+
+
+@pytest.mark.parametrize(
+    ("omitted", "attr"),
+    [
+        ("TWILIO_AUTH_TOKEN", "twilio_auth_token"),
+        ("META_APP_SECRET", "meta_app_secret"),
+        ("PLATFORM_EMAIL_SENDER", "platform_email_sender"),
+    ],
+)
+def test_live_mode_refuses_to_boot_without_a_delivery_secret(omitted: str, attr: str):
+    """P1-9/P1-10: these three default to "" and nothing downstream refuses.
+
+    An empty Twilio/Meta HMAC key makes ``verify_hmac_shared_secret`` succeed for a
+    forged webhook rather than skip verification, and an unset sender identity binds
+    ``NullEmailSender``, so every platform email is recorded and dropped. Neither is
+    visible from outside, so the refusal has to happen at boot.
+    """
+    blob = {k: v for k, v in REQUIRED_IN_LIVE_MODE.items() if k != omitted}
+    with pytest.raises(RuntimeError, match=omitted):
+        Settings(integration_mode="live", platform_secret=json.dumps(blob))
+
+    # Same blob in mock mode: CI and local dev must keep booting.
+    assert getattr(Settings(platform_secret=json.dumps(blob)), attr) == ""
+
+
+def test_the_delivery_guard_names_every_missing_secret_at_once():
+    """One boot, one complete list — an operator should not fix these one deploy apart."""
+    with pytest.raises(RuntimeError) as err:
+        Settings(
+            integration_mode="live",
+            platform_secret=json.dumps(
+                {"JWT_SIGNING_KEY": REAL_JWT, "STRIPE_WEBHOOK_SECRET": REAL_WEBHOOK}
+            ),
+        )
+    message = str(err.value)
+    assert all(name in message for name in OTHER_REQUIRED)
+    # Names only: the guard must never echo a provisioned secret's VALUE.
+    assert REQUIRED_IN_LIVE_MODE["JWT_SIGNING_KEY"] not in message
 
 
 @pytest.mark.parametrize("blob", EMPTY_BLOBS)
