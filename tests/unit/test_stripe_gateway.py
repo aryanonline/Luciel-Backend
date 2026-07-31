@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 
 import pytest
 from app.billing.stripe_gateway import (
+    SIGNATURE_TOLERANCE_SECONDS,
     FakeStripeGateway,
     RealStripeGateway,
     SignatureError,
@@ -324,3 +326,61 @@ def test_get_payment_method_handles_stripe_object_not_dict() -> None:
     disp = asyncio.get_event_loop().run_until_complete(gw.get_payment_method(customer_id="cus_x"))
     assert disp is not None
     assert disp.brand == "visa" and disp.last4 == "4242"
+
+
+def test_a_captured_signed_event_is_not_replayable_forever() -> None:
+    """The ``t=`` value was parsed and thrown away, so a signature stayed valid
+    indefinitely: anyone who captured one signed ``invoice.paid`` could re-post it and
+    wipe the tenant's usage counter. Stripe's own 5-minute tolerance closes it.
+    """
+    gw = FakeStripeGateway()
+    payload = json.dumps({"id": "evt_t", "type": "invoice.paid", "data": {"object": {}}}).encode()
+
+    fresh = build_signature_header(gw.WEBHOOK_SECRET, payload)
+    assert gw.verify_and_parse(payload=payload, signature_header=fresh).event_id == "evt_t"
+
+    stale = build_signature_header(
+        gw.WEBHOOK_SECRET, payload, timestamp=int(time.time()) - SIGNATURE_TOLERANCE_SECONDS - 60
+    )
+    with pytest.raises(SignatureError):
+        gw.verify_and_parse(payload=payload, signature_header=stale)
+
+    # A far-future timestamp is equally a forgery signal, not merely "not yet stale".
+    future = build_signature_header(
+        gw.WEBHOOK_SECRET, payload, timestamp=int(time.time()) + SIGNATURE_TOLERANCE_SECONDS + 60
+    )
+    with pytest.raises(SignatureError):
+        gw.verify_and_parse(payload=payload, signature_header=future)
+
+
+def test_a_non_numeric_signature_timestamp_is_rejected_not_crashed() -> None:
+    """``t=`` is attacker-supplied; parsing it must fail closed as SignatureError rather
+    than raise ValueError out of the route as a 500."""
+    gw = FakeStripeGateway()
+    payload = json.dumps({"id": "evt_b", "type": "invoice.paid", "data": {"object": {}}}).encode()
+    with pytest.raises(SignatureError):
+        gw.verify_and_parse(payload=payload, signature_header="t=abc,v1=deadbeef")
+
+
+def test_the_real_gateway_verifies_identically_to_the_fake() -> None:
+    """Both used byte-identical verification code. The suite proves webhook handling
+    against the fake, so any drift between them is invisible until production."""
+    secret = "whsec_shared"
+    real = RealStripeGateway(
+        secret_key="sk_test_x", publishable_key="pk_test_x", webhook_secret=secret
+    )
+    payload = json.dumps({"id": "evt_r", "type": "invoice.paid", "data": {"object": {}}}).encode()
+
+    assert (
+        real.verify_and_parse(
+            payload=payload, signature_header=build_signature_header(secret, payload)
+        ).event_id
+        == "evt_r"
+    )
+    with pytest.raises(SignatureError):
+        real.verify_and_parse(
+            payload=payload,
+            signature_header=build_signature_header(
+                secret, payload, timestamp=int(time.time()) - 3600
+            ),
+        )

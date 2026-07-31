@@ -167,6 +167,41 @@ def build_signature_header(secret: str, payload: bytes, timestamp: int | None = 
     return f"t={ts},v1={_compute_signature(secret, str(ts), payload)}"
 
 
+SIGNATURE_TOLERANCE_SECONDS = 300
+"""How stale a signed Stripe event may be. Stripe's own recommended default.
+
+Without an age check the ``t=`` value is parsed and thrown away, so a captured event stays
+replayable forever — and every replay of ``invoice.paid`` wipes the usage counter."""
+
+
+def _verify_and_parse(
+    *, secret: str, payload: bytes, signature_header: str, now: float | None = None
+) -> StripeEvent:
+    """Verify the Stripe-Signature header THEN parse (HARD CONSTRAINT #4).
+
+    Shared by both gateways so the fake cannot drift from the real verification — the
+    fake is what the whole suite proves webhook handling against.
+    """
+    ts, sigs = _parse_signature_header(signature_header)
+    if ts is None or not sigs:
+        raise SignatureError("Missing Stripe-Signature components.")
+    try:
+        age = (now if now is not None else time.time()) - int(ts)
+    except ValueError as exc:
+        raise SignatureError("Malformed Stripe-Signature timestamp.") from exc
+    if abs(age) > SIGNATURE_TOLERANCE_SECONDS:
+        raise SignatureError("Stripe-Signature timestamp outside tolerance.")
+    expected = _compute_signature(secret, ts, payload)
+    if not any(hmac.compare_digest(expected, s) for s in sigs):
+        raise SignatureError("Stripe signature mismatch.")
+    body = json.loads(payload.decode("utf-8"))
+    return StripeEvent(
+        event_id=str(body["id"]),
+        type=str(body["type"]),
+        data=dict(body.get("data", {}).get("object", {})),
+    )
+
+
 def _parse_signature_header(header: str) -> tuple[str | None, list[str]]:
     """Split ``t=...,v1=...,v1=...`` into (timestamp, [v1 signatures])."""
     ts: str | None = None
@@ -288,18 +323,8 @@ class FakeStripeGateway:
         return had  # idempotent: removing twice just returns False the second time
 
     def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
-        # HARD CONSTRAINT #4: verify BEFORE parsing/acting (Arc 13 discipline).
-        ts, sigs = _parse_signature_header(signature_header)
-        if ts is None or not sigs:
-            raise SignatureError("Missing Stripe-Signature components.")
-        expected = _compute_signature(self._webhook_secret, ts, payload)
-        if not any(hmac.compare_digest(expected, s) for s in sigs):
-            raise SignatureError("Stripe signature mismatch.")
-        body = json.loads(payload.decode("utf-8"))
-        return StripeEvent(
-            event_id=str(body["id"]),
-            type=str(body["type"]),
-            data=dict(body.get("data", {}).get("object", {})),
+        return _verify_and_parse(
+            secret=self._webhook_secret, payload=payload, signature_header=signature_header
         )
 
 
@@ -446,19 +471,9 @@ class RealStripeGateway:
         return True
 
     def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
-        # HARD CONSTRAINT #4: verify BEFORE parsing/acting. Same v1 scheme as the
-        # fake, keyed by the TEST webhook signing secret (never the live one).
-        ts, sigs = _parse_signature_header(signature_header)
-        if ts is None or not sigs:
-            raise SignatureError("Missing Stripe-Signature components.")
-        expected = _compute_signature(self._webhook_secret, ts, payload)
-        if not any(hmac.compare_digest(expected, s) for s in sigs):
-            raise SignatureError("Stripe signature mismatch.")
-        body = json.loads(payload.decode("utf-8"))
-        return StripeEvent(
-            event_id=str(body["id"]),
-            type=str(body["type"]),
-            data=dict(body.get("data", {}).get("object", {})),
+        # Same v1 scheme as the fake, keyed by the TEST webhook signing secret.
+        return _verify_and_parse(
+            secret=self._webhook_secret, payload=payload, signature_header=signature_header
         )
 
 

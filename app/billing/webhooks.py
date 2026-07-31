@@ -23,6 +23,7 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -30,15 +31,28 @@ from app.billing import dunning
 from app.billing.metering import get_or_create_billing_account
 from app.billing.stripe_gateway import StripeEvent
 from app.models.audit import ActorType
-from app.models.billing import BillingAccount
+from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.notifications import notifier as notify
 
 
-async def _already_processed(account: BillingAccount, event_id: str) -> bool:
-    """Idempotency guard: the last processed event id is stored on the account."""
-    return account.last_stripe_event_id == event_id
+async def _claim_event(session: AsyncSession, *, admin_id: uuid.UUID, event_id: str) -> bool:
+    """Claim this event id for processing. False if it was already applied.
+
+    The gate is the ``processed_stripe_events`` primary key rather than a comparison
+    against ``last_stripe_event_id``: that was a one-deep window, so an A → B → A
+    redelivery reprocessed A. Only the audit emissions had been made replay-safe — the
+    state mutations had not, and every one of them is destructive on a second
+    application (the counter is wiped, a re-carded account is flipped back to free_cap
+    and its tools re-dormanted, dunning re-advances and re-emails the admin).
+    """
+    claimed = await session.execute(
+        pg_insert(ProcessedStripeEvent)
+        .values(admin_id=admin_id, event_id=event_id, processed_at=datetime.now(UTC))
+        .on_conflict_do_nothing(index_elements=["event_id"])
+    )
+    return bool(claimed.rowcount)
 
 
 async def handle_event(
@@ -53,8 +67,9 @@ async def handle_event(
     now = now or datetime.now(UTC)
     account = await get_or_create_billing_account(session, admin_id=admin_id)
 
-    # Idempotent redelivery: same event id → no-op (HARD CONSTRAINT, §3.4.1b).
-    if await _already_processed(account, event.event_id):
+    # Idempotent redelivery: an event id already applied → no-op (HARD CONSTRAINT,
+    # §3.4.1b). Claimed BEFORE any state mutation, so a replay cannot re-apply one.
+    if not await _claim_event(session, admin_id=admin_id, event_id=event.event_id):
         return "duplicate"
 
     if event.type == "invoice.paid":

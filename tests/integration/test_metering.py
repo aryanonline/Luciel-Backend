@@ -19,6 +19,7 @@ from app.billing.stripe_gateway import FakeStripeGateway, StripeEvent
 from app.db.session import tenant_session
 from app.models.budget import ConversationBudget
 from app.models.instance import Account, AccountState, Instance, LucielState
+from app.runtime import budget
 from app.runtime.budget import current_billing_period_start
 
 pytestmark = [pytest.mark.asyncio]
@@ -401,3 +402,84 @@ async def test_pm_attached_restores_dormant_connections():
         assert conn.status == "unconfigured", (
             f"Dormant connection must be restored on pm.attached; got {conn.status!r}"
         )
+
+
+# --- the replay window (P0-6) ------------------------------------------------ #
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_an_a_b_a_redelivery_does_not_reprocess_a() -> None:
+    """The guard was a comparison against a single ``last_stripe_event_id`` column — a
+    one-deep window, so A → B → A saw a different id in the column and re-applied A.
+
+    Re-applying ``invoice.paid`` deletes the usage counter a second time: a PAYG tenant
+    who has run conversations since the invoice loses every one of them and is never
+    billed for them.
+    """
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, counted=180)
+    paid = StripeEvent(event_id="evt_A", type="invoice.paid", data={})
+    other = StripeEvent(event_id="evt_B", type="invoice.payment_failed", data={})
+
+    async with tenant_session(admin) as s:
+        assert await billing_webhooks.handle_event(s, admin_id=admin, event=paid) == "invoice_paid"
+
+    # The tenant keeps using the product after the invoice was paid.
+    async with tenant_session(admin) as s:
+        for _ in range(180):
+            await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+            )
+
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=other)
+    async with tenant_session(admin) as s:
+        replay = await billing_webhooks.handle_event(s, admin_id=admin, event=paid)
+
+    assert replay == "duplicate"
+    async with tenant_session(admin) as s:
+        b = await metering.build_budget(s, admin_id=admin, instance_id=iid)
+    assert b.conversations_this_period == 180  # not wiped by the replay
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_a_replayed_detach_does_not_re_dormant_a_recarded_account() -> None:
+    """detached → attached → replayed detached used to flip the account back to free_cap
+    and re-dormant its tools, silently disabling a customer who had already re-carded."""
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    detached = StripeEvent(event_id="evt_det", type="payment_method.detached", data={})
+    attached = StripeEvent(
+        event_id="evt_att",
+        type="payment_method.attached",
+        data={"card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2030}},
+    )
+
+    for event in (detached, attached):
+        async with tenant_session(admin) as s:
+            await billing_webhooks.handle_event(s, admin_id=admin, event=event)
+    async with tenant_session(admin) as s:
+        assert await billing_webhooks.handle_event(s, admin_id=admin, event=detached) == "duplicate"
+
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.billing_state == "payg_enabled"
+        assert acct.pm_last4 == "4242"
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_the_replay_gate_is_per_tenant() -> None:
+    """Stripe event ids are globally unique, but the gate must not let one tenant's
+    delivery swallow another's — a shared id would silently drop a real event."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _seed_tenant(a)
+    await _seed_tenant(b)
+    async with tenant_session(a) as s:
+        first = await billing_webhooks.handle_event(
+            s, admin_id=a, event=StripeEvent(event_id="evt_shared", type="invoice.paid", data={})
+        )
+    async with tenant_session(b) as s:
+        second = await billing_webhooks.handle_event(
+            s, admin_id=b, event=StripeEvent(event_id="evt_shared_b", type="invoice.paid", data={})
+        )
+    assert (first, second) == ("invoice_paid", "invoice_paid")

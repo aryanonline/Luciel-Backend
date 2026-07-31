@@ -6,7 +6,7 @@ Importing this package imports every model module so that:
 """
 
 from app.models.audit import AdminAuditLog
-from app.models.billing import BillingAccount
+from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.models.conversation import (
@@ -45,6 +45,7 @@ __all__ = [
     "InstanceConnection",
     "ConversationBudget",
     "CountedSession",
+    "ProcessedStripeEvent",
     "VoiceCallRecord",
     "DeferredAction",
 ]

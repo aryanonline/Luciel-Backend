@@ -17,7 +17,7 @@ end surfaced to the UI as ``periodResetsAt``; the counter resets on the Stripe
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -65,6 +65,25 @@ class BillingAccount(Base, TenantMixin, TimestampMixin):
     pm_exp_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pm_exp_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # Idempotency guard for Stripe webhook redelivery (§3.4.1b): the last processed
-    # Stripe event id, so a redelivered event is a no-op (Stripe may redeliver).
+    # Superseded by processed_stripe_events as the redelivery guard: a single column is a
+    # ONE-DEEP window, so an A → B → A redelivery reprocessed A. Retained as the "last
+    # event we saw" breadcrumb for operators reading the account row.
     last_stripe_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ProcessedStripeEvent(Base, TenantMixin, TimestampMixin):
+    """Every Stripe event id already applied — the redelivery guard (§3.4.1b).
+
+    The event id is the primary key, so ``INSERT ... ON CONFLICT DO NOTHING`` is the
+    whole gate: the rowcount says whether this delivery is the first. Replay is not
+    hypothetical — Stripe redelivers on any non-2xx, and each replayed ``invoice.paid``
+    used to delete the tenant's usage counter, handing back a fresh free 50 and losing
+    every conversation run since the invoice.
+    """
+
+    __tablename__ = "processed_stripe_events"
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
