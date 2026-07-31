@@ -298,6 +298,10 @@ async def report_usage(
     period_start = account.period_start or datetime(now.year, now.month, 1, tzinfo=UTC)
     key = usage_idempotency_key(admin_id=admin_id, period_start=period_start, quantity=quantity)
     await gateway.report_metered_usage(
-        subscription_id=account.stripe_subscription_id, quantity=quantity, idempotency_key=key
+        subscription_id=account.stripe_subscription_id,
+        quantity=quantity,
+        idempotency_key=key,
+        # ``quantity`` is the period total, not the delta since the last report.
+        action="set",
     )
     return quantity

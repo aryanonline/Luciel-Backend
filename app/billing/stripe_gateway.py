@@ -71,6 +71,8 @@ class UsageRecord:
     # test can prove the configured price actually reached the report rather than the
     # quantity landing against whatever price happened to be on the subscription.
     price_id: str = ""
+    # "set" | "increment" — how Stripe folds this quantity into the period total.
+    action: str = "set"
 
 
 def payg_price_id() -> str:
@@ -122,11 +124,17 @@ class StripeGateway(Protocol):
         ...
 
     async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str
+        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
     ) -> bool:
         """Report metered usage for the period. Idempotent on ``idempotency_key``
         (HARD CONSTRAINT #3, §3.4.1b): a retry with the same key never double-bills.
-        Returns True if this call reported new usage, False if it was a dedup no-op."""
+        Returns True if this call reported new usage, False if it was a dedup no-op.
+
+        ``quantity`` is the period-CUMULATIVE block count, so ``action`` must stay
+        ``"set"``. It is an explicit parameter rather than a hardcoded literal because
+        Stripe's default is ``increment``: under increment, posting 1 then 2 then 3
+        bills 6 blocks for 3 blocks of usage, and the error grows with usage. The
+        parameter is what lets the fake model both and a test pin the difference."""
         ...
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
@@ -201,6 +209,11 @@ class FakeStripeGateway:
         # need to prove usage was reported at the right threshold, not just that the
         # call did not raise.
         self.usage_records: list[UsageRecord] = []
+        # subscription id -> the quantity Stripe would BILL, after applying each
+        # record's action. Recording the calls alone hid a geometric overcharge: the
+        # caller posts a cumulative quantity, and under Stripe's default increment
+        # action those cumulative postings sum. See :meth:`billed_quantity`.
+        self._billed_quantity: dict[str, int] = {}
 
     async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
         # Deterministic id derived from the tenant so repeated calls are stable.
@@ -235,7 +248,7 @@ class FakeStripeGateway:
         return sub_id
 
     async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str
+        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
     ) -> bool:
         # HARD CONSTRAINT #3 (§3.4.1b): idempotent on the key — a redelivery / retry
         # with the same (period, quantity) key is a no-op, never a double-bill.
@@ -250,9 +263,21 @@ class FakeStripeGateway:
                 # Mirrors the real path, where usage attaches to the subscription ITEM
                 # the price created — so the recorded price is the one that will bill.
                 price_id=self._subscription_prices.get(subscription_id, payg_price_id()),
+                action=action,
             )
         )
+        # Apply Stripe's own semantics so the invoice total is assertable.
+        if action == "increment":
+            self._billed_quantity[subscription_id] = (
+                self._billed_quantity.get(subscription_id, 0) + quantity
+            )
+        else:
+            self._billed_quantity[subscription_id] = quantity
         return True
+
+    def billed_quantity(self, subscription_id: str) -> int:
+        """The blocks Stripe would invoice for ``subscription_id`` this period."""
+        return self._billed_quantity.get(subscription_id, 0)
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
         return self._cards.get(customer_id)
@@ -367,7 +392,7 @@ class RealStripeGateway:
         return str(created["id"])
 
     async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str
+        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
     ) -> bool:
         client = self._get_client()
         # Usage attaches to the subscription ITEM, not the subscription: resolve the
@@ -382,6 +407,10 @@ class RealStripeGateway:
             str(rows[0]["id"]),
             quantity=quantity,
             idempotency_key=idempotency_key,
+            # NOT optional. ``quantity`` is the period-cumulative block count and
+            # Stripe's default action is increment, which would sum every cumulative
+            # posting: 1 + 2 + 3 invoices 6 blocks for 3 blocks of usage.
+            action=action,
         )
         return True
 

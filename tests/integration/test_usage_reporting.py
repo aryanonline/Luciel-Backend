@@ -161,6 +161,50 @@ async def test_a_retry_at_the_same_boundary_never_double_bills(
     assert len(gateway.usage_records) == 1  # but only ONE accepted record
 
 
+# --- what Stripe actually invoices (P0-3) ---------------------------------- #
+
+
+async def _set_counted(admin: uuid.UUID, iid: uuid.UUID, counted: int) -> None:
+    from sqlalchemy import update
+
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(ConversationBudget)
+            .where(
+                ConversationBudget.admin_id == admin,
+                ConversationBudget.instance_id == iid,
+            )
+            .values(counted_conversations=counted)
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_successive_blocks_bill_the_period_total_not_their_sum(
+    gateway: FakeStripeGateway,
+) -> None:
+    """The reported quantity is period-CUMULATIVE, so it must be posted with
+    ``action="set"``.
+
+    Stripe's default action is increment, under which posting 1 then 2 then 3 invoices
+    6 blocks — $234 for $117 of usage. The error compounds with usage, so the heaviest
+    customers were the most overbilled. Recording the calls alone could not catch it:
+    the per-call quantities (1, 2, 3) are correct; only the total is wrong.
+    """
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=51, subscription_id="sub_test")
+
+    assert await _report(admin, iid) == 1
+    await _set_counted(admin, iid, 151)
+    assert await _report(admin, iid) == 2
+    await _set_counted(admin, iid, 251)
+    assert await _report(admin, iid) == 3
+
+    assert [r.quantity for r in gateway.usage_records] == [1, 2, 3]
+    assert {r.action for r in gateway.usage_records} == {"set"}
+    # 3 blocks of usage == 3 blocks invoiced. Under increment this is 6.
+    assert gateway.billed_quantity("sub_test") == 3
+
+
 # --- who is billable ------------------------------------------------------- #
 
 
@@ -263,7 +307,7 @@ async def test_a_stripe_failure_never_breaks_the_lead_s_turn() -> None:
 
     class BrokenGateway(FakeStripeGateway):
         async def report_metered_usage(
-            self, *, subscription_id: str, quantity: int, idempotency_key: str
+            self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
         ) -> bool:
             raise RuntimeError("stripe down")
 

@@ -56,6 +56,33 @@ def test_metered_usage_reporting_is_idempotent() -> None:
     assert second is False  # same key → dedup no-op (no double-bill)
 
 
+def test_the_fake_models_set_versus_increment() -> None:
+    """The fake only appended to a list, so the suite could not see the difference
+    between the two actions — which is how a geometric overcharge stayed invisible.
+
+    Both branches are modelled because the whole point is that they diverge: the caller
+    posts a period-cumulative quantity, which is only correct under "set".
+    """
+    gw = FakeStripeGateway()
+
+    async def run() -> tuple[int, int]:
+        for i, quantity in enumerate((1, 2, 3)):
+            await gw.report_metered_usage(
+                subscription_id="sub_set", quantity=quantity, idempotency_key=f"set-{i}"
+            )
+            await gw.report_metered_usage(
+                subscription_id="sub_inc",
+                quantity=quantity,
+                idempotency_key=f"inc-{i}",
+                action="increment",
+            )
+        return gw.billed_quantity("sub_set"), gw.billed_quantity("sub_inc")
+
+    with_set, with_increment = asyncio.run(run())
+    assert with_set == 3  # the period total, which is the actual usage
+    assert with_increment == 6  # 1+2+3 — Stripe's default, and double the real usage
+
+
 # --- Stripe TEST-mode posture wiring (never sk_live_, never hardcoded) ------- #
 
 
