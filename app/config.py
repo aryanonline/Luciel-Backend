@@ -220,18 +220,19 @@ class Settings(BaseSettings):
     # like ``platform_secret`` above. Defaults are empty so mock-mode/CI never needs
     # them and a live OAuth flow fails closed (no authorize URL) rather than using a
     # placeholder client id.
-    google_drive_client_id: str = ""
-    google_drive_client_secret: str = ""  # noqa: S105 — empty default, not a secret literal
-    google_drive_redirect_uri: str = ""
+    # ONE Google Cloud OAuth client serves every Google product (Drive knowledge sync
+    # AND Calendar): a Google client is not per-API — the same client_id requests
+    # whichever scopes the authorize URL asks for. Only the SCOPE differs per product,
+    # and that lives in connections.registry.
+    google_client_id: str = ""
+    google_client_secret: str = ""  # noqa: S105 — empty default, not a secret literal
+    google_redirect_uri: str = ""
     hubspot_client_id: str = ""
     hubspot_client_secret: str = ""  # noqa: S105
     hubspot_redirect_uri: str = ""
     salesforce_consumer_key: str = ""
     salesforce_consumer_secret: str = ""  # noqa: S105
     salesforce_redirect_uri: str = ""
-    google_calendar_client_id: str = ""
-    google_calendar_client_secret: str = ""  # noqa: S105
-    google_calendar_redirect_uri: str = ""
     calendly_client_id: str = ""
     calendly_client_secret: str = ""  # noqa: S105
     calendly_redirect_uri: str = ""
@@ -275,18 +276,21 @@ class Settings(BaseSettings):
         # B105 heuristic flags the name strings ending in secret/token/key, hence the
         # per-line `# nosec B105` on those entries. No secret material is hardcoded here.
         overlay = {
-            "GOOGLE_DRIVE_CLIENT_ID": "google_drive_client_id",
-            "GOOGLE_DRIVE_CLIENT_SECRET": "google_drive_client_secret",  # nosec B105
-            "GOOGLE_DRIVE_REDIRECT_URI": "google_drive_redirect_uri",
+            # The Google app credential is one client for Drive + Calendar. GOOGLE_DRIVE_*
+            # is the key set the blob was first provisioned under and names that same
+            # client, so it is still accepted; GOOGLE_* wins when both are present.
+            "GOOGLE_CLIENT_ID": "google_client_id",
+            "GOOGLE_DRIVE_CLIENT_ID": "google_client_id",
+            "GOOGLE_CLIENT_SECRET": "google_client_secret",  # nosec B105
+            "GOOGLE_DRIVE_CLIENT_SECRET": "google_client_secret",  # nosec B105
+            "GOOGLE_REDIRECT_URI": "google_redirect_uri",
+            "GOOGLE_DRIVE_REDIRECT_URI": "google_redirect_uri",
             "HUBSPOT_CLIENT_ID": "hubspot_client_id",
             "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",  # nosec B105
             "HUBSPOT_REDIRECT_URI": "hubspot_redirect_uri",
             "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
             "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
             "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
-            "GOOGLE_CALENDAR_CLIENT_ID": "google_calendar_client_id",
-            "GOOGLE_CALENDAR_CLIENT_SECRET": "google_calendar_client_secret",  # nosec B105
-            "GOOGLE_CALENDAR_REDIRECT_URI": "google_calendar_redirect_uri",
             "CALENDLY_CLIENT_ID": "calendly_client_id",
             "CALENDLY_CLIENT_SECRET": "calendly_client_secret",  # nosec B105
             "CALENDLY_REDIRECT_URI": "calendly_redirect_uri",

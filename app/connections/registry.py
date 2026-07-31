@@ -118,11 +118,20 @@ PROVIDERS: dict[str, ProviderSpec] = {
             exchange_endpoint="https://oauth2.googleapis.com/token",
             scopes="https://www.googleapis.com/auth/calendar.events",
             supports_pkce=True,
-            extra={"access_type": "offline", "prompt": "consent"},
+            extra={
+                "access_type": "offline",
+                "prompt": "consent",
+                # Same Google client as Drive, so an owner who already granted Drive is
+                # doing INCREMENTAL auth here: without this Google issues a token
+                # carrying only calendar.events and the Drive grant silently narrows.
+                "include_granted_scopes": "true",
+            },
         ),
-        client_id_setting="google_calendar_client_id",
-        client_secret_setting="google_calendar_client_secret",  # noqa: S106 — field NAME
-        redirect_uri_setting="google_calendar_redirect_uri",
+        # The SHARED Google client (see Settings.google_client_id) — Calendar is a scope
+        # on the same OAuth app as Drive, not a separate app. Only the scope differs.
+        client_id_setting="google_client_id",
+        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME
+        redirect_uri_setting="google_redirect_uri",
         help_text="Luciel reads your availability and writes bookings into this calendar.",
     ),
     "calendly": ProviderSpec(
@@ -227,9 +236,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
                 "include_granted_scopes": "true",
             },
         ),
-        client_id_setting="google_drive_client_id",
-        client_secret_setting="google_drive_client_secret",  # noqa: S106 — field NAME
-        redirect_uri_setting="google_drive_redirect_uri",
+        client_id_setting="google_client_id",
+        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME
+        redirect_uri_setting="google_redirect_uri",
         scope_kind=SCOPE_DRIVE_FOLDERS,
         help_text="Choose which folders Luciel may read.",
     ),

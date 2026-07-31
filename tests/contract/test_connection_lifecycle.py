@@ -127,6 +127,38 @@ async def test_providers_endpoint_filters_by_type_and_leaks_no_secret(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_calendar_is_configured_by_the_shared_google_client(client, monkeypatch):
+    """Over the wire the owner sees Google Calendar become connectable as soon as the
+    ONE Google OAuth app is registered — there is no separate calendar credential to
+    provision, because a Google client is per-app, not per-API.
+
+    Calendly is the control: it shares the connection type but not the vendor, so it
+    must stay honest-disabled rather than ride Google's credential."""
+    from app.config import Settings
+    from app.connections import registry as registry_module
+
+    settings = Settings(
+        google_client_id="test-google-client.apps.googleusercontent.com",
+        google_client_secret="test-secret",  # noqa: S106 — placeholder, not a real secret
+        google_redirect_uri="https://api.vantagemind.ai/api/v1/connections/google/callback",
+    )
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+
+    await _ready_account_with_luciel(client)
+    r = await client.get("/api/v1/admin/connections/providers?connection_type=calendar")
+    assert r.status_code == 200
+    by_provider = {p["provider"]: p for p in r.json()[0]["providers"]}
+    assert by_provider["google_calendar"]["configured"] is True
+    assert by_provider["calendly"]["configured"] is False
+    # The same grant still configures Drive — sharing must not have moved the credential.
+    kn = await client.get("/api/v1/admin/connections/providers?connection_type=knowledge_source")
+    drive = next(p for p in kn.json()[0]["providers"] if p["provider"] == "google_drive")
+    assert drive["configured"] is True
+    # §3.8.3: still only a boolean crosses the wire.
+    assert "test-secret" not in r.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_connect_rejects_a_provider_the_registry_does_not_offer(client):
     """An admin-supplied provider string steers a real OAuth endpoint, so a type that
     HAS a choice only accepts registered members of it (Decision #6)."""

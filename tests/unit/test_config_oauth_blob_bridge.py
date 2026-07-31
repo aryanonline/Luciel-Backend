@@ -15,31 +15,54 @@ from app.config import Settings
 def test_blob_fills_empty_oauth_fields():
     blob = json.dumps(
         {
-            "GOOGLE_DRIVE_CLIENT_ID": "gid",
-            "GOOGLE_DRIVE_CLIENT_SECRET": "gsec",
-            "GOOGLE_DRIVE_REDIRECT_URI": "https://api.vantagemind.ai/api/v1/connections/google/callback",
+            "GOOGLE_CLIENT_ID": "gid",
+            "GOOGLE_CLIENT_SECRET": "gsec",
+            "GOOGLE_REDIRECT_URI": "https://api.vantagemind.ai/api/v1/connections/google/callback",
             "HUBSPOT_CLIENT_SECRET": "hsec",
             "SALESFORCE_CONSUMER_SECRET": "ssec",
         }
     )
     s = Settings(platform_secret=blob)
-    assert s.google_drive_client_id == "gid"
-    assert s.google_drive_client_secret == "gsec"
-    assert s.google_drive_redirect_uri.endswith("/connections/google/callback")
+    assert s.google_client_id == "gid"
+    assert s.google_client_secret == "gsec"
+    assert s.google_redirect_uri.endswith("/connections/google/callback")
     assert s.hubspot_client_secret == "hsec"
     assert s.salesforce_consumer_secret == "ssec"
 
 
-def test_direct_env_var_wins_over_blob(monkeypatch):
-    monkeypatch.setenv("LUCIEL_GOOGLE_DRIVE_CLIENT_ID", "env-wins")
-    blob = json.dumps({"GOOGLE_DRIVE_CLIENT_ID": "blob-loses"})
+def test_legacy_google_drive_blob_keys_still_name_the_shared_google_client():
+    """The blob was first provisioned under GOOGLE_DRIVE_* for the Drive connector, but
+    those keys always named the ONE Google OAuth app. Dropping them would unconfigure
+    Drive in a deployed environment on the next release, so they still resolve — and
+    they now configure Calendar too, since it is the same client."""
+    blob = json.dumps(
+        {
+            "GOOGLE_DRIVE_CLIENT_ID": "gid",
+            "GOOGLE_DRIVE_CLIENT_SECRET": "gsec",
+            "GOOGLE_DRIVE_REDIRECT_URI": "https://api.vantagemind.ai/api/v1/connections/google/callback",
+        }
+    )
     s = Settings(platform_secret=blob)
-    assert s.google_drive_client_id == "env-wins"
+    assert s.google_client_id == "gid"
+    assert s.google_client_secret == "gsec"
+    assert s.google_redirect_uri.endswith("/connections/google/callback")
+
+
+def test_canonical_google_key_wins_over_the_legacy_drive_key():
+    blob = json.dumps({"GOOGLE_CLIENT_ID": "canonical", "GOOGLE_DRIVE_CLIENT_ID": "legacy"})
+    assert Settings(platform_secret=blob).google_client_id == "canonical"
+
+
+def test_direct_env_var_wins_over_blob(monkeypatch):
+    monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_ID", "env-wins")
+    blob = json.dumps({"GOOGLE_CLIENT_ID": "blob-loses"})
+    s = Settings(platform_secret=blob)
+    assert s.google_client_id == "env-wins"
 
 
 def test_empty_blob_leaves_fields_empty():
     s = Settings(platform_secret="{}")
-    assert s.google_drive_client_secret == ""
+    assert s.google_client_secret == ""
     assert s.hubspot_client_secret == ""
 
 

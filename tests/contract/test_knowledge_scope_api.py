@@ -87,9 +87,9 @@ async def _connected_drive(client, monkeypatch) -> tuple[str, FakeDriveTransport
     from app.knowledge import providers as providers_module
 
     configured = Settings(
-        google_drive_client_id="gcid",
-        google_drive_client_secret="gcsecret",
-        google_drive_redirect_uri="https://api.example.com/gd-callback",
+        google_client_id="gcid",
+        google_client_secret="gcsecret",
+        google_redirect_uri="https://api.example.com/gd-callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
     monkeypatch.setattr(registry_module, "get_settings", lambda: configured)
@@ -221,9 +221,9 @@ async def test_saving_a_scope_writes_an_audit_event(client, monkeypatch):
     from app.knowledge import providers as providers_module
 
     configured = Settings(
-        google_drive_client_id="gcid",
-        google_drive_client_secret="gcsecret",
-        google_drive_redirect_uri="https://api.example.com/gd-callback",
+        google_client_id="gcid",
+        google_client_secret="gcsecret",
+        google_redirect_uri="https://api.example.com/gd-callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
     monkeypatch.setattr(registry_module, "get_settings", lambda: configured)

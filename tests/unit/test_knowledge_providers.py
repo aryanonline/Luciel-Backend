@@ -90,9 +90,9 @@ def test_oauth_client_config_reads_from_settings(monkeypatch):
     from app.connections import registry as registry_module
 
     fresh = Settings(
-        google_drive_client_id="cid",
-        google_drive_client_secret="csecret",
-        google_drive_redirect_uri="https://api.example.com/callback",
+        google_client_id="cid",
+        google_client_secret="csecret",
+        google_redirect_uri="https://api.example.com/callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: fresh)
     cfg = oauth_client_config("google_drive")
@@ -358,9 +358,9 @@ def test_provider_for_connection_unknown_provider_raises():
 # --------------------------------------------------------------------------- #
 def _configured_settings(monkeypatch, provider_module):
     fresh = Settings(
-        google_drive_client_id="gcid",
-        google_drive_client_secret="gcsecret",
-        google_drive_redirect_uri="https://api.example.com/gd-callback",
+        google_client_id="gcid",
+        google_client_secret="gcsecret",
+        google_redirect_uri="https://api.example.com/gd-callback",
         hubspot_client_id="hcid",
         hubspot_client_secret="hcsecret",
         hubspot_redirect_uri="https://api.example.com/hs-callback",

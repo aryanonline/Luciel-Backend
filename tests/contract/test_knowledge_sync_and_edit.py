@@ -311,9 +311,9 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
     from app.knowledge import providers as providers_module
 
     configured = Settings(
-        google_drive_client_id="gcid",
-        google_drive_client_secret="gcsecret",
-        google_drive_redirect_uri="https://api.example.com/gd-callback",
+        google_client_id="gcid",
+        google_client_secret="gcsecret",
+        google_redirect_uri="https://api.example.com/gd-callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
     # The OAuth app credential is resolved through the provider REGISTRY now (Decision #6),

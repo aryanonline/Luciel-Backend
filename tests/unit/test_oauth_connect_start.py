@@ -18,14 +18,17 @@ from app.connections import oauth_flow
 
 @pytest.fixture
 def configured(monkeypatch):
-    """Register OAuth clients for the three providers whose credentials exist."""
+    """Register OAuth clients for the providers whose credentials exist.
+
+    There is ONE Google client on purpose: Drive and Calendar are two scopes on the
+    same Google Cloud OAuth app, not two apps."""
     from app.connections import registry as registry_module
     from app.knowledge import providers as providers_module
 
     settings = Settings(
-        google_drive_client_id="gd-client",
-        google_drive_client_secret="gd-secret",
-        google_drive_redirect_uri="https://api.vantagemind.ai/oauth/google-drive",
+        google_client_id="google-client",
+        google_client_secret="google-secret",
+        google_redirect_uri="https://api.vantagemind.ai/api/v1/connections/google/callback",
         hubspot_client_id="hs-client",
         hubspot_client_secret="hs-secret",
         hubspot_redirect_uri="https://api.vantagemind.ai/oauth/hubspot",
@@ -54,6 +57,7 @@ def _start(provider: str) -> tuple[oauth_flow.AuthorizeStart, dict[str, list[str
     ("provider", "host"),
     [
         ("google_drive", "accounts.google.com"),
+        ("google_calendar", "accounts.google.com"),
         ("hubspot", "app.hubspot.com"),
         ("salesforce", "login.salesforce.com"),
     ],
@@ -77,6 +81,53 @@ def test_google_requests_offline_access_for_a_refresh_token(configured):
     _start_result, params = _start("google_drive")
     assert params["access_type"] == ["offline"]
     assert params["prompt"] == ["consent"]
+
+
+def test_calendar_reuses_the_drive_google_client_with_its_own_scope(configured):
+    """Calendar was unconfigurable because it demanded its OWN google_calendar_* client
+    that no one ever registered, so the only calendar provider on the platform sat
+    honest-disabled while a perfectly good Google app was already connected for Drive.
+
+    A Google OAuth client is not per-API — the same client_id requests whichever scopes
+    the authorize URL asks for. So the app IDENTITY (client_id + redirect) is shared and
+    only the SCOPE differs; that split is what this pins."""
+    from app.connections.registry import oauth_client_config
+
+    cal, cal_params = _start("google_calendar")
+    _drive, drive_params = _start("google_drive")
+
+    assert not cal.unconfigured
+    assert cal_params["client_id"] == drive_params["client_id"] == ["google-client"]
+    assert cal_params["redirect_uri"] == drive_params["redirect_uri"]
+    assert oauth_client_config("google_calendar") == oauth_client_config("google_drive")
+
+    # The scope is the part that must NOT be shared.
+    assert cal_params["scope"] == ["https://www.googleapis.com/auth/calendar.events"]
+    assert drive_params["scope"] == ["https://www.googleapis.com/auth/drive.readonly"]
+
+    # A refresh token is what keeps the calendar connected past the first hour, and
+    # incremental auth is what stops this grant from narrowing an existing Drive grant.
+    assert cal_params["access_type"] == ["offline"]
+    assert cal_params["prompt"] == ["consent"]
+    assert cal_params["include_granted_scopes"] == ["true"]
+
+
+def test_calendar_is_unconfigured_without_the_google_client(monkeypatch):
+    """The flip must be driven by the credential, not by the registry entry existing —
+    otherwise the UI offers a consent screen that cannot be reached."""
+    from app.connections import registry as registry_module
+
+    monkeypatch.setattr(registry_module, "get_settings", lambda: Settings())
+    start, _params = _start("google_calendar")
+    assert start.unconfigured is True
+    assert start.state_jti is None
+
+
+def test_calendly_stays_unconfigured_on_the_google_client(configured):
+    """Sharing is per-VENDOR, not "any calendar provider": Calendly has no credential,
+    so it must stay honest-disabled rather than inherit Google's."""
+    start, _params = _start("calendly")
+    assert start.unconfigured is True
 
 
 def test_pkce_challenge_is_sent_only_to_providers_that_implement_it(configured):
