@@ -89,7 +89,7 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
     if settings.integration_mode != "live":
         return HashingEmbedder()
 
-    api_key = parse_platform_secret(settings.platform_secret).get("OPENAI_API_KEY", "")
+    api_key = parse_platform_secret(settings.platform_secret, live=True).get("OPENAI_API_KEY", "")
     if not api_key:
         # Fail loud, exactly as _build_live_router does: a live deploy without the key
         # is a misconfiguration. Falling back to HashingEmbedder here would write

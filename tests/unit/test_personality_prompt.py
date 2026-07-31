@@ -130,6 +130,7 @@ def test_orchestrator_composes_the_personality_it_was_constructed_with() -> None
         enabled_channels=set(),
         business_context="Cash only.",
         personality={"preset": "trusted_authority"},
+        has_payment_method=False,
     )
     assert "Trusted Authority" in orch.system_prompt
     assert "Cash only." in orch.system_prompt

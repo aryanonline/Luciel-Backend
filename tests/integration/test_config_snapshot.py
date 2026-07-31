@@ -215,6 +215,7 @@ async def _run_tool_turn(
             enabled_channels={"widget"},
             tool_resolver=_resolver,
             snapshot_tool_ids=snapshot_tool_ids,
+            has_payment_method=False,
         )
         result = await orch.run_turn(
             session_id=sid,

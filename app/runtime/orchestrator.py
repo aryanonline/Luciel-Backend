@@ -215,7 +215,11 @@ class Orchestrator:
     # actually shapes how Luciel talks. None = the default preset.
     personality: dict[str, object] | None = None
     system_prompt: str = field(default="", init=False)
-    has_payment_method: bool = False
+    # REQUIRED and keyword-only, deliberately undefaulted (P2-5). A default of False
+    # means a call site that forgets it caps a paying PAYG tenant at the free 50 and
+    # says nothing — the customer is refused service, and it looks identical to being
+    # genuinely out of allowance. Resolve it from ``metering.has_live_card``.
+    has_payment_method: bool = field(kw_only=True)
     # Resolves a proposed tool_id to a Tool with its Arc 17 backend bound; None when
     # tools are not wired (the default in Arc 14). A None resolution yields a `failed`
     # outcome so the loop reasons about it uniformly (§3.4.1).

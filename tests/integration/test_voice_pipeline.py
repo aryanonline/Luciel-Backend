@@ -140,6 +140,7 @@ async def test_paused_instance_no_handling_speaks_unavailable_no_llm():
             stt=EchoSpeechToText(),
             tts=EchoTextToSpeech(),
             router=LLMRouter(primary=boom, fallback=boom),
+            has_payment_method=False,
         )
         assert result.paused is True
         assert result.spoken_text == VOICE_UNAVAILABLE_REPLY
@@ -165,6 +166,7 @@ async def test_stt_failure_degrades_to_apology_and_handoff():
             stt=EchoSpeechToText(raise_error=True),
             tts=EchoTextToSpeech(),
             router=_router(),
+            has_payment_method=False,
         )
         assert result.stt_failed is True
         assert "<Hangup/>" in result.twiml
@@ -220,6 +222,7 @@ async def test_normal_turn_runs_through_orchestrator_and_speaks_reply():
             stt=EchoSpeechToText(),
             tts=EchoTextToSpeech(),
             router=_router(),
+            has_payment_method=False,
         )
         assert result.paused is False and result.stt_failed is False
         assert result.spoken_text  # a spoken reply was produced

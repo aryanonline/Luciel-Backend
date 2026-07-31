@@ -274,7 +274,7 @@ class Settings(BaseSettings):
         # past both of them and booted live with a forgeable session key. Every
         # overlay below is already written as `blob.get(...)`, so an empty mapping is
         # a no-op for them; only the guards change behaviour.
-        blob = parse_platform_secret(self.platform_secret)
+        blob = parse_platform_secret(self.platform_secret, live=self.integration_mode == "live")
         # blob key -> settings attribute. Only platform-owned APP credentials.
         # NOTE: the dict VALUES are Pydantic field NAMES (not secret values); bandit's
         # B105 heuristic flags the name strings ending in secret/token/key, hence the
@@ -461,12 +461,23 @@ class Settings(BaseSettings):
             )
 
 
-def parse_platform_secret(raw: str) -> dict[str, str]:
+class PlatformSecretError(RuntimeError):
+    """The platform secret blob exists but could not be read (live mode only)."""
+
+
+def parse_platform_secret(raw: str, *, live: bool = False) -> dict[str, str]:
     """Parse the LUCIEL_PLATFORM_SECRET JSON blob into a flat str->str mapping.
 
     The blob is injected from AWS Secrets Manager and holds the platform LLM
     keys (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY). Returns an empty dict for the
-    "{}" placeholder or any unparsable/empty input so "mock" mode never faults.
+    "{}" placeholder or any empty input so "mock" mode never faults.
+
+    MALFORMED input (P2-12) is different from ABSENT input. A truncated or
+    corrupted blob silently disabled every platform credential at once — the LLM
+    keys, the Stripe secret, the OAuth app clients — and the only trace was one
+    warning line. Downstream that reads as "not configured", which every seam is
+    built to degrade past quietly. In live mode a blob we cannot read is a boot
+    failure, not a degradation.
 
     SECURITY: the parsed values are credentials — this function NEVER logs them.
     On a parse error it logs only the failure fact, not the input (Space
@@ -477,9 +488,19 @@ def parse_platform_secret(raw: str) -> dict[str, str]:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         # Never log ``raw`` — it may contain secret material.
+        if live:
+            raise PlatformSecretError(
+                "LUCIEL_PLATFORM_SECRET is not valid JSON — refusing to start in live mode. "
+                "Treating it as empty would silently disable every platform credential."
+            ) from None
         logger.warning("LUCIEL_PLATFORM_SECRET is not valid JSON; treating as empty")
         return {}
     if not isinstance(parsed, dict):
+        if live:
+            raise PlatformSecretError(
+                "LUCIEL_PLATFORM_SECRET did not decode to a JSON object — refusing to start "
+                "in live mode."
+            )
         logger.warning("LUCIEL_PLATFORM_SECRET did not decode to an object; treating as empty")
         return {}
     return {str(k): str(v) for k, v in parsed.items()}

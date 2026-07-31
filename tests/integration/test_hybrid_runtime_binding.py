@@ -81,6 +81,7 @@ async def test_orchestrator_loop_with_real_retriever_returns_grounded_content():
             admin_id=admin,
             instance_id=iid,
             enabled_channels={"widget"},
+            has_payment_method=False,
         )
         result = await orch.run_turn(
             session_id=sid,

@@ -487,7 +487,7 @@ def _build_test_gateway() -> RealStripeGateway:
     from app.config import get_settings, parse_platform_secret  # noqa: PLC0415
 
     settings = get_settings()
-    secret = parse_platform_secret(settings.platform_secret)
+    secret = parse_platform_secret(settings.platform_secret, live=True)
     secret_key = secret.get("STRIPE_TEST_SECRET_KEY", "")
     publishable_key = secret.get("STRIPE_TEST_PUBLISHABLE_KEY", "")
     webhook_secret = secret.get("STRIPE_TEST_WEBHOOK_SECRET", "")

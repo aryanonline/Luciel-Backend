@@ -8,8 +8,11 @@ which parses to an empty mapping. So the exact configuration the guards exist to
 (live mode, secret never provisioned) was the one configuration that skipped them: the
 service booted live with a forgeable session key and a forgeable billing webhook.
 
-``parse_platform_secret`` also returns ``{}`` for whitespace and for unparsable JSON, so
-those inputs took the same shortcut.
+``parse_platform_secret`` also returned ``{}`` for whitespace and for unparsable JSON, so
+those inputs took the same shortcut. P2-12 has since split those two cases apart: an
+ABSENT secret still parses to an empty blob and falls through to the guards below, but a
+MALFORMED one is refused on the spot in live mode — reading it as "not provisioned"
+silently disabled every platform credential at once behind a single warning line.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from app.config import Settings
+from app.config import PlatformSecretError, Settings
 
 from tests.unit.live_settings import REQUIRED_IN_LIVE_MODE
 
@@ -30,13 +33,32 @@ _GUARDED_ELSEWHERE = ("JWT_SIGNING_KEY", "STRIPE_WEBHOOK_SECRET")
 OTHER_REQUIRED = {k: v for k, v in REQUIRED_IN_LIVE_MODE.items() if k not in _GUARDED_ELSEWHERE}
 
 # Every input that parses to an empty blob, i.e. every way of saying "not provisioned".
-EMPTY_BLOBS = ["{}", "", "   ", "\n\t ", "not json at all", "[]", "null"]
+EMPTY_BLOBS = ["{}", "", "   ", "\n\t "]
+# Inputs that are not a readable JSON object. "Cannot be read" is a different condition
+# from "was never set", and P2-12 gives it its own, earlier refusal.
+MALFORMED_BLOBS = ["not json at all", "[]", "null", '{"truncated": ']
 
 
 @pytest.mark.parametrize("blob", EMPTY_BLOBS)
 def test_live_mode_refuses_to_boot_on_an_empty_platform_secret(blob: str):
     with pytest.raises(RuntimeError, match="JWT_SIGNING_KEY"):
         Settings(integration_mode="live", platform_secret=blob)
+
+
+@pytest.mark.parametrize("blob", MALFORMED_BLOBS)
+def test_live_mode_refuses_to_boot_on_a_malformed_platform_secret(blob: str):
+    """P2-12: fail on the blob itself rather than on whichever guard below happens to
+    notice a credential missing. The operator needs to be told the secret is corrupt,
+    not that one key inside it looks unset."""
+    with pytest.raises(PlatformSecretError, match="LUCIEL_PLATFORM_SECRET"):
+        Settings(integration_mode="live", platform_secret=blob)
+
+
+@pytest.mark.parametrize("blob", MALFORMED_BLOBS)
+def test_mock_mode_still_tolerates_a_malformed_platform_secret(blob: str):
+    """CI and local dev never provision a real blob, so a corrupt one stays a warning
+    there — the fail-closed behaviour is live-mode only."""
+    assert Settings(integration_mode="mock", platform_secret=blob).integration_mode == "mock"
 
 
 def test_live_mode_still_refuses_when_only_the_jwt_key_is_provisioned():

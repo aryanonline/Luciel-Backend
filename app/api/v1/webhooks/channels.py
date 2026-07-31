@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import json
 from email import message_from_bytes
 from email import policy as email_policy
@@ -173,7 +174,10 @@ async def meta_verify(request: Request) -> Response:
     mode = q.get("hub.mode")
     token = q.get("hub.verify_token")
     challenge = q.get("hub.challenge", "")
-    if mode == "subscribe" and token and token == settings.meta_verify_token:
+    # compare_digest, not ``==`` (P2-11): the byte-by-byte early exit of a plain compare
+    # leaks the token prefix to a caller who can time this endpoint. The ``and token``
+    # guard stays — it is what stops an unset secret matching an omitted parameter.
+    if mode == "subscribe" and token and hmac.compare_digest(token, settings.meta_verify_token):
         return Response(content=challenge, media_type="text/plain")
     return Response(content="forbidden", status_code=403, media_type="text/plain")
 

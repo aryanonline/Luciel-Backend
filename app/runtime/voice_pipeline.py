@@ -148,7 +148,9 @@ async def handle_turn(
     stt: SpeechToText,
     tts: TextToSpeech,
     router: LLMRouter,
-    has_payment_method: bool = False,
+    # Undefaulted for the same reason as Orchestrator.has_payment_method (P2-5): a
+    # forgotten kwarg must be a TypeError, not a silently capped paying caller.
+    has_payment_method: bool,
 ) -> VoiceTurnResult:
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
     # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.

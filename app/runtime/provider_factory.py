@@ -51,7 +51,7 @@ def _build_live_router(settings: Settings, *, admin_id: uuid.UUID | None) -> LLM
     # Imported lazily so the mock path never imports the SDK-backed providers.
     from app.runtime.providers import AnthropicProvider, OpenAIProvider  # noqa: PLC0415
 
-    secret = parse_platform_secret(settings.platform_secret)
+    secret = parse_platform_secret(settings.platform_secret, live=True)
     anthropic_key = secret.get("ANTHROPIC_API_KEY", "")
     openai_key = secret.get("OPENAI_API_KEY", "")
     if not anthropic_key or not openai_key:
@@ -127,7 +127,7 @@ def _build_live_speech_providers(settings: Settings) -> tuple[object, object]:
         WhisperSpeechToText,
     )
 
-    secret = parse_platform_secret(settings.platform_secret)
+    secret = parse_platform_secret(settings.platform_secret, live=True)
     openai_key = secret.get("OPENAI_API_KEY", "")
     elevenlabs_key = secret.get("ELEVENLABS_API_KEY", "")
     if not openai_key or not elevenlabs_key:
