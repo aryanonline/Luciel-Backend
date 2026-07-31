@@ -411,6 +411,26 @@ def is_valid_provider(connection_type: str, provider: str) -> bool:
     return spec is not None and spec.connection_type == connection_type
 
 
+def oauth_client_label(provider: str) -> str:
+    """The OAuth APP this provider authenticates against, e.g. ``google``, ``salesforce``.
+
+    Providers that share one registered OAuth app share a label — Drive and Calendar are
+    two scopes on the SAME Google client (§3.8), so both resolve to ``google``. That is
+    also why they share one redirect URI, and therefore why the provider segment of the
+    callback path is the client label and NOT the provider id. Derived from the settings
+    field name so a new provider needs no entry here.
+
+    Returns "" for unregistered/non-OAuth providers."""
+    spec = get_provider(provider)
+    setting = spec.client_id_setting if spec is not None else None
+    if not setting:
+        return ""
+    for suffix in ("_client_id", "_consumer_key"):
+        if setting.endswith(suffix):
+            return setting[: -len(suffix)]
+    return setting
+
+
 def oauth_client_config(provider: str) -> OAuthClientConfig:
     """Read a provider's OAuth app registration from settings via the registry.
 

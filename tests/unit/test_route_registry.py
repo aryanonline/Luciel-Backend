@@ -125,6 +125,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/billing"),
         ("POST", "/api/v1/billing/checkout"),
         ("DELETE", "/api/v1/billing/payment-method"),
+        # The providers' registered OAuth redirect target (§3.8) — public by necessity,
+        # authorized by the signed single-use state, answers only in 3xx.
+        ("GET", "/api/v1/connections/{client}/callback"),
         # webhooks
         ("POST", "/api/v1/webhooks/stripe"),
         ("POST", "/api/v1/webhooks/twilio/sms"),
@@ -166,14 +169,18 @@ def test_all_include_router_routes_are_registered() -> None:
 @pytest.mark.parametrize(("method", "path"), sorted(EXPECTED_ROUTES))
 def test_every_route_resolves_not_404(method: str, path: str) -> None:
     """Each registered path must actually route (never 404). Path params get dummy
-    values; the route may answer 401/422/405, but a 404 means it is unmounted."""
-    client = TestClient(create_app())
+    values; the route may answer 401/422/405, but a 404 means it is unmounted.
+
+    Redirects are NOT followed: the OAuth callback answers 3xx pointing at the frontend
+    origin, which this ASGI client would chase back into the API app and 404 on."""
+    client = TestClient(create_app(), follow_redirects=False)
     concrete = path.format(
         source_id="00000000-0000-0000-0000-000000000000",
         connection_id="00000000-0000-0000-0000-000000000000",
         session_id="00000000-0000-0000-0000-000000000000",
         message_id="00000000-0000-0000-0000-000000000000",
         lead_id="00000000-0000-0000-0000-000000000000",
+        client="google",
     )
     response = client.request(method, concrete)
     assert response.status_code != 404, f"{method} {concrete} is not routed (404)"

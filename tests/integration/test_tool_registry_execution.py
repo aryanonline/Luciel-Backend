@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.db.session import tenant_session
@@ -43,6 +44,7 @@ async def _seed(
     authorize: list[str] | None = None,
     channels: list[dict[str, object]] | None = None,
     connections: list[str] | None = None,
+    connection_providers: dict[str, str] | None = None,
 ) -> uuid.UUID:
     async with tenant_session(admin) as s:
         s.add(
@@ -84,7 +86,7 @@ async def _seed(
                     instance_id=iid,
                     connection_type=conn_type,
                     auth_class="api_key",
-                    provider="platform",
+                    provider=(connection_providers or {}).get(conn_type, "platform"),
                     status="connected",
                     # BYO (§3.1.4): an sms_sender with no designated number has nothing to
                     # send FROM, so the tool correctly refuses. Seed the designation.
@@ -427,6 +429,93 @@ async def test_unimplemented_backend_is_failed_never_empty() -> None:
         # The catalog's own except-wrapper names the exception type — diagnostic and
         # non-secret, and unmistakably not a claim about the calendar's contents.
         assert res.reason == "calendar_error: BackendNotConnected"
+
+
+async def _seed_calendar(admin: uuid.UUID, provider: str, *, with_token: bool = True) -> uuid.UUID:
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    iid = await _seed(
+        admin,
+        authorize=["book_appointment"],
+        connections=["calendar"],
+        connection_providers={"calendar": provider},
+    )
+    if with_token:
+        await get_secret_store().put(
+            secret_ref_for(admin, iid, "calendar"), {"access_token": f"tok-{admin}"}
+        )
+    return iid
+
+
+def _future_slot() -> str:
+    start = (datetime.now(UTC) + timedelta(days=3)).replace(
+        hour=10, minute=0, second=0, microsecond=0
+    )
+    return f"{start.isoformat()}/{(start + timedelta(minutes=30)).isoformat()}"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_google_calendar_connection_gets_the_real_booking_backend() -> None:
+    """build_tool takes only a tool_id, so the backend is chosen from the tenant's
+    connected calendar PROVIDER at call time. Google resolves to the real backend."""
+    from app.tools.calendar_backend import InMemoryCalendarApi
+
+    InMemoryCalendarApi.reset()
+    admin = uuid.uuid4()
+    iid = await _seed_calendar(admin, "google_calendar")
+    tool = build_tool("book_appointment")
+    assert tool is not None
+
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool,
+            {"slot": _future_slot(), "email": "lead@example.com"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+    assert res.outcome is Outcome.ok, res.reason
+    assert res.payload["bookingRef"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_calendly_stays_honestly_unavailable() -> None:
+    """No Calendly OAuth client is registered yet, so a Calendly calendar must keep
+    failing cleanly rather than borrowing the Google backend and booking nowhere."""
+    admin = uuid.uuid4()
+    iid = await _seed_calendar(admin, "calendly")
+    tool = build_tool("book_appointment")
+    assert tool is not None
+
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool,
+            {"slot": _future_slot(), "email": "lead@example.com"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+    assert res.outcome is Outcome.failed
+    assert res.reason == "calendar_error: BackendNotConnected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_google_calendar_without_a_stored_token_is_failed_never_empty() -> None:
+    from app.tools.calendar_backend import InMemoryCalendarApi
+
+    InMemoryCalendarApi.reset()
+    admin = uuid.uuid4()
+    iid = await _seed_calendar(admin, "google_calendar", with_token=False)
+    tool = build_tool("book_appointment")
+    assert tool is not None
+
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool,
+            {"slot": _future_slot(), "email": "lead@example.com"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+    assert res.outcome is Outcome.failed
+    assert res.reason == "calendar_error: CalendarUnavailable"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

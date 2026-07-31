@@ -97,6 +97,7 @@ def create_app() -> FastAPI:
     from app.api.v1.auth import router as auth_router
     from app.api.v1.billing import router as billing_router
     from app.api.v1.chat_widget import router as chat_widget_router
+    from app.api.v1.connections_callback import router as connections_callback_router
     from app.api.v1.dashboard import router as dashboard_router
     from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
@@ -107,6 +108,9 @@ def create_app() -> FastAPI:
     app.include_router(account_router)
     # Connections layer: one model for every external dependency (§3.8).
     app.include_router(connections_router)
+    # The providers' registered OAuth redirect target: unauthenticated by necessity
+    # (a provider-driven browser navigation), authorized by the signed single-use state.
+    app.include_router(connections_callback_router)
     # Control plane: dashboard conversations/leads (cookie-authed, §3.4).
     app.include_router(dashboard_router)
     # Data plane: embeddable widget — ZERO admin surface (§1.2, §6.3).

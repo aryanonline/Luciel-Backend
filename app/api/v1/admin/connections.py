@@ -403,48 +403,56 @@ async def switch_connection(
         return StartConnectionResult.model_validate(result)
 
 
-@router.post("/{connection_id}/oauth-callback", response_model=ConnectionOut)
-async def oauth_callback(
-    connection_id: uuid.UUID,
-    req: OAuthCallbackRequest,
-    subject: Subject = Depends(current_admin),
-) -> ConnectionOut:
-    """Complete an OAuth connect for any registry provider (Decisions #5/#7).
+class OAuthStateRejected(Exception):
+    """The returned ``state`` is missing, forged, expired, or for another attempt."""
 
-    Knowledge sync had its own callback; the Meta channels (and every future OAuth
-    provider on a non-knowledge connection type) had none, so a `channel_auth` connect
-    could reach a consent screen but never leave ``unconfigured``. This is the generic
-    half: the token endpoint, PKCE posture, and secret-ref convention all come from the
-    registry, so the route needs no per-provider branch.
+
+class OAuthExchangeRejected(Exception):
+    """The provider refused the code, or its token endpoint was unreachable."""
+
+
+async def complete_oauth_connect(
+    *,
+    admin_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None,
+    connection_id: uuid.UUID,
+    code: str,
+    state: str | None,
+) -> ConnectionOut:
+    """Redeem an authorization code and mark the connection connected (Decisions #5/#7).
+
+    The provider-agnostic half of the connect flow, shared by BOTH callback surfaces:
+    the admin-authed ``POST .../oauth-callback`` (frontend-mediated) and the browser
+    ``GET /api/v1/connections/{client}/callback`` the provider itself redirects to. The
+    token endpoint, PKCE posture, and secret-ref convention all come from the registry,
+    so there is no per-provider branch.
 
     ``state`` is MANDATORY and single-use (§5.1): it is read-and-cleared BEFORE the
     exchange, so a replayed callback finds no live attempt to ride. Without that check
-    the endpoint would redeem a code obtained by any site that could drive the admin's
-    browser here — CSRF straight into a tenant's connection.
+    this would redeem a code obtained by any site that could drive the admin's browser
+    here — CSRF straight into a tenant's connection.
 
     The exchange runs BETWEEN two committed transactions rather than inside one. The
     single transaction it replaces rolled back on any failure, which silently undid both
     the state consumption (so a burnt state came back to life) and the recorded reason —
-    leaving the owner staring at a 409 and a connection that claimed nothing was wrong.
-
-    A rejected code surfaces as a clean 409, never a crash.
+    leaving the owner staring at an error and a connection that claimed nothing was wrong.
     """
-    async with tenant_session(subject.admin_id) as s:
-        conn = await _tenant_connection(s, subject.admin_id, connection_id)
+    async with tenant_session(admin_id) as s:
+        conn = await _tenant_connection(s, admin_id, connection_id)
         spec = registry.get_provider(conn.provider)
         if spec is None or not spec.is_oauth:
-            raise validation_error(
+            raise OAuthStateRejected(
                 f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
             )
         provider = conn.provider
         connection_type = conn.connection_type
-        instance_id = await _instance_id(s, subject.admin_id)
+        instance_id = await _instance_id(s, admin_id)
         expected_jti = service.consume_oauth_state(conn)
         state_rejected = None
         try:
             oauth_flow.verify_state(
-                req.state,
-                admin_id=subject.admin_id,
+                state,
+                admin_id=admin_id,
                 connection_id=conn.connection_id,
                 expected_jti=expected_jti,
             )
@@ -453,7 +461,7 @@ async def oauth_callback(
         # Commit the consumption either way: a state that has been offered once is spent,
         # whether or not it verified.
     if state_rejected is not None:
-        raise validation_error(state_rejected)
+        raise OAuthStateRejected(state_rejected)
 
     authorize = spec.authorize
     verifier = (
@@ -465,38 +473,38 @@ async def oauth_callback(
         try:
             material = await exchange_code_for_token(
                 provider,
-                code=req.code,
+                code=code,
                 transport=cast("HttpTransport", transport),
                 code_verifier=verifier,
             )
         except OAuthExchangeError as exc:
-            await service.record_exchange_failure(subject.admin_id, connection_id, str(exc))
-            raise conflict(f"OAuth token exchange failed: {exc}") from exc
+            await service.record_exchange_failure(admin_id, connection_id, str(exc))
+            raise OAuthExchangeRejected(f"OAuth token exchange failed: {exc}") from exc
         except ProviderUnavailable as exc:
-            await service.record_exchange_failure(subject.admin_id, connection_id, str(exc))
-            raise conflict(str(exc)) from exc
+            await service.record_exchange_failure(admin_id, connection_id, str(exc))
+            raise OAuthExchangeRejected(str(exc)) from exc
 
     # The token is durable before the row claims to be connected, so a crash in between
     # leaves a retryable "not connected yet" rather than a connection with no credential.
     await store_oauth_token(
         get_secret_store(),
-        admin_id=subject.admin_id,
+        admin_id=admin_id,
         instance_id=instance_id,
         material=material,
         connection_type=connection_type,
     )
-    async with tenant_session(subject.admin_id) as s:
-        conn = await _tenant_connection(s, subject.admin_id, connection_id)
+    async with tenant_session(admin_id) as s:
+        conn = await _tenant_connection(s, admin_id, connection_id)
         old_status = conn.status
         conn.status = "connected"
         conn.status_detail = None
         await s.flush()
         await audit.emit(
             s,
-            admin_id=subject.admin_id,
+            admin_id=admin_id,
             instance_id=instance_id,
             actor_type=ActorType.admin_user,
-            actor_user_id=subject.user_id,
+            actor_user_id=actor_user_id,
             event_type="connection_status_changed",
             payload={
                 "connection_id": str(conn.connection_id),
@@ -506,6 +514,31 @@ async def oauth_callback(
             },
         )
         return _connection_out(conn)
+
+
+@router.post("/{connection_id}/oauth-callback", response_model=ConnectionOut)
+async def oauth_callback(
+    connection_id: uuid.UUID,
+    req: OAuthCallbackRequest,
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Complete an OAuth connect for any registry provider (Decisions #5/#7).
+
+    A rejected state surfaces as a clean 422 and a rejected code as a clean 409, never
+    a crash. See ``complete_oauth_connect`` for the flow this wraps.
+    """
+    try:
+        return await complete_oauth_connect(
+            admin_id=subject.admin_id,
+            actor_user_id=subject.user_id,
+            connection_id=connection_id,
+            code=req.code,
+            state=req.state,
+        )
+    except OAuthStateRejected as exc:
+        raise validation_error(str(exc)) from exc
+    except OAuthExchangeRejected as exc:
+        raise conflict(str(exc)) from exc
 
 
 @router.put("/{connection_id}/destination", response_model=ConnectionOut)

@@ -125,6 +125,50 @@ def verify_state(
 
 
 @dataclass(frozen=True)
+class StateClaims:
+    """Who a signed ``state`` says the attempt belongs to."""
+
+    admin_id: uuid.UUID
+    instance_id: uuid.UUID
+    connection_id: uuid.UUID
+    provider: str
+    jti: str
+
+
+def decode_state(state: str | None) -> StateClaims:
+    """Recover (admin, instance, connection, provider) from a signature-verified state.
+
+    The GET callback is reached by the PROVIDER redirecting the browser to a fixed
+    redirect URI, so the URL carries no connection id and no admin session is required
+    to be present. The signed state is therefore the only thing that can say which
+    attempt this is — which is safe precisely because it is signed with the platform
+    key and short-lived.
+
+    This establishes IDENTITY only. It is not sufficient authorization: the caller must
+    still ``verify_state`` against the jti parked on the row, which is what makes the
+    state single-use. Raises ``StateRejected``."""
+    if not state:
+        raise StateRejected("Missing OAuth state.")
+    s = get_settings()
+    try:
+        claims = jwt.decode(state, s.jwt_signing_key, algorithms=[s.jwt_algorithm])
+    except jwt.PyJWTError as exc:
+        raise StateRejected("Invalid or expired OAuth state.") from exc
+    if claims.get("typ") != STATE_TOKEN_TYPE:
+        raise StateRejected("Wrong token type for OAuth state.")
+    try:
+        return StateClaims(
+            admin_id=uuid.UUID(str(claims["sub"])),
+            instance_id=uuid.UUID(str(claims["iid"])),
+            connection_id=uuid.UUID(str(claims["cid"])),
+            provider=str(claims["prv"]),
+            jti=str(claims["jti"]),
+        )
+    except (KeyError, ValueError) as exc:
+        raise StateRejected("Malformed OAuth state.") from exc
+
+
+@dataclass(frozen=True)
 class AuthorizeStart:
     """What ``start_connection`` needs to persist + return for one connect attempt.
 

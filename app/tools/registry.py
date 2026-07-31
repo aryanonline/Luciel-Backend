@@ -11,12 +11,16 @@ Functional today (a real effect, no external OAuth needed):
   * ``send_email``        — Amazon SES via ``build_email_sender`` (Null in mock/CI).
   * ``send_sms``          — Twilio via ``build_sms_sender`` (Null in mock/CI).
 
+Connection-backed (a real effect once the tenant has completed the OAuth connect):
+  * the four scheduling tools — Google Calendar via ``_TenantCalendarBackend``, which
+    picks the backend from the tenant's connected calendar provider at call time.
+
 Connection-gated (dispatch path is correct; the effect needs an OAuth backend that
 does not exist yet, so they resolve to a Tool and fail cleanly rather than silently):
-  * ``check_availability`` / ``book_appointment`` — calendar (Calendly / Google).
-  * ``lookup_record``                            — admin-connected record source.
-  * ``push_to_crm``                              — HubSpot / Salesforce.
-  * ``bring_your_own_webhook``                   — admin-registered HTTP endpoint.
+  * the scheduling tools on a CALENDLY connection — no registered OAuth client yet.
+  * ``lookup_record``          — admin-connected record source.
+  * ``push_to_crm``            — HubSpot / Salesforce.
+  * ``bring_your_own_webhook`` — admin-registered HTTP endpoint.
 
 For the connection-gated set the broker's gate 3 refuses first (the connection can
 never reach ``connected`` without a real OAuth flow), so the unimplemented backend is
@@ -34,7 +38,7 @@ from typing import Any
 from app.channels.twilio_sender import build_sms_sender
 from app.connections import sandbox
 from app.notifications.email_sender import build_email_sender
-from app.tools import catalog
+from app.tools import calendar_backend, catalog
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
 
@@ -50,6 +54,14 @@ CONNECTION_GATED_TOOL_IDS = frozenset(
         "bring_your_own_webhook",
     }
 )
+
+
+_CALENDAR_TOOLS: dict[str, Callable[[Any], Tool]] = {
+    "check_availability": catalog.CheckAvailabilityTool,
+    "book_appointment": catalog.BookAppointmentTool,
+    "reschedule_appointment": catalog.RescheduleAppointmentTool,
+    "cancel_appointment": catalog.CancelAppointmentTool,
+}
 
 
 class BackendNotConnected(RuntimeError):
@@ -92,6 +104,65 @@ class _UnavailableExternalBackend:
         self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
     ) -> str | None:
         raise BackendNotConnected("crm_backend_unavailable")
+
+
+class _TenantCalendarBackend:
+    """Dispatches the calendar tools on the PROVIDER the tenant actually connected.
+
+    ``build_tool`` takes only a tool_id, so which calendar a tool talks to cannot be
+    decided at construction — it is a per-tenant fact read from the connection row at
+    call time. Google Calendar gets the real backend; Calendly has no registered OAuth
+    client yet, so it keeps raising and stays honestly unavailable rather than
+    pretending to book into a calendar we cannot reach.
+    """
+
+    def __init__(self) -> None:
+        self._unavailable = _UnavailableExternalBackend()
+        self._google: calendar_backend.GoogleCalendarBackend | None = None
+
+    async def _for(self, ctx: ToolContext) -> Any:
+        if await self._calendar_provider(ctx) != "google_calendar":
+            return self._unavailable
+        if self._google is None:
+            self._google = calendar_backend.GoogleCalendarBackend()
+        return self._google
+
+    @staticmethod
+    async def _calendar_provider(ctx: ToolContext) -> str | None:
+        if ctx.session is None:
+            return None
+        from sqlalchemy import select  # noqa: PLC0415 — keeps import cost off module load
+
+        from app.models.connection import InstanceConnection  # noqa: PLC0415
+
+        return (
+            await ctx.session.execute(
+                select(InstanceConnection.provider).where(
+                    InstanceConnection.admin_id == ctx.admin_id,
+                    InstanceConnection.instance_id == ctx.instance_id,
+                    InstanceConnection.connection_type == "calendar",
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def free_busy(self, ctx: ToolContext, window: str) -> list[str]:
+        return await (await self._for(ctx)).free_busy(ctx, window)
+
+    async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
+        return await (await self._for(ctx)).book(ctx, slot, email)
+
+    async def find_bookings(
+        self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
+    ) -> list[dict[str, Any]]:
+        return await (await self._for(ctx)).find_bookings(ctx, email=email, booking_ref=booking_ref)
+
+    async def reschedule(
+        self, ctx: ToolContext, booking_ref: str, slot: str
+    ) -> dict[str, Any] | None:
+        return await (await self._for(ctx)).reschedule(ctx, booking_ref, slot)
+
+    async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
+        return await (await self._for(ctx)).cancel(ctx, booking_ref)
 
 
 class _EmailMessengerBackend:
@@ -206,14 +277,8 @@ def build_tool(tool_id: str) -> Tool | None:
         return catalog.SendEmailTool(_EmailMessengerBackend())
     if tool_id == "send_sms":
         return catalog.SendSmsTool(_SmsMessengerBackend())
-    if tool_id == "check_availability":
-        return catalog.CheckAvailabilityTool(unavailable)
-    if tool_id == "book_appointment":
-        return catalog.BookAppointmentTool(unavailable)
-    if tool_id == "reschedule_appointment":
-        return catalog.RescheduleAppointmentTool(unavailable)
-    if tool_id == "cancel_appointment":
-        return catalog.CancelAppointmentTool(unavailable)
+    if tool_id in _CALENDAR_TOOLS:
+        return _CALENDAR_TOOLS[tool_id](_TenantCalendarBackend())
     if tool_id == "lookup_record":
         return catalog.LookupRecordTool(unavailable)
     if tool_id == "push_to_crm":
