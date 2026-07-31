@@ -32,12 +32,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.billing import BillingAccount
-from app.models.budget import ConversationBudget
+from app.models.budget import ConversationBudget, CountedSession
 
 
 def current_billing_period_start(now: datetime | None = None) -> date:
@@ -97,17 +98,15 @@ class BudgetState:
 async def _get_or_create_row(
     session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID, period: date
 ) -> ConversationBudget:
-    row = (
-        await session.execute(
-            select(ConversationBudget).where(
-                ConversationBudget.admin_id == admin_id,
-                ConversationBudget.instance_id == instance_id,
-                ConversationBudget.billing_period_start == period,
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        row = ConversationBudget(
+    """The period's counter row, created if this is the tenant's first conversation.
+
+    ON CONFLICT DO NOTHING rather than SELECT-then-INSERT: two concurrent
+    first-conversations of a period both used to INSERT, and the loser violated
+    ``uq_budget_period`` — a 500 on a real customer's message.
+    """
+    await session.execute(
+        pg_insert(ConversationBudget)
+        .values(
             id=uuid.uuid4(),
             admin_id=admin_id,
             instance_id=instance_id,
@@ -115,9 +114,17 @@ async def _get_or_create_row(
             counted_conversations=0,
             counted_session_ids=[],
         )
-        session.add(row)
-        await session.flush()
-    return row
+        .on_conflict_do_nothing(index_elements=["admin_id", "instance_id", "billing_period_start"])
+    )
+    return (
+        await session.execute(
+            select(ConversationBudget).where(
+                ConversationBudget.admin_id == admin_id,
+                ConversationBudget.instance_id == instance_id,
+                ConversationBudget.billing_period_start == period,
+            )
+        )
+    ).scalar_one()
 
 
 async def check_budget(
@@ -156,16 +163,41 @@ async def count_session_once(
     already counted. Called at the fire-once trigger: the first model call, or a
     human-controlled handoff before any model call. Write-through to the Postgres
     source of truth happens here (synchronously, before serving).
+
+    Postgres decides who counted, not Python. The insert into ``counted_sessions``
+    either wins the unique constraint or does nothing, and the increment is a single
+    ``SET n = n + 1``. Reading the list, testing membership and writing back raced on
+    both halves: concurrent turns on one session double-counted and clobbered each
+    other's session ids, and concurrent turns on different sessions lost an increment
+    outright.
     """
     period = await resolve_billing_period_start(session, admin_id=admin_id)
-    row = await _get_or_create_row(
-        session, admin_id=admin_id, instance_id=instance_id, period=period
+    await _get_or_create_row(session, admin_id=admin_id, instance_id=instance_id, period=period)
+
+    claimed = await session.execute(
+        pg_insert(CountedSession)
+        .values(
+            id=uuid.uuid4(),
+            admin_id=admin_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            billing_period_start=period,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["admin_id", "instance_id", "session_id", "billing_period_start"]
+        )
     )
-    sid = str(session_id)
-    if sid in row.counted_session_ids:
+    if claimed.rowcount == 0:  # another turn already counted this session
         return False
-    # JSONB mutable column: reassign so SQLAlchemy detects the change.
-    row.counted_session_ids = [*row.counted_session_ids, sid]
-    row.counted_conversations += 1
+
+    await session.execute(
+        update(ConversationBudget)
+        .where(
+            ConversationBudget.admin_id == admin_id,
+            ConversationBudget.instance_id == instance_id,
+            ConversationBudget.billing_period_start == period,
+        )
+        .values(counted_conversations=ConversationBudget.counted_conversations + 1)
+    )
     await session.flush()
     return True

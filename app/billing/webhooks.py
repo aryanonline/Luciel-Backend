@@ -31,7 +31,7 @@ from app.billing.metering import get_or_create_billing_account
 from app.billing.stripe_gateway import StripeEvent
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount
-from app.models.budget import ConversationBudget
+from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.notifications import notifier as notify
 
@@ -99,6 +99,9 @@ async def _on_invoice_paid(
     # Counter reset, NO rollover (§3.4.1b): drop the tenant's budget rows so the
     # new period starts at zero. The counter is the source of truth (budget.py).
     await session.execute(delete(ConversationBudget).where(ConversationBudget.admin_id == admin_id))
+    # The fire-once guard is keyed on the period too, so its rows are spent along with
+    # the counter they guarded — leaving them would only accumulate.
+    await session.execute(delete(CountedSession).where(CountedSession.admin_id == admin_id))
 
     # A successful payment clears any dunning sequence (CJ §6).
     prev_dunning = account.dunning_state

@@ -47,6 +47,36 @@ class ConversationBudget(Base, TenantMixin, TimestampMixin):
     # Conversations counted this period (free + billed). The budget unit is
     # conversations, not LLM calls (§3.4.1b).
     counted_conversations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Session ids already counted, for the fire-once idempotency guard (§3.4.1b
-    # Counter precision). JSONB list — small per period; full metering store is Arc 18.
+    # Superseded by the counted_sessions table as the fire-once guard: a JSONB list can
+    # only be updated by read-modify-write, so two concurrent turns on one session both
+    # saw the id absent and both counted. Retained because it is the historical record of
+    # which sessions were counted before that table existed.
     counted_session_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+
+
+class CountedSession(Base, TenantMixin, TimestampMixin):
+    """One row per conversation counted — the fire-once guard (§3.4.1b Counter precision).
+
+    The uniqueness of (admin_id, instance_id, session_id, billing_period_start) is what
+    makes the increment idempotent, and Postgres enforces it: the caller inserts with
+    ``ON CONFLICT DO NOTHING`` and the rowcount says whether this call is the one that
+    counted. Concurrency is then the database's problem rather than a lost update.
+    """
+
+    __tablename__ = "counted_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "admin_id",
+            "instance_id",
+            "session_id",
+            "billing_period_start",
+            name="uq_counted_session",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    billing_period_start: Mapped[date] = mapped_column(Date, nullable=False)

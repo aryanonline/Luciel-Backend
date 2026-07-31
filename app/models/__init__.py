@@ -7,7 +7,7 @@ Importing this package imports every model module so that:
 
 from app.models.audit import AdminAuditLog
 from app.models.billing import BillingAccount
-from app.models.budget import ConversationBudget
+from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.models.conversation import (
     EscalationEvent,
@@ -44,6 +44,7 @@ __all__ = [
     "EscalationEvent",
     "InstanceConnection",
     "ConversationBudget",
+    "CountedSession",
     "VoiceCallRecord",
     "DeferredAction",
 ]

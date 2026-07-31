@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, date, datetime
 
@@ -129,3 +130,84 @@ async def test_a_tenant_stripe_has_never_invoiced_falls_back_to_the_calendar_mon
             .all()
         )
         assert accounts == []  # the gate reads, it does not create
+
+
+# --- concurrency (P0-5) ----------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_concurrent_turns_on_one_session_count_it_exactly_once():
+    """Two turns of the same session racing must not bill the conversation twice.
+
+    The read-modify-write both saw the session id absent and both incremented; the
+    losing JSONB write also clobbered the winner's, so the id could go missing and the
+    session be counted a third time later. Separate transactions, so the guard has to be
+    the unique constraint rather than anything held in one session's identity map.
+    """
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def count() -> bool:
+        async with tenant_session(admin) as s:
+            return await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=sid
+            )
+
+    results = await asyncio.gather(*(count() for _ in range(5)), return_exceptions=True)
+    assert [r for r in results if isinstance(r, BaseException)] == []
+    assert sum(1 for r in results if r is True) == 1  # exactly one call counted
+
+    async with tenant_session(admin) as s:
+        state = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+    assert state.counted == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_concurrent_distinct_sessions_lose_no_increment():
+    """Ten sessions racing must total ten. Each used to read N and write N+1, so
+    overlapping turns silently collapsed into a single increment — under-billing."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+
+    async def count(sid: uuid.UUID) -> bool:
+        async with tenant_session(admin) as s:
+            return await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=sid
+            )
+
+    sids = [uuid.uuid4() for _ in range(10)]
+    results = await asyncio.gather(*(count(sid) for sid in sids), return_exceptions=True)
+    assert [r for r in results if isinstance(r, BaseException)] == []
+
+    async with tenant_session(admin) as s:
+        state = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+    assert state.counted == 10
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_concurrent_first_conversations_do_not_500_on_the_budget_row():
+    """Both first-conversations of a period used to INSERT the budget row and the loser
+    violated uq_budget_period — an unhandled IntegrityError on a customer's message."""
+    admin = uuid.uuid4()
+    iid = uuid.uuid4()
+
+    async def first_turn(sid: uuid.UUID) -> bool:
+        async with tenant_session(admin) as s:
+            return await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=sid
+            )
+
+    results = await asyncio.gather(
+        *(first_turn(uuid.uuid4()) for _ in range(4)), return_exceptions=True
+    )
+    assert [r for r in results if isinstance(r, BaseException)] == []
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(ConversationBudget).where(ConversationBudget.admin_id == admin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # one period row, not one per racing turn
