@@ -16,6 +16,17 @@ Routing (§3.5.3) is a flat per-signal map, not a chain walker — one account o
 Nothing here raises into the runtime: the customer's reply has already been sent and must
 never be blocked on admin notification (§3.5.4). An undeliverable notification is loud in
 the audit log (``escalation_delivery_failed`` with an actionable reason) rather than silent.
+
+Loud, however, is not the same as delivered. A transient SES or Twilio blip used to end
+the story here: one attempt per contact, an audit row nobody reads, and the CJ Phase 6
+promise — the owner hears about a hot lead without logging in — quietly broken (P1-6). A
+failure that could plausibly clear on its own is now handed to the rule-D deferred queue
+(§3.8.7), which retries it with backoff and, at the 24h TTL, records the terminal miss as
+``escalation_delivery_failed`` rather than letting it evaporate.
+
+The distinction the enqueue turns on is whether waiting could possibly help. A provider
+that refused this second may accept in ten minutes; an escalation config with no contact
+in it will look exactly the same tomorrow, so that one is reported once and not queued.
 """
 
 from __future__ import annotations
@@ -41,6 +52,9 @@ from app.schemas_api.luciel import EscalationContactWire
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_CHANNEL = "email"
+
+#: The deferred-queue ``action_type`` a retried escalation notification travels under.
+ESCALATION_RETRY_ACTION = "escalation_notification"
 
 
 @dataclass(frozen=True)
@@ -165,8 +179,15 @@ async def notify_escalation(
     signal: str,
     gate: str,
     score: float | None = None,
-) -> None:
-    """Notify the configured contact(s) that an escalation fired (§3.5.3)."""
+    queue_retry: bool = True,
+) -> bool:
+    """Notify the configured contact(s) that an escalation fired (§3.5.3).
+
+    Returns whether anything reached anyone. ``queue_retry=False`` is what the deferred
+    sweep passes when it is REPLAYING a queued notification: the queue already owns the
+    backoff, and a retry that re-enqueues on failure would fork a new 24h TTL on every
+    pass and never abandon.
+    """
     notification, inst, owner_email = await _build_notification(
         session,
         admin_id=admin_id,
@@ -199,7 +220,7 @@ async def notify_escalation(
         )
 
     if delivered:
-        return
+        return True
     # Nothing reached the configured contacts — fall back to the account owner (§3.5.4).
     if owner_email and ("email", owner_email) not in attempted:
         if await _deliver(
@@ -223,10 +244,12 @@ async def notify_escalation(
                     "configured_channel": routing.channel,
                 },
             )
-            return
+            return True
     if not attempted:
         # No contact anywhere, not even an owner email: record it as a failure so the
-        # gap is visible instead of an escalation that silently notified nobody.
+        # gap is visible instead of an escalation that silently notified nobody. NOT
+        # queued — an empty escalation config is not a transient condition, and retrying
+        # it for 24h would bury the real failures under noise nobody can act on.
         await audit.emit(
             session,
             admin_id=admin_id,
@@ -241,6 +264,55 @@ async def notify_escalation(
                 "failure_reason": "no_contact_configured",
             },
         )
+        return False
+
+    if queue_retry:
+        # Contacts existed and every send was refused — the provider blip case (P1-6).
+        from app.connections import deferred_queue
+
+        await deferred_queue.enqueue(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            action_type=ESCALATION_RETRY_ACTION,
+            connection_type=deferred_queue.PLATFORM_NOTIFICATION,
+            resolved_lead_id=resolved_lead_id,
+            payload={
+                "session_id": str(session_id),
+                "signal": signal,
+                "gate": gate,
+                "score": score,
+            },
+        )
+    return False
+
+
+async def replay_queued_notification(
+    session: AsyncSession,
+    action_payload: Mapping[str, object],
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+) -> bool:
+    """Re-run a notification the deferred queue is holding. Never re-enqueues."""
+    session_id = action_payload.get("session_id")
+    signal = action_payload.get("signal")
+    gate = action_payload.get("gate")
+    if not isinstance(session_id, str) or not isinstance(signal, str) or not isinstance(gate, str):
+        return False
+    score = action_payload.get("score")
+    return await notify_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=uuid.UUID(session_id),
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score if isinstance(score, (int, float)) else None,
+        queue_retry=False,
+    )
 
 
 async def notify_escalation_safely(

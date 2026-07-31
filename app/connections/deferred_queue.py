@@ -35,6 +35,7 @@ from app.connections import gate
 from app.models.audit import ActorType
 from app.models.deferred import DeferredAction
 from app.models.lead import Lead
+from app.notifications import escalation_dispatch
 
 _log = logging.getLogger(__name__)
 
@@ -45,6 +46,14 @@ MAX_AGE = timedelta(hours=24)
 # capped at BACKOFF_CAP. Deterministic so the sweep is testable without wall-clock sleeps.
 BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
+
+#: ``connection_type`` for work that rides a PLATFORM binding rather than one of the
+#: tenant's own connections — a retried escalation notification goes out over the
+#: platform's email/SMS sender, and no row in ``instance_connections`` describes it.
+#: Rule C says do not deliver blind through a connection known to be down; an item with
+#: no connection has nothing to consult, and gating it on an absent row would hold every
+#: such item at attempt 0 until its TTL abandoned it — the very failure this queue is for.
+PLATFORM_NOTIFICATION = "platform_notification"
 
 
 class Deliverer(Protocol):
@@ -57,12 +66,15 @@ class Deliverer(Protocol):
 
 
 class ChannelDeliverer:
-    """The scheduled sweep's ``Deliverer``: push the queued message on the lead's channel.
+    """The scheduled sweep's ``Deliverer``. Two kinds of thing sit in the queue:
 
-    Everything the queue holds today is a ``schedule_callback`` — the lead asked to be
-    contacted later — so delivery is exactly the outbound reply the runtime would have
-    sent live, through the same ``send_outbound_reply`` that owns each channel's quirks
-    and each tenant's own credentials.
+    * ``schedule_callback`` — the lead asked to be contacted later, so delivery is
+      exactly the outbound reply the runtime would have sent live, through the same
+      ``send_outbound_reply`` that owns each channel's quirks and each tenant's own
+      credentials;
+    * ``escalation_notification`` — a page to the ADMIN that no provider would accept
+      when it fired (P1-6), replayed against the routing config as it stands now, which
+      is what makes "the admin fixed their contact details an hour later" recoverable.
 
     It returns the wire result rather than True-on-attempt. ``send_outbound_reply``
     reports an unprovisioned channel or a refused send as ``delivered=False`` instead of
@@ -77,6 +89,14 @@ class ChannelDeliverer:
 
     async def deliver(self, action: DeferredAction) -> bool:
         payload = action.payload or {}
+        if action.action_type == escalation_dispatch.ESCALATION_RETRY_ACTION:
+            return await escalation_dispatch.replay_queued_notification(
+                self._session,
+                payload,
+                admin_id=action.admin_id,
+                instance_id=action.instance_id,
+                resolved_lead_id=action.resolved_lead_id,
+            )
         channel = payload.get("channel")
         body = payload.get("message")
         if not isinstance(channel, str) or not isinstance(body, str) or not body:
@@ -264,7 +284,7 @@ async def run_sweep(
             counts["abandoned"] += 1
             continue
 
-        healthy = await gate.connection_healthy(
+        healthy = action.connection_type == PLATFORM_NOTIFICATION or await gate.connection_healthy(
             session,
             admin_id=admin_id,
             instance_id=action.instance_id,
@@ -295,13 +315,19 @@ async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction)
     The audit event is the durable, tamper-evident record the spec mandates
     ("with the event written to admin_audit_log"). The owner-facing PUSH to the
     escalation channel (§3.5) binds when notifications lands its real adapters —
-    flagged. The payload carries NO secret material (§3.8.3 rule 4)."""
+    flagged. The payload carries NO secret material (§3.8.3 rule 4).
+
+    An abandoned escalation retry is filed under ``escalation_delivery_failed`` instead
+    (P1-6): that is the event name the escalation surface already means by "the owner
+    was never told", and burying the terminal miss inside a generic connection event
+    would leave it findable only by someone who already knew to look."""
+    escalation = action.action_type == escalation_dispatch.ESCALATION_RETRY_ACTION
     await audit.emit(
         session,
         admin_id=action.admin_id,
         instance_id=action.instance_id,
         actor_type=ActorType.platform,
-        event_type="connection_status_changed",
+        event_type=("escalation_delivery_failed" if escalation else "connection_status_changed"),
         payload={
             "action": "deferred_abandoned",
             "deferred_action_id": str(action.id),
