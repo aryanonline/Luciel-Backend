@@ -64,6 +64,8 @@ export class ResidencyGuard extends Construct {
        * outlive the retention policy even if an app-side sweep misses it.
        */
       lifecycleRules?: s3.LifecycleRule[];
+      /** Deterministic physical name, for a bucket the app addresses by name. */
+      bucketName?: string;
     },
   ): s3.Bucket {
     const bucket = new s3.Bucket(this, id, {
@@ -74,6 +76,7 @@ export class ResidencyGuard extends Construct {
       versioned: opts.versioned ?? false,
       removalPolicy: opts.removalPolicy ?? RemovalPolicy.RETAIN,
       ...(opts.lifecycleRules ? { lifecycleRules: opts.lifecycleRules } : {}),
+      ...(opts.bucketName ? { bucketName: opts.bucketName } : {}),
     });
 
     // Region-Deny: reject any access whose requested region != the offering region.

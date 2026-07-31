@@ -83,12 +83,15 @@ class LocalExportStore:
 
 
 class S3ExportStore:
-    """Real ``vm-export-bundles`` S3 backend (Architecture §3.6.6 / §5.10).
+    """Real export-bundle S3 backend (Architecture §3.6.6 / §5.10).
 
     ``put_object`` uploads the ZIP under the per-admin key; ``generate_presigned_url``
     mints a GET URL valid for ``ttl_days`` (matching ``config.export_link_ttl_days``
     = 7). Server-side encryption + the bucket's own lifecycle expiration rule
-    (§4.4 storage-cost bounding) bound the object's life independent of this class.
+    (§4.4 storage-cost bounding) bound the object's life independent of this class —
+    a claim that was false until P1-14 provisioned the bucket in CDK: the bucket was
+    referenced here and created nowhere, so a ZIP holding a full tenant data dump
+    outlived its 7-day link by however long the manual bucket kept it.
 
     boto3 is imported LAZILY so CI (no AWS, boto3 may be absent) still imports this
     module and runs the LocalExportStore tests. Only selected in ``live`` mode by
@@ -153,7 +156,7 @@ def get_export_store() -> ExportStore:
 
         settings = get_settings()
         if settings.integration_mode == "live":
-            _default = S3ExportStore(bucket="vm-export-bundles", region_name=settings.aws_region)
+            _default = S3ExportStore(bucket=settings.export_bucket, region_name=settings.aws_region)
         else:
             _default = LocalExportStore()
     return _default

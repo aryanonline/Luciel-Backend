@@ -154,6 +154,10 @@ class Settings(BaseSettings):
     # Defaults to ca-central-1: residency lock (DEVOPS §2.1, LD 21) — a missing env
     # must never point the secret backend out of region.
     aws_region: str = "ca-central-1"
+    # Bucket the account-export ZIPs land in (§3.6.6). Settable because one hardcoded
+    # name cannot exist in two environments: the CDK stack names it per-env and injects
+    # the value, so dev exports cannot be written into the prod bucket (P1-14).
+    export_bucket: str = "vm-export-bundles"
     # Platform sender identity for outbound notification email (verify-email,
     # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
     # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).

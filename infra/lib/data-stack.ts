@@ -30,6 +30,7 @@ export interface DataStackProps extends StackProps {
 export class DataStack extends Stack {
   public readonly db: rds.DatabaseInstance;
   public readonly knowledgeBucket: s3.Bucket;
+  public readonly exportBucket: s3.Bucket;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
   /**
    * Redis connection URL for the app's `redis_url` (config.py, env prefix LUCIEL_).
@@ -128,6 +129,35 @@ export class DataStack extends Stack {
           noncurrentVersionExpiration: Duration.days(90),
           // Reap incomplete multipart uploads (cost hygiene, no retention meaning).
           abortIncompleteMultipartUploadAfter: Duration.days(7),
+        },
+      ],
+    });
+
+    // Account-export bundles (§3.6.6). app/lifecycle/export_store.py wrote to this
+    // bucket and nothing created it (P1-14): in live mode the put_object failed
+    // AccessDenied, and the docstring's claim that "the bucket's own lifecycle rule
+    // bounds the object's life" was false — a ZIP holding a full tenant data dump had
+    // no expiry at all once the 7-day presigned link went stale.
+    //
+    // Separate from the knowledge bucket rather than a prefix on it: these two have
+    // genuinely different retention (7 days vs 1 year) and different blast radius. An
+    // export bundle is every table a tenant owns in one object.
+    this.exportBucket = residency.hardenedBucket('Export', {
+      key: cmk,
+      // Named because the app addresses it by name, and per-env because one hardcoded
+      // name cannot exist twice — that is how a dev export lands in the prod bucket.
+      bucketName: `luciel-${envConfig.envName}-export-bundles-${this.account}`,
+      removalPolicy:
+        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      lifecycleRules: [
+        {
+          id: 'export-bundle-expiry',
+          enabled: true,
+          // The presigned link lives export_link_ttl_days (7). The object must not
+          // outlive the link by any meaningful margin; the extra day is slack for a
+          // download started just before expiry, not a retention period.
+          expiration: Duration.days(8),
+          abortIncompleteMultipartUploadAfter: Duration.days(1),
         },
       ],
     });

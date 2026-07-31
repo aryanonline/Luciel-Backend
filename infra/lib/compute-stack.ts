@@ -34,6 +34,7 @@ export interface ComputeStackProps extends StackProps {
   /** CMK ARN (imported by ARN to avoid a cross-stack dependency cycle). */
   readonly cmkArn: string;
   readonly knowledgeBucket: s3.IBucket;
+  readonly exportBucket: s3.IBucket;
   /** DB master-secret ARN (imported by ARN - avoids cross-stack cycle via its KMS key). */
   readonly dbSecretArn: string;
   /** Platform secret ARN (imported by ARN to avoid a cross-stack cycle via its KMS key). */
@@ -62,7 +63,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, knowledgeBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, knowledgeBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -143,6 +144,9 @@ export class ComputeStack extends Stack {
     // (Security<->Compute). Role-side policies keep the edges one-directional:
     // Compute depends on Security/Data, never the reverse. (Caught by CDK tests.)
     knowledgeBucket.grantReadWrite(taskRole); // same-stack (knowledge bucket arn is cross-stack but read/write only touches role + bucket policy in DataStack -> still one-way Compute->Data)
+    // Account-export ZIPs (§3.6.6). Without this the live put_object is AccessDenied
+    // and the export the tenant was promised never appears (P1-14).
+    exportBucket.grantReadWrite(taskRole);
     workerQueue.grantConsumeMessages(taskRole);
     workerQueue.grantSendMessages(taskRole);
 
@@ -242,6 +246,8 @@ export class ComputeStack extends Stack {
           // Redis-backed LLM cap (§9 C9). Same URL on both planes (makeTaskDef is
           // called for data-plane + control-plane). App reads it as redis_url.
           LUCIEL_REDIS_URL: redisUrl,
+          // Per-env, so a dev export can never be written to the prod bucket.
+          LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
