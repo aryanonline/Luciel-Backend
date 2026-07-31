@@ -9,6 +9,7 @@ from app.models.audit import AdminAuditLog
 from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
+from app.models.contact import ContactSubmission
 from app.models.conversation import (
     EscalationEvent,
     Session,
@@ -43,6 +44,7 @@ __all__ = [
     "SessionSummary",
     "EscalationEvent",
     "InstanceConnection",
+    "ContactSubmission",
     "ConversationBudget",
     "CountedSession",
     "ProcessedStripeEvent",

@@ -35,6 +35,11 @@ LIMITS: dict[str, ChannelLimits] = {
     "email": ChannelLimits(burst=10, refill_seconds=2.0, daily_cap=1000),
     "whatsapp": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
     "instagram_messenger": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
+    # Not a conversational channel and not in the §3.1.5 table: the marketing contact
+    # form (ruling 1). It shares the bucket rather than growing a second limiter, but its
+    # limits are an order of magnitude tighter — a human sends one enquiry, not five a
+    # minute, and there is no tenant behind it to absorb the abuse.
+    "contact": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
 }
 
 # Per-tenant cross-channel inbound ceiling (messages/minute) — denial-of-wallet backstop.

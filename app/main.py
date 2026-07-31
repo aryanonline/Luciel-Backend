@@ -109,6 +109,7 @@ def create_app() -> FastAPI:
     from app.api.v1.billing import router as billing_router
     from app.api.v1.chat_widget import router as chat_widget_router
     from app.api.v1.connections_callback import router as connections_callback_router
+    from app.api.v1.contact import router as contact_router
     from app.api.v1.dashboard import router as dashboard_router
     from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
@@ -134,6 +135,9 @@ def create_app() -> FastAPI:
     # Inbound channel webhooks: SMS/email/Meta — signature-verified before tenant
     # lookup (§3.1.3), pre-budget admission (§3.1.5), then the agentic loop (§3.4.1).
     app.include_router(channels_webhook_router)
+    # Marketing contact form: unauthenticated by necessity, captcha + IP bucket instead
+    # of a session (ruling 1).
+    app.include_router(contact_router)
 
     return app
 
