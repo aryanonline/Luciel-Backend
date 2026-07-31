@@ -128,6 +128,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # The providers' registered OAuth redirect target (§3.8) — public by necessity,
         # authorized by the signed single-use state, answers only in 3xx.
         ("GET", "/api/v1/connections/{client}/callback"),
+        # The marketing site's contact form (ruling 1) — unauthenticated by nature,
+        # gated by hCaptcha + rate limit rather than by a session.
+        ("POST", "/api/v1/contact"),
         # webhooks
         ("POST", "/api/v1/webhooks/stripe"),
         ("POST", "/api/v1/webhooks/twilio/sms"),
