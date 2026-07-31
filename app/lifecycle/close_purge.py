@@ -29,7 +29,7 @@ from app.audit import log as audit
 from app.config import get_settings
 from app.lifecycle.cascade import hard_delete_cascade
 from app.models.audit import ActorType, AdminAuditLog
-from app.models.instance import Account, AccountState, Instance
+from app.models.instance import Account, AccountState
 
 CLOSURE_EVENT = "account_closure_initiated"
 
@@ -85,11 +85,11 @@ async def purge_closed_account_if_due(
         return False
 
     # Belt to close_account's braces: a Luciel created/restored after closure, or a
-    # closure that failed mid-cascade, must not survive the purge.
-    if (
-        await session.execute(select(Instance).where(Instance.admin_id == admin_id))
-    ).scalar_one_or_none() is not None:
-        await hard_delete_cascade(session, admin_id)
+    # closure that failed mid-cascade, must not survive the purge. Unconditional
+    # because tenant data does not require a Luciel to exist — an account that attached
+    # a card and connected Google without finishing onboarding still owns billing rows
+    # and credentials, and this is the last caller that could ever remove them.
+    await hard_delete_cascade(session, admin_id)
 
     await audit.emit(
         session,

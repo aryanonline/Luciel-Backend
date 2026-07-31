@@ -5,8 +5,8 @@ expiration, not left to accumulate. Transcripts and session summaries carry a
 1-year retention; past that they are HARD-DELETED. The S3 lifecycle expiration
 rule (infra/lib/data-stack.ts) is the object-store backstop; this module is the
 Postgres-side reconciliation — the application sweep that deletes aged
-``Transcript`` and ``SessionSummary`` rows on LIVE (non-deleted) tenants and
-emits a ``data_retention_hard_delete`` audit event per data class.
+``Transcript``, ``SessionSummary`` and ``Session`` rows on LIVE (non-deleted)
+tenants and emits a ``data_retention_hard_delete`` audit event per data class.
 
 Captured Leads are NOT on that platform timer (Legal §B5 makes them Admin-managed
 business data). They get a second, opt-in policy in the same sweep —
@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
-from app.models.conversation import SessionSummary, Transcript
+from app.models.conversation import Session, SessionSummary, Transcript
 from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
 
@@ -45,11 +45,21 @@ from app.models.lead import Lead, LeadState
 # for tests/ops only).
 DEFAULT_RETENTION_DAYS = 365
 
-# (model, data_class label used in the audit payload) for each swept class. Both
-# models carry admin_id (TenantMixin) + created_at (TimestampMixin).
-_RETAINED_CLASSES: tuple[tuple[type[Transcript] | type[SessionSummary], str], ...] = (
+# (model, data_class label used in the audit payload) for each swept class, children
+# before the parent conversation row. Every model here carries admin_id (TenantMixin)
+# and created_at (TimestampMixin).
+#
+# ``Session`` belongs on this list because ``sessions.summary`` is itself conversation
+# content — the model's own account of what was said — so deleting the transcripts and
+# the session_summaries while leaving the parent row is not a 1-year retention. The
+# leftover shells also accumulate without bound on a tenant who never deletes anything,
+# which is exactly the plateau this sweep exists to produce.
+_RetainedModel = type[Transcript] | type[SessionSummary] | type[Session]
+
+_RETAINED_CLASSES: tuple[tuple[_RetainedModel, str], ...] = (
     (Transcript, "transcript"),
     (SessionSummary, "session_summary"),
+    (Session, "session"),
 )
 
 

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.config import get_settings
+from app.lifecycle.cascade import hard_delete_cascade
 from app.models.audit import ActorType
 from app.models.instance import Account, AccountState
 
@@ -37,7 +38,16 @@ def _cutoff(now: datetime) -> datetime:
 
 
 async def _purge(session: AsyncSession, admin_id: uuid.UUID, now: datetime) -> None:
-    """Emit the tombstone, THEN delete. Reversing the order loses the evidence."""
+    """Emit the tombstone, THEN destroy the tenant. Reversing the order loses evidence.
+
+    "Permanently deleted" is the whole tenant, not the ``accounts`` row. An abandoned
+    signup is not necessarily an empty one — verification gates login, not onboarding,
+    so a candidate can already own an instance, knowledge chunks with embeddings, and
+    live OAuth credentials in Secrets Manager. Deleting only the shell left all of it
+    addressed by an admin_id nothing would ever name again: unreachable, undeletable,
+    still stored, and still billed for. The cascade is the same one closure runs, so
+    the two paths cannot drift.
+    """
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -48,6 +58,7 @@ async def _purge(session: AsyncSession, admin_id: uuid.UUID, now: datetime) -> N
             "reaped_at": now.isoformat(),
         },
     )
+    await hard_delete_cascade(session, admin_id)
     await session.execute(delete(Account).where(Account.id == admin_id))
 
 

@@ -21,7 +21,7 @@ from app.audit.log import verify_chain
 from app.db.session import tenant_session
 from app.lifecycle.retention import expire_aged_data, prune_stale_leads, run_retention_sweep
 from app.models.audit import AdminAuditLog
-from app.models.conversation import SessionSummary, Transcript
+from app.models.conversation import Session, SessionSummary, Transcript
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead, LeadState
 from sqlalchemy import func, select
@@ -88,6 +88,23 @@ async def _add_summary(s, *, admin_id, instance_id, created_at, summary="s") -> 
     )
 
 
+async def _add_session(s, *, admin_id, instance_id, created_at) -> None:
+    """The parent conversation row. ``summary`` is conversation content in its own
+    right, so it is on the same 1-year clock as the transcripts underneath it."""
+    s.add(
+        Session(
+            id=uuid.uuid4(),
+            admin_id=admin_id,
+            instance_id=instance_id,
+            channel="web",
+            summary="caller asked about pricing",
+            created_at=created_at,
+            started_at=created_at,
+            last_message_at=created_at,
+        )
+    )
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
     admin = uuid.uuid4()
@@ -100,17 +117,20 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
         await _add_transcript(s, admin_id=admin, instance_id=iid, created_at=recent)
         await _add_summary(s, admin_id=admin, instance_id=iid, created_at=old)
         await _add_summary(s, admin_id=admin, instance_id=iid, created_at=recent)
+        await _add_session(s, admin_id=admin, instance_id=iid, created_at=old)
+        await _add_session(s, admin_id=admin, instance_id=iid, created_at=recent)
         await s.flush()
 
     async with tenant_session(admin) as s:
         counts = await expire_aged_data(s, admin_id=admin, now=now)
-        assert counts == {"transcript": 1, "session_summary": 1}
+        assert counts == {"transcript": 1, "session_summary": 1, "session": 1}
 
     async with tenant_session(admin) as s:
         # Exactly the recent rows survive.
         t = (await s.execute(select(func.count()).select_from(Transcript))).scalar_one()
         ss = (await s.execute(select(func.count()).select_from(SessionSummary))).scalar_one()
-        assert t == 1 and ss == 1
+        sess = (await s.execute(select(func.count()).select_from(Session))).scalar_one()
+        assert t == 1 and ss == 1 and sess == 1
         # A data_retention_hard_delete event per class, and the chain stays intact.
         evts = (
             (
@@ -125,7 +145,7 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
             .all()
         )
         classes = {(e.event_payload or {}).get("data_class") for e in evts}
-        assert {"transcript", "session_summary"} <= classes
+        assert {"transcript", "session_summary", "session"} <= classes
         assert await verify_chain(s, admin) is True
 
 
@@ -138,15 +158,16 @@ async def test_expire_aged_data_is_idempotent():
     async with tenant_session(admin) as s:
         await _add_transcript(s, admin_id=admin, instance_id=iid, created_at=old)
         await _add_summary(s, admin_id=admin, instance_id=iid, created_at=old)
+        await _add_session(s, admin_id=admin, instance_id=iid, created_at=old)
         await s.flush()
 
     async with tenant_session(admin) as s:
         first = await expire_aged_data(s, admin_id=admin, now=now)
-        assert first == {"transcript": 1, "session_summary": 1}
+        assert first == {"transcript": 1, "session_summary": 1, "session": 1}
     # Re-run: nothing left aged → zero deletes (idempotent).
     async with tenant_session(admin) as s:
         second = await expire_aged_data(s, admin_id=admin, now=now)
-        assert second == {"transcript": 0, "session_summary": 0}
+        assert second == {"transcript": 0, "session_summary": 0, "session": 0}
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

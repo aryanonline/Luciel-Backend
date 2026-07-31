@@ -68,7 +68,7 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
 async def _log_and_delete(
     session: AsyncSession,
     admin_id: uuid.UUID,
-    instance_id: uuid.UUID,
+    instance_id: uuid.UUID | None,
     model: type[TenantMixin],
     data_class: str,
 ) -> int:
@@ -89,7 +89,7 @@ async def _log_and_delete(
 
 
 async def _delete_tenant_secrets(
-    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
 ) -> None:
     """Destroy the tenant's credential material before the rows that reference it.
 
@@ -160,16 +160,21 @@ async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dic
     Destroys every table in ``CASCADE_MODELS`` (child data first, instance row last) plus
     the tenant's secret material. The account shell and the admin_audit_log survive
     (§3.6.5).
+
+    A tenant with no Instance row is still cascaded. The Luciel is not what makes the
+    other rows tenant data: an account can attach a card, connect Google, and close
+    without ever finishing onboarding, and the closure path is the only caller that
+    would ever remove those rows. Bailing early left them — and live OAuth credentials —
+    under an admin_id no query would ever name again.
     """
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()
-    if inst is None:
-        return {}
-    iid = inst.id
+    iid = inst.id if inst is not None else None
     await _delete_tenant_secrets(session, admin_id, iid)
 
-    inst.state = LucielState.luciel_hard_deleted
+    if inst is not None:
+        inst.state = LucielState.luciel_hard_deleted
     await session.flush()
     counts = {
         model.__tablename__: await _log_and_delete(session, admin_id, iid, model, data_class)
