@@ -223,6 +223,10 @@ async def notify_escalation(
         return True
     # Nothing reached the configured contacts — fall back to the account owner (§3.5.4).
     if owner_email and ("email", owner_email) not in attempted:
+        # Recorded BEFORE the attempt, because ``attempted`` now decides more than
+        # dedupe: an empty set below means "there was nowhere to send this", and a
+        # fallback that was tried and refused is a refusal, not an absence.
+        attempted.add(("email", owner_email))
         if await _deliver(
             session, notification, channel="email", to=owner_email, role="owner_fallback"
         ):
