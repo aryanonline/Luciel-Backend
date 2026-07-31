@@ -23,11 +23,12 @@ export class ObservabilityStack extends Stack {
     super(scope, id, props);
     const { envConfig, alb } = props;
 
-    // App log group - 90 day retention (§5.1). Audit/trace stores live in RDS with
-    // their own 1-year retention enforced by the app, not CloudWatch.
+    // App log group - 90 days in prod (§5.1), shorter in the environments nobody reads
+    // month-old logs from. Audit/trace stores live in RDS with their own 1-year
+    // retention enforced by the app, not CloudWatch.
     new logs.LogGroup(this, 'AppLogs', {
       logGroupName: `/luciel/${envConfig.envName}/app`,
-      retention: logs.RetentionDays.THREE_MONTHS,
+      retention: envConfig.logRetention,
     });
 
     const alarmTopic = new sns.Topic(this, 'Alarms', {

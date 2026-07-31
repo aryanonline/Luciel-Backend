@@ -46,7 +46,13 @@ export class PipelineStack extends Stack {
       repositoryName: `luciel-backend-${envConfig.envName}`,
       imageScanOnPush: true,
       imageTagMutability: ecr.TagMutability.IMMUTABLE,
-      lifecycleRules: [{ maxImageCount: 20 }],
+      lifecycleRules: [
+        // IMMUTABLE tags cannot be re-pointed, but an interrupted push still leaves
+        // untagged layers behind, and `maxImageCount` on tagged images never reaps
+        // them. Ordered first because CDK requires the catch-all rule to be last.
+        { description: 'expire untagged images', tagStatus: ecr.TagStatus.UNTAGGED, maxImageCount: 10 },
+        { description: 'keep the last 20 tagged images', maxImageCount: 20 },
+      ],
     });
 
     // GitHub OIDC provider (one per account; created here for the deploy role to trust).

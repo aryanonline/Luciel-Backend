@@ -16,10 +16,11 @@
  *
  * Region-locked ca-central-1 via the residency guard, like every in-region stack.
  */
-import { Stack, StackProps, Duration, CfnOutput } from 'aws-cdk-lib';
+import { Stack, StackProps, Duration, CfnOutput, RemovalPolicy } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
@@ -57,7 +58,14 @@ export class WebStack extends Stack {
       repositoryName: `luciel-${envConfig.envName}-web`,
       imageScanOnPush: true,
       imageTagMutability: ecr.TagMutability.MUTABLE,
-      lifecycleRules: [{ maxImageCount: 20 }],
+      lifecycleRules: [
+        // MUTABLE tags mean every re-push of `:latest` orphans the image it replaced.
+        // Those untagged layers are invisible in the console's default view and are
+        // billed forever, so they get a tighter ceiling than the tagged history — and
+        // this rule must precede the catch-all, which CDK requires to be last.
+        { description: 'expire untagged images', tagStatus: ecr.TagStatus.UNTAGGED, maxImageCount: 10 },
+        { description: 'keep the last 20 tagged images', maxImageCount: 20 },
+      ],
     });
 
     // The image tag the service runs. Default `latest`; pinned per-deploy via
@@ -81,7 +89,17 @@ export class WebStack extends Stack {
     });
     taskDef.addContainer('WebContainer', {
       image: ecs.ContainerImage.fromEcrRepository(this.ecrRepo, imageTag),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-web' }),
+      // Explicit group so the retention is declared; an implicitly created one never
+      // expires (same reasoning as ComputeStack).
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'luciel-web',
+        logGroup: new logs.LogGroup(this, 'WebLogs', {
+          logGroupName: `/luciel/${envConfig.envName}/web`,
+          retention: envConfig.logRetention,
+          removalPolicy:
+            envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        }),
+      }),
       environment: {
         NODE_ENV: 'production',
         PORT: '3000',

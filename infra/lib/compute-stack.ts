@@ -11,9 +11,10 @@
  * read/write the knowledge bucket, connect to RDS. NOT admin.
  */
 import * as cdk from 'aws-cdk-lib';
-import { Stack, StackProps, Duration } from 'aws-cdk-lib';
+import { Stack, StackProps, Duration, RemovalPolicy } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
@@ -209,6 +210,18 @@ export class ComputeStack extends Stack {
       }),
     );
 
+    // Every awsLogs driver below names an EXPLICIT log group. Left to itself the driver
+    // creates one on first write with retention "Never expire", which is the one AWS
+    // default in this stack that converts a fixed cost into a growing one — and it is
+    // invisible, because nothing in the template mentions the group at all.
+    const logGroupFor = (name: string) =>
+      new logs.LogGroup(this, `${name}Logs`, {
+        logGroupName: `/luciel/${envConfig.envName}/${name}`,
+        retention: envConfig.logRetention,
+        removalPolicy:
+          envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      });
+
     const makeTaskDef = (name: string) => {
       const td = new ecs.FargateTaskDefinition(this, `${name}Task`, {
         cpu: envConfig.envName === 'prod' ? 1024 : 256,
@@ -237,7 +250,10 @@ export class ComputeStack extends Stack {
         // Entrypoint builds the luciel_app (non-superuser) DB URL from the secret
         // so RLS binds, then execs uvicorn.
         command: ['bash', 'scripts/app-entrypoint.sh'],
-        logging: ecs.LogDrivers.awsLogs({ streamPrefix: `luciel-${name}` }),
+        logging: ecs.LogDrivers.awsLogs({
+          streamPrefix: `luciel-${name}`,
+          logGroup: logGroupFor(name),
+        }),
         environment: {
           LUCIEL_ENV: envConfig.envName,
           LUCIEL_PLANE: name,
@@ -311,7 +327,10 @@ export class ComputeStack extends Stack {
     );
     migrationTask.addContainer('MigrationContainer', {
       image: containerImage,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-migrate' }),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'luciel-migrate',
+        logGroup: logGroupFor('migrate'),
+      }),
       command: ['bash', 'scripts/migrate.sh'],
       secrets: {
         LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -350,7 +369,10 @@ export class ComputeStack extends Stack {
     );
     verifyTask.addContainer('VerifyContainer', {
       image: containerImage,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-verify' }),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'luciel-verify',
+        logGroup: logGroupFor('verify'),
+      }),
       command: ['bash', 'scripts/verify.sh'],
       secrets: {
         LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -388,7 +410,10 @@ export class ComputeStack extends Stack {
     );
     seedTestTask.addContainer('SeedTestContainer', {
       image: containerImage,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-seedtest' }),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'luciel-seedtest',
+        logGroup: logGroupFor('seedtest'),
+      }),
       command: ['python3', 'scripts/seed_and_livetest.py'],
       secrets: {
         LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -435,7 +460,10 @@ export class ComputeStack extends Stack {
     const sweepContainerName = 'SweepContainer';
     sweepTask.addContainer(sweepContainerName, {
       image: containerImage,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'luciel-sweep' }),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'luciel-sweep',
+        logGroup: logGroupFor('sweep'),
+      }),
       // Placeholder command; every schedule overrides it with its own sweep name so
       // one task definition backs all four schedules.
       command: ['bash', '-lc', 'scripts/run-sweep.sh retention'],

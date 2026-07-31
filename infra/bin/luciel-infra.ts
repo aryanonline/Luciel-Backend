@@ -23,6 +23,7 @@ import { PipelineStack } from '../lib/pipeline-stack';
 import { DnsStack } from '../lib/dns-stack';
 import { WebStack } from '../lib/web-stack';
 import { WidgetCertStack, WidgetStack } from '../lib/widget-stack';
+import { BoundedLambdaLogs } from '../lib/log-retention-aspect';
 import {
   getEnvConfig,
   applyContextOverrides,
@@ -118,5 +119,9 @@ new PipelineStack(app, `${prefix}-Pipeline`, {
   githubRepo: 'aryanonline/Luciel-Backend',
   frontendRepo: 'aryanonline/Luciel-Frontend',
 });
+
+// App-wide so it also reaches the functions CDK generates inside constructs the
+// stacks do not own — those are exactly the ones nobody would otherwise bound.
+cdk.Aspects.of(app).add(new BoundedLambdaLogs(envConfig.logRetention));
 
 app.synth();

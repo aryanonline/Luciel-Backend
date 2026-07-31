@@ -91,6 +91,18 @@ export class WidgetStack extends Stack {
       removalPolicy:
         envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
       autoDeleteObjects: envConfig.envName !== 'prod',
+      // No `expiration` rule: the current object IS the served bundle and must outlive
+      // any timer. What is bounded is everything the CI leaves behind it — prod is
+      // versioned, so each `s3 sync` of a rebuilt bundle pushes the old one to a
+      // noncurrent version that is billed forever and can never be served again.
+      lifecycleRules: [
+        {
+          id: 'widget-bundle-hygiene',
+          enabled: true,
+          noncurrentVersionExpiration: Duration.days(30),
+          abortIncompleteMultipartUploadAfter: Duration.days(1),
+        },
+      ],
     });
     this.bucket.addToResourcePolicy(
       new iam.PolicyStatement({

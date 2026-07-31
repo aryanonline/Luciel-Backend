@@ -17,6 +17,7 @@ import * as rds from 'aws-cdk-lib/aws-rds';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as elasticache from 'aws-cdk-lib/aws-elasticache';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 import { EnvConfig } from './env-config';
 import { ResidencyGuard } from './residency';
@@ -86,6 +87,10 @@ export class DataStack extends Stack {
       }),
       enablePerformanceInsights: envConfig.alarmsArmed,
       cloudwatchLogsExports: ['postgresql'],
+      // RDS creates /aws/rds/instance/<id>/postgresql itself, and a group RDS creates
+      // never expires. This is the one log group in the app that is NOT ours to declare
+      // directly, so CDK sets its retention through a custom resource instead.
+      cloudwatchLogsRetention: envConfig.logRetention,
     });
 
     // Knowledge / artifact bucket with the full residency envelope.
@@ -201,6 +206,10 @@ export class DataStack extends Stack {
       cacheSubnetGroupName: redisSubnets.ref,
       securityGroupIds: [redisSg.securityGroupId],
       port: 6379,
+      // Declared rather than defaulted. Everything in here is an LLM-cap counter with
+      // a TTL — a restored snapshot would be a stale count, so a backup of it has no
+      // recovery value and a retained one is pure storage cost.
+      snapshotRetentionLimit: envConfig.redisSnapshotRetentionDays,
     });
     redis.addDependency(redisSubnets);
 

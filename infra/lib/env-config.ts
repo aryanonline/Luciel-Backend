@@ -11,6 +11,8 @@
  * action, never a silent default.
  */
 
+import * as logs from 'aws-cdk-lib/aws-logs';
+
 export type EnvName = 'dev' | 'preprod' | 'prod';
 
 /** The ONE region for the current offering. No environment may deviate (LD 21, §4.2). */
@@ -57,6 +59,22 @@ export interface EnvConfig {
   /** Whether alarms/smoke-probe gating are armed (prod only fully armed). */
   readonly alarmsArmed: boolean;
   /**
+   * Retention for every log group this app owns. A CloudWatch log group created
+   * without one keeps its logs FOREVER and bills for the privilege, which is a cost
+   * that only ever grows and that nobody notices until the bill does. It lives here
+   * rather than at each call site so the environments can differ on purpose: dev
+   * churns and nobody reads a month-old dev log, preprod is torn down within the hour
+   * of the release that created it, and prod keeps the 90 days doctrine §5.1 asks for.
+   */
+  readonly logRetention: logs.RetentionDays;
+  /**
+   * Days of automatic ElastiCache snapshots to keep. Zero means the cluster takes no
+   * automatic backups at all — correct for a cache whose entire contents are LLM-cap
+   * counters that rebuild themselves, and the difference between a bounded and an
+   * unbounded snapshot bill.
+   */
+  readonly redisSnapshotRetentionDays: number;
+  /**
    * Cheap-idle pause switch (§ pause/resume). When true, EVERY ECS service in the
    * environment (backend control/data plane + frontend web) is set to desiredCount
    * 0 so compute cost drops to zero while the data layer floor remains. Reversible
@@ -74,6 +92,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     natGateways: 1,
     rdsInstanceClass: 'db.t4g.micro',
     alarmsArmed: false,
+    logRetention: logs.RetentionDays.ONE_MONTH,
+    redisSnapshotRetentionDays: 0,
     paused: false,
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
@@ -89,6 +109,10 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     natGateways: 2,
     rdsInstanceClass: 'db.r6g.large',
     alarmsArmed: true,
+    // The environment itself does not outlive the release that created it, so a week
+    // is already longer than any preprod log can be worth reading.
+    logRetention: logs.RetentionDays.ONE_WEEK,
+    redisSnapshotRetentionDays: 0,
     paused: false,
   },
   prod: {
@@ -98,6 +122,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     natGateways: 2,
     rdsInstanceClass: 'db.r6g.large',
     alarmsArmed: true,
+    logRetention: logs.RetentionDays.THREE_MONTHS, // doctrine §5.1: 90d app logs
+    redisSnapshotRetentionDays: 0,
     paused: false,
   },
 };
