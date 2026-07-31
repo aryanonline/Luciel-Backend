@@ -981,9 +981,9 @@ async def test_usage_reconcile_posts_a_missed_block_exactly_once(monkeypatch) ->
     posted: list[int] = []
 
     class RecordingGateway:
-        async def report_metered_usage(self, *, subscription_id, quantity, idempotency_key, action):
-            posted.append(quantity)
-            return {"ok": True}
+        async def report_meter_event(self, *, customer_id, value, identifier):
+            posted.append(value)
+            return True
 
     monkeypatch.setattr(metering_module, "get_stripe_gateway", lambda: RecordingGateway())
 
@@ -1003,7 +1003,9 @@ async def test_usage_reconcile_posts_a_missed_block_exactly_once(monkeypatch) ->
 
     assert await sweeps.run_usage_reconcile(now=NOW) == [str(admin_id)]
     assert await sweeps.run_usage_reconcile(now=NOW) == [], "usage was reported twice"
-    assert posted == [3], f"the reconcile posted {posted}, not one flush of the accrued total"
+    # Watermark 1, accrued 3 → the meter gets the DELTA of 2, not the total of 3. On an
+    # additive meter, flushing the total would bill 3 blocks on top of the 1 already there.
+    assert posted == [2], f"the reconcile posted {posted}, not one delta past the watermark"
 
     async with tenant_session(admin_id) as s:
         account = (

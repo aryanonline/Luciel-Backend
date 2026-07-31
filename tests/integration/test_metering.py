@@ -236,18 +236,20 @@ async def test_idempotent_metered_reporting_no_double_bill() -> None:
     async with tenant_session(admin) as s:
         acct = await metering.get_or_create_billing_account(s, admin_id=admin)
         acct.billing_state = "payg_enabled"
+        acct.stripe_customer_id = "cus_test"  # the meter event is keyed on the customer
         acct.stripe_subscription_id = "sub_test"
         acct.period_start = STRIPE_PERIOD_START
         await s.flush()
-    # Report twice with the same (period, quantity) — the second is a dedup no-op.
+    # Report twice over the same watermark span — the second finds nothing owing.
     async with tenant_session(admin) as s:
         q1 = await metering.report_usage(s, admin_id=admin, instance_id=iid, gateway=gw)
     async with tenant_session(admin) as s:
         q2 = await metering.report_usage(s, admin_id=admin, instance_id=iid, gateway=gw)
     assert q1 == 2  # 2 blocks
     assert q2 == 0  # nothing new owed, so Stripe is not called again
-    # Exactly one idempotency key recorded → no double-bill.
-    assert len(gw._usage_keys) == 1
+    # One event, and the meter totals the real usage rather than twice it.
+    assert len(gw.meter_events) == 1
+    assert gw.billed_quantity("cus_test") == 2
 
 
 # ---------------------------------------------------------------------------

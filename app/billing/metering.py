@@ -212,15 +212,23 @@ async def build_budget(
 
 
 # --- idempotent Stripe metered-usage reporting (HARD CONSTRAINT #3) --------- #
-def usage_idempotency_key(*, admin_id: uuid.UUID, period_start: date, quantity: int) -> str:
-    """Idempotency key per (tenant, period, quantity) so a retry / webhook
-    redelivery never double-bills (§3.4.1b).
+def meter_event_identifier(
+    *, customer_id: str, period_start: date, from_block: int, to_block: int
+) -> str:
+    """Stripe dedup identifier for the meter event covering blocks ``from``→``to``.
+
+    Meter events are additive, so the identifier is the whole of the double-report
+    defence: a retry after a timeout must carry the SAME identifier or its value is
+    added to the meter a second time. Naming the watermark span rather than a bare
+    quantity is what makes that automatic — a retry recomputes the identical span,
+    while genuinely new usage always starts where the last accepted event ended.
 
     ``period_start`` must be the same anchor the counter is keyed on
-    (``period_start_for``); if the key names a different period than the quantity was
-    counted under, a genuinely new block reuses a spent key and is silently dropped.
+    (``period_start_for``); if the identifier names a different period than the blocks
+    were counted under, a genuinely new block reuses a spent identifier and is silently
+    dropped (P0-4).
     """
-    return f"usage:{admin_id}:{period_start.isoformat()}:{quantity}"
+    return f"usage:{customer_id}:{period_start.isoformat()}:{from_block}-{to_block}"
 
 
 async def report_usage_after_count(
@@ -255,11 +263,13 @@ async def report_usage(
     now: datetime | None = None,
     gateway: StripeGateway | None = None,
 ) -> int:
-    """Report this period's billed blocks to Stripe metered usage, idempotently.
+    """Report this period's newly accrued blocks to the Stripe meter, idempotently.
 
-    Returns the quantity reported (billed blocks), or 0 when Stripe is already up to
-    date, there is no live subscription, or nothing is billable. Reporting is keyed by
-    (period, quantity) so a retry is deduped by the gateway (HARD CONSTRAINT #3)."""
+    Returns the number of blocks newly reported — the delta past the watermark, not the
+    period total, because meter events are additive. 0 when Stripe is already up to
+    date, there is no live subscription, or nothing is billable. Each event carries a
+    deterministic identifier naming its watermark span, so a retry is deduped by Stripe
+    (HARD CONSTRAINT #3)."""
     gateway = gateway or get_stripe_gateway()
     now = now or datetime.now(UTC)
     account = await get_or_create_billing_account(session, admin_id=admin_id)
@@ -303,24 +313,40 @@ async def _post_usage(
     gateway: StripeGateway,
     now: datetime,
 ) -> int:
-    """Post the period total to Stripe and advance the watermark.
+    """Post the blocks accrued since the watermark as a meter event, then advance it.
 
-    The watermark moves only after the gateway call returns, so a raising or otherwise
-    failed post leaves the tenant looking behind and the next turn retries it.
+    Billing Meters are ADDITIVE — there is no "set" — so what goes to Stripe is the
+    DELTA ``quantity - last_reported_blocks``, not the period total. Posting the total
+    against an additive meter would invoice 1+2+3 = 6 blocks for 3 blocks of usage.
+
+    The watermark moves only after Stripe accepts, so a raising post leaves the tenant
+    looking behind and the next turn (or the reconcile sweep) retries it. That retry
+    recomputes the same identifier, so Stripe dedupes it instead of adding the value
+    twice: together the two rules give exactly-once billing per block.
+
+    Returns the delta actually reported.
     """
-    key = usage_idempotency_key(
-        admin_id=account.admin_id, period_start=period_start_for(account, now), quantity=quantity
-    )
-    await gateway.report_metered_usage(
-        subscription_id=str(account.stripe_subscription_id),
-        quantity=quantity,
-        idempotency_key=key,
-        # ``quantity`` is the period total, not the delta since the last report.
-        action="set",
+    if account.stripe_customer_id is None:
+        # A meter event is keyed on the customer, so without one there is nowhere to
+        # post. Leave the watermark behind rather than pretending it was billed.
+        return 0
+    from_block = account.last_reported_blocks
+    delta = quantity - from_block
+    if delta <= 0:
+        return 0
+    await gateway.report_meter_event(
+        customer_id=account.stripe_customer_id,
+        value=delta,
+        identifier=meter_event_identifier(
+            customer_id=account.stripe_customer_id,
+            period_start=period_start_for(account, now),
+            from_block=from_block,
+            to_block=quantity,
+        ),
     )
     account.last_reported_blocks = quantity
     await session.flush()
-    return quantity
+    return delta
 
 
 async def report_accrued_usage(

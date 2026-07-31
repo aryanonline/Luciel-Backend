@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 from app.billing.stripe_gateway import (
+    METER_EVENT_NAME,
     SIGNATURE_TOLERANCE_SECONDS,
     FakeStripeGateway,
     RealStripeGateway,
@@ -41,48 +42,138 @@ def test_signature_verification_rejects_tampered_or_missing() -> None:
         gw.verify_and_parse(payload=payload, signature_header=bad)
 
 
-def test_metered_usage_reporting_is_idempotent() -> None:
+def test_meter_event_reporting_is_idempotent_on_the_identifier() -> None:
+    """Additivity makes the identifier load-bearing: a retry that is not deduped does
+    not merely re-record the event, it ADDS its value to the meter a second time."""
     gw = FakeStripeGateway()
 
     async def run() -> tuple[bool, bool]:
-        first = await gw.report_metered_usage(
-            subscription_id="sub_1", quantity=2, idempotency_key="k1"
-        )
-        second = await gw.report_metered_usage(
-            subscription_id="sub_1", quantity=2, idempotency_key="k1"
-        )
+        first = await gw.report_meter_event(customer_id="cus_1", value=2, identifier="id1")
+        second = await gw.report_meter_event(customer_id="cus_1", value=2, identifier="id1")
         return first, second
 
     first, second = asyncio.run(run())
-    assert first is True  # first report applied
-    assert second is False  # same key → dedup no-op (no double-bill)
+    assert first is True  # first event applied
+    assert second is False  # same identifier → dedup no-op (no double-bill)
+    assert gw.billed_quantity("cus_1") == 2  # NOT 4
+    assert [e.value for e in gw.meter_events] == [2]
 
 
-def test_the_fake_models_set_versus_increment() -> None:
-    """The fake only appended to a list, so the suite could not see the difference
-    between the two actions — which is how a geometric overcharge stayed invisible.
+def test_the_fake_models_additive_meter_semantics() -> None:
+    """The meter SUMS every event in the period, so the fake must too.
 
-    Both branches are modelled because the whole point is that they diverge: the caller
-    posts a period-cumulative quantity, which is only correct under "set".
+    A fake that stored the last value instead would let a caller post period totals and
+    still look correct in the suite, which is exactly the drift that hid the previous
+    ``action`` bug — and posting totals to an additive meter is a geometric overcharge.
     """
     gw = FakeStripeGateway()
 
-    async def run() -> tuple[int, int]:
-        for i, quantity in enumerate((1, 2, 3)):
-            await gw.report_metered_usage(
-                subscription_id="sub_set", quantity=quantity, idempotency_key=f"set-{i}"
-            )
-            await gw.report_metered_usage(
-                subscription_id="sub_inc",
-                quantity=quantity,
-                idempotency_key=f"inc-{i}",
-                action="increment",
-            )
-        return gw.billed_quantity("sub_set"), gw.billed_quantity("sub_inc")
+    async def run() -> int:
+        for i, delta in enumerate((1, 1, 1)):
+            await gw.report_meter_event(customer_id="cus_sum", value=delta, identifier=f"d-{i}")
+        return gw.billed_quantity("cus_sum")
 
-    with_set, with_increment = asyncio.run(run())
-    assert with_set == 3  # the period total, which is the actual usage
-    assert with_increment == 6  # 1+2+3 — Stripe's default, and double the real usage
+    assert asyncio.run(run()) == 3  # three one-block deltas == three blocks
+    assert all(e.event_name == METER_EVENT_NAME for e in gw.meter_events)
+
+
+# --- the real gateway posts Billing Meter events, not usage records ---------- #
+
+
+class _RecordingStripeClient:
+    """Stands in for the stripe module. Records meter events; NO network.
+
+    Deliberately exposes no ``SubscriptionItem`` at all, so any code that reaches for
+    the removed usage-records endpoint fails here with AttributeError instead of
+    silently "passing" against a permissive mock.
+    """
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[dict] = []
+        self._error = error
+        outer = self
+
+        class _MeterEvent:
+            @staticmethod
+            def create(**kwargs):
+                outer.calls.append(kwargs)
+                if outer._error is not None:
+                    raise outer._error
+                return {"identifier": kwargs.get("identifier")}
+
+        class _Billing:
+            MeterEvent = _MeterEvent
+
+        self.billing = _Billing()
+
+
+def _real_gateway_with(client: _RecordingStripeClient) -> RealStripeGateway:
+    gw = RealStripeGateway(
+        secret_key="sk_test_x", publishable_key="pk_test_x", webhook_secret="whsec_x"
+    )
+    gw._client = client  # inject; no network
+    return gw
+
+
+def test_real_gateway_posts_a_meter_event_with_the_configured_event_name() -> None:
+    """The account is pinned to API version 2025-03-31 "basil", where metered prices
+    must be meter-backed and the usage-records endpoint is gone. The value must go to
+    /v1/billing/meter_events, keyed on the customer, with the identifier carried through
+    so Stripe can dedupe a retry."""
+    client = _RecordingStripeClient()
+    gw = _real_gateway_with(client)
+
+    assert asyncio.run(gw.report_meter_event(customer_id="cus_x", value=2, identifier="u:1-3"))
+
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["event_name"] == METER_EVENT_NAME
+    assert call["identifier"] == "u:1-3"
+    # Stripe requires payload values to be strings, including the numeric one.
+    assert call["payload"] == {"stripe_customer_id": "cus_x", "value": "2"}
+
+
+def test_a_duplicate_identifier_is_reported_as_a_dedup_not_a_failure() -> None:
+    """A retry after a timeout re-posts a spent identifier. Stripe rejects it, and that
+    rejection means Stripe ALREADY HAS the value — so it must surface as a dedup (False)
+    and let the caller advance its watermark. Raising instead would retry the same spent
+    identifier forever and leave every later block unbilled behind it."""
+    client = _RecordingStripeClient(error=ValueError("An event with identifier X already exists."))
+    gw = _real_gateway_with(client)
+
+    assert asyncio.run(gw.report_meter_event(customer_id="cus_x", value=1, identifier="dup")) is (
+        False
+    )
+
+
+def test_a_genuine_stripe_failure_still_propagates() -> None:
+    """The duplicate check must stay narrow. Swallowing an ordinary failure would
+    advance the watermark past usage Stripe never received — silently un-billing it."""
+    client = _RecordingStripeClient(error=RuntimeError("service unavailable"))
+    gw = _real_gateway_with(client)
+
+    with pytest.raises(RuntimeError, match="service unavailable"):
+        asyncio.run(gw.report_meter_event(customer_id="cus_x", value=1, identifier="boom"))
+
+
+def test_nothing_in_the_codebase_calls_the_removed_usage_records_endpoint() -> None:
+    """``SubscriptionItem.create_usage_record`` was REMOVED in API version 2025-03-31.
+
+    A call to it cannot fail in the suite (the fake never modelled the real endpoint),
+    so only a source-level check can keep it from creeping back in — the previous
+    implementation looked perfectly healthy in CI while being incapable of billing
+    anything at all. Matching call syntax rather than the bare name leaves the history
+    describable in prose.
+    """
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parents[2] / "app"
+    offenders = [
+        str(p.relative_to(app_dir))
+        for p in app_dir.rglob("*.py")
+        if "create_usage_record(" in p.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
 
 
 # --- Stripe TEST-mode posture wiring (never sk_live_, never hardcoded) ------- #

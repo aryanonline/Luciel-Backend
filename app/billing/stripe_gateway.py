@@ -59,20 +59,30 @@ class CheckoutSession:
     session_id: str
 
 
-@dataclass(frozen=True)
-class UsageRecord:
-    """One accepted metered-usage report (§3.4.1b). Quantity is 100-conversation
-    blocks, never a dollar amount — Stripe multiplies by the metered price."""
+METER_EVENT_NAME = "luciel_payg_blocks"
+"""``event_name`` of the Stripe Billing Meter every PAYG usage event is posted to.
 
-    subscription_id: str
-    quantity: int
-    idempotency_key: str
-    # The metered price the reported-against subscription item is bound to. Carried so a
-    # test can prove the configured price actually reached the report rather than the
-    # quantity landing against whatever price happened to be on the subscription.
-    price_id: str = ""
-    # "set" | "increment" — how Stripe folds this quantity into the period total.
-    action: str = "set"
+Ops creates the meter with exactly this ``event_name`` and binds the PAYG price to it;
+the name is the contract between the two, so it lives here rather than in config — a
+per-environment override would silently meter into a meter no price reads.
+"""
+
+
+@dataclass(frozen=True)
+class MeterEvent:
+    """One accepted Billing Meter event (§3.4.1b).
+
+    ``value`` is a DELTA of 100-conversation blocks, never a period total and never a
+    dollar amount: meter events are additive, so Stripe sums every event in the period
+    and multiplies by the meter-backed price.
+    """
+
+    event_name: str
+    customer_id: str
+    value: int
+    # Stripe dedupes on this within the meter's window, so it is the thing that makes a
+    # retry after a timeout safe. See ``metering.meter_event_identifier``.
+    identifier: str
 
 
 def payg_price_id() -> str:
@@ -117,24 +127,25 @@ class StripeGateway(Protocol):
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
         """Return the customer's PAYG metered subscription id, creating it if absent.
 
-        Called the first time a tenant has billable overage (§3.4.1b): usage can only
-        be reported against a subscription item, so the subscription must exist before
-        the first report. Returns None when the platform has no metered price bound —
-        the caller then reports nothing rather than guessing at a price."""
+        Still required under Billing Meters: the meter accumulates the usage, but it is
+        the subscription on the meter-backed price that turns that usage into an invoice
+        line. Called the first time a tenant has billable overage (§3.4.1b). Returns None
+        when the platform has no metered price bound — the caller then reports nothing
+        rather than guessing at a price."""
         ...
 
-    async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
-    ) -> bool:
-        """Report metered usage for the period. Idempotent on ``idempotency_key``
-        (HARD CONSTRAINT #3, §3.4.1b): a retry with the same key never double-bills.
-        Returns True if this call reported new usage, False if it was a dedup no-op.
+    async def report_meter_event(self, *, customer_id: str, value: int, identifier: str) -> bool:
+        """Post ``value`` blocks to the :data:`METER_EVENT_NAME` meter for the customer.
 
-        ``quantity`` is the period-CUMULATIVE block count, so ``action`` must stay
-        ``"set"``. It is an explicit parameter rather than a hardcoded literal because
-        Stripe's default is ``increment``: under increment, posting 1 then 2 then 3
-        bills 6 blocks for 3 blocks of usage, and the error grows with usage. The
-        parameter is what lets the fake model both and a test pin the difference."""
+        Meter events are ADDITIVE — Stripe sums every event in the period — so ``value``
+        is the DELTA since the last accepted report, never the period total. Posting a
+        cumulative total here would invoice 1+2+3 = 6 blocks for 3 blocks of usage.
+
+        Idempotent on ``identifier`` (HARD CONSTRAINT #3, §3.4.1b): Stripe rejects a
+        second event carrying an identifier it has already accepted, which is what makes
+        a retry after a timeout safe. Returns True when this call reported new usage,
+        False when it was deduped — both mean Stripe now holds the value, so the caller
+        may advance its watermark. A raise means it may not."""
         ...
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
@@ -215,6 +226,18 @@ def _parse_signature_header(header: str) -> tuple[str | None, list[str]]:
     return ts, v1
 
 
+def _is_duplicate_meter_event(exc: BaseException) -> bool:
+    """True when Stripe rejected a meter event because it already has that identifier.
+
+    Matched on the message because stripe-python surfaces this as a generic
+    ``InvalidRequestError`` with no dedicated error code to key on. Deliberately narrow:
+    anything that is not recognizably the duplicate rejection must propagate, because
+    swallowing a real failure here would advance the watermark past usage Stripe never
+    received — silently un-billing it.
+    """
+    return "already exists" in str(exc).lower()
+
+
 class FakeStripeGateway:
     """Deterministic in-process Stripe fake used by ALL tests (objective #1).
 
@@ -230,8 +253,10 @@ class FakeStripeGateway:
     def __init__(self, *, webhook_secret: str | None = None) -> None:
         # customer_id -> display tuple (or None when no card attached).
         self._cards: dict[str, PaymentMethodDisplay | None] = {}
-        # idempotency_key -> reported (dedup ledger so retries never double-bill).
-        self._usage_keys: set[str] = set()
+        # Meter-event identifiers Stripe has already accepted (dedup ledger so retries
+        # never double-bill). Additive events make this load-bearing: without it a retry
+        # after a timeout adds its value a second time.
+        self._event_identifiers: set[str] = set()
         # A provisioned secret WINS over the published constant, so an environment that
         # runs the fake gateway but has a real whsec_ in its platform secret still only
         # accepts events Stripe actually signed. Tests pass nothing and keep the constant.
@@ -240,14 +265,14 @@ class FakeStripeGateway:
         self._subscriptions: dict[str, str] = {}
         # subscription id -> the metered price it was bound to at creation.
         self._subscription_prices: dict[str, str] = {}
-        # Every usage record accepted, in order — the assertion surface for tests that
+        # Every meter event accepted, in order — the assertion surface for tests that
         # need to prove usage was reported at the right threshold, not just that the
         # call did not raise.
-        self.usage_records: list[UsageRecord] = []
-        # subscription id -> the quantity Stripe would BILL, after applying each
-        # record's action. Recording the calls alone hid a geometric overcharge: the
-        # caller posts a cumulative quantity, and under Stripe's default increment
-        # action those cumulative postings sum. See :meth:`billed_quantity`.
+        self.meter_events: list[MeterEvent] = []
+        # customer_id -> the blocks Stripe would BILL, i.e. the running SUM of accepted
+        # event values. Recording the calls alone cannot catch an over-bill: the
+        # per-call values can each be right while the total is wrong.
+        # See :meth:`billed_quantity`.
         self._billed_quantity: dict[str, int] = {}
 
     async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
@@ -282,37 +307,41 @@ class FakeStripeGateway:
         self._subscription_prices[sub_id] = price_id
         return sub_id
 
-    async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
-    ) -> bool:
-        # HARD CONSTRAINT #3 (§3.4.1b): idempotent on the key — a redelivery / retry
-        # with the same (period, quantity) key is a no-op, never a double-bill.
-        if idempotency_key in self._usage_keys:
+    async def report_meter_event(self, *, customer_id: str, value: int, identifier: str) -> bool:
+        # HARD CONSTRAINT #3 (§3.4.1b): idempotent on the identifier — a retry after a
+        # timeout is a no-op, never a second addition to the meter.
+        if identifier in self._event_identifiers:
             return False
-        self._usage_keys.add(idempotency_key)
-        self.usage_records.append(
-            UsageRecord(
-                subscription_id=subscription_id,
-                quantity=quantity,
-                idempotency_key=idempotency_key,
-                # Mirrors the real path, where usage attaches to the subscription ITEM
-                # the price created — so the recorded price is the one that will bill.
-                price_id=self._subscription_prices.get(subscription_id, payg_price_id()),
-                action=action,
+        self._event_identifiers.add(identifier)
+        self.meter_events.append(
+            MeterEvent(
+                event_name=METER_EVENT_NAME,
+                customer_id=customer_id,
+                value=value,
+                identifier=identifier,
             )
         )
-        # Apply Stripe's own semantics so the invoice total is assertable.
-        if action == "increment":
-            self._billed_quantity[subscription_id] = (
-                self._billed_quantity.get(subscription_id, 0) + quantity
-            )
-        else:
-            self._billed_quantity[subscription_id] = quantity
+        # Meter semantics: ADDITIVE. Modelling this is what lets a test assert the
+        # invoice total rather than merely the sequence of calls.
+        self._billed_quantity[customer_id] = self._billed_quantity.get(customer_id, 0) + value
         return True
 
-    def billed_quantity(self, subscription_id: str) -> int:
-        """The blocks Stripe would invoice for ``subscription_id`` this period."""
-        return self._billed_quantity.get(subscription_id, 0)
+    def billed_quantity(self, customer_id: str) -> int:
+        """The blocks Stripe would invoice for ``customer_id`` this period.
+
+        Keyed on the CUSTOMER, like the meter events themselves — a meter accumulates
+        per customer, not per subscription.
+        """
+        return self._billed_quantity.get(customer_id, 0)
+
+    def subscription_price(self, subscription_id: str) -> str:
+        """The meter-backed price the subscription was created against.
+
+        The price no longer appears on the usage event (the meter carries the usage), so
+        this is what proves the operator-configured price is actually consumed rather
+        than merely validated — a subscription on the wrong price is a wrong invoice.
+        """
+        return self._subscription_prices.get(subscription_id, "")
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:
         return self._cards.get(customer_id)
@@ -394,7 +423,12 @@ class RealStripeGateway:
         return CheckoutSession(url=str(session["url"]), session_id=str(session["id"]))
 
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
-        """Find or create the customer's PAYG metered subscription.
+        """Find or create the customer's PAYG meter-backed subscription.
+
+        The meter accumulates the usage; this subscription is what invoices it, so it is
+        still required. ``payg_price_id()`` must name a price backed by the
+        :data:`METER_EVENT_NAME` meter — no quantity is set on the item, because the
+        meter supplies it.
 
         With no metered price configured we return None and the caller reports nothing
         rather than creating a subscription against a guessed price (a wrong price is
@@ -416,27 +450,33 @@ class RealStripeGateway:
         )
         return str(created["id"])
 
-    async def report_metered_usage(
-        self, *, subscription_id: str, quantity: int, idempotency_key: str, action: str = "set"
-    ) -> bool:
+    async def report_meter_event(self, *, customer_id: str, value: int, identifier: str) -> bool:
+        """POST /v1/billing/meter_events — the only usage API that still exists.
+
+        This used to post to the usage-records endpoint on the subscription item, with
+        an explicit ``action="set"`` because the value sent was a period-cumulative
+        total. That endpoint is REMOVED as of API version 2025-03-31 "basil", which the
+        platform account is pinned to: a metered price must now be backed by a Billing
+        Meter (creating one without a meter is refused outright), and usage is reported
+        as meter events. The old call could therefore never have billed anything — the
+        "test" posture was broken for as long as it stood.
+        """
         client = self._get_client()
-        # Usage attaches to the subscription ITEM, not the subscription: resolve the
-        # single metered item before reporting (the prior code passed the subscription
-        # id straight to SubscriptionItem, which Stripe rejects).
-        sub = client.Subscription.retrieve(subscription_id)  # type: ignore[attr-defined]
-        sub_items = sub["items"] if "items" in sub else None
-        rows = sub_items["data"] if sub_items and "data" in sub_items else []
-        if not rows:
+        try:
+            client.billing.MeterEvent.create(  # type: ignore[attr-defined]
+                event_name=METER_EVENT_NAME,
+                # Stripe requires payload values to be strings, including the numeric one.
+                payload={"stripe_customer_id": customer_id, "value": str(value)},
+                identifier=identifier,
+            )
+        except Exception as exc:  # noqa: BLE001 — narrowed by the predicate below
+            if not _is_duplicate_meter_event(exc):
+                raise
+            # Stripe already holds this event. Reporting it as a dedup rather than a
+            # failure is what lets the caller advance its watermark: treating it as a
+            # failure would retry the same spent identifier forever and every later
+            # block would go unbilled behind it.
             return False
-        client.SubscriptionItem.create_usage_record(  # type: ignore[attr-defined]
-            str(rows[0]["id"]),
-            quantity=quantity,
-            idempotency_key=idempotency_key,
-            # NOT optional. ``quantity`` is the period-cumulative block count and
-            # Stripe's default action is increment, which would sum every cumulative
-            # posting: 1 + 2 + 3 invoices 6 blocks for 3 blocks of usage.
-            action=action,
-        )
         return True
 
     async def get_payment_method(self, *, customer_id: str) -> PaymentMethodDisplay | None:

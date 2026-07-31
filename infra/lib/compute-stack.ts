@@ -259,6 +259,11 @@ export class ComputeStack extends Stack {
           LUCIEL_PLANE: name,
           // Integrations remain MOCK until a gated cutover flips them (GATE 2).
           LUCIEL_INTEGRATION_MODE: integrationMode,
+          // The Stripe seam has its OWN posture, one level down from the LLM cutover,
+          // so Stripe can move to real TEST-mode calls without flipping the LLM flag.
+          // Set on BOTH planes: the data plane reports usage on the conversation path
+          // and the control plane serves the billing webhook and card routes.
+          LUCIEL_STRIPE_INTEGRATION_POSTURE: envConfig.stripeIntegrationPosture,
           // Redis-backed LLM cap (§9 C9). Same URL on both planes (makeTaskDef is
           // called for data-plane + control-plane). App reads it as redis_url.
           LUCIEL_REDIS_URL: redisUrl,
@@ -475,6 +480,10 @@ export class ComputeStack extends Stack {
         LUCIEL_ENV: envConfig.envName,
         LUCIEL_PLANE: 'sweep',
         LUCIEL_INTEGRATION_MODE: integrationMode,
+        // MUST match the app planes. The usage_reconcile sweep posts meter events and
+        // advances the billing watermark; if it resolved a different gateway than the
+        // app, it would mark blocks reported that Stripe never received.
+        LUCIEL_STRIPE_INTEGRATION_POSTURE: envConfig.stripeIntegrationPosture,
         LUCIEL_REDIS_URL: redisUrl,
       },
     });

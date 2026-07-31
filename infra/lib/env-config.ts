@@ -82,6 +82,21 @@ export interface EnvConfig {
    * `-c paused=true` (applied in bin/luciel-infra.ts). See infra/PAUSE.md.
    */
   readonly paused: boolean;
+  /**
+   * Which Stripe binding the app resolves (`LUCIEL_STRIPE_INTEGRATION_POSTURE`).
+   *
+   * 'mock' is the deterministic in-process FakeStripeGateway - no keys read, no network
+   * possible. 'test' binds the real stripe-python client against the Stripe TEST keys
+   * (sk_test_/pk_test_/whsec_) from the platform secret. There is deliberately no
+   * 'live' value: binding a production Stripe key is owner-gated and NOT implemented by
+   * this seam, so prod stays on 'mock' and /healthz reports the gateway as degraded -
+   * which is the honest answer, rather than a posture that implies real billing works.
+   *
+   * Reporting usage in 'test' posture requires a Stripe Billing Meter with event_name
+   * `luciel_payg_blocks` and a price backed by it; the usage-records endpoint the seam
+   * used before is removed in API version 2025-03-31 'basil'.
+   */
+  readonly stripeIntegrationPosture: 'mock' | 'test';
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -95,6 +110,7 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     logRetention: logs.RetentionDays.ONE_MONTH,
     redisSnapshotRetentionDays: 0,
     paused: false,
+    stripeIntegrationPosture: 'test',
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate
@@ -114,6 +130,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     logRetention: logs.RetentionDays.ONE_WEEK,
     redisSnapshotRetentionDays: 0,
     paused: false,
+    // Prod-shaped in sizing, but the Stripe rehearsal runs against TEST keys - preprod
+    // must never move money, and 'live' is not a value this seam accepts anyway.
+    stripeIntegrationPosture: 'test',
   },
   prod: {
     envName: 'prod',
@@ -125,6 +144,10 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     logRetention: logs.RetentionDays.THREE_MONTHS, // doctrine §5.1: 90d app logs
     redisSnapshotRetentionDays: 0,
     paused: false,
+    // NOT 'test': prod must not bill against a Stripe test account, and the live
+    // cutover is owner-gated and unimplemented. 'mock' keeps prod honest - /healthz
+    // lists the gateway as degraded rather than implying billing reaches Stripe.
+    stripeIntegrationPosture: 'mock',
   },
 };
 
