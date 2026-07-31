@@ -54,13 +54,24 @@ def _resolve_ips(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
-def is_egress_allowed(url: str, allowlist: frozenset[str]) -> bool:
-    """Allow only allowlisted hosts whose RESOLVED IPs are public (anti-rebinding)."""
+def resolves_to_public_host(url: str) -> bool:
+    """http(s) URL whose host resolves ONLY to public addresses (§3.8.6 SSRF controls).
+
+    The allowlist-free half of the webhook envelope, split out because the website-crawl
+    knowledge source needs exactly this and nothing else: an admin may legitimately crawl
+    any public site they own, so there is no allowlist to check against, but pointing the
+    crawler at ``169.254.169.254`` must still be refused. That source's fetched body is
+    readable back through ``GET /sources/{id}/chunks``, which makes an unguarded fetch an
+    exfiltration channel rather than a blind SSRF (P1-4).
+
+    EVERY resolved address must be public: a host answering with one public and one
+    link-local address is refused, because which one a later connect() picks is not ours.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False
     host = parsed.hostname or ""
-    if host not in allowlist:
+    if not host:
         return False
     try:
         ips = _resolve_ips(host)
@@ -74,6 +85,13 @@ def is_egress_allowed(url: str, allowlist: frozenset[str]) -> bool:
             if addr.version == net.version and addr in net:
                 return False
     return True
+
+
+def is_egress_allowed(url: str, allowlist: frozenset[str]) -> bool:
+    """Allow only allowlisted hosts whose RESOLVED IPs are public (anti-rebinding)."""
+    if (urlparse(url).hostname or "") not in allowlist:
+        return False
+    return resolves_to_public_host(url)
 
 
 @dataclass

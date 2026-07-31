@@ -430,7 +430,9 @@ async def create_sync_connection(
         if req.provider == "website_crawl":
             if not req.crawl_urls:
                 raise validation_error("website_crawl requires crawl_urls.")
-            connection.non_secret_config = {"crawl_urls": req.crawl_urls}
+            # Stored as strings: the column is JSONB, and the HttpUrl typing did its
+            # work at the boundary.
+            connection.non_secret_config = {"crawl_urls": [str(u) for u in req.crawl_urls]}
             connection.status = "connected"  # no OAuth — nothing to authorize
             connection.status_detail = None
             await s.flush()

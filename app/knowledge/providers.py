@@ -38,7 +38,7 @@ from typing import Protocol
 import httpx
 
 from app.config import get_settings
-from app.connections import registry
+from app.connections import registry, sandbox
 from app.connections.registry import oauth_client_config
 from app.connections.secrets import SecretStore, secret_ref_for
 from app.knowledge import scope
@@ -483,9 +483,18 @@ class WebsiteCrawlProvider:
 
     async def _fetch_one(self, url: str) -> str:
         if self._transport is not None:
+            # An injected transport is a seam trusted code chose, not a socket this
+            # process opens against a tenant-supplied host.
             resp = await self._transport.get(url)
             body = resp.text
         else:
+            # SSRF gate immediately before the real connect, and re-derived on every
+            # sync rather than trusted from create time: the DNS answer for a host the
+            # admin registered last month is not the one it gives today. The crawled
+            # body is readable back through GET /sources/{id}/chunks, so an unguarded
+            # fetch is an exfiltration channel, not a blind SSRF (P1-4).
+            if not sandbox.resolves_to_public_host(url):
+                raise ProviderUnavailable(f"crawl URL is not a public http(s) address: {url}")
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()

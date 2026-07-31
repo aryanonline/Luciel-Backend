@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from pydantic import HttpUrl
+
 from app.schemas_api.common import WireModel
 
 KnowledgeSourceOriginWire = Literal[
@@ -74,7 +76,12 @@ class CreateSyncConnectionRequest(WireModel):
     """
 
     provider: KnowledgeSyncProviderWire
-    crawl_urls: list[str] | None = None
+    # HttpUrl, not str: the crawler fetches these and the body is readable back through
+    # the chunks endpoint, so ``file:///etc/passwd`` must fail at the boundary with a 422
+    # rather than reach the fetch path at all (P1-4). The runtime SSRF gate in
+    # ``WebsiteCrawlProvider`` is the other half — this one cannot check DNS, and DNS is
+    # what changes between registration and the next sync.
+    crawl_urls: list[HttpUrl] | None = None
 
 
 class SyncConnectionOut(WireModel):
