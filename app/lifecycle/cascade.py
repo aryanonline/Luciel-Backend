@@ -220,6 +220,11 @@ async def close_account(
     ).scalar_one_or_none()
     if acct is not None:
         acct.state = AccountState.closed
+        # Revoke every live session (P1-5). The account row outlives closure by 30 days
+        # (§3.6.6), so without the bump a cookie minted before closure stays valid against
+        # the whole admin surface until it happens to expire — on every device, not just
+        # the one that clicked close.
+        acct.session_epoch += 1
     await session.flush()
     await audit.emit(
         session,

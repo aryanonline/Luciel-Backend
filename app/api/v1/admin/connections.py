@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Subject, current_admin
+from app.api.deps import CLOSED_ACCOUNT_STATES, Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
 from app.audit import log as audit
 from app.channels import routing
@@ -46,7 +46,7 @@ from app.knowledge.providers import (
 )
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
-from app.models.instance import Instance
+from app.models.instance import Account, Instance
 from app.schemas_api.connections import (
     BindDestinationRequest,
     ConnectionOut,
@@ -438,6 +438,14 @@ async def complete_oauth_connect(
     leaving the owner staring at an error and a connection that claimed nothing was wrong.
     """
     async with tenant_session(admin_id) as s:
+        # Account state, checked here rather than only at the router (P1-5). The GET
+        # callback is entered by the PROVIDER's redirect and carries no session, so
+        # ``current_admin`` never runs on it: a consent screen opened before closure could
+        # otherwise be completed after it, writing fresh credentials into Secrets Manager
+        # for a tenant whose secrets the deletion cascade has already swept.
+        acct = (await s.execute(select(Account).where(Account.id == admin_id))).scalar_one_or_none()
+        if acct is None or acct.state in CLOSED_ACCOUNT_STATES:
+            raise OAuthStateRejected("Account is closed; the connection cannot be completed.")
         conn = await _tenant_connection(s, admin_id, connection_id)
         spec = registry.get_provider(conn.provider)
         if spec is None or not spec.is_oauth:

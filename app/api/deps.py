@@ -20,6 +20,14 @@ from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.instance import Account, AccountState
 
+#: Account states that must not reach the admin surface at all (P1-5). ``closed`` is the
+#: one that bites: the row survives its 30-day recovery window (§3.6.6), so without this
+#: a closed account keeps working until the cookie happens to expire. ``pending_deletion``
+#: is not set anywhere yet — listing it now is what stops the same hole reopening the day
+#: something does set it. Note the Luciel grace window lives on the INSTANCE state, not
+#: here, so restore-my-Luciel access is untouched.
+CLOSED_ACCOUNT_STATES = frozenset({AccountState.closed, AccountState.pending_deletion})
+
 
 @dataclass
 class Subject:
@@ -74,9 +82,17 @@ async def current_session_subject(request: Request) -> Subject:
 
 
 async def current_admin(request: Request) -> Subject:
-    """Gated dependency: valid session AND verified account; else 403 (→ unauthorized)."""
+    """Gated dependency: valid session AND verified, non-closed account.
+
+    Closure is checked here and not only via the epoch bump in ``close_account``: the
+    epoch revokes the tokens that exist at closure time, this refuses the ones minted
+    afterwards (login still authenticates a closed account so the owner can be told
+    what state they are in).
+    """
     subject = await current_session_subject(request)
     acct = await _load_account(subject)
+    if acct.state in CLOSED_ACCOUNT_STATES:
+        raise forbidden("Account closed.")
     if acct.state == AccountState.unverified or not acct.email_verified:
         raise forbidden("Email verification required.")
     return subject

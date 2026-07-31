@@ -68,8 +68,11 @@ async def test_meta_verify_rejects_an_absent_token_even_with_an_unset_secret(tok
     class Req:
         query_params = {
             k: v
-            for k, v in {"hub.mode": "subscribe", "hub.verify_token": token, "hub.challenge": "c"}
-            .items()
+            for k, v in {
+                "hub.mode": "subscribe",
+                "hub.verify_token": token,
+                "hub.challenge": "c",
+            }.items()
             if v is not None
         }
 
