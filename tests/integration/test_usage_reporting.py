@@ -20,6 +20,7 @@ from app.db.session import tenant_session
 from app.models.budget import ConversationBudget
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime.budget import current_billing_period_start
+from sqlalchemy import update
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -109,6 +110,18 @@ async def _report(admin: uuid.UUID, iid: uuid.UUID) -> int:
         return await metering.report_usage_after_count(s, admin_id=admin, instance_id=iid)
 
 
+async def _set_counted(admin: uuid.UUID, iid: uuid.UUID, counted: int) -> None:
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(ConversationBudget)
+            .where(
+                ConversationBudget.admin_id == admin,
+                ConversationBudget.instance_id == iid,
+            )
+            .values(counted_conversations=counted)
+        )
+
+
 # --- the thresholds -------------------------------------------------------- #
 
 
@@ -134,13 +147,17 @@ async def test_conversation_fifty_one_reports_the_first_block(
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_nothing_reported_partway_through_a_block(gateway: FakeStripeGateway) -> None:
-    """The block is already paid for; re-reporting every conversation would be a
-    pointless Stripe call per turn."""
+async def test_nothing_reported_partway_through_an_already_reported_block(
+    gateway: FakeStripeGateway,
+) -> None:
+    """Stripe already has this total; re-posting it every conversation would be a
+    pointless call per turn. The watermark, not the boundary, is what suppresses it."""
     admin = uuid.uuid4()
-    iid = await _seed(admin, counted=52, subscription_id="sub_test")
+    iid = await _seed(admin, counted=51, subscription_id="sub_test")
+    assert await _report(admin, iid) == 1
+    await _set_counted(admin, iid, 52)
     assert await _report(admin, iid) == 0
-    assert gateway.usage_records == []
+    assert [r.quantity for r in gateway.usage_records] == [1]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -157,30 +174,17 @@ async def test_conversation_one_fifty_one_reports_the_second_block(
 async def test_a_retry_at_the_same_boundary_never_double_bills(
     gateway: FakeStripeGateway,
 ) -> None:
-    """HARD CONSTRAINT #3: the (period, quantity) key makes a retried report a no-op,
-    which is what lets the runtime swallow a Stripe failure and recover later."""
+    """HARD CONSTRAINT #3: a retried report must never bill twice. The watermark now
+    stops the second call before it reaches Stripe at all; the (period, quantity)
+    idempotency key remains the backstop underneath it."""
     admin = uuid.uuid4()
     iid = await _seed(admin, counted=51, subscription_id="sub_test")
     assert await _report(admin, iid) == 1
-    assert await _report(admin, iid) == 1  # same quantity reported back to the caller
-    assert len(gateway.usage_records) == 1  # but only ONE accepted record
+    assert await _report(admin, iid) == 0  # Stripe already has this total
+    assert len(gateway.usage_records) == 1  # ONE accepted record
 
 
 # --- what Stripe actually invoices (P0-3) ---------------------------------- #
-
-
-async def _set_counted(admin: uuid.UUID, iid: uuid.UUID, counted: int) -> None:
-    from sqlalchemy import update
-
-    async with tenant_session(admin) as s:
-        await s.execute(
-            update(ConversationBudget)
-            .where(
-                ConversationBudget.admin_id == admin,
-                ConversationBudget.instance_id == iid,
-            )
-            .values(counted_conversations=counted)
-        )
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -352,3 +356,123 @@ async def test_a_stripe_failure_never_breaks_the_lead_s_turn() -> None:
         assert await _report(admin, iid) == 0  # swallowed, not raised
     finally:
         set_stripe_gateway(None)
+
+
+# --- the watermark (P1-12 / P1-13) ------------------------------------------- #
+
+
+class _FlakyGateway:
+    """Wraps the fake and fails the first N posts, the way a Stripe blip would."""
+
+    def __init__(self, inner: FakeStripeGateway, failures: int) -> None:
+        self._inner = inner
+        self._failures = failures
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    async def report_metered_usage(self, **kwargs):
+        if self._failures > 0:
+            self._failures -= 1
+            raise RuntimeError("stripe unavailable")
+        return await self._inner.report_metered_usage(**kwargs)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_stripe_blip_at_the_boundary_does_not_lose_the_block(
+    gateway: FakeStripeGateway,
+) -> None:
+    """Reporting used to fire only on the exact boundary conversation and swallow the
+    error, so a blip at conversation 151 lost block 2 for good — nothing recorded that a
+    report was owed and nothing came back for it. The next turn must retry.
+    """
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=151, subscription_id="sub_test")
+
+    set_stripe_gateway(_FlakyGateway(gateway, failures=1))
+    assert await _report(admin, iid) == 0  # the blip, swallowed
+    assert gateway.usage_records == []
+
+    set_stripe_gateway(gateway)
+    await _set_counted(admin, iid, 152)  # an ordinary turn, not a boundary
+    assert await _report(admin, iid) == 2
+    assert [r.quantity for r in gateway.usage_records] == [2]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_reconcile_sweep_bills_a_tenant_who_stopped_conversing(
+    gateway: FakeStripeGateway,
+) -> None:
+    """The per-turn retry only helps if there is a next turn. A tenant who crosses a
+    block, hits a blip, and goes quiet needs the sweep or the block is never billed."""
+    from app.jobs import sweeps
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=151, subscription_id="sub_test")
+
+    set_stripe_gateway(_FlakyGateway(gateway, failures=1))
+    assert await _report(admin, iid) == 0
+    set_stripe_gateway(gateway)
+
+    assert await sweeps.run_usage_reconcile() == [str(admin)]
+    assert [r.quantity for r in gateway.usage_records] == [2]
+    # Nothing left owing → the second run is a no-op, not a double-bill.
+    assert await sweeps.run_usage_reconcile() == []
+    assert gateway.billed_quantity("sub_test") == 2
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_detaching_a_card_bills_the_overage_already_run(
+    gateway: FakeStripeGateway,
+) -> None:
+    """build_budget reports zero blocks without a live card and report_usage refuses a
+    non-payg account, so 250 conversations followed by a card detach voided two real
+    blocks — a free-usage path anyone could take deliberately."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=250, subscription_id="sub_test")
+    async with tenant_session(admin) as s:
+        await metering.report_usage(s, admin_id=admin, instance_id=iid, gateway=gateway)
+    assert gateway.billed_quantity("sub_test") == 2
+
+    # They run one more block, then pull the card before the invoice.
+    await _set_counted(admin, iid, 260)
+    async with tenant_session(admin) as s:
+        await metering.report_usage(s, admin_id=admin, instance_id=iid, gateway=gateway)
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(event_id="evt_detach_bill", type="payment_method.detached", data={}),
+        )
+
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.billing_state == "free_cap"
+        assert acct.accrued_blocks == 3  # ceil(210/100)
+        assert acct.last_reported_blocks == 3
+    assert gateway.billed_quantity("sub_test") == 3  # not voided by the detach
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_new_period_starts_owing_stripe_nothing(gateway: FakeStripeGateway) -> None:
+    """The watermark is period-scoped like the counter: the invoice settled everything
+    reported, so leaving it set would suppress the new period's first real block."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=151, subscription_id="sub_test")
+    assert await _report(admin, iid) == 2
+
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(event_id="evt_new_period", type="invoice.paid", data={}),
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (0, 0)

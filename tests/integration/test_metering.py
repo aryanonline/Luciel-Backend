@@ -245,7 +245,7 @@ async def test_idempotent_metered_reporting_no_double_bill() -> None:
     async with tenant_session(admin) as s:
         q2 = await metering.report_usage(s, admin_id=admin, instance_id=iid, gateway=gw)
     assert q1 == 2  # 2 blocks
-    assert q2 == 2  # same quantity reported, but gateway deduped the key
+    assert q2 == 0  # nothing new owed, so Stripe is not called again
     # Exactly one idempotency key recorded → no double-bill.
     assert len(gw._usage_keys) == 1
 

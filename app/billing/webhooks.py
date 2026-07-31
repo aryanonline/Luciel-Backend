@@ -19,6 +19,7 @@ Events handled:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -27,7 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
-from app.billing import dunning
+from app.billing import dunning, metering
 from app.billing.metering import get_or_create_billing_account
 from app.billing.stripe_gateway import StripeEvent
 from app.models.audit import ActorType
@@ -35,6 +36,8 @@ from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.notifications import notifier as notify
+
+_log = logging.getLogger(__name__)
 
 
 async def _claim_event(session: AsyncSession, *, admin_id: uuid.UUID, event_id: str) -> bool:
@@ -52,7 +55,7 @@ async def _claim_event(session: AsyncSession, *, admin_id: uuid.UUID, event_id: 
         .values(admin_id=admin_id, event_id=event_id, processed_at=datetime.now(UTC))
         .on_conflict_do_nothing(index_elements=["event_id"])
     )
-    return bool(claimed.rowcount)
+    return bool(claimed.rowcount)  # type: ignore[attr-defined]
 
 
 async def handle_event(
@@ -117,6 +120,11 @@ async def _on_invoice_paid(
     # The fire-once guard is keyed on the period too, so its rows are spent along with
     # the counter they guarded — leaving them would only accumulate.
     await session.execute(delete(CountedSession).where(CountedSession.admin_id == admin_id))
+
+    # The usage watermark is period-scoped like the counter: the invoice just settled
+    # everything reported so far, so the new period starts owing Stripe nothing.
+    account.accrued_blocks = 0
+    account.last_reported_blocks = 0
 
     # A successful payment clears any dunning sequence (CJ §6).
     prev_dunning = account.dunning_state
@@ -303,6 +311,15 @@ async def _on_pm_detached(
     Also sends action-tool connections dormant (Legal §A3: losing a payment
     method reverts to free-cap behavior AND "Action-tool connections go dormant").
     """
+    # Bill what they already ran BEFORE the account stops looking billable: once
+    # billing_state is free_cap, build_budget reports zero blocks and report_usage
+    # refuses the account, so any accrued overage would simply vanish (P1-13).
+    try:
+        await metering.report_accrued_usage(session, admin_id=admin_id)
+    except Exception:  # noqa: BLE001 — a Stripe blip must not strand the detach event
+        # The watermark is unmoved, so the reconcile sweep picks this tenant up again.
+        _log.exception("accrued usage flush failed at detach", extra={"admin_id": str(admin_id)})
+
     prev_billing_state = account.billing_state
     account.billing_state = "free_cap"
     account.pm_brand = None

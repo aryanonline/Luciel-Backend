@@ -187,7 +187,7 @@ async def count_session_once(
             index_elements=["admin_id", "instance_id", "session_id", "billing_period_start"]
         )
     )
-    if claimed.rowcount == 0:  # another turn already counted this session
+    if claimed.rowcount == 0:  # type: ignore[attr-defined]  # another turn already counted this session
         return False
 
     await session.execute(

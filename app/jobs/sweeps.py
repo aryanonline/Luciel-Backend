@@ -13,6 +13,9 @@ entrypoints EventBridge Scheduler invokes (see ``infra/lib/compute-stack.ts``).
   * ``grace_expiry`` — fire the delete cascade at day 30 of the grace window (§B5).
   * ``close_purge``  — destroy a closed account's shell after its 30-day window (§B5).
   * ``dunning``      — day-7 retrying → reduced when Stripe retries go quiet (§A3).
+  * ``usage_reconcile`` — post any billable block Stripe has not been told about yet
+                       (§3.4.1b); the backstop for a tenant who crossed a block, hit a
+                       Stripe blip, and then stopped conversing.
 
 Two invariants every sweep holds:
 
@@ -34,8 +37,9 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.billing import dunning
+from app.billing import dunning, metering
 from app.db.session import tenant_session, untenanted_session
 from app.lifecycle import grace_expiry, retention
 from app.lifecycle.close_purge import purge_closed_account_if_due
@@ -44,8 +48,9 @@ RETENTION = "retention"
 GRACE_EXPIRY = "grace_expiry"
 CLOSE_PURGE = "close_purge"
 DUNNING = "dunning"
+USAGE_RECONCILE = "usage_reconcile"
 
-SWEEP_KINDS: tuple[str, ...] = (RETENTION, GRACE_EXPIRY, CLOSE_PURGE, DUNNING)
+SWEEP_KINDS: tuple[str, ...] = (RETENTION, GRACE_EXPIRY, CLOSE_PURGE, DUNNING, USAGE_RECONCILE)
 
 
 async def sweep_candidates(kind: str) -> list[uuid.UUID]:
@@ -103,9 +108,24 @@ async def run_dunning_transitions(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(DUNNING, dunning.advance_if_due, now)
 
 
+async def _reconcile_usage(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+    return await metering.report_accrued_usage(session, admin_id=admin_id, now=now)
+
+
+async def run_usage_reconcile(*, now: datetime | None = None) -> list[str]:
+    """Post any block Stripe has not been told about yet (§3.4.1b, P1-12).
+
+    The per-turn report is the primary path; this is the backstop for the tenant who
+    crossed a block, hit a Stripe blip, and then stopped conversing — there would be no
+    next turn to retry on, and the block would be lost.
+    """
+    return await _per_tenant(USAGE_RECONCILE, _reconcile_usage, now)
+
+
 SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
     CLOSE_PURGE: run_close_account_purge,
     DUNNING: run_dunning_transitions,
+    USAGE_RECONCILE: run_usage_reconcile,
 }

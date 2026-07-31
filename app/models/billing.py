@@ -58,6 +58,19 @@ class BillingAccount(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # High-water mark of billable 100-blocks accrued in the CURRENT period, and how many
+    # of them Stripe has been told about. Both reset on invoice.paid with the counter.
+    #
+    # accrued_blocks never walks backwards within a period: build_budget reports zero
+    # blocks the moment the card is gone, so without this a tenant who ran 250
+    # conversations and then detached had two real blocks voided.
+    #
+    # last_reported_blocks is what makes a failed report recoverable: reporting is
+    # "post when the accrual exceeds the watermark", so a Stripe blip is retried on the
+    # next turn instead of losing the block forever.
+    accrued_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_reported_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # Display-only payment-method tuple (§3.4.1b). NO PAN — these four fields are
     # the entire card surface the server ever holds or returns.
     pm_brand: Mapped[str | None] = mapped_column(String(32), nullable=True)

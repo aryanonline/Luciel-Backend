@@ -223,18 +223,6 @@ def usage_idempotency_key(*, admin_id: uuid.UUID, period_start: date, quantity: 
     return f"usage:{admin_id}:{period_start.isoformat()}:{quantity}"
 
 
-def crosses_block_boundary(counted: int, free_allowance: int, block_size: int) -> bool:
-    """True when the conversation that brought the count to ``counted`` opened a NEW
-    billable 100-block — i.e. the moment the reportable quantity changes.
-
-    With free=50/block=100 this is true at 51 (block 1) and 151 (block 2) and false in
-    between. Reporting only here keeps one Stripe call per block instead of one per
-    conversation; reporting is idempotent on (period, quantity) either way, so a
-    duplicate is harmless but a per-conversation call would be wasteful."""
-    over = billed_conversations(counted, free_allowance)
-    return over > 0 and over % block_size == 1
-
-
 async def report_usage_after_count(
     session: AsyncSession,
     *,
@@ -242,20 +230,17 @@ async def report_usage_after_count(
     instance_id: uuid.UUID,
     now: datetime | None = None,
 ) -> int:
-    """Report metered usage if the conversation just counted opened a new billable block.
+    """Reconcile this tenant's metered usage against Stripe after a conversation counted.
 
     Called from the runtime immediately after the fire-once counter increments — this is
-    what actually connects the (already correct) metering math to Stripe. A Stripe
-    failure must never fail the lead's turn: the next boundary crossing and the
-    idempotency key make a missed report recoverable, so it is swallowed here.
+    what actually connects the (already correct) metering math to Stripe.
+
+    This used to fire only on the exact boundary conversation, so a Stripe blip at
+    conversation 151 lost block 2 permanently: there was no record that a report was
+    owed and nothing ever came back for it. Reporting is now driven by the persisted
+    watermark instead, which makes every turn a retry opportunity. A Stripe failure
+    must never fail the lead's turn, so it is still swallowed here.
     """
-    settings = get_settings()
-    now = now or datetime.now(UTC)
-    budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
-    if not crosses_block_boundary(
-        budget.conversations_this_period, settings.free_allowance, settings.payg_block_size
-    ):
-        return 0
     try:
         return await report_usage(session, admin_id=admin_id, instance_id=instance_id, now=now)
     except Exception:  # noqa: BLE001 — never let billing break a conversation
@@ -272,22 +257,28 @@ async def report_usage(
 ) -> int:
     """Report this period's billed blocks to Stripe metered usage, idempotently.
 
-    Returns the quantity reported (billed blocks). A no-op (returns 0) when there
-    is no live subscription or nothing is billable. Reporting is keyed by
+    Returns the quantity reported (billed blocks), or 0 when Stripe is already up to
+    date, there is no live subscription, or nothing is billable. Reporting is keyed by
     (period, quantity) so a retry is deduped by the gateway (HARD CONSTRAINT #3)."""
     gateway = gateway or get_stripe_gateway()
     now = now or datetime.now(UTC)
     account = await get_or_create_billing_account(session, admin_id=admin_id)
 
     budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
-    quantity = budget.billed_blocks
-    if quantity == 0:
-        return 0
+    # The accrual is the period high-water mark, not the current reading: build_budget
+    # returns zero blocks once the card is gone, and blocks already run are still owed.
+    if budget.billed_blocks > account.accrued_blocks:
+        account.accrued_blocks = budget.billed_blocks
+        await session.flush()
 
     # PAYG is what makes usage billable: a free_cap tenant is blocked at the cap
     # instead (Vision §7), so there is nothing to meter.
     if account.billing_state != "payg_enabled":
         return 0
+
+    quantity = account.accrued_blocks
+    if quantity <= account.last_reported_blocks:
+        return 0  # Stripe already has this total
 
     if account.stripe_subscription_id is None:
         # First billable block for this tenant: the metered subscription has to exist
@@ -301,14 +292,61 @@ async def report_usage(
         account.stripe_subscription_id = sub_id
         await session.flush()
 
+    return await _post_usage(session, account=account, quantity=quantity, gateway=gateway, now=now)
+
+
+async def _post_usage(
+    session: AsyncSession,
+    *,
+    account: BillingAccount,
+    quantity: int,
+    gateway: StripeGateway,
+    now: datetime,
+) -> int:
+    """Post the period total to Stripe and advance the watermark.
+
+    The watermark moves only after the gateway call returns, so a raising or otherwise
+    failed post leaves the tenant looking behind and the next turn retries it.
+    """
     key = usage_idempotency_key(
-        admin_id=admin_id, period_start=period_start_for(account, now), quantity=quantity
+        admin_id=account.admin_id, period_start=period_start_for(account, now), quantity=quantity
     )
     await gateway.report_metered_usage(
-        subscription_id=account.stripe_subscription_id,
+        subscription_id=str(account.stripe_subscription_id),
         quantity=quantity,
         idempotency_key=key,
         # ``quantity`` is the period total, not the delta since the last report.
         action="set",
     )
+    account.last_reported_blocks = quantity
+    await session.flush()
     return quantity
+
+
+async def report_accrued_usage(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    gateway: StripeGateway | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Flush blocks already accrued this period to Stripe, whatever the card state now is.
+
+    Deliberately does NOT consult ``billing_state``: this is the path that bills a tenant
+    who ran 250 conversations and then detached their card. ``build_budget`` reports zero
+    blocks the moment the card is gone and ``report_usage`` refuses a non-payg account, so
+    without this the two blocks they had already run were silently voided — a free-usage
+    path anyone could take deliberately.
+
+    Needs no instance because the accrual is a per-tenant, per-period total on the account.
+    """
+    gateway = gateway or get_stripe_gateway()
+    now = now or datetime.now(UTC)
+    account = await get_or_create_billing_account(session, admin_id=admin_id)
+    if account.accrued_blocks <= account.last_reported_blocks:
+        return 0
+    if account.stripe_subscription_id is None:
+        return 0  # nothing was ever metered against this tenant
+    return await _post_usage(
+        session, account=account, quantity=account.accrued_blocks, gateway=gateway, now=now
+    )
