@@ -20,6 +20,17 @@ entrypoints EventBridge Scheduler invokes (see ``infra/lib/compute-stack.ts``).
                        (§3.7.1a, Legal §A1). The purge is what releases the email
                        address for signup again, so an unscheduled reaper does not just
                        hoard dead credentials — it permanently blocks the address.
+  * ``deferred``     — retry queued deferred actions and abandon the ones past their 24h
+                       TTL (§3.8.7 rule D). Rule D's promise is that a customer's
+                       follow-up is retried when the connection recovers and, failing
+                       that, abandoned WITH an owner notification. With no worker calling
+                       it, neither half happened: every queued callback sat at attempt 0
+                       forever, which is the silent drop the rule forbids.
+  * ``health``       — re-check every non-revoked connection and transition it (§3.8.5).
+                       The dormant/expired/error states this produces are what the
+                       universal gate reads before it lets a tool run, so an unswept
+                       platform gates on a status that was last true the day the admin
+                       connected.
 
 Two invariants every sweep holds:
 
@@ -45,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import reaper
 from app.billing import dunning, metering
+from app.connections import deferred_queue, health
 from app.db.session import tenant_session, untenanted_session
 from app.lifecycle import grace_expiry, retention
 from app.lifecycle.close_purge import purge_closed_account_if_due
@@ -55,6 +67,8 @@ CLOSE_PURGE = "close_purge"
 DUNNING = "dunning"
 USAGE_RECONCILE = "usage_reconcile"
 UNVERIFIED_REAP = "unverified_reap"
+DEFERRED = "deferred"
+HEALTH = "health"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -63,6 +77,8 @@ SWEEP_KINDS: tuple[str, ...] = (
     DUNNING,
     USAGE_RECONCILE,
     UNVERIFIED_REAP,
+    DEFERRED,
+    HEALTH,
 )
 
 
@@ -148,6 +164,42 @@ async def run_unverified_reap(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(UNVERIFIED_REAP, reaper.reap_account_if_due, now)
 
 
+async def _drain_deferred(
+    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
+) -> dict[str, int] | None:
+    counts = await deferred_queue.run_sweep(
+        session,
+        admin_id=admin_id,
+        deliverer=deferred_queue.ChannelDeliverer(session),
+        now=now,
+    )
+    # ``_per_tenant`` records a tenant as acted-upon only on a truthy result, and the
+    # counts dict is truthy even when every counter is zero.
+    return counts if any(counts.values()) else None
+
+
+async def run_deferred_retry(*, now: datetime | None = None) -> list[str]:
+    """Retry due deferred actions; abandon the ones past 24h with notice (§3.8.7 D)."""
+    return await _per_tenant(DEFERRED, _drain_deferred, now)
+
+
+async def _check_connections(
+    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
+) -> dict[str, str]:
+    return await health.run_health_sweep(
+        session,
+        admin_id=admin_id,
+        probe=health.StoredCredentialProbe(),
+        refresher=health.ReconnectOnExpiry(),
+        now=now,
+    )
+
+
+async def run_connection_health(*, now: datetime | None = None) -> list[str]:
+    """Re-check every tenant's non-revoked connections and transition them (§3.8.5)."""
+    return await _per_tenant(HEALTH, _check_connections, now)
+
+
 SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -155,4 +207,6 @@ SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     DUNNING: run_dunning_transitions,
     USAGE_RECONCILE: run_usage_reconcile,
     UNVERIFIED_REAP: run_unverified_reap,
+    DEFERRED: run_deferred_retry,
+    HEALTH: run_connection_health,
 }

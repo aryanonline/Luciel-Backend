@@ -48,6 +48,8 @@ const SWEEPS = [
   'dunning',
   'usage_reconcile',
   'unverified_reap',
+  'deferred',
+  'health',
 ];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {

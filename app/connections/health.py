@@ -18,12 +18,15 @@ here as healthy yet no successful use within ``DORMANT_AFTER``. It is not dispat
 by the broker and is restored on re-use/re-upgrade. (The downgrade-grace meaning in
 §3.8.4 is the lifecycle side; this worker sets the unused-window side.)
 
-Both the health PROBE and the token REFRESH are behind swappable Protocol seams
-with DETERMINISTIC test impls — NO real provider/OAuth/Secrets-Manager call in this
-arc or in CI (AWS/provider-DEFERRED SEAM, binds on explicit owner approval).
+Both the health PROBE and the token REFRESH are behind swappable Protocol seams, so
+tests drive them deterministically with no provider call. The implementations the
+SCHEDULED sweep binds are ``StoredCredentialProbe`` and ``ReconnectOnExpiry`` below;
+neither talks to a provider either, and each says plainly what it does and does not
+prove rather than reporting an unverified green.
 
-Invocable as a one-shot sweep (``run_health_sweep``) for tests; a real background
-worker just calls this on the auth-class cadence — no live loop needed in CI.
+``run_health_sweep`` is the one-shot pass. Its caller is the ``health`` sweep in
+``app/jobs/sweeps.py`` (P1-8) — before that it had none, which meant the status the
+universal gate consults was last computed the day the admin connected.
 """
 
 from __future__ import annotations
@@ -83,6 +86,59 @@ class TokenRefresher(Protocol):
     async def refresh(
         self, connection: InstanceConnection, store: SecretStore
     ) -> datetime | None: ...
+
+
+class StoredCredentialProbe:
+    """The scheduled sweep's probe: is the credential this connection points at still there?
+
+    This is deliberately NOT a provider liveness call — that seam is still deferred, and
+    binding it would mean one outbound request per connection per sweep against six
+    different providers' rate limits. What it checks instead is the failure the sweep
+    exists to catch and that we can answer authoritatively: a connection whose
+    ``secret_ref`` no longer resolves. That happens after an out-of-band Secrets Manager
+    deletion or a half-finished disconnect, and until now it stayed ``connected``
+    forever, so every use of it failed one at a time in front of a customer.
+
+    A connection with no ``secret_ref`` (``provisioned_resource`` — the platform owns the
+    resource, there is no tenant credential) has nothing to look up and passes.
+
+    The honest boundary: passing means "we still hold a credential", not "the provider
+    accepted it". It never reports a green it has not verified — it just verifies less
+    than the eventual probe will.
+    """
+
+    def __init__(self, store: SecretStore | None = None) -> None:
+        self._store = store
+
+    async def probe(self, connection: InstanceConnection) -> ProbeResult:
+        if not connection.secret_ref:
+            return ProbeResult(ok=True)
+        store = self._store or get_secret_store()
+        try:
+            material = await store.get(connection.secret_ref)
+        except Exception as exc:  # noqa: BLE001
+            # A store outage is not evidence the tenant's credential is gone. Marking
+            # every connection on the platform ``error`` because Secrets Manager blinked
+            # would be a self-inflicted outage, so leave the status alone.
+            return ProbeResult(ok=True, detail=f"probe_skipped:{type(exc).__name__}")
+        if not material:
+            return ProbeResult(ok=False, detail="stored credential is missing — reconnect")
+        return ProbeResult(ok=True)
+
+
+class ReconnectOnExpiry:
+    """The scheduled sweep's refresher: there isn't one, and it says so.
+
+    No provider token endpoint is bound yet, so there is no way to rotate an expiring
+    OAuth token. The choice is between reporting the connection as fine until it dies
+    mid-conversation, or telling the admin 30 minutes early that it needs reconnecting.
+    Returning None takes the second: ``check_connection`` transitions the connection to
+    ``expired`` with "reconnect in dashboard", pauses dependent knowledge sync, and
+    audits the change — an actionable warning instead of a surprise.
+    """
+
+    async def refresh(self, connection: InstanceConnection, store: SecretStore) -> datetime | None:
+        return None
 
 
 def _expiry_of(connection: InstanceConnection) -> datetime | None:

@@ -503,6 +503,21 @@ export class ComputeStack extends Stack {
         cron: 'cron(45 5 * * ? *)',
         description: 'Hard-purge accounts left unverified past 7 days (§3.7.1a, Legal §A1)',
       },
+      {
+        // Not a nightly: a queued callback is a promise to a customer with a time on it,
+        // and the rule-D TTL is measured in hours. Hourly is the coarsest cadence that
+        // still delivers near when the lead asked (§3.8.7 rule D).
+        name: 'deferred',
+        cron: 'cron(10 * * * ? *)',
+        description: 'Retry due deferred actions; abandon past-TTL ones with notice (§3.8.7 D)',
+      },
+      {
+        // Every 6h rather than nightly: connection status is what the universal gate
+        // reads before it runs a tool, so a day-old verdict gates a day of decisions.
+        name: 'health',
+        cron: 'cron(40 */6 * * ? *)',
+        description: 'Re-check non-revoked connections and transition them (§3.8.5)',
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack
