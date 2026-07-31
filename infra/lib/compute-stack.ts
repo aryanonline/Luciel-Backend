@@ -493,7 +493,20 @@ export class ComputeStack extends Stack {
         cron: 'cron(45 4 * * ? *)',
         description: 'Advance day-7 dunning retrying -> reduced (Legal §A3)',
       },
+      {
+        name: 'usage_reconcile',
+        cron: 'cron(15 5 * * ? *)',
+        description: 'Post billable blocks Stripe was never told about (§3.4.1b)',
+      },
+      {
+        name: 'unverified_reap',
+        cron: 'cron(45 5 * * ? *)',
+        description: 'Hard-purge accounts left unverified past 7 days (§3.7.1a, Legal §A1)',
+      },
     ];
+    // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
+    // no schedule is a compliance promise that never runs, and nothing else in the stack
+    // notices. tests/unit/test_sweep_scheduling.py asserts the two lists agree.
     for (const sweep of sweepSchedules) {
       new scheduler.CfnSchedule(this, `Sweep-${sweep.name}`, {
         name: `Luciel-${envConfig.envName}-sweep-${sweep.name}`,

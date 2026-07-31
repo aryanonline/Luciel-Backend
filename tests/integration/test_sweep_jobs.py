@@ -19,6 +19,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app.auth import reaper
 from app.billing import dunning
 from app.db.session import tenant_session
 from app.jobs import sweeps
@@ -35,7 +36,9 @@ pytestmark = [pytest.mark.asyncio]
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
-async def _seed_account(admin_id: uuid.UUID, state: AccountState) -> None:
+async def _seed_account(
+    admin_id: uuid.UUID, state: AccountState, *, created_at: datetime | None = None
+) -> None:
     async with tenant_session(admin_id) as s:
         s.add(
             Account(
@@ -46,7 +49,8 @@ async def _seed_account(admin_id: uuid.UUID, state: AccountState) -> None:
                 email_lower=f"{admin_id}@x.com",
                 password_hash="x",
                 state=state,
-                email_verified=True,
+                email_verified=state is not AccountState.unverified,
+                **({} if created_at is None else {"created_at": created_at}),
             )
         )
 
@@ -250,6 +254,79 @@ async def test_dunning_job_advances_day_seven_and_sends_action_tools_dormant() -
 
     # Idempotent: already reduced, nothing further to advance.
     assert await sweeps.run_dunning_transitions(now=NOW) == []
+
+
+async def test_unverified_reap_discovery_finds_only_unverified_accounts() -> None:
+    unverified, verified = uuid.uuid4(), uuid.uuid4()
+    await _seed_account(unverified, AccountState.unverified)
+    await _seed_account(verified, AccountState.verified)
+
+    candidates = await sweeps.sweep_candidates(sweeps.UNVERIFIED_REAP)
+    assert unverified in candidates
+    assert verified not in candidates
+
+
+async def test_unverified_reap_purges_aged_accounts_and_leaves_the_rest() -> None:
+    """§3.7.1a / Legal §A1: unverified for 7 days means the row is gone — which is also
+    what releases the email address for signup. The reaper had no caller at all, so the
+    promise never ran; these assertions are on the newly-wired sweep, not the primitive.
+    """
+    aged, fresh, verified = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_account(aged, AccountState.unverified, created_at=NOW - timedelta(days=8))
+    await _seed_account(fresh, AccountState.unverified, created_at=NOW - timedelta(days=2))
+    await _seed_account(verified, AccountState.verified, created_at=NOW - timedelta(days=400))
+
+    assert await sweeps.run_unverified_reap(now=NOW) == [str(aged)]
+
+    async def _exists(admin_id: uuid.UUID) -> bool:
+        async with tenant_session(admin_id) as s:
+            return (
+                await s.execute(select(Account).where(Account.admin_id == admin_id))
+            ).scalar_one_or_none() is not None
+
+    assert not await _exists(aged), "the 7-day window expired and the row survived"
+    assert await _exists(fresh), "an account still inside its window was destroyed"
+    assert await _exists(verified), "a verified account was reaped by age alone"
+
+    # The tombstone outlives the row it describes: the audit log is not cascade material.
+    async with tenant_session(aged) as s:
+        reaped = (
+            (
+                await s.execute(
+                    select(AdminAuditLog.event_payload).where(
+                        AdminAuditLog.admin_id == aged,
+                        AdminAuditLog.event_type == "unverified_account_reaped",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(reaped) == 1
+    assert reaped[0]["reason"] == "7_day_unverified_window_expired"
+
+    # Idempotent: schedules deliver at-least-once.
+    assert await sweeps.run_unverified_reap(now=NOW) == []
+
+
+async def test_unverified_reap_respects_a_verification_that_lands_mid_sweep() -> None:
+    """Discovery filters on state only — the age cutoff lives in config, so re-deriving
+    it per tenant is what keeps the two halves from drifting. The same re-check is what
+    makes a stale candidate list safe: verify between discovery and the purge and the
+    account must survive."""
+    admin_id = uuid.uuid4()
+    await _seed_account(admin_id, AccountState.unverified, created_at=NOW - timedelta(days=30))
+
+    async with tenant_session(admin_id) as s:
+        acct = (await s.execute(select(Account).where(Account.admin_id == admin_id))).scalar_one()
+        acct.state = AccountState.verified
+
+    async with tenant_session(admin_id) as s:
+        assert await reaper.reap_account_if_due(s, admin_id=admin_id, now=NOW) is False
+    async with tenant_session(admin_id) as s:
+        assert (
+            await s.execute(select(Account).where(Account.admin_id == admin_id))
+        ).scalar_one_or_none() is not None
 
 
 async def test_dunning_job_leaves_a_tenant_inside_the_retry_window_alone() -> None:

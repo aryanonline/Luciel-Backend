@@ -7,7 +7,7 @@
 # than as master — the per-tenant sweep transactions depend on that.
 set -euo pipefail
 
-SWEEP="${1:?usage: run-sweep.sh <retention|grace_expiry|close_purge|dunning>}"
+SWEEP="${1:?usage: run-sweep.sh <any name in app.jobs.sweeps SWEEP_KINDS>}"
 
 # Absolute venv interpreter, never a bare `python3`: the scheduler runs this script
 # through a LOGIN shell (`bash -lc`), and /etc/profile resets PATH to the system

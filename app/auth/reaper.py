@@ -7,13 +7,14 @@ available again."
 Legal §A1: "…permanently deleted after 7 days…"
 
 config.py ``unverified_reap_after_seconds`` (default 7 * 24 * 3600) defines the
-window. A scheduled/periodic worker invokes ``reap_unverified_accounts()``; this
-module owns the callable, not the scheduling infrastructure (no infra provisioned
-here per Phase-2 constraints).
+window.
 
-The reaper runs under a SUPERUSER/BYPASSRLS session (via the postgres superuser
-psql path) so it can see ALL accounts regardless of tenant scope. In tests we
-supply a plain tenant session since all test accounts share the same admin_id.
+Both entrypoints run under a NORMAL tenant-scoped session — the reaper is not a
+BYPASSRLS job. ``accounts`` is self-tenanted (``admin_id`` mirrors the primary key),
+so a tenant session already scopes the SELECT, the audit emit, and the DELETE to the
+one account being reaped; nothing here needs to see across tenants. Cross-tenant
+DISCOVERY is the sweep layer's job (``app.jobs.sweeps``), and it returns admin_ids
+only.
 """
 
 from __future__ import annotations
@@ -30,56 +31,88 @@ from app.models.audit import ActorType
 from app.models.instance import Account, AccountState
 
 
+def _cutoff(now: datetime) -> datetime:
+    """Accounts created before this instant have outlived the verification window."""
+    return now - timedelta(seconds=get_settings().unverified_reap_after_seconds)
+
+
+async def _purge(session: AsyncSession, admin_id: uuid.UUID, now: datetime) -> None:
+    """Emit the tombstone, THEN delete. Reversing the order loses the evidence."""
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type="unverified_account_reaped",
+        payload={
+            "reason": "7_day_unverified_window_expired",
+            "reaped_at": now.isoformat(),
+        },
+    )
+    await session.execute(delete(Account).where(Account.id == admin_id))
+
+
+async def reap_account_if_due(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+) -> bool:
+    """Hard-purge ONE account iff it is still ``unverified`` past the window.
+
+    The per-tenant primitive the ``unverified_reap`` sweep drives, shaped like every
+    other sweep unit (``purge_closed_account_if_due``, ``dunning.advance_if_due``): it
+    re-derives its own precondition rather than trusting the candidate list, so a
+    verification that landed between discovery and this call is respected and a repeat
+    run over the same tenant is a no-op. Must be called inside a tenant session for
+    ``admin_id``.
+
+    Returns True when the account row was destroyed.
+    """
+    now = now or datetime.now(UTC)
+    acct = (
+        await session.execute(
+            select(Account).where(
+                Account.admin_id == admin_id,
+                Account.state == AccountState.unverified,
+                Account.created_at < _cutoff(now),
+            )
+        )
+    ).scalar_one_or_none()
+    if acct is None:
+        return False
+    await _purge(session, acct.id, now)
+    await session.flush()
+    return True
+
+
 async def reap_unverified_accounts(
     session: AsyncSession,
     *,
     now: datetime | None = None,
 ) -> list[uuid.UUID]:
-    """Hard-purge ``unverified`` accounts older than ``unverified_reap_after_seconds``.
+    """Reap every aged ``unverified`` account VISIBLE to ``session``.
 
-    Deletes the account row (email + password_hash gone), emits
-    ``unverified_account_reaped`` for each, and returns the list of reaped admin_ids.
+    The direct/one-shot form: it purges whatever the session can see, which under a
+    tenant session is that tenant alone. The scheduled path does not go through here —
+    it discovers candidates cross-tenant and calls :func:`reap_account_if_due` once per
+    tenant, so one tenant's failure cannot roll back another's.
 
-    A scheduled job/worker calls this function periodically. No infra is provisioned
-    here — the caller is responsible for the scheduling mechanism (celery beat, cron,
-    asyncio background task, or a one-shot management command).
-
-    Returns the list of admin_ids that were reaped so tests can assert on them.
+    Returns the reaped admin_ids.
     """
     now = now or datetime.now(UTC)
-    settings = get_settings()
-    window = timedelta(seconds=settings.unverified_reap_after_seconds)
-    cutoff = now - window
-
-    aged_accounts = (
+    aged = (
         (
             await session.execute(
-                select(Account).where(
+                select(Account.id).where(
                     Account.state == AccountState.unverified,
-                    Account.created_at < cutoff,
+                    Account.created_at < _cutoff(now),
                 )
             )
         )
         .scalars()
         .all()
     )
-
-    reaped: list[uuid.UUID] = []
-    for acct in aged_accounts:
-        admin_id = acct.id
-        # Emit the audit tombstone BEFORE deleting (evidence of the reap).
-        await audit.emit(
-            session,
-            admin_id=admin_id,
-            actor_type=ActorType.platform,
-            event_type="unverified_account_reaped",
-            payload={
-                "reason": "7_day_unverified_window_expired",
-                "reaped_at": now.isoformat(),
-            },
-        )
-        await session.execute(delete(Account).where(Account.id == admin_id))
-        reaped.append(admin_id)
-
+    for admin_id in aged:
+        await _purge(session, admin_id, now)
     await session.flush()
-    return reaped
+    return list(aged)

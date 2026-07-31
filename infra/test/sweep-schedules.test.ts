@@ -3,6 +3,9 @@
  * repo had NO scheduler at all, so four fully-implemented sweeps never ran. Assert
  * the synthesized schedules so a refactor cannot silently un-schedule a Legal
  * commitment again.
+ *
+ * The same defect recurred twice after that: ``usage_reconcile`` and ``unverified_reap``
+ * each shipped an entrypoint and a discovery branch with no schedule behind them (P0-8).
  */
 import { App } from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
@@ -35,7 +38,17 @@ function buildCompute() {
   return Template.fromStack(compute);
 }
 
-const SWEEPS = ['retention', 'grace_expiry', 'close_purge', 'dunning'];
+// Must stay equal to SWEEP_KINDS in app/jobs/sweeps.py — an entrypoint with no schedule
+// is a compliance promise that never runs (P0-8). tests/unit/test_sweep_scheduling.py
+// asserts the two halves agree from the Python side.
+const SWEEPS = [
+  'retention',
+  'grace_expiry',
+  'close_purge',
+  'dunning',
+  'usage_reconcile',
+  'unverified_reap',
+];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {
   test('one EventBridge Scheduler schedule exists per compliance sweep', () => {

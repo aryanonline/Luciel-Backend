@@ -16,6 +16,10 @@ entrypoints EventBridge Scheduler invokes (see ``infra/lib/compute-stack.ts``).
   * ``usage_reconcile`` — post any billable block Stripe has not been told about yet
                        (§3.4.1b); the backstop for a tenant who crossed a block, hit a
                        Stripe blip, and then stopped conversing.
+  * ``unverified_reap`` — hard-purge accounts left ``unverified`` past the 7-day window
+                       (§3.7.1a, Legal §A1). The purge is what releases the email
+                       address for signup again, so an unscheduled reaper does not just
+                       hoard dead credentials — it permanently blocks the address.
 
 Two invariants every sweep holds:
 
@@ -39,6 +43,7 @@ from datetime import UTC, datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import reaper
 from app.billing import dunning, metering
 from app.db.session import tenant_session, untenanted_session
 from app.lifecycle import grace_expiry, retention
@@ -49,8 +54,16 @@ GRACE_EXPIRY = "grace_expiry"
 CLOSE_PURGE = "close_purge"
 DUNNING = "dunning"
 USAGE_RECONCILE = "usage_reconcile"
+UNVERIFIED_REAP = "unverified_reap"
 
-SWEEP_KINDS: tuple[str, ...] = (RETENTION, GRACE_EXPIRY, CLOSE_PURGE, DUNNING, USAGE_RECONCILE)
+SWEEP_KINDS: tuple[str, ...] = (
+    RETENTION,
+    GRACE_EXPIRY,
+    CLOSE_PURGE,
+    DUNNING,
+    USAGE_RECONCILE,
+    UNVERIFIED_REAP,
+)
 
 
 async def sweep_candidates(kind: str) -> list[uuid.UUID]:
@@ -122,10 +135,24 @@ async def run_usage_reconcile(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(USAGE_RECONCILE, _reconcile_usage, now)
 
 
+async def run_unverified_reap(*, now: datetime | None = None) -> list[str]:
+    """Hard-purge accounts left unverified past the 7-day window (§3.7.1a, Legal §A1).
+
+    Discovery deliberately returns EVERY unverified account rather than filtering on
+    age in SQL: the window is ``unverified_reap_after_seconds`` in config, and a second
+    copy of it inside the SECURITY DEFINER function would silently under-reap the day
+    someone shortened it. ``reap_account_if_due`` owns the cutoff; the candidate list is
+    a superset and stays small on its own, since anything genuinely aged is deleted on
+    the first sweep that sees it.
+    """
+    return await _per_tenant(UNVERIFIED_REAP, reaper.reap_account_if_due, now)
+
+
 SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
     CLOSE_PURGE: run_close_account_purge,
     DUNNING: run_dunning_transitions,
     USAGE_RECONCILE: run_usage_reconcile,
+    UNVERIFIED_REAP: run_unverified_reap,
 }
