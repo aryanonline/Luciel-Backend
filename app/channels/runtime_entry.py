@@ -44,9 +44,16 @@ class RuntimeReply:
 
 
 def _names(inst: Instance) -> tuple[str, str]:
+    """Business + assistant display names (§3.4.16).
+
+    Mirrors app.api.v1.chat_widget._names: when no assistantName is configured,
+    the business name is used VERBATIM as the speaker — never suffixed with
+    "'s assistant", which is what produced "...Assistant's assistant" for a
+    business/Luciel name already ending in the word "Assistant".
+    """
     business = inst.name or "this business"
     personality = inst.personality or {}
-    assistant = str(personality.get("assistantName") or f"{business}'s assistant")
+    assistant = str(personality.get("assistantName") or business)
     return business, assistant
 
 

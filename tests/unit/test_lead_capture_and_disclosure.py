@@ -52,3 +52,26 @@ def test_backstop_noop_when_already_disclosed():
     original = "Hi — I'm Ava, the AI assistant for GTA Premier. Our hours are 9 to 5."
     out = ensure_ai_identity_disclosure(original, business_name="GTA Premier", assistant_name="Ava")
     assert out == original  # surfaced once; not duplicated
+
+
+def test_backstop_never_doubles_assistant_when_name_already_ends_in_assistant():
+    """LIVE-VERIFIED (Harmony wave 2, item 1): a Luciel/business name that already
+    ends in the word "Assistant" (e.g. a front-desk name an owner actually typed,
+    "Aryan's Front-Desk Assistant") must never produce "...Assistant's assistant" in
+    the composed greeting. The old template appended ", the AI assistant for
+    {business}" directly after the speaker name, and the old default-assistant
+    fallback separately appended "'s assistant" onto the business name — either
+    path doubles the word when the configured name already ends in "Assistant".
+    """
+    name = "Aryan's Front-Desk Assistant"
+    out = ensure_ai_identity_disclosure(
+        "Our hours are 9 to 5.", business_name=name, assistant_name=name
+    )
+    lowered = out.lower()
+    assert "assistant's assistant" not in lowered
+    assert "assistant assistant" not in lowered
+    # The configured name is used VERBATIM as the speaker.
+    assert out.startswith(f"Hi — I'm {name}.")
+    # AI-disclosure requirement stays explicit and intact.
+    assert disclosure_present(out)
+    assert "Our hours are 9 to 5." in out

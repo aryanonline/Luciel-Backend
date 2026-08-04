@@ -71,6 +71,57 @@ async def test_bootstrap_delivers_disclosure_and_chrome(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_bootstrap_never_doubles_assistant_in_name(client):
+    """LIVE-VERIFIED (Harmony wave 2, item 1): a business/Luciel name that already
+    ends in the word "Assistant" (e.g. "Aryan's Front-Desk Assistant"), with NO
+    separate assistantName override configured, must not produce
+    "...Assistant's assistant" in the opening message — the exact string the old
+    default fallback (business + "'s assistant") plus the old greeting template
+    (", the AI assistant for {business}") combined to produce on dev.
+    """
+    admin = uuid.uuid4()
+    embed_key = f"vm_live_{uuid.uuid4().hex[:10]}"
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@x.com",
+                email_lower=f"{admin}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        s.add(
+            Instance(
+                id=admin,
+                admin_id=admin,
+                name="Aryan's Front-Desk Assistant",
+                state=LucielState.active,
+                embed_key_public_id=embed_key,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},  # no assistantName override — exercises the fallback
+            )
+        )
+        await s.flush()
+    r = await client.post("/api/v1/chat-widget/bootstrap", json={"embedKey": embed_key})
+    assert r.status_code == 200
+    body = r.json()
+    opening = body["openingMessage"]
+    lowered = opening.lower()
+    assert "assistant's assistant" not in lowered
+    assert "assistant assistant" not in lowered
+    # The Luciel name is used verbatim as the speaker.
+    assert opening.startswith("Hi — I'm Aryan's Front-Desk Assistant.")
+    # AI-disclosure requirement stays explicit.
+    assert "ai assistant" in lowered
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_unknown_embed_key_is_404(client):
     r = await client.post("/api/v1/chat-widget/bootstrap", json={"embedKey": "vm_live_nope"})
     assert r.status_code == 404  # never routed on a guess (§3.1.3)

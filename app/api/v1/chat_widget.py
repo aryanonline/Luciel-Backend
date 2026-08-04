@@ -39,6 +39,7 @@ from app.models.audit import ActorType
 from app.models.conversation import Transcript
 from app.models.instance import Instance, is_paused
 from app.runtime import budget
+from app.runtime.input_safety import _compose_greeting
 from app.runtime.knowledge_retrieval import make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
@@ -58,12 +59,11 @@ CHANNEL = "widget"
 
 
 # AI-identity disclosure wording (§3.4.16). Admin-shaped in production via the
-# personality pillar; the FACT of AI ("AI assistant") is non-removable.
+# personality pillar; the FACT of AI ("AI assistant") is non-removable. Delegates to
+# the shared composer so the widget and the cross-channel backstop never drift into
+# two different concatenation bugs again (see _compose_greeting docstring).
 def _disclosure(business: str, assistant: str) -> str:
-    return (
-        f"Hi — I'm {assistant}, the AI assistant for {business}. "
-        "I can help answer questions, book, or connect you to a person."
-    )
+    return _compose_greeting(business_name=business, assistant_name=assistant)
 
 
 async def _resolve_embed_key(embed_key: str) -> InstanceContext:
@@ -107,10 +107,16 @@ async def _widget_abuse_gate(
 
 
 def _names(inst: Instance) -> tuple[str, str]:
-    """Business + assistant display names from the instance config (§3.4.16)."""
+    """Business + assistant display names from the instance config (§3.4.16).
+
+    When no assistantName is configured, the business name itself is used
+    VERBATIM as the speaker — never suffixed with "'s assistant". That suffix is
+    exactly what produced "...Assistant's assistant" when a business/Luciel name
+    already ends in the word "Assistant" (e.g. "Aryan's Front-Desk Assistant").
+    """
     business = inst.name or "this business"
     personality = inst.personality or {}
-    assistant = str(personality.get("assistantName") or f"{business}'s assistant")
+    assistant = str(personality.get("assistantName") or business)
     return business, assistant
 
 

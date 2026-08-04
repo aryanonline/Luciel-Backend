@@ -197,6 +197,25 @@ def disclosure_present(text: str) -> bool:
     return any(m in lowered for m in _AI_IDENTITY_MARKERS)
 
 
+def _compose_greeting(*, business_name: str, assistant_name: str) -> str:
+    """Compose the first-contact greeting/disclosure line (§3.4.16).
+
+    Uses the configured Luciel/assistant name VERBATIM as the speaker — it is
+    never suffixed with "'s assistant" or concatenated into "the AI assistant for
+    {business}". That concatenation is what produced "...Assistant's assistant"
+    when an admin's chosen name already ends in the word "Assistant" (e.g. a
+    front-desk name like "Aryan's Front-Desk Assistant"): the old fallback default
+    (`f"{business}'s assistant"`) combined with the old template's own
+    ", the AI assistant for {business}" suffix doubled the word "assistant".
+    The AI-identity disclosure (§3.4.16) stays explicit and non-removable — it is
+    just phrased as its own clause instead of being grafted onto the name.
+    """
+    return (
+        f"Hi — I'm {assistant_name}. I'm an AI assistant for {business_name}, and I "
+        "can help answer questions, book, or connect you to a person."
+    )
+
+
 def ensure_ai_identity_disclosure(
     reply_text: str, *, business_name: str, assistant_name: str
 ) -> str:
@@ -210,10 +229,7 @@ def ensure_ai_identity_disclosure(
     """
     if disclosure_present(reply_text):
         return reply_text
-    line = (
-        f"Hi — I'm {assistant_name}, the AI assistant for {business_name}. "
-        "I can help answer questions, book, or connect you to a person."
-    )
+    line = _compose_greeting(business_name=business_name, assistant_name=assistant_name)
     reply = (reply_text or "").strip()
     return f"{line}\n\n{reply}" if reply else line
 
