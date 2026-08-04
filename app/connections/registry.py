@@ -461,6 +461,26 @@ def is_valid_provider(connection_type: str, provider: str) -> bool:
     return spec is not None and spec.connection_type == connection_type
 
 
+def provider_available(provider: str) -> bool:
+    """True iff a connection to this provider can actually be (re)established today.
+
+    Harmony wave 2 (item 3): a stale ``instance_connections`` row can outlive the
+    provider it points at -- the row was created when the provider was offered (or
+    briefly misconfigured), and since then either the provider was dropped from the
+    catalog entirely, or it is still catalogued but its platform OAuth client was
+    never registered (missing client id/secret settings). Both cases are the SAME
+    "not available yet" state the Configure page already derives via
+    ``oauth_client_config(...).configured`` for ``list_providers`` -- this gives the
+    Overview list (``list_connections`` / ``ConnectionOut``) the identical truth so
+    the two pages cannot disagree about the same provider ever again."""
+    spec = get_provider(provider)
+    if spec is None:
+        return False
+    if not spec.is_oauth:
+        return True
+    return oauth_client_config(spec.provider).configured
+
+
 def oauth_client_label(provider: str) -> str:
     """The OAuth APP this provider authenticates against, e.g. ``google``, ``salesforce``.
 

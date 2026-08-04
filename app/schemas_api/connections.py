@@ -37,6 +37,15 @@ class ConnectionOut(WireModel):
     status_detail: str | None = None
     last_health_check_at: datetime | None = None
     created_at: datetime
+    # Harmony wave 2 (item 3): True iff this provider can actually be (re)connected
+    # today per app.connections.registry.provider_available -- the SAME truth the
+    # Configure page (/connections/providers -> ProviderOptionOut.configured) uses.
+    # A stale row for a provider that is unconfigured-in-registry (dropped from the
+    # catalog, or still catalogued but its OAuth client was never registered) must
+    # render "not available yet" here too, never "Action needed" -- "Action needed"
+    # implies the owner can fix this by acting, which is false when the platform
+    # itself has not made the provider connectable yet.
+    provider_available: bool = True
 
 
 class StartConnectionRequest(WireModel):

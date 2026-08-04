@@ -85,6 +85,11 @@ def _connection_out(c: InstanceConnection) -> ConnectionOut:
             "statusDetail": c.status_detail,
             "lastHealthCheckAt": c.last_health_check_at,
             "createdAt": c.created_at,
+            # Harmony wave 2 (item 3): registry.provider_available is the SAME check
+            # /connections/providers uses for ProviderOptionOut.configured, so a
+            # stale row for a provider the platform cannot connect today is marked
+            # here too instead of rendering the owner-actionable "Action needed".
+            "providerAvailable": registry.provider_available(c.provider),
         }
     )
 

@@ -70,7 +70,8 @@ async def test_list_shape_and_status(client):
     rows = r.json()
     assert len(rows) == 1
     c = rows[0]
-    # Frozen Connection field set (camelCase).
+    # Frozen Connection field set (camelCase). providerAvailable added Harmony wave 2
+    # (item 3): registry truth about whether this provider can be connected today.
     assert set(c.keys()) <= {
         "connectionId",
         "connectionType",
@@ -80,10 +81,62 @@ async def test_list_shape_and_status(client):
         "statusDetail",
         "lastHealthCheckAt",
         "createdAt",
+        "providerAvailable",
     }
     assert c["connectionType"] == "crm"
     assert c["provider"] == "hubspot"
     assert c["status"] == "unconfigured"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_provider_available_true_for_non_oauth_provider(client):
+    """A credential-form (non-OAuth) provider needs no platform OAuth client, so it
+    is available the moment it is registered -- the "healthy" counterpart to the
+    stale-row test below."""
+    await _ready_account_with_luciel(client)
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "outbound_webhook", "provider": "outbound_webhook"},
+    )
+    r = await client.get("/api/v1/admin/connections")
+    row = r.json()[0]
+    assert row["provider"] == "outbound_webhook"
+    assert row["providerAvailable"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_stale_row_for_unconfigured_provider_reports_provider_unavailable(client):
+    """LIVE-VERIFIED (Harmony wave 2, item 3): dev showed a Notion row rendering
+    "! Action needed" on Overview while the Configure page correctly showed Notion
+    as "not available yet" (its platform OAuth client -- notion_client_id/secret --
+    was never registered). Root cause: the Overview list (list_connections /
+    ConnectionOut) only ever exposed the row's own ``status`` field, with no way to
+    know the row points at a provider the platform itself cannot connect right now.
+    "Action needed" implies the OWNER can fix this by acting (e.g. entering
+    credentials); that is false here -- no admin action unblocks a provider whose
+    OAuth client the platform never configured. This reproduces the exact live
+    condition: a knowledge_source/notion connection attempt against the DEFAULT
+    test-env settings, where notion_client_id/secret are empty (unconfigured),
+    exactly as the previous fix's test never modeled (it only checked frozen field
+    shape on an ALREADY-connectable provider)."""
+    from app.config import get_settings
+
+    assert get_settings().notion_client_id == "", (
+        "test assumes the default test env leaves Notion's OAuth client unconfigured"
+    )
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "knowledge_source", "provider": "notion"},
+    )
+    assert r.status_code == 200
+
+    rows = (await client.get("/api/v1/admin/connections")).json()
+    row = next(x for x in rows if x["provider"] == "notion")
+    assert row["status"] == "unconfigured"
+    # The stale-row bug: providerAvailable must be False so the FE renders "not
+    # available yet", never the owner-actionable "Action needed" chip.
+    assert row["providerAvailable"] is False
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -108,6 +161,7 @@ async def test_no_secret_fields_ever_in_serialized_connection(client):
         "statusDetail",
         "lastHealthCheckAt",
         "createdAt",
+        "providerAvailable",
     }
     for c in rows:
         assert set(c.keys()) <= allowed, f"unexpected key in Connection: {set(c.keys()) - allowed}"
