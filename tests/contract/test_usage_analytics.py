@@ -18,6 +18,7 @@ import pytest
 from app.db.session import tenant_session
 from app.models.conversation import EscalationEvent, Session
 from app.models.instance import Instance, LucielState
+from app.runtime import budget as budget_runtime
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -38,6 +39,7 @@ async def _signup_verify_login(client) -> uuid.UUID:
 
 async def _seed_instance_with_activity(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()
+    session_id = uuid.uuid4()
     async with tenant_session(admin) as s:
         s.add(
             Instance(
@@ -53,7 +55,7 @@ async def _seed_instance_with_activity(admin: uuid.UUID) -> uuid.UUID:
         )
         s.add(
             Session(
-                id=uuid.uuid4(),
+                id=session_id,
                 admin_id=admin,
                 instance_id=iid,
                 channel="widget",
@@ -70,6 +72,14 @@ async def _seed_instance_with_activity(admin: uuid.UUID) -> uuid.UUID:
                 gate="intake",
                 fired_at=datetime.now(UTC),
             )
+        )
+    # channel_mix / conversion_by_channel now count BILLED conversations only
+    # (harmony fix item 2: conversation == billed session, one semantics
+    # everywhere) — route the seeded session through the real fire-once counter
+    # so it shows up exactly the way a real conversation would.
+    async with tenant_session(admin) as s:
+        await budget_runtime.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=session_id
         )
     return iid
 

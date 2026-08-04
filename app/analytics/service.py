@@ -37,9 +37,28 @@ surfaced as ``conversion_by_channel``; by-source and by-service are surfaced
 as an honest empty ``not_available`` list (no source/service dimension is
 persisted anywhere to group by).
 
-Busiest-times and channel-mix/conversations/leads/escalations ARE fully real:
-Session.started_at (hour-of-day x day-of-week), Session.channel, EscalationEvent
-rows all exist and are queried for real below.
+Busiest-times and escalations ARE fully real: Session.started_at (hour-of-day x
+day-of-week) and EscalationEvent rows all exist and are queried for real below.
+
+Conversation-counting semantics (single source of truth, harmony fix 2026-08-04):
+``conversation == billed session``, i.e. a row in ``counted_sessions`` (the same
+fire-once table ``app/runtime/budget.py::count_session_once`` writes and the
+Billing page's ``conversationsThisPeriod`` reads via ``metering.build_budget``).
+Before this fix, ``conversations_total``/``channel_mix``/``conversion_by_channel``
+counted raw ``sessions`` rows (every session ever opened, including sessions that
+never reached a first model call and so were never billed) while
+``conversations_this_period`` counted ``counted_sessions`` rows for the current
+billing period only — four surfaces (Overview, Billing, Analytics, the per-channel
+breakdown) could each show a different number for what a business owner reads as
+one fact: "how many conversations have I had". All four now derive from
+``counted_sessions``:
+  * ``conversations_this_period`` — counted_sessions rows in the current billing
+    period (unchanged; this was already correct — sourced from the budget counter).
+  * ``conversations_total`` — counted_sessions rows, all billing periods (all-time
+    billed conversations), NOT a raw session count.
+  * ``channel_mix`` / ``conversion_by_channel`` — sessions joined to counted_sessions
+    (i.e. restricted to billed sessions), scoped to the current billing period, so
+    the per-channel breakdown sums back to ``conversations_this_period`` exactly.
 """
 
 from __future__ import annotations
@@ -52,6 +71,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
+from app.models.budget import CountedSession
 from app.models.conversation import EscalationEvent, Session
 from app.models.lead import Lead
 
@@ -134,8 +154,23 @@ async def _escalations_by_signal(
     return [EscalationSignalCount(signal=sig, count=cnt) for sig, cnt in rows]
 
 
-async def _channel_mix(s: AsyncSession) -> list[ChannelFraction]:
-    rows = (await s.execute(select(Session.channel, func.count()).group_by(Session.channel))).all()
+async def _channel_mix(s: AsyncSession, *, period_start: date) -> list[ChannelFraction]:
+    """Channel mix over BILLED conversations this period (see module docstring —
+    single conversation-counting source of truth). Joins sessions to
+    counted_sessions so a session that opened but never reached a first model
+    call (never billed) is not counted here either."""
+    rows = (
+        await s.execute(
+            select(Session.channel, func.count())
+            .select_from(Session)
+            .join(
+                CountedSession,
+                (CountedSession.session_id == Session.id)
+                & (CountedSession.billing_period_start == period_start),
+            )
+            .group_by(Session.channel)
+        )
+    ).all()
     total = sum(cnt for _, cnt in rows) or 0
     return [
         ChannelFraction(channel=ch, fraction=(cnt / total) if total else 0.0) for ch, cnt in rows
@@ -174,13 +209,17 @@ async def _response_time_percentiles() -> tuple[float | None, float | None, NotA
     return None, None, RESPONSE_TIME_GAP
 
 
-async def _conversion_by_channel(s: AsyncSession) -> list[ChannelConversion]:
+async def _conversion_by_channel(s: AsyncSession, *, period_start: date) -> list[ChannelConversion]:
     """Lead-capture-rate proxy for 'conversion by channel' (Vision §7).
 
     Grounded in real columns: Session.channel and Session.resolved_lead_id (set
     when a session resolves to a captured lead). This is the honest metric that
     IS computable today — a true admin-marked-outcome conversion rate is not
     (see conversion_by_source/service gaps + module docstring).
+
+    ``conversations`` here means BILLED conversations this period (see module
+    docstring): joined to counted_sessions so this sums back to exactly
+    ``conversations_this_period``, matching Billing/Overview/Analytics.
     """
     rows = (
         await s.execute(
@@ -188,7 +227,14 @@ async def _conversion_by_channel(s: AsyncSession) -> list[ChannelConversion]:
                 Session.channel,
                 func.count(),
                 func.count(Session.resolved_lead_id),
-            ).group_by(Session.channel)
+            )
+            .select_from(Session)
+            .join(
+                CountedSession,
+                (CountedSession.session_id == Session.id)
+                & (CountedSession.billing_period_start == period_start),
+            )
+            .group_by(Session.channel)
         )
     ).all()
     return [
@@ -215,7 +261,16 @@ async def build_overview(
     from the budget counter — the single source of truth for that count
     (§3.4.1b) — NOT recomputed here from sessions.
     """
-    conversations_total = (await s.execute(select(func.count()).select_from(Session))).scalar_one()
+    # conversations_total = all-time BILLED conversations (counted_sessions rows),
+    # not a raw session count — see module docstring (single conversation-counting
+    # source of truth).
+    conversations_total = (
+        await s.execute(
+            select(func.count())
+            .select_from(CountedSession)
+            .where(CountedSession.admin_id == admin_id)
+        )
+    ).scalar_one()
     leads_this_period = (
         await s.execute(
             select(func.count()).select_from(Lead).where(Lead.created_at >= period_start)
@@ -223,12 +278,12 @@ async def build_overview(
     ).scalar_one()
 
     escalations_by_signal = await _escalations_by_signal(s, period_start=period_start)
-    channel_mix = await _channel_mix(s)
+    channel_mix = await _channel_mix(s, period_start=period_start)
     busiest_times = await _busiest_times(s)
     top_sources, sources_gap = await _top_knowledge_sources()
     appointments, appointments_gap = await _appointments_booked()
     p50, p95, response_gap = await _response_time_percentiles()
-    conversion_by_channel = await _conversion_by_channel(s)
+    conversion_by_channel = await _conversion_by_channel(s, period_start=period_start)
 
     return AnalyticsAggregate(
         conversations_this_period=conversations_this_period,

@@ -17,10 +17,12 @@ from datetime import UTC, datetime
 
 import pytest
 from app.analytics import service as analytics_service
+from app.billing import metering
 from app.db.session import tenant_session
 from app.models.conversation import EscalationEvent, Session
 from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
+from app.runtime import budget as budget_runtime
 from app.runtime.budget import current_billing_period_start
 
 
@@ -74,6 +76,17 @@ async def _add_lead(admin: uuid.UUID, iid: uuid.UUID) -> uuid.UUID:
     return lid
 
 
+async def _count_session(admin: uuid.UUID, iid: uuid.UUID, session_id: uuid.UUID) -> None:
+    """Mark a session as BILLED (insert into counted_sessions + bump the budget
+    counter) via the real fire-once path — the same one the orchestrator calls on
+    first model call (§3.4.1b). Tests must go through this, not a raw INSERT, so
+    analytics stays wired to the actual conversation-counting semantics."""
+    async with tenant_session(admin) as s:
+        await budget_runtime.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=session_id
+        )
+
+
 async def _add_escalation(admin: uuid.UUID, iid: uuid.UUID, *, signal: str) -> None:
     async with tenant_session(admin) as s:
         s.add(
@@ -115,13 +128,27 @@ async def test_busiest_times_is_real_heatmap() -> None:
 
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_channel_mix_and_conversion_by_channel_are_real() -> None:
+    """channel_mix / conversion_by_channel count BILLED conversations only (single
+    conversation-counting source of truth, harmony fix item 2) — a session that
+    opened but never had its first model call (never went through
+    count_session_once) must NOT appear here, exactly like it doesn't count
+    against the Billing/Overview conversationsThisPeriod number."""
     admin = uuid.uuid4()
     iid = await _seed(admin)
     lead = await _add_lead(admin, iid)
     now = datetime.now(UTC)
-    await _add_session(admin, iid, channel="widget", started_at=now, resolved_lead_id=lead)
-    await _add_session(admin, iid, channel="widget", started_at=now)
+    widget_billed = await _add_session(
+        admin, iid, channel="widget", started_at=now, resolved_lead_id=lead
+    )
+    widget_billed_2 = await _add_session(admin, iid, channel="widget", started_at=now)
+    sms_billed = await _add_session(admin, iid, channel="sms", started_at=now)
+    # Opened but never counted (e.g. abandoned before a first model call) — must
+    # not be reflected in either metric, matching conversationsThisPeriod.
     await _add_session(admin, iid, channel="sms", started_at=now)
+
+    await _count_session(admin, iid, widget_billed)
+    await _count_session(admin, iid, widget_billed_2)
+    await _count_session(admin, iid, sms_billed)
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
@@ -139,8 +166,74 @@ async def test_channel_mix_and_conversion_by_channel_are_real() -> None:
     assert conv_by_channel["widget"].conversations == 2
     assert conv_by_channel["widget"].leads == 1
     assert conv_by_channel["widget"].conversion_rate == pytest.approx(0.5)
+    assert conv_by_channel["sms"].conversations == 1, "the uncounted sms session must not appear"
     assert conv_by_channel["sms"].leads == 0
     assert conv_by_channel["sms"].conversion_rate == 0.0
+
+    # The per-channel breakdown must sum back to exactly conversations_this_period
+    # — this is the "channel table" surface from the walkthrough that showed 13
+    # while Overview/Billing/Analytics showed 1/3/3.
+    assert sum(c.conversations for c in agg.conversion_by_channel) == agg.conversations_this_period
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_conversations_total_counts_billed_sessions_not_raw_sessions() -> None:
+    """conversations_total must be the all-time BILLED count (counted_sessions),
+    not a raw Session row count — harmony fix item 2 (Overview/Billing/Analytics/
+    channel-table must agree on one semantics: conversation == billed session)."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    now = datetime.now(UTC)
+    billed = await _add_session(admin, iid, channel="widget", started_at=now)
+    await _add_session(admin, iid, channel="widget", started_at=now)  # never counted
+    await _add_session(admin, iid, channel="widget", started_at=now)  # never counted
+    await _count_session(admin, iid, billed)
+
+    async with tenant_session(admin) as s:
+        agg = await analytics_service.build_overview(
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=1,
+        )
+
+    assert agg.conversations_total == 1, (
+        "conversations_total leaked raw (unbilled) session rows instead of counting "
+        "billed conversations"
+    )
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_conversation_count_agrees_across_billing_overview_and_analytics() -> None:
+    """Cross-surface harmony check (item 2): Billing's conversationsThisPeriod,
+    Analytics' conversationsThisPeriod, and the per-channel breakdown total must
+    all be the exact same number for the exact same admin/period — the walkthrough
+    finding was four different surfaces disagreeing about one fact."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    now = datetime.now(UTC)
+    for _ in range(3):
+        sid = await _add_session(admin, iid, channel="widget", started_at=now)
+        await _count_session(admin, iid, sid)
+
+    async with tenant_session(admin) as s:
+        budget = await metering.build_budget(s, admin_id=admin, instance_id=iid)
+        # Billing surface number.
+        billing_count = budget.conversations_this_period
+
+        agg = await analytics_service.build_overview(
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=billing_count,
+        )
+
+    analytics_count = agg.conversations_this_period
+    channel_table_total = sum(c.conversations for c in agg.conversion_by_channel)
+
+    assert billing_count == 3
+    assert analytics_count == billing_count
+    assert channel_table_total == billing_count
 
 
 @pytest.mark.usefixtures("db_engine_reset")
