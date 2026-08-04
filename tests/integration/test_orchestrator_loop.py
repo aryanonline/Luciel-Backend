@@ -13,6 +13,7 @@ import pytest
 from app.db.session import tenant_session
 from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
+from app.models.instance import Instance, LucielState
 from app.runtime import budget
 from app.runtime.escalation import Signal
 from app.runtime.grounding import GROUNDING_FLOOR
@@ -102,6 +103,61 @@ async def test_explicit_human_request_hands_off_at_intake():
         # Session is now human_controlled (§3.4.12).
         sess = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
         assert sess.mode == "human_controlled"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_intake_handoff_ack_is_honest_when_no_escalation_contact_configured():
+    """Harmony fix 2026-08-04 item 4: with no Instance row at all (the common case in
+    these hermetic tests, and a real brand-new account before onboarding), the ack must
+    not promise a live human is connecting right now — the only thing that will
+    actually happen is a best-effort email to the owner's own account address whenever
+    they next check it."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel())
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I want to speak to a human please",
+        )
+        assert "right now" not in result.reply_text.lower()
+        assert "connecting" not in result.reply_text.lower()
+        assert "team" in result.reply_text.lower()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_intake_handoff_ack_promises_immediacy_only_when_a_contact_is_configured():
+    """The flip side: once the admin has actually configured a primary contact,
+    escalations really do reach someone promptly, so the more immediate copy is honest
+    and should be used."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="L",
+                state=LucielState.active,
+                channels=[],
+                tools=[],
+                escalation={"primaryEmail": "owner@acme.example"},
+                personality={},
+            )
+        )
+        await s.flush()
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel())
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I want to speak to a human please",
+        )
+        assert "right now" in result.reply_text.lower()
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

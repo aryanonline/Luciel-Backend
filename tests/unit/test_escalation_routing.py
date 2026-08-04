@@ -12,7 +12,10 @@ import uuid
 
 from app.notifications.base import EscalationNotification
 from app.notifications.email_notifier import EmailNotifier
-from app.notifications.escalation_dispatch import resolve_routing
+from app.notifications.escalation_dispatch import (
+    has_configured_escalation_contact,
+    resolve_routing,
+)
 from app.notifications.sms_notifier import SmsNotifier
 
 
@@ -129,3 +132,22 @@ def test_next_step_is_specific_per_signal():
     at_cap = _notification(signal="budget_exhausted").next_step
     assert "payment method" in at_cap
     assert _notification(signal="explicit_human_request").next_step != at_cap
+
+
+def test_no_configured_contact_is_reported_honestly():
+    """Harmony fix 2026-08-04 item 4: a brand-new account (empty escalation config, the
+    JSONB column's own default) must report False, not None-is-falsy-by-luck -- this is
+    what the customer-facing ack copy and the dashboard nudge both key off of."""
+    assert has_configured_escalation_contact({}) is False
+    assert has_configured_escalation_contact(None) is False
+
+
+def test_any_single_configured_contact_counts():
+    """Only one of the four contact fields needs to be set for the platform to actually
+    have somewhere real to send an escalation -- preferredChannel/routing rules alone
+    (with no contact) do not count."""
+    assert has_configured_escalation_contact({"primaryEmail": "owner@acme.example"}) is True
+    assert has_configured_escalation_contact({"primarySms": "+15550001111"}) is True
+    assert has_configured_escalation_contact({"secondaryEmail": "backup@acme.example"}) is True
+    assert has_configured_escalation_contact({"secondarySms": "+15552223333"}) is True
+    assert has_configured_escalation_contact({"preferredChannel": "sms"}) is False

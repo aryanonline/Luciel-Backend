@@ -76,6 +76,13 @@ class AnalyticsOverviewOut(WireModel):
     conversion_by_channel: list[ChannelConversionOut]
     conversion_by_source_note: str | None
     conversion_by_service_note: str | None
+    # New in this build (harmony fix 2026-08-04 item 4). False means escalations are
+    # only reaching the owner via the last-resort account-email fallback (§3.5.4),
+    # never a configured primary/secondary contact (§3.5.3) — the FE nudge banner
+    # ("configure who gets notified") reads this rather than inferring it from
+    # escalation history, which would be empty for a brand-new account with zero fired
+    # escalations yet and wrongly imply nothing needs configuring.
+    escalation_contact_configured: bool
 
 
 class AuditEventOut(WireModel):

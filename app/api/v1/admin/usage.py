@@ -32,6 +32,7 @@ from app.billing import metering
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.instance import Instance
+from app.notifications.escalation_dispatch import has_configured_escalation_contact
 from app.runtime.budget import resolve_billing_period_start
 from app.schemas_api.usage import (
     AnalyticsOverviewOut,
@@ -77,6 +78,15 @@ async def _build_overview_out(
         period_start=period,
         conversations_this_period=conversations_this_period,
     )
+
+    # harmony fix 2026-08-04 item 4: surface whether escalations have anywhere real to
+    # go, so the FE can nudge the owner instead of assuming the ack's promise held.
+    escalation_config = None
+    if instance_id is not None:
+        escalation_config = (
+            await s.execute(select(Instance.escalation).where(Instance.id == instance_id))
+        ).scalar_one_or_none()
+    escalation_contact_configured = has_configured_escalation_contact(escalation_config)
 
     out = AnalyticsOverviewOut.model_validate(
         {
@@ -130,6 +140,7 @@ async def _build_overview_out(
             "conversionByServiceNote": (
                 agg.conversion_by_service_gap.reason if agg.conversion_by_service_gap else None
             ),
+            "escalationContactConfigured": escalation_contact_configured,
         }
     )
     return out, agg

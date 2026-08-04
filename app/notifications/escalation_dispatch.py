@@ -88,6 +88,21 @@ def resolve_routing(escalation_config: Mapping[str, object] | None, signal: str)
     )
 
 
+def has_configured_escalation_contact(escalation_config: Mapping[str, object] | None) -> bool:
+    """Whether the admin has set up an actual escalation contact (§3.5.3), as opposed to
+    relying on the owner-account-email last resort (§3.5.4).
+
+    Item 4 (harmony fix 2026-08-04): the customer-facing handoff ack used to say
+    "connecting you with a person now" unconditionally, even when this returns False and
+    the only thing that will happen is a best-effort email to the owner's own account
+    address whenever they next check it. Callers use this to choose honest ack copy and
+    the dashboard uses it to decide whether to show a "configure escalation contacts"
+    nudge.
+    """
+    cfg = EscalationContactWire.model_validate(dict(escalation_config or {}))
+    return bool(cfg.primary_email or cfg.primary_sms or cfg.secondary_email or cfg.secondary_sms)
+
+
 _ADAPTERS: dict[str, NotificationAdapter] = {"email": EmailNotifier(), "sms": SmsNotifier()}
 
 

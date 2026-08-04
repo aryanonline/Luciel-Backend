@@ -19,6 +19,7 @@ from app.db.session import tenant_session
 from app.models.conversation import EscalationEvent, Session
 from app.models.instance import Instance, LucielState
 from app.runtime import budget as budget_runtime
+from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -139,6 +140,28 @@ async def test_usage_overview_new_fields_present_and_honest(client) -> None:
     assert any(c["channel"] == "widget" for c in body["channelMix"])
     assert any(c["channel"] == "widget" for c in body["conversionByChannel"])
     assert any(e["signal"] == "cannot_answer" for e in body["escalationsBySignal"])
+
+    # Harmony fix 2026-08-04 item 4: this seeded instance has escalation={} (no
+    # contact configured), so the dashboard nudge field must say so honestly.
+    assert "escalationContactConfigured" in body
+    assert body["escalationContactConfigured"] is False
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_usage_overview_escalation_contact_configured_is_true_once_set(client) -> None:
+    """The flip side of the honesty check above: once the admin sets a real contact,
+    the nudge field must turn off rather than staying stuck on its initial reading."""
+    admin = await _signup_verify_login(client)
+    iid = await _seed_instance_with_activity(admin)
+    async with tenant_session(admin) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.id == iid))
+        ).scalar_one()
+        inst.escalation = {"primaryEmail": "owner@acme.example"}
+
+    r = await client.get("/api/v1/admin/usage/overview")
+    assert r.status_code == 200
+    assert r.json()["escalationContactConfigured"] is True
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

@@ -16,8 +16,11 @@ The loop, per inbound message:
         the first model call fires the budget counter once (§3.4.1b). Tool calls
         dispatch via the Arc 12 broker (§3.3.3) using the five-outcome contract.
       → GROUNDING (§3.4.13): score the answer against retrieved chunks / tool result.
-      → ESCALATION GATE 2 — OUTCOME (§3.4.5): cannot_answer (low confidence AND below
-        the 0.50 grounding floor with no resolving tool) or high_value_lead.
+      → ESCALATION GATE 2 — OUTCOME (§3.4.5): high_value_lead (checked first — an
+        opportunity signal independent of answer quality), else cannot_answer (low
+        confidence OR below the 0.50 grounding floor, with no resolving tool —
+        harmony fix 2026-08-04 item 3: AND made this gate unsatisfiable in live mode
+        because providers always report confidence=1.0).
 
   Half B — emission:
     RESPOND: channel arbiter picks the outbound channel (§3.4.2).
@@ -50,7 +53,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, Session, Transcript
-from app.notifications.escalation_dispatch import notify_escalation_safely
+from app.models.instance import Instance
+from app.notifications.escalation_dispatch import (
+    has_configured_escalation_contact,
+    notify_escalation_safely,
+)
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
@@ -354,9 +361,7 @@ class Orchestrator:
                 signal=Signal.explicit_human_request,
                 gate="intake",
                 score=None,
-                ack=(
-                    "I want to make sure you're properly helped — connecting you with a person now."
-                ),
+                ack=await self._handoff_ack(),
             )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -377,7 +382,7 @@ class Orchestrator:
                 signal=intake.signal or Signal.explicit_human_request,
                 gate="intake",
                 score=intake.score_or_confidence,
-                ack="Of course — I'm connecting you with someone from the team right now.",
+                ack=await self._handoff_ack(),
             )
 
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
@@ -597,6 +602,29 @@ class Orchestrator:
             )
             outcomes.append(result.outcome.value)
         return outcomes
+
+    async def _handoff_ack(self) -> str:
+        """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4).
+
+        Used to say "connecting you with a person now" unconditionally. That is only
+        true if the admin has actually configured an escalation contact (§3.5.3); if
+        not, the only thing that happens is a best-effort email to the owner's own
+        account address whenever they next check it (§3.5.4 owner-fallback), which is
+        not "right now" by any reasonable reading. The ack now reflects which of those
+        is actually going to happen, instead of promising immediacy the platform cannot
+        back up.
+        """
+        inst = (
+            await self.session.execute(
+                select(Instance).where(
+                    Instance.admin_id == self.admin_id, Instance.id == self.instance_id
+                )
+            )
+        ).scalar_one_or_none()
+        configured = has_configured_escalation_contact(inst.escalation if inst else None)
+        if configured:
+            return "Of course — I'm connecting you with someone from the team right now."
+        return "I've passed this along to the team — they'll follow up with you shortly."
 
     async def _hand_off_with_ack(
         self,
