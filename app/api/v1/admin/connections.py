@@ -72,6 +72,16 @@ def oauth_transport() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=15.0)
 
 
+def _provider_display_name(provider: str) -> str:
+    """The human label for a provider code, falling back to the raw code ONLY when
+    the provider is not (or no longer) registered at all -- e.g. a connection made
+    under a provider later dropped from the catalog. Every REGISTERED provider has
+    a real display_name (Harmony wave 2, item 4 audited every entry in
+    app.connections.registry.PROVIDERS for a raw-code leak; none remain)."""
+    spec = registry.get_provider(provider)
+    return spec.display_name if spec is not None else provider
+
+
 def _connection_out(c: InstanceConnection) -> ConnectionOut:
     # Build EXPLICITLY from non-secret fields only (§3.8.3). secret_ref / auth_class
     # are intentionally NOT mapped — the wire model has no slot for them anyway.
@@ -90,6 +100,10 @@ def _connection_out(c: InstanceConnection) -> ConnectionOut:
             # stale row for a provider the platform cannot connect today is marked
             # here too instead of rendering the owner-actionable "Action needed".
             "providerAvailable": registry.provider_available(c.provider),
+            # Harmony wave 2 (item 4): give Overview the SAME human label Configure
+            # already shows, so it never has to derive one from the raw provider
+            # code (that derivation is what produced "Ses" instead of "Amazon SES").
+            "displayName": _provider_display_name(c.provider),
         }
     )
 

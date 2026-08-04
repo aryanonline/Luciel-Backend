@@ -82,10 +82,12 @@ async def test_list_shape_and_status(client):
         "lastHealthCheckAt",
         "createdAt",
         "providerAvailable",
+        "displayName",
     }
     assert c["connectionType"] == "crm"
     assert c["provider"] == "hubspot"
     assert c["status"] == "unconfigured"
+    assert c["displayName"] == "HubSpot"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -102,6 +104,57 @@ async def test_provider_available_true_for_non_oauth_provider(client):
     row = r.json()[0]
     assert row["provider"] == "outbound_webhook"
     assert row["providerAvailable"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_sender_overview_row_shows_amazon_ses_not_raw_code(client):
+    """LIVE-VERIFIED (Harmony wave 2, item 4): the Overview catalog rendered
+    "Email sending · Ses" -- the raw provider code, title-cased, because
+    ConnectionOut carried NO display label at all and the frontend had nothing
+    else to render. Provisioning the platform email sender (provider "ses") must
+    now come back with displayName "Amazon SES" so Overview never has to
+    improvise a label from the raw code again."""
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections/email",
+        json={"mode": "vm_subdomain"},
+    )
+    assert r.status_code == 200
+
+    rows = (await client.get("/api/v1/admin/connections")).json()
+    row = next(x for x in rows if x["connectionType"] == "email_sender")
+    assert row["provider"] == "ses"
+    assert row["displayName"] == "Amazon SES"
+    assert row["displayName"] != "Ses"
+
+
+def test_no_registered_provider_display_name_is_the_raw_code() -> None:
+    """Audit guard (Harmony wave 2, item 4): every entry in the provider registry
+    must carry a real human label -- never the bare raw code (``ses`` staying
+    ``ses``). A naive title-case of the raw code (``ses`` -> ``Ses``) is ALSO a
+    bug UNLESS the provider's brand name genuinely equals its title-cased code
+    (e.g. ``calendly`` -> "Calendly", ``notion`` -> "Notion") -- those are
+    correct and deliberately allow-listed here, so this guard only fires on
+    the actual bug shape: a multi-word or acronym code whose brand name is NOT
+    just its own title-case (the "ses" -> should-be "Amazon SES" case)."""
+    from app.connections import registry
+
+    # Providers whose registered code IS (title-cased) their real brand name --
+    # confirmed correct, not a raw-code leak.
+    title_case_is_correct = {"calendly", "notion", "salesforce", "instagram", "twilio"}
+
+    for provider_id, spec in registry.PROVIDERS.items():
+        assert spec.display_name.strip(), f"{provider_id} has no display_name"
+        assert spec.display_name != provider_id, (
+            f"{provider_id} display_name is the bare raw code: {spec.display_name!r}"
+        )
+        if spec.display_name == provider_id.title() and provider_id not in title_case_is_correct:
+            pytest.fail(
+                f"{provider_id} display_name is an un-reviewed naive title-case of "
+                f"the raw code: {spec.display_name!r} -- confirm it is the real brand "
+                f"name and allow-list it, or fix it (this is exactly how 'ses' leaked "
+                f"as 'Ses' instead of 'Amazon SES')"
+            )
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -162,6 +215,7 @@ async def test_no_secret_fields_ever_in_serialized_connection(client):
         "lastHealthCheckAt",
         "createdAt",
         "providerAvailable",
+        "displayName",
     }
     for c in rows:
         assert set(c.keys()) <= allowed, f"unexpected key in Connection: {set(c.keys()) - allowed}"

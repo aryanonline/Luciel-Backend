@@ -46,6 +46,15 @@ class ConnectionOut(WireModel):
     # implies the owner can fix this by acting, which is false when the platform
     # itself has not made the provider connectable yet.
     provider_available: bool = True
+    # Harmony wave 2 (item 4): the Overview row never carried a human label at all --
+    # only the raw ``provider`` code (e.g. "ses"). With nothing else to render, the
+    # frontend was left to title-case the raw code itself, producing "Ses" instead of
+    # "Amazon SES". displayName is the SAME catalog string /connections/providers
+    # already serves for Configure (registry.get_provider(provider).display_name),
+    # so Overview never needs to improvise a label from a raw code again. Falls back
+    # to the raw provider string only for a provider absent from the registry
+    # entirely (dropped from the catalog) so the field is never empty.
+    display_name: str = ""
 
 
 class StartConnectionRequest(WireModel):

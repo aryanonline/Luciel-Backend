@@ -340,7 +340,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "ses": ProviderSpec(
         provider="ses",
         connection_type="email_sender",
-        display_name="Luciel work email",
+        # Harmony wave 2 (item 4): this leaked to the owner as the raw provider
+        # code "Ses" (Overview composed "Email sending · Ses" with nothing else to
+        # render, since ConnectionOut carried no display label at all). "Amazon
+        # SES" is the actual vendor VantageMind provisions this sender through --
+        # naming it plainly here means Overview never has to derive a label from
+        # the raw code again.
+        display_name="Amazon SES",
         auth_kind=AUTH_PROVISIONED,
         auth_class="api_key",
         help_text="The address Luciel sends and receives on.",
