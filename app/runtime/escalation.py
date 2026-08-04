@@ -9,7 +9,10 @@ Gate 1 — intake (pre-PLAN), knowable from the inbound message alone:
   - explicit_human_request  (intent_class == request_human, conf >= 0.85)
   - strong_negative_sentiment (<= -0.7 across >= 2 of trailing 3 messages)
 Gate 2 — outcome (post-REFLECT), needs the loop's output:
-  - cannot_answer (plan confidence < 0.6 AND grounding < floor 0.50)
+  - cannot_answer (grounding < floor 0.50 OR plan confidence < 0.6, unless a
+    resolving tool succeeded — see evaluate_outcome docstring: this is an OR, not
+    an AND, because live providers report a fixed confidence=1.0 today and
+    grounding must be sufficient on its own to gate a response)
   - high_value_lead (normalized lead-score; budget 0.5 + time-pressure 0.3 +
     purchase/booking intent 0.4, capped at 1.0)
 
@@ -137,18 +140,37 @@ def evaluate_outcome(
 ) -> EscalationDecision:
     """Gate 2 — signals that need the loop's output (post-REFLECT).
 
-    cannot_answer fires when confidence < 0.6 AND grounding below the 0.50 floor,
-    UNLESS a resolving tool succeeded (then the answer is grounded in the tool result).
-    high_value_lead fires on the scoring heuristic.
-    """
-    if (
-        not resolving_tool_succeeded
-        and plan_confidence < CANNOT_ANSWER_CONFIDENCE
-        and grounding_score < GROUNDING_FLOOR
-    ):
-        return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, plan_confidence)
+    cannot_answer fires when the answer is below the grounding floor (no resolving
+    tool backed it, and retrieval/self-support didn't clear 0.50) OR the model
+    self-reports low confidence, UNLESS a resolving tool succeeded (then the answer
+    is grounded in the tool result). high_value_lead fires on the scoring heuristic.
 
+    Harmony fix 2026-08-04 (item 3): this was previously an AND of the two signals
+    ("confidence < 0.6 AND grounding < floor"). The live Anthropic/OpenAI providers
+    (app/runtime/providers.py) report a hardcoded confidence=1.0 — no real
+    self-reported confidence signal exists in production — so the AND was
+    permanently unsatisfiable on the confidence side: an ungrounded, fabricated
+    answer with grounding_score=0.0 would never escalate, because 1.0 is never
+    < 0.6. Grounding alone is real and computed (app/runtime/grounding.py); it must
+    be sufficient on its own to gate a response, not merely a necessary condition
+    alongside a signal that is currently always 1.0. Confidence remains an
+    independent OR trigger so a genuinely low-confidence signal (from EchoModel in
+    tests today, or a real one if a provider ever supplies it) still escalates even
+    when grounding happens to clear the floor.
+    """
+    # high_value_lead is checked FIRST: it is a content/opportunity signal, entirely
+    # independent of whether Luciel's own answer was grounded. A high-value lead
+    # message ("$5000 budget, want to book today") deserves urgent human follow-up
+    # regardless of how well-grounded the reply happened to be — masking that behind
+    # a grounding failure would bury the more business-critical signal.
     lead_score = high_value_lead_score(message, custom_rules_hit)
     if lead_score >= 0.5:
         return EscalationDecision(True, Signal.high_value_lead, Gate.outcome, lead_score)
+
+    if not resolving_tool_succeeded and (
+        grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE
+    ):
+        score = min(plan_confidence, grounding_score)
+        return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, score)
+
     return EscalationDecision(False)

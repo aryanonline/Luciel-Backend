@@ -15,6 +15,7 @@ from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
 from app.runtime import budget
 from app.runtime.escalation import Signal
+from app.runtime.grounding import GROUNDING_FLOOR
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.testing import EchoModel
@@ -195,3 +196,96 @@ async def test_high_value_lead_escalates_at_outcome():
         assert result.escalation is not None
         assert result.escalation.signal is Signal.high_value_lead
         assert result.counted is True  # answered + counted, then escalated at outcome
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_kb_backed_answer_scores_above_floor_and_persists_the_real_score():
+    """Harmony fix 2026-08-04 (item 3): a KB-backed answer whose reply is actually
+    supported by retrieved chunks must score above the grounding floor, and that REAL
+    score (not a hardcoded 0.50) must be what's persisted on the transcript row for
+    the dashboard evidence endpoint to read."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+
+    async def _kb_retriever(_q: str) -> list[str]:
+        return [
+            "Our return policy allows returns within 30 days of purchase with a receipt.",
+            "Electronics have a 15 day return window due to manufacturer restrictions.",
+        ]
+
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        primary = EchoModel(
+            confidence=1.0,  # matches what live providers always report (§3.4.3)
+            fixed_reply="Electronics have a 15 day return window per our policy.",
+        )
+        orch = Orchestrator(
+            session=s,
+            router=LLMRouter(primary=primary, fallback=primary),
+            retriever=_kb_retriever,
+            admin_id=admin,
+            instance_id=iid,
+            enabled_channels={"widget"},
+            has_payment_method=False,
+        )
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="What's your return policy for electronics?",
+        )
+
+        assert result.escalation is None, "a grounded answer must not escalate"
+        assert result.grounding_score >= GROUNDING_FLOOR
+
+        luciel_row = (
+            await s.execute(
+                select(Transcript).where(
+                    Transcript.session_id == sid, Transcript.role == "luciel"
+                )
+            )
+        ).scalar_one()
+        assert luciel_row.grounding_score == pytest.approx(result.grounding_score)
+        assert luciel_row.grounding_score >= GROUNDING_FLOOR
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_no_kb_confidently_fabricated_answer_escalates_instead_of_confident_specifics():
+    """The exact walkthrough symptom: a no-KB question answered with confident,
+    specific-sounding fabrication (a fake warranty claim) must escalate rather than
+    reach the customer as a confident answer -- even though the live-provider
+    confidence signal is pinned at 1.0 (app/runtime/providers.py), exactly like the
+    real Anthropic/OpenAI providers report today. Before the harmony fix, the AND
+    gate meant this NEVER escalated because plan_confidence=1.0 is never < 0.6."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        primary = EchoModel(
+            confidence=1.0,
+            fixed_reply="Sure, we offer a lifetime warranty on all products, no questions asked.",
+        )
+        orch = _orch(s, admin, iid, primary=primary)
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Do you offer a warranty?",
+        )
+
+        assert result.escalation is not None, (
+            "a confidently fabricated, ungrounded answer must escalate — this is the "
+            "harmony fix item 3 regression test"
+        )
+        assert result.escalation.signal is Signal.cannot_answer
+        assert result.grounding_score == 0.0
+
+        luciel_row = (
+            await s.execute(
+                select(Transcript).where(
+                    Transcript.session_id == sid, Transcript.role == "luciel"
+                )
+            )
+        ).scalar_one()
+        assert luciel_row.grounding_score == 0.0

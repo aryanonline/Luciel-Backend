@@ -31,6 +31,7 @@ from app.models.conversation import EscalationEvent, SessionSummary, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
+from app.runtime.grounding import GROUNDING_FLOOR
 from app.runtime.orchestrator import persist_turn
 from app.schemas_api.conversations import (
     AnswerEvidenceOut,
@@ -257,11 +258,21 @@ async def get_answer_evidence(
 ) -> AnswerEvidenceOut:
     """Answer grounding + source chunks for one Luciel message (§3.4.13).
 
-    FLAGGED CONTRACT GAP: per-message grounding scores + retrieved source chunks are
-    persisted by the vector-retrieval arc (Arc 11/16). Arc 14 persists the transcript
-    but not the per-message evidence rows, so this returns the message at the uniform
-    grounding floor (0.50, §3.4.13) with no chunks until the retrieval store lands.
-    The wire shape is frozen now so the dashboard binds without later change.
+    Harmony fix 2026-08-04 (item 3): this used to hardcode grounding_score=0.50 for
+    EVERY message regardless of what actually happened at runtime — the walkthrough's
+    "every answer scores exactly 0.50" observation was this endpoint being completely
+    disconnected from the real per-turn score, which score_grounding (see
+    app/runtime/grounding.py) DOES compute dynamically and the orchestrator DOES use
+    to gate escalation. It is now persisted on Transcript.grounding_score
+    (app/runtime/orchestrator.py::persist_turn) and read for real here.
+
+    FLAGGED CONTRACT GAP (narrower than before): retrieved source chunks are NOT
+    persisted with source attribution — the retriever seam
+    (app/runtime/knowledge_retrieval.py) returns plain text, discarding
+    KnowledgeChunk.source_id/source_name by the time it reaches the orchestrator.
+    Wiring real source_chunks would mean changing that seam's return type across
+    orchestrator/voice_pipeline/chat_widget and every test double — deferred to
+    Arc 11/16 rather than fabricated here. source_chunks stays an honest empty list.
     """
     async with tenant_session(subject.admin_id) as s:
         await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
@@ -278,7 +289,10 @@ async def get_answer_evidence(
             raise not_found("Message not found.")
         return AnswerEvidenceOut(
             message_id=msg.id,
-            grounding_score=0.50,  # uniform grounding floor (§3.4.13) until Arc 11/16.
+            # Real persisted score for luciel replies; other roles (lead/human_agent)
+            # were never scored — surface the floor constant only as a neutral
+            # placeholder for those, never as a fabricated "this was checked" value.
+            grounding_score=msg.grounding_score if msg.grounding_score is not None else GROUNDING_FLOOR,
             source_chunks=[],
             flagged_by_admin=False,
         )

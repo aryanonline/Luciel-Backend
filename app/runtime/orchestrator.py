@@ -112,12 +112,19 @@ async def persist_turn(
     session_id: uuid.UUID,
     role: str,
     text: str,
+    grounding_score: float | None = None,
 ) -> Transcript:
     """Append one message to the session transcript and return the persisted row.
 
     Public because the takeover reply path (§3.4.12) writes ``human_agent`` rows through
     the SAME function the loop uses — one transcript writer, so an admin reply and a
-    Luciel reply are indistinguishable in ordering/tenancy handling."""
+    Luciel reply are indistinguishable in ordering/tenancy handling.
+
+    ``grounding_score`` (harmony fix 2026-08-04, item 3) persists the real per-turn
+    score computed by score_grounding for ``luciel`` replies, so the dashboard evidence
+    endpoint can read the actual value instead of a hardcoded floor constant. Left
+    None for non-luciel roles and for the technical-issue ack (no grounding was
+    computed — no model call was served)."""
     if role not in TRANSCRIPT_ROLES:
         raise ValueError(f"unknown transcript role: {role}")
     row = Transcript(
@@ -127,6 +134,7 @@ async def persist_turn(
         session_id=session_id,
         role=role,
         text=text,
+        grounding_score=grounding_score,
     )
     session.add(row)
     await session.flush()
@@ -475,6 +483,7 @@ class Orchestrator:
             session_id=session_id,
             role="luciel",
             text=reply_text,
+            grounding_score=grounding.score,
         )
         return LoopResult(
             reply_text=reply_text,

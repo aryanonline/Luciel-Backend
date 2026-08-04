@@ -52,6 +52,13 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Harmony fix 2026-08-04 (item 3): the real per-turn grounding score computed by
+    # app/runtime/grounding.py::score_grounding was computed and used for the
+    # escalation floor gate but never persisted anywhere, so the dashboard evidence
+    # endpoint (GET .../evidence) had nothing real to read and returned a hardcoded
+    # 0.50 for every message regardless of what actually happened. NULL for
+    # non-luciel roles (lead/human_agent turns are not scored).
+    grounding_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

@@ -89,6 +89,10 @@ async def test_list_conversations_camelcase(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_messages_and_nested_evidence(client):
+    """Harmony fix 2026-08-04 (item 3): the seeded message here has NO grounding
+    score persisted (it was never scored by the runtime — pre-fix seed data /
+    legacy rows), so the floor constant is a neutral placeholder, not a claim that
+    this specific message was actually checked at 0.50."""
     admin = await _signup_verify_login(client)
     _iid, sid, mid = await _seed_conversation(admin)
     rm = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
@@ -99,9 +103,50 @@ async def test_messages_and_nested_evidence(client):
     assert re.status_code == 200
     ev = re.json()
     assert ev["messageId"] == str(mid)
-    assert ev["groundingScore"] == 0.50  # uniform floor (§3.4.13)
+    assert ev["groundingScore"] == 0.50  # neutral placeholder for an unscored row
     assert ev["sourceChunks"] == []
     assert ev["flaggedByAdmin"] is False
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_evidence_returns_the_real_persisted_grounding_score(client):
+    """This is the actual harmony fix: two different messages with two different
+    REAL scores must return two different values, not both hitting the same
+    hardcoded 0.50 the walkthrough observed for every answer."""
+    admin = await _signup_verify_login(client)
+    iid, sid, _mid = await _seed_conversation(admin)
+    high_id, low_id = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=high_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="Electronics have a 15 day return window per our policy.",
+                grounding_score=0.83,
+            )
+        )
+        s.add(
+            Transcript(
+                id=low_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="Sure, we offer a lifetime warranty on all products.",
+                grounding_score=0.0,
+            )
+        )
+        await s.flush()
+
+    r_high = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{high_id}/evidence")
+    r_low = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{low_id}/evidence")
+    assert r_high.status_code == 200 and r_low.status_code == 200
+    assert r_high.json()["groundingScore"] == pytest.approx(0.83)
+    assert r_low.json()["groundingScore"] == 0.0
+    assert r_high.json()["groundingScore"] != r_low.json()["groundingScore"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
