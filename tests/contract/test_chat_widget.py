@@ -296,3 +296,57 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
     assert rows, "widget_abuse_blocked audit event must be written on a flood"
     for row in rows:
         assert "reason" in row.event_payload and row.event_payload["channel"] == "widget"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_bootstrap_disclosure_clause_never_names_the_luciel(client):
+    """LIVE-VERIFIED regression: the opening greeting read "Hi — I'm Aryan's
+    Front-Desk Assistant. I'm an AI assistant for Aryan's Front-Desk Assistant,
+    and I can help…" — the disclosure clause substituted the LUCIEL name where
+    the BUSINESS should be. No usable short business-name field exists on the
+    Instance/Personality pillar, so the disclosure clause must fall back to
+    "this business" and must never repeat the Luciel name.
+    """
+    luciel_name = "Aryan's Front-Desk Assistant"
+    admin = uuid.uuid4()
+    embed_key = f"vm_live_{uuid.uuid4().hex[:10]}"
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin}@x.com",
+                email_lower=f"{admin}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        s.add(
+            Instance(
+                id=admin,
+                admin_id=admin,
+                name=luciel_name,
+                state=LucielState.active,
+                embed_key_public_id=embed_key,
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        await s.flush()
+    r = await client.post("/api/v1/chat-widget/bootstrap", json={"embedKey": embed_key})
+    assert r.status_code == 200
+    body = r.json()
+    opening = body["openingMessage"]
+    assert opening.startswith(f"Hi — I'm {luciel_name}.")
+    # The disclosure clause (after the speaker introduction) must name the
+    # business generically -- never the Luciel name.
+    clause = opening.split(".", 1)[1]
+    assert luciel_name not in clause
+    assert "an ai assistant for this business" in clause.lower()
+    # The frozen wire field business_name still mirrors inst.name (unrelated to
+    # the disclosure clause fix -- widget header contract, not the greeting text).
+    assert body["businessName"] == luciel_name

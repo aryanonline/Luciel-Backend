@@ -44,10 +44,18 @@ class RuntimeReply:
 
 
 def _names(inst: Instance) -> tuple[str, str]:
-    """Business + assistant display names (§3.4.16).
+    """Luciel display name + assistant speaker name (§3.4.16).
 
-    Mirrors app.api.v1.chat_widget._names: when no assistantName is configured,
-    the business name is used VERBATIM as the speaker — never suffixed with
+    Mirrors app.api.v1.chat_widget._names. NOTE ON NAMING: the first element
+    returned here (historically called "business") is ``inst.name`` -- the
+    LUCIEL's own configured name, NOT the business's name. It must never be
+    fed into the AI-identity disclosure's business noun; see
+    ``_disclosure_business_name`` for that (the bug this fixes: the disclosure
+    naming the Luciel, e.g. "Aryan's Front-Desk Assistant", instead of the
+    business).
+
+    When no assistantName is configured, the Luciel name itself is used
+    VERBATIM as the speaker — never suffixed with
     "'s assistant", which is what produced "...Assistant's assistant" for a
     business/Luciel name already ending in the word "Assistant".
     """
@@ -55,6 +63,21 @@ def _names(inst: Instance) -> tuple[str, str]:
     personality = inst.personality or {}
     assistant = str(personality.get("assistantName") or business)
     return business, assistant
+
+
+def _disclosure_business_name(inst: Instance) -> str:
+    """Resolve the BUSINESS name for the AI-identity disclosure clause (§3.4.16).
+
+    Mirrors app.api.v1.chat_widget._disclosure_business_name. Checked the
+    Instance model and the Personality pillar for a usable SHORT business-name
+    field: there isn't one -- ``personality.businessContext``
+    (app.runtime.personality.business_context_of) and the signup
+    ``Instance.business_one_liner`` are both free-text up to 280 chars, meant
+    for the system prompt, not a short display name. With no usable short
+    name, this falls back to the generic "this business". The Luciel name
+    (``inst.name``) must NEVER be returned here.
+    """
+    return "this business"
 
 
 async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> RuntimeReply:
@@ -100,7 +123,9 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         admin_id=msg.admin_id,
         instance_id=msg.instance_id,
         enabled_channels=effective.enabled_channels,
-        business_name=business,
+        # `business` above is inst.name (the Luciel's own name) -- never pass it as
+        # business_name for the disclosure backstop; use _disclosure_business_name.
+        business_name=_disclosure_business_name(inst),
         assistant_name=assistant,
         business_context=effective.business_context,
         personality=effective.personality,

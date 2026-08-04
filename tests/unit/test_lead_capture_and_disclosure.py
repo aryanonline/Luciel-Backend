@@ -75,3 +75,46 @@ def test_backstop_never_doubles_assistant_when_name_already_ends_in_assistant():
     # AI-disclosure requirement stays explicit and intact.
     assert disclosure_present(out)
     assert "Our hours are 9 to 5." in out
+
+
+def test_disclosure_clause_names_business_when_luciel_name_ends_in_assistant():
+    """LIVE-VERIFIED regression: the disclosure clause must name the BUSINESS, never
+    the Luciel, even when the Luciel/speaker name ends in the word "Assistant" (the
+    exact live-failing shape: "Hi — I'm Aryan's Front-Desk Assistant. I'm an AI
+    assistant for Aryan's Front-Desk Assistant..." incorrectly repeated the Luciel
+    name in the disclosure clause instead of naming the business).
+    """
+    luciel_name = "Aryan's Front-Desk Assistant"
+    business_name = "Aryan's Detailing Co"
+    out = ensure_ai_identity_disclosure(
+        "", business_name=business_name, assistant_name=luciel_name
+    )
+    assert out.startswith(f"Hi — I'm {luciel_name}.")
+    assert f"an AI assistant for {business_name}" in out
+    # The Luciel name must never appear in the disclosure clause itself (only as
+    # the speaker at the very start of the line).
+    after_speaker = out[len(f"Hi — I'm {luciel_name}."):]
+    assert luciel_name not in after_speaker
+
+
+def test_disclosure_clause_falls_back_to_this_business_when_no_business_name():
+    """No usable business name → the disclosure clause falls back to the generic
+    "this business" rather than ever substituting the Luciel name."""
+    luciel_name = "Nova"
+    out = ensure_ai_identity_disclosure(
+        "", business_name="this business", assistant_name=luciel_name
+    )
+    assert "an AI assistant for this business" in out
+    assert luciel_name not in out.split(".", 1)[1]
+
+
+def test_disclosure_never_contains_the_luciel_name_even_when_it_ends_in_assistant():
+    """Hard invariant: whatever business_name is supplied, the disclosure clause
+    (the part after the speaker introduction) must never contain the Luciel name."""
+    luciel_name = "Aryan's Front-Desk Assistant"
+    for business_name in ("this business", "Aryan's Detailing Co", "GTA Premier"):
+        out = ensure_ai_identity_disclosure(
+            "", business_name=business_name, assistant_name=luciel_name
+        )
+        clause = out.split(".", 1)[1]
+        assert luciel_name not in clause

@@ -107,10 +107,19 @@ async def _widget_abuse_gate(
 
 
 def _names(inst: Instance) -> tuple[str, str]:
-    """Business + assistant display names from the instance config (§3.4.16).
+    """Luciel display name + assistant speaker name from the instance config.
 
-    When no assistantName is configured, the business name itself is used
-    VERBATIM as the speaker — never suffixed with "'s assistant". That suffix is
+    NOTE ON NAMING: despite the historical local variable name "business", the
+    first element returned here is ``inst.name`` -- the LUCIEL's own configured
+    name ("The one Luciel per account", see app.models.instance.Instance), NOT
+    the business's name. It feeds the frozen wire field
+    ``WidgetBootstrapOut.business_name`` (contract-tested to equal ``inst.name``,
+    e.g. "Sarah Chen") and the widget header -- it must NEVER be fed into the
+    AI-identity disclosure clause's business noun; see ``_disclosure_business_name``
+    for that.
+
+    When no assistantName is configured, the Luciel name itself is used
+    VERBATIM as the speaker -- never suffixed with "'s assistant". That suffix is
     exactly what produced "...Assistant's assistant" when a business/Luciel name
     already ends in the word "Assistant" (e.g. "Aryan's Front-Desk Assistant").
     """
@@ -118,6 +127,25 @@ def _names(inst: Instance) -> tuple[str, str]:
     personality = inst.personality or {}
     assistant = str(personality.get("assistantName") or business)
     return business, assistant
+
+
+def _disclosure_business_name(inst: Instance) -> str:
+    """Resolve the BUSINESS name for the AI-identity disclosure clause (Sec 3.4.16).
+
+    Bug fixed here: the disclosure previously named the LUCIEL (``inst.name``,
+    e.g. "Aryan's Front-Desk Assistant") instead of the business, producing
+    "I'm an AI assistant for Aryan's Front-Desk Assistant" -- the Luciel name must
+    NEVER appear in this clause.
+
+    Checked the Instance model and the Personality pillar for a usable SHORT
+    business-name field: there isn't one. ``personality.businessContext``
+    (app.runtime.personality.business_context_of) and the signup
+    ``Instance.business_one_liner`` are both free-text up to 280 chars --
+    descriptive one-liners meant for the system prompt, not short display
+    names -- so neither is safe to drop into a one-line greeting. With no
+    usable short name, this falls back to the generic "this business".
+    """
+    return "this business"
 
 
 @router.post("/bootstrap", response_model=WidgetBootstrapOut)
@@ -153,7 +181,9 @@ async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
             render_state="at_cap" if state.at_cap else "active",
             business_name=business,
             assistant_name=assistant,
-            opening_message=_disclosure(business, assistant),
+            # Disclosure clause names the BUSINESS, never the Luciel (`business` above
+            # is inst.name, the Luciel's own name -- see _disclosure_business_name).
+            opening_message=_disclosure(_disclosure_business_name(inst), assistant),
             ai_assistant_label="AI assistant",
             powered_by_vantage_mind=True,
         )
@@ -242,7 +272,10 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             instance_id=ctx.instance_id,
             enabled_channels=effective.enabled_channels,
             # Names for the first-message AI-identity disclosure backstop (§3.4.16).
-            business_name=business,
+            # `business` here is inst.name (the Luciel's own name) -- never pass it as
+            # business_name for the disclosure; use _disclosure_business_name (never
+            # the Luciel name) so the backstop never names the Luciel as the business.
+            business_name=_disclosure_business_name(inst),
             assistant_name=assistant,
             # 280-char admin business-context, composed UNDER the platform invariants
             # by Defense 6 (§3.4.14) — it tunes tone/facts, never overrides identity.
