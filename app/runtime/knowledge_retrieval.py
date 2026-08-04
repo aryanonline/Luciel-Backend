@@ -108,3 +108,71 @@ def make_retriever(
         )
 
     return _retrieve
+
+
+# Harmony wave 2, item 2a (LIVE-VERIFIED): source_id/source_name are already on
+# every KnowledgeChunk row the vector store returns (app/knowledge/service.py::
+# retrieve), but hybrid_retrieve() above collapses them to plain text before the
+# orchestrator ever sees them, so persist_turn had nothing real to attach as
+# source_chunks -- the dashboard evidence endpoint always rendered an empty list,
+# which the frontend then rendered as "no source backed this answer" even when
+# retrieval genuinely ran and found KB matches. ChunkAttributor is an ADDITIVE
+# seam (not a change to the existing Retriever contract, to avoid rewriting every
+# call site/fake across chat_widget/runtime_entry/voice_pipeline/tests): it
+# answers the SAME query and returns the vector hits' real source metadata so the
+# orchestrator can persist real chunk refs on new turns whose retriever actually
+# has them. Graph facts have no KnowledgeChunk row to attribute to, so this only
+# ever covers the vector leg -- deliberately: a graph-only structured-filter turn
+# still persists source_chunks=None (attribution_unavailable), never a fabricated
+# source for a fact that has no chunk this maps back to.
+ChunkAttributor = Callable[[str], Awaitable[list[dict[str, object]]]]
+
+
+async def hybrid_retrieve_sources(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    query: str,
+    k: int = DEFAULT_K,
+) -> list[dict[str, object]]:
+    """Real source attribution for the vector leg of hybrid_retrieve (§3.2.1/§3.4.13).
+
+    Returns [{"source_id", "source_name", "text"}, ...] for the same vector hits
+    hybrid_retrieve() would fold into its plain-text list, so callers that want to
+    PERSIST attribution (not just prompt the model) have the real chunk refs
+    available, without changing hybrid_retrieve's existing return type."""
+    vector_hits = await service.retrieve(
+        session, admin_id=admin_id, instance_id=instance_id, query=query, k=k
+    )
+    if not vector_hits:
+        return []
+    source_ids = {chunk.source_id for chunk, _distance in vector_hits}
+    sources = await service.sources_by_id(
+        session, admin_id=admin_id, instance_id=instance_id, source_ids=source_ids
+    )
+    return [
+        {
+            "source_id": str(chunk.source_id),
+            "source_name": sources.get(chunk.source_id, "Knowledge source"),
+            "text": chunk.text,
+        }
+        for chunk, _distance in vector_hits
+    ]
+
+
+def make_chunk_attributor(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    k: int = DEFAULT_K,
+) -> ChunkAttributor:
+    """Bind a tenant-scoped chunk attributor alongside make_retriever's retriever."""
+
+    async def _attribute(query: str) -> list[dict[str, object]]:
+        return await hybrid_retrieve_sources(
+            session, admin_id=admin_id, instance_id=instance_id, query=query, k=k
+        )
+
+    return _attribute

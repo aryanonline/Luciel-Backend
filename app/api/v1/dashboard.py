@@ -31,7 +31,6 @@ from app.models.conversation import EscalationEvent, SessionSummary, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
-from app.runtime.grounding import GROUNDING_FLOOR
 from app.runtime.orchestrator import persist_turn
 from app.schemas_api.conversations import (
     AnswerEvidenceOut,
@@ -43,6 +42,7 @@ from app.schemas_api.conversations import (
     LeadOut,
     MessageOut,
     PruneRequest,
+    SourceChunkOut,
 )
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
@@ -258,21 +258,28 @@ async def get_answer_evidence(
 ) -> AnswerEvidenceOut:
     """Answer grounding + source chunks for one Luciel message (§3.4.13).
 
-    Harmony fix 2026-08-04 (item 3): this used to hardcode grounding_score=0.50 for
-    EVERY message regardless of what actually happened at runtime — the walkthrough's
-    "every answer scores exactly 0.50" observation was this endpoint being completely
-    disconnected from the real per-turn score, which score_grounding (see
-    app/runtime/grounding.py) DOES compute dynamically and the orchestrator DOES use
-    to gate escalation. It is now persisted on Transcript.grounding_score
-    (app/runtime/orchestrator.py::persist_turn) and read for real here.
+    Harmony fix 2026-08-04 (item 3) persisted the real per-turn score on
+    Transcript.grounding_score (app/runtime/orchestrator.py::persist_turn) instead
+    of the old hardcoded 0.50. That fix's OWN fallback path was itself dishonest,
+    caught live in Harmony wave 2 (item 2c): any row with grounding_score IS NULL
+    (both genuine legacy/pre-migration rows AND the harmony-fix-era test fixtures
+    that seeded a "legacy" luciel row) still rendered the SAME 0.50 floor constant
+    as if it had been measured -- "Grounded 0.50" for a row nobody ever scored.
+    scoringStatus now makes that distinction explicit on the wire: "scored" carries
+    a real groundingScore, "not_scored_legacy" carries groundingScore=null and the
+    dashboard renders "Not scored (before scoring existed)", never a number.
 
-    FLAGGED CONTRACT GAP (narrower than before): retrieved source chunks are NOT
-    persisted with source attribution — the retriever seam
-    (app/runtime/knowledge_retrieval.py) returns plain text, discarding
-    KnowledgeChunk.source_id/source_name by the time it reaches the orchestrator.
-    Wiring real source_chunks would mean changing that seam's return type across
-    orchestrator/voice_pipeline/chat_widget and every test double — deferred to
-    Arc 11/16 rather than fabricated here. source_chunks stays an honest empty list.
+    Harmony wave 2 (item 2a) also closes the FLAGGED CONTRACT GAP this endpoint
+    used to carry: source_chunks is no longer unconditionally empty. New luciel
+    replies persist real chunk refs when the retriever had them
+    (app/runtime/knowledge_retrieval.py::make_chunk_attributor, threaded through
+    Orchestrator.chunk_attributor -> persist_turn). attributionStatus distinguishes
+    "has_sources" (non-empty, real chunks), "no_sources_retrieved" (retrieval ran,
+    found nothing -- an honest empty list), and "attribution_unavailable" (we never
+    captured attribution for this row, e.g. legacy rows predating this column, or a
+    reply channel/path with no attribution seam bound). Empty source_chunks must
+    NEVER be presented as "no source backed this answer" on its own -- that FE copy
+    is only correct for "no_sources_retrieved", not for "attribution_unavailable".
     """
     async with tenant_session(subject.admin_id) as s:
         await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
@@ -287,13 +294,32 @@ async def get_answer_evidence(
         ).scalar_one_or_none()
         if msg is None:
             raise not_found("Message not found.")
+
+        scored = msg.grounding_score is not None
+        source_chunks_raw = msg.source_chunks
+        if source_chunks_raw is None:
+            attribution_status = "attribution_unavailable"
+            source_chunks: list[SourceChunkOut] = []
+        elif len(source_chunks_raw) == 0:
+            attribution_status = "no_sources_retrieved"
+            source_chunks = []
+        else:
+            attribution_status = "has_sources"
+            source_chunks = [
+                SourceChunkOut(
+                    source_id=uuid.UUID(str(c["source_id"])),
+                    source_name=str(c["source_name"]),
+                    text=str(c["text"]),
+                )
+                for c in source_chunks_raw
+            ]
+
         return AnswerEvidenceOut(
             message_id=msg.id,
-            # Real persisted score for luciel replies; other roles (lead/human_agent)
-            # were never scored — surface the floor constant only as a neutral
-            # placeholder for those, never as a fabricated "this was checked" value.
-            grounding_score=msg.grounding_score if msg.grounding_score is not None else GROUNDING_FLOOR,
-            source_chunks=[],
+            grounding_score=msg.grounding_score if scored else None,
+            scoring_status="scored" if scored else "not_scored_legacy",
+            source_chunks=source_chunks,
+            attribution_status=attribution_status,
             flagged_by_admin=False,
         )
 

@@ -89,10 +89,16 @@ async def test_list_conversations_camelcase(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_messages_and_nested_evidence(client):
-    """Harmony fix 2026-08-04 (item 3): the seeded message here has NO grounding
-    score persisted (it was never scored by the runtime — pre-fix seed data /
-    legacy rows), so the floor constant is a neutral placeholder, not a claim that
-    this specific message was actually checked at 0.50."""
+    """LIVE-VERIFIED (Harmony wave 2, items 2a/2c): the seeded message here has NO
+    grounding score and NO source_chunks persisted (it models a genuine
+    pre-migration/legacy Transcript row — created before either column existed).
+    The harmony-fix-2026-08-04 version of this test asserted groundingScore == 0.50
+    for exactly this row, which is the item-2c bug itself: a legacy row must render
+    a "not scored" marker, never the floor constant dressed up as a real score.
+    Likewise sourceChunks == [] here must be reported as attribution_unavailable
+    (we never captured attribution for this row), NOT no_sources_retrieved (which
+    would claim retrieval genuinely ran and found nothing) and NEVER rendered by
+    the frontend as "no source backed this answer"."""
     admin = await _signup_verify_login(client)
     _iid, sid, mid = await _seed_conversation(admin)
     rm = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
@@ -103,8 +109,10 @@ async def test_messages_and_nested_evidence(client):
     assert re.status_code == 200
     ev = re.json()
     assert ev["messageId"] == str(mid)
-    assert ev["groundingScore"] == 0.50  # neutral placeholder for an unscored row
+    assert ev["groundingScore"] is None
+    assert ev["scoringStatus"] == "not_scored_legacy"
     assert ev["sourceChunks"] == []
+    assert ev["attributionStatus"] == "attribution_unavailable"
     assert ev["flaggedByAdmin"] is False
 
 
@@ -145,8 +153,83 @@ async def test_evidence_returns_the_real_persisted_grounding_score(client):
     r_low = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{low_id}/evidence")
     assert r_high.status_code == 200 and r_low.status_code == 200
     assert r_high.json()["groundingScore"] == pytest.approx(0.83)
+    assert r_high.json()["scoringStatus"] == "scored"
     assert r_low.json()["groundingScore"] == 0.0
+    assert r_low.json()["scoringStatus"] == "scored"
     assert r_high.json()["groundingScore"] != r_low.json()["groundingScore"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_evidence_reports_has_sources_for_real_attributed_chunks(client):
+    """LIVE-VERIFIED (Harmony wave 2, item 2a): a reply with REAL persisted
+    source_chunks (the retriever had them and Orchestrator.chunk_attributor
+    persisted them via persist_turn) must report attributionStatus ==
+    "has_sources" and return the real chunk refs — never an empty list dressed
+    up as "no source backed this answer"."""
+    admin = await _signup_verify_login(client)
+    iid, sid, _mid = await _seed_conversation(admin)
+    msg_id = uuid.uuid4()
+    src_id = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=msg_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="Standard shipping takes 5 to 7 business days.",
+                grounding_score=0.9,
+                source_chunks=[
+                    {
+                        "source_id": str(src_id),
+                        "source_name": "Shipping FAQ.pdf",
+                        "text": "Standard shipping takes 5 to 7 business days.",
+                    }
+                ],
+            )
+        )
+        await s.flush()
+
+    r = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{msg_id}/evidence")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["attributionStatus"] == "has_sources"
+    assert body["scoringStatus"] == "scored"
+    assert len(body["sourceChunks"]) == 1
+    assert body["sourceChunks"][0]["sourceName"] == "Shipping FAQ.pdf"
+    assert body["sourceChunks"][0]["sourceId"] == str(src_id)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_evidence_reports_no_sources_retrieved_when_retrieval_found_nothing(client):
+    """An empty source_chunks list that WAS captured (retrieval genuinely ran and
+    found nothing) must be distinguished from attribution_unavailable — both
+    render as an empty sourceChunks array, but only no_sources_retrieved is an
+    honest claim about retrieval outcome."""
+    admin = await _signup_verify_login(client)
+    iid, sid, _mid = await _seed_conversation(admin)
+    msg_id = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=msg_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="I don't have information on that in my knowledge base.",
+                grounding_score=0.0,
+                source_chunks=[],
+            )
+        )
+        await s.flush()
+
+    r = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{msg_id}/evidence")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["attributionStatus"] == "no_sources_retrieved"
+    assert body["sourceChunks"] == []
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

@@ -214,6 +214,34 @@ async def list_sources(session: AsyncSession, admin_id: uuid.UUID) -> list[Knowl
     )
 
 
+async def sources_by_id(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    source_ids: set[uuid.UUID],
+) -> dict[uuid.UUID, str]:
+    """source_id -> display name, for the given ids (harmony wave 2, item 2a).
+
+    Used by the retrieval attribution seam to resolve a real, human-readable source
+    name for persisted source_chunks instead of leaving the dashboard to show a bare
+    UUID. Soft-deleted sources are still resolved by name (a chunk retrieved before
+    deletion should still show what it came from), just never re-retrieved.
+    """
+    if not source_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(KnowledgeSource.id, KnowledgeSource.name).where(
+                KnowledgeSource.admin_id == admin_id,
+                KnowledgeSource.instance_id == instance_id,
+                KnowledgeSource.id.in_(source_ids),
+            )
+        )
+    ).all()
+    return {row[0]: row[1] for row in rows}
+
+
 async def get_chunks(
     session: AsyncSession, admin_id: uuid.UUID, source_id: uuid.UUID, limit: int = 20
 ) -> list[KnowledgeChunk]:

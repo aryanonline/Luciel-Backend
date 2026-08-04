@@ -85,10 +85,38 @@ class SourceChunkOut(WireModel):
     text: str
 
 
+# Harmony wave 2, item 2 (LIVE-VERIFIED evidence-honesty contract):
+#
+# scoringStatus distinguishes a REAL persisted grounding score from a row that was
+# never scored at all -- "not_scored_legacy" covers BOTH pre-migration Transcript
+# rows (grounding_score column did not exist yet when they were written) and any
+# other luciel-role row that predates real scoring. The dashboard must render
+# "Not scored (before scoring existed)" for that status, NEVER the floor constant
+# as if it were a real measurement -- rendering 0.50 for an unscored row is exactly
+# the "Grounded 0.50" bug this item closes. groundingScore is null whenever
+# scoringStatus != "scored".
+#
+# attributionStatus distinguishes "the retriever found no source for this answer"
+# from "we have no idea what backed this answer" (attribution simply wasn't
+# captured). sourceChunks == [] must NEVER be presented as "no source backed this
+# answer" -- that is a claim about retrieval, and an empty list here is frequently
+# just a gap in what was captured (attribution_unavailable), not evidence of an
+# ungrounded reply. FRONTEND CONTRACT CHANGE: the dashboard's per-message evidence
+# panel must branch on attributionStatus, not on `sourceChunks.length === 0` alone,
+# to decide which copy to render (see register note for the sibling FE task).
+ScoringStatusWire = Literal["scored", "not_scored_legacy"]
+AttributionStatusWire = Literal["has_sources", "no_sources_retrieved", "attribution_unavailable"]
+
+
 class AnswerEvidenceOut(WireModel):
     message_id: uuid.UUID
-    grounding_score: float  # [0,1]; grounding floor is 0.50 uniform (§3.4.13).
+    # Real score in [0,1] when scoring_status == "scored"; null otherwise. Grounding
+    # floor is 0.50 uniform (§3.4.13), but this field is never backfilled with that
+    # constant for a row that was not actually measured.
+    grounding_score: float | None
+    scoring_status: ScoringStatusWire
     source_chunks: list[SourceChunkOut]
+    attribution_status: AttributionStatusWire
     flagged_by_admin: bool
 
 

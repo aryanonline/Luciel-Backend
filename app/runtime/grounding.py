@@ -7,9 +7,41 @@ Luciel may only state what a tool/result actually contains. Lands in Arc 14.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 GROUNDING_FLOOR = 0.50
+
+# Harmony wave 2, item 2b (LIVE-VERIFIED): a genuinely verbatim-KB-backed answer
+# scored 0.36 -- below the floor -- despite the model having copied the retrieved
+# fact word-for-word. Root cause: the token-overlap proxy normalized by EVERY
+# answer token, including ordinary conversational connective/filler words a real
+# LLM adds around a quoted fact ("Hi there!", "Thanks for reaching out.", "Is
+# there anything else I can help you with?"). None of those filler tokens can
+# ever be "supported" by a knowledge chunk -- they carry no factual claim -- so
+# their mere presence diluted the score of an answer that was, in fact, fully
+# grounded. The previous fix's test (test_score_grounding_kb_backed_answer_
+# scores_above_floor) only ever exercised a bare, unwrapped factual sentence and
+# never modeled a live LLM's actual conversational phrasing, so it never caught
+# this. Fix: exclude common stopwords/conversational connectives from the
+# ANSWER-side denominator only -- a fabricated claim still scores at or near 0.0
+# because its substantive (non-stopword) tokens still have to be found in the
+# retrieved chunks; only claim-free filler is no longer penalized.
+_GROUNDING_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be",
+        "been", "being", "to", "of", "in", "on", "at", "for", "with", "about",
+        "as", "by", "from", "this", "that", "these", "those", "it", "its",
+        "you", "your", "yours", "i", "me", "my", "we", "our", "us", "he",
+        "she", "they", "them", "their", "there", "here", "what", "which",
+        "who", "whom", "will", "would", "can", "could", "should", "shall",
+        "may", "might", "do", "does", "did", "have", "has", "had", "not",
+        "no", "yes", "if", "then", "than", "so", "just", "also", "please",
+        "thanks", "thank", "sure", "hi", "hello", "hey", "let", "know",
+        "any", "other", "questions", "question", "help", "today", "else",
+        "anything", "out", "reaching", "checked",
+    }
+)
 
 
 @dataclass
@@ -36,17 +68,23 @@ def score_grounding(
         return GroundingResult(0.0, False, "empty_answer")
     if not retrieved_chunks:
         return GroundingResult(0.0, False, "no_retrieval")
-    import re
 
-    def toks(s: str) -> set[str]:
-        return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) > 2}
+    def toks(s: str, *, drop_stopwords: bool) -> set[str]:
+        words = (w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) > 2)
+        if drop_stopwords:
+            return {w for w in words if w not in _GROUNDING_STOPWORDS}
+        return set(words)
 
-    answer_tokens = toks(answer)
+    # Only the answer side drops stopwords/filler -- claim-free connective tissue
+    # a real LLM wraps around a quoted fact must not dilute the score. The support
+    # side (retrieved chunks) keeps every token so a stopword that happens to be
+    # part of the substantive claim (rare, but harmless either way) still counts.
+    answer_tokens = toks(answer, drop_stopwords=True)
     if not answer_tokens:
         return GroundingResult(0.0, False, "no_content_tokens")
     support = set()
     for chunk in retrieved_chunks:
-        support |= toks(chunk)
+        support |= toks(chunk, drop_stopwords=False)
     overlap = len(answer_tokens & support) / len(answer_tokens)
     return GroundingResult(overlap, overlap >= GROUNDING_FLOOR, "knowledge_overlap")
 

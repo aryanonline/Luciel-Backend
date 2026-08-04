@@ -80,6 +80,14 @@ MAX_ITERATIONS = 5  # §3.4.1 — internal cost-control constant, identical on e
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
 Retriever = Callable[[str], Awaitable[list[str]]]
 
+# ChunkAttributor: (query) -> real retrieved-chunk metadata (harmony wave 2,
+# item 2a). ADDITIVE seam alongside Retriever -- see
+# app/runtime/knowledge_retrieval.py::make_chunk_attributor for why this doesn't
+# change the Retriever contract itself. None when the caller has no attribution
+# source bound (voice/tests using a bare fake retriever); the loop then persists
+# source_chunks=None (attribution_unavailable) rather than fabricating a list.
+ChunkAttributor = Callable[[str], Awaitable[list[dict[str, object]]]]
+
 # ToolResolver: (tool_id) -> a Tool instance (with its Arc 17 backend bound) or None.
 # The catalog tools require injected connection backends (Arc 17), so the loop takes
 # a resolver rather than constructing the catalog itself; the broker still enforces
@@ -120,6 +128,7 @@ async def persist_turn(
     role: str,
     text: str,
     grounding_score: float | None = None,
+    source_chunks: list[dict[str, object]] | None = None,
 ) -> Transcript:
     """Append one message to the session transcript and return the persisted row.
 
@@ -131,7 +140,14 @@ async def persist_turn(
     score computed by score_grounding for ``luciel`` replies, so the dashboard evidence
     endpoint can read the actual value instead of a hardcoded floor constant. Left
     None for non-luciel roles and for the technical-issue ack (no grounding was
-    computed — no model call was served)."""
+    computed — no model call was served).
+
+    ``source_chunks`` (harmony wave 2, item 2a) persists the REAL retriever chunk
+    refs (source_id/source_name/text) used for this reply, when the caller has an
+    attribution source bound. None (the default) means attribution was never
+    captured for this row — that is NOT a claim that no source backed the answer,
+    just that we don't know. An empty list means retrieval genuinely ran and found
+    nothing. The dashboard evidence endpoint keeps these three states distinct."""
     if role not in TRANSCRIPT_ROLES:
         raise ValueError(f"unknown transcript role: {role}")
     row = Transcript(
@@ -142,6 +158,7 @@ async def persist_turn(
         role=role,
         text=text,
         grounding_score=grounding_score,
+        source_chunks=source_chunks,
     )
     session.add(row)
     await session.flush()
@@ -211,6 +228,11 @@ class Orchestrator:
     admin_id: uuid.UUID
     instance_id: uuid.UUID
     enabled_channels: set[str]
+    # Harmony wave 2, item 2a: optional real chunk-attribution seam bound alongside
+    # `retriever`. None means this construction site has no attribution source
+    # (e.g. voice, or a test's bare fake retriever) -- source_chunks is then
+    # persisted as None (attribution_unavailable), never fabricated.
+    chunk_attributor: ChunkAttributor | None = None
     # Admin-provided 280-char business-context (Vision §3.5). Composed into the system
     # prompt UNDER the platform-invariant stanzas via Defense 6 (§3.4.14) so it can
     # tune tone/facts but cannot override AI-identity disclosure, grounding, the
@@ -388,6 +410,15 @@ class Orchestrator:
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
         raw_chunks = await self.retriever(inbound_text)
         wrapped_chunks = [wrap_untrusted(c) for c in raw_chunks]
+        # Harmony wave 2, item 2a: real chunk attribution for persistence, kept
+        # separate from `raw_chunks` (which only ever feeds the model/scorer).
+        # None when this construction site has no attribution source bound (voice,
+        # bare fakes in tests) -- persisted as attribution_unavailable, never
+        # fabricated. When bound, an empty list here is a REAL "retrieval found
+        # nothing", distinct from None.
+        attributed_chunks: list[dict[str, object]] | None = None
+        if self.chunk_attributor is not None:
+            attributed_chunks = await self.chunk_attributor(inbound_text)
 
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
         resp, iterations, used_fallback, llm_failed = await self._reason(
@@ -489,6 +520,7 @@ class Orchestrator:
             role="luciel",
             text=reply_text,
             grounding_score=grounding.score,
+            source_chunks=attributed_chunks,
         )
         return LoopResult(
             reply_text=reply_text,

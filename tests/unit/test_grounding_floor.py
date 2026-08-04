@@ -107,3 +107,44 @@ def test_score_grounding_tool_result_is_always_fully_grounded() -> None:
     assert result.score == 1.0
     assert result.grounded is True
     assert result.reason == "tool_result"
+
+
+def test_verbatim_kb_answer_with_live_conversational_wrapper_scores_above_floor() -> None:
+    """LIVE-VERIFIED (Harmony wave 2, item 2b): a REAL production LLM answer was
+    observed scoring 0.36 -- below the 0.50 floor -- despite the factual claim
+    being copied VERBATIM from a retrieved KB chunk. The previous fix's test
+    (test_score_grounding_kb_backed_answer_scores_above_floor, above) only ever
+    exercised a bare, unwrapped factual sentence and never modeled how a real
+    LLM actually talks: it wraps the quoted fact in ordinary conversational
+    connective tissue ("Hi there!", "Thanks for reaching out.", "Is there
+    anything else I can help you with today?"). None of that filler carries a
+    factual claim the KB could ever "support", so normalizing by EVERY answer
+    token (the old behavior) diluted a fully-grounded answer's score below the
+    floor. This is the live condition that broke the scorer/floor agreement:
+    reproduced here with the same shape of wrapper that caused the 0.36 score.
+    """
+    chunk = "Standard shipping takes 5 to 7 business days."
+    answer = (
+        "Hi there! Thanks for reaching out. To answer your question: standard "
+        "shipping takes 5 to 7 business days. Is there anything else I can help "
+        "you with today?"
+    )
+    result = score_grounding(answer, [chunk], False)
+    assert result.score >= GROUNDING_FLOOR
+    assert result.grounded is True
+
+
+def test_fabricated_answer_still_scores_at_or_near_zero_despite_wrapper() -> None:
+    """The stopword/filler exclusion (item 2b fix) must not become a loophole: a
+    genuinely fabricated claim wrapped in the SAME kind of conversational filler
+    must still score far below the floor, because its substantive claim tokens
+    still have no support in the retrieved chunks."""
+    irrelevant_chunk = "Our store hours are 9am to 6pm Monday through Friday."
+    answer = (
+        "Hi there! Thanks for reaching out. To answer your question: we offer "
+        "a lifetime warranty on all products. Is there anything else I can help "
+        "you with today?"
+    )
+    result = score_grounding(answer, [irrelevant_chunk], False)
+    assert result.score < GROUNDING_FLOOR
+    assert result.grounded is False

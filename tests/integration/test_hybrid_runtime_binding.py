@@ -18,7 +18,7 @@ from app.knowledge import service
 from app.models.conversation import Session as SessionModel
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime.grounding import GROUNDING_FLOOR
-from app.runtime.knowledge_retrieval import make_retriever
+from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
@@ -95,6 +95,58 @@ async def test_orchestrator_loop_with_real_retriever_returns_grounded_content():
     assert result.grounding_score is not None
     assert result.grounding_score >= GROUNDING_FLOOR
     assert "refund" in result.reply_text.lower()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_real_chunk_attributor_persists_source_chunks_through_the_loop():
+    """LIVE-VERIFIED (Harmony wave 2, item 2a) end-to-end: when a construction site
+    binds chunk_attributor alongside the real retriever (exactly as
+    app/api/v1/chat_widget.py, app/channels/runtime_entry.py, and
+    app/runtime/voice_pipeline.py now do), a KB-backed reply persists REAL
+    source_chunks on the Transcript row -- not the empty list the dashboard used
+    to always render as "no source backed this answer"."""
+    from sqlalchemy import select
+
+    from app.models.conversation import Transcript
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        await service.ingest_text(s, admin_id=admin, instance_id=iid, name="kb.txt", text=KNOWLEDGE)
+    async with tenant_session(admin) as s:
+        sid = uuid.uuid4()
+        s.add(SessionModel(id=sid, admin_id=admin, instance_id=iid, channel="widget", mode="ai"))
+        await s.flush()
+        orch = Orchestrator(
+            session=s,
+            router=LLMRouter(primary=EchoModel(confidence=0.9), fallback=EchoModel()),
+            retriever=make_retriever(s, admin_id=admin, instance_id=iid),
+            chunk_attributor=make_chunk_attributor(s, admin_id=admin, instance_id=iid),
+            admin_id=admin,
+            instance_id=iid,
+            enabled_channels={"widget"},
+            has_payment_method=False,
+        )
+        await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="What is your refund policy?",
+        )
+        row = (
+            await s.execute(
+                select(Transcript).where(
+                    Transcript.admin_id == admin,
+                    Transcript.session_id == sid,
+                    Transcript.role == "luciel",
+                )
+            )
+        ).scalar_one()
+    assert row.source_chunks is not None
+    assert len(row.source_chunks) > 0
+    assert any("refund" in c["text"].lower() for c in row.source_chunks)
+    assert all(c.get("source_name") for c in row.source_chunks)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

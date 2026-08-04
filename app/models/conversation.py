@@ -59,6 +59,16 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # 0.50 for every message regardless of what actually happened. NULL for
     # non-luciel roles (lead/human_agent turns are not scored).
     grounding_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Harmony wave 2, item 2a (LIVE-VERIFIED): real retriever chunk references
+    # (source_id/source_name/text), persisted at reply time for luciel turns whose
+    # retriever actually returned chunks. NULL means attribution was never captured
+    # for this row (legacy rows, or a channel/role that never retrieves) -- it is
+    # NOT evidence that no source backed the answer. An empty list ([]) means
+    # retrieval genuinely ran and found nothing. The dashboard evidence endpoint
+    # (app/api/v1/dashboard.py::get_answer_evidence) maps NULL vs [] vs non-empty to
+    # three distinct attributionStatus values -- never collapses NULL and [] into
+    # the same "no source backed this answer" claim.
+    source_chunks: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

@@ -40,7 +40,7 @@ from app.models.conversation import Transcript
 from app.models.instance import Instance, is_paused
 from app.runtime import budget
 from app.runtime.input_safety import _compose_greeting
-from app.runtime.knowledge_retrieval import make_retriever
+from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import effective_config, resolve_or_open_session
@@ -213,6 +213,12 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         # "Arc 11/16" stub. Retrieval is real over the tenant's ingested knowledge.
         # Content flows through wrap_untrusted in the loop (§3.4.14).
         retriever = make_retriever(s, admin_id=ctx.admin_id, instance_id=ctx.instance_id)
+        # Harmony wave 2, item 2a: bind the real chunk-attribution seam alongside the
+        # retriever so persist_turn can attach real source_chunks instead of leaving
+        # attribution uncaptured for every widget reply.
+        chunk_attributor = make_chunk_attributor(
+            s, admin_id=ctx.admin_id, instance_id=ctx.instance_id
+        )
 
         # §3.8.7 rule E (Decision #39): source the additive/neutral effective config
         # (enabled tools, business-context, enabled channels) from the config snapshot
@@ -231,6 +237,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             session=s,
             router=build_llm_router(admin_id=ctx.admin_id),
             retriever=retriever,
+            chunk_attributor=chunk_attributor,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels=effective.enabled_channels,

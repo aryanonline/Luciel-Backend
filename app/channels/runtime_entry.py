@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.billing import metering
 from app.channels.base import InboundMessage
 from app.models.instance import Instance, is_paused
-from app.runtime.knowledge_retrieval import make_retriever
+from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import effective_config, resolve_or_open_session
@@ -84,6 +84,11 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
     )
 
     retriever = make_retriever(session, admin_id=msg.admin_id, instance_id=msg.instance_id)
+    # Harmony wave 2, item 2a: real chunk attribution alongside the retriever, for
+    # the same reason as the widget path (app/api/v1/chat_widget.py).
+    chunk_attributor = make_chunk_attributor(
+        session, admin_id=msg.admin_id, instance_id=msg.instance_id
+    )
     effective = effective_config(sess.config_snapshot, inst, always_include_channel=msg.channel)
     business, assistant = _names(inst)
 
@@ -91,6 +96,7 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         session=session,
         router=build_llm_router(admin_id=msg.admin_id),
         retriever=retriever,
+        chunk_attributor=chunk_attributor,
         admin_id=msg.admin_id,
         instance_id=msg.instance_id,
         enabled_channels=effective.enabled_channels,

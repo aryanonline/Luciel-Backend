@@ -45,7 +45,7 @@ from app.channels.voice_adapter import (
 from app.models.audit import ActorType
 from app.models.instance import Instance, is_paused
 from app.models.voice import VoiceCallRecord
-from app.runtime.knowledge_retrieval import make_retriever
+from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.sessions import resolve_or_open_session
@@ -194,11 +194,16 @@ async def handle_turn(
     # Voice runs the SAME orchestrator/retrieval path as every other channel; retrieved
     # content flows through wrap_untrusted in the loop (§3.4.14).
     retriever = make_retriever(session, admin_id=admin_id, instance_id=instance_id)
+    # Harmony wave 2, item 2a: real chunk attribution alongside the retriever, same
+    # as the text channels -- a voice answer backed by real KB retrieval deserves
+    # the same honest evidence trail as a widget/SMS/email answer.
+    chunk_attributor = make_chunk_attributor(session, admin_id=admin_id, instance_id=instance_id)
 
     orch = Orchestrator(
         session=session,
         router=router,
         retriever=retriever,
+        chunk_attributor=chunk_attributor,
         admin_id=admin_id,
         instance_id=instance_id,
         enabled_channels={"voice"},
