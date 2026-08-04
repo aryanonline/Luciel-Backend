@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.channels.email_routing import MxDelegationProbe, MxDelegationResult
 from app.connections import registry
 from app.connections.secrets import SecretStore, get_secret_store, secret_ref_for
 from app.models.audit import ActorType
@@ -1079,6 +1080,68 @@ async def get_email_provisioning(
 ) -> InstanceConnection | None:
     """The current (non-revoked) email_sender connection, if provisioned."""
     return await _single_active(session, admin_id, instance_id, "email_sender")
+
+
+_DETAIL_ROUTING_CONFIRMED = (
+    "Email routing is confirmed — mail to this address will reach Luciel."
+)
+_DETAIL_ROUTING_NOT_YET = (
+    "We still don't see the MX record pointing at us. Add the DNS records shown below "
+    "at your domain registrar, then click Re-verify — DNS changes can take a little "
+    "while to propagate."
+)
+_DETAIL_ROUTING_UNKNOWN = (
+    "Couldn't look up this domain's DNS just now. It has not been marked routed; "
+    "click Re-verify to try again."
+)
+
+
+async def reverify_email_routing(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    probe: MxDelegationProbe | None = None,
+) -> InstanceConnection | None:
+    """Re-run the MX-delegation probe against the tenant's CURRENTLY provisioned
+    own_domain address (§3.1.6a). Mirrors ``phone_lifecycle.reverify_sms_number``
+    (harmony fix 2026-08-04 item 5): stateless + repeatable (no background poller, no
+    expiry) — the tenant clicks this after adding the MX record at their registrar.
+    Transitions to ``connected`` only on a confirmed live DELEGATED result; a domain
+    that still doesn't resolve, or resolves without our MX, stays in the honest
+    ``pending_email_routing`` state with an actionable detail. Reads the current
+    address live, so a since-changed address is what gets checked.
+
+    Returns the updated row, ``None`` if no email_sender connection exists yet, or
+    unchanged (still ``pending_email_routing``, detail refreshed) if the connection is
+    ``vm_subdomain`` mode — that mode has no DNS step and is never pending, so there is
+    nothing to re-verify."""
+    from app.channels.email_routing import build_mx_probe
+
+    existing = await _single_active(session, admin_id, instance_id, "email_sender")
+    if existing is None:
+        return None
+    cfg = existing.non_secret_config or {}
+    if cfg.get("mode") != "own_domain":
+        return existing
+    address = str(cfg.get("address") or "")
+    domain = address.split("@", 1)[1] if "@" in address else ""
+    if not domain:
+        return existing
+
+    probe = probe or build_mx_probe()
+    result = await probe.check(domain, _INBOUND_MX)
+    if result is MxDelegationResult.DELEGATED:
+        existing.status = "connected"
+        existing.status_detail = _DETAIL_ROUTING_CONFIRMED
+    elif result is MxDelegationResult.NOT_DELEGATED:
+        existing.status = "pending_email_routing"
+        existing.status_detail = _DETAIL_ROUTING_NOT_YET
+    else:
+        existing.status = "pending_email_routing"
+        existing.status_detail = _DETAIL_ROUTING_UNKNOWN
+    await session.flush()
+    return existing
 
 
 async def resolve_email_address(

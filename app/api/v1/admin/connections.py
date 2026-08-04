@@ -262,6 +262,30 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
         return _connection_out(conn)
 
 
+@router.post("/email/reverify", response_model=ConnectionOut)
+async def reverify_email_routing_endpoint(
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Re-run the MX-delegation probe against the tenant's CURRENTLY provisioned
+    own_domain email address (§3.1.6a, harmony fix 2026-08-04 item 5). Mirrors
+    ``/connections/sms/reverify``: stateless + repeatable (no background poller, no
+    expiry) — the tenant clicks this after adding the MX record shown by
+    ``GET .../email`` at their domain registrar. Transitions to ``connected`` only on a
+    confirmed live DELEGATED result; a domain that still doesn't resolve our MX stays in
+    the honest ``pending_email_routing`` state — closing the previous dead end where
+    that status had no way forward once set. vm_subdomain connections (no DNS step) are
+    returned unchanged. Reads the current address live, so a since-changed address is
+    what gets checked."""
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        conn = await service.reverify_email_routing(
+            s, admin_id=subject.admin_id, instance_id=instance_id
+        )
+        if conn is None:
+            raise not_found("No email address provisioned to re-verify.")
+        return _connection_out(conn)
+
+
 @router.post("/{connection_id}/swap", response_model=StartConnectionResult)
 async def swap_connection(
     connection_id: uuid.UUID,

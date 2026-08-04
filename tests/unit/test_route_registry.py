@@ -83,6 +83,7 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/admin/connections/{connection_id}/reconnect"),
         ("POST", "/api/v1/admin/connections/{connection_id}/swap"),
         ("POST", "/api/v1/admin/connections/sms/reverify"),
+        ("POST", "/api/v1/admin/connections/email/reverify"),
         # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every
         # connection type is connect / disconnect / switch-able through these three.
         ("GET", "/api/v1/admin/connections/providers"),

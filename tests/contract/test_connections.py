@@ -390,3 +390,64 @@ async def test_sms_attach_then_reverify_is_honest_in_mock(client):
 async def test_sms_reverify_requires_auth(client):
     r = await client.post("/api/v1/admin/connections/sms/reverify")
     assert r.status_code in (401, 403)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_reverify_without_provisioning_is_404(client):
+    """Harmony fix 2026-08-04 item 5: re-verify with no email provisioned at all ->
+    404 (nothing to re-verify), mirroring the SMS reverify contract."""
+    await _ready_account_with_luciel(client)
+    r = await client.post("/api/v1/admin/connections/email/reverify")
+    assert r.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_own_domain_reverify_closes_the_pending_dead_end(client):
+    """The exact dead end item 5 closes: provisioning own_domain lands in
+    pending_email_routing with previously NO way forward. Re-verify now exists,
+    responds 200, and -- honestly, since mock mode's MX probe never reports a domain
+    as delegated -- repeatably reports the same non-live state rather than silently
+    flipping to connected on a click."""
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections/email",
+        json={"mode": "own_domain", "emailAddress": "hello@acme.com"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "pending_email_routing"
+
+    rv = await client.post("/api/v1/admin/connections/email/reverify")
+    assert rv.status_code == 200
+    assert rv.json().get("status") == "pending_email_routing"
+    # Repeatable: a second click is the same honest answer, not a fluke.
+    rv2 = await client.post("/api/v1/admin/connections/email/reverify")
+    assert rv2.status_code == 200
+    assert rv2.json().get("status") == "pending_email_routing"
+
+    # GET reflects the same live status the reverify call reported.
+    g = await client.get("/api/v1/admin/connections")
+    email_conn = [c for c in g.json() if c["connectionType"] == "email_sender"]
+    assert email_conn and email_conn[0]["status"] == "pending_email_routing"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_vm_subdomain_reverify_is_a_harmless_noop(client):
+    """vm_subdomain is already connected with no DNS step -- re-verify must not error
+    or regress its status."""
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections/email",
+        json={"mode": "vm_subdomain"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "connected"
+
+    rv = await client.post("/api/v1/admin/connections/email/reverify")
+    assert rv.status_code == 200
+    assert rv.json().get("status") == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_reverify_requires_auth(client):
+    r = await client.post("/api/v1/admin/connections/email/reverify")
+    assert r.status_code in (401, 403)
