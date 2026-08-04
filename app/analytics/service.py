@@ -108,30 +108,17 @@ class AnalyticsAggregate:
     conversion_by_service_gap: NotAvailable | None = None
 
 
-TOOL_CALL_GAP = NotAvailable(
-    "No durable tool-call/trace store exists yet — app/tools/broker.py keeps "
-    "outcomes in-memory per-request only (Arc 14 persistence not landed). "
-    "Not fabricated; see app/analytics/service.py module docstring."
-)
-RETRIEVAL_GAP = NotAvailable(
-    "No durable retrieval-results log exists yet — "
-    "app/runtime/knowledge_retrieval.py does not persist retrieval events. "
-    "Not fabricated; see app/analytics/service.py module docstring."
-)
-RESPONSE_TIME_GAP = NotAvailable(
-    "No escalation-acknowledgement timestamp store exists yet — "
-    "'escalation_acked' is a defined audit event type (app/audit/events.py) "
-    "but is never emitted by any code path today, so no ack time exists to "
-    "compute p50/p95 from. Not fabricated."
-)
-CONVERSION_SOURCE_GAP = NotAvailable(
-    "No lead-source dimension is persisted (Lead has no 'source' column); "
-    "cannot group conversion by source without fabricating a dimension."
-)
-CONVERSION_SERVICE_GAP = NotAvailable(
-    "No service-type dimension is persisted anywhere in the schema; "
-    "cannot group conversion by service without fabricating a dimension."
-)
+# Owner-facing copy only. These strings are served verbatim to the dashboard
+# (AnalyticsOverviewOut.*_note) — they must read like a product empty state,
+# never like an engineering note (no file paths, arc/workstream names, or
+# "code path" language). See module docstring above for the internal reasons;
+# keep any internals-facing detail in comments/docstrings, not in these
+# strings.
+TOOL_CALL_GAP = NotAvailable("Tool activity isn't tracked yet — coming soon.")
+RETRIEVAL_GAP = NotAvailable("Knowledge source usage isn't tracked yet — coming soon.")
+RESPONSE_TIME_GAP = NotAvailable("Response time tracking isn't available yet — coming soon.")
+CONVERSION_SOURCE_GAP = NotAvailable("Conversion by source isn't available yet — coming soon.")
+CONVERSION_SERVICE_GAP = NotAvailable("Conversion by service isn't available yet — coming soon.")
 
 
 async def _escalations_by_signal(

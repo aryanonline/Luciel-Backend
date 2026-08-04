@@ -181,18 +181,41 @@ async def test_honest_gaps_never_fabricated() -> None:
 
     assert agg.appointments_booked is None
     assert agg.appointments_booked_gap is not None
-    assert "trace" in agg.appointments_booked_gap.reason.lower()
 
     assert agg.response_time_p50_seconds is None
     assert agg.response_time_p95_seconds is None
     assert agg.response_time_gap is not None
-    assert "ack" in agg.response_time_gap.reason.lower()
 
     assert agg.top_knowledge_sources == []
     assert agg.top_knowledge_sources_gap is not None
 
     assert agg.conversion_by_source_gap is not None
     assert agg.conversion_by_service_gap is not None
+
+    # Owner-language empty states only: never leak internal engineering notes
+    # (file paths, Arc/workstream names, "code path" language, etc.) onto the
+    # wire. This is served verbatim in AnalyticsOverviewOut.*_note.
+    leaked_terms = (
+        "arc ",
+        "app/",
+        ".py",
+        "code path",
+        "workstream",
+        "build_brief",
+        "fabricat",
+        "module docstring",
+    )
+    all_notes = [
+        agg.appointments_booked_gap.reason,
+        agg.response_time_gap.reason,
+        agg.top_knowledge_sources_gap.reason,
+        agg.conversion_by_source_gap.reason,
+        agg.conversion_by_service_gap.reason,
+    ]
+    for note in all_notes:
+        lowered = note.lower()
+        for term in leaked_terms:
+            assert term not in lowered, f"dev-note leak in owner-facing copy: {note!r}"
 
 
 @pytest.mark.usefixtures("db_engine_reset")
