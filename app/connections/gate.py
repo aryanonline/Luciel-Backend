@@ -31,11 +31,23 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.connections import registry
 from app.models.connection import InstanceConnection
 
 # The single value that satisfies the connection gate (§3.8.4: only `connected`
 # dispatches; revoked rows are not even broker-visible).
 CONNECTED = "connected"
+
+# Reverse of registry.DEPENDENT_CHANNELS: channel_id -> the connection_type that backs
+# it. Built once at import time from the same table the disconnect cascade already
+# uses (§5b), so a channel's live status and its cascade dependency can never diverge.
+# A connection_type covering >1 channel (channel_auth -> whatsapp + instagram_messenger)
+# fans out to each; a channel with no backing connection (widget) is simply absent.
+_CHANNEL_CONNECTION_TYPE: dict[str, str] = {
+    channel_id: connection_type
+    for connection_type, channel_ids in registry.DEPENDENT_CHANNELS.items()
+    for channel_id in channel_ids
+}
 
 
 async def connection_status(
@@ -91,3 +103,81 @@ def gate_failure_reason(connection_type: str, status: str | None) -> str:
     connection failure exactly like any other structured tool outcome (§3.3.3 /
     §3.4.1 / §3.8.7 rule A)."""
     return f"connection_not_ready:{connection_type}:{status or 'unconfigured'}"
+
+
+# Raw instance_connections.status values that ARE live-user-facing on the channels
+# pillar (Schemas §ConnectionStatusWire) but were never surfaced there — only
+# 'connected' short-circuits the tool broker's gate 3, yet the owner-facing channel
+# card needs the FULL honest state (pending/needs-hosting/etc.), not a collapsed
+# connected/not-connected bit. Anything not in this allow-list (e.g. a future raw
+# status the registry grows before the wire enum catches up) degrades to the closest
+# honest existing wire value rather than raising, so a new provider status can never
+# 500 the dashboard's main read.
+_WIRE_SAFE_STATUSES = frozenset(
+    {
+        "unconfigured",
+        "connected",
+        "error",
+        "expired",
+        "revoked",
+        "dormant",
+        "not_connected",
+        "pending_carrier_registration",
+        "pending_email_routing",
+    }
+)
+
+
+def _to_wire_status(raw: str | None) -> str:
+    """Map a raw ``instance_connections.status`` to the closed wire enum.
+
+    ``not_operable_hosting_required`` (§3.1.4 BYO-number operability) has no wire
+    counterpart yet — schema follow-up, tracked separately — so it degrades to
+    ``error`` (never silently "connected", never a KeyError) until the wire enum
+    grows the value. Every currently-registered status besides that one already has
+    a 1:1 wire entry."""
+    if raw is None:
+        return "unconfigured"
+    if raw in _WIRE_SAFE_STATUSES:
+        return raw
+    return "error"
+
+
+async def channel_connection_statuses(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+) -> dict[str, str]:
+    """LIVE wire-safe connection status for every channel backed by a connection.
+
+    This is the read-side counterpart to ``registry.DEPENDENT_CHANNELS`` / the
+    disconnect cascade: a channel absent from ``_CHANNEL_CONNECTION_TYPE`` (``widget``)
+    has no connection to report and is simply absent from the returned mapping — the
+    caller leaves its stored ``connectionStatus`` (there isn't one) untouched.
+
+    One query per distinct backing connection_type (at most 3 today: email_sender,
+    sms_sender, channel_auth, instagram_auth), not per channel, so whatsapp and
+    instagram_messenger sharing ``channel_auth`` do not double-query.
+
+    Fixes the toggle-reconnect bug (owner report, SMS disable/enable): the channels
+    pillar's ``connectionStatus`` used to be written ONLY by the client's own PUT echo
+    and by ``update_channels``' full-replace — nothing ever synced it from the actual
+    ``instance_connections`` row an attach/OAuth-callback updates, so a freshly BYO'd
+    Twilio number never made it into the JSONB the dashboard reads, and the channel
+    card fell back to its ``unconfigured`` default and asked the owner to reconnect
+    even though the connection (and runtime dispatch, gated live via
+    ``connection_status`` above) were never touched."""
+    connection_types = sorted(set(_CHANNEL_CONNECTION_TYPE.values()))
+    by_type: dict[str, str | None] = {}
+    for connection_type in connection_types:
+        by_type[connection_type] = await connection_status(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            connection_type=connection_type,
+        )
+    return {
+        channel_id: _to_wire_status(by_type[connection_type])
+        for channel_id, connection_type in _CHANNEL_CONNECTION_TYPE.items()
+    }

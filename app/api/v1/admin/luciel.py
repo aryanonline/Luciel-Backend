@@ -22,6 +22,7 @@ from app.api.v1.admin.luciel_invariants import (
     validate_personality,
 )
 from app.audit import log as audit
+from app.connections import gate
 from app.db.session import tenant_session
 from app.lifecycle import state_machine
 from app.lifecycle.state_machine import LifecycleError
@@ -56,7 +57,31 @@ DEFAULT_CHANNELS = [
 DEFAULT_TOOLS = [{"id": tool_id, "enabled": False} for tool_id in catalog.ALL_TOOL_IDS]
 
 
-def _to_out(inst: Instance) -> LucielOut:
+def _merge_live_channel_status(
+    channels: list[dict[str, object]], live_status: dict[str, str]
+) -> list[dict[str, object]]:
+    """Overlay LIVE connection status onto the stored channels JSONB (bug fix).
+
+    The channels pillar's persisted ``connectionStatus`` was previously written ONLY
+    by a client PUT echo — nothing on the backend ever synced it from the actual
+    ``instance_connections`` row an attach/OAuth-callback updates (§3.8.4). That made
+    a freshly BYO'd Twilio number (or any other channel-backing connection) invisible
+    to the dashboard: the card kept showing whatever stale/default status it was
+    created with and asked the owner to reconnect a channel that was never actually
+    disconnected. This is the read-side fix: every response that carries ``channels``
+    is overlaid with the live status for channels that have a backing connection
+    (§gate.channel_connection_statuses); channels with no backing connection (widget)
+    are left exactly as stored."""
+    return [
+        {**ch, "connectionStatus": live_status[ch["id"]]} if ch.get("id") in live_status else dict(ch)
+        for ch in channels
+    ]
+
+
+def _to_out(inst: Instance, *, live_channel_status: dict[str, str] | None = None) -> LucielOut:
+    channels = inst.channels or []
+    if live_channel_status:
+        channels = _merge_live_channel_status(channels, live_channel_status)
     return LucielOut.model_validate(
         {
             "instanceId": inst.id,
@@ -64,7 +89,7 @@ def _to_out(inst: Instance) -> LucielOut:
             "websiteUrl": inst.website_url,
             "state": inst.state.value,
             "embedKeyPublicId": inst.embed_key_public_id,
-            "channels": inst.channels or [],
+            "channels": channels,
             "tools": inst.tools or [],
             "escalation": inst.escalation or {},
             "personality": inst.personality or {"preset": "warm_concierge"},
@@ -87,7 +112,13 @@ async def _load(admin_id: uuid.UUID) -> Instance | None:
 async def get_luciel(subject: Subject = Depends(current_admin)) -> LucielOut | None:
     inst = await _load(subject.admin_id)
     # Contract: returns JSON null (200) when the account is empty — NOT 404.
-    return _to_out(inst) if inst is not None else None
+    if inst is None:
+        return None
+    async with tenant_session(subject.admin_id) as s:
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+    return _to_out(inst, live_channel_status=live_status)
 
 
 @router.get("/capabilities", response_model=list[CapabilityGroupOut])
@@ -200,7 +231,12 @@ async def _update_config(
             event_type="instance_configured",
             payload={"surface": field},
         )
-        return _to_out(inst)
+        live_status = (
+            await gate.channel_connection_statuses(s, admin_id=admin_id, instance_id=inst.id)
+            if field == "channels"
+            else None
+        )
+        return _to_out(inst, live_channel_status=live_status)
 
 
 @router.put("/channels", response_model=LucielOut)
@@ -349,7 +385,10 @@ async def acknowledge_voice_consent(subject: Subject = Depends(current_admin)) -
             actor_type=ActorType.admin_user,
             event_type="voice_consent_ack",
         )
-        return _to_out(inst)
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        return _to_out(inst, live_channel_status=live_status)
 
 
 # --- lifecycle -------------------------------------------------------------- #
