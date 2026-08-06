@@ -17,7 +17,7 @@ FROM base AS builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 # Copy dependency manifests first for layer caching.
-COPY pyproject.toml uv.lock* README.md ./
+COPY pyproject.toml uv.lock* CLAUDE.md ./
 # Create the venv and install runtime deps (no dev extras in prod).
 RUN uv venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"

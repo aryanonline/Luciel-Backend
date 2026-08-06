@@ -5,7 +5,7 @@
       "**"
     ],
     "exclude": [
-      "README.md",
+      "CLAUDE.md",
       "cdk*.json",
       "**/*.d.ts",
       "**/*.js",

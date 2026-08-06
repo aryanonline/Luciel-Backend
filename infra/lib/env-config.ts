@@ -79,7 +79,7 @@ export interface EnvConfig {
    * environment (backend control/data plane + frontend web) is set to desiredCount
    * 0 so compute cost drops to zero while the data layer floor remains. Reversible
    * by flipping back to false and redeploying. Defaults false; flip per-deploy with
-   * `-c paused=true` (applied in bin/luciel-infra.ts). See infra/PAUSE.md.
+   * `-c paused=true` (applied in bin/luciel-infra.ts). See infra/CLAUDE.md.
    */
   readonly paused: boolean;
   /**

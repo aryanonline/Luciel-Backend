@@ -100,7 +100,7 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/admin/usage/audit-log"),
         ("GET", "/api/v1/admin/usage/overview"),
         # ANALYTICS WORKSTREAM addition (Vision §7 CSV export, Arch §3.9) — flagged
-        # per BUILD_BRIEF.md's one allowed cross-file exception.
+        # as an intentional API-surface change.
         ("GET", "/api/v1/admin/usage/export.csv"),
         # dashboard
         ("GET", "/api/v1/dashboard/conversations"),
