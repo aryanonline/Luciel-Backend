@@ -158,6 +158,18 @@ async def archive_aged_transcripts(
     return archived
 
 
+class ArchivedTranscriptUnavailable(Exception):
+    """The session IS archived, but cold storage did not return its object.
+
+    Deliberately distinct from "not archived" (``None``). Collapsing the two is what
+    let an unreadable archive render as a conversation with NO MESSAGES: the dashboard
+    and the export both coalesced the miss to an empty list, so the product told the
+    owner their customer had said nothing when the truth was that we moved the
+    transcript and could not read it back. An empty conversation and an unavailable
+    one look identical to the reader and mean opposite things.
+    """
+
+
 async def load_archived_transcripts(
     session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
 ) -> list[dict[str, object]] | None:
@@ -165,7 +177,11 @@ async def load_archived_transcripts(
 
     Used by the dashboard conversation view and the export bundle so a conversation
     older than 90 days is served on demand from cold storage rather than going blank
-    the day its hot rows moved."""
+    the day its hot rows moved.
+
+    Raises :class:`ArchivedTranscriptUnavailable` when the session carries an archive
+    key but the object does not come back — the caller must surface that, never
+    present it as an empty transcript."""
     sess = (
         await session.execute(
             select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
@@ -175,5 +191,5 @@ async def load_archived_transcripts(
         return None
     data = await get_transcript_store().get(key=sess.archive_object_key)
     if data is None:
-        return None
+        raise ArchivedTranscriptUnavailable(str(session_id))
     return deserialize_transcripts(data)

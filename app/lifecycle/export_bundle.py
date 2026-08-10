@@ -98,6 +98,11 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                 # or "Download all my data" silently drops every older conversation.
                 from app.lifecycle.transcript_archive import load_archived_transcripts
 
+                # A cold-storage miss raises ArchivedTranscriptUnavailable and is
+                # deliberately NOT caught: failing the export is honest, whereas
+                # completing it drops those conversations from a bundle the customer
+                # was told is all of their data — the exact silent loss this
+                # read-through exists to prevent.
                 archived = await load_archived_transcripts(
                     session, admin_id=admin_id, session_id=sess.id
                 )

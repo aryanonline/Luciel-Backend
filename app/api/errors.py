@@ -64,6 +64,16 @@ def rate_limited(message: str, retry_after_seconds: int | None = None) -> ApiErr
     return ApiError(429, message, retry_after_seconds)
 
 
+def service_unavailable(message: str = "Temporarily unavailable.") -> ApiError:
+    """A dependency this response NEEDS did not answer, and the data is not lost.
+
+    Reserved for the case where returning the successful shape would be a lie about
+    content — an archived transcript cold storage did not hand back reads as a
+    conversation with no messages unless we say otherwise (§ honest error states).
+    """
+    return ApiError(503, message)
+
+
 def _body(err: ApiError) -> dict[str, object]:
     body: dict[str, object] = {"message": err.message}
     if err.retry_after_seconds is not None:

@@ -22,7 +22,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import not_found, validation_error
+from app.api.errors import not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
@@ -123,11 +123,22 @@ async def get_messages(
             .all()
         )
         if not rows and sess.archive_object_key:
-            from app.lifecycle.transcript_archive import load_archived_transcripts
-
-            archived = await load_archived_transcripts(
-                s, admin_id=subject.admin_id, session_id=session_id
+            from app.lifecycle.transcript_archive import (
+                ArchivedTranscriptUnavailable,
+                load_archived_transcripts,
             )
+
+            try:
+                archived = await load_archived_transcripts(
+                    s, admin_id=subject.admin_id, session_id=session_id
+                )
+            except ArchivedTranscriptUnavailable:
+                # Say so. Returning [] here renders as a conversation the customer
+                # never wrote anything in, which is a different — and false — claim.
+                raise service_unavailable(
+                    "This conversation is in long-term storage and could not be "
+                    "loaded right now. Nothing has been lost; please try again shortly."
+                ) from None
             return [
                 MessageOut(
                     message_id=uuid.UUID(str(r["id"])),

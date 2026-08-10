@@ -101,3 +101,89 @@ async def test_dashboard_serves_an_archived_conversation_identically(client):
     # Identical content either side of the move — only the storage tier changed.
     assert [m["text"] for m in after.json()] == [m["text"] for m in before.json()]
     assert [m["role"] for m in after.json()] == [m["role"] for m in before.json()]
+
+
+async def _seed_archived(client) -> tuple[uuid.UUID, uuid.UUID]:
+    """An owner with one conversation already moved to cold storage."""
+    admin_id = await _login(client)
+    iid, sid = uuid.uuid4(), uuid.uuid4()
+    last = NOW - timedelta(days=120)
+    async with tenant_session(admin_id) as s:
+        s.add(Instance(id=iid, admin_id=admin_id, name="Acme", state=LucielState.active))
+        s.add(
+            ConvSession(
+                id=sid,
+                admin_id=admin_id,
+                instance_id=iid,
+                channel="sms",
+                mode="ai",
+                counted=False,
+                started_at=last - timedelta(minutes=10),
+                last_message_at=last,
+                ended_at=last + timedelta(hours=4),
+            )
+        )
+        s.add(
+            Transcript(
+                id=uuid.uuid4(),
+                admin_id=admin_id,
+                instance_id=iid,
+                session_id=sid,
+                role="lead",
+                text="do you deliver on Sundays?",
+                at=last,
+            )
+        )
+        await s.flush()
+    async with tenant_session(admin_id) as s:
+        assert await archive_aged_transcripts(s, admin_id=admin_id, now=NOW) == 1
+    return admin_id, sid
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_unreadable_archive_is_reported_not_rendered_as_an_empty_conversation(client):
+    """The two states look identical to the reader and mean opposite things.
+
+    Both the dashboard and the export used to coalesce a cold-storage miss to an empty
+    list, so a conversation we could not read back displayed as a conversation in which
+    the customer had said nothing. That is a false claim about content, and the owner
+    has no way to tell it from the truth.
+    """
+    _admin_id, sid = await _seed_archived(client)
+    # The object goes missing (bucket outage, wrong binding, a key that never landed)
+    # while the session still points at it — the only case this endpoint must not fake.
+    LocalTranscriptStore.reset()
+
+    response = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
+
+    assert response.status_code == 503
+    body = response.json()["message"].lower()
+    assert "long-term storage" in body
+    assert "nothing has been lost" in body
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_read_through_raises_rather_than_returning_an_empty_transcript(client):
+    """The seam itself distinguishes the two, so every caller inherits the honesty.
+
+    The export bundle deliberately does not catch this: shipping a bundle that silently
+    omits older conversations is worse than failing the export, because the customer was
+    told the bundle is all of their data.
+    """
+    from app.lifecycle.transcript_archive import (
+        ArchivedTranscriptUnavailable,
+        load_archived_transcripts,
+    )
+
+    admin_id, sid = await _seed_archived(client)
+    LocalTranscriptStore.reset()
+
+    async with tenant_session(admin_id) as s:
+        with pytest.raises(ArchivedTranscriptUnavailable):
+            await load_archived_transcripts(s, admin_id=admin_id, session_id=sid)
+
+        # A session that was never archived is still an ordinary None, not an error.
+        never_archived = await load_archived_transcripts(
+            s, admin_id=admin_id, session_id=uuid.uuid4()
+        )
+        assert never_archived is None
