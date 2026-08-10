@@ -1,0 +1,70 @@
+# Dev cost guard — re-stop the dev database while the environment is paused.
+#
+# AWS auto-restarts a stopped RDS instance after 7 days ("maintenance can't be
+# applied to a stopped instance"), so a paused dev environment silently resumes
+# paying db.t4g.micro hours until someone notices. Nothing else in the account
+# needs the database when both ECS services sit at desiredCount 0, so this
+# weekly job stops it again — and does NOTHING when the environment is actually
+# in use (any service scaled up = not paused = leave the database alone).
+#
+# GitHub-hosted cron instead of standing AWS infra (EventBridge + Lambda) on
+# purpose: the guard costs nothing while it idles, which is the whole point.
+name: dev-cost-guard
+
+on:
+  schedule:
+    # Weekly, Sunday 09:00 UTC — well inside every 7-day auto-restart window
+    # that could begin after a pause.
+    - cron: '0 9 * * 0'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ca-central-1
+
+jobs:
+  restop-dev-db:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop the dev DB if (and only if) the environment is paused
+        run: |
+          cluster=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='Luciel-dev-ClusterName'].Value" --output text)
+          if [ -z "$cluster" ] || [ "$cluster" = "None" ]; then
+            echo "[guard] no dev cluster export found — nothing to do"; exit 0
+          fi
+          services=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns' --output text)
+          desired_total=0
+          if [ -n "$services" ] && [ "$services" != "None" ]; then
+            desired_total=$(aws ecs describe-services --cluster "$cluster" --services $services \
+              --query 'sum(services[].desiredCount)' --output text)
+          fi
+          if [ "$desired_total" != "0" ]; then
+            echo "[guard] dev is ACTIVE (desired=$desired_total) — leaving the database alone"
+            exit 0
+          fi
+          db=$(aws rds describe-db-instances \
+            --query "DBInstances[?starts_with(DBInstanceIdentifier, 'luciel-dev-')].DBInstanceIdentifier | [0]" \
+            --output text)
+          if [ -z "$db" ] || [ "$db" = "None" ]; then
+            echo "[guard] no dev DB instance found — nothing to do"; exit 0
+          fi
+          status=$(aws rds describe-db-instances --db-instance-identifier "$db" \
+            --query 'DBInstances[0].DBInstanceStatus' --output text)
+          if [ "$status" = "available" ]; then
+            echo "[guard] dev is paused but the DB is running (AWS 7-day auto-restart) — stopping $db"
+            aws rds stop-db-instance --db-instance-identifier "$db" \
+              --query 'DBInstance.DBInstanceStatus' --output text
+          else
+            echo "[guard] DB $db is '$status' — nothing to do"
+          fi
