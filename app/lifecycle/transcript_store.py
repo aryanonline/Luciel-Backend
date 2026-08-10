@@ -163,26 +163,52 @@ class S3TranscriptStore:
         return bytes(body)
 
     async def delete(self, *, key: str) -> None:
-        self._get_client().delete_object(Bucket=self._bucket, Key=key)  # type: ignore[attr-defined]
+        """Destroy EVERY version of ``key``, not just the current one.
+
+        The bucket is versioned (accident protection for live accounts), so a plain
+        ``delete_object`` only writes a delete marker and the bytes persist as a
+        noncurrent version for the 30-day lifecycle tail. For the retention sweep and
+        the account-closure cascade — the two callers of this method — that tail is a
+        broken promise: the product says deleted data is GONE (owner decision
+        2026-08-10). Versioning still protects everything these methods were never
+        asked to delete.
+        """
+        self._delete_all_versions(prefix=key, exact_key=key)
 
     async def delete_prefix(self, *, prefix: str) -> int:
+        """Destroy every object under ``prefix`` including all versions and markers."""
+        return self._delete_all_versions(prefix=prefix, exact_key=None)
+
+    def _delete_all_versions(self, *, prefix: str, exact_key: str | None) -> int:
+        """Enumerate versions+markers under ``prefix`` and delete them by VersionId.
+
+        ``list_object_versions`` (not ``list_objects_v2``): the current-object listing
+        cannot see noncurrent versions or existing delete markers, which is exactly
+        what the old implementation left behind. Returns the number of distinct KEYS
+        removed (not versions), preserving the sweep's acted-count semantics.
+        """
         client = self._get_client()
-        deleted = 0
-        token: str | None = None
+        keys_removed: set[str] = set()
+        kwargs: dict[str, object] = {"Bucket": self._bucket, "Prefix": prefix}
         while True:
-            kwargs: dict[str, object] = {"Bucket": self._bucket, "Prefix": prefix}
-            if token:
-                kwargs["ContinuationToken"] = token
-            page = client.list_objects_v2(**kwargs)  # type: ignore[attr-defined]
-            keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-            if keys:
+            page = client.list_object_versions(**kwargs)  # type: ignore[attr-defined]
+            doomed = [
+                {"Key": item["Key"], "VersionId": item["VersionId"]}
+                for section in ("Versions", "DeleteMarkers")
+                for item in page.get(section, [])
+                # delete(key=...) must not touch sibling keys that share the prefix
+                # (`.../abc.jsonl` vs `.../abc.jsonl.bak`); prefix mode takes all.
+                if exact_key is None or item["Key"] == exact_key
+            ]
+            if doomed:
                 client.delete_objects(  # type: ignore[attr-defined]
-                    Bucket=self._bucket, Delete={"Objects": keys, "Quiet": True}
+                    Bucket=self._bucket, Delete={"Objects": doomed, "Quiet": True}
                 )
-                deleted += len(keys)
+                keys_removed.update(str(d["Key"]) for d in doomed)
             if not page.get("IsTruncated"):
-                return deleted
-            token = page.get("NextContinuationToken")
+                return len(keys_removed)
+            kwargs["KeyMarker"] = page.get("NextKeyMarker")
+            kwargs["VersionIdMarker"] = page.get("NextVersionIdMarker")
 
 
 _default: TranscriptStore | None = None
