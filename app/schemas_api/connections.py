@@ -20,6 +20,13 @@ from pydantic import Field
 from app.schemas_api.common import WireModel
 
 EmailProvisioningModeWire = Literal["own_domain", "vm_subdomain"]
+# The OUT view carries one more mode than the request accepts, deliberately:
+# ``byo_mailbox`` is REPORTED (the Outlook mailbox connected via the OAuth flow is
+# the sender, §3.1.6a) but never PROVISIONED here — a POST cannot ask for it, because
+# a mailbox arrives through connect/verify/bind, not through this endpoint. Missing
+# this split made the read 500 the moment the first real mailbox connected: the
+# connect succeeded, and the panel that should have shown it crashed instead.
+EmailProvisioningModeOutWire = Literal["own_domain", "vm_subdomain", "byo_mailbox"]
 
 # The three channels one Meta connection serves (§3.1.4/§3.8.1). Each designates its own
 # destination on that single connection — they are not separate connections.
@@ -200,7 +207,7 @@ class ProvisionEmailRequest(WireModel):
 class EmailProvisioningOut(WireModel):
     """Non-secret view of the email_sender provisioning state (§3.8.3). NO secret."""
 
-    mode: EmailProvisioningModeWire
+    mode: EmailProvisioningModeOutWire
     email_address: str
     status: str
     # own_domain only: records the admin must add to complete inbound routing.

@@ -332,3 +332,41 @@ async def test_disconnecting_the_mailbox_releases_its_routing_claim(client, monk
         assert released not in cfg, released
     async with tenant_session(admin_id) as s:
         assert await routing.owner_of_destination(s, "email_sender", MAILBOX) is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_email_panel_serves_a_connected_mailbox(client, monkeypatch):
+    """Found live, on the FIRST real mailbox ever connected: the connect succeeded
+    and GET /connections/email 500'd — the OUT schema still only knew the two
+    platform modes, so the panel that should have shown the success crashed. The
+    read must serve mode byo_mailbox with the mailbox address and no DNS records."""
+    await _ready_account_with_luciel(client)
+    _configure_microsoft(monkeypatch)
+    _fake_microsoft_transport(monkeypatch)
+    connection_id = await _provision_ses(client)
+    state = await _swap_to_outlook(client, connection_id)
+    r = await client.post(
+        f"/api/v1/admin/connections/{connection_id}/oauth-callback",
+        json={"code": "auth-code-1", "state": state},
+    )
+    assert r.status_code == 200
+
+    r = await client.get("/api/v1/admin/connections/email")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mode"] == "byo_mailbox"
+    assert body["emailAddress"] == MAILBOX
+    assert body["status"] == "connected"
+    assert body["dnsRecords"] is None  # nothing to publish for a mailbox
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_byo_mailbox_cannot_be_provisioned_only_connected(client):
+    """The OUT enum gained byo_mailbox; the REQUEST deliberately did not. A mailbox
+    arrives through connect/verify/bind — a POST asking for it is a caller bug and
+    must be rejected, not silently treated as some platform mode."""
+    await _ready_account_with_luciel(client)
+
+    r = await client.post("/api/v1/admin/connections/email", json={"mode": "byo_mailbox"})
+
+    assert r.status_code == 422
