@@ -68,3 +68,45 @@ async def test_delete_prefix_removes_only_the_tenants_objects():
 
     assert deleted == 3
     assert LocalTranscriptStore.keys() == [theirs]
+
+
+def _rebind(monkeypatch, *, bucket: str | None, mode: str):
+    """Bind a fresh store under a given deployment shape."""
+    from app.config import get_settings
+    from app.lifecycle import transcript_store as mod
+
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", mode)
+    if bucket is None:
+        monkeypatch.delenv("LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET", raising=False)
+    else:
+        monkeypatch.setenv("LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET", bucket)
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    mod.set_transcript_store(None)
+    try:
+        return mod.get_transcript_store()
+    finally:
+        mod.set_transcript_store(None)
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+async def test_a_deployed_environment_archives_for_real_even_in_mock_mode(monkeypatch):
+    """Commitment #38 must not be hostage to the third-party integration flag.
+
+    The store used to bind on ``integration_mode == "live"``. Dev is always ``mock``
+    and production is ``mock`` until the owner-gated live cutover, so in BOTH the
+    sweep bound the in-process fake, refused to move anything (correctly — the fake
+    cannot outlive the sweep process), and the 90-day hot→cold offload we promise
+    customers never ran. Transcripts sat in hot Postgres indefinitely instead.
+    """
+    store = _rebind(monkeypatch, bucket="luciel-dev-transcript-archive-000", mode="mock")
+
+    assert type(store).__name__ == "S3TranscriptStore"
+    assert store.durable is True  # the archive sweep is allowed to proceed
+
+
+async def test_a_local_run_keeps_the_in_process_fake(monkeypatch):
+    """No injected bucket means no AWS: the suite and docker-compose stay hermetic."""
+    store = _rebind(monkeypatch, bucket=None, mode="mock")
+
+    assert type(store).__name__ == "LocalTranscriptStore"
+    assert store.durable is False  # and so the sweep refuses to delete hot rows

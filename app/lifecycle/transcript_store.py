@@ -13,7 +13,9 @@ discipline as the rest of the codebase:
   * :class:`S3TranscriptStore` — the real transcript-archive S3 backend (boto3),
     imported LAZILY so CI (no AWS) imports this module cleanly. Objects are written
     ``STANDARD_IA`` — they arrive already 90 days cold, so there is no warm phase to
-    tier through — with SSE-KMS. Bound ONLY when ``integration_mode == "live"``.
+    tier through — with SSE-KMS. Bound whenever the CDK injected a real bucket, which
+    is every deployed environment; see :func:`get_transcript_store` for why this seam
+    does NOT follow the integration-mode gate the sender seams use.
 
 Key convention: ``vm/{admin_id}/transcripts/{instance_id}/{session_id}.jsonl`` — the
 ``vm/{admin_id}/transcripts/`` tenant prefix is what lets the hard-delete cascade
@@ -121,8 +123,9 @@ class S3TranscriptStore:
     retention sweep's :meth:`delete` at the 1-year transcript-age boundary is the
     authoritative deletion (see the CDK anchoring note in data-stack.ts).
 
-    boto3 is imported LAZILY so CI (no AWS) still imports this module. Only selected
-    in ``live`` mode by :func:`get_transcript_store`; never the default."""
+    boto3 is imported LAZILY so CI (no AWS) still imports this module, and the client
+    is built on first use so merely BINDING this store needs no credentials. Selected
+    by :func:`get_transcript_store` whenever a real bucket was injected."""
 
     #: S3 outlives every process that writes to it — the one store the archive sweep
     #: may delete hot rows into.
@@ -186,14 +189,32 @@ _default: TranscriptStore | None = None
 
 
 def get_transcript_store() -> TranscriptStore:
-    """Return the bound TranscriptStore (mirrors ``get_export_store``): the AWS
-    backend in ``live`` integration mode, the local fake everywhere else."""
+    """Return the bound TranscriptStore: the real bucket when the INFRASTRUCTURE gave
+    us one, the local fake when it did not.
+
+    Deliberately NOT keyed on ``integration_mode`` the way the sender seams are. That
+    flag means "may this process talk to third parties that cost money and reach real
+    people" — Twilio, Meta, Anthropic, Stripe. S3 is not a third party; it is our own
+    storage, and it exists in every deployed environment. Keying the archive on the
+    mode meant a deployment running ``mock`` (which is dev always, and production up
+    to the owner-gated live cutover) bound the in-process fake, so the sweep refused
+    and Commitment #38 — transcripts move to cold storage at 90 days — silently never
+    ran anywhere. Transcripts instead accumulated in hot Postgres forever, which is
+    both the expensive outcome and a promise we were not keeping.
+
+    The discriminator is the CDK-injected environment variable rather than the settings
+    value, because the setting carries a placeholder default: a bucket NAME is always
+    present, so it cannot distinguish "configured" from "defaulted". Local runs and CI
+    set no such variable and keep the fake, so the suite stays hermetic.
+    """
     global _default
     if _default is None:
+        import os  # noqa: PLC0415 — deployment shape, read at bind time
+
         from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
 
         settings = get_settings()
-        if settings.integration_mode == "live":
+        if os.environ.get("LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET"):
             _default = S3TranscriptStore(
                 bucket=settings.transcript_archive_bucket, region_name=settings.aws_region
             )
