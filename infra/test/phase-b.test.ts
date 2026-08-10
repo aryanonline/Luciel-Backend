@@ -152,7 +152,6 @@ describe('Edge layer / WAF (§5.6 — closes audit M2)', () => {
       transcriptArchiveBucket: data.transcriptArchiveBucket, exportBucket: data.exportBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn, redisUrl: data.redisUrl,
-      backendPath: path.join(__dirname, '..', '..', 'Luciel-Backend'),
     });
     const edge = new EdgeStack(app, 'Edge', { env: ENV, envConfig: getEnvConfig('dev'), alb: compute.alb });
     return Template.fromStack(edge);

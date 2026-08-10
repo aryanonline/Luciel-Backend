@@ -52,7 +52,6 @@ function buildCompute(envName: EnvName = 'dev') {
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
-    backendPath: path.join(__dirname, '..', '..'),
   });
   return Template.fromStack(compute);
 }
@@ -192,7 +191,6 @@ describe('No log group retains forever', () => {
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
       redisUrl: data.redisUrl,
-      backendPath: path.join(__dirname, '..', '..'),
     });
     // The observability stack declares NO log group of its own (the former
     // `/luciel/<env>/app` group had no producer and was removed — cost hygiene);

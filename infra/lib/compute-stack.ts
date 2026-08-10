@@ -22,7 +22,7 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
-import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
@@ -45,8 +45,6 @@ export interface ComputeStackProps extends StackProps {
    * The app reads it as `redis_url` (config.py); the live LLM cap uses it (§9 C9).
    */
   readonly redisUrl: string;
-  /** Path to the backend repo (contains the Dockerfile). */
-  readonly backendPath: string;
   /**
    * Regional (ca-central-1) ACM cert for api.vantagemind.ai (from DnsStack). When
    * provided, an HTTPS:443 listener is added to the ALB and an api.vantagemind.ai
@@ -64,7 +62,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -92,40 +90,30 @@ export class ComputeStack extends Stack {
     // EventBridge-scheduled ECS sweep tasks (sweepSchedules below), not off a queue.
     // A queue returns only if a consumer ships with it.
 
-    // Container image. Built from the backend Dockerfile ONLY when -c buildImage=true
-    // (requires a Docker daemon - i.e. the CI/CD runner, per §5.8: images are built
-    // in the pipeline, not by hand). For synth/validation without Docker we use a
-    // neutral placeholder so the data/networking/security stacks can be synthesized
-    // and cost-reviewed independently of an image build.
-    const buildImage = this.node.tryGetContext('buildImage') === 'true';
+    // Container image: the SCANNED artifact from the pipeline's ECR repo, selected by
+    // `-c imageTag=<git sha>`. This used to be a CDK DockerImageAsset built fresh at
+    // deploy time — which meant the image the CVE gate scanned and the image ECS ran
+    // were two *different builds* of the same context, and the gate never gated the
+    // deployed bytes (and preprod, which had no build step at all, deployed with no
+    // scan whatsoever). Consuming the gated tag makes the pipeline's scan → gate →
+    // deploy sequence true of the artifact that actually runs (§5.8/§5.14). For
+    // synth/validation without a pipeline (CDK tests, cost review) we fall back to a
+    // neutral placeholder so no ECR lookup or Docker daemon is required.
+    const imageTag = this.node.tryGetContext('imageTag') as string | undefined;
     // GATE 2 cutover flag. Defaults to 'mock' (EchoModel, no external LLM). A
     // deliberate `-c integrationMode=live` flips real Anthropic/OpenAI on — set per
     // environment, so dev can go live for verification while prod stays mock
     // until their own gated cutover. The flip is an explicit deploy parameter, never
     // a silent default (DEVOPS §6 / §2.8).
     const integrationMode = this.node.tryGetContext('integrationMode') === 'live' ? 'live' : 'mock';
-    const containerImage = buildImage
-      ? ecs.ContainerImage.fromDockerImageAsset(
-          new ecr_assets.DockerImageAsset(this, 'BackendImage', {
-            directory: backendPath,
-            platform: ecr_assets.Platform.LINUX_AMD64,
-            // CRITICAL: exclude the infra dir + its cdk.out from the asset source.
-            // The backend root CONTAINS infra/, so without this the asset staging
-            // recurses into infra/cdk.out (its own output) -> ENAMETOOLONG. Also
-            // trims the build context. Mirrors .dockerignore.
-            exclude: [
-              'infra',
-              '.git',
-              '.github',
-              '.venv',
-              'node_modules',
-              'tests',
-              '**/__pycache__',
-              '.pytest_cache',
-              '.ruff_cache',
-              '.mypy_cache',
-            ],
-          }),
+    const containerImage = imageTag
+      ? ecs.ContainerImage.fromEcrRepository(
+          // By NAME, not a cross-stack export: the repo predates this stack (created
+          // by the per-env PipelineStack) and preprod deliberately runs the PROD
+          // repo's image — the release rehearses the exact gated artifact prod will
+          // run, not a lookalike build (imageRepoName in env-config.ts).
+          ecr.Repository.fromRepositoryName(this, 'GatedBackendImage', envConfig.imageRepoName),
+          imageTag,
         )
       : ecs.ContainerImage.fromRegistry('public.ecr.aws/docker/library/python:3.12-slim');
 

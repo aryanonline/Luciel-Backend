@@ -34,7 +34,6 @@ function buildCompute() {
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
-    backendPath: path.join(__dirname, '..', '..'),
   });
   return Template.fromStack(compute);
 }

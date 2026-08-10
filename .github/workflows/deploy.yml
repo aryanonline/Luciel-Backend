@@ -18,10 +18,11 @@ name: deploy
 #     NEVER reached unless a prod-shaped preprod passed the §10 verification.
 #
 # Prod release flow (all automatic once approved):
-#   preprod-standup (cdk deploy preprod, buildImage=true + integrationMode=live,
-#   migrate) -> preprod-verify (run-verify-task.sh + run-seedtest-task.sh, HARD
-#   gate) -> prod-deploy (only if verify passed) -> preprod-teardown (if: always(),
-#   cdk destroy preprod --force; can't be skipped).
+#   preprod-standup (build+scan+GATE the release image into the prod ECR repo,
+#   cdk deploy preprod -c imageTag=<sha> + integrationMode=live, migrate)
+#   -> preprod-verify (run-verify-task.sh + run-seedtest-task.sh, HARD gate)
+#   -> prod-deploy (reuses the SAME gated artifact; only if verify passed)
+#   -> preprod-teardown (if: always(), cdk destroy preprod --force; can't be skipped).
 
 on:
   push:
@@ -83,7 +84,11 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Skipped on a pause run: pausing takes the environment DOWN, so it must never
+      # be blocked by a build or a red CVE gate (that inversion actually happened —
+      # a critical-CVE day made the environment impossible to pause).
       - name: Build, scan, push image
+        if: inputs.paused != 'true'
         env:
           ECR: ${{ steps.ecr.outputs.registry }}
           REPO: luciel-backend-dev
@@ -97,34 +102,57 @@ jobs:
             docker build -t "$ECR/$REPO:$TAG" .
             docker push "$ECR/$REPO:$TAG"
           fi
+          # Governed CVE gate (scripts/check_image_scan.py): fails CLOSED on scan
+          # unavailability, on any non-allowlisted CRITICAL, and on expired
+          # allowlist entries. The describe call is NOT error-swallowed — an API
+          # failure must block, not pass.
           aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
-          CRIT=$(aws ecr describe-image-scan-findings --repository-name "$REPO" \
-            --image-id imageTag="$TAG" \
-            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text 2>/dev/null || echo None)
-          if [ "$CRIT" != "None" ] && [ "$CRIT" != "0" ]; then
-            echo "::error::$CRIT CRITICAL CVEs in image - blocking deploy"; exit 1
-          fi
+          aws ecr describe-image-scan-findings --repository-name "$REPO" \
+            --image-id imageTag="$TAG" > scan-findings.json
+          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      # A pause run deploys no new code, so it reuses the image the environment is
+      # ALREADY running (read from the live service's task definition) rather than
+      # minting an ungated tag.
+      - name: Resolve the currently deployed image tag (pause runs only)
+        if: inputs.paused == 'true'
+        run: |
+          cluster=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='Luciel-dev-ClusterName'].Value" --output text)
+          svc=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns[0]' --output text)
+          td=$(aws ecs describe-services --cluster "$cluster" --services "$svc" \
+            --query 'services[0].taskDefinition' --output text)
+          image=$(aws ecs describe-task-definition --task-definition "$td" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+          echo "[pause] reusing deployed image tag ${image##*:}"
+          echo "IMAGE_TAG=${image##*:}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy infra stacks (Data/Compute/Edge/Observability/Budget/Widget)
+      - name: Deploy infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         run: |
           npm ci
           # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
           # crossRegionReferences; the CDK app wires that, so naming both is enough.
+          # Networking is named so VPC-shape changes (e.g. the env-gated interface
+          # endpoints) actually apply — it no-ops when unchanged.
           # Data is named because it owns the transcript-archive bucket the Compute
           # task role is granted on (Commitment #38) — deploying Compute against a
           # stale Data stack fails on a cross-stack export that does not exist yet.
           # Budget is the per-environment AWS Budgets ceiling: no runtime cost, and
           # it is the control that catches an environment left running by accident.
-          npx cdk deploy "Luciel-dev-Data" "Luciel-dev-Compute" "Luciel-dev-Edge" \
-            "Luciel-dev-Observability" "Luciel-dev-Budget" \
+          # imageTag points Compute at the SCANNED artifact in ECR — the gate above
+          # gated the exact bytes ECS will run, not a parallel rebuild.
+          npx cdk deploy "Luciel-dev-Networking" "Luciel-dev-Data" "Luciel-dev-Compute" \
+            "Luciel-dev-Edge" "Luciel-dev-Observability" "Luciel-dev-Budget" \
             "Luciel-dev-WidgetCert" "Luciel-dev-Widget" \
-            -c env=dev -c buildImage=true \
+            -c env=dev -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
+            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
             --require-approval never
 
       # Skipped when pausing: a pause run is taking the environment DOWN, so there is
@@ -157,18 +185,44 @@ jobs:
           role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Preprod used to deploy a CDK-asset image with NO scan of any kind — the one
+      # environment whose whole purpose is to rehearse prod ran ungated bytes. It now
+      # builds/scans/gates into the PROD repo under this commit's SHA, so the §10
+      # rehearsal exercises the exact artifact prod will deploy.
+      - name: Build, scan, push image (prod repo — the release artifact)
+        env:
+          ECR: ${{ steps.ecr.outputs.registry }}
+          REPO: luciel-backend-prod
+          TAG: ${{ github.sha }}
+        run: |
+          if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already present - skipping build/push, reusing it."
+          else
+            docker build -t "$ECR/$REPO:$TAG" .
+            docker push "$ECR/$REPO:$TAG"
+          fi
+          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
+          aws ecr describe-image-scan-findings --repository-name "$REPO" \
+            --image-id imageTag="$TAG" > scan-findings.json
+          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Stand up preprod (prod-shaped, buildImage + live LLM)
+      - name: Stand up preprod (prod-shaped, gated image + live LLM)
         working-directory: infra
         run: |
           npm ci
-          # Full stack set: preprod is created from scratch each release. buildImage
-          # builds the runtime image as a CDK asset; integrationMode=live exercises
-          # real Anthropic/OpenAI for a faithful §10 production rehearsal.
+          # Full stack set: preprod is created from scratch each release. imageTag
+          # points at the gated release artifact in the PROD repo (imageRepoName in
+          # env-config.ts); integrationMode=live exercises real Anthropic/OpenAI for
+          # a faithful §10 production rehearsal.
           npx cdk deploy "Luciel-preprod-*" \
-            -c env=preprod -c buildImage=true -c integrationMode=live \
+            -c env=preprod -c imageTag=${{ github.sha }} -c integrationMode=live \
             --require-approval never
 
       - name: Run DB migrations on preprod (one-off ECS task, inside the VPC)
@@ -221,7 +275,13 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # By this point preprod-standup already built, scanned, and GATED this exact
+      # tag (immutable repo, same SHA) and the §10 harness verified the environment
+      # running it — so prod reuses the artifact and this step is normally the
+      # idempotent-skip path. The gate still re-runs: an allowlist entry can expire
+      # between rehearsal and release.
       - name: Build, scan, push image
+        if: inputs.paused != 'true'
         env:
           ECR: ${{ steps.ecr.outputs.registry }}
           REPO: luciel-backend-prod
@@ -234,28 +294,41 @@ jobs:
             docker push "$ECR/$REPO:$TAG"
           fi
           aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
-          CRIT=$(aws ecr describe-image-scan-findings --repository-name "$REPO" \
-            --image-id imageTag="$TAG" \
-            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text 2>/dev/null || echo None)
-          if [ "$CRIT" != "None" ] && [ "$CRIT" != "0" ]; then
-            echo "::error::$CRIT CRITICAL CVEs in image - blocking deploy"; exit 1
-          fi
+          aws ecr describe-image-scan-findings --repository-name "$REPO" \
+            --image-id imageTag="$TAG" > scan-findings.json
+          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Resolve the currently deployed image tag (pause runs only)
+        if: inputs.paused == 'true'
+        run: |
+          cluster=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='Luciel-prod-ClusterName'].Value" --output text)
+          svc=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns[0]' --output text)
+          td=$(aws ecs describe-services --cluster "$cluster" --services "$svc" \
+            --query 'services[0].taskDefinition' --output text)
+          image=$(aws ecs describe-task-definition --task-definition "$td" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+          echo "[pause] reusing deployed image tag ${image##*:}"
+          echo "IMAGE_TAG=${image##*:}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy prod infra stacks (Data/Compute/Edge/Observability/Budget/Widget)
+      - name: Deploy prod infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         run: |
           npm ci
-          # Data and Budget are named for the same reasons as in the dev job above:
-          # the transcript-archive bucket's cross-stack export, and the cost ceiling.
-          npx cdk deploy "Luciel-prod-Data" "Luciel-prod-Compute" "Luciel-prod-Edge" \
-            "Luciel-prod-Observability" "Luciel-prod-Budget" \
+          # Networking/Data/Budget are named for the same reasons as in the dev job:
+          # VPC-shape changes must apply, the transcript-archive bucket's cross-stack
+          # export, and the cost ceiling.
+          npx cdk deploy "Luciel-prod-Networking" "Luciel-prod-Data" "Luciel-prod-Compute" \
+            "Luciel-prod-Edge" "Luciel-prod-Observability" "Luciel-prod-Budget" \
             "Luciel-prod-WidgetCert" "Luciel-prod-Widget" \
-            -c env=prod -c buildImage=true \
+            -c env=prod -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
+            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
             --require-approval never
 
       # See the dev job: a pause run takes the environment down, so there is nothing

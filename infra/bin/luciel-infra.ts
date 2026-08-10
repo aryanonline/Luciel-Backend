@@ -11,7 +11,6 @@
  * GATE 1 (§2.8): the data/compute/edge stacks carry real recurring cost — do not
  * deploy before the founder approves the dev cost figure.
  */
-import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { NetworkingStack } from '../lib/networking-stack';
 import { BudgetStack } from '../lib/budget-stack';
@@ -42,9 +41,6 @@ const account = process.env.CDK_DEFAULT_ACCOUNT;
 const env: cdk.Environment = { account, region: OFFERING_REGION };
 // CloudFront certs MUST be in us-east-1 (the single sanctioned region deviation).
 const usEast1Env: cdk.Environment = { account, region: CLOUDFRONT_CERT_REGION };
-// infra/ lives inside the backend repo, so the backend root (Docker build context)
-// is two levels up from infra/bin/.
-const backendPath = path.join(__dirname, '..', '..');
 
 const prefix = `Luciel-${envName}`;
 
@@ -73,7 +69,6 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   dbSecretArn: data.db.secret!.secretArn,
   platformSecretArn: sec.platformSecret.secretArn,
   redisUrl: data.redisUrl,
-  backendPath,
   apiCert: dns.apiCert,
   hostedZone: dns.hostedZone,
 });

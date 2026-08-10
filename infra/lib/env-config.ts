@@ -104,6 +104,23 @@ export interface EnvConfig {
    * 80% actual, 100% actual, and 100% forecast.
    */
   readonly monthlyBudgetUsd: number;
+  /**
+   * ECR repository whose SCANNED image this environment's ECS services run
+   * (`-c imageTag` selects the tag). Dev runs its own repo; preprod deliberately
+   * runs the PROD repo — the release rehearsal must exercise the exact gated
+   * artifact prod will run, not a lookalike build of the same commit.
+   */
+  readonly imageRepoName: string;
+  /**
+   * Whether the VPC gets interface endpoints (Secrets Manager, ECR, ECR-Docker,
+   * CloudWatch Logs, STS). They exist to keep that traffic off the NAT path, but
+   * five endpoints x two AZs is ~$73/month of standing cost — the single largest
+   * line item in an idle dev environment, which already has a NAT gateway that
+   * serves the same traffic for pennies at dev volume. So dev goes without and
+   * rides NAT; preprod/prod keep the endpoints for throughput and blast-radius
+   * isolation. The free S3 GATEWAY endpoint stays in every environment.
+   */
+  readonly vpcInterfaceEndpoints: boolean;
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -119,6 +136,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     paused: false,
     stripeIntegrationPosture: 'test',
     monthlyBudgetUsd: 150,
+    imageRepoName: 'luciel-backend-dev',
+    vpcInterfaceEndpoints: false,
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate
@@ -144,6 +163,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // Prod-shaped burn: this ceiling exists precisely for the failure mode where a
     // teardown fails and the ephemeral stack quietly runs for a month.
     monthlyBudgetUsd: 400,
+    // The release rehearsal runs the exact gated artifact prod will run.
+    imageRepoName: 'luciel-backend-prod',
+    vpcInterfaceEndpoints: true,
   },
   prod: {
     envName: 'prod',
@@ -160,6 +182,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // lists the gateway as degraded rather than implying billing reaches Stripe.
     stripeIntegrationPosture: 'mock',
     monthlyBudgetUsd: 400,
+    imageRepoName: 'luciel-backend-prod',
+    vpcInterfaceEndpoints: true,
   },
 };
 
