@@ -482,6 +482,16 @@ export class ComputeStack extends Stack {
         // app, it would mark blocks reported that Stripe never received.
         LUCIEL_STRIPE_INTEGRATION_POSTURE: envConfig.stripeIntegrationPosture,
         LUCIEL_REDIS_URL: redisUrl,
+        // Both buckets, for the same reason the posture above is here: the sweeps are
+        // the ONLY things that touch cold storage. transcript_archive writes the 90-day
+        // offload, retention deletes the archived object at the 1-year boundary, and
+        // the hard-delete cascade drops a closed tenant's whole prefix. Omitting these
+        // did not fail loudly — `transcript_archive_bucket` carries a placeholder
+        // default, so the sweep silently addressed a bucket named `vm-transcript-archive`
+        // that exists in no account we own. Commitment #38 cannot run from a plane that
+        // was never told where the bucket is.
+        LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
+        LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
       },
     });
 

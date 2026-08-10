@@ -13,6 +13,10 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.
+- The sweep task carries the same cold-storage bucket names as the app planes. Every
+  archive/retention/cascade operation on S3 runs there, and the app's bucket settings
+  have placeholder defaults, so an un-injected sweep addresses a phantom bucket instead
+  of failing (`test/sweep-cold-storage.test.ts`).
 
 ## Testing pointers
 - `infra/test/*.test.ts`, especially stripe posture, cost retention, tenant secrets, and sweep schedules.
