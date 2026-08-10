@@ -157,7 +157,7 @@ jobs:
           # gated the exact bytes ECS will run, not a parallel rebuild.
           npx cdk deploy "Luciel-dev-Networking" "Luciel-dev-Data" "Luciel-dev-Compute" \
             "Luciel-dev-Edge" "Luciel-dev-Observability" "Luciel-dev-Budget" \
-            "Luciel-dev-WidgetCert" "Luciel-dev-Widget" \
+            "Luciel-dev-WidgetCert" "Luciel-dev-Widget" "Luciel-dev-Web" \
             -c env=dev -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
@@ -351,7 +351,7 @@ jobs:
           # export, and the cost ceiling.
           npx cdk deploy "Luciel-prod-Networking" "Luciel-prod-Data" "Luciel-prod-Compute" \
             "Luciel-prod-Edge" "Luciel-prod-Observability" "Luciel-prod-Budget" \
-            "Luciel-prod-WidgetCert" "Luciel-prod-Widget" \
+            "Luciel-prod-WidgetCert" "Luciel-prod-Widget" "Luciel-prod-Web" \
             -c env=prod -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
