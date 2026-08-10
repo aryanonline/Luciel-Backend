@@ -158,6 +158,10 @@ class Settings(BaseSettings):
     # name cannot exist in two environments: the CDK stack names it per-env and injects
     # the value, so dev exports cannot be written into the prod bucket (P1-14).
     export_bucket: str = "vm-export-bundles"
+    # Transcript cold-storage bucket (Commitment #38, §3.4.10): the 90-day hot→cold
+    # offload's home. Same per-env naming rule as export_bucket — CDK injects the
+    # real name (LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET); this default is the local fallback.
+    transcript_archive_bucket: str = "vm-transcript-archive"
     # Platform sender identity for outbound notification email (verify-email,
     # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
     # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).

@@ -30,7 +30,7 @@ export interface DataStackProps extends StackProps {
 
 export class DataStack extends Stack {
   public readonly db: rds.DatabaseInstance;
-  public readonly knowledgeBucket: s3.Bucket;
+  public readonly transcriptArchiveBucket: s3.Bucket;
   public readonly exportBucket: s3.Bucket;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
   /**
@@ -93,45 +93,41 @@ export class DataStack extends Stack {
       cloudwatchLogsRetention: envConfig.logRetention,
     });
 
-    // Knowledge / artifact bucket with the full residency envelope.
+    // Transcript cold-storage bucket (Architecture §3.4.10 / §4.4 / Commitment #38).
     //
-    // STORAGE-COST BOUNDING (Architecture §4.4 / Decision #38, P0-4): the customer-data
-    // bucket carries a lifecycle envelope so its footprint PLATEAUS rather than growing
-    // unbounded — transition cold at 90d, hard-delete at the 1-year retention boundary,
-    // and bound noncurrent versions so prior versions never accumulate.
+    // This REPLACES the former 'Knowledge' bucket, which no code path ever wrote to —
+    // knowledge ingest is Postgres-only (pgvector chunks), so that bucket was a dead
+    // resource wearing the customer-data lifecycle envelope as a placeholder. The
+    // hot→cold transcript offload (app/lifecycle/transcript_archive.py, the
+    // `transcript_archive` sweep) is now real, and this is its home.
     //
-    // TRANSCRIPT-ARCHIVE-BUCKET DECISION (spec step 2): the doctrine's separate
-    // `vm-transcript-archive` bucket is NOT provisioned here. Transcripts currently live
-    // only in Postgres (no hot→cold S3 offload ships yet), so a dedicated archive bucket
-    // would be wired to nothing. Per the "make the minimal honest choice; don't invent an
-    // unused bucket" guidance we apply the lifecycle envelope to the existing customer-data
-    // (knowledge/artifact) bucket now; the dedicated transcript-archive bucket binds — with
-    // this same envelope — when the hot→cold offload lands. The app-side age sweep
-    // (app/lifecycle/retention.py) is the Postgres-side reconciliation of the same policy.
-    this.knowledgeBucket = residency.hardenedBucket('Knowledge', {
+    // Anchoring (deliberate, D2): objects land here already ~90 days old (the sweep
+    // moves transcripts at the 90-day hot boundary) and are written STANDARD_IA at
+    // upload — no transition rules needed. The AUTHORITATIVE deleter at the 1-year
+    // transcript-age boundary is the app retention sweep (app/lifecycle/retention.py),
+    // which removes the S3 object and the session rows together and emits the
+    // data_retention_hard_delete audit event. The bucket's own 365-days-from-upload
+    // expiration is the §4.4 BACKSTOP for an object the app somehow failed to delete:
+    // late-safe (worst case ~90 days past the boundary), never early — an
+    // upload-anchored 275d rule would delete data EARLY whenever archival ran late.
+    this.transcriptArchiveBucket = residency.hardenedBucket('TranscriptArchive', {
       key: cmk,
-      versioned: envConfig.envName === 'prod',
+      // Named because the app addresses it by name (LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET),
+      // per-env + per-account for global uniqueness (same rationale as the export bucket).
+      bucketName: `luciel-${envConfig.envName}-transcript-archive-${this.account}`,
+      versioned: true,
       removalPolicy:
         envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
       lifecycleRules: [
         {
-          id: 'customer-data-retention-envelope',
+          id: 'transcript-archive-backstop',
           enabled: true,
-          // Transition current versions to cheaper storage as they age (§4.4).
-          transitions: [
-            {
-              storageClass: s3.StorageClass.INFREQUENT_ACCESS,
-              transitionAfter: Duration.days(90),
-            },
-            {
-              storageClass: s3.StorageClass.GLACIER,
-              transitionAfter: Duration.days(180),
-            },
-          ],
-          // 1-year hard-delete backstop: an object cannot outlive the retention policy.
+          // 1-year-from-upload hard-delete backstop (see anchoring note above).
           expiration: Duration.days(365),
-          // Bound prior (noncurrent) versions so the versioned bucket doesn't accumulate.
-          noncurrentVersionExpiration: Duration.days(90),
+          // Bound prior (noncurrent) versions so the versioned bucket doesn't accumulate:
+          // a noncurrent version only exists after a re-archive overwrite or an app
+          // delete, and neither is a state we retain (the app delete IS the deletion).
+          noncurrentVersionExpiration: Duration.days(30),
           // Reap incomplete multipart uploads (cost hygiene, no retention meaning).
           abortIncompleteMultipartUploadAfter: Duration.days(7),
         },

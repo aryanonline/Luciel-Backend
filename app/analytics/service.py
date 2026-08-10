@@ -54,11 +54,15 @@ one fact: "how many conversations have I had". All four now derive from
 ``counted_sessions``:
   * ``conversations_this_period`` — counted_sessions rows in the current billing
     period (unchanged; this was already correct — sourced from the budget counter).
-  * ``conversations_total`` — counted_sessions rows, all billing periods (all-time
-    billed conversations), NOT a raw session count.
-  * ``channel_mix`` / ``conversion_by_channel`` — sessions joined to counted_sessions
-    (i.e. restricted to billed sessions), scoped to the current billing period, so
-    the per-channel breakdown sums back to ``conversations_this_period`` exactly.
+  * ``conversations_total`` — the monotonic ``billing_accounts.lifetime_conversations``
+    counter (migration 0035; incremented with the fire-once claim), because the
+    counted_sessions ledger is deliberately reset by every ``invoice.paid`` — a total
+    computed from the ledger alone restarted at zero each billing period. The live
+    ledger count is kept as a max() fallback for tenants with no billing row.
+  * ``channel_mix`` / ``conversion_by_channel`` / ``busiest_times`` — sessions joined
+    to counted_sessions (i.e. restricted to billed sessions), scoped to the current
+    billing period, so every per-channel/per-hour breakdown sums back to
+    ``conversations_this_period`` exactly.
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
+from app.models.billing import BillingAccount
 from app.models.budget import CountedSession
 from app.models.conversation import EscalationEvent, Session
 from app.models.lead import Lead
@@ -177,15 +182,34 @@ async def _channel_mix(s: AsyncSession, *, period_start: date) -> list[ChannelFr
     ]
 
 
-async def _busiest_times(s: AsyncSession) -> list[list[int]]:
+async def _busiest_times(s: AsyncSession, *, period_start: date) -> list[list[int]]:
     """Conversation volume heatmap by hour-of-day x day-of-week (Arch §3.9).
 
-    Real data over Session.started_at. Aggregated in Python (not SQL EXTRACT) so
-    the query is portable across the Postgres prod engine and any test engine,
-    and so the day-of-week convention (Python's Monday=0) is applied identically
-    regardless of backend-specific date function semantics.
+    Period-scoped over BILLED conversations — joined to counted_sessions like every
+    other panel (module docstring: single conversation-counting source of truth).
+    An unscoped raw-session scan disagreed with ``conversations_this_period`` on
+    both axes: it counted never-billed sessions and it counted all time.
+
+    Aggregated in Python (not SQL EXTRACT) so the query is portable across the
+    Postgres prod engine and any test engine, and so the day-of-week convention
+    (Python's Monday=0) is applied identically regardless of backend-specific date
+    function semantics.
     """
-    rows = (await s.execute(select(Session.started_at))).scalars().all()
+    rows = (
+        (
+            await s.execute(
+                select(Session.started_at)
+                .select_from(Session)
+                .join(
+                    CountedSession,
+                    (CountedSession.session_id == Session.id)
+                    & (CountedSession.billing_period_start == period_start),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     grid = [[0] * _HOURS for _ in range(_DAYS)]
     for started_at in rows:
         if started_at is None:
@@ -261,16 +285,26 @@ async def build_overview(
     from the budget counter — the single source of truth for that count
     (§3.4.1b) — NOT recomputed here from sessions.
     """
-    # conversations_total = all-time BILLED conversations (counted_sessions rows),
-    # not a raw session count — see module docstring (single conversation-counting
-    # source of truth).
-    conversations_total = (
+    # conversations_total = all-time BILLED conversations. The authoritative source is
+    # billing_accounts.lifetime_conversations (monotonic, incremented with the fire-once
+    # claim, migration 0035) because the counted_sessions LEDGER is deliberately reset by
+    # every invoice.paid — reading only the ledger made "all-time" restart each period.
+    # The max() with the live ledger covers the fallbacks honestly: a tenant with no
+    # billing row (never opened billing — their ledger has never been reset, so it IS
+    # complete), and rows counted before the 0035 backfill ran.
+    counted_rows = (
         await s.execute(
             select(func.count())
             .select_from(CountedSession)
             .where(CountedSession.admin_id == admin_id)
         )
     ).scalar_one()
+    lifetime = (
+        await s.execute(
+            select(BillingAccount.lifetime_conversations).where(BillingAccount.admin_id == admin_id)
+        )
+    ).scalar_one_or_none()
+    conversations_total = max(lifetime or 0, counted_rows)
     leads_this_period = (
         await s.execute(
             select(func.count()).select_from(Lead).where(Lead.created_at >= period_start)
@@ -279,7 +313,7 @@ async def build_overview(
 
     escalations_by_signal = await _escalations_by_signal(s, period_start=period_start)
     channel_mix = await _channel_mix(s, period_start=period_start)
-    busiest_times = await _busiest_times(s)
+    busiest_times = await _busiest_times(s, period_start=period_start)
     top_sources, sources_gap = await _top_knowledge_sources()
     appointments, appointments_gap = await _appointments_booked()
     p50, p95, response_gap = await _response_time_percentiles()

@@ -89,6 +89,22 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                 .scalars()
                 .all()
             )
+            messages = [
+                {"role": t.role, "text": t.text, "at": t.at.isoformat()} for t in transcripts
+            ]
+            if not messages and sess.archive_object_key:
+                # Commitment #38 read-through: a session past the 90-day hot boundary
+                # keeps its transcript in S3 cold storage — the export must include it,
+                # or "Download all my data" silently drops every older conversation.
+                from app.lifecycle.transcript_archive import load_archived_transcripts
+
+                archived = await load_archived_transcripts(
+                    session, admin_id=admin_id, session_id=sess.id
+                )
+                messages = [
+                    {"role": str(r["role"]), "text": str(r["text"]), "at": str(r["at"])}
+                    for r in (archived or [])
+                ]
             summary = (
                 await session.execute(
                     select(SessionSummary).where(SessionSummary.session_id == sess.id)
@@ -100,9 +116,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                 "mode": sess.mode,
                 "startedAt": sess.started_at.isoformat(),
                 "summary": summary.summary if summary else sess.summary,
-                "messages": [
-                    {"role": t.role, "text": t.text, "at": t.at.isoformat()} for t in transcripts
-                ],
+                "messages": messages,
             }
             z.writestr(f"conversations/{sess.id}.json", json.dumps(conv, indent=2))
             conv_rows.append(

@@ -55,7 +55,7 @@ Two invariants every sweep holds:
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 
 from sqlalchemy import text
@@ -65,8 +65,9 @@ from app.auth import reaper
 from app.billing import dunning, metering
 from app.connections import deferred_queue, health
 from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
-from app.lifecycle import audit_retention, grace_expiry, retention
+from app.lifecycle import audit_retention, grace_expiry, retention, transcript_archive
 from app.lifecycle.close_purge import purge_closed_account_if_due
+from app.runtime import session_close
 
 RETENTION = "retention"
 GRACE_EXPIRY = "grace_expiry"
@@ -77,6 +78,8 @@ UNVERIFIED_REAP = "unverified_reap"
 DEFERRED = "deferred"
 HEALTH = "health"
 AUDIT_RETENTION = "audit_retention"
+SESSION_FINALIZE = "session_finalize"
+TRANSCRIPT_ARCHIVE = "transcript_archive"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -88,6 +91,8 @@ SWEEP_KINDS: tuple[str, ...] = (
     DEFERRED,
     HEALTH,
     AUDIT_RETENTION,
+    SESSION_FINALIZE,
+    TRANSCRIPT_ARCHIVE,
 )
 
 
@@ -217,7 +222,36 @@ async def run_audit_retention(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(AUDIT_RETENTION, audit_retention.prune_audit_log_if_due, now)
 
 
-SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
+async def _finalize_sessions(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+    return await session_close.finalize_due_sessions(session, admin_id=admin_id, now=now)
+
+
+async def run_session_finalize(*, now: datetime | None = None) -> list[str]:
+    """Close sessions past their channel inactivity timeout; summarize (§3.4.7/§3.4.8).
+
+    This is what makes 'summarization fires at the close of every conversation' true:
+    a session the channel gave no explicit end signal for (SMS/email/Meta always;
+    widget when the tab dies without the beacon) is sealed here, gets its ``ended_at``
+    at the honest ``last_message_at + timeout`` boundary, and its §3.4.7 summary is
+    written into the cross-session memory store (§3.4.6)."""
+    return await _per_tenant(SESSION_FINALIZE, _finalize_sessions, now)
+
+
+async def _archive_transcripts(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+    return await transcript_archive.archive_aged_transcripts(session, admin_id=admin_id, now=now)
+
+
+async def run_transcript_archive(*, now: datetime | None = None) -> list[str]:
+    """Move ended sessions' transcripts past 90 days to S3 cold storage (#38).
+
+    Runs nightly BEFORE the retention sweep so a session crossing both boundaries in
+    one night is archived and then aged out through the same policy path. The hot
+    Postgres table plateaus at ~90 days of transcripts; the cold bucket self-bounds
+    via the retention sweep's object deletion + the bucket's lifecycle backstop."""
+    return await _per_tenant(TRANSCRIPT_ARCHIVE, _archive_transcripts, now)
+
+
+SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
     CLOSE_PURGE: run_close_account_purge,
@@ -227,4 +261,6 @@ SWEEPS: dict[str, Callable[..., Awaitable[object]]] = {
     DEFERRED: run_deferred_retry,
     HEALTH: run_connection_health,
     AUDIT_RETENTION: run_audit_retention,
+    SESSION_FINALIZE: run_session_finalize,
+    TRANSCRIPT_ARCHIVE: run_transcript_archive,
 }

@@ -222,7 +222,7 @@ describe('Backend ALB gains the api HTTPS listener (spec §1)', () => {
       envConfig: getEnvConfig('dev'),
       vpc: net.vpc,
       cmkArn: sec.cmk.keyArn,
-      knowledgeBucket: data.knowledgeBucket,
+      transcriptArchiveBucket: data.transcriptArchiveBucket,
       exportBucket: data.exportBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,

@@ -33,6 +33,7 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -48,7 +49,7 @@ from app.models.voice import VoiceCallRecord
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
-from app.runtime.sessions import resolve_or_open_session
+from app.runtime.sessions import participant_key_for, resolve_or_open_session
 from app.runtime.speech import SpeechError, SpeechToText, TextToSpeech
 
 # Voice replies stay short — long answers switch channel or get truncated for speech
@@ -151,6 +152,11 @@ async def handle_turn(
     # Undefaulted for the same reason as Orchestrator.has_payment_method (P2-5): a
     # forgotten kwarg must be a TypeError, not a silently capped paying caller.
     has_payment_method: bool,
+    # The Twilio Call SID, when the caller has it: joins this turn's session onto the
+    # VoiceCallRecord opened by start_call (§3.1.2) so the disclosure log and the
+    # conversation are one auditable thread. Optional so pre-existing callers/tests
+    # keep working; the voice webhook passes it.
+    provider_call_id: str | None = None,
 ) -> VoiceTurnResult:
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
     # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.
@@ -181,13 +187,30 @@ async def handle_turn(
     # Voice identity is STRONG (E.164, §3.4.9) but lead linkage is the identity arc's
     # job; here resolved_lead_id stays None so this turn opens/uses a voice session
     # without inheriting another lead's history (the HARD RULE still holds in memory).
+    # The caller's number is the participant key (§3.4.8): every utterance of one call
+    # — and a quick follow-up call inside the 30-minute window — is ONE billed session,
+    # never a session (and a billed conversation) per utterance.
     sess, _is_new = await resolve_or_open_session(
         session,
         admin_id=admin_id,
         instance_id=instance_id,
         channel="voice",
         resolved_lead_id=None,
+        participant_key=participant_key_for(admin_id, "voice", from_number),
     )
+    if provider_call_id is not None:
+        # Join the session onto the call's disclosure record (§3.1.2): set once, never
+        # re-pointed — the first turn wins, matching "one call, one session".
+        await session.execute(
+            update(VoiceCallRecord)
+            .where(
+                VoiceCallRecord.admin_id == admin_id,
+                VoiceCallRecord.instance_id == instance_id,
+                VoiceCallRecord.provider_call_id == provider_call_id,
+                VoiceCallRecord.session_id.is_(None),
+            )
+            .values(session_id=sess.id)
+        )
 
     # Arc 16 binds the production hybrid retriever (vector + intent-gated graph, §3.2.1)
     # behind the orchestrator's injected seam — closing the Arc 14b empty "Arc 11/16" stub.

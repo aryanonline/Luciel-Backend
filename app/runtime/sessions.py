@@ -15,6 +15,7 @@ another lead's history; a matching identifier never authorizes PII disclosure.
 from __future__ import annotations
 
 import enum
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,10 @@ INACTIVITY_TIMEOUT = {
     "widget": timedelta(minutes=30),
     "sms": timedelta(hours=4),
     "whatsapp": timedelta(hours=4),
+    "messenger": timedelta(hours=4),
+    "instagram": timedelta(hours=4),
+    # Legacy combined id (pre-§3.1.2-split sessions): still times out on the same
+    # asynchronous-messaging class so an old open session closes correctly.
     "instagram_messenger": timedelta(hours=4),
     "email": timedelta(hours=24),
     "voice": timedelta(minutes=30),  # post-call follow-up window
@@ -52,6 +57,9 @@ IDENTITY_STRENGTH = {
     "sms": IdentityStrength.strong,
     "voice": IdentityStrength.strong,
     "whatsapp": IdentityStrength.strong,
+    "messenger": IdentityStrength.platform_scoped_strong,
+    "instagram": IdentityStrength.platform_scoped_strong,
+    # Legacy combined id (pre-§3.1.2-split sessions) keeps its class for old rows.
     "instagram_messenger": IdentityStrength.platform_scoped_strong,
     "widget": IdentityStrength.weak,
 }
@@ -70,6 +78,33 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def participant_key_for(
+    admin_id: uuid.UUID, channel: str, customer_identifier: str | None
+) -> str | None:
+    """The §3.4.8 session participant key for a transport identifier, or None.
+
+    ``sha256(admin_id ‖ channel ‖ normalized identifier)`` hex — tenant-salted so equal
+    identifiers on two tenants can never correlate, and stored instead of the raw
+    identifier so the resume index carries no second plaintext copy of a phone number
+    or email (erasure-lean, §3.4.11).
+
+    Returns None for the widget (weak identity — a widget conversation resumes ONLY by
+    its own client-supplied ``session_id``; §3.4.9 HARD RULE) and for an empty
+    identifier. Normalization: emails are case-folded/stripped (RFC5321 domain case and
+    practical mailbox case-insensitivity); E.164 numbers and Meta platform-scoped ids
+    are used as delivered.
+    """
+    if not customer_identifier:
+        return None
+    if IDENTITY_STRENGTH.get(channel, IdentityStrength.weak) is IdentityStrength.weak:
+        return None
+    normalized = customer_identifier.strip()
+    if channel == "email":
+        normalized = normalized.lower()
+    material = f"{admin_id}\x1f{channel}\x1f{normalized}".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
 async def resolve_or_open_session(
     session: AsyncSession,
     *,
@@ -78,12 +113,15 @@ async def resolve_or_open_session(
     channel: str,
     resolved_lead_id: uuid.UUID | None,
     session_id: uuid.UUID | None = None,
+    participant_key: str | None = None,
 ) -> tuple[Session, bool]:
     """Return (session, is_new). Finds a live session for the key, else opens one.
 
     Liveness is determined deterministically by the channel inactivity timeout —
     a session whose last_message_at is older than the timeout is considered closed,
-    and a new inbound opens a fresh session (a new budget unit, §3.4.8).
+    and a new inbound opens a fresh session (a new budget unit, §3.4.8). A session
+    whose ``ended_at`` is set is closed regardless of the window (explicit end signal
+    or the finalization sweep already sealed it).
 
     ``session_id`` is the client-supplied conversation handle (the widget's signed
     embed session id, §3.4.9 widget row). It is the ONLY way a weak-identity channel
@@ -92,6 +130,13 @@ async def resolve_or_open_session(
     does NOT weaken the §3.4.9 HARD RULE: a resumed widget session inherits only its
     OWN transcript, and ``can_carry_cross_session_memory('widget')`` still blocks any
     other lead's cross-session history.
+
+    ``participant_key`` (``participant_key_for``) is the transport-identifier key for
+    the strong / platform-scoped-strong channels — it is what makes a conversation ONE
+    billed session across its turns (§3.4.8): the second SMS from the same number
+    within the 4-hour window lands in the same session instead of opening (and
+    billing) a new one. It exists from the very first message, before lead capture
+    has resolved a lead.
 
     Architecture §3.4.10a: if the resolved lead is in ``archived`` state, it is
     automatically reactivated (archived → active) and a ``lead_reactivated`` audit
@@ -113,6 +158,7 @@ async def resolve_or_open_session(
                     Session.instance_id == instance_id,
                     Session.channel == channel,
                     Session.id == session_id,
+                    Session.ended_at.is_(None),
                 )
             )
         ).scalar_one_or_none()
@@ -125,6 +171,22 @@ async def resolve_or_open_session(
                     Session.instance_id == instance_id,
                     Session.channel == channel,
                     Session.resolved_lead_id == resolved_lead_id,
+                    Session.ended_at.is_(None),
+                )
+                .order_by(Session.last_message_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if existing is None and participant_key is not None:
+        existing = (
+            await session.execute(
+                select(Session)
+                .where(
+                    Session.admin_id == admin_id,
+                    Session.instance_id == instance_id,
+                    Session.channel == channel,
+                    Session.participant_key == participant_key,
+                    Session.ended_at.is_(None),
                 )
                 .order_by(Session.last_message_at.desc())
                 .limit(1)
@@ -141,6 +203,7 @@ async def resolve_or_open_session(
         instance_id=instance_id,
         resolved_lead_id=resolved_lead_id,
         channel=channel,
+        participant_key=participant_key,
         mode="ai",
         counted=False,
         started_at=_now(),

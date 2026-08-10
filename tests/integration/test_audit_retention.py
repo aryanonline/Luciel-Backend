@@ -43,6 +43,13 @@ async def _seed_account(admin_id: uuid.UUID) -> None:
                 password_hash="x",
                 state=AccountState.verified,
                 email_verified=True,
+                # The account must PREDATE its aged audit rows: an audit row older than
+                # a year can only exist on an account older than a year (append-only,
+                # server-stamped created_at). Discovery relies on exactly this
+                # invariant (migration 0034's grant-free age predicate), so seeding a
+                # young account with backdated rows would be a state production can
+                # never produce.
+                created_at=datetime.now(UTC) - AGED - timedelta(days=5),
             )
         )
 

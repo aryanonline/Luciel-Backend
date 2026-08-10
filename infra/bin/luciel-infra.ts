@@ -14,6 +14,7 @@
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { NetworkingStack } from '../lib/networking-stack';
+import { BudgetStack } from '../lib/budget-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
@@ -67,7 +68,7 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   envConfig,
   vpc: net.vpc,
   cmkArn: sec.cmk.keyArn,
-  knowledgeBucket: data.knowledgeBucket,
+  transcriptArchiveBucket: data.transcriptArchiveBucket,
   exportBucket: data.exportBucket,
   dbSecretArn: data.db.secret!.secretArn,
   platformSecretArn: sec.platformSecret.secretArn,
@@ -118,6 +119,15 @@ new PipelineStack(app, `${prefix}-Pipeline`, {
   envConfig,
   githubRepo: 'aryanonline/Luciel-Backend',
   frontendRepo: 'aryanonline/Luciel-Frontend',
+});
+
+// Monthly cost ceiling (AWS Budgets) — the backstop that catches everything the
+// per-resource ceilings miss, incl. a failed preprod teardown. Alert email comes
+// from deploy-time context so no address is committed to the repo.
+new BudgetStack(app, `${prefix}-Budget`, {
+  env,
+  envConfig,
+  alertEmail: app.node.tryGetContext('budgetAlertEmail') as string | undefined,
 });
 
 // App-wide so it also reaches the functions CDK generates inside constructs the

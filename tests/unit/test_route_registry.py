@@ -122,6 +122,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/chat-widget/bootstrap"),
         ("POST", "/api/v1/chat-widget/messages"),
         ("GET", "/api/v1/chat-widget/sessions/{session_id}"),
+        # The §3.4.8 explicit end signal (widget close beacon) — intentional addition.
+        ("POST", "/api/v1/chat-widget/sessions/{session_id}/end"),
         # billing
         ("GET", "/api/v1/billing"),
         ("POST", "/api/v1/billing/checkout"),

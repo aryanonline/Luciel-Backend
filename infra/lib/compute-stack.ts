@@ -1,14 +1,15 @@
 /**
- * Compute layer - ECS Fargate + ALB + SQS (DEVOPS §5.5, Arch §3.1/§4.6).
+ * Compute layer - ECS Fargate + ALB (DEVOPS §5.5, Arch §3.1/§4.6).
  *
  * One container image, TWO logical planes per §0 (control-plane = admin API,
  * data-plane = channel/widget ingress) run as separate ECS services with their
- * own task roles (role-split, not physical separation). Background workers
- * (health-check, hard-delete cascade, summarization) run as separate tasks off
- * SQS so a heavy tenant job never blocks request handling.
+ * own task roles (role-split, not physical separation). Background work
+ * (health-check, retention, cascade, summarization/finalization, transcript
+ * archive) runs as EventBridge-scheduled one-shot ECS sweep tasks — never in
+ * the request-handling planes, so a heavy tenant job never blocks requests.
  *
  * The task role gets least-privilege: read its platform secret, use the CMK,
- * read/write the knowledge bucket, connect to RDS. NOT admin.
+ * read/write the transcript-archive + export buckets, connect to RDS. NOT admin.
  */
 import * as cdk from 'aws-cdk-lib';
 import { Stack, StackProps, Duration, RemovalPolicy } from 'aws-cdk-lib';
@@ -21,7 +22,6 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
-import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
@@ -34,7 +34,7 @@ export interface ComputeStackProps extends StackProps {
   readonly vpc: ec2.IVpc;
   /** CMK ARN (imported by ARN to avoid a cross-stack dependency cycle). */
   readonly cmkArn: string;
-  readonly knowledgeBucket: s3.IBucket;
+  readonly transcriptArchiveBucket: s3.IBucket;
   readonly exportBucket: s3.IBucket;
   /** DB master-secret ARN (imported by ARN - avoids cross-stack cycle via its KMS key). */
   readonly dbSecretArn: string;
@@ -64,7 +64,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, knowledgeBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, backendPath, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -87,15 +87,10 @@ export class ComputeStack extends Stack {
       allowAllOutbound: true,
     });
 
-    // Background-worker queues (§3.8.5/§3.6.5/§3.4.7).
-    const workerQueue = new sqs.Queue(this, 'WorkerQueue', {
-      encryptionMasterKey: cmk,
-      visibilityTimeout: Duration.seconds(120),
-      deadLetterQueue: {
-        maxReceiveCount: 5,
-        queue: new sqs.Queue(this, 'WorkerDlq', { encryptionMasterKey: cmk }),
-      },
-    });
+    // NOTE: the former WorkerQueue/WorkerDlq SQS pair was removed (cost hygiene):
+    // no app code ever consumed or produced on it — background work runs as
+    // EventBridge-scheduled ECS sweep tasks (sweepSchedules below), not off a queue.
+    // A queue returns only if a consumer ships with it.
 
     // Container image. Built from the backend Dockerfile ONLY when -c buildImage=true
     // (requires a Docker daemon - i.e. the CI/CD runner, per §5.8: images are built
@@ -137,20 +132,20 @@ export class ComputeStack extends Stack {
     // Least-privilege task role.
     const taskRole = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'Luciel ECS task role - least privilege (secrets, cmk, bucket, queue)',
+      description: 'Luciel ECS task role - least privilege (secrets, cmk, buckets)',
     });
     // Grants are applied on the ROLE side only (inline policies referencing ARNs).
     // Using the resource-side grant helpers (secret.grantRead / cmk.grant*) would
     // mutate the Security/Data stacks and create a cross-stack dependency CYCLE
     // (Security<->Compute). Role-side policies keep the edges one-directional:
     // Compute depends on Security/Data, never the reverse. (Caught by CDK tests.)
-    knowledgeBucket.grantReadWrite(taskRole); // same-stack (knowledge bucket arn is cross-stack but read/write only touches role + bucket policy in DataStack -> still one-way Compute->Data)
+    // Transcript cold storage (Commitment #38): the archive sweep writes/deletes
+    // JSONL objects and the dashboard/export read them back. grantReadWrite includes
+    // s3:DeleteObject*, which the retention sweep + cascade prefix-delete need.
+    transcriptArchiveBucket.grantReadWrite(taskRole);
     // Account-export ZIPs (§3.6.6). Without this the live put_object is AccessDenied
     // and the export the tenant was promised never appears (P1-14).
     exportBucket.grantReadWrite(taskRole);
-    workerQueue.grantConsumeMessages(taskRole);
-    workerQueue.grantSendMessages(taskRole);
-
     taskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ReadSecrets',
@@ -269,6 +264,8 @@ export class ComputeStack extends Stack {
           LUCIEL_REDIS_URL: redisUrl,
           // Per-env, so a dev export can never be written to the prod bucket.
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
+          // Transcript cold storage (Commitment #38) — same per-env naming rule.
+          LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -568,6 +565,23 @@ export class ComputeStack extends Stack {
         name: 'audit_retention',
         cron: 'cron(30 6 ? * SUN *)',
         description: 'Delete audit rows past the published 1-year retention (Legal §B5)',
+      },
+      {
+        // Hourly, not nightly: the shortest inactivity window is 30 minutes (widget),
+        // and cross-session memory (§3.4.6) only exists once the summary is written —
+        // a nightly close would leave a same-day returning lead unremembered.
+        // :25 staggers off the deferred (:10) and health (:40) hourly slots.
+        name: 'session_finalize',
+        cron: 'cron(25 * * * ? *)',
+        description: 'Close sessions past their inactivity window; summarize (§3.4.7/§3.4.8)',
+      },
+      {
+        // Nightly, BEFORE the 03:15 retention prune: a session crossing both the
+        // 90-day archive boundary and the 1-year deletion boundary in one night is
+        // archived first and then aged out through the same policy path.
+        name: 'transcript_archive',
+        cron: 'cron(30 2 * * ? *)',
+        description: 'Move transcripts past 90 days to S3 cold storage (Commitment #38)',
       },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with

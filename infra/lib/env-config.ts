@@ -97,6 +97,13 @@ export interface EnvConfig {
    * used before is removed in API version 2025-03-31 'basil'.
    */
   readonly stripeIntegrationPosture: 'mock' | 'test';
+  /**
+   * Monthly AWS cost ceiling (USD) for the AWS Budgets alarm (BudgetStack). The one
+   * control that catches everything the per-resource ceilings miss — including a
+   * failed preprod teardown silently running a prod-shaped stack. Alerts fire at
+   * 80% actual, 100% actual, and 100% forecast.
+   */
+  readonly monthlyBudgetUsd: number;
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -111,6 +118,7 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     redisSnapshotRetentionDays: 0,
     paused: false,
     stripeIntegrationPosture: 'test',
+    monthlyBudgetUsd: 150,
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate
@@ -133,6 +141,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // Prod-shaped in sizing, but the Stripe rehearsal runs against TEST keys - preprod
     // must never move money, and 'live' is not a value this seam accepts anyway.
     stripeIntegrationPosture: 'test',
+    // Prod-shaped burn: this ceiling exists precisely for the failure mode where a
+    // teardown fails and the ephemeral stack quietly runs for a month.
+    monthlyBudgetUsd: 400,
   },
   prod: {
     envName: 'prod',
@@ -148,6 +159,7 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // cutover is owner-gated and unimplemented. 'mock' keeps prod honest - /healthz
     // lists the gateway as degraded rather than implying billing reaches Stripe.
     stripeIntegrationPosture: 'mock',
+    monthlyBudgetUsd: 400,
   },
 };
 

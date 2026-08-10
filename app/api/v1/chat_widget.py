@@ -25,7 +25,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import select
 
 from app.api.errors import not_found, rate_limited
@@ -38,7 +38,7 @@ from app.db.session import tenant_session, untenanted_session
 from app.models.audit import ActorType
 from app.models.conversation import Transcript
 from app.models.instance import Instance, is_paused
-from app.runtime import budget
+from app.runtime import budget, session_close
 from app.runtime.input_safety import _compose_greeting
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
@@ -309,6 +309,35 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             ),
             render_state=render_state,
         )
+
+
+@router.post("/sessions/{session_id}/end", status_code=204)
+async def end_session(
+    session_id: uuid.UUID,
+    # Query key is camelCase to match widget-adapters.ts (?embedKey=...). A query
+    # param (not a body) because the widget sends this via navigator.sendBeacon on
+    # pagehide, which cannot set JSON content types reliably across browsers.
+    embed_key: str = Query(alias="embedKey"),
+) -> Response:
+    """Widget close beacon — the §3.4.8 explicit end signal for the widget channel.
+
+    Ends THIS widget session (finalizes + summarizes, §3.4.7) instead of leaving it
+    to the 30-minute inactivity sweep. Idempotent: repeat beacons and races with the
+    sweep are no-ops. Scoped to the embed key's tenant + the widget channel, so the
+    public key can only ever end its own tenant's widget sessions — and an unknown
+    session id acks 204 rather than confirming existence to an unauthenticated
+    caller (same non-enumeration posture as the rest of the data plane).
+    """
+    ctx = await _resolve_embed_key(embed_key)
+    async with tenant_session(ctx.admin_id) as s:
+        await session_close.finalize_session(
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            channel="widget",
+            session_id=session_id,
+        )
+    return Response(status_code=204)
 
 
 @router.get("/sessions/{session_id}", response_model=list[WidgetMessageOut])

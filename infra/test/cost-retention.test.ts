@@ -47,7 +47,7 @@ function buildCompute(envName: EnvName = 'dev') {
     envConfig,
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
-    knowledgeBucket: data.knowledgeBucket,
+    transcriptArchiveBucket: data.transcriptArchiveBucket,
     exportBucket: data.exportBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
@@ -187,19 +187,20 @@ describe('No log group retains forever', () => {
       envConfig,
       vpc: net.vpc,
       cmkArn: sec.cmk.keyArn,
-      knowledgeBucket: data.knowledgeBucket,
+      transcriptArchiveBucket: data.transcriptArchiveBucket,
       exportBucket: data.exportBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
       redisUrl: data.redisUrl,
       backendPath: path.join(__dirname, '..', '..'),
     });
-    Template.fromStack(
+    // The observability stack declares NO log group of its own (the former
+    // `/luciel/<env>/app` group had no producer and was removed — cost hygiene);
+    // every real log group is declared by the container that writes to it.
+    const obs = Template.fromStack(
       new ObservabilityStack(app, 'Obs', { env: ENV, envConfig, alb: compute.alb }),
-    ).hasResourceProperties('AWS::Logs::LogGroup', {
-      LogGroupName: '/luciel/prod/app',
-      RetentionInDays: 90,
-    });
+    );
+    obs.resourceCountIs('AWS::Logs::LogGroup', 0);
     for (const [, props] of logGroups(Template.fromStack(compute))) {
       expect(props.RetentionInDays).toBe(90);
     }
@@ -251,14 +252,19 @@ describe('Every S3 bucket plateaus', () => {
     });
   });
 
-  test('the knowledge bucket bounds current AND noncurrent objects', () => {
+  test('the transcript archive bounds current AND noncurrent objects', () => {
+    // Commitment #38: cold storage plateaus. The app retention sweep is the
+    // authoritative 1-year deleter; this 365-days-from-upload rule is the §4.4
+    // backstop (late-safe by design — objects land already ~90 days old).
     buildData().hasResourceProperties('AWS::S3::Bucket', {
+      VersioningConfiguration: { Status: 'Enabled' },
       LifecycleConfiguration: {
         Rules: Match.arrayWith([
           Match.objectLike({
-            Id: 'customer-data-retention-envelope',
+            Id: 'transcript-archive-backstop',
             ExpirationInDays: 365,
-            NoncurrentVersionExpiration: { NoncurrentDays: 90 },
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 },
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 },
           }),
         ]),
       },

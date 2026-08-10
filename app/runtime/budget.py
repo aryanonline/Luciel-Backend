@@ -199,5 +199,17 @@ async def count_session_once(
         )
         .values(counted_conversations=ConversationBudget.counted_conversations + 1)
     )
+    # Monotonic all-time counter (migration 0035): same transaction as the winning
+    # claim above, so it inherits the fire-once idempotency and — unlike the ledger —
+    # survives the invoice.paid period reset. No billing row yet (tenant never opened
+    # billing) is fine: analytics falls back to the counted_sessions count, which is
+    # complete for exactly those tenants (their rows have never been reset away).
+    from app.models.billing import BillingAccount  # noqa: PLC0415 — avoid import cycle
+
+    await session.execute(
+        update(BillingAccount)
+        .where(BillingAccount.admin_id == admin_id)
+        .values(lifetime_conversations=BillingAccount.lifetime_conversations + 1)
+    )
     await session.flush()
     return True

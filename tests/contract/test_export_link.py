@@ -47,9 +47,15 @@ async def test_request_export_uploads_and_issues_presigned_link(client):
     r = await client.post("/api/v1/admin/account/export")
     assert r.status_code == 200
     assert r.json()["ok"] is True
+    # The presigned link is delivered in the API response (and by email) — the
+    # channels the owner actually reads it from.
+    url = r.json()["download_url"]
+    assert "export.local" in url
 
-    # The data_export_ready audit event carries the presigned link + 7-day TTL
-    # (config.export_link_ttl_days) — the bundle is no longer discarded.
+    # The data_export_ready audit event records THAT an export was minted (id, size,
+    # TTL) — and deliberately NOT the presigned link: the audit log is append-only,
+    # 1-year retained, and included in every later export bundle, so a persisted URL
+    # would be a working door to a full tenant data dump long past its 7-day life.
     async with tenant_session(admin_id) as s:
         rows = (
             await s.execute(
@@ -61,12 +67,12 @@ async def test_request_export_uploads_and_issues_presigned_link(client):
     assert len(rows) == 1
     payload = rows[0].event_payload
     assert payload["ttl_days"] == 7
-    assert "export.local" in payload["download_url"]
     assert payload["size_bytes"] > 0
+    assert payload["export_id"]
+    assert "download_url" not in payload
 
     # Extract the key from the fake URL and read back the persisted bundle —
     # proves put_and_presign actually stored the bytes, not just minted a URL.
-    url = payload["download_url"]
     key = url.split("https://export.local/", 1)[1].split("?expires=")[0]
     zip_bytes = LocalExportStore.get_bytes(key)
     assert zip_bytes is not None

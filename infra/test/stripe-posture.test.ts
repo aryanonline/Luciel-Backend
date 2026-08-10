@@ -35,7 +35,7 @@ function computeTemplate(envName: EnvName) {
     envConfig,
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
-    knowledgeBucket: data.knowledgeBucket,
+    transcriptArchiveBucket: data.transcriptArchiveBucket,
     exportBucket: data.exportBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,

@@ -11,7 +11,7 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 
 ## Contracts this module owns
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
-- Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, and zero Redis snapshots.
+- Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.
 
 ## Testing pointers

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from typing import cast
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -99,9 +100,14 @@ async def _require_session(
 async def get_messages(
     session_id: uuid.UUID, subject: Subject = Depends(current_admin)
 ) -> list[MessageOut]:
-    """The full transcript for one session (§3.4.6 within-session memory)."""
+    """The full transcript for one session (§3.4.6 within-session memory).
+
+    Sessions past the 90-day hot boundary (Commitment #38) have no Transcript rows —
+    their transcript moved to S3 cold storage. The read-through below serves those
+    on demand from the archive, so a conversation never goes blank the day its rows
+    moved; only its storage tier changed."""
     async with tenant_session(subject.admin_id) as s:
-        await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
+        sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
         rows = (
             (
                 await s.execute(
@@ -116,6 +122,21 @@ async def get_messages(
             .scalars()
             .all()
         )
+        if not rows and sess.archive_object_key:
+            from app.lifecycle.transcript_archive import load_archived_transcripts
+
+            archived = await load_archived_transcripts(
+                s, admin_id=subject.admin_id, session_id=session_id
+            )
+            return [
+                MessageOut(
+                    message_id=uuid.UUID(str(r["id"])),
+                    role=str(r["role"]),
+                    text=str(r["text"]),
+                    at=datetime.fromisoformat(str(r["at"])),
+                )
+                for r in (archived or [])
+            ]
         return [MessageOut(message_id=r.id, role=r.role, text=r.text, at=r.at) for r in rows]
 
 

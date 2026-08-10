@@ -22,7 +22,14 @@ class Session(Base, TenantMixin, TimestampMixin):
     instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     resolved_lead_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    # §3.4.8 session key: tenant-salted sha256(admin_id ‖ channel ‖ normalized transport
+    # identifier). NULL on the widget (weak identity — resumes only by session_id) and on
+    # pre-split legacy rows. This is what lets an SMS thread's second text land in the
+    # SAME billed session instead of opening (and billing) a new one per message.
+    participant_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="ai")
+    # DEPRECATED: never written True anywhere; the fire-once billing guard is the
+    # counted_sessions ledger (app/models/budget.py). Kept only for schema stability.
     counted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -30,6 +37,18 @@ class Session(Base, TenantMixin, TimestampMixin):
     last_message_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Explicit session END (§3.4.8): stamped by the finalization sweep at
+    # last_message_at + channel timeout, or by an explicit end signal (widget close
+    # beacon / voice hangup). NULL = still live (or not yet finalized). An ended
+    # session is never resumed, even inside the inactivity window.
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Hot→cold transcript offload markers (Commitment #38, migration 0036). Session-
+    # level because "moved" deletes the hot Transcript rows once the S3 object is
+    # durably written — a per-row marker would be deleted with the rows it marks.
+    transcripts_archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archive_object_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # §3.7.1/§3.8.7 rule E: the EFFECTIVE additive/neutral config (enabled tools,
     # personality, enabled channels) frozen at session-open. Additive pillar changes
@@ -68,7 +87,7 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # (app/api/v1/dashboard.py::get_answer_evidence) maps NULL vs [] vs non-empty to
     # three distinct attributionStatus values -- never collapses NULL and [] into
     # the same "no source backed this answer" claim.
-    source_chunks: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    source_chunks: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

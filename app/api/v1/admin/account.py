@@ -56,11 +56,13 @@ async def _build_upload_and_notify(
         "size_bytes": len(zip_bytes),
         "export_id": str(export_id),
         "ttl_days": settings.export_link_ttl_days,
-        # The presigned URL itself is not secret material (§3.8.3 covers connection
-        # credentials, not this time-limited download link), but it IS sensitive —
-        # surfaced via audit payload the same way other lifecycle links are, so the
-        # admin dashboard/notification path can read it back.
-        "download_url": url,
+        # Deliberately NO download_url here: the audit log is append-only, 1-year
+        # retained, AND included in every subsequent export bundle — persisting the
+        # presigned link there kept a working, unauthenticated door to a full tenant
+        # data dump readable long after (and far more widely than) its 7-day life
+        # warranted. The link goes to the owner via the API response + email below;
+        # the audit row records THAT an export was minted (export_id), never the key
+        # to open it.
     }
     if context is not None:
         payload["context"] = context

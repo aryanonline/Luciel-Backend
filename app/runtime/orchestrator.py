@@ -25,8 +25,10 @@ The loop, per inbound message:
   Half B — emission:
     RESPOND: channel arbiter picks the outbound channel (§3.4.2).
     FINALIZATION: persist transcript; the summary is produced at session close
-      (§3.4.7), not per message — the loop persists turns, summarization fires on
-      session end (memory.summarize / persist_summary).
+      (§3.4.7), not per message — the loop persists turns; summarization fires at
+      session end via app/runtime/session_close.py (the hourly session_finalize
+      sweep on inactivity timeout, or an explicit end signal such as the widget
+      close beacon).
 
 The LLM's instructions are NOT a security boundary (§3.4.14 / §7 #36): tenant
 isolation (RLS), tool authorization (broker default-deny), and budget all hold in
@@ -420,9 +422,27 @@ class Orchestrator:
         if self.chunk_attributor is not None:
             attributed_chunks = await self.chunk_attributor(inbound_text)
 
+        # --- CROSS-SESSION MEMORY (§3.4.6) ----------------------------------- #
+        # Prior-session SUMMARIES for this lead (never full transcripts, §3.4.8) —
+        # bounded N=10/12-month injection (§3.4.10), gated by the §3.4.9 HARD RULE
+        # inside load_cross_session_summaries (weak channel / no lead → []). This is
+        # what makes "good to hear from you again" real for a returning lead.
+        prior_summaries = await memory.load_cross_session_summaries(
+            self.session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            channel=channel,
+            resolved_lead_id=resolved_lead_id,
+            exclude_session_id=session_id,
+        )
+
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
         resp, iterations, used_fallback, llm_failed = await self._reason(
-            inbound_text, history, wrapped_chunks, resolved_lead_id=resolved_lead_id
+            inbound_text,
+            history,
+            wrapped_chunks,
+            resolved_lead_id=resolved_lead_id,
+            prior_summaries=prior_summaries,
         )
 
         if llm_failed:
@@ -541,11 +561,24 @@ class Orchestrator:
         wrapped_chunks: list[str],
         *,
         resolved_lead_id: uuid.UUID | None = None,
+        prior_summaries: list[str] | None = None,
     ) -> tuple[_Reasoned, int, bool, bool]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and
         whether BOTH providers failed (llm_failed)."""
         messages: list[dict[str, str]] = []
+        if prior_summaries:
+            # §3.4.6 cross-session memory, injected BEFORE this session's history.
+            # Summaries derive from lead-authored content, so they enter the context
+            # as untrusted data (§3.4.14 Defense 2), never as instructions.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": wrap_untrusted(
+                        "Prior conversation summaries:\n" + "\n".join(prior_summaries)
+                    ),
+                }
+            )
         for t in history:
             role = "user" if t.role == "lead" else "assistant"
             messages.append({"role": role, "content": t.text})

@@ -35,6 +35,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.lifecycle.transcript_store import get_transcript_store
 from app.models.audit import ActorType
 from app.models.conversation import Session, SessionSummary, Transcript
 from app.models.instance import Instance
@@ -74,9 +75,21 @@ async def expire_aged_data(
 
     Rows whose ``created_at`` is older than ``now - retention_days`` are permanently
     deleted; a ``data_retention_hard_delete`` audit event is emitted per data class
-    BEFORE its rows are removed (payload: data_class, count, retention_policy).
-    Returns per-class deletion counts. Idempotent — a second run finds nothing aged
-    and deletes nothing (and emits a zero-count event, keeping the audit honest).
+    BEFORE its rows are removed (payload: data_class, count, retention_policy) —
+    and ONLY when the class actually has aged rows. A zero-count run emits nothing:
+    the unconditional variant appended ~3 rows per tenant per night to the very
+    1-year-retained table this sweep exists to bound — the exact write-amplification
+    ``audit_retention.py`` documents refusing (its reasoning, adopted here).
+    Returns per-class deletion counts. Idempotent — a second run finds nothing aged,
+    deletes nothing, and writes nothing.
+
+    Archived-transcript reconciliation (Commitment #38): an aged ``Session`` may
+    carry an ``archive_object_key`` — its transcript moved to S3 cold storage at the
+    90-day boundary. The retention sweep is the AUTHORITATIVE deleter of that object
+    at the 1-year boundary (the bucket's own lifecycle rule is only the late-safe
+    backstop), so the objects are deleted here, best-effort, BEFORE the rows: a store
+    outage must not abort the row deletion (the bucket backstop still bounds the
+    object), and the failure is recorded on the audit payload rather than raised.
 
     Must be called inside a tenant-scoped session for ``admin_id`` so RLS scopes both
     the counts and the deletes to this tenant; the app-level ``admin_id`` filter is
@@ -93,6 +106,47 @@ async def expire_aged_data(
     instance_id = inst.id if inst is not None else None
 
     counts: dict[str, int] = {}
+
+    # Cold-store reconciliation first (see docstring): collect the aged sessions'
+    # archive keys and delete their S3 objects, best-effort.
+    aged_keys = (
+        (
+            await session.execute(
+                select(Session.archive_object_key).where(
+                    Session.admin_id == admin_id,
+                    Session.created_at < cutoff,
+                    Session.archive_object_key.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    objects_deleted = 0
+    object_delete_errors = 0
+    if aged_keys:
+        store = get_transcript_store()
+        for key in aged_keys:
+            try:
+                await store.delete(key=str(key))
+                objects_deleted += 1
+            except Exception:  # noqa: BLE001 — best-effort; bucket lifecycle is the backstop
+                object_delete_errors += 1
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="data_retention_hard_delete",
+            payload={
+                "data_class": "transcript_archive_object",
+                "count": objects_deleted,
+                "delete_errors": object_delete_errors,
+                "retention_policy": f"age_based_sweep:{retention_days}d",
+            },
+        )
+        counts["transcript_archive_object"] = objects_deleted
+
     for model, data_class in _RETAINED_CLASSES:
         aged = int(
             (
@@ -103,6 +157,9 @@ async def expire_aged_data(
                 )
             ).scalar_one()
         )
+        if aged == 0:
+            counts[data_class] = 0
+            continue
         await audit.emit(
             session,
             admin_id=admin_id,

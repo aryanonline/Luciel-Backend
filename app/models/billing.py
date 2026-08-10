@@ -71,6 +71,13 @@ class BillingAccount(Base, TenantMixin, TimestampMixin):
     accrued_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_reported_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Monotonic ALL-TIME billed-conversation count (migration 0035). Incremented in
+    # count_session_once inside the same transaction as the counted_sessions claim
+    # (fire-once inherited), and — unlike the per-period ledger — NEVER reset by
+    # invoice.paid. This is what lets analytics say "all-time" honestly while the
+    # ledger keeps its correct period-reset semantics.
+    lifetime_conversations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # Display-only payment-method tuple (§3.4.1b). NO PAN — these four fields are
     # the entire card surface the server ever holds or returns.
     pm_brand: Mapped[str | None] = mapped_column(String(32), nullable=True)

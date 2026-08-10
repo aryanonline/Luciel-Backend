@@ -134,7 +134,8 @@ async def test_additive_tool_deferred_for_in_flight_present_for_new_session():
         inst = (await s.execute(select(Instance).where(Instance.id == iid))).scalar_one()
         eff_a = effective_config(snap_a, inst, always_include_channel="widget")
     assert eff_a.snapshot_tool_ids == set()  # empty at open → tool deferred
-    # A NEW session B (widget always opens fresh — resolved_lead_id is None) sees it.
+    # A NEW session B sees it (no session_id / participant key given, so the resolver
+    # has no handle to resume by and opens fresh — the no-key path).
     async with tenant_session(admin) as s:
         sess_b, is_new_b = await resolve_or_open_session(
             s, admin_id=admin, instance_id=iid, channel="widget", resolved_lead_id=None

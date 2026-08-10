@@ -7,7 +7,6 @@
  */
 import { Stack, StackProps, Duration } from 'aws-cdk-lib';
 import * as cw from 'aws-cdk-lib/aws-cloudwatch';
-import * as logs from 'aws-cdk-lib/aws-logs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
@@ -23,13 +22,11 @@ export class ObservabilityStack extends Stack {
     super(scope, id, props);
     const { envConfig, alb } = props;
 
-    // App log group - 90 days in prod (§5.1), shorter in the environments nobody reads
-    // month-old logs from. Audit/trace stores live in RDS with their own 1-year
+    // NOTE: the former `/luciel/<env>/app` log group was removed (cost hygiene):
+    // no producer ever wrote to it — every ECS container declares its own
+    // `/luciel/<env>/<plane>` group in ComputeStack, so this one sat empty as a
+    // dead resource. Audit/trace stores live in RDS with their own 1-year
     // retention enforced by the app, not CloudWatch.
-    new logs.LogGroup(this, 'AppLogs', {
-      logGroupName: `/luciel/${envConfig.envName}/app`,
-      retention: envConfig.logRetention,
-    });
 
     const alarmTopic = new sns.Topic(this, 'Alarms', {
       displayName: `Luciel ${envConfig.envName} alarms`,

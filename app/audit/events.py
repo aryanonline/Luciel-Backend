@@ -35,6 +35,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "dunning_state_changed",
         "connection_status_changed",
         "connection_secret_cleanup",
+        # Hot→cold transcript offload (Commitment #38): a session's transcript moved
+        # to the S3 archive (key + row count, never content), and the cascade's
+        # prefix cleanup of a deleted tenant's archived objects.
+        "transcript_archived",
+        "transcript_archive_cleanup",
         "data_export_requested",
         "data_export_ready",
         "data_export_self_serve",

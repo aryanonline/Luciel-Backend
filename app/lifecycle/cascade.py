@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.connections.secrets import get_secret_store, tenant_secret_prefix
 from app.db.base import TenantMixin
+from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
@@ -154,6 +155,41 @@ async def _delete_tenant_secrets(
     )
 
 
+async def _delete_tenant_transcript_archive(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
+) -> None:
+    """Destroy the tenant's archived-transcript objects (Commitment #38).
+
+    The cascade deletes the Postgres rows, but a session archived at the 90-day
+    boundary keeps its transcript in the S3 cold store — left alone, a deleted
+    tenant's conversations would survive up to ~a year past "hard-deleted" (until
+    the bucket's lifecycle backstop fired). One ``vm/{admin_id}/transcripts/``
+    prefix sweep removes them all, mirroring the Secrets Manager prefix cleanup
+    above: best-effort (a store outage must not abort a deletion the owner already
+    confirmed — the bucket backstop still bounds the objects), with the outcome
+    recorded on the audit trail either way.
+    """
+    prefix = transcript_prefix_for(admin_id)
+    try:
+        swept = await get_transcript_store().delete_prefix(prefix=prefix)
+        error: str | None = None
+    except Exception as exc:  # noqa: BLE001 — a broken store must not strand the deletion
+        swept, error = 0, type(exc).__name__
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="transcript_archive_cleanup",
+        payload={
+            "object_prefix": prefix,
+            "deleted_count": swept,
+            "error": error,
+            "context": "hard_delete_cascade_prefix_sweep",
+        },
+    )
+
+
 async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dict[str, int]:
     """Run the ordered cascade for the tenant's Luciel. Returns per-table row counts.
 
@@ -172,12 +208,16 @@ async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dic
     ).scalar_one_or_none()
     iid = inst.id if inst is not None else None
     await _delete_tenant_secrets(session, admin_id, iid)
+    await _delete_tenant_transcript_archive(session, admin_id, iid)
 
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted
     await session.flush()
     counts = {
-        model.__tablename__: await _log_and_delete(session, admin_id, iid, model, data_class)
+        # __tablename__ lives on each concrete model, not on the TenantMixin bound.
+        str(getattr(model, "__tablename__")): await _log_and_delete(  # noqa: B009
+            session, admin_id, iid, model, data_class
+        )
         for model, data_class in CASCADE_MODELS
     }
 

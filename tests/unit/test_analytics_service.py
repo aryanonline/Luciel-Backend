@@ -104,12 +104,13 @@ async def _add_escalation(admin: uuid.UUID, iid: uuid.UUID, *, signal: str) -> N
 async def test_busiest_times_is_real_heatmap() -> None:
     admin = uuid.uuid4()
     iid = await _seed(admin)
-    # Tuesday 09:00 UTC, twice, and Wednesday 14:00 once.
+    # Tuesday 09:00 UTC, twice, and Wednesday 14:00 once — all BILLED (the heatmap
+    # counts billed conversations this period, like every other panel).
     tue_9am = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)  # 2026-07-07 is a Tuesday
     wed_2pm = datetime(2026, 7, 8, 14, 0, tzinfo=UTC)
-    await _add_session(admin, iid, channel="widget", started_at=tue_9am)
-    await _add_session(admin, iid, channel="widget", started_at=tue_9am)
-    await _add_session(admin, iid, channel="sms", started_at=wed_2pm)
+    for channel, started_at in (("widget", tue_9am), ("widget", tue_9am), ("sms", wed_2pm)):
+        sid = await _add_session(admin, iid, channel=channel, started_at=started_at)
+        await _count_session(admin, iid, sid)
 
     async with tenant_session(admin) as s:
         agg = await analytics_service.build_overview(
@@ -124,6 +125,29 @@ async def test_busiest_times_is_real_heatmap() -> None:
     assert sum(sum(row) for row in agg.busiest_times) == 3
     assert len(agg.busiest_times) == 7
     assert all(len(row) == 24 for row in agg.busiest_times)
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_busiest_times_excludes_unbilled_sessions() -> None:
+    """The heatmap shares the single conversation-counting source of truth: a session
+    that opened but never billed (no first model call) must not appear — previously
+    the heatmap read raw sessions all-time and disagreed with every other panel."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    tue_9am = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
+    billed = await _add_session(admin, iid, channel="widget", started_at=tue_9am)
+    await _count_session(admin, iid, billed)
+    await _add_session(admin, iid, channel="widget", started_at=tue_9am)  # never billed
+
+    async with tenant_session(admin) as s:
+        agg = await analytics_service.build_overview(
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=1,
+        )
+
+    assert sum(sum(row) for row in agg.busiest_times) == 1
 
 
 @pytest.mark.usefixtures("db_engine_reset")
@@ -201,6 +225,46 @@ async def test_conversations_total_counts_billed_sessions_not_raw_sessions() -> 
         "conversations_total leaked raw (unbilled) session rows instead of counting "
         "billed conversations"
     )
+
+
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_conversations_total_survives_the_invoice_paid_period_reset() -> None:
+    """'All-time' must actually mean all time. The counted_sessions LEDGER is
+    deliberately deleted by every invoice.paid reset (§3.4.1b) — so a total computed
+    only from the ledger restarted at zero each billing period. The monotonic
+    billing_accounts.lifetime_conversations (migration 0035) is what survives."""
+    from app.models.billing import BillingAccount
+    from app.models.budget import CountedSession
+    from sqlalchemy import delete
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        s.add(BillingAccount(admin_id=admin))
+    now = datetime.now(UTC)
+    for _ in range(3):
+        sid = await _add_session(admin, iid, channel="widget", started_at=now)
+        await _count_session(admin, iid, sid)
+
+    # Simulate the invoice.paid ledger reset (app/billing/webhooks.py): every
+    # counted_sessions row for the tenant is deleted when the period closes.
+    async with tenant_session(admin) as s:
+        await s.execute(delete(CountedSession).where(CountedSession.admin_id == admin))
+
+    # A new period's conversation bills normally...
+    sid = await _add_session(admin, iid, channel="widget", started_at=now)
+    await _count_session(admin, iid, sid)
+
+    async with tenant_session(admin) as s:
+        agg = await analytics_service.build_overview(
+            s,
+            admin_id=admin,
+            period_start=current_billing_period_start(),
+            conversations_this_period=1,
+        )
+
+    # ...and the all-time total still remembers the pre-reset three.
+    assert agg.conversations_total == 4
 
 
 @pytest.mark.usefixtures("db_engine_reset")

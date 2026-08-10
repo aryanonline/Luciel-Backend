@@ -27,13 +27,22 @@ from app.models.instance import Instance, is_paused
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
-from app.runtime.sessions import effective_config, resolve_or_open_session
+from app.runtime.sessions import effective_config, participant_key_for, resolve_or_open_session
 from app.tools.registry import make_tool_resolver
 
 # Strong-identity channels: the transport identifier IS a stable lead key, so it is
 # passed to the loop for lead capture + identity resolution (§3.4.4/§3.4.9). The widget
 # is weak-identity and passes None; these channels carry a real sender address/id.
-_STRONG_TRANSPORT_CHANNELS = {"sms", "voice", "email", "whatsapp", "instagram_messenger"}
+_STRONG_TRANSPORT_CHANNELS = {
+    "sms",
+    "voice",
+    "email",
+    "whatsapp",
+    "messenger",
+    "instagram",
+    # Legacy combined id (pre-§3.1.2 split) — old in-flight sessions keep their class.
+    "instagram_messenger",
+}
 
 
 @dataclass
@@ -98,12 +107,19 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
     if is_paused(inst):
         return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
+    # Conversation = ONE billed session (§3.4.8). The transport identifier the adapter
+    # already resolved (From number / from_address / Meta-scoped id) is the session key,
+    # so a thread's later messages land in the SAME session inside the channel's
+    # inactivity window instead of opening — and billing — a new conversation per
+    # message (the owner-reported 10-texts-=-10-conversations defect).
     sess, _is_new = await resolve_or_open_session(
         session,
         admin_id=msg.admin_id,
         instance_id=msg.instance_id,
         channel=msg.channel,
         resolved_lead_id=None,
+        session_id=msg.session_id,
+        participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
     )
 
     retriever = make_retriever(session, admin_id=msg.admin_id, instance_id=msg.instance_id)

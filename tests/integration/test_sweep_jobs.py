@@ -104,6 +104,10 @@ async def test_discovery_selects_only_the_right_tenants_per_kind() -> None:
     assert await sweeps.sweep_candidates(sweeps.GRACE_EXPIRY) == [in_grace]
     assert closed in await sweeps.sweep_candidates(sweeps.CLOSE_PURGE)
     assert live not in await sweeps.sweep_candidates(sweeps.CLOSE_PURGE)
+    # session_finalize discovers active/paused instances (superset discipline, 0034);
+    # the per-tenant pass re-derives which sessions are actually past their window.
+    assert live in await sweeps.sweep_candidates(sweeps.SESSION_FINALIZE)
+    assert in_grace not in await sweeps.sweep_candidates(sweeps.SESSION_FINALIZE)
 
 
 async def test_unknown_sweep_kind_discovers_nothing() -> None:

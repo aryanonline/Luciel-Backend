@@ -895,7 +895,9 @@ async def _append_audit(admin_id: uuid.UUID, *, age: timedelta, n: int) -> None:
 
 async def test_audit_retention_deletes_only_aged_rows_and_is_idempotent() -> None:
     admin_id = uuid.uuid4()
-    await _seed_account(admin_id)
+    # The account must predate its aged rows (append-only, server-stamped created_at);
+    # discovery's grant-free age predicate (migration 0034) relies on that invariant.
+    await _seed_account(admin_id, created_at=datetime.now(UTC) - timedelta(days=405))
     await _append_audit(admin_id, age=timedelta(days=400), n=40)
     await _append_audit(admin_id, age=timedelta(days=30), n=10)
 
@@ -935,7 +937,8 @@ async def test_audit_retention_deletes_only_aged_rows_and_is_idempotent() -> Non
 
 async def test_audit_retention_frees_the_storage_it_deletes() -> None:
     admin_id = uuid.uuid4()
-    await _seed_account(admin_id)
+    # Aged account: see test_audit_retention_deletes_only_aged_rows_and_is_idempotent.
+    await _seed_account(admin_id, created_at=datetime.now(UTC) - timedelta(days=405))
 
     async def seed() -> None:
         await _append_audit(admin_id, age=timedelta(days=400), n=6000)
