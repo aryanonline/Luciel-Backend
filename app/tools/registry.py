@@ -121,7 +121,9 @@ class _TenantCalendarBackend:
         self._unavailable = _UnavailableExternalBackend()
         self._google: calendar_backend.GoogleCalendarBackend | None = None
 
-    async def _for(self, ctx: ToolContext) -> Any:
+    async def _for(
+        self, ctx: ToolContext
+    ) -> _UnavailableExternalBackend | calendar_backend.GoogleCalendarBackend:
         if await self._calendar_provider(ctx) != "google_calendar":
             return self._unavailable
         if self._google is None:
@@ -136,7 +138,7 @@ class _TenantCalendarBackend:
 
         from app.models.connection import InstanceConnection  # noqa: PLC0415
 
-        return (
+        provider = (
             await ctx.session.execute(
                 select(InstanceConnection.provider).where(
                     InstanceConnection.admin_id == ctx.admin_id,
@@ -145,6 +147,7 @@ class _TenantCalendarBackend:
                 )
             )
         ).scalar_one_or_none()
+        return str(provider) if provider is not None else None
 
     async def free_busy(self, ctx: ToolContext, window: str) -> list[str]:
         return await (await self._for(ctx)).free_busy(ctx, window)
@@ -229,7 +232,7 @@ class BringYourOwnWebhookTool:
     tool_id = "bring_your_own_webhook"
     display_name = "Custom webhook"
     description = "Call the admin-registered HTTP endpoint registered as a tool."
-    requires_connection = "outbound_webhook"
+    requires_connection: str | None = "outbound_webhook"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "subprocess"
     required_inputs: frozenset[str] = frozenset({"payload"})

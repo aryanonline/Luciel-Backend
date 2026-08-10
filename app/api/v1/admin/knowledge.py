@@ -489,7 +489,9 @@ async def trigger_sync(
 
 
 # --- knowledge SCOPE selection (Decision #9) ------------------------------------ #
-async def _scoped_connection(s: AsyncSession, admin_id: uuid.UUID, connection_id: uuid.UUID):
+async def _scoped_connection(
+    s: AsyncSession, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> InstanceConnection:
     conn = (
         await s.execute(
             select(InstanceConnection).where(
@@ -537,7 +539,11 @@ async def list_scope_candidates_endpoint(
             raise conflict("Connection is revoked; reconnect before choosing a scope.")
         transport = oauth_transport()
         try:
-            candidates = await list_scope_candidates(conn, get_secret_store(), transport)
+            # httpx.AsyncClient's precise stub types are wider than the narrow
+            # HttpTransport seam; the calls made through the seam are compatible.
+            candidates = await list_scope_candidates(
+                conn, get_secret_store(), cast("HttpTransport", transport)
+            )
         except ProviderUnavailable as exc:
             # No token on file, or a provider with nothing to narrow — a clean 409/422,
             # never an empty list that reads as "your Drive has no folders".

@@ -154,9 +154,7 @@ async def test_usage_overview_escalation_contact_configured_is_true_once_set(cli
     admin = await _signup_verify_login(client)
     iid = await _seed_instance_with_activity(admin)
     async with tenant_session(admin) as s:
-        inst = (
-            await s.execute(select(Instance).where(Instance.id == iid))
-        ).scalar_one()
+        inst = (await s.execute(select(Instance).where(Instance.id == iid))).scalar_one()
         inst.escalation = {"primaryEmail": "owner@acme.example"}
 
     r = await client.get("/api/v1/admin/usage/overview")

@@ -78,7 +78,7 @@ def resolve_axes(personality: dict[str, object] | None) -> dict[str, float]:
         resolved: dict[str, float] = {}
         for name in AXIS_NAMES:
             try:
-                resolved[name] = min(1.0, max(0.0, float(axes[name])))  # type: ignore[arg-type]
+                resolved[name] = min(1.0, max(0.0, float(axes[name])))
             except (KeyError, TypeError, ValueError):
                 # An incomplete custom config (the API rejects it, but a legacy row
                 # may exist) falls back per-axis rather than dropping the stanza.

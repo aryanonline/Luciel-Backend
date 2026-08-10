@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    result = asyncio.run(SWEEPS[name]())
+    result: object = asyncio.run(SWEEPS[name]())
     print(json.dumps({"sweep": name, "result": result}, default=str))
     return 0
 

@@ -306,7 +306,7 @@ async def run_byo_webhook(
     auth_header: str | None,
     allowlist: frozenset[str],
     breaker: CircuitBreaker,
-    executor: WebhookExecutor,
+    executor: WebhookExecutor | SubprocessWebhookExecutor,
     now: float,
     response_required_fields: frozenset[str] = frozenset(),
     context: ToolContext | None = None,

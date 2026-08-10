@@ -126,7 +126,7 @@ class SnsSignatureVerifier:
         self._client = client
         self._certs: dict[str, Any] = {}
 
-    def _load_cert(self, url: str):  # noqa: ANN202 — cryptography's Certificate
+    def _load_cert(self, url: str) -> Any:  # cryptography's Certificate (lazy import)
         from cryptography import x509  # noqa: PLC0415 — keep the mock path import-free
 
         if url in self._certs:

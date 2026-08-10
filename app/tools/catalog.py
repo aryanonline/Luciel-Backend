@@ -68,7 +68,7 @@ class CheckAvailabilityTool:
     tool_id = "check_availability"
     display_name = "Check availability"
     description = "Read the connected calendar's free/busy to find open slots."
-    requires_connection = "calendar"
+    requires_connection: str | None = "calendar"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"window"})
@@ -90,7 +90,7 @@ class BookAppointmentTool:
     tool_id = "book_appointment"
     display_name = "Book an appointment"
     description = "Write a booking into the connected calendar after availability is confirmed."
-    requires_connection = "calendar"
+    requires_connection: str | None = "calendar"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"slot", "email"})
@@ -151,7 +151,7 @@ class RescheduleAppointmentTool:
     tool_id = "reschedule_appointment"
     display_name = "Reschedule an appointment"
     description = "Move an existing booking on the connected calendar to a new slot."
-    requires_connection = "calendar"
+    requires_connection: str | None = "calendar"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     # booking_ref is OPTIONAL: supplied it disambiguates, absent the tool reads first.
@@ -179,7 +179,7 @@ class CancelAppointmentTool:
     tool_id = "cancel_appointment"
     display_name = "Cancel an appointment"
     description = "Cancel an existing booking on the connected calendar."
-    requires_connection = "calendar"
+    requires_connection: str | None = "calendar"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"email"})
@@ -205,7 +205,7 @@ class LookupRecordTool:
     tool_id = "lookup_record"
     display_name = "Look up a record"
     description = "Query the connected record source for an exact record."
-    requires_connection = "record_source"
+    requires_connection: str | None = "record_source"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"query"})
@@ -229,7 +229,7 @@ class SendEmailTool:
     tool_id = "send_email"
     display_name = "Send email"
     description = "Send an outbound email."
-    requires_connection = "email_sender"
+    requires_connection: str | None = "email_sender"
     requires_channels: frozenset[str] = frozenset({"email"})
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"to", "body"})
@@ -252,7 +252,7 @@ class SendSmsTool(SendEmailTool):
     tool_id = "send_sms"
     display_name = "Send SMS"
     description = "Send an outbound SMS."
-    requires_connection = "sms_sender"
+    requires_connection: str | None = "sms_sender"
     requires_channels: frozenset[str] = frozenset({"sms"})
 
 
@@ -261,7 +261,7 @@ class ScheduleCallbackTool:
     display_name = "Schedule a callback"
     description = "Queue a future outbound follow-up."
     # No connection at SCHEDULING time; delivery channel bound at fire time (§3.3.5).
-    requires_connection = None
+    requires_connection: str | None = None
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"fire_at", "channel", "message"})
@@ -423,7 +423,7 @@ class PushToCrmTool:
     tool_id = "push_to_crm"
     display_name = "Push to CRM"
     description = "Push a captured lead to the connected CRM."
-    requires_connection = "crm"
+    requires_connection: str | None = "crm"
     requires_channels: frozenset[str] = frozenset()
     execution_mode = "in_process"
     required_inputs: frozenset[str] = frozenset({"lead_key", "fields"})

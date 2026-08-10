@@ -26,6 +26,7 @@ posture), never a one-time badge.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -79,9 +80,7 @@ class DnsMxProbe:
             return MxDelegationResult.UNKNOWN
         try:
             answers = await _to_thread(
-                lambda: dns.resolver.resolve(
-                    domain, "MX", lifetime=self.timeout_seconds
-                )
+                lambda: dns.resolver.resolve(domain, "MX", lifetime=self.timeout_seconds)
             )
             expected = expected_mx_host.rstrip(".").lower()
             hosts = {str(r.exchange).rstrip(".").lower() for r in answers}
@@ -103,7 +102,7 @@ class DnsMxProbe:
             return MxDelegationResult.UNKNOWN
 
 
-async def _to_thread[T](fn):  # pragma: no cover - asyncio shim
+async def _to_thread[T](fn: Callable[[], T]) -> T:  # pragma: no cover - asyncio shim
     import asyncio
 
     return await asyncio.to_thread(fn)

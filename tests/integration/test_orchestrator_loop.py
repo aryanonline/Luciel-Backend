@@ -296,9 +296,7 @@ async def test_kb_backed_answer_scores_above_floor_and_persists_the_real_score()
 
         luciel_row = (
             await s.execute(
-                select(Transcript).where(
-                    Transcript.session_id == sid, Transcript.role == "luciel"
-                )
+                select(Transcript).where(Transcript.session_id == sid, Transcript.role == "luciel")
             )
         ).scalar_one()
         assert luciel_row.grounding_score == pytest.approx(result.grounding_score)
@@ -339,9 +337,7 @@ async def test_no_kb_confidently_fabricated_answer_escalates_instead_of_confiden
 
         luciel_row = (
             await s.execute(
-                select(Transcript).where(
-                    Transcript.session_id == sid, Transcript.role == "luciel"
-                )
+                select(Transcript).where(Transcript.session_id == sid, Transcript.role == "luciel")
             )
         ).scalar_one()
         assert luciel_row.grounding_score == 0.0

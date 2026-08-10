@@ -408,7 +408,7 @@ async def disconnect_connection_post(
             raise not_found("Connection not found.")
         return DisconnectResult.model_validate(
             {
-                "connection": _connection_out(out["connection"]),
+                "connection": _connection_out(cast("InstanceConnection", out["connection"])),
                 "secretDeleted": out["secret_deleted"],
                 "disabledTools": out["disabled_tools"],
                 "disabledChannels": out["disabled_channels"],

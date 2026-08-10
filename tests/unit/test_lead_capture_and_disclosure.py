@@ -86,14 +86,12 @@ def test_disclosure_clause_names_business_when_luciel_name_ends_in_assistant():
     """
     luciel_name = "Aryan's Front-Desk Assistant"
     business_name = "Aryan's Detailing Co"
-    out = ensure_ai_identity_disclosure(
-        "", business_name=business_name, assistant_name=luciel_name
-    )
+    out = ensure_ai_identity_disclosure("", business_name=business_name, assistant_name=luciel_name)
     assert out.startswith(f"Hi — I'm {luciel_name}.")
     assert f"an AI assistant for {business_name}" in out
     # The Luciel name must never appear in the disclosure clause itself (only as
     # the speaker at the very start of the line).
-    after_speaker = out[len(f"Hi — I'm {luciel_name}."):]
+    after_speaker = out[len(f"Hi — I'm {luciel_name}.") :]
     assert luciel_name not in after_speaker
 
 

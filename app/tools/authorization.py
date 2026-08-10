@@ -25,10 +25,17 @@ from app.models.tool_auth import InstanceToolAuthorization
 
 
 class ToolToggle(Protocol):
-    """The shape of one entry in the tools pillar payload (``AddonToolIn``)."""
+    """The shape of one entry in the tools pillar payload (``AddonToolIn``).
 
-    id: str
-    enabled: bool
+    Read-only properties (not mutable attributes) so a pydantic model whose ``id``
+    is a narrower Literal type still satisfies the protocol — this function only
+    ever reads the toggles."""
+
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def enabled(self) -> bool: ...
 
 
 async def sync_tool_authorizations(

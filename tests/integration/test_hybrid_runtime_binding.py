@@ -105,9 +105,8 @@ async def test_real_chunk_attributor_persists_source_chunks_through_the_loop():
     app/runtime/voice_pipeline.py now do), a KB-backed reply persists REAL
     source_chunks on the Transcript row -- not the empty list the dashboard used
     to always render as "no source backed this answer"."""
-    from sqlalchemy import select
-
     from app.models.conversation import Transcript
+    from sqlalchemy import select
 
     admin = uuid.uuid4()
     iid = await _seed(admin)

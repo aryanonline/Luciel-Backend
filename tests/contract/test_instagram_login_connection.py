@@ -188,9 +188,7 @@ async def test_the_authorize_url_is_instagrams_own_dialog(client, monkeypatch):
     q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
     assert q["client_id"] == "ig-cid"
     assert q["response_type"] == "code"
-    assert q["redirect_uri"] == (
-        "https://api.example.com/api/v1/connections/instagram/callback"
-    )
+    assert q["redirect_uri"] == ("https://api.example.com/api/v1/connections/instagram/callback")
     assert set(q["scope"].split(",")) == {
         "instagram_business_basic",
         "instagram_business_manage_messages",
@@ -222,9 +220,7 @@ async def test_the_two_meta_apps_get_their_own_callback_paths(client, monkeypatc
 # The callback: short-lived code exchange + mandatory long-lived upgrade
 # --------------------------------------------------------------------------- #
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_the_callback_upgrades_to_a_long_lived_token_before_storing_it(
-    client, monkeypatch
-):
+async def test_the_callback_upgrades_to_a_long_lived_token_before_storing_it(client, monkeypatch):
     """The whole round trip. What is stored must be the LONG-lived token: the short-lived
     one expires in about an hour, so persisting it would give the owner a connection that
     says "connected" and silently stops answering DMs the same day."""
@@ -282,9 +278,10 @@ async def test_a_failed_long_lived_upgrade_does_not_report_connected(client, mon
 
     assert _redirect_params(r)["reason"] == "exchange_failed"
     assert await _status_of(client, cid) != "connected"
-    assert await get_secret_store().get(
-        secret_ref_for(admin_id, instance_id, "instagram_auth")
-    ) is None
+    assert (
+        await get_secret_store().get(secret_ref_for(admin_id, instance_id, "instagram_auth"))
+        is None
+    )
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

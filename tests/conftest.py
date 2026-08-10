@@ -41,6 +41,10 @@ os.environ["LUCIEL_COOKIE_SECURE"] = "false"
 _CI_PG = os.environ.get("LUCIEL_SUPERUSER_TCP") == "1" or os.environ.get("CI") == "true"
 _SUPERUSER = os.environ.get("LUCIEL_SUPERUSER", "postgres")
 _SUPERUSER_PW = os.environ.get("PGPASSWORD", "postgres")
+# The psql executable. Overridable for hosts with no native client (e.g. a Windows
+# dev box driving the docker-compose db through a `docker exec` shim script) — the
+# same environment-portability seam as _CI_PG above. CI/default is plain "psql".
+_PSQL = os.environ.get("LUCIEL_PSQL", "psql")
 
 
 def _admin_psql(sql: str, db: str = "postgres") -> None:
@@ -48,7 +52,7 @@ def _admin_psql(sql: str, db: str = "postgres") -> None:
         env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
         subprocess.run(
             [
-                "psql",
+                _PSQL,
                 "-h",
                 PG_HOST,
                 "-p",
@@ -86,7 +90,7 @@ def superuser_exec(sql: str) -> None:
         env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
         subprocess.run(
             [
-                "psql",
+                _PSQL,
                 "-h",
                 PG_HOST,
                 "-p",
@@ -165,7 +169,7 @@ def _provision_test_db() -> None:
         _env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
         subprocess.run(
             [
-                "psql",
+                _PSQL,
                 "-h",
                 PG_HOST,
                 "-p",
