@@ -203,11 +203,15 @@ async def run_deferred_retry(*, now: datetime | None = None) -> list[str]:
 async def _check_connections(
     session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
 ) -> dict[str, str]:
+    from app.channels.tenant_outlook import ProviderDispatchingRefresher
+
     return await health.run_health_sweep(
         session,
         admin_id=admin_id,
         probe=health.StoredCredentialProbe(),
-        refresher=health.ReconnectOnExpiry(),
+        # Outlook rows refresh for real (live mode; Microsoft tokens live ~1h);
+        # everything else keeps the honest no-refresher → expired path.
+        refresher=ProviderDispatchingRefresher(fallback=health.ReconnectOnExpiry()),
         now=now,
     )
 
