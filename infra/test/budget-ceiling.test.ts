@@ -24,9 +24,12 @@ describe('Monthly cost ceiling (AWS Budgets)', () => {
     (envName) => {
       const cfg = getEnvConfig(envName as EnvName);
       expect(cfg.monthlyBudgetUsd).toBeGreaterThan(0);
+      // No BudgetName assertion: the name is deliberately GENERATED. Budgets are
+      // replaced when notifications change, and a replacement under a fixed name
+      // deadlocks against itself (create-before-delete + "same name, different
+      // internalId") — which a real deploy hit the day the alert email landed.
       build(envName as EnvName).hasResourceProperties('AWS::Budgets::Budget', {
         Budget: Match.objectLike({
-          BudgetName: `luciel-${envName}-monthly-cost-ceiling`,
           BudgetType: 'COST',
           TimeUnit: 'MONTHLY',
           BudgetLimit: { Amount: cfg.monthlyBudgetUsd, Unit: 'USD' },

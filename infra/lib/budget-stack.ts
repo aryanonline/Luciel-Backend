@@ -71,7 +71,12 @@ export class BudgetStack extends Stack {
 
     new budgets.CfnBudget(this, 'MonthlyCostCeiling', {
       budget: {
-        budgetName: `luciel-${envConfig.envName}-monthly-cost-ceiling`,
+        // NO fixed budgetName, deliberately. AWS::Budgets::Budget REPLACES the
+        // resource when notifications change (adding the alert email did), and a
+        // replacement under a fixed name deadlocks against itself: CloudFormation
+        // creates the new budget BEFORE deleting the old one, and Budgets rejects
+        // "same name, different internalId". A generated name (stack + logical id
+        // + suffix) stays readable in the console and lets replacements roll.
         budgetType: 'COST',
         timeUnit: 'MONTHLY',
         budgetLimit: { amount: envConfig.monthlyBudgetUsd, unit: 'USD' },
