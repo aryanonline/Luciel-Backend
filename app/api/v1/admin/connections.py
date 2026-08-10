@@ -36,6 +36,7 @@ from app.audit import log as audit
 from app.channels import routing
 from app.connections import oauth_flow, registry, service
 from app.connections.secrets import get_secret_store
+from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
 from app.knowledge.providers import (
     HttpTransport,
@@ -490,12 +491,19 @@ async def complete_oauth_connect(
         if acct is None or acct.state in CLOSED_ACCOUNT_STATES:
             raise OAuthStateRejected("Account is closed; the connection cannot be completed.")
         conn = await _tenant_connection(s, admin_id, connection_id)
-        spec = registry.get_provider(conn.provider)
+        # The EFFECTIVE provider: a swap stages its candidate in non_secret_config
+        # (§3.8.7 rule B) and never touches `conn.provider` before cutover — so the
+        # callback for a ses→outlook swap must exchange against OUTLOOK's endpoints.
+        # Resolving from the row alone made every cross-provider swap unredeemable:
+        # the live provider was provisioned-class, so this raised before the exchange.
+        staged = (conn.non_secret_config or {}).get("pending_provider")
+        pending_provider = staged if isinstance(staged, str) and staged else None
+        provider = pending_provider or conn.provider
+        spec = registry.get_provider(provider)
         if spec is None or not spec.is_oauth:
             raise OAuthStateRejected(
-                f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
+                f"Provider '{provider}' has no OAuth callback (not an OAuth-class provider)."
             )
-        provider = conn.provider
         connection_type = conn.connection_type
         instance_id = await _instance_id(s, admin_id)
         expected_jti = service.consume_oauth_state(conn)
@@ -529,42 +537,123 @@ async def complete_oauth_connect(
                 code_verifier=verifier,
             )
         except OAuthExchangeError as exc:
-            await service.record_exchange_failure(admin_id, connection_id, str(exc))
+            await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, str(exc))
             raise OAuthExchangeRejected(f"OAuth token exchange failed: {exc}") from exc
         except ProviderUnavailable as exc:
-            await service.record_exchange_failure(admin_id, connection_id, str(exc))
+            await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, str(exc))
             raise OAuthExchangeRejected(str(exc)) from exc
 
-    # The token is durable before the row claims to be connected, so a crash in between
-    # leaves a retryable "not connected yet" rather than a connection with no credential.
-    await store_oauth_token(
-        get_secret_store(),
-        admin_id=admin_id,
-        instance_id=instance_id,
-        material=material,
-        connection_type=connection_type,
-    )
-    async with tenant_session(admin_id) as s:
-        conn = await _tenant_connection(s, admin_id, connection_id)
-        old_status = conn.status
-        conn.status = "connected"
-        conn.status_detail = None
-        await s.flush()
-        await audit.emit(
-            s,
+        # The token is durable before the row claims to be connected, so a crash in
+        # between leaves a retryable "not connected yet" rather than a connection with
+        # no credential. It also runs before VERIFY on purpose: a verify retry can
+        # reuse the stored token, whereas an unstored token is gone with the code.
+        await store_oauth_token(
+            get_secret_store(),
             admin_id=admin_id,
             instance_id=instance_id,
-            actor_type=ActorType.admin_user,
-            actor_user_id=actor_user_id,
-            event_type="connection_status_changed",
-            payload={
-                "connection_id": str(conn.connection_id),
-                "old_status": old_status,
-                "new_status": "connected",
-                "reason": "oauth_callback_token_exchanged",
-            },
+            material=material,
+            connection_type=connection_type,
         )
-        return _connection_out(conn)
+
+        # §3.1.6a "connect, VERIFY, bind, then live": providers with a registered
+        # verifier must prove the credential works — and reveal WHOSE it is — before
+        # any status flips. Providers without one keep today's behavior exactly.
+        verify_updates: dict[str, object] | None = None
+        provider_verifier = POST_EXCHANGE_VERIFIERS.get(provider)
+        if provider_verifier is not None:
+            try:
+                verify_updates = await provider_verifier(material=material, transport=transport)
+            except PostExchangeVerifyFailed as exc:
+                await _fail_exchange(
+                    admin_id, connection_id, actor_user_id, pending_provider, str(exc)
+                )
+                raise OAuthExchangeRejected(str(exc)) from exc
+
+    conflict_reason: str | None = None
+    async with tenant_session(admin_id) as s:
+        conn = await _tenant_connection(s, admin_id, connection_id)
+        if verify_updates is not None:
+            # BIND: the verified address becomes this tenant's inbound-routing
+            # destination — unless another tenant already holds it. Checked through
+            # the same SECURITY DEFINER resolver delivery uses, because RLS hides
+            # foreign claims from an ordinary query (routing.owner_of_destination).
+            destination = str(verify_updates.get("destination", ""))
+            if destination:
+                holder = await routing.owner_of_destination(s, connection_type, destination)
+                if holder is not None and holder != admin_id:
+                    conflict_reason = f"{destination} is already connected to a different account"
+            if conflict_reason is None:
+                cfg = dict(conn.non_secret_config or {})
+                cfg.update(verify_updates)
+                conn.non_secret_config = cfg
+        if conflict_reason is None:
+            if pending_provider is not None:
+                # A swap completes through confirm_reconnect — the ONLY place a staged
+                # provider becomes authoritative — so the cutover semantics (flip
+                # provider+auth_class, clear the pending marker, audit) hold on the
+                # real callback path and not just in tests.
+                ok, detail = await service.confirm_reconnect(
+                    s,
+                    admin_id=admin_id,
+                    connection_id=connection_id,
+                    user_id=actor_user_id,
+                    probe_ok=True,
+                )
+                if not ok:  # pragma: no cover — row vanished mid-flow
+                    raise OAuthExchangeRejected(detail)
+            else:
+                old_status = conn.status
+                conn.status = "connected"
+                conn.status_detail = None
+                await s.flush()
+                await audit.emit(
+                    s,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    actor_type=ActorType.admin_user,
+                    actor_user_id=actor_user_id,
+                    event_type="connection_status_changed",
+                    payload={
+                        "connection_id": str(conn.connection_id),
+                        "old_status": old_status,
+                        "new_status": "connected",
+                        "reason": "oauth_callback_token_exchanged",
+                    },
+                )
+            return _connection_out(conn)
+
+    # Destination conflict: fail exactly like a failed verify — previous sender stays
+    # live, the owner gets an actionable reason, nothing half-binds.
+    await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, conflict_reason)
+    raise OAuthExchangeRejected(conflict_reason)
+
+
+async def _fail_exchange(
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None,
+    pending_provider: str | None,
+    reason: str,
+) -> None:
+    """Record a failed exchange/verify so the previous sender STAYS live.
+
+    For a swap that means resolving through ``confirm_reconnect(probe_ok=False)`` —
+    it restores the prior status from the reconnect marker and discards the staged
+    provider, which is the mechanical form of "never silently replaces a working
+    sender" (§3.1.6a). A plain connect just records the reason on the row.
+    """
+    if pending_provider is not None:
+        async with tenant_session(admin_id) as s:
+            await service.confirm_reconnect(
+                s,
+                admin_id=admin_id,
+                connection_id=connection_id,
+                user_id=actor_user_id,
+                probe_ok=False,
+                probe_detail=reason,
+            )
+    else:
+        await service.record_exchange_failure(admin_id, connection_id, reason)
 
 
 @router.post("/{connection_id}/oauth-callback", response_model=ConnectionOut)

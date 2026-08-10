@@ -472,10 +472,16 @@ async def swap(
     and the candidate provider is recorded in ``non_secret_config['pending_provider']``
     (non-secret — §3.8.3 — just a provider name). ``confirm_reconnect()`` is the ONLY
     place ``connection.provider`` is ever written for a swap: on a confirmed-healthy
-    probe it flips provider to the staged value; on a failed probe it discards the
-    staged value and ``connection.provider`` was never touched, so there is nothing to
-    roll back. connection_type is unchanged, so ``auth_class`` (and therefore the
-    connect-flow shape) is unchanged. Returns None if no such connection for tenant."""
+    probe it flips provider (and ``auth_class``) to the staged provider's; on a failed
+    probe it discards the staged value and ``connection.provider`` was never touched,
+    so there is nothing to roll back.
+
+    The connect-flow SHAPE is derived from the STAGED provider, not the row: a swap
+    can cross auth classes (the provisioned SES sender → the OAuth Outlook mailbox),
+    and deriving from the row's persisted ``auth_class`` returned the OLD provider's
+    shape — a ses→outlook swap answered ``requiresClientForm`` and no consent screen
+    was ever reachable. The row's persisted class still only changes at cutover.
+    Returns None if no such connection for tenant."""
     connection = (
         await session.execute(
             select(InstanceConnection).where(
@@ -517,7 +523,11 @@ async def swap(
             "new_provider": provider,  # staged only — not yet written to `provider`
         },
     )
-    return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
+    # Flow shape from the STAGED provider (see docstring): the row's auth_class is the
+    # LIVE provider's and only flips at confirmed cutover.
+    return connection, _start_result(
+        _auth_class_for(connection.connection_type, provider), connection, admin_id=admin_id
+    )
 
 
 async def confirm_reconnect(
@@ -568,6 +578,12 @@ async def confirm_reconnect(
         # This is the ONLY place a swap's staged provider becomes authoritative.
         if pending_provider is not None:
             connection.provider = str(pending_provider)
+            # The behavior key follows the provider (§3.8.5): a cross-class swap
+            # (provisioned ses → oauth_token outlook) that kept the old class would
+            # put the new credential on a cadence with no refresh and no expiry.
+            connection.auth_class = _auth_class_for(
+                connection.connection_type, str(pending_provider)
+            )
         connection.non_secret_config = config
         connection.status = "connected"
         connection.status_detail = None
