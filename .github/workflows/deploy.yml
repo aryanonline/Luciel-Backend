@@ -127,15 +127,15 @@ jobs:
       - name: Resolve the currently deployed image tag (pause runs only)
         if: inputs.paused == 'true'
         run: |
-          cluster=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='Luciel-dev-ClusterName'].Value" --output text)
-          svc=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns[0]' --output text)
-          td=$(aws ecs describe-services --cluster "$cluster" --services "$svc" \
-            --query 'services[0].taskDefinition' --output text)
-          image=$(aws ecs describe-task-definition --task-definition "$td" \
-            --query 'taskDefinition.containerDefinitions[0].image' --output text)
-          echo "[pause] reusing deployed image tag ${image##*:}"
-          echo "IMAGE_TAG=${image##*:}" >> "$GITHUB_ENV"
+          # Newest tag in the env's IMMUTABLE repo - every deploy pushes before it
+          # deploys, so this is the running (or most recently gated) artifact. Read
+          # from ECR rather than the ECS task definition because the deploy role
+          # holds ecr:DescribeImages (the build step's idempotency check depends on
+          # it) but not ecs:DescribeTaskDefinition - and a pause should not need
+          # wider IAM than a deploy.
+          TAG=$(aws ecr describe-images --repository-name luciel-backend-dev --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)
+          echo "[pause] reusing gated image tag $TAG"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
@@ -329,15 +329,15 @@ jobs:
       - name: Resolve the currently deployed image tag (pause runs only)
         if: inputs.paused == 'true'
         run: |
-          cluster=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='Luciel-prod-ClusterName'].Value" --output text)
-          svc=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns[0]' --output text)
-          td=$(aws ecs describe-services --cluster "$cluster" --services "$svc" \
-            --query 'services[0].taskDefinition' --output text)
-          image=$(aws ecs describe-task-definition --task-definition "$td" \
-            --query 'taskDefinition.containerDefinitions[0].image' --output text)
-          echo "[pause] reusing deployed image tag ${image##*:}"
-          echo "IMAGE_TAG=${image##*:}" >> "$GITHUB_ENV"
+          # Newest tag in the env's IMMUTABLE repo - every deploy pushes before it
+          # deploys, so this is the running (or most recently gated) artifact. Read
+          # from ECR rather than the ECS task definition because the deploy role
+          # holds ecr:DescribeImages (the build step's idempotency check depends on
+          # it) but not ecs:DescribeTaskDefinition - and a pause should not need
+          # wider IAM than a deploy.
+          TAG=$(aws ecr describe-images --repository-name luciel-backend-prod --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)
+          echo "[pause] reusing gated image tag $TAG"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
