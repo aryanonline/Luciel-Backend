@@ -66,13 +66,17 @@ async def send_outbound_reply(
     body: str,
     subject: str | None = None,
     sender_id: str | None = None,
+    in_reply_to: str | None = None,
 ) -> OutboundResult:
     """Push one reply to the customer on ``channel``.
 
     ``subject`` threads an email reply onto the lead's own subject line; ``sender_id`` is
     the tenant's channel identity carried straight off the inbound message (Meta page/IG
     id, WhatsApp phone-number id) and falls back to the provisioned connection when the
-    caller has no inbound context — i.e. on the takeover path.
+    caller has no inbound context — i.e. on the takeover path. ``in_reply_to`` is the
+    provider-side id of the inbound message being answered (today: the Graph message id
+    on a BYO-mailbox reply, for true threading); senders without a reply concept ignore
+    it.
 
     Never raises for a delivery problem — an undeliverable reply is reported as data so
     the caller can tell the admin the truth instead of failing the whole request after the
@@ -87,7 +91,13 @@ async def send_outbound_reply(
         receipt = await _send_sms(session, admin_id, instance_id, to=to, body=body)
     elif channel == "email":
         receipt = await _send_email(
-            session, admin_id, instance_id, to=to, body=body, subject=subject
+            session,
+            admin_id,
+            instance_id,
+            to=to,
+            body=body,
+            subject=subject,
+            in_reply_to=in_reply_to,
         )
     elif channel in ("whatsapp", "messenger", "instagram", "instagram_messenger"):
         receipt = await _send_meta(
@@ -149,11 +159,39 @@ async def _send_email(
     to: str,
     body: str,
     subject: str | None,
+    in_reply_to: str | None = None,
 ) -> DeliveryReceipt:
     from app.channels.email_adapter import EmailAdapter
     from app.connections.service import resolve_email_address
     from app.notifications.email_sender import build_email_sender
     from app.runtime.integration_status import null_in_live
+
+    # BYO mailbox (§3.1.6a): when the tenant's email sender IS their Outlook mailbox,
+    # the reply goes out through THEIR Graph credential — and only through it. There
+    # is deliberately no SES fallback on this branch: falling back would swap the
+    # FROM identity behind the owner's back, the mirror image of "never silently
+    # replaces a working sender".
+    conn = await _email_sender_row(session, admin_id, instance_id)
+    if conn is not None and conn.provider == "outlook":
+        from app.channels.outlook_sender import build_tenant_outlook_sender
+
+        if conn.status != "connected":
+            return DeliveryReceipt(accepted=False, detail="mailbox_reconnect_needed")
+        sender = await build_tenant_outlook_sender(session, admin_id, instance_id)
+        if null_in_live(sender):
+            # Connected on paper but the token could not be made fresh — the health
+            # sweep will mark it expired within its cadence; the reply must not wait
+            # on that to tell the truth.
+            return DeliveryReceipt(accepted=False, detail="mailbox_reconnect_needed")
+        accepted = await sender.send_mail(
+            to=to, subject=_reply_subject(subject), body=body, in_reply_to=in_reply_to
+        )
+        # Graph's 202 carries no message id — report none rather than invent one.
+        return DeliveryReceipt(
+            accepted=accepted,
+            provider_message_id=None,
+            detail=None if accepted else "mailbox_send_failed",
+        )
 
     address = await resolve_email_address(session, admin_id, instance_id)
     if not address:
@@ -171,6 +209,25 @@ async def _send_email(
             metadata={"sender_identity": address, "subject": _reply_subject(subject)},
         )
     )
+
+
+async def _email_sender_row(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> Any:  # InstanceConnection | None (lazy import keeps module import light)
+    from sqlalchemy import select
+
+    from app.models.connection import InstanceConnection
+
+    return (
+        await session.execute(
+            select(InstanceConnection).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.instance_id == instance_id,
+                InstanceConnection.connection_type == "email_sender",
+                InstanceConnection.status != "revoked",
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def _send_meta(

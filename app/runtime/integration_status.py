@@ -34,6 +34,7 @@ DATABASE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
 def _degraded_types() -> tuple[type, ...]:
+    from app.channels.outlook_sender import NullOutlookSender
     from app.channels.twilio_sender import NullSmsSender
     from app.channels.whatsapp_adapter import NullMetaSender
     from app.connections.secrets import LocalSecretStore
@@ -44,17 +45,19 @@ def _degraded_types() -> tuple[type, ...]:
         NullEmailSender,
         NullSmsSender,
         NullMetaSender,
+        NullOutlookSender,
         LocalSecretStore,
         InMemoryCalendarApi,
     )
 
 
 def _null_sender_types() -> tuple[type, ...]:
+    from app.channels.outlook_sender import NullOutlookSender
     from app.channels.twilio_sender import NullSmsSender
     from app.channels.whatsapp_adapter import NullMetaSender
     from app.notifications.email_sender import NullEmailSender
 
-    return (NullEmailSender, NullSmsSender, NullMetaSender)
+    return (NullEmailSender, NullSmsSender, NullMetaSender, NullOutlookSender)
 
 
 def is_degraded_binding(obj: object) -> bool:
