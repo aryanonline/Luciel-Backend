@@ -302,3 +302,33 @@ async def test_a_fresh_outlook_connect_without_ses_also_verifies_and_binds(clien
     assert row.provider == "outlook"
     assert row.status == "connected"
     assert (row.non_secret_config or {})["destination"] == MAILBOX
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_disconnecting_the_mailbox_releases_its_routing_claim(client, monkeypatch):
+    """A dead outlook row must neither keep routing inbound mail nor block the
+    mailbox's real owner from connecting it on another account — unlike a BYO phone
+    number, the destination was bound BY the platform's verify step, not typed by
+    the owner. Reconnect later re-baselines the poll from scratch."""
+    from app.channels import routing
+
+    admin_id = await _ready_account_with_luciel(client)
+    _configure_microsoft(monkeypatch)
+    _fake_microsoft_transport(monkeypatch)
+    connection_id = await _provision_ses(client)
+    state = await _swap_to_outlook(client, connection_id)
+    r = await client.post(
+        f"/api/v1/admin/connections/{connection_id}/oauth-callback",
+        json={"code": "auth-code-1", "state": state},
+    )
+    assert r.status_code == 200
+
+    r = await client.post(f"/api/v1/admin/connections/{connection_id}/disconnect")
+    assert r.status_code == 200
+
+    row = await _row(admin_id)
+    cfg = row.non_secret_config or {}
+    for released in ("destination", "address", "mailbox_delta_link", "mailbox_seen_ids"):
+        assert released not in cfg, released
+    async with tenant_session(admin_id) as s:
+        assert await routing.owner_of_destination(s, "email_sender", MAILBOX) is None

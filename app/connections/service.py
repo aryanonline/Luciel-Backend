@@ -852,6 +852,24 @@ async def disconnect(
     cfg = dict(connection.non_secret_config or {})
     for ephemeral in ("oauth_state_jti", "authorize_url", "pending_provider"):
         cfg.pop(ephemeral, None)
+    # A disconnected OUTLOOK mailbox releases its routing claim. Unlike a BYO phone
+    # number (kept — it is the owner's own asset to re-link), the mailbox address was
+    # bound BY the verify step as this tenant's inbound-routing destination and holds
+    # the cross-tenant uniqueness claim; a dead row must neither keep routing inbound
+    # mail nor block the mailbox's real owner from connecting it elsewhere. The poll
+    # cursor and dedupe window go with it — a future reconnect re-baselines from
+    # scratch (the baseline rule), which is exactly what a fresh consent means.
+    if connection.provider == "outlook":
+        for mailbox_state in (
+            "destination",
+            "address",
+            "mode",
+            "token_expires_at",
+            "mailbox_delta_link",
+            "mailbox_seen_ids",
+            "mailbox_polling_since",
+        ):
+            cfg.pop(mailbox_state, None)
     connection.non_secret_config = cfg
     connection.status = NOT_CONNECTED
     connection.status_detail = DISCONNECTED_DETAIL
