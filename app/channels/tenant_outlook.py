@@ -40,7 +40,7 @@ from app.models.connection import InstanceConnection
 
 logger = logging.getLogger(__name__)
 
-TOKEN_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/token"  # noqa: S105
+TOKEN_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/token"  # noqa: S105 — a public URL whose path ends in /token, not a credential  # nosec B105
 # Refresh when the stored expiry is inside this window. Five minutes: long enough to
 # cover clock skew and a slow Graph call, short enough that we are not refreshing on
 # every poll.
