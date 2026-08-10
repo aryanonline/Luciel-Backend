@@ -596,6 +596,8 @@ async def test_each_meta_channel_replies_from_its_own_sender_identity(client, mo
 
     async with tenant_session(admin_id) as s:
         assert await resolve_meta_destination(s, admin_id, instance_id, "whatsapp") == wa
+        assert await resolve_meta_destination(s, admin_id, instance_id, "messenger") == page
+        # Legacy combined id (pre-§3.1.2-split sessions) still resolves for old rows.
         assert await resolve_meta_destination(s, admin_id, instance_id, "instagram_messenger") == (
             page
         )

@@ -191,8 +191,16 @@ async def meta_inbound(request: Request) -> dict[str, str]:
     except ValueError:
         return {"status": "ignored", "reason": "bad_payload"}
     # WhatsApp uses object=="whatsapp_business_account"; IG/Messenger use page/instagram.
+    # The object also names the split channel id (§3.1.2): an Instagram webhook opens an
+    # ``instagram`` session, a Page webhook a ``messenger`` one — never a merged channel.
     obj = payload.get("object", "")
-    adapter = WhatsAppAdapter() if obj == "whatsapp_business_account" else MetaMessagingAdapter()
+    adapter: ChannelAdapter
+    if obj == "whatsapp_business_account":
+        adapter = WhatsAppAdapter()
+    elif obj == "instagram":
+        adapter = MetaMessagingAdapter(channel="instagram")
+    else:
+        adapter = MetaMessagingAdapter(channel="messenger")
     # Instagram Login is a separate Meta app, so its webhooks are signed with a separate
     # app secret. Falling back to the Facebook one keeps tenants whose IG still rides the
     # Facebook app working while the Instagram app is unprovisioned.

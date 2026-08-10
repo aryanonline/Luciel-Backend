@@ -50,7 +50,8 @@ DEFAULT_CHANNELS = [
     {"id": "sms", "enabled": False, "connectionStatus": "unconfigured"},
     {"id": "voice", "enabled": False, "connectionStatus": "unconfigured"},
     {"id": "whatsapp", "enabled": False},
-    {"id": "instagram_messenger", "enabled": False},
+    {"id": "messenger", "enabled": False},
+    {"id": "instagram", "enabled": False},
 ]
 # Derived from the tool catalog so a newly registered addon tool cannot be missing from a
 # freshly created Luciel — default-off, per §3.3.3 default-deny.
@@ -73,7 +74,9 @@ def _merge_live_channel_status(
     (§gate.channel_connection_statuses); channels with no backing connection (widget)
     are left exactly as stored."""
     return [
-        {**ch, "connectionStatus": live_status[ch["id"]]} if ch.get("id") in live_status else dict(ch)
+        {**ch, "connectionStatus": live_status[str(ch["id"])]}
+        if str(ch.get("id")) in live_status
+        else dict(ch)
         for ch in channels
     ]
 

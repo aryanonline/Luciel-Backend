@@ -28,8 +28,11 @@ def test_provider_lists_are_exactly_what_each_connection_type_supports():
         "google_calendar",
         "calendly",
     ]
-    # ONE Meta grant powers WhatsApp, Instagram and Messenger (§3.8.1).
+    # ONE Meta grant powers the WhatsApp and Messenger channels (§3.1.2 split);
+    # Instagram rides its own Business Login connection type.
     assert [p.provider for p in registry.providers_for("channel_auth")] == ["meta"]
+    assert registry.DEPENDENT_CHANNELS["channel_auth"] == ("whatsapp", "messenger")
+    assert registry.DEPENDENT_CHANNELS["instagram_auth"] == ("instagram",)
     # SMS is BYO (§3.1.4): the customer's own Twilio, never a platform-provisioned number.
     assert [p.provider for p in registry.providers_for("sms_sender")] == ["twilio"]
 

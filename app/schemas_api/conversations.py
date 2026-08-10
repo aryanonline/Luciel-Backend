@@ -17,7 +17,20 @@ from pydantic import Field
 from app.schemas_api.common import WireModel
 
 ConversationModeWire = Literal["ai", "human_controlled"]
-ChannelIdWire = Literal["widget", "email", "sms", "voice", "whatsapp", "instagram_messenger"]
+# §3.1.2 split ids, PLUS the legacy combined ``instagram_messenger`` — read-path only:
+# session rows opened before the split carry it, and rewriting history would claim to
+# know which platform a past conversation used. It is never offered as a configurable
+# channel (the config enum in schemas_api/luciel.py does not include it).
+ChannelIdWire = Literal[
+    "widget",
+    "email",
+    "sms",
+    "voice",
+    "whatsapp",
+    "messenger",
+    "instagram",
+    "instagram_messenger",
+]
 LeadStateWire = Literal["active", "archived"]  # NO 'pruned' — prune deletes (§3.4.10a).
 MessageRoleWire = Literal["lead", "luciel", "human_agent"]
 GateWire = Literal["intake", "outcome"]

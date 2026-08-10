@@ -1082,9 +1082,7 @@ async def get_email_provisioning(
     return await _single_active(session, admin_id, instance_id, "email_sender")
 
 
-_DETAIL_ROUTING_CONFIRMED = (
-    "Email routing is confirmed — mail to this address will reach Luciel."
-)
+_DETAIL_ROUTING_CONFIRMED = "Email routing is confirmed — mail to this address will reach Luciel."
 _DETAIL_ROUTING_NOT_YET = (
     "We still don't see the MX record pointing at us. Add the DNS records shown below "
     "at your domain registrar, then click Re-verify — DNS changes can take a little "
@@ -1180,12 +1178,16 @@ async def resolve_sms_number(
 
 
 # Which connection + destination key(s) a runtime channel may bind, in the order tried.
-# ``instagram_messenger`` is one channel id in this codebase but two assets on two
-# DIFFERENT grants since the Instagram Login split, so it spans both connections — an
-# IG-only tenant and a Page-only tenant each resolve through the one they connected.
+# Since the §3.1.2 split each messaging channel is its own id with exactly one grant:
+# WhatsApp and Messenger live on the Facebook ``channel_auth`` grant (each under its own
+# destination key), Instagram on the separate Business Login ``instagram_auth`` grant.
+# The legacy combined ``instagram_messenger`` id (sessions opened before the split) still
+# spans both connections so an old in-flight conversation can keep replying.
 INSTAGRAM_CONNECTION_TYPE = "instagram_auth"
 META_CHANNEL_DESTINATION_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     "whatsapp": (("channel_auth", "whatsapp"),),
+    "messenger": (("channel_auth", "messenger"),),
+    "instagram": ((INSTAGRAM_CONNECTION_TYPE, "instagram"),),
     "instagram_messenger": (
         (INSTAGRAM_CONNECTION_TYPE, "instagram"),
         ("channel_auth", "messenger"),

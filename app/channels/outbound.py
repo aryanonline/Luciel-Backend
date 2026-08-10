@@ -89,7 +89,7 @@ async def send_outbound_reply(
         receipt = await _send_email(
             session, admin_id, instance_id, to=to, body=body, subject=subject
         )
-    elif channel in ("whatsapp", "instagram_messenger"):
+    elif channel in ("whatsapp", "messenger", "instagram", "instagram_messenger"):
         receipt = await _send_meta(
             session, admin_id, instance_id, channel=channel, to=to, body=body, sender_id=sender_id
         )
@@ -217,8 +217,9 @@ async def _send_meta(
     from app.channels.meta_messaging_adapter import MetaMessagingAdapter
 
     # IG DM / Messenger send from the IG-account / page id, on the Messenger send API —
-    # a different Graph shape from WhatsApp, hence a different adapter (§3.1.2).
-    return await MetaMessagingAdapter(meta_sender).send(
+    # a different Graph shape from WhatsApp, hence a different adapter (§3.1.2). The
+    # split channel id is threaded through so the send is attributed to the real channel.
+    return await MetaMessagingAdapter(meta_sender, channel=channel).send(
         OutboundMessage(channel=channel, to=to, body=body, metadata={"destination_id": identity})
     )
 

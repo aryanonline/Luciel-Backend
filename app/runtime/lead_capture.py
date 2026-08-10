@@ -99,7 +99,7 @@ async def capture_or_update_lead(
     """Always-on lead-capture cognition (§3.4.4). Returns the resolved_lead_id if a
     lead exists/was created for this turn, else None.
 
-    - Strong channels (email/sms/voice/whatsapp/instagram_messenger): the transport
+    - Strong channels (email/sms/voice/whatsapp/messenger/instagram): the transport
       identifier IS the lead key — capture/upsert immediately on a qualified turn.
     - Weak widget: only promote to a real lead once the visitor volunteers a strong
       identifier (email/phone) in-conversation (§3.4.9). Before that, no lead row is

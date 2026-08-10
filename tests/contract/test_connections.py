@@ -140,8 +140,9 @@ def test_no_registered_provider_display_name_is_the_raw_code() -> None:
     from app.connections import registry
 
     # Providers whose registered code IS (title-cased) their real brand name --
-    # confirmed correct, not a raw-code leak.
-    title_case_is_correct = {"calendly", "notion", "salesforce", "instagram", "twilio"}
+    # confirmed correct, not a raw-code leak. "meta" joined when the §3.1.2 channel
+    # split moved the channel names onto the rows: the grant's own brand IS "Meta".
+    title_case_is_correct = {"calendly", "notion", "salesforce", "instagram", "twilio", "meta"}
 
     for provider_id, spec in registry.PROVIDERS.items():
         assert spec.display_name.strip(), f"{provider_id} has no display_name"

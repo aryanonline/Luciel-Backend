@@ -174,6 +174,104 @@ async def test_twilio_sms_is_verified_with_the_tenants_own_auth_token(client, mo
     assert "<Response>" in r.text
 
 
+# --------------------------------------------------------------------------- #
+# Meta POST inbound — §3.1.2 split channel attribution
+# --------------------------------------------------------------------------- #
+def _meta_signature(secret: str, body: bytes) -> str:
+    import hashlib
+    import hmac as hmac_mod
+
+    return "sha256=" + hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _meta_inbound_payload(obj: str, destination_id: str) -> dict:
+    return {
+        "object": obj,
+        "entry": [
+            {
+                "id": destination_id,
+                "messaging": [
+                    {
+                        "sender": {"id": "PSID_42"},
+                        "message": {"mid": "m.42", "text": "Do you deliver?"},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+async def _seed_meta_destination(
+    admin: uuid.UUID, iid: uuid.UUID, *, connection_type: str, key: str, destination: str
+) -> None:
+    from app.connections.secrets import secret_ref_for
+    from app.models.connection import InstanceConnection
+
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type=connection_type,
+                auth_class="oauth_token",
+                provider="meta" if connection_type == "channel_auth" else "instagram",
+                status="connected",
+                secret_ref=secret_ref_for(admin, iid, connection_type),
+                non_secret_config={"destinations": {key: destination}},
+            )
+        )
+        await s.flush()
+
+
+@pytest.mark.parametrize(
+    ("obj", "connection_type", "key", "expected_channel"),
+    [
+        ("page", "channel_auth", "messenger", "messenger"),
+        ("instagram", "instagram_auth", "instagram", "instagram"),
+    ],
+)
+async def test_meta_inbound_opens_a_session_on_the_split_channel(
+    client, monkeypatch, obj, connection_type, key, expected_channel
+):
+    """§3.1.2: an Instagram webhook opens an ``instagram`` session and a Page webhook a
+    ``messenger`` one — never the pre-split combined channel. The channel id is what
+    sessions, rate limits, and the dashboard's channel mix are keyed by."""
+    import json as jsonlib
+
+    from app.models.conversation import Session as ConvSession
+    from sqlalchemy import select as sa_select
+
+    secret = "meta-secret-42"  # noqa: S105 — test fixture
+    monkeypatch.setattr(get_settings(), "meta_app_secret", secret, raising=False)
+    monkeypatch.setattr(get_settings(), "instagram_app_secret", "", raising=False)
+    admin, iid = await _seed_active_instance()
+    destination = f"dest-{uuid.uuid4().hex[:8]}"
+    await _seed_meta_destination(
+        admin, iid, connection_type=connection_type, key=key, destination=destination
+    )
+
+    body = jsonlib.dumps(_meta_inbound_payload(obj, destination)).encode()
+    r = await client.post(
+        "/api/v1/webhooks/meta",
+        content=body,
+        headers={
+            "X-Hub-Signature-256": _meta_signature(secret, body),
+            "Content-Type": "application/json",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+    async with tenant_session(admin) as s:
+        channels = (
+            (await s.execute(sa_select(ConvSession.channel).where(ConvSession.admin_id == admin)))
+            .scalars()
+            .all()
+        )
+    assert channels == [expected_channel]
+
+
 async def test_twilio_sms_unresolvable_number_is_clean_ack(client, monkeypatch):
     """Valid signature but a number no tenant owns → clean 200 no-op, not a crash."""
     auth_token = "authtok-x"

@@ -20,7 +20,7 @@ from typing import Any, Protocol
 class InboundMessage:
     admin_id: uuid.UUID
     instance_id: uuid.UUID
-    channel: str  # widget|email|sms|voice|whatsapp|instagram_messenger
+    channel: str  # widget|email|sms|voice|whatsapp|messenger|instagram (§3.1.2 split ids)
     session_id: uuid.UUID | None
     customer_identifier: str  # channel-specific (email, E.164, fingerprint, ...)
     body: str

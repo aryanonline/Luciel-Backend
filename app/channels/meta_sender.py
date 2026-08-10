@@ -66,7 +66,7 @@ class GraphMetaSender:
                 "type": "text",
                 "text": {"body": body},
             }
-        else:  # instagram_messenger
+        else:  # messenger / instagram (same Messenger-API send shape)
             payload = {
                 "recipient": {"id": recipient_id},
                 "message": {"text": body},

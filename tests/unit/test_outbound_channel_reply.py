@@ -182,15 +182,17 @@ async def test_email_reply_without_a_provisioned_identity_is_reported_not_sent(e
 
 # --- Meta (Instagram DM / Messenger) ------------------------------------------- #
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_instagram_reply_uses_the_messenger_send_shape(meta_sender):
+@pytest.mark.parametrize("channel", ["messenger", "instagram"])
+async def test_meta_reply_uses_the_messenger_send_shape(meta_sender, channel):
     """IG DM / Messenger is a DIFFERENT Graph shape from WhatsApp. Routing it through the
-    WhatsApp adapter is accepted-then-dropped, which looks like success."""
+    WhatsApp adapter is accepted-then-dropped, which looks like success. Since the §3.1.2
+    split each ride their own channel id, threaded through to the sender."""
     admin, instance = uuid.uuid4(), uuid.uuid4()
 
     result = await _reply(
         admin,
         instance,
-        channel="instagram_messenger",
+        channel=channel,
         to="ig-user-1",
         body="Thanks for reaching out!",
         sender_id=PAGE_ID,
@@ -199,7 +201,7 @@ async def test_instagram_reply_uses_the_messenger_send_shape(meta_sender):
     assert result.delivered is True
     assert meta_sender.sent == [
         {
-            "channel": "instagram_messenger",
+            "channel": channel,
             "sender_id": PAGE_ID,
             "recipient_id": "ig-user-1",
             "body": "Thanks for reaching out!",
@@ -233,24 +235,21 @@ async def test_meta_takeover_reply_falls_back_to_the_provisioned_channel_identit
     admin, instance = uuid.uuid4(), uuid.uuid4()
     await _seed_meta_channel(admin, instance)
 
-    result = await _reply(
-        admin, instance, channel="instagram_messenger", to="ig-user-1", body="Sam here."
-    )
+    result = await _reply(admin, instance, channel="messenger", to="ig-user-1", body="Sam here.")
 
     assert result.delivered is True
     assert meta_sender.sent[0]["sender_id"] == PAGE_ID
     # A Page is a Facebook asset, so the Facebook grant's token is the one that can send
-    # as it — even though the channel it rides is shared with Instagram.
+    # as it — even though that grant is shared with the WhatsApp channel.
     assert meta_sender.grants == ["channel_auth"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_an_instagram_asset_sends_with_the_instagram_grants_token(meta_sender):
-    """instagram_messenger is one channel over two Meta APPS. The asset we send AS and the
-    token we send WITH have to come from the same app, or Graph rejects the call: an
-    Instagram Login token is not a Facebook token and is not even accepted at the same
-    host. So the grant is chosen by which connection owns the destination, not by channel.
-    """
+    """The asset we send AS and the token we send WITH have to come from the same Meta
+    app, or Graph rejects the call: an Instagram Login token is not a Facebook token and
+    is not even accepted at the same host. The instagram channel resolves its asset on
+    the Instagram grant even when a Facebook grant is also connected."""
     admin, instance = uuid.uuid4(), uuid.uuid4()
     ig_account = "ig-account-1"
     await _seed_connection(
@@ -263,9 +262,7 @@ async def test_an_instagram_asset_sends_with_the_instagram_grants_token(meta_sen
     )
     await _seed_meta_channel(admin, instance)
 
-    result = await _reply(
-        admin, instance, channel="instagram_messenger", to="ig-user-1", body="Sam here."
-    )
+    result = await _reply(admin, instance, channel="instagram", to="ig-user-1", body="Sam here.")
 
     assert result.delivered is True
     assert meta_sender.sent[0]["sender_id"] == ig_account
@@ -273,10 +270,27 @@ async def test_an_instagram_asset_sends_with_the_instagram_grants_token(meta_sen
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_legacy_combined_channel_sessions_can_still_reply(meta_sender):
+    """Sessions opened before the §3.1.2 split carry channel='instagram_messenger'.
+    Their in-flight replies must keep working: the legacy id still resolves across BOTH
+    grants (Instagram first, then the Facebook Page)."""
+    admin, instance = uuid.uuid4(), uuid.uuid4()
+    await _seed_meta_channel(admin, instance)
+
+    result = await _reply(
+        admin, instance, channel="instagram_messenger", to="ig-user-1", body="Sam here."
+    )
+
+    assert result.delivered is True
+    assert meta_sender.sent[0]["sender_id"] == PAGE_ID
+    assert meta_sender.grants == ["channel_auth"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_meta_reply_without_a_provisioned_channel_is_reported(meta_sender):
     admin, instance = uuid.uuid4(), uuid.uuid4()
 
-    result = await _reply(admin, instance, channel="instagram_messenger", to="ig-user-1", body="hi")
+    result = await _reply(admin, instance, channel="messenger", to="ig-user-1", body="hi")
 
     assert result.delivered is False
     assert result.detail == "channel_not_provisioned"
@@ -290,7 +304,8 @@ async def test_sms_is_the_only_inline_reply_channel():
     silence. This membership is what decides that, for both reply paths."""
     assert outbound.INLINE_REPLY_CHANNELS == frozenset({"sms"})
     assert "email" not in outbound.INLINE_REPLY_CHANNELS
-    assert "instagram_messenger" not in outbound.INLINE_REPLY_CHANNELS
+    assert "messenger" not in outbound.INLINE_REPLY_CHANNELS
+    assert "instagram" not in outbound.INLINE_REPLY_CHANNELS
     assert "whatsapp" not in outbound.INLINE_REPLY_CHANNELS
 
 

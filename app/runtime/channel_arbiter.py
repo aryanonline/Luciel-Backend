@@ -7,6 +7,9 @@ _IMMEDIACY = {
     "voice": 0,
     "sms": 1,
     "whatsapp": 1,
+    "messenger": 1,
+    "instagram": 1,
+    # Legacy combined id (pre-§3.1.2 split) — old sessions keep the messaging tier.
     "instagram_messenger": 1,
     "widget": 1,
     "email": 2,

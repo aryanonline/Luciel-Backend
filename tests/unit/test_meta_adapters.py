@@ -125,12 +125,16 @@ async def test_whatsapp_send_via_null_sender():
 # --- Instagram / Messenger ------------------------------------------------------- #
 
 
-async def test_meta_messaging_channel_id_is_combined():
-    assert MetaMessagingAdapter().channel_id == "instagram_messenger"
+async def test_meta_messaging_carries_the_split_channel_ids():
+    # §3.1.2: Messenger and Instagram are separate channels on one adapter class; the
+    # webhook edge names the channel from the payload's ``object``.
+    assert MetaMessagingAdapter().channel_id == "messenger"
+    assert MetaMessagingAdapter(channel="instagram").channel_id == "instagram"
 
 
-async def test_meta_messaging_verifies_and_normalizes():
-    adapter = MetaMessagingAdapter(NullMetaSender())
+@pytest.mark.parametrize("channel", ["messenger", "instagram"])
+async def test_meta_messaging_verifies_and_normalizes(channel: str):
+    adapter = MetaMessagingAdapter(NullMetaSender(), channel=channel)
     body = json.dumps(_meta_payload()).encode()
     request = {
         "app_secret": APP_SECRET,
@@ -141,15 +145,16 @@ async def test_meta_messaging_verifies_and_normalizes():
     }
     ctx = await adapter.verify_inbound(request)
     msg = await adapter.receive(request, ctx)
-    assert msg.channel == "instagram_messenger"
+    assert msg.channel == channel
     assert msg.customer_identifier == "PSID_1"
     assert msg.body == "Do you deliver?"
 
 
 async def test_meta_messaging_falls_back_to_the_facebook_grant():
-    """Instagram DMs and Messenger share one channel but not one grant: an IG account is
-    bound on the Instagram Login connection and a Page on the Facebook one. The adapter
-    must try both, or a tenant who connected only Facebook stops receiving Messenger."""
+    """An IG account is bound on the Instagram Login connection and a Page on the
+    Facebook one, and the webhook entry does not say which kind of id it carries. The
+    adapter must try both, or a tenant who connected only Facebook stops receiving
+    Messenger."""
     tried: list[str] = []
 
     async def _resolve_page_only(connection_type: str, destination: str) -> InstanceContext:
@@ -187,7 +192,7 @@ async def test_meta_messaging_rejects_when_no_grant_owns_the_destination():
                 "resolve": _resolve_nobody,
             }
         )
-    assert e.value.reason == "unresolvable_destination:instagram_messenger"
+    assert e.value.reason == "unresolvable_destination:messenger"
 
 
 async def test_meta_messaging_bad_signature_rejected():

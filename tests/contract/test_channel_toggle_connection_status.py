@@ -19,9 +19,9 @@ These tests pin two properties:
   2. GET/PUT responses reflect the connection's LIVE status, before and after the
      round trip — so the dashboard has no reason to ask for the number again.
 
-The identical property is asserted for whatsapp/messenger (``channel_auth``),
-instagram_messenger (``instagram_auth``), and email (``email_sender``) — every
-channel with a backing connection, not just SMS.
+The identical property holds for whatsapp + messenger (``channel_auth``),
+instagram (``instagram_auth``), and email (``email_sender``) — every channel
+with a backing connection, not just SMS.
 """
 
 from __future__ import annotations

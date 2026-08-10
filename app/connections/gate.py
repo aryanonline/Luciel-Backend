@@ -41,7 +41,7 @@ CONNECTED = "connected"
 # Reverse of registry.DEPENDENT_CHANNELS: channel_id -> the connection_type that backs
 # it. Built once at import time from the same table the disconnect cascade already
 # uses (§5b), so a channel's live status and its cascade dependency can never diverge.
-# A connection_type covering >1 channel (channel_auth -> whatsapp + instagram_messenger)
+# A connection_type covering >1 channel (channel_auth -> whatsapp + messenger)
 # fans out to each; a channel with no backing connection (widget) is simply absent.
 _CHANNEL_CONNECTION_TYPE: dict[str, str] = {
     channel_id: connection_type
@@ -156,9 +156,9 @@ async def channel_connection_statuses(
     has no connection to report and is simply absent from the returned mapping — the
     caller leaves its stored ``connectionStatus`` (there isn't one) untouched.
 
-    One query per distinct backing connection_type (at most 3 today: email_sender,
-    sms_sender, channel_auth, instagram_auth), not per channel, so whatsapp and
-    instagram_messenger sharing ``channel_auth`` do not double-query.
+    One query per distinct backing connection_type (email_sender, sms_sender,
+    channel_auth, instagram_auth), not per channel, so whatsapp and messenger
+    sharing ``channel_auth`` do not double-query.
 
     Fixes the toggle-reconnect bug (owner report, SMS disable/enable): the channels
     pillar's ``connectionStatus`` used to be written ONLY by the client's own PUT echo

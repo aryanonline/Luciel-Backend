@@ -184,7 +184,7 @@ async def test_meta_reply_reports_an_unprovisioned_sender_rather_than_delivery(l
     result = await _reply(
         admin,
         instance,
-        channel="instagram_messenger",
+        channel="instagram",
         to="ig-user-1",
         body="Thanks!",
         sender_id="ig-account-77",

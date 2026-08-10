@@ -38,6 +38,9 @@ def test_weak_widget_identity_never_carries_cross_session_memory():
     # HARD RULE §3.4.9: weak widget token never inherits history.
     assert can_carry_cross_session_memory("widget") is False
     assert can_carry_cross_session_memory("email") is True
+    assert can_carry_cross_session_memory("messenger") is True
+    assert can_carry_cross_session_memory("instagram") is True
+    # Legacy combined id (pre-§3.1.2-split sessions) keeps its class for old rows.
     assert can_carry_cross_session_memory("instagram_messenger") is True
 
 

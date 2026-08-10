@@ -1,12 +1,14 @@
 """Instagram DM + Facebook Messenger adapter (Architecture §3.1.2, §3.1.3).
 
-Instagram DM and Messenger SHARE one adapter and one `channel_id = instagram_messenger`
-(canonical §3.1.2): they ride the same Meta Graph/Messenger API surface and the platform
-routes/rate-limits/configures them as a single channel. Inbound is a Meta webhook whose
-X-Hub-Signature-256 is verified BEFORE tenant lookup (§3.1.3/§3.7.2); the destination
-Instagram-account ID or Facebook-page ID resolves to the tenant. These channels bind to
-the admin's Meta page/account, NOT a phone number (§3.1.3). Outbound goes through the
-shared Meta Graph sender (fake/Null in mock/CI).
+Instagram DM and Messenger SHARE one adapter class — they ride the same Graph/Messenger
+API surface — but each instance carries its OWN channel id (``instagram`` or
+``messenger``, canonical §3.1.2: the wire enums carry separate channels). The webhook
+edge picks the channel from the payload's ``object`` field, so an Instagram DM opens an
+``instagram`` session and a Page message a ``messenger`` one. Inbound is a Meta webhook
+whose X-Hub-Signature-256 is verified BEFORE tenant lookup (§3.1.3/§3.7.2); the
+destination Instagram-account ID or Facebook-page ID resolves to the tenant. These
+channels bind to the admin's Meta page/account, NOT a phone number (§3.1.3). Outbound
+goes through the shared Meta Graph sender (fake/Null in mock/CI).
 """
 
 from __future__ import annotations
@@ -40,9 +42,11 @@ def _first_messaging_event(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 class MetaMessagingAdapter:
-    channel_id = "instagram_messenger"
-
-    def __init__(self, sender: MetaSender | None = None) -> None:
+    def __init__(self, sender: MetaSender | None = None, *, channel: str = "messenger") -> None:
+        # ``channel`` is the split channel id this instance serves (§3.1.2): the webhook
+        # edge passes "instagram" for object=="instagram" payloads and "messenger" for
+        # Page ones, so sessions/rate-limits/arbitration see the real channel.
+        self.channel_id = channel
         # Per-tenant Graph token (P1-1) — see the note in ``WhatsAppAdapter.__init__``.
         self._sender = sender or NullMetaSender()
 
@@ -72,7 +76,7 @@ class MetaMessagingAdapter:
             except InboundRejected:
                 continue
             return ctx
-        raise InboundRejected("unresolvable_destination:instagram_messenger")
+        raise InboundRejected(f"unresolvable_destination:{self.channel_id}")
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
         parsed = _first_messaging_event(request["payload"])
@@ -85,7 +89,7 @@ class MetaMessagingAdapter:
         return InboundMessage(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
-            channel="instagram_messenger",
+            channel=self.channel_id,
             session_id=None,
             customer_identifier=(event.get("sender") or {}).get("id", ""),
             body=body,
@@ -100,7 +104,7 @@ class MetaMessagingAdapter:
         sender_id = message.metadata.get("destination_id", "")
         try:
             mid = await self._sender.send_message(
-                channel="instagram_messenger",
+                channel=self.channel_id,
                 sender_id=sender_id,
                 recipient_id=message.to,
                 body=message.body,

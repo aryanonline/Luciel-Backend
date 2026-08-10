@@ -34,7 +34,10 @@ class StrictWireModel(WireModel):
 
 
 LucielStateWire = Literal["active", "paused", "luciel_grace_window", "luciel_hard_deleted"]
-ChannelIdWire = Literal["widget", "email", "sms", "voice", "whatsapp", "instagram_messenger"]
+# §3.1.2: the wire enums carry SEPARATE whatsapp/messenger/instagram channels. One
+# `meta` connection powers WhatsApp + Messenger; Instagram rides its own Business Login
+# connection — but each is its own channel row, toggled and destination-bound on its own.
+ChannelIdWire = Literal["widget", "email", "sms", "voice", "whatsapp", "messenger", "instagram"]
 AddonToolIdWire = Literal[
     "check_availability",
     "book_appointment",

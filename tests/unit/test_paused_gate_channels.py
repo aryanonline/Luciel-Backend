@@ -51,7 +51,7 @@ def _inbound(admin_id: uuid.UUID, instance_id: uuid.UUID, channel: str) -> Inbou
 
 
 @pytest.mark.parametrize("state", NON_SERVING)
-@pytest.mark.parametrize("channel", ["sms", "email", "whatsapp", "instagram_messenger"])
+@pytest.mark.parametrize("channel", ["sms", "email", "whatsapp", "messenger", "instagram"])
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_paused_luciel_answers_nothing_on_any_channel(state, channel):
     """The owner-visible promise: paused means silent, on every channel."""

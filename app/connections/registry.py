@@ -288,7 +288,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "meta": ProviderSpec(
         provider="meta",
         connection_type="channel_auth",
-        display_name="Meta (WhatsApp & Messenger)",
+        # Just "Meta": since the §3.1.2 channel split the WhatsApp and Messenger rows each
+        # carry their own name, so the shared grant's button reads "Connect Meta" instead
+        # of repeating both channel names under whichever row rendered it.
+        display_name="Meta",
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             endpoint="https://www.facebook.com/v19.0/dialog/oauth",
@@ -555,12 +558,11 @@ DEPENDENT_TOOLS: dict[str, tuple[str, ...]] = {
 DEPENDENT_CHANNELS: dict[str, tuple[str, ...]] = {
     "email_sender": ("email",),
     "sms_sender": ("sms", "voice"),
-    # The Facebook grant powers WhatsApp and the Messenger half of instagram_messenger.
-    "channel_auth": ("whatsapp", "instagram_messenger"),
-    # ``instagram_messenger`` is one channel id covering two assets, so either grant going
-    # away takes it down. Overstating the loss is the safe direction: the alternative
-    # leaves the channel switched on with only half its senders resolvable.
-    "instagram_auth": ("instagram_messenger",),
+    # §3.1.2 split: the one Facebook grant powers the WhatsApp AND Messenger channels
+    # (each still binds its own destination id); Instagram rides its own Business Login
+    # grant. Each channel therefore has exactly one backing connection.
+    "channel_auth": ("whatsapp", "messenger"),
+    "instagram_auth": ("instagram",),
 }
 
 

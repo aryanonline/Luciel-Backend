@@ -34,6 +34,9 @@ LIMITS: dict[str, ChannelLimits] = {
     "voice": ChannelLimits(burst=3, refill_seconds=10.0, daily_cap=200),
     "email": ChannelLimits(burst=10, refill_seconds=2.0, daily_cap=1000),
     "whatsapp": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
+    "messenger": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
+    "instagram": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
+    # Legacy combined id (pre-§3.1.2 split) — kept so any in-flight caller stays limited.
     "instagram_messenger": ChannelLimits(burst=5, refill_seconds=5.0, daily_cap=500),
     # Not a conversational channel and not in the §3.1.5 table: the marketing contact
     # form (ruling 1). It shares the bucket rather than growing a second limiter, but its
