@@ -174,7 +174,7 @@ python -m pytest -v
 
 For a fresh local environment, create/activate a Python 3.12 virtual environment,
 then install `-e .` plus the required test dependencies if the supplied environment
-does not already contain them. The expected baseline is about **1270 passed, 0 failed**.
+does not already contain them. The expected baseline is about **1327 passed, 0 failed**.
 Run focused tests while iterating, then run the full command above before commit.
 
 ## Deploy
