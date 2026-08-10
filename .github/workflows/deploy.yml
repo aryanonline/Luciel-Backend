@@ -38,6 +38,17 @@ on:
         type: choice
         options: [mock, live]
         default: mock
+      paused:
+        # The cheap-idle switch has existed in the CDK app since it was written
+        # (`-c paused=true` -> every ECS service desiredCount 0, every sweep schedule
+        # DISABLED) but NOTHING in the pipeline ever passed it, so the one deliberate
+        # cost lever could only be pulled by hand from a laptop with deploy creds.
+        # Exposed here so pausing and resuming an environment is a repeatable,
+        # audited pipeline action like any other deploy. Resume = run again with false.
+        description: Pause the environment (all services to 0, sweeps disabled). Resume with false.
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 permissions:
   id-token: write
@@ -113,9 +124,13 @@ jobs:
             "Luciel-dev-WidgetCert" "Luciel-dev-Widget" \
             -c env=dev -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
+            -c paused=${{ inputs.paused || 'false' }} \
             --require-approval never
 
+      # Skipped when pausing: a pause run is taking the environment DOWN, so there is
+      # nothing to migrate and a migration task would be the only thing still running.
       - name: Run DB migrations as a one-off ECS task (inside the VPC)
+        if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh dev
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----
@@ -240,9 +255,13 @@ jobs:
             "Luciel-prod-WidgetCert" "Luciel-prod-Widget" \
             -c env=prod -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
+            -c paused=${{ inputs.paused || 'false' }} \
             --require-approval never
 
+      # See the dev job: a pause run takes the environment down, so there is nothing
+      # to migrate.
       - name: Run DB migrations as a one-off ECS task (inside the VPC)
+        if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh prod
 
   # 4) ALWAYS tear down preprod — even if standup/verify/prod-deploy failed. The
