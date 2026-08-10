@@ -80,9 +80,7 @@ class NullOutlookSender:
     ) -> bool:
         from app.config import live_mode  # noqa: PLC0415 — read the mode at call time
 
-        self.sent.append(
-            {"to": to, "subject": subject, "body": body, "in_reply_to": in_reply_to}
-        )
+        self.sent.append({"to": to, "subject": subject, "body": body, "in_reply_to": in_reply_to})
         # Mock: an accepted fake is honest (nothing real exists to disagree with it).
         # Live: nothing left the process — saying otherwise would fabricate a delivery.
         return not live_mode()
