@@ -106,9 +106,18 @@ jobs:
           # unavailability, on any non-allowlisted CRITICAL, and on expired
           # allowlist entries. The describe call is NOT error-swallowed — an API
           # failure must block, not pass.
-          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
-          aws ecr describe-image-scan-findings --repository-name "$REPO" \
-            --image-id imageTag="$TAG" > scan-findings.json
+          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
+          # scan exists and completes — the ECR waiter errors on ScanNotFound
+          # instead of retrying, which is the exact race the old gate's
+          # `|| echo None` silently turned into a PASS. If it never completes,
+          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
+          for i in $(seq 1 60); do
+            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
+              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
+              [ "$status" = "COMPLETE" ] && break
+            fi
+            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
+          done
           python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
@@ -205,9 +214,18 @@ jobs:
             docker build -t "$ECR/$REPO:$TAG" .
             docker push "$ECR/$REPO:$TAG"
           fi
-          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
-          aws ecr describe-image-scan-findings --repository-name "$REPO" \
-            --image-id imageTag="$TAG" > scan-findings.json
+          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
+          # scan exists and completes — the ECR waiter errors on ScanNotFound
+          # instead of retrying, which is the exact race the old gate's
+          # `|| echo None` silently turned into a PASS. If it never completes,
+          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
+          for i in $(seq 1 60); do
+            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
+              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
+              [ "$status" = "COMPLETE" ] && break
+            fi
+            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
+          done
           python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
 
       - uses: actions/setup-node@v4
@@ -293,9 +311,18 @@ jobs:
             docker build -t "$ECR/$REPO:$TAG" .
             docker push "$ECR/$REPO:$TAG"
           fi
-          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="$TAG" || true
-          aws ecr describe-image-scan-findings --repository-name "$REPO" \
-            --image-id imageTag="$TAG" > scan-findings.json
+          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
+          # scan exists and completes — the ECR waiter errors on ScanNotFound
+          # instead of retrying, which is the exact race the old gate's
+          # `|| echo None` silently turned into a PASS. If it never completes,
+          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
+          for i in $(seq 1 60); do
+            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
+              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
+              [ "$status" = "COMPLETE" ] && break
+            fi
+            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
+          done
           python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
