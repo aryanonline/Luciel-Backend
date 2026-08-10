@@ -13,6 +13,7 @@ never whether a specific secret is present (§3.8.3).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.config import get_settings, live_mode
@@ -20,11 +21,16 @@ from app.config import get_settings, live_mode
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "database_unreachable_reason",
     "degraded_bindings",
     "is_degraded_binding",
     "log_resolved_bindings",
     "null_in_live",
 ]
+
+# A health probe that can hang is worse than one that lies: the ALB would hold the
+# check open, and a burst of checks against a dead server would pin one worker each.
+DATABASE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
 def _degraded_types() -> tuple[type, ...]:
@@ -92,6 +98,36 @@ def degraded_bindings() -> list[str]:
     if not live_mode():
         degraded.append("llm:EchoModel")
     return degraded
+
+
+async def database_unreachable_reason() -> str | None:
+    """``None`` when a query actually round-trips to Postgres; otherwise a short reason.
+
+    Every other seam above is answered by looking at what got BOUND, which is a purely
+    process-local fact. The database is the one dependency whose binding proves nothing
+    about whether it works: the URL is always well-formed, the engine constructs
+    happily, and the first symptom of an unreachable server is a request that hangs
+    until the caller gives up. Dev proved the gap — with the instance stopped,
+    ``/healthz`` answered ``ok`` in milliseconds while every real request died on an
+    asyncpg connect timeout thirty seconds later.
+
+    Reports the exception TYPE and nothing else: a driver's message can carry the host,
+    the user, and the database name, and this endpoint is unauthenticated (§3.8.3).
+    """
+    from sqlalchemy import text  # noqa: PLC0415 — import cost stays off module import
+
+    from app.db.engine import get_sessionmaker  # noqa: PLC0415
+
+    try:
+        async with asyncio.timeout(DATABASE_PROBE_TIMEOUT_SECONDS):
+            async with get_sessionmaker()() as session:
+                await session.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 — ANY failure to query means unreachable;
+        # a probe that re-raises turns a degraded report into a 500 with a stack trace.
+        reason = type(exc).__name__
+        logger.warning("healthz_database_unreachable reason=%s", reason)
+        return reason
+    return None
 
 
 def log_resolved_bindings() -> None:

@@ -316,3 +316,63 @@ def test_healthz_reports_the_resolved_mode_and_degraded_seams():
     assert body["status"] == "ok"
     assert body["integrationMode"] == "mock"
     assert "platform_email:NullEmailSender" in body["degraded"]
+
+
+def _sessionmaker_pointed_at_a_dead_database():
+    """A REAL sessionmaker whose server does not exist, so the real driver failure runs.
+
+    Port 1 refuses the connection immediately rather than black-holing it, which keeps
+    the suite fast while still exercising the genuine asyncpg error path — a hand-rolled
+    ``raise`` would prove only that the ``except`` clause is spelled correctly.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    return async_sessionmaker(
+        bind=create_async_engine("postgresql+asyncpg://luciel:luciel@127.0.0.1:1/luciel"),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+
+def test_healthz_reports_degraded_when_the_database_is_unreachable(monkeypatch):
+    """Dev ran for hours answering ``ok`` with its database stopped.
+
+    ``/healthz`` reported every seam it had BOUND and never asked whether the one
+    dependency that cannot be faked actually answers. The endpoint returned 200 in
+    milliseconds while every real request hung for thirty seconds on an asyncpg connect
+    timeout — the single endpoint whose whole job is honesty was the last place you
+    could learn the service was down.
+    """
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr("app.db.engine.get_sessionmaker", _sessionmaker_pointed_at_a_dead_database)
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    with TestClient(create_app()) as client:
+        response = client.get("/healthz")
+
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert any(entry.startswith("database:") for entry in body["degraded"])
+    # Liveness stays 200: a 5xx here drains every ALB target at once and lets the ECS
+    # circuit breaker roll back a healthy release over a dependency outage that
+    # restarting the task cannot fix.
+    assert response.status_code == 200
+
+
+def test_the_database_probe_never_leaks_connection_details(monkeypatch):
+    """``/healthz`` is unauthenticated, so the reason must name the error type only.
+
+    A driver's own message carries the host, the port, the user and the database name
+    (§3.8.3) — exactly the reconnaissance an anonymous caller should not get for free.
+    """
+    import asyncio
+
+    from app.runtime.integration_status import database_unreachable_reason
+
+    monkeypatch.setattr("app.db.engine.get_sessionmaker", _sessionmaker_pointed_at_a_dead_database)
+    reason = asyncio.run(database_unreachable_reason())
+
+    # A bare Python identifier by construction: no URL, no host, no user, no message.
+    assert reason is not None
+    assert reason.isidentifier(), reason

@@ -16,7 +16,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.errors import register_error_handlers
 from app.config import get_settings
-from app.runtime.integration_status import degraded_bindings, log_resolved_bindings
+from app.runtime.integration_status import (
+    database_unreachable_reason,
+    degraded_bindings,
+    log_resolved_bindings,
+)
 
 # Data plane: the embeddable widget is loaded on ARBITRARY customer websites, so its
 # origin can never be allow-listed in advance (§1.2, §9.6).
@@ -93,10 +97,21 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, object]:
         # Binding NAMES only — never a credential and never whether a given secret is
         # set. ``degraded`` non-empty in live mode means sends are being fabricated.
+        degraded = degraded_bindings()
+        database_reason = await database_unreachable_reason()
+        if database_reason is not None:
+            degraded.append(f"database:{database_reason}")
+
+        # Still HTTP 200 with the database down, deliberately. This path is also the
+        # ALB target health check: failing it would drain every target at once (the
+        # service starts answering 503 instead of degraded) and would let the ECS
+        # deployment circuit breaker roll back a perfectly good release because a
+        # dependency blipped. Restarting a task has never fixed an unreachable
+        # database. So liveness keeps its 200 and the BODY carries the truth.
         return {
-            "status": "ok",
+            "status": "ok" if database_reason is None else "degraded",
             "integrationMode": settings.integration_mode,
-            "degraded": degraded_bindings(),
+            "degraded": degraded,
         }
 
     # v1 routers (mounted as arcs land).
