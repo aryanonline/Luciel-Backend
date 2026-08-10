@@ -35,6 +35,12 @@ def test_provider_lists_are_exactly_what_each_connection_type_supports():
     assert registry.DEPENDENT_CHANNELS["instagram_auth"] == ("instagram",)
     # SMS is BYO (§3.1.4): the customer's own Twilio, never a platform-provisioned number.
     assert [p.provider for p in registry.providers_for("sms_sender")] == ["twilio"]
+    # Email's one CHOOSABLE option is the BYO Outlook mailbox (§3.1.6a). The platform
+    # SES sender is provisioned via /connections/email, never offered as a pick —
+    # but its rows must keep validating under the now-choiceful type.
+    assert [p.provider for p in registry.providers_for("email_sender")] == ["outlook"]
+    assert registry.is_valid_provider("email_sender", "ses")
+    assert registry.DEPENDENT_CHANNELS["email_sender"] == ("email",)
 
 
 def test_no_provider_is_ever_offered_for_a_connection_type_that_is_not_its_home():

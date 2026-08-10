@@ -259,3 +259,60 @@ def test_expired_state_is_rejected(configured, monkeypatch):
         oauth_flow.verify_state(
             state, admin_id=admin_id, connection_id=connection_id, expected_jti=jti
         )
+
+
+@pytest.fixture
+def microsoft_configured(monkeypatch):
+    """The Microsoft Entra app (BYO Outlook mailbox, §3.1.6a)."""
+    from app.connections import registry as registry_module
+    from app.knowledge import providers as providers_module
+
+    settings = Settings(
+        microsoft_client_id="ms-client",
+        microsoft_client_secret="ms-secret",
+        microsoft_redirect_uri="https://api.vantagemind.ai/api/v1/connections/microsoft/callback",
+    )
+    monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+    return settings
+
+
+def test_outlook_authorize_url_reaches_the_common_microsoft_endpoint(microsoft_configured):
+    """/common serves org AND personal Microsoft accounts — the registration the owner
+    creates must be multi-tenant + personal, and this URL is what depends on it."""
+    start, params = _start("outlook")
+    assert not start.unconfigured
+    parsed = urlparse(start.authorize_url)
+    assert parsed.netloc == "login.microsoftonline.com"
+    assert parsed.path.startswith("/common/oauth2/v2.0/")
+    # offline_access is what returns a refresh token; Microsoft access tokens live
+    # ~1 hour, so omitting it disconnects every mailbox by mid-afternoon.
+    assert "offline_access" in params["scope"][0]
+    assert "Mail.Send" in params["scope"][0]
+    assert "Mail.Read" in params["scope"][0]
+    # PKCE: Microsoft supports it and the flow must send a challenge, not a verifier.
+    assert params["code_challenge_method"] == ["S256"]
+    assert params["code_challenge"][0]
+    assert params["prompt"] == ["select_account"]
+
+
+def test_outlook_callback_rides_the_microsoft_client_label(microsoft_configured):
+    """The callback path segment is the OAuth CLIENT label derived from the settings
+    field name — no new route needed for a new provider."""
+    from app.connections import registry
+
+    assert registry.oauth_client_label("outlook") == "microsoft"
+
+
+def test_outlook_is_honestly_unconfigured_without_the_entra_app(monkeypatch):
+    """Before the owner registers the Azure app, the option must render dark-but-
+    honest (configured=false, no follow-able URL) — never a broken consent screen."""
+    from app.connections import registry as registry_module
+    from app.knowledge import providers as providers_module
+
+    settings = Settings()
+    monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+
+    start, _params = _start("outlook")
+    assert start.unconfigured

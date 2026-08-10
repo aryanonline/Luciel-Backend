@@ -268,6 +268,14 @@ class Settings(BaseSettings):
     instagram_app_id: str = ""
     instagram_app_secret: str = ""  # noqa: S105
     instagram_redirect_uri: str = ""
+    # Microsoft Entra app for the BYO Outlook mailbox (§3.1.6a; owner decision
+    # 2026-08-10). One multi-tenant + personal-accounts registration serves every
+    # customer; /common in the registry endpoints is what makes that work. Empty ->
+    # the Outlook option reports configured=false and offers no authorize URL, same
+    # honest posture as an unprovisioned Instagram app; never a boot failure.
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""  # noqa: S105
+    microsoft_redirect_uri: str = ""
 
     # --- Website crawl (§3.2.3 crawl-sync note) ---------------------------------
     # No OAuth — just an httpx fetch. Bounded so a misconfigured crawl target can
@@ -325,6 +333,9 @@ class Settings(BaseSettings):
             "META_REDIRECT_URI": "meta_redirect_uri",
             "INSTAGRAM_APP_ID": "instagram_app_id",
             "INSTAGRAM_REDIRECT_URI": "instagram_redirect_uri",
+            "MICROSOFT_CLIENT_ID": "microsoft_client_id",
+            "MICROSOFT_REDIRECT_URI": "microsoft_redirect_uri",
+            "MICROSOFT_CLIENT_SECRET": "microsoft_client_secret",  # nosec B105
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
             # Not secret material, but it is per-environment Stripe account state that
             # travels with the Stripe keys — so it is rotated in the same blob rather
@@ -473,6 +484,13 @@ class Settings(BaseSettings):
                 self.instagram_app_secret
             ):
                 missing.append("INSTAGRAM_APP_SECRET")
+            # Same half-provisioned rule for the Microsoft (Outlook mailbox) app:
+            # absent entirely = honestly unconfigured; id/redirect without the secret
+            # sends the owner through a real consent screen to an unredeemable code.
+            if (self.microsoft_client_id or self.microsoft_redirect_uri) and not (
+                self.microsoft_client_secret
+            ):
+                missing.append("MICROSOFT_CLIENT_SECRET")
             if missing:
                 raise RuntimeError(
                     "live mode is missing required platform secret(s): "

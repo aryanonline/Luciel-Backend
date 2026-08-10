@@ -156,3 +156,21 @@ def test_cookie_domain_empty_for_localhost():
     s = Settings(platform_secret=json.dumps({"APP_BASE_URL": "http://localhost:3000"}))
     assert s.cookie_domain == ""
     assert Settings().cookie_domain == ""
+
+
+def test_microsoft_keys_bridge_from_the_blob():
+    """The Entra app credential for the BYO Outlook mailbox travels in the platform
+    secret like every other platform-owned OAuth client (§3.8.3)."""
+    blob = json.dumps(
+        {
+            "MICROSOFT_CLIENT_ID": "ms-cid",
+            "MICROSOFT_CLIENT_SECRET": "ms-sec",
+            "MICROSOFT_REDIRECT_URI": (
+                "https://api.vantagemind.ai/api/v1/connections/microsoft/callback"
+            ),
+        }
+    )
+    s = Settings(platform_secret=blob)
+    assert s.microsoft_client_id == "ms-cid"
+    assert s.microsoft_client_secret == "ms-sec"  # noqa: S105 — test fixture
+    assert s.microsoft_redirect_uri.endswith("/connections/microsoft/callback")

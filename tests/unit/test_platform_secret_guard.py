@@ -168,3 +168,31 @@ def test_a_fully_provisioned_instagram_app_boots():
     )
     assert s.instagram_app_id == "ig-cid"
     assert s.instagram_app_secret == "ig-csecret"  # noqa: S105 — test fixture
+
+
+def test_an_absent_microsoft_app_still_boots_in_live_mode():
+    """The BYO Outlook mailbox before its Entra app exists: honestly unconfigured
+    (dark tile, no authorize URL), never a boot failure."""
+    s = live_settings()
+    assert s.microsoft_client_id == ""
+    assert s.microsoft_client_secret == ""
+
+
+def test_a_half_provisioned_microsoft_app_refuses_to_boot_in_live_mode():
+    """Same rule as Instagram: an id or redirect without the secret sends the owner
+    through a real Microsoft consent screen to a code the exchange can never redeem."""
+    with pytest.raises(RuntimeError, match="MICROSOFT_CLIENT_SECRET"):
+        live_settings(MICROSOFT_CLIENT_ID="ms-cid")
+
+    with pytest.raises(RuntimeError, match="MICROSOFT_CLIENT_SECRET"):
+        live_settings(MICROSOFT_REDIRECT_URI="https://api.example.com/cb")
+
+
+def test_a_fully_provisioned_microsoft_app_boots():
+    s = live_settings(
+        MICROSOFT_CLIENT_ID="ms-cid",
+        MICROSOFT_CLIENT_SECRET="ms-csecret",
+        MICROSOFT_REDIRECT_URI="https://api.example.com/cb",
+    )
+    assert s.microsoft_client_id == "ms-cid"
+    assert s.microsoft_client_secret == "ms-csecret"  # noqa: S105 — test fixture

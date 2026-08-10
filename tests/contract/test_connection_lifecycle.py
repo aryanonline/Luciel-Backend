@@ -98,6 +98,9 @@ async def test_providers_endpoint_offers_the_decision_6_choices(client):
     # separate Meta app with its own login, so it is its own connection type.
     assert [p["provider"] for p in by_type["channel_auth"]] == ["meta"]
     assert [p["provider"] for p in by_type["instagram_auth"]] == ["instagram"]
+    # §3.1.6a BYO mailbox: Outlook is the email type's one choosable provider (the
+    # platform SES address is provisioned through /connections/email, not picked).
+    assert [p["provider"] for p in by_type["email_sender"]] == ["outlook"]
 
     # Every option carries what the UI needs to render the choice.
     hubspot = next(p for p in by_type["crm"] if p["provider"] == "hubspot")

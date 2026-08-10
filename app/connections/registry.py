@@ -339,6 +339,34 @@ PROVIDERS: dict[str, ProviderSpec] = {
         redirect_uri_setting="instagram_redirect_uri",
         help_text="Connect the Instagram professional account Luciel answers DMs on.",
     ),
+    # --- Email (§3.1.6a): platform-provisioned SES today, BYO mailbox as the ruled
+    # --- target. Outlook is the first BYO-mailbox provider (owner decision
+    # --- 2026-08-10; Gmail follows once Google's restricted-scope review is done).
+    "outlook": ProviderSpec(
+        provider="outlook",
+        connection_type="email_sender",
+        display_name="Outlook mailbox",
+        auth_kind=AUTH_OAUTH,
+        authorize=ProviderAuthorize(
+            # /common serves both org (Entra) and personal Microsoft accounts — the
+            # Azure app registration must be "any org directory + personal accounts".
+            endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            exchange_endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            # offline_access is what returns a refresh token; Microsoft access tokens
+            # live ~1 hour, so without it every mailbox dies mid-afternoon.
+            scopes="offline_access User.Read Mail.Read Mail.Send",
+            supports_pkce=True,
+            extra={"response_mode": "query", "prompt": "select_account"},
+            # Seconds-until-expiry of the access token. Kept so the verify step can
+            # stamp non_secret_config["token_expires_at"] — the refresh path's cue.
+            token_fields=("expires_in",),
+        ),
+        client_id_setting="microsoft_client_id",
+        client_secret_setting="microsoft_client_secret",  # noqa: S106 — field NAME  # nosec B106
+        redirect_uri_setting="microsoft_redirect_uri",
+        help_text="Connect the work mailbox Luciel answers from — replies come from "
+        "your own address. Sent mail lands in your own Sent folder.",
+    ),
     # --- Senders (provisioned / platform-owned, no owner-facing choice) -----------
     "ses": ProviderSpec(
         provider="ses",
@@ -399,6 +427,10 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "channel_auth": ("meta",),
     "instagram_auth": ("instagram",),
     "sms_sender": ("twilio",),
+    # The choice here is not between vendors but between MODES: keep the platform
+    # SES address (never offered as a pick — it is provisioned via /connections/email)
+    # or connect your own Outlook mailbox. Only the BYO option is choosable.
+    "email_sender": ("outlook",),
 }
 
 # Provider ids that were split before the single-Meta correction. Rows already written
@@ -451,11 +483,11 @@ def default_provider(connection_type: str) -> str | None:
 def has_choice(connection_type: str) -> bool:
     """True iff this type presents the owner a PROVIDER CHOICE (Decision #6).
 
-    Only these types are validated against the registry on connect. ``email_sender`` is
-    the remaining exception — it is platform-provisioned, so its ``provider`` column is
-    just a brand label and pinning it to a registry entry would reject labels already in
-    the field for no safety gain. Everywhere a choice EXISTS the string steers a real
-    OAuth endpoint or credential form, so it is validated."""
+    Only these types are validated against the registry on connect. Every type now
+    carries a choice — ``email_sender`` joined when the BYO Outlook mailbox landed
+    (its ``ses`` rows keep validating because ``ses`` is registered for the type).
+    Everywhere a choice exists the string steers a real OAuth endpoint or credential
+    form, so it is validated."""
     return connection_type in _ORDER
 
 
