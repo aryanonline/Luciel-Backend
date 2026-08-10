@@ -8,6 +8,7 @@ Owns account/Luciel state transitions, delete grace, cascade cleanup, retention,
 `cascade.py`, `close_purge.py`, and `grace_expiry.py` — close/delete cleanup.
 `export_bundle.py` and `export_store.py` — export assembly/storage.
 `retention.py` and `audit_retention.py` — scheduled deletion rules.
+`transcript_archive.py` and `transcript_store.py` — 90-day hot→cold transcript offload to S3 + read-through (Commitment #38).
 
 ## Contracts this module owns
 - Account close is delete Luciel (offer export) then close account; deletion has 30-day grace and can restore active.

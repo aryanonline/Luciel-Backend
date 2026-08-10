@@ -6,7 +6,8 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
 ## Key files
 `orchestrator.py` — main runtime loop.
 `grounding.py` and `knowledge_retrieval.py` — evidence and score gate.
-`sessions.py`, `memory.py`, and `budget.py` — continuity/counting controls.
+`sessions.py`, `memory.py`, and `budget.py` — continuity/counting controls (participant-key session resolution: conversation = ONE billed session per §3.4.8).
+`session_close.py` — deterministic session END (inactivity sweep + explicit end signals) firing §3.4.7 summarization.
 `integration_status.py` and `provider_factory.py` — mode/binding truthfulness.
 
 ## Contracts this module owns

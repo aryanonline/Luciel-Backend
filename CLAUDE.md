@@ -71,6 +71,10 @@ modules rather than duplicating business rules in a new location.
   block, pay-as-you-go.
 - A conversation is a billed session. It counts once per billing period despite
   multiple turns and must mean the same thing in Overview, Billing, and Analytics.
+  On every channel the session key is the transport identifier (participant key,
+  §3.4.8); sessions END deterministically (inactivity sweep / close beacon) and are
+  summarized at close (§3.4.7). Transcripts move to S3 cold storage at 90 days and
+  hard-delete at 1 year (Commitment #38).
 - The free-50 window is anchored to the Stripe billing period; before a card exists,
   use the calendar-month fallback.
 - Meter only deltas: persist the watermark, use idempotent identifiers, flush
@@ -103,8 +107,11 @@ modules rather than duplicating business rules in a new location.
 - SMS and voice use the customer’s own Twilio account and designated number. Luciel
   neither pools/resells numbers nor performs the customer’s A2P registration.
 - One Meta connection serves WhatsApp and Messenger; Instagram is a separate
-  Business Login connection. Consent alone is not a live channel: each destination
-  must bind before it can truthfully be Connected.
+  Business Login connection. The wire/config enums carry SEPARATE `whatsapp`,
+  `messenger`, and `instagram` channel ids (§3.1.2); the legacy combined
+  `instagram_messenger` value survives only on pre-split session rows (read-path
+  tolerance, never configurable). Consent alone is not a live channel: each
+  destination must bind before it can truthfully be Connected.
 - Lifecycle is Connect → healthy / Action needed / Reconnect → Disconnect → Switch.
   Swap keeps the old credential serving until the replacement verifies.
 - Disabling a channel never disconnects its provider or clears its number.
@@ -162,7 +169,7 @@ python -m pytest -v
 
 For a fresh local environment, create/activate a Python 3.12 virtual environment,
 then install `-e .` plus the required test dependencies if the supplied environment
-does not already contain them. The expected baseline is about **1212 passed, 0 failed**.
+does not already contain them. The expected baseline is about **1270 passed, 0 failed**.
 Run focused tests while iterating, then run the full command above before commit.
 
 ## Deploy

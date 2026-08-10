@@ -17,7 +17,7 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
 - `tests/unit/test_sweep_scheduling.py`.
 
 ## Gotchas from the 2026-08-06 truth delta
-- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, and usage reconcile.
+- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), and the 90-day transcript hot→cold archive (Commitment #38).
 - “Freed” pages may be reused; files shrink only after explicit `VACUUM FULL`.
 
 ## Change checklist
