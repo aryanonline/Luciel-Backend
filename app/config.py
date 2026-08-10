@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # here (not only in app.billing.stripe_gateway) because live-mode startup must be able to
 # REFUSE it: it is published in this repo, so anything it verifies is forgeable. Defined
 # in config to keep the fail-closed check free of a billing import cycle.
-FAKE_STRIPE_WEBHOOK_SECRET = "whsec_fake_test_only"  # noqa: S105 # nosec B105
+FAKE_STRIPE_WEBHOOK_SECRET = "whsec_fake_test_only"  # noqa: S105  # nosec B105
 
 
 class Settings(BaseSettings):

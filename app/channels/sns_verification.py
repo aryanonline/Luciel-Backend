@@ -179,7 +179,7 @@ class SnsSignatureVerifier:
                 signature,
                 signed,
                 padding.PKCS1v15(),
-                hashes.SHA1() if algorithm == "SHA1" else hashes.SHA256(),  # noqa: S303
+                hashes.SHA1() if algorithm == "SHA1" else hashes.SHA256(),  # noqa: S303 — SignatureVersion 1 is SHA1 BY AWS SNS PROTOCOL; the algorithm is read from the signed message, not chosen by us, and SHA256 is used whenever AWS sends it  # nosec B303
             )
         except InvalidSignature:
             raise SnsVerificationError("signature_mismatch") from None

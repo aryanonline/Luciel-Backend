@@ -37,9 +37,9 @@ if TYPE_CHECKING:
 # Field names on the connect form (registry ``twilio`` credential_fields) and, for the
 # secret half, the keys the material is stored under.
 FIELD_ACCOUNT_SID = "accountSid"
-FIELD_AUTH_TOKEN = "authToken"  # noqa: S105 — field NAME, not a credential
+FIELD_AUTH_TOKEN = "authToken"  # noqa: S105 — field NAME, not a credential  # nosec B105
 FIELD_API_KEY_SID = "apiKeySid"
-FIELD_API_KEY_SECRET = "apiKeySecret"  # noqa: S105 — field NAME, not a credential
+FIELD_API_KEY_SECRET = "apiKeySecret"  # noqa: S105 — field NAME, not a credential  # nosec B105
 
 
 class InvalidTwilioCredentials(ValueError):

@@ -73,7 +73,7 @@ def _owned_by_current_user(table: str) -> str:
     RAISE NOTICE '0019: {table} not owned by %, left to the superuser lock', current_user;
     RETURN;
   END IF;
-"""  # noqa: S608
+"""  # noqa: S608  # nosec B608
 
 
 def upgrade() -> None:

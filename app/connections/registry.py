@@ -139,7 +139,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         # The SHARED Google client (see Settings.google_client_id) — Calendar is a scope
         # on the same OAuth app as Drive, not a separate app. Only the scope differs.
         client_id_setting="google_client_id",
-        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME
+        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="google_redirect_uri",
         help_text="Luciel reads your availability and writes bookings into this calendar.",
     ),
@@ -155,7 +155,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             supports_pkce=True,
         ),
         client_id_setting="calendly_client_id",
-        client_secret_setting="calendly_client_secret",  # noqa: S106 — field NAME
+        client_secret_setting="calendly_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="calendly_redirect_uri",
         help_text="Luciel books, moves, and cancels through your Calendly event types.",
     ),
@@ -174,7 +174,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             supports_pkce=False,
         ),
         client_id_setting="hubspot_client_id",
-        client_secret_setting="hubspot_client_secret",  # noqa: S106 — field NAME
+        client_secret_setting="hubspot_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="hubspot_redirect_uri",
         help_text="Push captured leads into HubSpot contacts.",
     ),
@@ -191,7 +191,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             token_fields=("instance_url",),  # the org's API base, needed on every call
         ),
         client_id_setting="salesforce_consumer_key",
-        client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME
+        client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="salesforce_redirect_uri",
         help_text="Push captured leads into Salesforce.",
     ),
@@ -247,7 +247,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             },
         ),
         client_id_setting="google_client_id",
-        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME
+        client_secret_setting="google_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="google_redirect_uri",
         scope_kind=SCOPE_DRIVE_FOLDERS,
         help_text="Choose which folders Luciel may read.",
@@ -265,7 +265,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             extra={"owner": "user"},
         ),
         client_id_setting="notion_client_id",
-        client_secret_setting="notion_client_secret",  # noqa: S106 — field NAME
+        client_secret_setting="notion_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="notion_redirect_uri",
         scope_kind=SCOPE_NOTION_PAGES,
         help_text="Choose which pages or databases Luciel may read.",
@@ -302,7 +302,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             supports_pkce=False,
         ),
         client_id_setting="meta_app_id",
-        client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME
+        client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="meta_redirect_uri",
         help_text="Connect your Meta Business account once — it powers WhatsApp and "
         "Facebook Messenger. Instagram is connected separately.",
@@ -335,7 +335,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             token_fields=("user_id",),
         ),
         client_id_setting="instagram_app_id",
-        client_secret_setting="instagram_app_secret",  # noqa: S106 — field NAME
+        client_secret_setting="instagram_app_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="instagram_redirect_uri",
         help_text="Connect the Instagram professional account Luciel answers DMs on.",
     ),

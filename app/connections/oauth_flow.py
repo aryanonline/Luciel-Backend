@@ -35,7 +35,7 @@ from app.config import get_settings
 from app.connections.registry import PROVIDERS, ProviderAuthorize, oauth_client_config
 
 STATE_TTL_SECONDS = 600  # a consent click-through is minutes, not hours
-STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, not a secret
+STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, not a secret  # nosec B105
 
 UNCONFIGURED_DETAIL = "Action needed: this provider's OAuth client is not configured yet"
 

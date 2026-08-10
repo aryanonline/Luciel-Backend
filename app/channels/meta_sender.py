@@ -38,7 +38,7 @@ _GRAPH_BASE = "https://graph.facebook.com/v19.0"
 _INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com/v23.0"
 
 #: The key ``exchange_code_for_token`` writes the Graph token under.
-FIELD_ACCESS_TOKEN = "access_token"  # noqa: S105 — field NAME, not a credential
+FIELD_ACCESS_TOKEN = "access_token"  # noqa: S105 — field NAME, not a credential  # nosec B105
 
 
 class GraphMetaSender:

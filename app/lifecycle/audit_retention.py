@@ -68,14 +68,14 @@ class LockCheck:
 # CLI, which has no SQLAlchemy to bind with.
 def _owned_by_audit_owner(relname: str) -> str:
     return (
-        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "  # noqa: S608
+        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "  # noqa: S608  # nosec B608
         f"WHERE c.relname = '{relname}' AND r.rolname = 'luciel_audit_owner')"
     )
 
 
 def _trigger_exists(relname: str, tgname: str) -> str:
     return (
-        "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "  # noqa: S608
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "  # noqa: S608  # nosec B608
         f"WHERE c.relname = '{relname}' AND t.tgname = '{tgname}' AND NOT t.tgisinternal)"
     )
 
