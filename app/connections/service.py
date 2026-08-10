@@ -986,6 +986,15 @@ async def switch(
 # zero-DNS fallback that is immediately connected.
 
 EMAIL_ROUTING_DETAIL = "Action needed: complete email routing"
+
+
+class EmailAddressTaken(Exception):
+    """The requested email address is another tenant's inbound-routing destination."""
+
+    def __init__(self, address: str) -> None:
+        super().__init__(f"{address} is already in use by another account")
+
+
 _VM_SUBDOMAIN_ZONE = "reply.vantagemind.ai"
 _INBOUND_MX = "inbound.vantagemind.ai"
 
@@ -1066,9 +1075,21 @@ async def provision_email(
             created_by_user_id=user_id,
         )
         session.add(connection)
+    # Inbound routing (§3.1.3): the address IS the destination key that
+    # ``channel_resolve_destination`` matches at delivery time. This was the dead-
+    # routing gap — provisioning wrote only {address, mode}, so SES inbound could
+    # resolve NO tenant at all: every inbound email bounced off "unknown destination"
+    # while the dashboard showed a configured address. Same cross-tenant uniqueness
+    # rule as every other destination claim, through the same SECURITY DEFINER
+    # resolver delivery uses (RLS hides foreign claims from an ordinary query).
+    from app.channels import routing  # noqa: PLC0415 — avoid import cycle at module load
+
+    holder = await routing.owner_of_destination(session, "email_sender", address)
+    if holder is not None and holder != admin_id:
+        raise EmailAddressTaken(address)
     connection.status = status
     connection.status_detail = status_detail
-    connection.non_secret_config = {"address": address, "mode": mode}
+    connection.non_secret_config = {"address": address, "mode": mode, "destination": address}
     await session.flush()
 
     await audit.emit(

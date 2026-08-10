@@ -581,6 +581,17 @@ export class ComputeStack extends Stack {
         cron: 'cron(30 2 * * ? *)',
         description: 'Move transcripts past 90 days to S3 cold storage (Commitment #38)',
       },
+      {
+        // Every 5 minutes — this is the email channel's inbound TRANSPORT for BYO-
+        // mailbox tenants (§3.1.6a delta poll), not a compliance sweep, so its cadence
+        // is customer-facing reply latency. Cost is deliberate and bounded: ~288
+        // 256-CPU Fargate runs/day ≈ $3-4/month, each a no-op index scan on a platform
+        // with no connected mailboxes (candidates limited to CONNECTED outlook rows,
+        // migration 0038). Pauses with the environment like every other schedule.
+        name: 'mailbox_poll',
+        cron: 'cron(0/5 * * * ? *)',
+        description: 'Pull new mail from connected BYO Outlook mailboxes (§3.1.6a)',
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack

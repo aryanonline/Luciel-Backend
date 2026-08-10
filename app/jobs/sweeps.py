@@ -80,6 +80,7 @@ HEALTH = "health"
 AUDIT_RETENTION = "audit_retention"
 SESSION_FINALIZE = "session_finalize"
 TRANSCRIPT_ARCHIVE = "transcript_archive"
+MAILBOX_POLL = "mailbox_poll"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -93,6 +94,7 @@ SWEEP_KINDS: tuple[str, ...] = (
     AUDIT_RETENTION,
     SESSION_FINALIZE,
     TRANSCRIPT_ARCHIVE,
+    MAILBOX_POLL,
 )
 
 
@@ -255,6 +257,21 @@ async def run_transcript_archive(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(TRANSCRIPT_ARCHIVE, _archive_transcripts, now)
 
 
+async def _poll_mailboxes(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+    from app.channels.mailbox_poll import poll_mailbox  # noqa: PLC0415 — lazy: 5-min cadence
+
+    return await poll_mailbox(session, admin_id=admin_id, now=now)
+
+
+async def run_mailbox_poll(*, now: datetime | None = None) -> list[str]:
+    """Pull new mail from every connected BYO Outlook mailbox (§3.1.6a).
+
+    Every 5 minutes — the email channel's inbound transport for mailbox tenants, not
+    a compliance sweep. Candidates are only tenants with a CONNECTED outlook row
+    (migration 0038), so the run is a no-op scan on a platform with none."""
+    return await _per_tenant(MAILBOX_POLL, _poll_mailboxes, now)
+
+
 SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -267,4 +284,5 @@ SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     AUDIT_RETENTION: run_audit_retention,
     SESSION_FINALIZE: run_session_finalize,
     TRANSCRIPT_ARCHIVE: run_transcript_archive,
+    MAILBOX_POLL: run_mailbox_poll,
 }

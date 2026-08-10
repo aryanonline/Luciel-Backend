@@ -32,10 +32,9 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request, Response
 
-from app.channels import outbound, pipeline, routing
-from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected, InstanceContext
+from app.channels import inbound_dispatch, routing
+from app.channels.base import ChannelAdapter, InboundRejected, InstanceContext
 from app.channels.meta_messaging_adapter import MetaMessagingAdapter
-from app.channels.runtime_entry import run_inbound_message
 from app.channels.sms_adapter import SmsAdapter
 from app.channels.sns_verification import ConfigGatedSnsVerifier, confirm_subscription
 from app.channels.whatsapp_adapter import WhatsAppAdapter
@@ -72,32 +71,9 @@ async def _tenant_twilio_auth_token(to_number: str) -> str | None:
         return await tenant_auth_token(s, ctx.admin_id, ctx.instance_id)
 
 
-async def _run_and_reply(msg: InboundMessage) -> str:
-    """Run an admitted InboundMessage through the runtime and deliver Luciel's answer.
-
-    SMS rides back in the TwiML response the caller builds, so it is left alone here.
-    Every other channel's provider needs an out-of-band push, so the reply is sent through
-    the channel adapter before the webhook acks — otherwise the lead gets silence.
-    """
-    async with tenant_session(msg.admin_id) as s:
-        reply = await run_inbound_message(s, msg)
-        if reply.reply_text and msg.channel not in outbound.INLINE_REPLY_CHANNELS:
-            await outbound.send_outbound_reply(
-                s,
-                admin_id=msg.admin_id,
-                instance_id=msg.instance_id,
-                channel=msg.channel,
-                # Reply to the identifier the lead wrote in from (§3.4.9), never a stored
-                # contact on another channel.
-                to=msg.customer_identifier,
-                body=reply.reply_text,
-                subject=msg.channel_metadata.get("subject"),
-                sender_id=(
-                    msg.channel_metadata.get("destination_id")
-                    or msg.channel_metadata.get("phone_number_id")
-                ),
-            )
-        return reply.reply_text
+# Shared with the mailbox poll sweep (pull ingress) — see channels/inbound_dispatch.
+# Module-level aliases keep this module's public shape (and its tests) stable.
+_run_and_reply = inbound_dispatch.run_and_reply
 
 
 # --------------------------------------------------------------------------- #
@@ -221,26 +197,9 @@ async def meta_inbound(request: Request) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# shared dispatch
+# shared dispatch — see channels/inbound_dispatch (shared with the mailbox poll)
 # --------------------------------------------------------------------------- #
-async def _dispatch(adapter: ChannelAdapter, req: dict[str, Any]) -> str | None:
-    """Run the inbound edge + runtime; return reply text, or None if not routed.
-
-    Signature/resolution failures are rejected + logged (never raised to the provider
-    as a 5xx — a rejected inbound is a clean no-op ack so the provider does not retry
-    a spoofed/garbled request forever)."""
-    async with untenanted_session() as s:
-        try:
-            outcome = await pipeline.ingest(adapter, req, s)
-        except InboundRejected as rej:
-            await pipeline.record_inbound_rejection(
-                s, reason=rej.reason, channel=adapter.channel_id
-            )
-            return None
-    if isinstance(outcome, InboundMessage):
-        return await _run_and_reply(outcome)  # noqa: RET504
-    # AdmissionDenied / OptOutHandled / InboundRejected → no runtime reply.
-    return None
+_dispatch = inbound_dispatch.dispatch_inbound
 
 
 def _build_email_adapter() -> EmailAdapter:

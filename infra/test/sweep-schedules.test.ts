@@ -53,6 +53,7 @@ const SWEEPS = [
   'audit_retention',
   'session_finalize',
   'transcript_archive',
+  'mailbox_poll',
 ];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {

@@ -183,15 +183,18 @@ async def provision_email(
 ) -> EmailProvisioningOut:
     async with tenant_session(subject.admin_id) as s:
         inst = await _instance_row(s, subject.admin_id)
-        conn = await service.provision_email(
-            s,
-            admin_id=subject.admin_id,
-            instance_id=inst.id,
-            mode=req.mode,
-            email_address=req.email_address,
-            instance_name=inst.name,
-            user_id=subject.user_id,
-        )
+        try:
+            conn = await service.provision_email(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=inst.id,
+                mode=req.mode,
+                email_address=req.email_address,
+                instance_name=inst.name,
+                user_id=subject.user_id,
+            )
+        except service.EmailAddressTaken as exc:
+            raise conflict(str(exc)) from exc
         return _email_provisioning_out(conn)
 
 

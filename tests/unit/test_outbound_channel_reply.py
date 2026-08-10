@@ -325,7 +325,11 @@ async def test_inbound_email_answer_is_pushed_back_to_the_lead(email_sender, mon
     async def fake_run(session, msg):
         return Reply()
 
-    monkeypatch.setattr(webhook_channels, "run_inbound_message", fake_run)
+    from app.channels import inbound_dispatch
+
+    # The runtime entry moved with the shared dispatch (channels/inbound_dispatch);
+    # webhook_channels._run_and_reply is an alias of the same function.
+    monkeypatch.setattr(inbound_dispatch, "run_inbound_message", fake_run)
 
     await webhook_channels._run_and_reply(
         InboundMessage(

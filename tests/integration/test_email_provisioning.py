@@ -67,7 +67,13 @@ async def test_own_domain_is_pending_until_routing_verified():
         )
         assert conn.status == "pending_email_routing"
         assert conn.status_detail == service.EMAIL_ROUTING_DETAIL
-        assert conn.non_secret_config == {"address": "hello@acme.com", "mode": "own_domain"}
+        # ``destination`` rides along since the dead-routing fix: the address IS the
+        # key inbound routing resolves by (channel_resolve_destination).
+        assert conn.non_secret_config == {
+            "address": "hello@acme.com",
+            "mode": "own_domain",
+            "destination": "hello@acme.com",
+        }
         assert conn.connection_type == "email_sender"
         # Address is the authoritative resolver value; no secret written on this path.
         assert await service.resolve_email_address(s, admin, iid) == "hello@acme.com"
