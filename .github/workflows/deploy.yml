@@ -97,14 +97,19 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy infra stacks (Compute/Edge/Observability/Widget) with the built image
+      - name: Deploy infra stacks (Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         run: |
           npm ci
           # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
           # crossRegionReferences; the CDK app wires that, so naming both is enough.
-          npx cdk deploy "Luciel-dev-Compute" "Luciel-dev-Edge" \
-            "Luciel-dev-Observability" \
+          # Data is named because it owns the transcript-archive bucket the Compute
+          # task role is granted on (Commitment #38) — deploying Compute against a
+          # stale Data stack fails on a cross-stack export that does not exist yet.
+          # Budget is the per-environment AWS Budgets ceiling: no runtime cost, and
+          # it is the control that catches an environment left running by accident.
+          npx cdk deploy "Luciel-dev-Data" "Luciel-dev-Compute" "Luciel-dev-Edge" \
+            "Luciel-dev-Observability" "Luciel-dev-Budget" \
             "Luciel-dev-WidgetCert" "Luciel-dev-Widget" \
             -c env=dev -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
@@ -224,12 +229,14 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy prod infra stacks (Compute/Edge/Observability/Widget) with the built image
+      - name: Deploy prod infra stacks (Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         run: |
           npm ci
-          npx cdk deploy "Luciel-prod-Compute" "Luciel-prod-Edge" \
-            "Luciel-prod-Observability" \
+          # Data and Budget are named for the same reasons as in the dev job above:
+          # the transcript-archive bucket's cross-stack export, and the cost ceiling.
+          npx cdk deploy "Luciel-prod-Data" "Luciel-prod-Compute" "Luciel-prod-Edge" \
+            "Luciel-prod-Observability" "Luciel-prod-Budget" \
             "Luciel-prod-WidgetCert" "Luciel-prod-Widget" \
             -c env=prod -c buildImage=true \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
