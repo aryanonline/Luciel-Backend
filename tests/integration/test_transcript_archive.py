@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.db.session import tenant_session
 from app.jobs import sweeps
+from app.lifecycle import transcript_store as store_mod
 from app.lifecycle.transcript_archive import archive_aged_transcripts
 from app.lifecycle.transcript_store import LocalTranscriptStore, transcript_prefix_for
 from app.models.conversation import Session as ConvSession
@@ -28,10 +29,24 @@ pytestmark = [pytest.mark.asyncio]
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)
 
 
+class DurableLocalStore(LocalTranscriptStore):
+    """Stands in for the real S3 store: same behavior, but flagged DURABLE.
+
+    The archive sweep refuses to delete hot rows into a store that cannot outlive the
+    process (see ``LocalTranscriptStore.durable``), so the tests that exercise the
+    MOVE must bind a store that claims what S3 provides. The refusal itself is
+    covered by ``test_the_sweep_refuses_to_move_into_a_non_durable_store``.
+    """
+
+    durable = True
+
+
 @pytest.fixture(autouse=True)
 def _fresh_store():
     LocalTranscriptStore.reset()
+    store_mod.set_transcript_store(DurableLocalStore())
     yield
+    store_mod.set_transcript_store(None)
     LocalTranscriptStore.reset()
 
 
@@ -170,10 +185,46 @@ async def test_a_live_session_is_never_archived():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_sweep_refuses_to_move_into_a_non_durable_store():
+    """FOUND ON DEV — the failure this guard exists for.
+
+    In mock mode the bound store is an in-process dict. The sweep runs as its OWN
+    one-shot process (``python -m app.jobs transcript_archive``), so it deleted the
+    hot rows, wrote the "archive" into memory that died with the process, and left
+    the session pointing at a key that resolved to nothing: the customer's
+    conversation was silently, permanently gone. A "move" is only a move when the
+    destination outlives the mover — otherwise the sweep must do nothing at all.
+
+    The in-process test suite could not see this: it archived and read back inside
+    one process, where the dict is still alive.
+    """
+    admin_id, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed_tenant(admin_id, iid)
+    sid = await _seed_ended_session(admin_id, iid, age=timedelta(days=120))
+
+    # The DEFAULT mock-mode store (non-durable), not the DurableLocalStore double.
+    store_mod.set_transcript_store(LocalTranscriptStore())
+    try:
+        assert await _archive(admin_id) == 0, (
+            "the sweep moved data into a store that cannot keep it"
+        )
+    finally:
+        store_mod.set_transcript_store(DurableLocalStore())
+
+    # Everything stays exactly where it is safe: hot, unmarked, readable.
+    assert await _hot_rows(admin_id, sid) == 4
+    sess = await _session(admin_id, sid)
+    assert sess.archive_object_key is None
+    assert sess.transcripts_archived_at is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_put_failure_leaves_everything_hot_for_the_next_run():
     from app.lifecycle import transcript_store as store_mod
 
-    class ExplodingStore(LocalTranscriptStore):
+    class ExplodingStore(DurableLocalStore):
+        """A durable store that is momentarily unreachable — the put fails."""
+
         async def put(self, *, key: str, data: bytes) -> None:
             raise RuntimeError("s3 down")
 
@@ -186,7 +237,7 @@ async def test_a_put_failure_leaves_everything_hot_for_the_next_run():
         with pytest.raises(RuntimeError):
             await _archive(admin_id)
     finally:
-        store_mod.set_transcript_store(None)
+        store_mod.set_transcript_store(DurableLocalStore())
 
     # Nothing moved, nothing stamped — the next healthy run picks it up whole.
     assert await _hot_rows(admin_id, sid) == 4

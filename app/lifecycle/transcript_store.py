@@ -41,6 +41,12 @@ def transcript_key_for(admin_id: uuid.UUID, instance_id: uuid.UUID, session_id: 
 class TranscriptStore(Protocol):
     """Persist / read / delete archived-transcript JSONL objects (Commitment #38)."""
 
+    #: Whether this store OUTLIVES the process that wrote to it. The archive sweep
+    #: DELETES the hot Postgres rows once it has written the object, so a store that
+    #: does not survive its own process would destroy the transcript rather than move
+    #: it. Only a real remote store may set this True.
+    durable: bool
+
     async def put(self, *, key: str, data: bytes) -> None:
         """Upload ``data`` under ``key``. Overwrite-idempotent: re-archiving the same
         session writes the same key, so an at-least-once sweep cannot duplicate."""
@@ -60,7 +66,17 @@ class TranscriptStore(Protocol):
 
 
 class LocalTranscriptStore:
-    """In-process, deterministic TranscriptStore for dev/test (mirrors LocalExportStore)."""
+    """In-process, deterministic TranscriptStore for dev/test (mirrors LocalExportStore).
+
+    NOT durable, and that is load-bearing: the dict dies with the process. The archive
+    sweep reads :attr:`durable` and refuses to move (and therefore delete) transcripts
+    into a store that cannot outlive it — see ``transcript_archive.archive_aged_transcripts``.
+    Found on dev: a mock-mode sweep ran in its own process, deleted the hot rows, wrote
+    the object into that process's memory, and exited — the conversation was gone and
+    the session pointed at a key that resolved to nothing.
+    """
+
+    durable = False
 
     _store: dict[str, bytes] = {}
     _lock = threading.Lock()
@@ -107,6 +123,10 @@ class S3TranscriptStore:
 
     boto3 is imported LAZILY so CI (no AWS) still imports this module. Only selected
     in ``live`` mode by :func:`get_transcript_store`; never the default."""
+
+    #: S3 outlives every process that writes to it — the one store the archive sweep
+    #: may delete hot rows into.
+    durable = True
 
     def __init__(self, *, bucket: str, region_name: str) -> None:
         self._bucket = bucket

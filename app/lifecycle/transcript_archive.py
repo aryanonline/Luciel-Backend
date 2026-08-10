@@ -85,9 +85,19 @@ async def archive_aged_transcripts(
     Returns the number of sessions archived (the sweep's acted signal). Idempotent:
     archived sessions carry ``transcripts_archived_at`` and are never candidates
     again; a crash between put and stamp re-puts the same key (overwrite) next run.
+
+    REFUSES TO RUN against a non-durable store (``store.durable is False``). This is
+    the load-bearing safety check, found on dev: in mock mode the bound store is an
+    in-process dict, so a sweep running as its own one-shot process deleted the hot
+    rows, wrote the "archive" into memory that died with it, and left the session
+    pointing at a key resolving to nothing — a silent, permanent loss of the
+    customer's conversation. "Move" is only a move when the destination outlives the
+    mover; otherwise this is a no-op and the transcripts stay hot where they are safe.
     """
     now = now or datetime.now(UTC)
     store = get_transcript_store()
+    if not getattr(store, "durable", False):
+        return 0
     candidates = (
         (
             await session.execute(

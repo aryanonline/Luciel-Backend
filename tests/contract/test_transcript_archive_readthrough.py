@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.db.session import tenant_session
+from app.lifecycle import transcript_store as store_mod
 from app.lifecycle.transcript_archive import archive_aged_transcripts
 from app.lifecycle.transcript_store import LocalTranscriptStore
 from app.models.conversation import Session as ConvSession
@@ -23,10 +24,19 @@ pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)
 
 
+class DurableLocalStore(LocalTranscriptStore):
+    """Stands in for S3: same behavior, flagged durable so the archive sweep will
+    actually move (the sweep refuses non-durable stores — see the archive tests)."""
+
+    durable = True
+
+
 @pytest.fixture(autouse=True)
 def _fresh_store():
     LocalTranscriptStore.reset()
+    store_mod.set_transcript_store(DurableLocalStore())
     yield
+    store_mod.set_transcript_store(None)
     LocalTranscriptStore.reset()
 
 
