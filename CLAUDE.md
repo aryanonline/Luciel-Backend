@@ -106,6 +106,11 @@ modules rather than duplicating business rules in a new location.
   external secrets in Secrets Manager under the `vm/` prefix.
 - SMS and voice use the customer’s own Twilio account and designated number. Luciel
   neither pools/resells numbers nor performs the customer’s A2P registration.
+- Email is BYO-mailbox (§3.1.6a; Outlook first): the customer connects their own work
+  mailbox under the existing `email_sender` type; replies go out AS that mailbox with
+  no silent SES fallback, inbound arrives via the 5-minute `mailbox_poll` delta sweep
+  (the FIRST poll drains history unprocessed — the baseline rule), and the platform
+  SES / own-domain modes remain the non-mailbox alternative.
 - One Meta connection serves WhatsApp and Messenger; Instagram is a separate
   Business Login connection. The wire/config enums carry SEPARATE `whatsapp`,
   `messenger`, and `instagram` channel ids (§3.1.2); the legacy combined

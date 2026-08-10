@@ -5,7 +5,10 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
 
 ## Key files
 `pipeline.py` and `runtime_entry.py` — inbound flow and shared pause/runtime gate.
-`outbound.py`, `twilio_sender.py`, and `meta_sender.py` — actual delivery boundaries.
+`inbound_dispatch.py` — pipeline→runtime→reply, shared by webhooks AND the mailbox poll.
+`outbound.py`, `twilio_sender.py`, `meta_sender.py`, and `outlook_sender.py` — delivery boundaries.
+`tenant_outlook.py` — Microsoft token refresh (rotating refresh tokens, live-gated).
+`mailbox_poll.py` — BYO-mailbox inbound via Graph delta polling (5-min sweep).
 `signatures.py` and `sns_verification.py` — inbound authenticity.
 `email_routing.py`, `phone_lifecycle.py`, and `number_operability.py` — channel readiness.
 
@@ -18,9 +21,16 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
 - `tests/integration/test_channels.py`, `test_voice_pipeline.py`, and `test_tenant_meta_sender.py`.
 - `tests/unit/test_delivery_honesty.py`, signature, sender, pause, and adapter tests.
 
-## Gotchas from the 2026-08-06 truth delta
+## Gotchas from the 2026-08-06 truth delta (updated 2026-08-10)
 - Widget replies from human takeover are persisted and delivered on the next poll, not pushed instantly.
 - Customer Twilio accounts/numbers are BYO; number disable/enable must not sever the connection or erase the number.
+- A BYO Outlook mailbox has NO silent SES fallback on the send path: an expired or
+  unrefreshable mailbox refuses with `mailbox_reconnect_needed` (falling back would
+  swap the FROM identity behind the owner's back). Graph's sendMail answers 202 with
+  no message id — never fabricate one.
+- THE BASELINE RULE (`mailbox_poll.py`): the first poll after a mailbox connects
+  drains the entire delta chain WITHOUT processing — the customer's historical inbox
+  is never conversation backlog. Do not weaken this to satisfy a test.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

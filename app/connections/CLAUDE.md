@@ -7,6 +7,7 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
 `service.py` — connection lifecycle operations.
 `registry.py` — supported provider definitions.
 `oauth_flow.py` — signed OAuth state and callback exchange.
+`verify.py` — post-exchange provider verification (Graph /me for the Outlook mailbox).
 `secrets.py` — tenant secret storage.
 `health.py`, `gate.py`, and `deferred_queue.py` — readiness and follow-up.
 
@@ -19,9 +20,20 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
 - `tests/contract/test_connection_lifecycle.py`, `test_connections.py`, and OAuth callback tests.
 - `tests/integration/test_connections.py`, swap, provisioning, operability, and deferred-health tests.
 
-## Gotchas from the 2026-08-06 truth delta
+## Gotchas from the 2026-08-06 truth delta (updated 2026-08-10)
 - One Meta connection covers WhatsApp/Messenger; Instagram is separate and each channel needs its own destination binding.
-- Email is ruled BYO but not built; current platform-provisioned address/own-domain reverify state must not be presented as completed BYO email.
+- BYO email mailbox IS now built (Outlook first, owner decision 2026-08-10): `outlook`
+  registers under the existing `email_sender` type beside the platform `ses` modes.
+  Connect-verify-bind-live runs through `complete_oauth_connect`'s verify seam
+  (`verify.py`); a ses→outlook swap derives its flow shape from the STAGED provider
+  and cuts over (provider + auth_class) only in `confirm_reconnect`. The SES sender
+  keeps serving on any verify failure — never silently replaced.
+- `provision_email` binds the address as the inbound-routing `destination` (with the
+  cross-tenant uniqueness check); before migration 0037 no email_sender row carried
+  one and SES inbound resolved no tenant at all.
+- Microsoft tokens live ~1h and refresh tokens ROTATE: `app/channels/tenant_outlook.py`
+  owns refresh (on-demand + the health sweep's provider-dispatching refresher). Live
+  mode only; mock falls back to the honest no-refresher.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

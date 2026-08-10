@@ -10,6 +10,14 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 `test/stripe-posture.test.ts` — deployment posture guard.
 
 ## Contracts this module owns
+- ECS runs the SCANNED artifact: `-c imageTag=<sha>` points Compute at the pipeline's
+  gated ECR image (`imageRepoName` in env-config; preprod runs the PROD repo — the
+  rehearsal uses the release artifact). Never reintroduce a deploy-time asset build.
+- The CVE gate is `scripts/check_image_scan.py` + `.security/cve-allowlist.json`
+  (governed, expiring exceptions; fails CLOSED on scan unavailability). Pause runs
+  skip the build and reuse the deployed tag — taking an env down never needs a build.
+- Twelve sweep schedules (incl. the 5-min `mailbox_poll`); dev has NO VPC interface
+  endpoints (env-gated, ~$73/mo — NAT carries the traffic; prod/preprod keep them).
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.
