@@ -15,12 +15,15 @@ or delivery honesty just because no webhook was involved.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.channels import outbound, pipeline
 from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected
 from app.channels.runtime_entry import run_inbound_message
 from app.db.session import tenant_session, untenanted_session
+
+logger = logging.getLogger(__name__)
 
 
 async def run_and_reply(msg: InboundMessage) -> str:
@@ -34,7 +37,7 @@ async def run_and_reply(msg: InboundMessage) -> str:
     async with tenant_session(msg.admin_id) as s:
         reply = await run_inbound_message(s, msg)
         if reply.reply_text and msg.channel not in outbound.INLINE_REPLY_CHANNELS:
-            await outbound.send_outbound_reply(
+            result = await outbound.send_outbound_reply(
                 s,
                 admin_id=msg.admin_id,
                 instance_id=msg.instance_id,
@@ -52,6 +55,16 @@ async def run_and_reply(msg: InboundMessage) -> str:
                 # when the ingress knew it. Senders without a reply concept ignore it.
                 in_reply_to=msg.channel_metadata.get("graph_message_id"),
             )
+            if not result.delivered:
+                # An AI reply that did not reach the customer is an incident-shaped
+                # fact, not a return value to discard — the transcript records what
+                # Luciel SAID; this records whether anyone HEARD it. No recipient
+                # identifiers in the line (§3.8.3): channel + reason only.
+                logger.warning(
+                    "inbound_reply_undelivered channel=%s detail=%s",
+                    msg.channel,
+                    result.detail,
+                )
         return reply.reply_text
 
 

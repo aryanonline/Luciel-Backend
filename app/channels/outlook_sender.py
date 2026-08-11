@@ -17,6 +17,7 @@ Honesty notes:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Protocol
 
@@ -24,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.tenant_outlook import ensure_fresh_token
 from app.connections.secrets import SecretStore
+
+logger = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -66,6 +69,15 @@ class GraphMailSender:
             }
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(url, json=payload, headers=headers)
+        if response.status_code != 202:
+            # The owner's first live question was "did it actually send?" — and a
+            # silent False here made that unanswerable from our own logs. Status
+            # code only: a Graph error body can carry addresses (§3.8.3).
+            logger.warning(
+                "outlook_send_rejected status=%s endpoint=%s",
+                response.status_code,
+                "reply" if in_reply_to else "sendMail",
+            )
         return response.status_code == 202
 
 

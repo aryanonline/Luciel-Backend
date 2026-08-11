@@ -282,3 +282,37 @@ async def test_the_sweep_registration_is_complete():
     candidates = await sweeps.sweep_candidates("mailbox_poll")
     assert admin in candidates
     assert other not in candidates
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_undelivered_reply_is_logged_not_silently_discarded(monkeypatch, caplog):
+    """The owner's first live question was "did it actually send?" — and the reply
+    pipeline discarded the delivery receipt, so the logs could not answer. The
+    transcript records what Luciel SAID; this line records whether anyone HEARD it."""
+    import logging
+
+    delta = "https://graph.microsoft.com/v1.0/delta-final"
+    admin, _iid = await _seed_tenant(delta_link=delta, since=NOW.isoformat())
+    graph = FakeGraph(
+        {
+            delta: {
+                "value": [_message("new-1")],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-next",
+            }
+        }
+    )
+
+    async def undelivered(session, **kwargs):
+        return outbound.OutboundResult(
+            channel="email", delivered=False, detail="mailbox_send_failed"
+        )
+
+    monkeypatch.setattr(outbound, "send_outbound_reply", undelivered)
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.inbound_dispatch"):
+        async with tenant_session(admin) as s:
+            await poll_mailbox(s, admin_id=admin, now=NOW + timedelta(minutes=35), transport=graph)
+
+    line = next(r for r in caplog.records if "inbound_reply_undelivered" in r.getMessage())
+    assert "mailbox_send_failed" in line.getMessage()
+    assert "dana@lead.example" not in line.getMessage()  # no recipient identifiers (§3.8.3)
