@@ -26,11 +26,23 @@ export interface EdgeStackProps extends StackProps {
 }
 
 export class EdgeStack extends Stack {
-  public readonly webAcl: wafv2.CfnWebACL;
+  public readonly webAcl?: wafv2.CfnWebACL;
 
   constructor(scope: Construct, id: string, props: EdgeStackProps) {
     super(scope, id, props);
     const { envConfig, alb } = props;
+
+    // WAF follows the environment's WAKEFULNESS in dev (owner cost mandate,
+    // 2026-08-12): a paused environment's ALB serves nothing but 503s, so its
+    // firewall protects nothing while still billing (~$20+/month, hourly). The
+    // pause/unpause pipeline deploys this stack on every run, so the ACL is
+    // removed at pause and re-created automatically the moment the environment
+    // wakes — an UNPAUSED dev (live demos, real keys) is always protected.
+    // Environments with armed alarms (preprod/prod) keep the WAF unconditionally:
+    // production posture is never cost-gated.
+    if (!envConfig.alarmsArmed && envConfig.paused) {
+      return;
+    }
 
     this.webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
       scope: 'REGIONAL', // attaches to the ALB

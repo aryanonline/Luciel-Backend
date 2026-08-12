@@ -13,9 +13,11 @@ name: dev-cost-guard
 
 on:
   schedule:
-    # Weekly, Sunday 09:00 UTC — well inside every 7-day auto-restart window
-    # that could begin after a pause.
-    - cron: '0 9 * * 0'
+    # Daily 09:00 UTC. AWS force-restarts a stopped RDS after 7 days at an
+    # unpredictable hour; a weekly check could trail that restart by up to a
+    # week of billed hours. Daily caps the drift at under a day for a job
+    # that costs nothing to run.
+    - cron: '0 9 * * *'
   workflow_dispatch: {}
 
 permissions:
