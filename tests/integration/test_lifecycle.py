@@ -15,6 +15,7 @@ from app.db.session import tenant_session
 from app.lifecycle import cascade, state_machine
 from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import AdminAuditLog
+from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead
@@ -91,16 +92,80 @@ async def test_delete_fused_quiesce_to_grace_then_restore_active():
             await s.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin))
         ).scalar_one()
         assert src.soft_deleted_at is not None
-    # Restore → ACTIVE (not paused), fresh embed key.
+    # Restore → ACTIVE (not paused), and the SAME embed key revives (§3.6.4
+    # "exactly as it was") — a fresh key would permanently kill the snippet
+    # already deployed on the customer's website.
     async with tenant_session(admin) as s:
         inst = await state_machine.restore(s, admin, admin)
         assert inst.state == LucielState.active
         assert inst.grace_window_started_at is None
-        assert inst.embed_key_public_id and inst.embed_key_public_id.startswith("vm_live_")
+        assert inst.embed_key_public_id == "vm_live_seed"
+        assert inst.embed_key_stashed is None
         src = (
             await s.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin))
         ).scalar_one()
         assert src.soft_deleted_at is None
+
+
+async def test_restore_of_a_legacy_grace_row_with_no_stash_mints_a_fresh_key() -> None:
+    """A row that entered grace before the stash column existed has nothing to
+    revive — restore falls back to minting, never crashes and never restores None."""
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == admin))
+        ).scalar_one()
+        inst.embed_key_stashed = None  # simulate the pre-migration grace row
+    async with tenant_session(admin) as s:
+        inst = await state_machine.restore(s, admin, admin)
+        assert inst.state == LucielState.active
+        assert inst.embed_key_public_id and inst.embed_key_public_id.startswith("vm_live_")
+        assert inst.embed_key_public_id != "vm_live_seed"
+
+
+async def test_delete_schedules_secret_cleanup_rather_than_claiming_it_happened() -> None:
+    """The delete-time audit event must not assert a cleanup that has not run: the
+    secret survives the 30-day grace (restore needs it), so delete emits
+    connection_secret_cleanup_scheduled; the real connection_secret_cleanup belongs
+    to the cascade/disconnect paths that actually destroy material."""
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=(
+                    await s.execute(select(Instance.id).where(Instance.admin_id == admin))
+                ).scalar_one(),
+                connection_type="calendar",
+                auth_class="oauth_token",
+                provider="google_calendar",
+                status="connected",
+                secret_ref="vm/keep-me",
+            )
+        )
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+    async with tenant_session(admin) as s:
+        events = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(AdminAuditLog.admin_id == admin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        kinds = {e.event_type for e in events}
+        assert "connection_secret_cleanup_scheduled" in kinds
+        assert "connection_secret_cleanup" not in kinds  # nothing was destroyed yet
+        scheduled = [
+            e for e in events if e.event_type == "connection_secret_cleanup_scheduled"
+        ]
+        assert scheduled[0].event_payload["secret_ref_present"] is True
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

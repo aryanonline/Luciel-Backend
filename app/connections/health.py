@@ -7,16 +7,21 @@ connection", §3.8.5). It:
     brand, §3.8.5) — so a new provider inherits the right behavior automatically;
   * proactively refreshes OAuth/long-lived tokens ~30 min before expiry (§3.8.5
     refresh path); on refresh failure → status='expired' + status_detail + audit;
-  * transitions status (connected / error / expired / dormant) and stamps
+  * transitions status (connected / error / expired) and stamps
     ``last_health_check_at`` + ``status_detail`` (§3.8.4 lifecycle);
   * for a revoked/expired knowledge_source connection, pauses the sync and flags
     the source paused_reconnect_needed — reusing the Arc 11b mechanism
     (app/knowledge/sync.pause_sync_on_revocation, §3.2.3) rather than a parallel one.
 
-``dormant`` (§3.8.4): a connection preserved but unused for a long window — defined
-here as healthy yet no successful use within ``DORMANT_AFTER``. It is not dispatched
-by the broker and is restored on re-use/re-upgrade. (The downgrade-grace meaning in
-§3.8.4 is the lifecycle side; this worker sets the unused-window side.)
+``dormant`` (§3.8.4 / Legal §A3) is a BILLING state, not a health state: dunning
+suspends action-tool connections when payment is lost (app/billing/dunning.py)
+and the payment webhooks restore them. The sweep therefore leaves dormant rows
+untouched — probing one and finding it healthy must NOT flip it back to
+``connected``, or the 6-hour sweep would silently re-arm a non-paying account's
+action tools. (An earlier draft also set dormant here on a 30-day unused window;
+that branch was provably unreachable — it compared against
+``last_health_check_at``, which every sweep pass re-stamps — and has been
+removed rather than left looking load-bearing.)
 
 Both the health PROBE and the token REFRESH are behind swappable Protocol seams, so
 tests drive them deterministically with no provider call. The implementations the
@@ -55,9 +60,6 @@ HEALTH_CADENCE: dict[str, timedelta] = {
 }
 # §3.8.5 refresh path: refresh proactively ~30 min before known expiry.
 REFRESH_LEAD = timedelta(minutes=30)
-# Unused-window after which a healthy connection is marked dormant (§3.8.4). 30 days
-# matches the downgrade-grace horizon used elsewhere in the lifecycle (§3.6).
-DORMANT_AFTER = timedelta(days=30)
 
 
 @dataclass
@@ -173,8 +175,9 @@ async def check_connection(
 
     Order: (1) proactively refresh if near expiry and the auth class supports it —
     on refresh failure go expired immediately (don't probe a dead token). (2) Probe
-    liveness. (3) Apply dormant if healthy-but-unused. Always stamps
-    last_health_check_at; emits connection_status_changed on a real transition."""
+    liveness. Always stamps last_health_check_at; emits connection_status_changed
+    on a real transition. ``dormant`` rows never reach here (the sweep excludes
+    them — billing owns that state, module docstring)."""
     now = now or datetime.now(UTC)
     old_status = connection.status
 
@@ -209,12 +212,8 @@ async def check_connection(
         await _propagate_knowledge_pause(session, connection)
         return connection.status
 
-    # (3) Healthy. Dormant if unused for a long window (§3.8.4), else connected.
-    last_used = connection.last_health_check_at
-    if old_status == "connected" and last_used is not None and now - last_used >= DORMANT_AFTER:
-        await _transition(session, connection, "dormant", "unused > 30 days", now, old_status)
-    else:
-        await _transition(session, connection, "connected", None, now, old_status)
+    # (3) Healthy → connected.
+    await _transition(session, connection, "connected", None, now, old_status)
     return connection.status
 
 
@@ -281,7 +280,11 @@ async def run_health_sweep(
             await session.execute(
                 select(InstanceConnection).where(
                     InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.status != "revoked",
+                    # revoked is terminal; dormant is billing-suspended (Legal
+                    # §A3) — probing a healthy dormant row would flip it back to
+                    # connected and re-arm action tools for a non-paying
+                    # account. Only the payment webhooks may leave dormant.
+                    InstanceConnection.status.notin_(("revoked", "dormant")),
                 )
             )
         )

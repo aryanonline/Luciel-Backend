@@ -35,6 +35,12 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "dunning_state_changed",
         "connection_status_changed",
         "connection_secret_cleanup",
+        # Emitted at delete_luciel time (§3.6.3): the secret's destruction is
+        # SCHEDULED for the day-30 cascade so a restore can revive the
+        # connection. The real `connection_secret_cleanup` (with the deleted
+        # outcome) fires only when a secret is actually destroyed — an audit
+        # event must never assert a cleanup that has not happened.
+        "connection_secret_cleanup_scheduled",
         # Hot→cold transcript offload (Commitment #38): a session's transcript moved
         # to the S3 archive (key + row count, never content), and the cascade's
         # prefix cleanup of a deleted tenant's archived objects.

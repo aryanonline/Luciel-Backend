@@ -386,3 +386,28 @@ async def test_the_health_sweep_leaves_a_revoked_connection_alone() -> None:
         assert rows[dead].status == "revoked"
         assert rows[dead].last_health_check_at is None
         assert rows[live].status == "connected"
+
+
+async def test_the_health_sweep_never_resurrects_a_billing_dormant_connection() -> None:
+    """``dormant`` is a BILLING suspension (Legal §A3, app/billing/dunning.py), not a
+    health state. A dormant row whose credential is perfectly healthy must stay
+    dormant through the sweep — flipping it back to ``connected`` would silently
+    re-arm a non-paying account's action tools within one 6-hour sweep cycle. Only
+    the payment webhooks may leave dormant."""
+    admin_id = uuid.uuid4()
+    instance_id = await _seed_tenant(admin_id)
+    # No secret_ref: the probe would report this row healthy if it were swept.
+    suspended = await _seed_connection(
+        admin_id, instance_id, connection_type="calendar", status="dormant", secret_ref=None
+    )
+
+    await sweeps.run_connection_health(now=NOW)
+
+    async with tenant_session(admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_id == suspended)
+            )
+        ).scalar_one()
+        assert row.status == "dormant"
+        assert row.last_health_check_at is None

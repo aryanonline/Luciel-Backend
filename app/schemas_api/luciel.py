@@ -71,6 +71,11 @@ ConnectionStatusWire = Literal[
     # NOT live; shown as "Action needed: complete email routing" (§3.1.6a, Decision
     # #49). Subdomain mode skips this and is immediately `connected`.
     "pending_email_routing",
+    # The designated BYO SMS/Voice number is not hosted in the tenant's own
+    # Twilio account (§3.1.4 operability probe) — distinct from a pending
+    # carrier registration: the number needs hosting/porting first. Previously
+    # degraded to `error` on the wire, which hid the actionable guidance.
+    "not_operable_hosting_required",
 ]
 # §3.2.3: paused_reconnect_needed (was needs_reconnect) + error (Axis4-F02).
 KnowledgeSyncStatusWire = Literal["synced", "syncing", "paused_reconnect_needed", "error"]

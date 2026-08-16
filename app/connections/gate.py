@@ -124,6 +124,7 @@ _WIRE_SAFE_STATUSES = frozenset(
         "not_connected",
         "pending_carrier_registration",
         "pending_email_routing",
+        "not_operable_hosting_required",
     }
 )
 
@@ -131,11 +132,12 @@ _WIRE_SAFE_STATUSES = frozenset(
 def _to_wire_status(raw: str | None) -> str:
     """Map a raw ``instance_connections.status`` to the closed wire enum.
 
-    ``not_operable_hosting_required`` (§3.1.4 BYO-number operability) has no wire
-    counterpart yet — schema follow-up, tracked separately — so it degrades to
-    ``error`` (never silently "connected", never a KeyError) until the wire enum
-    grows the value. Every currently-registered status besides that one already has
-    a 1:1 wire entry."""
+    Every currently-registered status has a 1:1 wire entry (including
+    ``not_operable_hosting_required``, §3.1.4 — added so the owner sees the
+    actionable "this number isn't in your Twilio account" state instead of a
+    generic error). A future raw status the registry grows before the wire enum
+    catches up still degrades to ``error`` (never silently "connected", never a
+    KeyError)."""
     if raw is None:
         return "unconfigured"
     if raw in _WIRE_SAFE_STATUSES:

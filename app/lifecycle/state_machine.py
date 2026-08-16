@@ -101,10 +101,18 @@ async def delete_luciel(
         raise LifecycleError("cannot_delete_from_state")
     frm = inst.state.value
 
-    # 0. Quiesce: revoke embed key so no new inbound is accepted.
+    # 0. Quiesce: revoke embed key so no new inbound is accepted. The key VALUE
+    # is stashed, not destroyed: restore-within-grace must revive the SAME key
+    # ("exactly as it was", §3.6.4) or the customer's deployed embed snippet is
+    # permanently dead after a restore. The day-30 cascade deletes the whole
+    # instance row, stash included.
+    inst.embed_key_stashed = inst.embed_key_public_id
     inst.embed_key_public_id = None
 
-    # 1. instance_connections → revoked; enqueue secret cleanup (best-effort, idempotent).
+    # 1. instance_connections → revoked; secret destruction is SCHEDULED for the
+    # day-30 cascade (restore must be able to revive the connection). The audit
+    # event says exactly that — `connection_secret_cleanup` is reserved for the
+    # moment a secret is actually destroyed (cascade.py / service.disconnect).
     conns = (
         (
             await session.execute(
@@ -121,11 +129,12 @@ async def delete_luciel(
                 session,
                 admin_id=admin_id,
                 instance_id=inst.id,
-                event_type="connection_secret_cleanup",
+                event_type="connection_secret_cleanup_scheduled",
                 actor_type=ActorType.platform,
                 payload={
                     "connection_id": str(c.connection_id),
                     "secret_ref_present": bool(c.secret_ref),
+                    "scheduled_for": "grace_expiry_hard_delete_cascade",
                 },
             )
 
@@ -157,8 +166,12 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
     inst.state = LucielState.active
     inst.grace_window_started_at = None
     inst.soft_deleted_at = None
-    # Re-issue a fresh embed key and restore connections to a re-checkable state.
-    inst.embed_key_public_id = f"vm_live_{uuid.uuid4().hex[:12]}"
+    # Revive the SAME embed key the delete stashed ("exactly as it was",
+    # §3.6.4): the snippet already deployed on the customer's site starts
+    # working again with no re-edit. Minting fresh is only the fallback for a
+    # legacy row that entered grace before the stash column existed.
+    inst.embed_key_public_id = inst.embed_key_stashed or f"vm_live_{uuid.uuid4().hex[:12]}"
+    inst.embed_key_stashed = None
     conns = (
         (
             await session.execute(

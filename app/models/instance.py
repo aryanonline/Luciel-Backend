@@ -99,6 +99,12 @@ class Instance(Base, TenantMixin, TimestampMixin):
         Enum(LucielState, name="luciel_state"), default=LucielState.active, nullable=False
     )
     embed_key_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # The key's value while the Luciel sits in the delete grace window (§3.6.3
+    # quiesce): resolution keys on embed_key_public_id, so a stashed key accepts
+    # no inbound — but restore revives the SAME key, keeping the customer's
+    # deployed snippet alive ("exactly as it was", §3.6.4). Cleared on restore;
+    # destroyed with the row by the day-30 cascade.
+    embed_key_stashed: Mapped[str | None] = mapped_column(String(64), nullable=True)
     grace_window_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
