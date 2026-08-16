@@ -9,8 +9,9 @@
  * idle one stops paying for theater. Environments with armed alarms (preprod/prod)
  * keep the WAF unconditionally — production posture is never cost-gated.
  */
-import { App } from 'aws-cdk-lib';
+import { App, Stack } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
@@ -20,7 +21,7 @@ import { EnvName, getEnvConfig, OFFERING_REGION } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
 
-function edgeTemplate(envName: EnvName, paused: boolean) {
+function edgeTemplate(envName: EnvName, paused: boolean, withWebAlb = false) {
   const app = new App();
   const envConfig = { ...getEnvConfig(envName), paused };
   const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig });
@@ -37,7 +38,18 @@ function edgeTemplate(envName: EnvName, paused: boolean) {
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
   });
-  const edge = new EdgeStack(app, 'Edge', { env: ENV, envConfig, alb: compute.alb });
+  // Stand-in for WebStack's dashboard/marketing ALB (building the real
+  // WebStack here would drag in certs + hosted zones the WAF doesn't care
+  // about — the association only needs an ALB ARN).
+  let webAlb: elbv2.IApplicationLoadBalancer | undefined;
+  if (withWebAlb) {
+    const helper = new Stack(app, 'WebHelper', { env: ENV });
+    webAlb = new elbv2.ApplicationLoadBalancer(helper, 'WebAlb', {
+      vpc: net.vpc,
+      internetFacing: true,
+    });
+  }
+  const edge = new EdgeStack(app, 'Edge', { env: ENV, envConfig, alb: compute.alb, webAlb });
   return Template.fromStack(edge);
 }
 
@@ -61,4 +73,19 @@ describe('WAF wakefulness gating', () => {
       t.resourceCountIs('AWS::WAFv2::WebACLAssociation', 1);
     });
   }
+
+  test('the dashboard/marketing ALB is bound to the SAME WebACL — one firewall, two doors', () => {
+    // The entrypoint passes WebStack's ALB into EdgeStack; without it the SSR
+    // dashboard (login) and the marketing site's anonymous contact form sat
+    // outside the WAF entirely while the API ALB was protected.
+    const t = edgeTemplate('prod', false, true);
+    t.resourceCountIs('AWS::WAFv2::WebACL', 1);
+    t.resourceCountIs('AWS::WAFv2::WebACLAssociation', 2);
+  });
+
+  test('dev paused with a web ALB: still nothing — wakefulness gates both doors', () => {
+    const t = edgeTemplate('dev', true, true);
+    t.resourceCountIs('AWS::WAFv2::WebACL', 0);
+    t.resourceCountIs('AWS::WAFv2::WebACLAssociation', 0);
+  });
 });

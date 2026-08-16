@@ -74,7 +74,7 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
 });
 
 // Frontend web service (SSR Next.js on ECS) — mirrors the backend compute pattern.
-new WebStack(app, `${prefix}-Web`, {
+const web = new WebStack(app, `${prefix}-Web`, {
   env,
   envConfig,
   vpc: net.vpc,
@@ -101,6 +101,9 @@ new EdgeStack(app, `${prefix}-Edge`, {
   env,
   envConfig,
   alb: compute.alb,
+  // The dashboard/marketing ALB gets the same WebACL — login + the anonymous
+  // contact form were previously outside the WAF entirely.
+  webAlb: web.alb,
 });
 
 new ObservabilityStack(app, `${prefix}-Observability`, {

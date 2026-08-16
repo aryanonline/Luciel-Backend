@@ -181,7 +181,13 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // cutover is owner-gated and unimplemented. 'mock' keeps prod honest - /healthz
     // lists the gateway as degraded rather than implying billing reaches Stripe.
     stripeIntegrationPosture: 'mock',
-    monthlyBudgetUsd: 400,
+    // Prod's standing run-rate is ~$750–900/mo before traffic (RDS r6g.large
+    // Multi-AZ ≈ $380, Fargate ≈ $180, interface endpoints ≈ $73, NAT ≈ $70,
+    // 2×ALB ≈ $36, Redis + misc). The previous 400 sat at roughly HALF that,
+    // so the alarm would have fired permanently from day one and trained
+    // alert-blindness. 1000 restores meaning: 80% (~$800) marks the top of
+    // normal, 100% means something real changed.
+    monthlyBudgetUsd: 1000,
     imageRepoName: 'luciel-backend-prod',
     vpcInterfaceEndpoints: true,
   },
