@@ -536,3 +536,54 @@ async def test_every_dispatch_outcome_is_traced() -> None:
         await broker.dispatch(tool, {"body": "x"}, admin_id=admin, instance_id=iid)
         assert [t["tool"] for t in broker.traces] == ["send_email", "send_email"]
         assert {t["outcome"] for t in broker.traces} == {"ok", "missing_input"}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_byo_webhook_attaches_the_stored_auth_header(monkeypatch) -> None:
+    """§3.8.6: the admin's registered Authorization header is read from the
+    SecretStore by the PARENT process and attached at dispatch. It was hardcoded
+    to None — every authenticated endpoint 401'd while the tool looked fine."""
+    from app.connections import sandbox
+    from app.connections.secrets import get_secret_store
+    from app.tools import contract as c
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, authorize=["bring_your_own_webhook"])
+    secret_ref = f"vm/{admin}/{iid}/outbound_webhook"
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="outbound_webhook",
+                auth_class="long_lived_token",
+                provider="custom_webhook",
+                status="connected",
+                secret_ref=secret_ref,
+                non_secret_config={
+                    "url": "https://hooks.example.com/leads",
+                    "egressAllowlist": ["hooks.example.com"],
+                },
+            )
+        )
+    await get_secret_store().put(secret_ref, {"auth_header": "Bearer tenant-token"})
+
+    seen: dict[str, object] = {}
+
+    async def _capture(**kwargs):  # noqa: ANN003 — mirror run_byo_webhook's kwargs
+        seen.update(kwargs)
+        return c.ok({"status": 200})
+
+    monkeypatch.setattr(sandbox, "run_byo_webhook", _capture)
+
+    tool = build_tool("bring_your_own_webhook")
+    assert tool is not None
+    async with tenant_session(admin) as s:
+        broker = ToolBroker(s)
+        res = await broker.dispatch(
+            tool, {"payload": {"a": 1}}, admin_id=admin, instance_id=iid
+        )
+    assert res.outcome is Outcome.ok
+    assert seen["auth_header"] == "Bearer tenant-token"
+    assert seen["url"] == "https://hooks.example.com/leads"

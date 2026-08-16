@@ -15,12 +15,16 @@ Connection-backed (a real effect once the tenant has completed the OAuth connect
   * the four scheduling tools — Google Calendar via ``_TenantCalendarBackend``, which
     picks the backend from the tenant's connected calendar provider at call time.
 
+Connection-backed (a real effect once the tenant has connected):
+  * ``bring_your_own_webhook`` — admin-registered HTTP endpoint through the
+    subprocess sandbox, with the admin's stored Authorization header attached
+    by the parent process at dispatch (the subprocess never sees other secrets).
+
 Connection-gated (dispatch path is correct; the effect needs an OAuth backend that
 does not exist yet, so they resolve to a Tool and fail cleanly rather than silently):
   * the scheduling tools on a CALENDLY connection — no registered OAuth client yet.
   * ``lookup_record``          — admin-connected record source.
   * ``push_to_crm``            — HubSpot / Salesforce.
-  * ``bring_your_own_webhook`` — admin-registered HTTP endpoint.
 
 For the connection-gated set the broker's gate 3 refuses first (the connection can
 never reach ``connected`` without a real OAuth flow), so the unimplemented backend is
@@ -244,7 +248,7 @@ class BringYourOwnWebhookTool:
         self._breaker = sandbox.CircuitBreaker()
 
     async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
-        config = await self._connection_config(context)
+        config, secret_ref = await self._connection_config(context)
         url = str(config.get("url") or "")
         if not url:
             return c.failed("webhook_url_not_configured")
@@ -255,7 +259,12 @@ class BringYourOwnWebhookTool:
         return await sandbox.run_byo_webhook(
             url=url,
             payload=dict(payload) if isinstance(payload, dict) else {"value": payload},
-            auth_header=None,  # secrets stay in the SecretStore; §3.8.4 binds them later
+            # The admin-registered Authorization header, read from the
+            # SecretStore HERE (the Data Plane process) and attached by the
+            # sandbox before the subprocess submits — the subprocess never sees
+            # raw token bytes (§3.8.6). Hardcoding None meant every
+            # authenticated endpoint 401'd while the tool looked configured.
+            auth_header=await self._auth_header(secret_ref),
             allowlist=allowlist,
             breaker=self._breaker,
             executor=sandbox.SubprocessWebhookExecutor(),
@@ -263,21 +272,36 @@ class BringYourOwnWebhookTool:
             context=context,
         )
 
-    async def _connection_config(self, context: ToolContext) -> dict[str, object]:
+    async def _connection_config(self, context: ToolContext) -> tuple[dict[str, object], str | None]:
         from sqlalchemy import select  # noqa: PLC0415 — keeps import cost off module load
 
         from app.models.connection import InstanceConnection  # noqa: PLC0415
 
         row = (
             await context.session.execute(
-                select(InstanceConnection.non_secret_config).where(
+                select(
+                    InstanceConnection.non_secret_config, InstanceConnection.secret_ref
+                ).where(
                     InstanceConnection.admin_id == context.admin_id,
                     InstanceConnection.instance_id == context.instance_id,
                     InstanceConnection.connection_type == "outbound_webhook",
                 )
             )
-        ).scalar_one_or_none()
-        return dict(row) if isinstance(row, dict) else {}
+        ).one_or_none()
+        if row is None:
+            return {}, None
+        config, secret_ref = row
+        return (dict(config) if isinstance(config, dict) else {}), secret_ref
+
+    @staticmethod
+    async def _auth_header(secret_ref: str | None) -> str | None:
+        if not secret_ref:
+            return None
+        from app.connections.secrets import get_secret_store  # noqa: PLC0415
+
+        material = await get_secret_store().get(secret_ref) or {}
+        header = material.get("auth_header", "")
+        return header or None
 
 
 def build_tool(tool_id: str) -> Tool | None:

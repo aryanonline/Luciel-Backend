@@ -1,12 +1,20 @@
 """Signup bot-protection via hCaptcha siteverify (Architecture §3.7.1a).
 
 Closes the gap where the signup captcha_token was accepted without verification.
-Behavior mirrors the codebase's integration-mode seam pattern:
+Enforcement keys on ONE thing: is an hCaptcha secret configured?
 
-- Live mode WITH an hCaptcha secret configured -> the token is verified against
-  hCaptcha's siteverify endpoint; a failed/absent token raises 400.
-- Mock/CI or live-without-secret -> a no-op pass (so the suite and local dev stay
-  hermetic and don't need a real captcha), exactly like the other live seams.
+- Secret configured -> the token is verified against hCaptcha's siteverify
+  endpoint; a failed/absent token raises 400.
+- No secret -> a no-op pass (so the suite and local dev stay hermetic and don't
+  need a real captcha).
+
+Deliberately NOT gated on ``integration_mode == "live"``: production currently
+ships `mock` integration (Stripe stays mock until the owner-gated cutover), and
+the previous double gate meant a prod deploy in mock posture ran signup with NO
+bot protection at all — even with the hCaptcha secret provisioned in the
+platform blob. Bot protection is not a delivery integration; whether SES sends
+real mail has nothing to do with whether signup should verify a captcha. The
+secret's presence is the honest switch: configured ⇒ enforced.
 
 Secrets are read from config (bridged from the platform secret / env); never logged.
 """
@@ -41,8 +49,8 @@ async def verify_captcha(token: str | None) -> None:
     """
     settings = get_settings()
     secret = settings.hcaptcha_secret_key
-    if settings.integration_mode != "live" or not secret:
-        return  # seam: bot-protection binds only when configured (like SES/Twilio)
+    if not secret:
+        return  # unconfigured -> hermetic no-op (CI/local); configured -> enforced
 
     # Non-production seed/live-test bypass (see _SEEDTEST_BYPASS_TOKEN). Only honored
     # when explicitly enabled in config; prod never enables it. Constant-time compare so

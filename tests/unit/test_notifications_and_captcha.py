@@ -55,6 +55,21 @@ async def test_captcha_enforced_when_live_and_configured(monkeypatch):
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
+async def test_captcha_enforced_in_mock_posture_when_secret_configured(monkeypatch):
+    """Enforcement keys on the SECRET, not on integration_mode: prod currently
+    ships mock integration (Stripe stays mock until the owner-gated cutover),
+    and the old double gate left prod signup with no bot protection at all.
+    A configured secret must enforce regardless of posture."""
+    monkeypatch.setenv("LUCIEL_HCAPTCHA_SECRET_KEY", "0xtest")
+    monkeypatch.delenv("LUCIEL_INTEGRATION_MODE", raising=False)  # default: mock
+    from app.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    with pytest.raises(Exception):
+        await verify_captcha(None)  # missing token -> rejected, no network call
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 async def test_captcha_bypass_rejected_when_flag_off(monkeypatch):
     """Fail-safe: the seedtest bypass token must NOT pass when the flag is off, even in

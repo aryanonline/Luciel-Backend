@@ -196,3 +196,32 @@ def test_a_fully_provisioned_microsoft_app_boots():
     )
     assert s.microsoft_client_id == "ms-cid"
     assert s.microsoft_client_secret == "ms-csecret"  # noqa: S105 — test fixture
+
+
+def test_llm_model_ids_overlay_from_the_platform_secret():
+    """§3.4.3 model-retirement contingency: a retired model version is swapped by
+    rotating the platform secret + restarting ECS — no image rebuild. The LLM
+    fields carry non-empty defaults, so the generic empty-field overlay never
+    reaches them; the explicit bridge must."""
+    s = live_settings(
+        LLM_ANTHROPIC_PRIMARY_MODEL="claude-sonnet-9-9",
+        LLM_ANTHROPIC_FAST_MODEL="claude-haiku-9-9",
+        LLM_OPENAI_FALLBACK_MODEL="gpt-9.9",
+    )
+    assert s.llm_anthropic_primary_model == "claude-sonnet-9-9"
+    assert s.llm_anthropic_fast_model == "claude-haiku-9-9"
+    assert s.llm_openai_fallback_model == "gpt-9.9"
+
+
+def test_llm_model_env_var_beats_the_platform_secret(monkeypatch: pytest.MonkeyPatch):
+    """Env > blob > default: a deliberate task-definition/local pin must not be
+    silently overridden by the blob."""
+    monkeypatch.setenv("LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL", "claude-pinned-by-env")
+    s = live_settings(LLM_ANTHROPIC_PRIMARY_MODEL="claude-from-blob")
+    assert s.llm_anthropic_primary_model == "claude-pinned-by-env"
+
+
+def test_llm_model_defaults_hold_when_neither_env_nor_blob_sets_them():
+    s = live_settings()
+    assert s.llm_anthropic_primary_model == "claude-sonnet-4-6"
+    assert s.llm_openai_fallback_model == "gpt-5.4"

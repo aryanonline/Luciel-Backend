@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from functools import lru_cache
 
 from pydantic import Field
@@ -361,6 +362,35 @@ class Settings(BaseSettings):
         # email link) must override the localhost default in deployed environments.
         if blob.get("APP_BASE_URL"):
             object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
+
+        # LLM model IDs (§3.4.3 model-retirement contingency). These carry
+        # non-empty defaults, so the generic empty-field overlay above never
+        # reaches them — bridged explicitly with env > platform-secret > default
+        # precedence. The point: when a provider retires a model version, the
+        # swap is a platform-secret rotation + ECS restart, not an image
+        # rebuild + deploy. A direct env var (local/CI, and any deliberate
+        # task-definition pin) still wins over the blob.
+        for env_name, blob_key, field_name in (
+            (
+                "LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL",
+                "LLM_ANTHROPIC_PRIMARY_MODEL",
+                "llm_anthropic_primary_model",
+            ),
+            (
+                "LUCIEL_LLM_ANTHROPIC_FAST_MODEL",
+                "LLM_ANTHROPIC_FAST_MODEL",
+                "llm_anthropic_fast_model",
+            ),
+            (
+                "LUCIEL_LLM_OPENAI_FALLBACK_MODEL",
+                "LLM_OPENAI_FALLBACK_MODEL",
+                "llm_openai_fallback_model",
+            ),
+        ):
+            if os.environ.get(env_name):
+                continue  # pydantic already applied the env value; env wins
+            if blob.get(blob_key):
+                object.__setattr__(self, field_name, blob[blob_key])
 
         # JWT signing key: security-critical. Bridge it from the platform secret; it has
         # a KNOWN dev-default (published in source), so in live mode we must FAIL CLOSED
