@@ -5,25 +5,19 @@ sessions, leads, escalation_events, budget counters, admin_audit_log. No new
 write path; no new PII; every query runs inside the caller's ``tenant_session``
 so RLS (§3.7.2b) scopes every aggregate to the caller's tenant.
 
-Honest-gap policy (Arch §3.9 data-sources table): §3.9 documents two data
-sources that do not exist yet as durable stores in this codebase today:
+Honest-gap policy (Arch §3.9 data-sources table), updated as stores land:
 
-  * Trace store ``tool_calls``       — appointments-booked would read this.
-  * Trace store ``retrieval_results`` — top-knowledge-sources would read this.
-
-``app/tools/broker.py`` only keeps an in-memory, per-request ``traces`` list
-(explicitly flagged there: "the trace store §5.4 persists these in Arc 14" —
-not yet true) and ``app/runtime/knowledge_retrieval.py`` never persists a
-retrieval-frequency log. Both are OWNED by other workstreams (tools/broker,
-knowledge) per BUILD_BRIEF.md file ownership, so this module cannot add the
-missing persistence itself without crossing that boundary.
-
-Rather than fabricate a plausible-looking number, both metrics are returned as
-an honest "not yet available" gap (``available=False``, no count), exactly the
-treatment the task spec mandates for escalation→response-time percentiles
-(no ack-timestamp store exists either — ``escalation_acked`` is a defined
-audit event type in app/audit/events.py but is never emitted anywhere in the
-codebase today, so no ack timestamp exists to compute p50/p95 from).
+  * Appointments booked — REAL since ``booking_events`` (migration 0041): one
+    row per successful ``book_appointment`` dispatch, written by the tool
+    broker at the same point that authorizes the customer-facing "booked".
+  * Reply time p50/p95 — REAL, computed from the transcript itself (each lead
+    turn paired with Luciel's next turn in the same session). This measures
+    "how fast does Luciel answer" — the number the dashboard card asks for —
+    not the escalation→admin-ack distribution §3.9 originally sketched (no ack
+    store exists; ``escalation_acked`` is defined but never emitted).
+  * Trace store ``retrieval_results`` — still absent, so top-knowledge-sources
+    keeps its honest "not yet available" gap rather than a fabricated list
+    (owned by the knowledge workstream).
 
 Similarly, Vision §7 "conversion by source / channel / service" requires an
 admin-marked lead OUTCOME ("converted" / "lost" / "in-progress"); ``Lead`` only
@@ -76,8 +70,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
 from app.models.billing import BillingAccount
+from app.models.booking import BookingEvent
 from app.models.budget import CountedSession
-from app.models.conversation import EscalationEvent, Session
+from app.models.conversation import EscalationEvent, Session, Transcript
 from app.models.lead import Lead
 
 # Vision §7 / Arch §3.9: heatmap is [dayOfWeek 0-6][hourOfDay 0-23] -> count.
@@ -139,9 +134,12 @@ class AnalyticsAggregate:
 # "code path" language). See module docstring above for the internal reasons;
 # keep any internals-facing detail in comments/docstrings, not in these
 # strings.
-TOOL_CALL_GAP = NotAvailable("Tool activity isn't tracked yet — coming soon.")
 RETRIEVAL_GAP = NotAvailable("Knowledge source usage isn't tracked yet — coming soon.")
-RESPONSE_TIME_GAP = NotAvailable("Response time tracking isn't available yet — coming soon.")
+# Not a build gap any more — the honest EMPTY state for a period with no
+# customer→Luciel reply pairs yet (a new account, or a quiet period).
+RESPONSE_TIME_EMPTY = NotAvailable(
+    "Shows up once Luciel has replied to customers this billing period."
+)
 CONVERSION_SOURCE_GAP = NotAvailable("Conversion by source isn't available yet — coming soon.")
 CONVERSION_SERVICE_GAP = NotAvailable("Conversion by service isn't available yet — coming soon.")
 
@@ -223,14 +221,60 @@ async def _top_knowledge_sources() -> tuple[list[dict[str, object]], NotAvailabl
     return [], RETRIEVAL_GAP
 
 
-async def _appointments_booked() -> tuple[int | None, NotAvailable]:
-    # See module docstring / TOOL_CALL_GAP — no durable tool-call store exists.
-    return None, TOOL_CALL_GAP
+async def _appointments_booked(
+    s: AsyncSession, *, period_start: date
+) -> tuple[int | None, NotAvailable | None]:
+    """Real count from ``booking_events`` — one row per successful
+    ``book_appointment`` dispatch, written by the tool broker. A real zero is an
+    honest number for a period with no bookings; the "not available" gap ended
+    when the durable store landed (migration 0041)."""
+    count = (
+        await s.execute(
+            select(func.count())
+            .select_from(BookingEvent)
+            .where(BookingEvent.booked_at >= period_start)
+        )
+    ).scalar_one()
+    return int(count), None
 
 
-async def _response_time_percentiles() -> tuple[float | None, float | None, NotAvailable]:
-    # See module docstring / RESPONSE_TIME_GAP — no ack-timestamp store exists.
-    return None, None, RESPONSE_TIME_GAP
+async def _response_time_percentiles(
+    s: AsyncSession, *, period_start: date
+) -> tuple[float | None, float | None, NotAvailable | None]:
+    """Reply-time percentiles from the transcript itself: each lead turn paired
+    with Luciel's next turn in the same session, p50/p95 of the gap in seconds.
+
+    This is the "how fast does Luciel answer" number the dashboard card asks
+    for, measured from what actually happened — no ack store, no estimate. A
+    period with no lead→luciel pairs (new/quiet account) returns the honest
+    empty state, not zeros."""
+    next_role = (
+        func.lead(Transcript.role)
+        .over(partition_by=Transcript.session_id, order_by=Transcript.at)
+        .label("next_role")
+    )
+    next_at = (
+        func.lead(Transcript.at)
+        .over(partition_by=Transcript.session_id, order_by=Transcript.at)
+        .label("next_at")
+    )
+    turns = (
+        select(Transcript.role.label("role"), Transcript.at.label("at"), next_role, next_at)
+        .where(Transcript.at >= period_start)
+        .subquery()
+    )
+    gap_seconds = func.extract("epoch", turns.c.next_at - turns.c.at)
+    p50, p95 = (
+        await s.execute(
+            select(
+                func.percentile_cont(0.5).within_group(gap_seconds),
+                func.percentile_cont(0.95).within_group(gap_seconds),
+            ).where(turns.c.role == "lead", turns.c.next_role == "luciel")
+        )
+    ).one()
+    if p50 is None or p95 is None:
+        return None, None, RESPONSE_TIME_EMPTY
+    return float(p50), float(p95), None
 
 
 async def _conversion_by_channel(s: AsyncSession, *, period_start: date) -> list[ChannelConversion]:
@@ -315,8 +359,8 @@ async def build_overview(
     channel_mix = await _channel_mix(s, period_start=period_start)
     busiest_times = await _busiest_times(s, period_start=period_start)
     top_sources, sources_gap = await _top_knowledge_sources()
-    appointments, appointments_gap = await _appointments_booked()
-    p50, p95, response_gap = await _response_time_percentiles()
+    appointments, appointments_gap = await _appointments_booked(s, period_start=period_start)
+    p50, p95, response_gap = await _response_time_percentiles(s, period_start=period_start)
     conversion_by_channel = await _conversion_by_channel(s, period_start=period_start)
 
     return AnalyticsAggregate(

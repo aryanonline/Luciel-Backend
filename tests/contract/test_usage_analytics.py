@@ -121,12 +121,16 @@ async def test_usage_overview_new_fields_present_and_honest(client) -> None:
     ):
         assert key in body, f"missing {key}"
 
-    # Honest gaps: null + a note, never a fabricated 0/[].
-    assert body["appointmentsBooked"] is None
-    assert body["appointmentsBookedNote"]
+    # Appointments booked is REAL now (booking_events, migration 0041): a
+    # period with no bookings is an honest 0 with no gap note — never null.
+    assert body["appointmentsBooked"] == 0
+    assert body["appointmentsBookedNote"] is None
+    # Reply time is real too, but this seed has no lead→luciel pair yet, so the
+    # honest EMPTY state applies: nulls + the plain-language note.
     assert body["responseTimeP50Seconds"] is None
     assert body["responseTimeP95Seconds"] is None
     assert body["responseTimeNote"]
+    # Still-real gaps: no retrieval-frequency store exists yet.
     assert body["topKnowledgeSources"] == []
     assert body["topKnowledgeSourcesNote"]
     assert body["conversionBySourceNote"]
@@ -221,3 +225,78 @@ async def test_usage_export_csv_audit_log_view(client) -> None:
     r = await client.get("/api/v1/admin/usage/export.csv", params={"view": "audit_log"})
     assert r.status_code == 200
     assert "event_id,event_type,at,actor_user_id" in r.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_appointments_and_reply_time_are_real_numbers(client) -> None:
+    """The two cards that served "not available" forever now read real stores:
+    booking_events (broker-written on every ok book_appointment) and the
+    transcript's lead→luciel turn gaps. Seed both and assert the numbers."""
+    from datetime import timedelta
+
+    from app.models.booking import BookingEvent
+    from app.models.conversation import Transcript
+
+    admin = await _signup_verify_login(client)
+    iid = await _seed_instance_with_activity(admin)
+
+    t0 = datetime.now(UTC)
+    async with tenant_session(admin) as s:
+        s.add(BookingEvent(admin_id=admin, instance_id=iid, booking_ref="evt-1"))
+        s.add(BookingEvent(admin_id=admin, instance_id=iid, booking_ref="evt-2"))
+        session_id = uuid.uuid4()
+        s.add(
+            Session(
+                id=session_id,
+                admin_id=admin,
+                instance_id=iid,
+                channel="widget",
+                mode="ai",
+                started_at=t0,
+                last_message_at=t0,
+            )
+        )
+        # Two lead→luciel pairs: 10s and 30s replies ⇒ p50 20s, p95 29s.
+        for offset, (role, text) in enumerate(
+            [("lead", "hi"), ("luciel", "hello")],
+        ):
+            s.add(
+                Transcript(
+                    admin_id=admin,
+                    instance_id=iid,
+                    session_id=session_id,
+                    role=role,
+                    text=text,
+                    at=t0 + timedelta(seconds=0 if role == "lead" else 10),
+                )
+            )
+        s.add(
+            Transcript(
+                admin_id=admin,
+                instance_id=iid,
+                session_id=session_id,
+                role="lead",
+                text="another question",
+                at=t0 + timedelta(seconds=60),
+            )
+        )
+        s.add(
+            Transcript(
+                admin_id=admin,
+                instance_id=iid,
+                session_id=session_id,
+                role="luciel",
+                text="an answer",
+                at=t0 + timedelta(seconds=90),
+            )
+        )
+
+    r = await client.get("/api/v1/admin/usage/overview")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["appointmentsBooked"] == 2
+    assert body["appointmentsBookedNote"] is None
+    # Gaps are 10s and 30s → p50 = 20.0, p95 between 10 and 30, no gap note.
+    assert body["responseTimeP50Seconds"] == pytest.approx(20.0)
+    assert 10.0 <= body["responseTimeP95Seconds"] <= 30.0
+    assert body["responseTimeNote"] is None

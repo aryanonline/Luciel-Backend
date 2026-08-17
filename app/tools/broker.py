@@ -169,6 +169,22 @@ class ToolBroker:
         except Exception as exc:  # noqa: BLE001
             result = c.failed(f"tool_exception:{type(exc).__name__}")
 
+        # Durable booking fact for the analytics card (§3.9): written at the ONE
+        # point every dispatch passes through, and only on `ok` — a metric fed
+        # by the same event that told the customer "booked" can never disagree
+        # with what Luciel said (§3.3.4 rule 1: no success-claim without ok, and
+        # its converse: no metric without a success-claim).
+        if tool.tool_id == "book_appointment" and result.outcome is c.Outcome.ok:
+            from app.models.booking import BookingEvent  # noqa: PLC0415
+
+            self.s.add(
+                BookingEvent(
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    booking_ref=str(result.payload.get("bookingRef") or ""),
+                )
+            )
+
         await self._trace(
             admin_id, instance_id, tool.tool_id, result, connection=tool.requires_connection
         )

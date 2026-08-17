@@ -323,8 +323,10 @@ async def test_escalations_by_signal_real_and_period_scoped() -> None:
 
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_honest_gaps_never_fabricated() -> None:
-    """appointments-booked / response-time / top-knowledge-sources / conversion-by-
-    source/service must be null/empty + a reason string, NEVER a fabricated 0/[]."""
+    """Remaining gaps (top-knowledge-sources, conversion by source/service) must
+    be null/empty + a reason string, NEVER a fabricated 0/[]. Appointments
+    booked is REAL now (booking_events): its honest empty state IS 0 with no
+    gap; reply time's honest empty state is nulls + the plain-language note."""
     admin = uuid.uuid4()
     await _seed(admin)
 
@@ -336,12 +338,12 @@ async def test_honest_gaps_never_fabricated() -> None:
             conversations_this_period=0,
         )
 
-    assert agg.appointments_booked is None
-    assert agg.appointments_booked_gap is not None
+    assert agg.appointments_booked == 0  # a real zero from a real store
+    assert agg.appointments_booked_gap is None
 
     assert agg.response_time_p50_seconds is None
     assert agg.response_time_p95_seconds is None
-    assert agg.response_time_gap is not None
+    assert agg.response_time_gap is not None  # empty state, not a build gap
 
     assert agg.top_knowledge_sources == []
     assert agg.top_knowledge_sources_gap is not None
@@ -363,11 +365,15 @@ async def test_honest_gaps_never_fabricated() -> None:
         "module docstring",
     )
     all_notes = [
-        agg.appointments_booked_gap.reason,
-        agg.response_time_gap.reason,
-        agg.top_knowledge_sources_gap.reason,
-        agg.conversion_by_source_gap.reason,
-        agg.conversion_by_service_gap.reason,
+        gap.reason
+        for gap in (
+            agg.appointments_booked_gap,  # None now — the store is real
+            agg.response_time_gap,
+            agg.top_knowledge_sources_gap,
+            agg.conversion_by_source_gap,
+            agg.conversion_by_service_gap,
+        )
+        if gap is not None
     ]
     for note in all_notes:
         lowered = note.lower()
@@ -407,11 +413,11 @@ def test_render_csv_unknown_view_raises() -> None:
         escalations_by_signal=[],
         channel_mix=[],
         busiest_times=[[0] * 24 for _ in range(7)],
-        appointments_booked=None,
-        appointments_booked_gap=analytics_service.TOOL_CALL_GAP,
+        appointments_booked=0,
+        appointments_booked_gap=None,
         response_time_p50_seconds=None,
         response_time_p95_seconds=None,
-        response_time_gap=analytics_service.RESPONSE_TIME_GAP,
+        response_time_gap=analytics_service.RESPONSE_TIME_EMPTY,
         top_knowledge_sources=[],
         top_knowledge_sources_gap=analytics_service.RETRIEVAL_GAP,
     )

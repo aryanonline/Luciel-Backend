@@ -587,3 +587,35 @@ async def test_byo_webhook_attaches_the_stored_auth_header(monkeypatch) -> None:
     assert res.outcome is Outcome.ok
     assert seen["auth_header"] == "Bearer tenant-token"
     assert seen["url"] == "https://hooks.example.com/leads"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_successful_booking_writes_the_durable_booking_event() -> None:
+    """§3.9: the analytics count is fed by the SAME dispatch that told the
+    customer "booked" — an ok write, one row; a failed/conflict write, none."""
+    from app.models.booking import BookingEvent
+    from app.tools.calendar_backend import InMemoryCalendarApi
+
+    InMemoryCalendarApi.reset()
+    admin = uuid.uuid4()
+    iid = await _seed_calendar(admin, "google_calendar")
+    tool = build_tool("book_appointment")
+    assert tool is not None
+
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool,
+            {"slot": _future_slot(), "email": "lead@example.com"},
+            admin_id=admin,
+            instance_id=iid,
+        )
+        assert res.outcome is Outcome.ok, res.reason
+
+    async with tenant_session(admin) as s:
+        events = (
+            (await s.execute(select(BookingEvent).where(BookingEvent.admin_id == admin)))
+            .scalars()
+            .all()
+        )
+        assert len(events) == 1
+        assert events[0].booking_ref == res.payload["bookingRef"]

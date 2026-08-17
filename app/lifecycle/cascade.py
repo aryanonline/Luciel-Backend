@@ -20,6 +20,7 @@ from app.db.base import TenantMixin
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
+from app.models.booking import BookingEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
@@ -58,6 +59,7 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (VoiceCallRecord, "voice_call_record"),
     (CrmLeadLink, "crm_lead_link"),
     (RecordSourceRecord, "record_source_record"),
+    (BookingEvent, "booking_event"),
     (DeferredAction, "deferred_action"),
     (InstanceToolAuthorization, "instance_tool_authorization"),
     (ConversationBudget, "conversation_budget"),
