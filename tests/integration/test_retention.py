@@ -123,7 +123,14 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
 
     async with tenant_session(admin) as s:
         counts = await expire_aged_data(s, admin_id=admin, now=now)
-        assert counts == {"transcript": 1, "session_summary": 1, "session": 1}
+        assert counts == {
+            "transcript": 1,
+            "session_summary": 1,
+            "escalation_event": 0,
+            "session": 1,
+            "deferred_action_terminal": 0,
+            "processed_stripe_event": 0,
+        }
 
     async with tenant_session(admin) as s:
         # Exactly the recent rows survive.
@@ -163,11 +170,25 @@ async def test_expire_aged_data_is_idempotent():
 
     async with tenant_session(admin) as s:
         first = await expire_aged_data(s, admin_id=admin, now=now)
-        assert first == {"transcript": 1, "session_summary": 1, "session": 1}
+        assert first == {
+            "transcript": 1,
+            "session_summary": 1,
+            "escalation_event": 0,
+            "session": 1,
+            "deferred_action_terminal": 0,
+            "processed_stripe_event": 0,
+        }
     # Re-run: nothing left aged → zero deletes (idempotent).
     async with tenant_session(admin) as s:
         second = await expire_aged_data(s, admin_id=admin, now=now)
-        assert second == {"transcript": 0, "session_summary": 0, "session": 0}
+        assert second == {
+            "transcript": 0,
+            "session_summary": 0,
+            "escalation_event": 0,
+            "session": 0,
+            "deferred_action_terminal": 0,
+            "processed_stripe_event": 0,
+        }
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -365,3 +386,201 @@ async def test_the_retention_sweep_applies_each_tenant_s_own_rule():
 
     assert await _lead_ids(admin_on) == set()
     assert len(await _lead_ids(admin_off)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Data-growth enforcers (owner audit): tables that previously grew forever
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_terminal_deferred_actions_are_pruned_but_the_queue_is_never_touched() -> None:
+    from app.models.deferred import DeferredAction
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    old = datetime.now(UTC) - timedelta(days=120)
+    async with tenant_session(admin) as s:
+        for status in ("delivered", "abandoned", "queued"):
+            s.add(
+                DeferredAction(
+                    id=uuid.uuid4(),
+                    admin_id=admin,
+                    instance_id=iid,
+                    action_type="schedule_callback",
+                    connection_type="sms_sender",
+                    payload={},
+                    status=status,
+                    created_at=old,
+                    next_attempt_at=old,
+                    expires_at=old + timedelta(hours=24),
+                )
+            )
+    async with tenant_session(admin) as s:
+        counts = await expire_aged_data(s, admin_id=admin)
+        assert counts["deferred_action_terminal"] == 2
+    async with tenant_session(admin) as s:
+        left = (
+            (
+                await s.execute(
+                    select(DeferredAction.status).where(DeferredAction.admin_id == admin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # The 120-day-old QUEUED row survives: a pending promise is not aged data.
+        assert left == ["queued"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_aged_escalation_events_and_stripe_replay_ids_are_pruned() -> None:
+    from app.models.billing import ProcessedStripeEvent
+    from app.models.conversation import EscalationEvent
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    now = datetime.now(UTC)
+    async with tenant_session(admin) as s:
+        s.add(
+            EscalationEvent(
+                admin_id=admin,
+                instance_id=iid,
+                signal="cannot_answer",
+                gate="intake",
+                fired_at=now - timedelta(days=400),
+                created_at=now - timedelta(days=400),
+            )
+        )
+        s.add(
+            EscalationEvent(
+                admin_id=admin,
+                instance_id=iid,
+                signal="high_value_lead",
+                gate="outcome",
+                fired_at=now - timedelta(days=10),
+                created_at=now - timedelta(days=10),
+            )
+        )
+        s.add(
+            ProcessedStripeEvent(
+                event_id="evt_old", admin_id=admin, created_at=now - timedelta(days=500)
+            )
+        )
+        s.add(
+            ProcessedStripeEvent(
+                event_id="evt_recent", admin_id=admin, created_at=now - timedelta(days=30)
+            )
+        )
+    async with tenant_session(admin) as s:
+        counts = await expire_aged_data(s, admin_id=admin)
+        assert counts["escalation_event"] == 1
+        assert counts["processed_stripe_event"] == 1
+    async with tenant_session(admin) as s:
+        signals = (
+            (
+                await s.execute(
+                    select(EscalationEvent.signal).where(EscalationEvent.admin_id == admin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert signals == ["high_value_lead"]  # the recent one survives
+        ids = (
+            (
+                await s.execute(
+                    select(ProcessedStripeEvent.event_id).where(
+                        ProcessedStripeEvent.admin_id == admin
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert ids == ["evt_recent"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_platform_data_enforcers_prune_contact_forms_and_cap_the_access_log() -> None:
+    """The two platform-level stores that had NO deletion path at all: anonymous
+    contact-form PII (1 year) and the internal-access log (3-year ceiling, with
+    the §5.11 floor clamped in SQL so nothing younger can ever be pruned)."""
+    from app.db.session import untenanted_session
+    from app.lifecycle.retention import expire_platform_data
+    from app.models.contact import ContactSubmission
+    from app.models.internal_access import InternalAccessLog
+
+    now = datetime.now(UTC)
+    async with untenanted_session() as s:
+        s.add(
+            ContactSubmission(
+                id=uuid.uuid4(),
+                name="Old Visitor",
+                email="old@example.com",
+                message="hello from long ago",
+                created_at=now - timedelta(days=400),
+            )
+        )
+        s.add(
+            ContactSubmission(
+                id=uuid.uuid4(),
+                name="Recent Visitor",
+                email="recent@example.com",
+                message="hello",
+                created_at=now - timedelta(days=10),
+            )
+        )
+
+    # The app role is INSERT-only on internal_access_log (no-UPDATE trigger,
+    # migration 0012), so aged entries are seeded as inserts with an explicit
+    # created_at — exactly how a 4-year-old real entry looks to the pruner.
+    admin = uuid.uuid4()
+    async with untenanted_session() as s:
+        s.add(
+            InternalAccessLog(
+                staff_id="ops@vantagemind",
+                approver_id="second@vantagemind",
+                admin_id=admin,
+                data_class="conversation_content",
+                access_started_at=now - timedelta(days=4 * 365),
+                access_type="break_glass",
+                justification="incident-123",
+                ticket_ref="TICK-1",
+                created_at=now - timedelta(days=4 * 365),
+            )
+        )
+        s.add(
+            InternalAccessLog(
+                staff_id="ops@vantagemind",
+                approver_id="second@vantagemind",
+                admin_id=admin,
+                data_class="conversation_content",
+                access_started_at=now,
+                access_type="break_glass",
+                justification="incident-456",
+                ticket_ref="TICK-2",
+            )
+        )
+
+    counts = await expire_platform_data()
+    assert counts.get("contact_submission") == 1
+    assert counts.get("internal_access_log") == 1
+
+    async with untenanted_session() as s:
+        emails = (
+            (await s.execute(select(ContactSubmission.email))).scalars().all()
+        )
+        assert emails == ["recent@example.com"]
+        # The app role cannot read internal_access_log (§5.11 — reading the
+        # compliance record needs its own approval), so the fresh entry's
+        # survival is proven through the pruner itself: an AGGRESSIVE cutoff of
+        # "now" is clamped to the 3-year floor in SQL and prunes NOTHING more.
+        from sqlalchemy import text as sa_text
+
+        pruned_again = (
+            await s.execute(
+                sa_text("SELECT internal_access_prune(:cutoff)"), {"cutoff": now}
+            )
+        ).scalar_one()
+        assert int(pruned_again or 0) == 0

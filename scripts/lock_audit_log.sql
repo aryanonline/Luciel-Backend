@@ -53,10 +53,17 @@ BEGIN
   -- be settable by the app role and so would be no lock at all.
   --
   -- The age test is repeated HERE rather than trusted from the procedure, so what
-  -- makes "only rows older than 365 days" true is the trigger — the same object that
-  -- makes append-only true — and not a function body that could later be replaced.
+  -- makes "only rows older than the floor" true is the trigger — the same object
+  -- that makes append-only true — and not a function body that could later be
+  -- replaced. The floor is PER TABLE: admin_audit_log keeps the published 1-year
+  -- retention (§B5); internal_access_log keeps the §5.11 THREE-year floor (its
+  -- ceiling prune must never reach younger compliance evidence).
   IF TG_OP = 'DELETE' AND current_user = 'luciel_audit_owner' THEN
-    IF OLD.created_at < now() - interval '365 days' THEN
+    IF TG_TABLE_NAME = 'internal_access_log' THEN
+      IF OLD.created_at < now() - interval '1095 days' THEN
+        RETURN OLD;
+      END IF;
+    ELSIF OLD.created_at < now() - interval '365 days' THEN
       RETURN OLD;
     END IF;
   END IF;
@@ -98,6 +105,28 @@ $$;
 ALTER FUNCTION audit_retention_prune(uuid, int) OWNER TO luciel_audit_owner;
 REVOKE ALL ON FUNCTION audit_retention_prune(uuid, int) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION audit_retention_prune(uuid, int) TO luciel_app;
+
+-- 1c) The internal-access log's retention CEILING (§5.11 has a 3-year floor for the
+--     staff-access evidence; before this the floor had no ceiling and the compliance
+--     record grew forever). Same narrow shape as audit_retention_prune: SECURITY
+--     DEFINER is the ONLY DELETE path luciel_app can reach, the 1095-day floor is
+--     clamped in SQL (a caller cannot argue it down), and the trigger above repeats
+--     the same age test on identity — belt and braces.
+CREATE OR REPLACE FUNCTION internal_access_prune(p_cutoff timestamptz)
+  RETURNS bigint
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_deleted bigint;
+BEGIN
+  DELETE FROM internal_access_log
+   WHERE created_at < LEAST(p_cutoff, now() - interval '1095 days');
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+ALTER FUNCTION internal_access_prune(timestamptz) OWNER TO luciel_audit_owner;
+REVOKE ALL ON FUNCTION internal_access_prune(timestamptz) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION internal_access_prune(timestamptz) TO luciel_app;
 
 -- 2) admin_audit_log (§5.3): row guard + TRUNCATE guard, then ownership + grants.
 DROP TRIGGER IF EXISTS trg_audit_append_only ON admin_audit_log;
@@ -153,6 +182,9 @@ BEGIN
   ALTER TABLE internal_access_log OWNER TO luciel_audit_owner;
   REVOKE ALL ON internal_access_log FROM luciel_app;
   GRANT SELECT, INSERT ON internal_access_log TO luciel_app;
+  -- The owner's DELETE feeds internal_access_prune (1c) and is bounded by the
+  -- row guard's 1095-day identity+age test — same shape as admin_audit_log's.
+  GRANT DELETE ON internal_access_log TO luciel_audit_owner;
 
   -- 0012's own guard function is left in place for its downgrade path, but re-owned:
   -- while luciel_app owned it, the app role could CREATE OR REPLACE the body into a

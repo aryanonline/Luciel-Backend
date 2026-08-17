@@ -592,6 +592,17 @@ export class ComputeStack extends Stack {
         cron: 'cron(0/5 * * * ? *)',
         description: 'Pull new mail from connected BYO Outlook mailboxes (§3.1.6a)',
       },
+      {
+        // Every 6h, staggered off health's :40 slot: the periodic half of §3.2.3
+        // "kept in sync" — before this schedule existed, live-sync sources were
+        // synced exactly as often as the owner clicked Re-sync, and a crawled
+        // website was never re-crawled. Per-origin cadence lives in the worker
+        // (delta providers 6h, website crawl 24h); candidates are only tenants
+        // with a CONNECTED knowledge connection (migration 0042).
+        name: 'knowledge_sync',
+        cron: 'cron(50 */6 * * ? *)',
+        description: 'Re-sync due live-sync knowledge sources; re-crawl websites (§3.2.3)',
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack

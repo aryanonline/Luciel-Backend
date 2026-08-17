@@ -54,6 +54,7 @@ const SWEEPS = [
   'session_finalize',
   'transcript_archive',
   'mailbox_poll',
+  'knowledge_sync',
 ];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {

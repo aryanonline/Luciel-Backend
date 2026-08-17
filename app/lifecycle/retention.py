@@ -37,7 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.lifecycle.transcript_store import get_transcript_store
 from app.models.audit import ActorType
-from app.models.conversation import Session, SessionSummary, Transcript
+from app.models.billing import ProcessedStripeEvent
+from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
+from app.models.deferred import DeferredAction
 from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
 
@@ -45,6 +47,18 @@ from app.models.lead import Lead, LeadState
 # summaries. Platform policy, not admin-configurable (default; overridable per call
 # for tests/ops only).
 DEFAULT_RETENTION_DAYS = 365
+# Terminal deferred-action rows (delivered/abandoned) are receipts, not queue:
+# the model's own docstring promised "never accumulates indefinitely", which was
+# true of the QUEUE and false of the TABLE until this enforcer.
+DEFERRED_TERMINAL_RETENTION_DAYS = 90
+# Stripe replay-gate ids: retained past a year with margin (the replay window
+# they guard is days), then pruned — the gate's protection does not require
+# keeping every event id forever.
+STRIPE_EVENT_RETENTION_DAYS = 400
+# Marketing contact-form submissions (name + email + free text from anonymous
+# visitors): PII with previously NO retention and NO deletion path anywhere.
+# Aligned with the 1-year conversation retention (Legal §B5 posture).
+CONTACT_SUBMISSION_RETENTION_DAYS = 365
 
 # (model, data_class label used in the audit payload) for each swept class, children
 # before the parent conversation row. Every model here carries admin_id (TenantMixin)
@@ -55,11 +69,16 @@ DEFAULT_RETENTION_DAYS = 365
 # the session_summaries while leaving the parent row is not a 1-year retention. The
 # leftover shells also accumulate without bound on a tenant who never deletes anything,
 # which is exactly the plateau this sweep exists to produce.
-_RetainedModel = type[Transcript] | type[SessionSummary] | type[Session]
+_RetainedModel = type[Transcript] | type[SessionSummary] | type[EscalationEvent] | type[Session]
 
 _RETAINED_CLASSES: tuple[tuple[_RetainedModel, str], ...] = (
     (Transcript, "transcript"),
     (SessionSummary, "session_summary"),
+    # Conversation-adjacent content that outlived the published 1-year window:
+    # escalation events reference sessions/leads and grew forever on a live
+    # tenant. Analytics reads them period-scoped only, so the prune cannot
+    # distort any served card. Removed before Session (they reference it).
+    (EscalationEvent, "escalation_event"),
     (Session, "session"),
 )
 
@@ -177,6 +196,44 @@ async def expire_aged_data(
         )
         counts[data_class] = int(result.rowcount or 0)  # type: ignore[attr-defined]
 
+    # Terminal deferred-action rows: receipts of delivered/abandoned follow-ups,
+    # kept 90 days for support forensics, then pruned. The QUEUE (status=queued)
+    # is never touched — a pending promise to a customer is not "aged data".
+    deferred_cutoff = now - timedelta(days=DEFERRED_TERMINAL_RETENTION_DAYS)
+    deferred_result = await session.execute(
+        delete(DeferredAction).where(
+            DeferredAction.admin_id == admin_id,
+            DeferredAction.status.in_(("delivered", "abandoned")),
+            DeferredAction.created_at < deferred_cutoff,
+        )
+    )
+    deferred_pruned = int(deferred_result.rowcount or 0)  # type: ignore[attr-defined]
+    if deferred_pruned:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="data_retention_hard_delete",
+            payload={
+                "data_class": "deferred_action_terminal",
+                "count": deferred_pruned,
+                "retention_policy": f"age_based_sweep:{DEFERRED_TERMINAL_RETENTION_DAYS}d",
+            },
+        )
+    counts["deferred_action_terminal"] = deferred_pruned
+
+    # Stripe replay-gate ids past 400 days: the replay window they protect is
+    # measured in days; keeping every event id forever was pure growth.
+    stripe_cutoff = now - timedelta(days=STRIPE_EVENT_RETENTION_DAYS)
+    stripe_result = await session.execute(
+        delete(ProcessedStripeEvent).where(
+            ProcessedStripeEvent.admin_id == admin_id,
+            ProcessedStripeEvent.created_at < stripe_cutoff,
+        )
+    )
+    counts["processed_stripe_event"] = int(stripe_result.rowcount or 0)  # type: ignore[attr-defined]
+
     await session.flush()
     return counts
 
@@ -276,3 +333,45 @@ async def run_retention_sweep(
         if any(counts.values()):
             swept[str(admin_id)] = counts
     return swept
+
+
+async def expire_platform_data(*, now: datetime | None = None) -> dict[str, int]:
+    """Age-enforce the PLATFORM-level tables that have no tenant to iterate.
+
+    Two stores previously had NO deletion path at all:
+
+      * ``contact_submission`` — the marketing site's anonymous form: name,
+        email, and up to 5000 chars of free text, NOT tenant-scoped, in no
+        cascade and no sweep — unbounded PII retention. Pruned at 1 year,
+        aligned with the conversation retention posture (Legal §B5).
+      * ``internal_access_log`` — §5.11 keeps a 3-year FLOOR for staff-access
+        evidence, but the floor had no ceiling. The prune runs through a
+        SECURITY DEFINER function (the app role is deliberately INSERT-only on
+        this table) whose SQL clamps the cutoff to now()-3y, so not even a bug
+        here can prune younger than the floor.
+
+    No audit emission: ``admin_audit_log`` requires an admin_id and these rows
+    belong to no tenant; the deletion counts are returned for the job log.
+    """
+    from sqlalchemy import text as sa_text  # noqa: PLC0415
+
+    from app.db.session import untenanted_session  # noqa: PLC0415 — see driver note
+    from app.models.contact import ContactSubmission  # noqa: PLC0415
+
+    now = now or datetime.now(UTC)
+    counts: dict[str, int] = {}
+    async with untenanted_session() as s:
+        contact_cutoff = now - timedelta(days=CONTACT_SUBMISSION_RETENTION_DAYS)
+        result = await s.execute(
+            delete(ContactSubmission).where(ContactSubmission.created_at < contact_cutoff)
+        )
+        counts["contact_submission"] = int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+        pruned = (
+            await s.execute(
+                sa_text("SELECT internal_access_prune(:cutoff)"),
+                {"cutoff": now - timedelta(days=3 * 365)},
+            )
+        ).scalar_one()
+        counts["internal_access_log"] = int(pruned or 0)
+    return {k: v for k, v in counts.items() if v}
