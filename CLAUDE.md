@@ -199,6 +199,15 @@ Run focused tests while iterating, then run the full command above before commit
   `_dmarc` is `p=quarantine; adkim=s; aspf=r`. Set 2026-08-17 after live sends
   quarantined: strict-SPF DMARC with no custom MAIL FROM fails SPF alignment on
   every SES send. Do not re-strict `aspf` without keeping the MAIL FROM domain.
+- Email INBOUND for platform reply addresses is likewise out-of-band ops
+  (live-caught NXDOMAIN 2026-08-17 — the vm_subdomain addresses shipped
+  unreceivable): Route53 wildcard MX `*.reply.vantagemind.ai → 10
+  inbound-smtp.ca-central-1.amazonaws.com`; SES active receipt rule set
+  `luciel-dev-inbound` matching `.reply.vantagemind.ai` → SNS topic
+  `luciel-dev-ses-inbound` (content inline) → HTTPS subscription to
+  `/api/v1/webhooks/ses/inbound` (the route auto-confirms, signature-verified).
+  A new environment needs all three pieces; codifying them into CDK is a
+  flagged follow-up.
 
 ## Before handing off
 
