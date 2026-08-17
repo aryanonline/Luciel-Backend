@@ -9,6 +9,8 @@ never routed.
 
 Channels:
 - Twilio SMS       — POST /api/v1/webhooks/twilio/sms   (X-Twilio-Signature; TwiML reply)
+- Twilio Voice     — POST /api/v1/webhooks/twilio/voice       (call start; TwiML)
+                     POST /api/v1/webhooks/twilio/voice/turn  (Gather action; TwiML)
 - SES/SNS email    — POST /api/v1/webhooks/ses/inbound  (SNS envelope; async, 200)
 - Meta (WA/IG/FB)  — GET  /api/v1/webhooks/meta         (hub.challenge verification)
                      POST /api/v1/webhooks/meta         (X-Hub-Signature-256; async, 200)
@@ -107,6 +109,188 @@ async def twilio_sms_inbound(request: Request) -> Response:
     else:
         body = '<?xml version="1.0" encoding="UTF-8"?><Response/>'
     return Response(content=body, media_type="application/xml")
+
+
+# --------------------------------------------------------------------------- #
+# Twilio Voice (Arc 14b — the ingress that finally makes the built pipeline
+# reachable: adapter, disclosure, TwiML, and call records all existed with no
+# webhook route, so an enabled Voice channel answered nothing)
+# --------------------------------------------------------------------------- #
+
+
+class TwilioGatherTranscript:
+    """Honest 'STT' for the ``<Gather input="speech">`` flow: Twilio's own speech
+    recognition already transcribed the caller — ``SpeechResult`` IS the
+    transcript — so this passthrough names the real recognizer rather than
+    re-transcribing text. Whisper binds on a recording-based flow, which this
+    Gather loop does not produce."""
+
+    name = "twilio_gather_stt"
+
+    async def transcribe(self, audio_ref: str) -> Any:
+        from app.runtime.speech import Transcription  # noqa: PLC0415
+
+        return Transcription(text=audio_ref)
+
+
+class TwilioSayDelivery:
+    """Honest 'TTS' for TwiML delivery: the spoken reply is rendered by Twilio's
+    ``<Say>`` in the webhook response — no synthesis API is called, because
+    paying a TTS provider to produce audio the response then discards would be
+    waste, not delivery. ElevenLabs binds when a ``<Play>`` audio-hosting
+    surface exists (flagged follow-up, not silently skipped)."""
+
+    name = "twilio_say_tts"
+
+    async def synthesize(self, text: str) -> Any:
+        from app.runtime.speech import SynthesizedSpeech  # noqa: PLC0415
+
+        return SynthesizedSpeech(audio_ref=f"twiml-say:{len(text)}", text=text)
+
+
+def _voice_enabled(inst: Any) -> bool:
+    channels = inst.channels or []
+    return any(
+        isinstance(c, dict) and c.get("id") == "voice" and bool(c.get("enabled"))
+        for c in channels
+    )
+
+
+def _voice_unavailable_twiml() -> Response:
+    """A closed, honest reply for every not-handled case (disabled channel,
+    paused, rejected inbound): a spoken notice + hangup. Twilio must always
+    receive valid TwiML — an empty 200 leaves dead air on a live call."""
+    from app.runtime.voice_pipeline import VOICE_UNAVAILABLE_REPLY  # noqa: PLC0415
+
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Say>{_xml_escape(VOICE_UNAVAILABLE_REPLY)}</Say><Hangup/></Response>"
+    )
+    return Response(content=body, media_type="application/xml")
+
+
+def _voice_turn_action_url(request: Request) -> str:
+    """Absolute URL Twilio posts the caller's next utterance to. Derived from the
+    request URL (ALB-terminated HTTPS — --proxy-headers is load-bearing here,
+    exactly as for signature verification)."""
+    return str(request.url.replace(path="/api/v1/webhooks/twilio/voice/turn", query=""))
+
+
+async def _voice_request(request: Request) -> dict[str, Any]:
+    settings = get_settings()
+    form = await request.form()
+    params: dict[str, str] = {k: str(v) for k, v in form.items()}
+    return {
+        # BYO (§3.1.4): the called number belongs to the TENANT's Twilio account,
+        # so Twilio signs with THEIR auth token — same resolution as SMS.
+        "auth_token": await _tenant_twilio_auth_token(params.get("To", ""))
+        or settings.twilio_auth_token,
+        "url": str(request.url),
+        "params": params,
+        "x_twilio_signature": request.headers.get("X-Twilio-Signature", ""),
+        "resolve": _resolve,
+        "source_ip": request.client.host if request.client else "unknown",
+    }
+
+
+@router.post("/twilio/voice")
+async def twilio_voice_inbound(request: Request) -> Response:
+    """Call start: verify → resolve → admit, then play the mandatory disclosure
+    and gather the caller's first utterance (§3.1.2 — disclosure BEFORE any
+    caller audio is processed)."""
+    from app.channels.voice_adapter import VoiceAdapter  # noqa: PLC0415
+    from app.channels.base import InboundMessage, InboundRejected  # noqa: PLC0415
+    from app.channels import pipeline  # noqa: PLC0415
+    from app.runtime import voice_pipeline  # noqa: PLC0415
+    from app.models.instance import Instance, is_paused  # noqa: PLC0415
+
+    from sqlalchemy import select  # noqa: PLC0415
+
+    req = await _voice_request(request)
+    async with untenanted_session() as s:
+        try:
+            outcome = await pipeline.ingest(VoiceAdapter(), req, s)
+        except InboundRejected as rej:
+            await pipeline.record_inbound_rejection(s, reason=rej.reason, channel="voice")
+            return _voice_unavailable_twiml()
+    if not isinstance(outcome, InboundMessage):
+        # AdmissionDenied (rate/abuse) or opt-out keyword — no call handling.
+        return _voice_unavailable_twiml()
+
+    async with tenant_session(outcome.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.id == outcome.instance_id))
+        ).scalar_one_or_none()
+        # Paused → no handling and NO disclosure record (§3.6.2); a disabled
+        # channel likewise never claims to answer (§3.8.7 rule A).
+        if inst is None or is_paused(inst) or not _voice_enabled(inst):
+            return _voice_unavailable_twiml()
+        twiml = await voice_pipeline.start_call(
+            s,
+            instance=inst,
+            admin_id=outcome.admin_id,
+            instance_id=outcome.instance_id,
+            provider_call_id=str(outcome.channel_metadata.get("call_sid") or ""),
+            from_number=outcome.customer_identifier,
+            action_url=_voice_turn_action_url(request),
+        )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/twilio/voice/turn")
+async def twilio_voice_turn(request: Request) -> Response:
+    """One caller utterance (Twilio ``<Gather>`` action) → spoken reply, through
+    the SAME orchestrator + budget gate as every other channel (§3.4.1b)."""
+    from app.billing import metering  # noqa: PLC0415
+    from app.channels import pipeline  # noqa: PLC0415
+    from app.channels.base import InboundMessage, InboundRejected  # noqa: PLC0415
+    from app.channels.voice_adapter import VoiceAdapter, reply_twiml  # noqa: PLC0415
+    from app.models.instance import Instance  # noqa: PLC0415
+    from app.runtime import voice_pipeline  # noqa: PLC0415
+    from app.runtime.provider_factory import build_llm_router  # noqa: PLC0415
+
+    from sqlalchemy import select  # noqa: PLC0415
+
+    req = await _voice_request(request)
+    async with untenanted_session() as s:
+        try:
+            outcome = await pipeline.ingest(VoiceAdapter(), req, s)
+        except InboundRejected as rej:
+            await pipeline.record_inbound_rejection(s, reason=rej.reason, channel="voice")
+            return _voice_unavailable_twiml()
+    if not isinstance(outcome, InboundMessage):
+        return _voice_unavailable_twiml()
+
+    action_url = _voice_turn_action_url(request)
+    if not outcome.body.strip():
+        # Gather timed out with no speech: reprompt without invoking the runtime
+        # (silence must not consume the tenant's conversation budget).
+        body = reply_twiml("Sorry, I didn't catch that. Could you say that again?", action_url)
+        return Response(content=body, media_type="application/xml")
+
+    async with tenant_session(outcome.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.id == outcome.instance_id))
+        ).scalar_one_or_none()
+        if inst is None or not _voice_enabled(inst):
+            return _voice_unavailable_twiml()
+        # handle_turn owns the paused branch (spoken unavailable + hangup, the
+        # shared is_paused gate) and the at-cap graceful no-LLM reply.
+        result = await voice_pipeline.handle_turn(
+            s,
+            instance=inst,
+            admin_id=outcome.admin_id,
+            instance_id=outcome.instance_id,
+            from_number=outcome.customer_identifier,
+            speech_audio_ref=outcome.body,
+            action_url=action_url,
+            stt=TwilioGatherTranscript(),
+            tts=TwilioSayDelivery(),
+            router=build_llm_router(admin_id=outcome.admin_id),
+            has_payment_method=await metering.has_live_card(s, admin_id=outcome.admin_id),
+            provider_call_id=str(outcome.channel_metadata.get("call_sid") or "") or None,
+        )
+    return Response(content=result.twiml, media_type="application/xml")
 
 
 # --------------------------------------------------------------------------- #

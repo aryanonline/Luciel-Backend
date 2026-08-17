@@ -137,6 +137,11 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # webhooks
         ("POST", "/api/v1/webhooks/stripe"),
         ("POST", "/api/v1/webhooks/twilio/sms"),
+        # Voice ingress (Arc 14b): call start + the <Gather> action URL. The
+        # deliberate addition that makes the built voice pipeline reachable —
+        # before these, an enabled Voice channel had nowhere to receive a call.
+        ("POST", "/api/v1/webhooks/twilio/voice"),
+        ("POST", "/api/v1/webhooks/twilio/voice/turn"),
         ("POST", "/api/v1/webhooks/ses/inbound"),
         ("GET", "/api/v1/webhooks/meta"),
         ("POST", "/api/v1/webhooks/meta"),
