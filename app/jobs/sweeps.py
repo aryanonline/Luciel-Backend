@@ -83,6 +83,7 @@ TRANSCRIPT_ARCHIVE = "transcript_archive"
 MAILBOX_POLL = "mailbox_poll"
 KNOWLEDGE_SYNC = "knowledge_sync"
 BILLING_NOTICES = "billing_notices"
+MODEL_CURRENCY = "model_currency"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -99,6 +100,7 @@ SWEEP_KINDS: tuple[str, ...] = (
     MAILBOX_POLL,
     KNOWLEDGE_SYNC,
     BILLING_NOTICES,
+    MODEL_CURRENCY,
 )
 
 
@@ -326,6 +328,20 @@ async def run_billing_notices(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(BILLING_NOTICES, _deliver_billing_notices, now)
 
 
+async def run_model_currency(*, now: datetime | None = None) -> dict[str, object]:
+    """Verify the pinned LLM model IDs still exist at their providers (§3.4.3).
+
+    PLATFORM-level like the retention sweep's ``expire_platform_data`` half: no
+    tenant loop, no candidates — model pins belong to the platform, not a tenant.
+    A retired CHAT pin is auto-swapped to its same-family successor (platform-
+    secret write + service restart + operator email); the embedding pin and any
+    unremediable case alert and RAISE, so the nonzero exit + the ERROR log line
+    reach the sweep log group's SweepErrors alarm. Mock mode is a no-op."""
+    from app.runtime.model_currency import run_model_currency_check  # noqa: PLC0415
+
+    return await run_model_currency_check(now=now)
+
+
 SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -341,4 +357,5 @@ SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     MAILBOX_POLL: run_mailbox_poll,
     KNOWLEDGE_SYNC: run_knowledge_sync,
     BILLING_NOTICES: run_billing_notices,
+    MODEL_CURRENCY: run_model_currency,
 }

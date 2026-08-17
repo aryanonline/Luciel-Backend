@@ -110,6 +110,11 @@ new ObservabilityStack(app, `${prefix}-Observability`, {
   env,
   envConfig,
   alb: compute.alb,
+  // Operator inbox for the Alarms topic. A dedicated `-c alarmEmail` wins;
+  // otherwise the budget address doubles as the operator inbox (one knob).
+  // Same no-address-in-the-repo rule as BudgetStack.
+  alertEmail: (app.node.tryGetContext('alarmEmail') ??
+    app.node.tryGetContext('budgetAlertEmail')) as string | undefined,
 });
 
 new PipelineStack(app, `${prefix}-Pipeline`, {

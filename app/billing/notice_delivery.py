@@ -19,8 +19,10 @@ Lead-time enforcement (§A5): a reduction announced with less than
 NOTICE_LEAD_DAYS of lead left is a compliance defect the OPERATOR must fix by
 moving the effective date — the platform cannot conjure the missing days. What
 the platform CAN do is refuse to let it pass silently: the first delivery of a
-short-lead reduction logs an ERROR (operator-facing, CloudWatch-alarmed) and
-stamps ``lead_days_below_minimum`` into the audit payload, so the violation is
+short-lead reduction logs an ERROR — which, running in the sweep container,
+feeds the sweep log group's ``SweepErrors`` metric filter and its alarm in
+armed environments (compute-stack.ts / observability-stack.ts) — and stamps
+``lead_days_below_minimum`` into the audit payload, so the violation is
 provable instead of invisible. (Nothing in the codebase auto-applies the
 reduction to metering — the cutover is an explicit operator settings change,
 and the frozen billing wire pins the current allowance — so there is no

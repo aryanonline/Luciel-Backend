@@ -27,6 +27,18 @@ export const OFFERING_REGION = 'ca-central-1';
 export const CLOUDFRONT_CERT_REGION = 'us-east-1';
 
 /**
+ * The shared name of the sweep ERROR metric: ComputeStack's log metric filter
+ * EMITS it (it owns the sweep log group); ObservabilityStack's alarm READS it.
+ * CloudWatch metrics are referenced by name, not construct edge, so this const
+ * is the single source that keeps the two stacks pointing at the same metric
+ * without a cross-stack prop.
+ */
+export const SWEEP_ERROR_METRIC = {
+  metricNamespace: 'Luciel',
+  metricName: 'SweepErrors',
+} as const;
+
+/**
  * Founder-confirmed public domains (DEPLOY.md / DEVOPS §9). The founder owns
  * vantagemind.ai only — there is no .com.
  */

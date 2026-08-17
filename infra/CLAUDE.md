@@ -16,7 +16,10 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - The CVE gate is `scripts/check_image_scan.py` + `.security/cve-allowlist.json`
   (governed, expiring exceptions; fails CLOSED on scan unavailability). Pause runs
   skip the build and reuse the deployed tag — taking an env down never needs a build.
-- Fourteen sweep schedules (incl. the 5-min `mailbox_poll`); dev has NO VPC interface
+- Fifteen sweep schedules (incl. the 5-min `mailbox_poll` and the daily
+  `model_currency` watchdog); ERROR-level sweep log lines feed the `SweepErrors`
+  metric filter (ComputeStack) alarmed in armed envs (ObservabilityStack, which
+  subscribes `-c alarmEmail`/`-c budgetAlertEmail` to the Alarms topic); dev has NO VPC interface
   endpoints (env-gated, ~$73/mo — NAT carries the traffic; prod/preprod keep them).
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).

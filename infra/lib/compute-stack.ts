@@ -27,7 +27,7 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { EnvConfig, DOMAINS } from './env-config';
+import { EnvConfig, DOMAINS, SWEEP_ERROR_METRIC } from './env-config';
 
 export interface ComputeStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -296,7 +296,7 @@ export class ComputeStack extends Stack {
     });
 
     // Control plane (admin API) - same image, separate service/role-split.
-    new ecs.FargateService(this, 'ControlPlane', {
+    const controlService = new ecs.FargateService(this, 'ControlPlane', {
       cluster: this.cluster,
       taskDefinition: makeTaskDef('control-plane'),
       desiredCount: controlCount,
@@ -446,6 +446,35 @@ export class ComputeStack extends Stack {
       memoryLimitMiB: 512,
       taskRole,
     });
+    // The model_currency watchdog's RETIREMENT AUTO-SWAP (owner decision, §3.4.3):
+    // when a pinned chat model disappears at the provider, the sweep writes the
+    // same-family successor into the platform secret and force-redeploys the app
+    // services so fresh tasks read it. Both grants are an EXPLICIT, scoped widening
+    // of the shared task role (the sweep deliberately runs as the same role as the
+    // app planes, so RLS and every seam behave identically): PutSecretValue is
+    // limited to the ONE platform secret the planes can already read, and
+    // UpdateService to the two app services — nothing else in the account.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'RotatePlatformSecret',
+        actions: ['secretsmanager:PutSecretValue'],
+        resources: [platformSecret.secretArn],
+      }),
+    );
+    // Scoped by the CLUSTER's service namespace rather than the two service ARNs:
+    // referencing dataService/controlService construct attributes here creates a
+    // CloudFormation cycle (service → role default policy → service). The cluster
+    // is created before the role, so its name is cycle-free, and nothing but the
+    // two app planes lives in it — same effective blast radius, deployable graph.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'RestartAppServices',
+        actions: ['ecs:UpdateService'],
+        resources: [
+          `arn:${this.partition}:ecs:${this.region}:${this.account}:service/${this.cluster.clusterName}/*`,
+        ],
+      }),
+    );
     sweepTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
         actions: ['kms:Decrypt', 'kms:DescribeKey'],
@@ -459,11 +488,12 @@ export class ComputeStack extends Stack {
       }),
     );
     const sweepContainerName = 'SweepContainer';
+    const sweepLogGroup = logGroupFor('sweep');
     sweepTask.addContainer(sweepContainerName, {
       image: containerImage,
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'luciel-sweep',
-        logGroup: logGroupFor('sweep'),
+        logGroup: sweepLogGroup,
       }),
       // Placeholder command; every schedule overrides it with its own sweep name so
       // one task definition backs all four schedules.
@@ -491,7 +521,28 @@ export class ComputeStack extends Stack {
         // was never told where the bucket is.
         LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
         LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
+        // model_currency auto-swap targets (§3.4.3): WHERE to write the successor
+        // model ID and WHICH services to redeploy so it takes effect. Absent in
+        // local/CI runs, where the watchdog degrades to alert-only by design.
+        LUCIEL_PLATFORM_SECRET_ARN: platformSecretArn,
+        LUCIEL_ECS_CLUSTER: this.cluster.clusterName,
+        LUCIEL_ECS_SERVICES: `${dataService.serviceName},${controlService.serviceName}`,
       },
+    });
+
+    // ERROR-level sweep lines become a metric (SweepErrors) the ObservabilityStack
+    // alarms on in armed environments. This is what makes an operator-facing
+    // `logger.error` in ANY sweep — the model_currency watchdog, the §A5 short-lead
+    // billing notice — an alert instead of a line nobody reads. Lives HERE because
+    // this stack owns the sweep log group; the alarm lives with the alarm topic.
+    // CloudWatch term matching is token-delimited, so tracebacks mentioning
+    // SpeechError/ProviderError do not match the standalone ERROR level token.
+    new logs.MetricFilter(this, 'SweepErrorMetric', {
+      logGroup: sweepLogGroup,
+      metricNamespace: SWEEP_ERROR_METRIC.metricNamespace,
+      metricName: SWEEP_ERROR_METRIC.metricName,
+      filterPattern: logs.FilterPattern.literal('ERROR'),
+      metricValue: '1',
     });
 
     // Role EventBridge Scheduler assumes to RunTask. Separate from the task role: the
@@ -624,6 +675,17 @@ export class ComputeStack extends Stack {
         name: 'billing_notices',
         cron: 'cron(20 6 * * ? *)',
         description: 'Email due billing/legal notices once per tenant (§A5/§A10 + 80% nudge)',
+      },
+      {
+        // Daily at 06:35 UTC — deliberately NOT :40 (health fires 06:40) or :50
+        // (knowledge_sync). Verifies every pinned LLM model ID against its
+        // provider's live model list; a retired CHAT pin auto-swaps to its
+        // same-family successor (platform-secret write + service redeploy +
+        // operator email), the embedding pin and anything unremediable alerts
+        // via ERROR log (→ SweepErrors alarm) + nonzero exit (§3.4.3).
+        name: 'model_currency',
+        cron: 'cron(35 6 * * ? *)',
+        description: 'Verify pinned LLM model IDs; auto-swap retired chat pins (§3.4.3)',
       },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with

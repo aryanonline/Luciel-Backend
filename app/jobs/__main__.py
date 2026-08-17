@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 
 from app.jobs.sweeps import AUDIT_RETENTION, SWEEPS
@@ -33,6 +34,12 @@ async def _preflight_audit_lock() -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Nothing else configures logging in the sweep container, so without this,
+    # ERROR-level lines go through Python's lastResort handler with NO level token
+    # — and the sweep log group's `ERROR` metric filter (compute-stack.ts →
+    # SweepErrors → the armed alarm) would never match anything. The level token
+    # leading the line is what makes an operator-facing logger.error alarmable.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     args = argv if argv is not None else sys.argv[1:]
     if len(args) != 1 or args[0] not in SWEEPS:
         print(f"usage: python -m app.jobs {{{'|'.join(SWEEPS)}}}", file=sys.stderr)
