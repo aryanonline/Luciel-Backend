@@ -205,15 +205,19 @@ async def run_deferred_retry(*, now: datetime | None = None) -> list[str]:
 async def _check_connections(
     session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
 ) -> dict[str, str]:
-    from app.channels.tenant_outlook import ProviderDispatchingRefresher
+    from app.connections.refresh import DispatchingRefresher
 
     return await health.run_health_sweep(
         session,
         admin_id=admin_id,
         probe=health.StoredCredentialProbe(),
-        # Outlook rows refresh for real (live mode; Microsoft tokens live ~1h);
-        # everything else keeps the honest no-refresher → expired path.
-        refresher=ProviderDispatchingRefresher(fallback=health.ReconnectOnExpiry()),
+        # Every provider with a REFRESH_SPECS entry refreshes for real in live
+        # mode (Google/HubSpot/Salesforce/Calendly/Outlook refresh grants,
+        # Instagram/Meta long-lived re-exchange); mock and unspecced providers
+        # keep the honest no-refresher → expired path. Before this, ONLY
+        # Outlook could refresh — Google stored a refresh token nothing ever
+        # redeemed and calendars died ~an hour after connect.
+        refresher=DispatchingRefresher(fallback=health.ReconnectOnExpiry()),
         now=now,
     )
 

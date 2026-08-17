@@ -23,6 +23,7 @@ here — the wire model has no field for it (§3.8.3).
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, cast
 
 import httpx
@@ -588,6 +589,21 @@ async def complete_oauth_connect(
             if conflict_reason is None:
                 cfg = dict(conn.non_secret_config or {})
                 cfg.update(verify_updates)
+                conn.non_secret_config = cfg
+        # Generic token-expiry stamping (§3.8.5): every OAuth exchange that
+        # states a lifetime gets its `token_expires_at` hint recorded, so the
+        # proactive-refresh worker's expiry branch fires for EVERY provider —
+        # not only Outlook, whose verifier (POST_EXCHANGE_VERIFIERS) stamps its
+        # own value and is never overwritten here. Without this hint the sweep
+        # had nothing to key on: Google stored a refresh token nothing ever
+        # redeemed and the connection died ~an hour after connect.
+        if conflict_reason is None and material.get("expires_in"):
+            raw_lifetime = str(material["expires_in"])
+            if raw_lifetime.isdigit() and "token_expires_at" not in (verify_updates or {}):
+                cfg = dict(conn.non_secret_config or {})
+                cfg["token_expires_at"] = (
+                    datetime.now(UTC) + timedelta(seconds=int(raw_lifetime))
+                ).isoformat()
                 conn.non_secret_config = cfg
         if conflict_reason is None:
             if pending_provider is not None:

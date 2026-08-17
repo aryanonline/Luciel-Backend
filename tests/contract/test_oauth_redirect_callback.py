@@ -93,7 +93,13 @@ def _fake_google_transport(monkeypatch, *, fail: bool = False):
                 )
             return httpx.Response(
                 200,
-                json={"access_token": "g-tok-1", "refresh_token": "g-refresh-1"},
+                # expires_in mirrors the real Google response: it becomes the
+                # token_expires_at hint the proactive-refresh worker keys on.
+                json={
+                    "access_token": "g-tok-1",
+                    "refresh_token": "g-refresh-1",
+                    "expires_in": 3599,
+                },
                 request=httpx.Request("POST", url),
             )
 
@@ -170,6 +176,15 @@ async def test_valid_state_exchanges_the_code_connects_and_redirects(client, mon
     assert transport.calls[0]["code_verifier"]
     # Secret material must never ride the wire, not even in a redirect URL (§3.8.3).
     assert "g-tok-1" not in r.headers["location"]
+
+    # §3.8.5: the exchange's expires_in is stamped as the non-secret expiry HINT —
+    # without it the health sweep's proactive-refresh branch never fires and the
+    # stored refresh token is never redeemed (the "calendar dies after an hour"
+    # failure this closes at the root).
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    row = next(c for c in listed if c["connectionId"] == connection_id)
+    hint = row.get("nonSecretConfig", {}).get("token_expires_at")
+    assert hint, "token_expires_at hint must be stamped from the exchange's expires_in"
 
 
 # --- every failure is a redirect, never an error page ----------------------- #

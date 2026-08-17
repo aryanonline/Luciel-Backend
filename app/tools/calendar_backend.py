@@ -188,6 +188,20 @@ class GoogleCalendarBackend:
         self._calendar_id = calendar_id
 
     async def _credentials(self, ctx: ToolContext) -> CalendarCredentials:
+        # Call-time freshness (§3.8.5, the tenant_outlook pattern generalized):
+        # refresh a stale/unknown-expiry token BEFORE the booking call, so a
+        # customer's "book me in" never fails on a token that merely aged out
+        # between health sweeps. Live-gated inside the helper; in mock (and
+        # when no session is available) it returns the stored token untouched.
+        if ctx.session is not None:
+            from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+            token = await ensure_fresh_access_token(
+                ctx.session, ctx.admin_id, ctx.instance_id, connection_type="calendar"
+            )
+            if not token:
+                raise CalendarUnavailable("calendar_token_unavailable")
+            return CalendarCredentials(access_token=token, calendar_id=self._calendar_id)
         ref = secret_ref_for(ctx.admin_id, ctx.instance_id, "calendar")
         material = await get_secret_store().get(ref)
         token = (material or {}).get("access_token")

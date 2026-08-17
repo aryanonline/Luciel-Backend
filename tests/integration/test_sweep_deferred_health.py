@@ -71,6 +71,7 @@ async def _seed_connection(
     status: str = "connected",
     secret_ref: str | None = None,
     non_secret_config: dict[str, object] | None = None,
+    provider: str = "twilio",
 ) -> uuid.UUID:
     connection_id = uuid.uuid4()
     async with tenant_session(admin_id) as s:
@@ -81,7 +82,7 @@ async def _seed_connection(
                 instance_id=instance_id,
                 connection_type=connection_type,
                 auth_class=auth_class,
-                provider="twilio",
+                provider=provider,
                 status=status,
                 secret_ref=secret_ref,
                 non_secret_config=non_secret_config,
@@ -386,6 +387,135 @@ async def test_the_health_sweep_leaves_a_revoked_connection_alone() -> None:
         assert rows[dead].status == "revoked"
         assert rows[dead].last_health_check_at is None
         assert rows[live].status == "connected"
+
+
+async def test_an_expiring_token_with_a_real_refresher_stays_connected() -> None:
+    """§3.8.5 steps 3–4, now for EVERY specced provider: a Google row near expiry
+    is refreshed in place — new material persisted, new hint stamped, status
+    stays connected. Before app/connections/refresh.py this path existed only
+    for Outlook; Google connections just expired."""
+    from datetime import UTC, datetime
+
+    from app.connections import health
+    from app.connections.secrets import LocalSecretStore
+
+    admin_id = uuid.uuid4()
+    instance_id = await _seed_tenant(admin_id)
+    connection_id = await _seed_connection(
+        admin_id,
+        instance_id,
+        auth_class="oauth_token",
+        secret_ref="vm/refresh-me",
+        non_secret_config={"token_expires_at": (NOW + timedelta(minutes=5)).isoformat()},
+    )
+    store = LocalSecretStore()
+    await store.put("vm/refresh-me", {"access_token": "old", "refresh_token": "rt"})
+
+    class _AlwaysFresh:
+        async def refresh(self, connection, backing):  # noqa: ANN001
+            await backing.put(connection.secret_ref, {"access_token": "new", "refresh_token": "rt"})
+            return datetime.now(UTC) + timedelta(hours=1)
+
+    async with tenant_session(admin_id) as s:
+        await health.run_health_sweep(
+            session=s,
+            admin_id=admin_id,
+            probe=health.StoredCredentialProbe(store),
+            refresher=_AlwaysFresh(),  # the worker seam takes any TokenRefresher
+            store=store,
+            now=NOW,
+        )
+
+    async with tenant_session(admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_id == connection_id)
+            )
+        ).scalar_one()
+        assert row.status == "connected"
+        new_hint = row.non_secret_config["token_expires_at"]
+        assert datetime.fromisoformat(new_hint) > NOW + timedelta(minutes=30)
+    assert (await store.get("vm/refresh-me"))["access_token"] == "new"
+
+
+async def test_ensure_fresh_access_token_refreshes_at_call_time(monkeypatch) -> None:
+    """The call-time twin of the sweep (§3.8.5, the tenant_outlook pattern
+    generalized): a booking call finding a stale hint refreshes FIRST, so the
+    customer's "book me in" never fails on a token that merely aged out between
+    sweeps. A fresh hint short-circuits with no provider call."""
+    from datetime import UTC, datetime
+
+    from app.connections import refresh
+    from app.connections.secrets import LocalSecretStore
+
+    admin_id = uuid.uuid4()
+    instance_id = await _seed_tenant(admin_id)
+    await _seed_connection(
+        admin_id,
+        instance_id,
+        connection_type="calendar",
+        auth_class="oauth_token",
+        secret_ref="vm/cal-token",
+        provider="google_calendar",
+        non_secret_config={"token_expires_at": (NOW - timedelta(minutes=1)).isoformat()},
+    )
+    store = LocalSecretStore()
+    await store.put("vm/cal-token", {"access_token": "stale", "refresh_token": "rt"})
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"access_token": "fresh", "expires_in": 3600}
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def post(self, url, *, data=None, headers=None):  # noqa: ANN001
+            self.calls += 1
+            return _Response()
+
+        async def get(self, url, *, params=None):  # noqa: ANN001
+            raise AssertionError("google refresh is a POST")
+
+    from app.config import get_settings
+
+    monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_ID", "g-cid")
+    monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_SECRET", "g-csecret")
+    monkeypatch.setenv("LUCIEL_GOOGLE_REDIRECT_URI", "https://api.example.com/cb")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    monkeypatch.setattr(refresh, "live_mode", lambda: True)
+    transport = _Transport()
+
+    async with tenant_session(admin_id) as s:
+        token = await refresh.ensure_fresh_access_token(
+            s, admin_id, instance_id, connection_type="calendar", store=store, transport=transport
+        )
+        assert token == "fresh"
+        assert transport.calls == 1
+        # Second call inside the fresh window: no provider call, same token.
+        token2 = await refresh.ensure_fresh_access_token(
+            s, admin_id, instance_id, connection_type="calendar", store=store, transport=transport
+        )
+        assert token2 == "fresh"
+        assert transport.calls == 1
+
+    assert (await store.get("vm/cal-token"))["access_token"] == "fresh"
+    async with tenant_session(admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_type == "calendar",
+                )
+            )
+        ).scalar_one()
+        assert datetime.fromisoformat(row.non_secret_config["token_expires_at"]) > datetime.now(
+            UTC
+        ) + timedelta(minutes=30)
+    get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 async def test_the_health_sweep_never_resurrects_a_billing_dormant_connection() -> None:

@@ -249,18 +249,32 @@ async def exchange_code_for_token(
     material: dict[str, str] = {"access_token": str(data["access_token"])}
     if data.get("refresh_token"):
         material["refresh_token"] = str(data["refresh_token"])
+    # Always capture the token lifetime when the provider states one: it is the
+    # expiry HINT the proactive-refresh worker (§3.8.5, app/connections/refresh)
+    # keys on. Before this, only providers that listed expires_in in
+    # token_fields kept it — i.e. none — so no non-Outlook connection ever got
+    # an expiry hint and the refresh branch never fired for them.
+    if data.get("expires_in"):
+        material["expires_in"] = str(data["expires_in"])
     for extra in authorize.token_fields:
         if data.get(extra):
             material[extra] = str(data[extra])
 
     if authorize.long_lived_endpoint and authorize.long_lived_grant_type:
-        material["access_token"] = await _upgrade_to_long_lived(
+        long_lived_token, long_lived_expires_in = await _upgrade_to_long_lived(
             provider,
             authorize,
             client_secret=cfg.client_secret,
             short_lived=material["access_token"],
             transport=transport,
         )
+        material["access_token"] = long_lived_token
+        # The LONG-lived expiry is the one that matters (~60 days); keeping the
+        # short-lived token's ~1h value would make the sweep refresh constantly.
+        if long_lived_expires_in:
+            material["expires_in"] = long_lived_expires_in
+        else:
+            material.pop("expires_in", None)
     return material
 
 
@@ -271,12 +285,15 @@ async def _upgrade_to_long_lived(
     client_secret: str,
     short_lived: str,
     transport: HttpTransport,
-) -> str:
+) -> tuple[str, str | None]:
     """Trade a short-lived token for a long-lived one (Instagram Login, §3.8.3).
 
-    Raises ``OAuthExchangeError`` rather than falling back to the short-lived token: the
-    fallback would look like a successful connect and then break about an hour later, with
-    nothing in the connection's status to explain why.
+    Returns ``(token, expires_in_or_None)`` — the long-lived expiry (~60 days) is
+    the hint the proactive-refresh worker needs; the caller replaces the
+    short-lived ~1h value with it. Raises ``OAuthExchangeError`` rather than
+    falling back to the short-lived token: the fallback would look like a
+    successful connect and then break about an hour later, with nothing in the
+    connection's status to explain why.
     """
     resp = await transport.get(
         str(authorize.long_lived_endpoint),
@@ -298,7 +315,8 @@ async def _upgrade_to_long_lived(
             f"{provider} long-lived token exchange returned no access_token "
             f"({data.get('error', 'no reason given')})."
         )
-    return str(token)
+    expires_in = str(data["expires_in"]) if data.get("expires_in") else None
+    return str(token), expires_in
 
 
 async def store_oauth_token(
