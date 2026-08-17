@@ -340,10 +340,16 @@ async def ensure_fresh_access_token(
             )
         )
     ).scalar_one_or_none()
-    if conn is None or not conn.secret_ref:
+    if conn is None:
         return None
+    # The connect flow stamps secret_ref; rows that predate it (and fixtures)
+    # rely on the vm/{admin}/{instance}/{type} convention the store has always
+    # used — the same fallback the direct-read paths applied before this helper.
+    from app.connections.secrets import secret_ref_for  # noqa: PLC0415
+
+    secret_ref = conn.secret_ref or secret_ref_for(admin_id, instance_id, connection_type)
     backing = store or get_secret_store()
-    material = await backing.get(conn.secret_ref) or {}
+    material = await backing.get(secret_ref) or {}
     access_token = material.get("access_token", "")
     if not access_token:
         return None
@@ -363,7 +369,7 @@ async def ensure_fresh_access_token(
         return None
     rotated, new_expiry = refreshed
     # Rotation durable BEFORE the new token is used (the Outlook rule, §3.8.5).
-    await backing.put(conn.secret_ref, rotated)
+    await backing.put(secret_ref, rotated)
     cfg = dict(conn.non_secret_config or {})
     cfg["token_expires_at"] = new_expiry.isoformat()
     conn.non_secret_config = cfg

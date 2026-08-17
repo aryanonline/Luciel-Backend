@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +57,7 @@ from app.schemas_api.connections import (
     EmailProvisioningOut,
     ProviderOptionOut,
     ProvisionEmailRequest,
+    RecordSourceCsvOut,
     StartConnectionRequest,
     StartConnectionResult,
     SubmitCredentialsRequest,
@@ -368,9 +369,17 @@ async def list_providers(
                             "displayName": spec.display_name,
                             "authKind": spec.auth_kind,
                             "helpText": spec.help_text,
-                            "configured": registry.oauth_client_config(spec.provider).configured
-                            if spec.is_oauth
-                            else True,
+                            # unavailable_for wins over OAuth-client presence: a
+                            # provider whose EFFECT layer is unbuilt for this
+                            # surface must render "not available yet", never a
+                            # connect button that dead-ends (honest-disabled).
+                            "configured": False
+                            if ct in spec.unavailable_for
+                            else (
+                                registry.oauth_client_config(spec.provider).configured
+                                if spec.is_oauth
+                                else True
+                            ),
                             "credentialFields": [
                                 {
                                     "name": f.name,
@@ -389,6 +398,109 @@ async def list_providers(
         )
         for ct in types
     ]
+
+
+# Record-source CSV bounds: a live-lookup table, not the knowledge store — the
+# knowledge quota (5 GB) does not apply here. Bounded so one upload cannot
+# balloon a hot tenant table the tool scans at call time.
+RECORD_SOURCE_MAX_BYTES = 5_000_000
+RECORD_SOURCE_MAX_ROWS = 10_000
+
+
+@router.post("/record-source/csv", response_model=RecordSourceCsvOut)
+async def upload_record_source_csv(
+    file: UploadFile, subject: Subject = Depends(current_admin)
+) -> RecordSourceCsvOut:
+    """Upload (or REPLACE) the CSV rows backing ``lookup_record`` (Vision §3.2).
+
+    The rows are the ``csv`` provider's live system of record — queried by the
+    tool at call time, never via the knowledge store (§3.2 boundary). Upload
+    replaces the tenant's previous rows in one transaction and flips the
+    ``record_source`` connection to ``connected`` with the row count on its
+    status detail, so the Configure surface states exactly what the tool serves.
+    """
+    import csv as csv_module  # noqa: PLC0415
+    import io  # noqa: PLC0415
+
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.record_source import RecordSourceRecord  # noqa: PLC0415
+
+    raw = await file.read(RECORD_SOURCE_MAX_BYTES + 1)
+    if len(raw) > RECORD_SOURCE_MAX_BYTES:
+        raise validation_error("That CSV is larger than 5 MB — split it or trim unused columns.")
+    reader = csv_module.DictReader(io.StringIO(raw.decode("utf-8-sig", errors="replace")))
+    columns = [c for c in (reader.fieldnames or []) if c]
+    if not columns:
+        raise validation_error("The CSV needs a header row naming its columns.")
+    rows: list[dict[str, str]] = []
+    for record in reader:
+        if len(rows) >= RECORD_SOURCE_MAX_ROWS:
+            raise validation_error(
+                f"That CSV has more than {RECORD_SOURCE_MAX_ROWS} rows — trim it down."
+            )
+        fields = {str(k): str(v or "") for k, v in record.items() if k}
+        if any(v.strip() for v in fields.values()):
+            rows.append(fields)
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        await s.execute(
+            sa_delete(RecordSourceRecord).where(RecordSourceRecord.admin_id == subject.admin_id)
+        )
+        for ordinal, fields in enumerate(rows):
+            s.add(
+                RecordSourceRecord(
+                    admin_id=subject.admin_id,
+                    instance_id=instance_id,
+                    ordinal=ordinal,
+                    fields=fields,
+                )
+            )
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.instance_id == instance_id,
+                    InstanceConnection.connection_type == "record_source",
+                )
+            )
+        ).scalar_one_or_none()
+        detail = f"{len(rows)} records on file"
+        if conn is None:
+            old_status = "unconfigured"
+            conn = InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                connection_type="record_source",
+                provider="csv",
+                auth_class="provisioned_resource",
+                status="connected",
+                status_detail=detail,
+            )
+            s.add(conn)
+        else:
+            old_status = conn.status
+            conn.provider = "csv"
+            conn.auth_class = "provisioned_resource"
+            conn.status = "connected"
+            conn.status_detail = detail
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "old_status": old_status,
+                "new_status": "connected",
+                "reason": "record_source_csv_uploaded",
+            },
+        )
+    return RecordSourceCsvOut(records=len(rows), columns=columns)
 
 
 @router.post("/{connection_id}/disconnect", response_model=DisconnectResult)

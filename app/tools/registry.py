@@ -19,12 +19,18 @@ Connection-backed (a real effect once the tenant has connected):
   * ``bring_your_own_webhook`` — admin-registered HTTP endpoint through the
     subprocess sandbox, with the admin's stored Authorization header attached
     by the parent process at dispatch (the subprocess never sees other secrets).
+  * ``push_to_crm``   — HubSpot contact upsert (maintains the SAME lead's record
+    via ``crm_lead_links``, §3.3.6) or the custom-webhook sandbox path; both in
+    ``app/tools/crm_backend.py``.
+  * ``lookup_record`` — the admin's uploaded CSV rows, read live at call time
+    (``app/tools/record_backend.py``).
 
 Connection-gated (dispatch path is correct; the effect needs an OAuth backend that
 does not exist yet, so they resolve to a Tool and fail cleanly rather than silently):
   * the scheduling tools on a CALENDLY connection — no registered OAuth client yet.
-  * ``lookup_record``          — admin-connected record source.
-  * ``push_to_crm``            — HubSpot / Salesforce.
+  * ``lookup_record`` on a LIVE-API connector (non-CSV) — no effect layer yet.
+  * ``push_to_crm`` on a SALESFORCE connection — honestly unavailable in the
+    registry (``unavailable_for``), HubSpot-first by owner decision.
 
 For the connection-gated set the broker's gate 3 refuses first (the connection can
 never reach ``connected`` without a real OAuth flow), so the unimplemented backend is
@@ -107,7 +113,7 @@ class _UnavailableExternalBackend:
 
     async def upsert_lead(
         self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         raise BackendNotConnected("crm_backend_unavailable")
 
 
@@ -171,6 +177,66 @@ class _TenantCalendarBackend:
 
     async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
         return await (await self._for(ctx)).cancel(ctx, booking_ref)
+
+
+class _TenantCrmBackend:
+    """Dispatches ``push_to_crm`` on the PROVIDER the tenant actually connected
+    (same pattern as ``_TenantCalendarBackend``): HubSpot gets the real upsert
+    backend, the custom webhook posts through the sandbox envelope, and
+    Salesforce stays honestly unavailable until its effect layer exists."""
+
+    def __init__(self) -> None:
+        self._unavailable = _UnavailableExternalBackend()
+
+    async def upsert_lead(
+        self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        provider = await _connection_provider(ctx, "crm")
+        if provider == "hubspot":
+            from app.tools.crm_backend import HubSpotCrmBackend  # noqa: PLC0415
+
+            return await HubSpotCrmBackend().upsert_lead(ctx, lead_key, fields)
+        if provider == "custom_webhook":
+            from app.tools.crm_backend import WebhookCrmBackend  # noqa: PLC0415
+
+            return await WebhookCrmBackend().upsert_lead(ctx, lead_key, fields)
+        return await self._unavailable.upsert_lead(ctx, lead_key, fields)
+
+
+class _TenantRecordBackend:
+    """Dispatches ``lookup_record`` on the connected record-source provider:
+    ``csv`` reads the uploaded rows live at call time; a live-API connector has
+    no effect layer yet and stays honestly unavailable."""
+
+    def __init__(self) -> None:
+        self._unavailable = _UnavailableExternalBackend()
+
+    async def lookup(self, ctx: ToolContext, query: str) -> list[dict[str, Any]]:
+        provider = await _connection_provider(ctx, "record_source")
+        if provider == "csv":
+            from app.tools.record_backend import CsvRecordBackend  # noqa: PLC0415
+
+            return await CsvRecordBackend().lookup(ctx, query)
+        return await self._unavailable.lookup(ctx, query)
+
+
+async def _connection_provider(ctx: ToolContext, connection_type: str) -> str | None:
+    if ctx.session is None:
+        return None
+    from sqlalchemy import select  # noqa: PLC0415 — keeps import cost off module load
+
+    from app.models.connection import InstanceConnection  # noqa: PLC0415
+
+    provider = (
+        await ctx.session.execute(
+            select(InstanceConnection.provider).where(
+                InstanceConnection.admin_id == ctx.admin_id,
+                InstanceConnection.instance_id == ctx.instance_id,
+                InstanceConnection.connection_type == connection_type,
+            )
+        )
+    ).scalar_one_or_none()
+    return str(provider) if provider is not None else None
 
 
 class _EmailMessengerBackend:
@@ -310,7 +376,6 @@ def build_tool(tool_id: str) -> Tool | None:
     A fresh instance per resolution: the tools are stateless apart from the BYO
     breaker, and per-turn construction keeps no cross-tenant state.
     """
-    unavailable = _UnavailableExternalBackend()
     if tool_id == "schedule_callback":
         return catalog.ScheduleCallbackTool()
     if tool_id == "send_email":
@@ -320,9 +385,9 @@ def build_tool(tool_id: str) -> Tool | None:
     if tool_id in _CALENDAR_TOOLS:
         return _CALENDAR_TOOLS[tool_id](_TenantCalendarBackend())
     if tool_id == "lookup_record":
-        return catalog.LookupRecordTool(unavailable)
+        return catalog.LookupRecordTool(_TenantRecordBackend())
     if tool_id == "push_to_crm":
-        return catalog.PushToCrmTool(unavailable)
+        return catalog.PushToCrmTool(_TenantCrmBackend())
     if tool_id == "bring_your_own_webhook":
         return BringYourOwnWebhookTool()
     return None

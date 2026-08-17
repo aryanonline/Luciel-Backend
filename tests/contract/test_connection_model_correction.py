@@ -84,6 +84,21 @@ async def test_providers_accepts_the_camelcase_filter_the_frontend_sends(client)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_salesforce_lead_push_is_honestly_unavailable_on_the_crm_surface(client):
+    """§3.3.6 owner scope: HubSpot push is real; Salesforce push has no effect
+    layer yet. The crm group must serve salesforce configured=false (the UI's
+    "not available yet" row) — a connect button that dead-ends after a real
+    consent screen is the exact dishonesty the registry exists to prevent.
+    KB-read is untouched: the unavailability is scoped to the crm surface."""
+    await _ready_account_with_luciel(client)
+    crm = await client.get("/api/v1/admin/connections/providers?connectionType=crm")
+    options = {o["provider"]: o for o in crm.json()[0]["providers"]}
+    assert options["salesforce"]["configured"] is False
+    # The custom-webhook CRM path is a credential form — always offerable.
+    assert options["custom_webhook"]["configured"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_chosen_provider_is_what_the_connect_flow_starts(client, monkeypatch):
     """Picking Salesforce must start Salesforce — provider choice drives the flow.
 

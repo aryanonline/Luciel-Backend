@@ -23,10 +23,12 @@ from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
+from app.models.crm_link import CrmLeadLink
 from app.models.deferred import DeferredAction
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
 from app.models.lead import Lead
+from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
 from app.models.voice import VoiceCallRecord
 
@@ -54,6 +56,8 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (Lead, "lead_record"),
     (EscalationEvent, "escalation_event"),
     (VoiceCallRecord, "voice_call_record"),
+    (CrmLeadLink, "crm_lead_link"),
+    (RecordSourceRecord, "record_source_record"),
     (DeferredAction, "deferred_action"),
     (InstanceToolAuthorization, "instance_tool_authorization"),
     (ConversationBudget, "conversation_budget"),

@@ -109,6 +109,12 @@ class ProviderSpec:
     scope_kind: str | None = None
     # Human-readable one-liner the UI shows next to the choice.
     help_text: str = ""
+    # Connection types for which this provider is offered but its EFFECT layer is
+    # not built yet (honest-disabled: served configured=false, so the UI renders
+    # the "not available yet" row instead of a connect button that dead-ends).
+    # Scoped per type because one provider can be real on one surface and not
+    # another — Salesforce KB-read works; Salesforce lead-push does not.
+    unavailable_for: frozenset[str] = frozenset()
 
     @property
     def is_oauth(self) -> bool:
@@ -193,7 +199,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
         client_id_setting="salesforce_consumer_key",
         client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="salesforce_redirect_uri",
-        help_text="Push captured leads into Salesforce.",
+        help_text="Push captured leads into Salesforce — not available yet.",
+        # Lead-PUSH has no Salesforce effect layer yet (owner scope decision:
+        # HubSpot first). KB-read (knowledge_source via _ALSO_ACCEPTED) stays
+        # live — the unavailability is scoped to the crm surface only.
+        unavailable_for=frozenset({"crm"}),
     ),
     "custom_webhook": ProviderSpec(
         provider="custom_webhook",

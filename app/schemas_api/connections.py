@@ -212,3 +212,13 @@ class EmailProvisioningOut(WireModel):
     status: str
     # own_domain only: records the admin must add to complete inbound routing.
     dns_records: list[DnsRecord] | None = None
+
+
+class RecordSourceCsvOut(WireModel):
+    """Result of a record-source CSV upload: how many live rows now back
+    ``lookup_record``. Upload REPLACES the tenant's rows (re-upload to refresh,
+    Vision §3.2 'CSV upload' provider); the row count is echoed so the owner
+    sees exactly what the tool now serves."""
+
+    records: int
+    columns: list[str]

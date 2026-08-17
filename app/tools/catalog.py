@@ -60,7 +60,14 @@ class MessengerBackend(Protocol):
 class CrmBackend(Protocol):
     async def upsert_lead(
         self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
-    ) -> str | None: ...
+    ) -> dict[str, Any] | None:
+        """Idempotent upsert maintaining the SAME lead's record (§3.3.6).
+
+        Returns ``{"crm_record_id": ..., "action": "created"|"updated"|"delivered"}``
+        on success (the create-vs-update history is traced, §3.3.6), or None for a
+        provider field-mapping rejection. Raises on connection/provider failure.
+        """
+        ...
 
 
 # --- tools ------------------------------------------------------------------ #
@@ -433,13 +440,20 @@ class PushToCrmTool:
 
     async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
         try:
-            crm_id = await self.backend.upsert_lead(context, inputs["lead_key"], inputs["fields"])
+            result = await self.backend.upsert_lead(context, inputs["lead_key"], inputs["fields"])
         except Exception as exc:  # noqa: BLE001
             return c.failed(f"crm_error: {type(exc).__name__}")
-        if crm_id is None:
+        if result is None:
             # Field-mapping failure → failed; lead remains safe in our dashboard (§3.3.6).
             return c.failed("crm_field_mapping")
-        return c.ok({"crmRecordId": crm_id})
+        # create-vs-update is part of the confirming payload (§3.3.6 traced
+        # history): "updated" IS the maintenance semantics working.
+        return c.ok(
+            {
+                "crmRecordId": result["crm_record_id"],
+                "action": result.get("action", "updated"),
+            }
+        )
 
 
 # bring_your_own_webhook is implemented in app/connections/sandbox.py (its execute

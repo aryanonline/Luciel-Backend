@@ -34,6 +34,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "payment_failed",
         "dunning_state_changed",
         "connection_status_changed",
+        # A push_to_crm upsert landed (§3.3.6 traced create-vs-update history).
+        # Payload: provider + action + record id — never lead PII (§3.4.11).
+        "crm_record_upserted",
         "connection_secret_cleanup",
         # Emitted at delete_luciel time (§3.6.3): the secret's destruction is
         # SCHEDULED for the day-30 cascade so a restore can revive the
