@@ -29,6 +29,7 @@ from app.models.deferred import DeferredAction
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
 from app.models.lead import Lead
+from app.models.notice_delivery import NoticeDelivery
 from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
 from app.models.voice import VoiceCallRecord
@@ -64,6 +65,7 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (InstanceToolAuthorization, "instance_tool_authorization"),
     (ConversationBudget, "conversation_budget"),
     (CountedSession, "counted_session"),
+    (NoticeDelivery, "notice_delivery"),
     (ProcessedStripeEvent, "processed_stripe_event"),
     (BillingAccount, "billing_account"),
     (InstanceConnection, "instance_connection"),

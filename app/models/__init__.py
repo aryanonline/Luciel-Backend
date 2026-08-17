@@ -7,6 +7,7 @@ Importing this package imports every model module so that:
 
 from app.models.audit import AdminAuditLog
 from app.models.billing import BillingAccount, ProcessedStripeEvent
+from app.models.booking import BookingEvent
 from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.models.contact import ContactSubmission
@@ -16,6 +17,7 @@ from app.models.conversation import (
     SessionSummary,
     Transcript,
 )
+from app.models.crm_link import CrmLeadLink
 from app.models.deferred import DeferredAction
 from app.models.instance import Account, Instance
 from app.models.knowledge import (
@@ -25,6 +27,8 @@ from app.models.knowledge import (
     KnowledgeSource,
 )
 from app.models.lead import Lead
+from app.models.notice_delivery import NoticeDelivery
+from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
 from app.models.voice import VoiceCallRecord
 
@@ -35,10 +39,14 @@ __all__ = [
     "Lead",
     "AdminAuditLog",
     "BillingAccount",
+    "BookingEvent",
+    "CrmLeadLink",
     "KnowledgeSource",
     "KnowledgeChunk",
     "KnowledgeEntity",
     "KnowledgeEdge",
+    "NoticeDelivery",
+    "RecordSourceRecord",
     "Session",
     "Transcript",
     "SessionSummary",

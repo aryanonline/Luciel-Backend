@@ -82,5 +82,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "lead_archived",
         "lead_reactivated",
         "lifecycle_notice_sent",
+        # A billing/legal notice email left the platform (§A5 allowance
+        # reduction, §A10 price change, the 80% pay-as-you-go heads-up).
+        # Payload: notice_id + kind + delivery status. The once-only proof is
+        # the notice_deliveries row; this is the audit trail of the send.
+        "billing_notice_sent",
     }
 )

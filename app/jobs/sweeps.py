@@ -82,6 +82,7 @@ SESSION_FINALIZE = "session_finalize"
 TRANSCRIPT_ARCHIVE = "transcript_archive"
 MAILBOX_POLL = "mailbox_poll"
 KNOWLEDGE_SYNC = "knowledge_sync"
+BILLING_NOTICES = "billing_notices"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -97,6 +98,7 @@ SWEEP_KINDS: tuple[str, ...] = (
     TRANSCRIPT_ARCHIVE,
     MAILBOX_POLL,
     KNOWLEDGE_SYNC,
+    BILLING_NOTICES,
 )
 
 
@@ -303,6 +305,27 @@ async def run_knowledge_sync(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(KNOWLEDGE_SYNC, _sync_knowledge, now)
 
 
+async def _deliver_billing_notices(
+    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
+) -> int:
+    from app.billing.notice_delivery import deliver_due_notices  # noqa: PLC0415 — lazy import
+
+    return await deliver_due_notices(session, admin_id=admin_id, now=now)
+
+
+async def run_billing_notices(*, now: datetime | None = None) -> list[str]:
+    """Email every due billing notice, once per tenant per notice (§A5 / §A10).
+
+    THE email half of the account-notice commitments: the §A5 allowance-reduction
+    notice ("BOTH by email AND as an in-dashboard notification") and any
+    operator-published §A10/§B6 notice, plus the Vision §7 ~80%-through-a-block
+    pay-as-you-go heads-up (once per billing period). The dashboard halves have
+    always rendered; before this sweep nothing ever sent the emails, so the
+    commitment was met only for owners who happened to log in. Idempotency is the
+    ``notice_deliveries`` ledger, not the schedule."""
+    return await _per_tenant(BILLING_NOTICES, _deliver_billing_notices, now)
+
+
 SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -317,4 +340,5 @@ SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     TRANSCRIPT_ARCHIVE: run_transcript_archive,
     MAILBOX_POLL: run_mailbox_poll,
     KNOWLEDGE_SYNC: run_knowledge_sync,
+    BILLING_NOTICES: run_billing_notices,
 }

@@ -186,6 +186,88 @@ async def send_export_ready(
         return None
 
 
+async def send_account_notice(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    notice_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    extra_payload: dict[str, object] | None = None,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """The EMAIL half of an account notice (Legal §A5 / §A10 / §B6).
+
+    §A5 owes an allowance reduction notice "BOTH by email AND as an in-dashboard
+    notification" — the dashboard half renders from ``app.billing.notices``; this
+    sends the same copy by mail. Called once per (tenant, notice_id) by the
+    ``billing_notices`` sweep, whose ``notice_deliveries`` ledger is what makes
+    "once" true; this function just sends and audits.
+    """
+    full_body = (
+        f"{body}\n\n"
+        "You can review your usage and billing setup any time from the Billing page "
+        "of your VantageMind dashboard, where this notice also appears."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=title,
+        body=full_body,
+        notice_type="account_notice",
+        audit_event="billing_notice_sent",
+        extra_payload={"notice_id": notice_id, "kind": kind, **(extra_payload or {})},
+        sender=sender,
+    )
+
+
+async def send_payg_usage_nudge(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    notice_id: str,
+    conversations_this_period: int,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """The ~80%-through-a-block heads-up email (Vision §7 / §3.4.1b).
+
+    A nudge, never a cap: nothing changes automatically and Luciel keeps
+    answering. The dashboard half is ``nearNextBlock`` on the billing read; this
+    is the email the docs promise alongside it, sent at most once per billing
+    period (the sweep keys it ``payg80:<period_start>``).
+    """
+    settings = get_settings()
+    price_dollars = settings.payg_price_per_block_cents // 100
+    body = (
+        "A quick heads-up from VantageMind.\n\n"
+        f"Luciel has handled {conversations_this_period} conversations so far this "
+        f"billing period, which puts you close to starting your next block of "
+        f"{settings.payg_block_size} pay-as-you-go conversations (${price_dollars}).\n\n"
+        "Nothing changes automatically and there is nothing you need to do — Luciel "
+        "keeps answering your customers as usual. You can review your usage and "
+        "billing setup any time from the Billing page of your dashboard."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Heads-up: you're approaching your next pay-as-you-go block",
+        body=body,
+        notice_type="payg_usage_nudge",
+        audit_event="billing_notice_sent",
+        extra_payload={
+            "notice_id": notice_id,
+            "kind": "payg_usage_nudge",
+            "conversations_this_period": conversations_this_period,
+        },
+        sender=sender,
+    )
+
+
 async def send_payment_failed(
     session: AsyncSession,
     *,

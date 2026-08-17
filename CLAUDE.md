@@ -130,7 +130,10 @@ modules rather than duplicating business rules in a new location.
 - Account closure is two-step: delete Luciel (with export offer) and then close the
   account. Deletion has a 30-day grace and restore returns it to active; pause differs.
 - Export links expire after seven days. Session content and summaries over one year
-  are deleted. Do not claim unbuilt auto-pruning or allowance-reduction notices.
+  are deleted. Lead auto-pruning is per-tenant opt-in (`leadRetentionDays`; NULL is
+  off). Allowance-reduction notices are real in BOTH halves (§A5): the dashboard
+  notice renders on login and the daily `billing_notices` sweep emails each notice
+  once per tenant (`notice_deliveries` ledger).
 - The audit log is append-only with one-year retention. The audit ownership lock is a
   migration postcondition: run the superuser lock step after `alembic upgrade head`.
 - SSRF protection, session-epoch invalidation on close, constant-time comparisons,

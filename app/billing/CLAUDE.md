@@ -7,7 +7,8 @@ Owns PAYG billing accounts, metering, Stripe interaction, dunning, and billing n
 `metering.py` — session counting, delta blocks, watermark, and reconciliation.
 `stripe_gateway.py` — Stripe posture and meter-event gateway.
 `webhooks.py` — signature/replay handling.
-`dunning.py` and `notices.py` — account follow-up behavior.
+`dunning.py`, `notices.py`, and `notice_delivery.py` — account follow-up, in-dashboard
+notices, and the once-only notice email sweep worker.
 
 ## Contracts this module owns
 - Price is $0/first 50 conversations then $39 per 100-conversation PAYG block; no tiers, seats, or model picker.

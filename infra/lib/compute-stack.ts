@@ -603,6 +603,17 @@ export class ComputeStack extends Stack {
         cron: 'cron(50 */6 * * ? *)',
         description: 'Re-sync due live-sync knowledge sources; re-crawl websites (§3.2.3)',
       },
+      {
+        // Daily, morning UTC: the EMAIL half of the account-notice commitments —
+        // Legal §A5 owes an allowance reduction notice "BOTH by email AND as an
+        // in-dashboard notification" (the dashboard half renders on login; before
+        // this schedule nothing ever sent the email), plus §A10/§B6 operator-
+        // published notices and the Vision §7 80% pay-as-you-go heads-up. Once-only
+        // is the notice_deliveries ledger, so daily at-least-once delivery is safe.
+        name: 'billing_notices',
+        cron: 'cron(20 6 * * ? *)',
+        description: 'Email due billing/legal notices once per tenant (§A5/§A10 + 80% nudge)',
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack
