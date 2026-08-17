@@ -3,15 +3,19 @@
 The config bridge made a model-retirement swap deploy-free; this sweep is the
 detection half and (owner decision 2026-08-17) the remediation half. Pinned here:
 
-  - the Anthropic models list is parsed PAGINATED (has_more/after_id) — the
-    envelope contract our checker depends on;
+  - presence is judged by the provider's per-id RETRIEVE (``GET /v1/models/{id}``),
+    NEVER by listing membership: the first live run proved ``claude-haiku-4-5``
+    retrieves 200 while the listing carries only the dated
+    ``claude-haiku-4-5-20251001`` — list-membership would false-alarm (or
+    false-SWAP) every aliased pin;
+  - the paginated listing (has_more/after_id) is fetched only to resolve a
+    successor once a pin is genuinely 404;
   - a retired CHAT pin auto-swaps to the newest same-family successor: the
     platform-secret write, the service redeploy, and the "swapped X → Y" email
     all happen, and the run does NOT raise (the condition is remediated);
   - the guard rails: no cross-family guess, an env-var pin is never overridden,
     and the EMBEDDING model is never swapped (vectors are model-specific);
-  - a provider we cannot REACH is a WARNING, never an alert — an unreachable
-    models endpoint is not a retired model;
+  - a provider we cannot REACH is a WARNING, never an alert;
   - mock mode is a no-op that constructs no transport and reads no secret.
 """
 
@@ -24,6 +28,7 @@ from app.runtime import model_currency
 from app.runtime.model_currency import (
     MODEL_CURRENCY_ALERT,
     MODEL_CURRENCY_SWAP,
+    anthropic_models,
     model_family,
     pick_successor,
     run_model_currency_check,
@@ -40,37 +45,56 @@ pytestmark = [pytest.mark.asyncio]
 class _Resp:
     def __init__(self, payload: dict, status: int = 200) -> None:
         self._payload = payload
-        self._status = status
+        self.status_code = status
 
     def raise_for_status(self) -> None:
-        if self._status >= 400:
-            raise RuntimeError(f"http {self._status}")
+        if self.status_code >= 400:
+            raise RuntimeError(f"http {self.status_code}")
 
     def json(self) -> dict:
         return self._payload
 
 
 class FakeTransport:
-    """Queued responses per URL prefix; records every GET."""
+    """Retrieve + listing fakes per provider; records every GET.
 
-    def __init__(self, anthropic: list[dict] | Exception, openai: dict | Exception) -> None:
-        self._anthropic_pages = anthropic if isinstance(anthropic, list) else None
-        self._anthropic_error = anthropic if isinstance(anthropic, Exception) else None
-        self._openai = openai
-        self._anthropic_calls = 0
+    ``existing`` drives the per-id retrieves (200 iff the id is in the set) —
+    the ground truth. The listing pages/payloads are served ONLY when the
+    checker asks for a successor. An Exception for a provider makes every call
+    against it raise (the unreachable case).
+    """
+
+    def __init__(
+        self,
+        *,
+        existing: set[str],
+        anthropic_pages: list[dict] | Exception | None = None,
+        openai_listing: dict | Exception | None = None,
+    ) -> None:
+        self._existing = existing
+        self._anthropic_pages = anthropic_pages
+        self._openai_listing = openai_listing
+        self._anthropic_page_calls = 0
         self.calls: list[tuple[str, dict | None]] = []
+
+    def listing_calls(self, provider: str) -> list[tuple[str, dict | None]]:
+        return [(u, p) for u, p in self.calls if provider in u and u.endswith("/v1/models")]
 
     async def get(self, url: str, *, params=None, headers=None):
         self.calls.append((url, params))
-        if "anthropic" in url:
-            if self._anthropic_error is not None:
-                raise self._anthropic_error
-            page = self._anthropic_pages[self._anthropic_calls]
-            self._anthropic_calls += 1
-            return _Resp(page)
-        if isinstance(self._openai, Exception):
-            raise self._openai
-        return _Resp(self._openai)
+        provider_error = (
+            self._anthropic_pages if "anthropic" in url else self._openai_listing
+        )
+        if isinstance(provider_error, Exception):
+            raise provider_error
+        if url.endswith("/v1/models"):  # the listing
+            if "anthropic" in url:
+                page = self._anthropic_pages[self._anthropic_page_calls]
+                self._anthropic_page_calls += 1
+                return _Resp(page)
+            return _Resp(self._openai_listing)
+        model_id = url.rsplit("/", 1)[1]  # the per-id retrieve
+        return _Resp({"id": model_id}, status=200 if model_id in self._existing else 404)
 
     async def __aenter__(self):
         return self
@@ -116,7 +140,7 @@ class FakeRestarter:
 
 def _anthropic_pages(*ids_with_created: tuple[str, int]) -> list[dict]:
     """Two pages, split after the first item — pins the has_more/after_id walk."""
-    items = [{"id": i, "created_at": None, "created": c} for i, c in ids_with_created]
+    items = [{"id": i, "created": c} for i, c in ids_with_created]
     first, rest = items[:1], items[1:]
     return [
         {"data": first, "has_more": True, "first_id": first[0]["id"], "last_id": first[0]["id"]},
@@ -129,9 +153,12 @@ def _openai_listing(*ids_with_created: tuple[str, int]) -> dict:
 
 
 _SETTINGS_KW = {"ANTHROPIC_API_KEY": "sk-ant-fake", "OPENAI_API_KEY": "sk-oai-fake"}
-
-ALL_CURRENT_ANTHROPIC = _anthropic_pages(("claude-sonnet-4-6", 300), ("claude-haiku-4-5", 200))
-ALL_CURRENT_OPENAI = _openai_listing(("gpt-5.4", 400), ("text-embedding-3-small", 100))
+ALL_PINS = {
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    "gpt-5.4",
+    "text-embedding-3-small",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -167,11 +194,33 @@ def test_pick_successor_newest_same_family_never_cross_family():
     assert pick_successor("gpt-5.4", [{"id": "gpt-5.6", "created": 999}]) == "gpt-5.6"
 
 
+async def test_anthropic_listing_walks_pagination():
+    transport = FakeTransport(
+        existing=set(),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-6", 300), ("claude-haiku-4-5", 200)),
+    )
+    items = await anthropic_models(transport, api_key="sk-ant-fake")
+    assert [i["id"] for i in items] == ["claude-sonnet-4-6", "claude-haiku-4-5"]
+    listing_calls = transport.listing_calls("anthropic")
+    assert len(listing_calls) == 2
+    assert listing_calls[1][1]["after_id"] == "claude-sonnet-4-6"
+
+
 # --- the check ----------------------------------------------------------------- #
 
 
-async def test_all_pins_present_parses_the_paginated_envelope_and_stays_quiet():
-    transport = FakeTransport(ALL_CURRENT_ANTHROPIC, ALL_CURRENT_OPENAI)
+async def test_presence_is_retrieve_based_and_listing_free_when_all_pins_resolve():
+    """THE live finding (2026-08-17), pinned: an aliased pin that retrieves 200
+    is PRESENT even though the listing would only show its dated form. All pins
+    resolving means the listing is never even fetched."""
+    transport = FakeTransport(
+        existing=set(ALL_PINS),
+        # A listing that would falsely convict claude-haiku-4-5 if consulted:
+        anthropic_pages=_anthropic_pages(
+            ("claude-sonnet-4-6", 300), ("claude-haiku-4-5-20251001", 200)
+        ),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender = RecordingSender()
     result = await run_model_currency_check(
         settings=live_settings(**_SETTINGS_KW),
@@ -182,26 +231,31 @@ async def test_all_pins_present_parses_the_paginated_envelope_and_stays_quiet():
     )
     assert len(result["checked"]) == 4 and result["swapped"] == []
     assert sender.sent == []
-    # The pagination walk actually happened: two Anthropic GETs, the second
-    # carrying after_id from the first page's last item.
-    anthropic_calls = [(u, p) for u, p in transport.calls if "anthropic" in u]
-    assert len(anthropic_calls) == 2
-    assert anthropic_calls[1][1]["after_id"] == "claude-sonnet-4-6"
+    assert transport.listing_calls("anthropic") == []
+    assert transport.listing_calls("openai") == []
 
 
 async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplog):
-    anthropic = _anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200))
+    # sonnet-4-6 genuinely 404s; the listing (fetched for the successor) has 4-8.
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(
+            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
+        ),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender, writer, restarter = RecordingSender(), FakeWriter(), FakeRestarter()
     with caplog.at_level(logging.WARNING, logger="app.runtime.model_currency"):
         result = await run_model_currency_check(
             settings=live_settings(**_SETTINGS_KW),
-            transport_factory=lambda: FakeTransport(anthropic, ALL_CURRENT_OPENAI),
+            transport_factory=lambda: transport,
             email_sender=sender,
             secret_writer=writer,
             restarter=restarter,
         )
     assert writer.applied == [{"LLM_ANTHROPIC_PRIMARY_MODEL": "claude-sonnet-4-8"}]
     assert restarter.restarts == 1
+    assert len(transport.listing_calls("anthropic")) == 2  # paginated successor lookup
     ((to, subject, body),) = sender.sent
     assert "swapped" in subject and "claude-sonnet-4-6" in subject
     assert "claude-sonnet-4-8" in body and "No action is required" in body
@@ -217,14 +271,18 @@ async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplo
 
 
 async def test_no_same_family_successor_alerts_and_raises(caplog):
-    # Sonnet vanished entirely; only other families remain.
-    anthropic = _anthropic_pages(("claude-haiku-4-5", 200), ("claude-opus-5-1", 900))
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        # Sonnet vanished entirely; only other families remain.
+        anthropic_pages=_anthropic_pages(("claude-haiku-4-5", 200), ("claude-opus-5-1", 900)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender, writer = RecordingSender(), FakeWriter()
     with caplog.at_level(logging.ERROR, logger="app.runtime.model_currency"):
         with pytest.raises(RuntimeError, match="model_currency"):
             await run_model_currency_check(
                 settings=live_settings(**_SETTINGS_KW),
-                transport_factory=lambda: FakeTransport(anthropic, ALL_CURRENT_OPENAI),
+                transport_factory=lambda: transport,
                 email_sender=sender,
                 secret_writer=writer,
                 restarter=FakeRestarter(),
@@ -237,12 +295,18 @@ async def test_no_same_family_successor_alerts_and_raises(caplog):
 
 async def test_env_pinned_model_is_never_overridden(monkeypatch):
     monkeypatch.setenv("LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL", "claude-sonnet-4-6")
-    anthropic = _anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200))
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(
+            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
+        ),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender, writer = RecordingSender(), FakeWriter()
     with pytest.raises(RuntimeError):
         await run_model_currency_check(
             settings=live_settings(**_SETTINGS_KW),
-            transport_factory=lambda: FakeTransport(anthropic, ALL_CURRENT_OPENAI),
+            transport_factory=lambda: transport,
             email_sender=sender,
             secret_writer=writer,
             restarter=FakeRestarter(),
@@ -253,28 +317,38 @@ async def test_env_pinned_model_is_never_overridden(monkeypatch):
 
 
 async def test_embedding_model_is_alert_only_even_when_a_successor_exists():
-    openai = _openai_listing(("gpt-5.4", 400), ("text-embedding-4-small", 900))
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"text-embedding-3-small"},
+        openai_listing=_openai_listing(("gpt-5.4", 400), ("text-embedding-4-small", 900)),
+    )
     sender, writer = RecordingSender(), FakeWriter()
     with pytest.raises(RuntimeError):
         await run_model_currency_check(
             settings=live_settings(**_SETTINGS_KW),
-            transport_factory=lambda: FakeTransport(ALL_CURRENT_ANTHROPIC, openai),
+            transport_factory=lambda: transport,
             email_sender=sender,
             secret_writer=writer,
             restarter=FakeRestarter(),
         )
     assert writer.applied == []  # vectors are model-specific: NEVER swapped
+    assert transport.listing_calls("openai") == []  # alert-only pins skip the listing
     ((_to, _subject, body),) = sender.sent
     assert "re-embedding" in body
 
 
 async def test_secret_write_failure_becomes_an_alert_not_a_crash():
-    anthropic = _anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200))
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(
+            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
+        ),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender = RecordingSender()
     with pytest.raises(RuntimeError, match="model_currency"):
         await run_model_currency_check(
             settings=live_settings(**_SETTINGS_KW),
-            transport_factory=lambda: FakeTransport(anthropic, ALL_CURRENT_OPENAI),
+            transport_factory=lambda: transport,
             email_sender=sender,
             secret_writer=FakeWriter(fail=True),
             restarter=FakeRestarter(),
@@ -284,13 +358,16 @@ async def test_secret_write_failure_becomes_an_alert_not_a_crash():
 
 
 async def test_unreachable_provider_warns_and_never_false_alarms(caplog):
+    transport = FakeTransport(
+        existing={"gpt-5.4", "text-embedding-3-small"},
+        anthropic_pages=ConnectionError("anthropic down"),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
     sender, writer = RecordingSender(), FakeWriter()
     with caplog.at_level(logging.WARNING, logger="app.runtime.model_currency"):
         result = await run_model_currency_check(
             settings=live_settings(**_SETTINGS_KW),
-            transport_factory=lambda: FakeTransport(
-                ConnectionError("anthropic down"), ALL_CURRENT_OPENAI
-            ),
+            transport_factory=lambda: transport,
             email_sender=sender,
             secret_writer=writer,
             restarter=FakeRestarter(),

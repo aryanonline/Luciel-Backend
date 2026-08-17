@@ -6,8 +6,14 @@ retirement: the first sign a pinned model died would be live conversations
 quietly riding the cross-provider fallback. This sweep is the detection half —
 and, owner decision 2026-08-17, the remediation half for the chat models:
 
-  * every pinned model ID is checked against its provider's live model list
-    (Anthropic ``GET /v1/models`` paginated; OpenAI ``GET /v1/models``);
+  * every pinned model ID is checked with the provider's per-id RETRIEVE
+    (``GET /v1/models/{id}``) — NOT listing membership. Ground truth from the
+    first live run (2026-08-17): ``claude-haiku-4-5`` retrieves 200 while the
+    LISTING carries only the dated ``claude-haiku-4-5-20251001`` — alias pins
+    are valid without appearing in the list, and judging by the list would
+    false-alarm (or worse, false-SWAP) on every aliased pin. The paginated
+    listing is fetched only when a pin is actually gone, to resolve the
+    successor;
   * a CHAT pin that has disappeared is AUTO-SWAPPED to the newest same-family
     successor (``claude-sonnet-4-6`` → the newest ``claude-sonnet-*``): the new
     ID is written into the platform secret, the app services are restarted to
@@ -142,6 +148,26 @@ async def openai_models(client: _Transport, *, api_key: str) -> list[dict]:
     )
     resp.raise_for_status()
     return list(resp.json().get("data") or [])
+
+
+async def model_exists(
+    client: _Transport, *, provider: str, api_key: str, model_id: str
+) -> bool:
+    """Per-id ground truth: ``GET /v1/models/{id}`` — 200 means the pin resolves
+    (alias or dated id alike), 404 means it is genuinely gone. This is the ONLY
+    honest presence check: a valid alias can be absent from the listing (live
+    finding 2026-08-17), so listing membership must never decide a retirement."""
+    if provider == "anthropic":
+        url = f"{_ANTHROPIC_MODELS_URL}/{model_id}"
+        headers = {"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION}
+    else:
+        url = f"{_OPENAI_MODELS_URL}/{model_id}"
+        headers = {"Authorization": f"Bearer {api_key}"}
+    resp = await client.get(url, headers=headers)
+    if getattr(resp, "status_code", None) == 404:
+        return False
+    resp.raise_for_status()
+    return True
 
 
 # --- successor resolution ------------------------------------------------------ #
@@ -325,106 +351,132 @@ async def run_model_currency_check(
         raise RuntimeError(f"model_currency: missing provider keys: {missing_keys}")
 
     factory = transport_factory or _transport_factory
-    listings: dict[str, list[dict] | None] = {}
-    async with factory() as client:
-        for provider, fetch in (("anthropic", anthropic_models), ("openai", openai_models)):
-            try:
-                listings[provider] = await fetch(client, api_key=keys[provider])
-            except Exception as exc:  # noqa: BLE001 — unreachable ≠ retired; never false-alarm
-                logger.warning(
-                    "model_currency_provider_unreachable provider=%s error=%s",
-                    provider,
-                    type(exc).__name__,
-                )
-                listings[provider] = None
-
     sender = email_sender or build_email_sender()
     operator = settings.platform_email_sender
     checked: list[str] = []
     swapped: list[dict[str, str]] = []
     alerts: list[str] = []
-    unreachable = sorted(p for p, listing in listings.items() if listing is None)
+    unreachable: set[str] = set()
+    # The paginated listing is fetched LAZILY, only to resolve a successor for a
+    # pin the retrieve proved gone — presence is never judged by list membership.
+    listings: dict[str, list[dict] | None] = {}
 
-    for pin in PINS:
-        listing = listings[pin.provider]
-        if listing is None:
-            continue  # provider unreachable this run — no verdict, no false alarm
-        model_id = str(getattr(settings, pin.setting))
-        ids = {item.get("id") for item in listing}
-        if model_id in ids:
-            checked.append(pin.setting)
-            continue
-
-        # The pin is GONE at the provider. Remediate if this pin allows it.
-        env_pinned = bool(os.environ.get(pin.env_var))
-        successor = pick_successor(model_id, listing) if pin.swappable else None
-        writer = secret_writer if secret_writer is not None else _default_secret_writer(settings)
-
-        if pin.swappable and successor and not env_pinned and writer is not None:
+    async def _listing_for(client: _Transport, provider: str) -> list[dict] | None:
+        if provider not in listings:
+            fetch = anthropic_models if provider == "anthropic" else openai_models
             try:
-                await writer.apply({pin.blob_key: successor})
-            except Exception as exc:  # noqa: BLE001 — a failed write is an alert, not a crash
-                logger.warning("model_currency_secret_write_failed error=%s", type(exc).__name__)
-                alerts.append(
-                    f"{pin.setting} = '{model_id}' retired; successor '{successor}' found "
-                    f"but the platform-secret write failed"
+                listings[provider] = await fetch(client, api_key=keys[provider])
+            except Exception as exc:  # noqa: BLE001 — unreachable ≠ retired
+                logger.warning(
+                    "model_currency_provider_unreachable provider=%s error=%s (listing)",
+                    provider,
+                    type(exc).__name__,
                 )
-                continue
-            restart_note = "restarted"
-            restart = restarter if restarter is not None else _default_restarter(settings)
-            if restart is None:
-                restart_note = "restart_skipped_no_service_env"
-            else:
-                try:
-                    await restart.restart()
-                except Exception as exc:  # noqa: BLE001 — swap persisted; restart is recoverable
-                    logger.warning("model_currency_restart_failed error=%s", type(exc).__name__)
-                    restart_note = "restart_failed"
-            logger.warning(
-                "%s setting=%s old=%s new=%s services=%s",
-                MODEL_CURRENCY_SWAP,
-                pin.setting,
-                model_id,
-                successor,
-                restart_note,
-            )
-            if operator:
-                await _send(
-                    sender,
-                    to=operator,
-                    subject=(
-                        f"Luciel swapped a retired model automatically "
-                        f"({settings.environment}): {model_id} → {successor}"
-                    ),
-                    body=(
-                        f"The pinned model for {pin.setting} — '{model_id}' — is no longer "
-                        f"offered by {pin.provider}. The platform swapped it to the newest "
-                        f"same-family model, '{successor}', wrote it to the platform secret, "
-                        + (
-                            "and restarted the app services."
-                            if restart_note == "restarted"
-                            else f"but could not restart the app services ({restart_note}) "
-                            "— restart them when convenient."
-                        )
-                        + "\n\nNo action is required; review the choice at your leisure. The "
-                        "pin is never changed while it still exists — this happens only on "
-                        "a provider retirement (§3.4.3)."
-                    ),
-                )
-            swapped.append({"setting": pin.setting, "old": model_id, "new": successor})
-            continue
+                listings[provider] = None
+        return listings[provider]
 
-        reason = (
-            "the embedding model is never auto-swapped (stored vectors are "
-            "model-specific — re-embedding is a migration)"
-            if not pin.swappable
-            else "pinned by env var, which outranks the platform secret"
-            if env_pinned
-            else "no same-family successor exists at the provider"
-            if successor is None
-            else "no platform-secret writer is configured in this environment"
-        )
-        alerts.append(f"{pin.setting} = '{model_id}' is gone from {pin.provider}; {reason}")
+    async with factory() as client:
+        for pin in PINS:
+            if pin.provider in unreachable:
+                continue  # no verdicts against a provider we could not reach
+            model_id = str(getattr(settings, pin.setting))
+            try:
+                exists = await model_exists(
+                    client, provider=pin.provider, api_key=keys[pin.provider], model_id=model_id
+                )
+            except Exception as exc:  # noqa: BLE001 — unreachable ≠ retired; never false-alarm
+                logger.warning(
+                    "model_currency_provider_unreachable provider=%s error=%s",
+                    pin.provider,
+                    type(exc).__name__,
+                )
+                unreachable.add(pin.provider)
+                continue
+            if exists:
+                checked.append(pin.setting)
+                continue
+
+            # The pin is GONE at the provider (a real 404, not a listing quirk).
+            # Remediate if this pin allows it.
+            env_pinned = bool(os.environ.get(pin.env_var))
+            listing = await _listing_for(client, pin.provider) if pin.swappable else None
+            successor = pick_successor(model_id, listing) if listing else None
+            writer = (
+                secret_writer if secret_writer is not None else _default_secret_writer(settings)
+            )
+
+            if pin.swappable and successor and not env_pinned and writer is not None:
+                try:
+                    await writer.apply({pin.blob_key: successor})
+                except Exception as exc:  # noqa: BLE001 — a failed write alerts, not crashes
+                    logger.warning(
+                        "model_currency_secret_write_failed error=%s", type(exc).__name__
+                    )
+                    alerts.append(
+                        f"{pin.setting} = '{model_id}' retired; successor '{successor}' found "
+                        f"but the platform-secret write failed"
+                    )
+                    continue
+                restart_note = "restarted"
+                restart = restarter if restarter is not None else _default_restarter(settings)
+                if restart is None:
+                    restart_note = "restart_skipped_no_service_env"
+                else:
+                    try:
+                        await restart.restart()
+                    except Exception as exc:  # noqa: BLE001 — swap persisted; recoverable
+                        logger.warning(
+                            "model_currency_restart_failed error=%s", type(exc).__name__
+                        )
+                        restart_note = "restart_failed"
+                logger.warning(
+                    "%s setting=%s old=%s new=%s services=%s",
+                    MODEL_CURRENCY_SWAP,
+                    pin.setting,
+                    model_id,
+                    successor,
+                    restart_note,
+                )
+                if operator:
+                    await _send(
+                        sender,
+                        to=operator,
+                        subject=(
+                            f"Luciel swapped a retired model automatically "
+                            f"({settings.environment}): {model_id} → {successor}"
+                        ),
+                        body=(
+                            f"The pinned model for {pin.setting} — '{model_id}' — is no "
+                            f"longer offered by {pin.provider}. The platform swapped it to "
+                            f"the newest same-family model, '{successor}', wrote it to the "
+                            "platform secret, "
+                            + (
+                                "and restarted the app services."
+                                if restart_note == "restarted"
+                                else f"but could not restart the app services ({restart_note}) "
+                                "— restart them when convenient."
+                            )
+                            + "\n\nNo action is required; review the choice at your leisure. "
+                            "The pin is never changed while it still exists — this happens "
+                            "only on a provider retirement (§3.4.3)."
+                        ),
+                    )
+                swapped.append({"setting": pin.setting, "old": model_id, "new": successor})
+                continue
+
+            reason = (
+                "the embedding model is never auto-swapped (stored vectors are "
+                "model-specific — re-embedding is a migration)"
+                if not pin.swappable
+                else "pinned by env var, which outranks the platform secret"
+                if env_pinned
+                else "the provider's model list is unavailable to resolve a successor"
+                if pin.swappable and listing is None
+                else "no same-family successor exists at the provider"
+                if successor is None
+                else "no platform-secret writer is configured in this environment"
+            )
+            alerts.append(f"{pin.setting} = '{model_id}' is gone from {pin.provider}; {reason}")
 
     if alerts:
         logger.error("%s %s", MODEL_CURRENCY_ALERT, " | ".join(alerts))
@@ -443,5 +495,5 @@ async def run_model_currency_check(
     return {
         "checked": checked,
         "swapped": swapped,
-        "unreachable": unreachable,
+        "unreachable": sorted(unreachable | {p for p, v in listings.items() if v is None}),
     }
