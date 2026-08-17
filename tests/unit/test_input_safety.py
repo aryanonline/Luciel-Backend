@@ -101,9 +101,24 @@ def test_no_email_stanza_when_address_absent():
 
 def test_email_address_does_not_disturb_invariants():
     prompt = build_system_prompt(None, luciel_email_address="hi@t.example")
-    # The absolute-platform-rules preamble still leads.
+    # The absolute-platform-rules preamble still leads (default name when unnamed).
     assert prompt.startswith("You are Luciel")
     assert prompt.index("AI IDENTITY") < prompt.index("EMAIL IDENTITY")
+
+
+def test_prompt_identity_uses_the_tenants_configured_name():
+    """Live-caught 2026-08-17: the greeting said "Aurora" (code-composed) while the
+    model, prompted "You are Luciel", reintroduced itself as Luciel one turn later.
+    The identity stanza must carry the tenant's configured name — the product name
+    appears nowhere in a named tenant's prompt."""
+    prompt = build_system_prompt("We sell pottery.", assistant_name="Aurora")
+    assert prompt.startswith("You are Aurora, an AI assistant for this business.")
+    assert "Luciel" not in prompt
+    # Blank/whitespace names fall back rather than composing "You are ,".
+    assert build_system_prompt(None, assistant_name="  ").startswith("You are Luciel")
+    # The invariants still lead and the name cannot disturb their precedence.
+    named = build_system_prompt("ctx", luciel_email_address="a@b.c", assistant_name="Aurora")
+    assert named.index("AI IDENTITY") < named.index("EMAIL IDENTITY")
 
 
 # --- Defense 4: pre_send_check ------------------------------------------------------

@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -163,6 +164,8 @@ async def handle_turn(
     provider_call_id: str | None = None,
 ) -> VoiceTurnResult:
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
+    # TRUE arrival time for the lead transcript row (reply-time analytics, 2026-08-17).
+    received_at = datetime.now(UTC)
     # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.
     if is_paused(instance):
         speech = await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
@@ -248,6 +251,7 @@ async def handle_turn(
         channel="voice",
         mode=sess.mode,
         inbound_text=transcription.text,
+        received_at=received_at,
     )
 
     # at_cap → the orchestrator already produced the graceful no-LLM reply (§3.4.1b);

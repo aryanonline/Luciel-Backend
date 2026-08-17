@@ -196,6 +196,10 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
     Paused → empty render, no LLM. At-cap is handled inside the loop (graceful
     no-LLM reply, §3.4.1b) and surfaces here as renderState 'at_cap'.
     """
+    # TRUE arrival time, captured before any gate/DB work: the lead transcript row
+    # carries it so reply-time analytics measure real latency (the widget has no
+    # adapter InboundMessage.received_at; this is its equivalent).
+    received_at = datetime.now(UTC)
     ctx = await _resolve_embed_key(body.embed_key)
     # Pre-budget abuse gate (§3.1.5): runs BEFORE the budget gate / any LLM call so a
     # widget flood can never drain budget or run up cost (denial-of-wallet). 429 on deny.
@@ -295,6 +299,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             channel=CHANNEL,
             mode=sess.mode,
             inbound_text=body.text,
+            received_at=received_at,
         )
 
         reply_text = result.reply_text or AT_CAP_REPLY

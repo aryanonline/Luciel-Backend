@@ -162,6 +162,9 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         mode=sess.mode,
         inbound_text=msg.body,
         transport_identifier=transport_identifier,
+        # Every adapter stamps received_at at ingestion; the lead transcript row
+        # carries it so reply-time analytics measure real latency (2026-08-17).
+        received_at=msg.received_at,
     )
 
     return RuntimeReply(

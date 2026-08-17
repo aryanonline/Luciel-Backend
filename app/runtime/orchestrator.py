@@ -48,6 +48,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -131,6 +132,7 @@ async def persist_turn(
     text: str,
     grounding_score: float | None = None,
     source_chunks: list[dict[str, object]] | None = None,
+    at: datetime | None = None,
 ) -> Transcript:
     """Append one message to the session transcript and return the persisted row.
 
@@ -149,7 +151,13 @@ async def persist_turn(
     attribution source bound. None (the default) means attribution was never
     captured for this row — that is NOT a claim that no source backed the answer,
     just that we don't know. An empty list means retrieval genuinely ran and found
-    nothing. The dashboard evidence endpoint keeps these three states distinct."""
+    nothing. The dashboard evidence endpoint keeps these three states distinct.
+
+    ``at`` (live-caught 2026-08-17): the column's server default is Postgres
+    ``now()`` — TRANSACTION timestamp, constant across the whole request — so a
+    turn's lead row and reply row landed with an identical ``at`` and the
+    reply-time analytics read 0s forever. Callers now stamp the honest moment:
+    arrival time for the inbound row, wall-clock persist time for the reply."""
     if role not in TRANSCRIPT_ROLES:
         raise ValueError(f"unknown transcript role: {role}")
     row = Transcript(
@@ -162,6 +170,8 @@ async def persist_turn(
         grounding_score=grounding_score,
         source_chunks=source_chunks,
     )
+    if at is not None:
+        row.at = at
     session.add(row)
     await session.flush()
     return row
@@ -278,7 +288,13 @@ class Orchestrator:
         # text can never suppress AI-identity disclosure, grounding, escalation, or
         # moderation. This is the in-code enforcement; it does not depend on the model.
         self.system_prompt = build_system_prompt(
-            self.business_context, self.luciel_email_address, self.personality
+            self.business_context,
+            self.luciel_email_address,
+            self.personality,
+            # The tenant's configured name — the model must self-identify by it,
+            # not by the platform's product name (live-caught 2026-08-17: greeting
+            # said "Aurora", the model then said "I'm Luciel").
+            assistant_name=self.assistant_name,
         )
 
     async def run_turn(
@@ -290,11 +306,16 @@ class Orchestrator:
         mode: str,
         inbound_text: str,
         transport_identifier: str | None = None,
+        received_at: datetime | None = None,
     ) -> LoopResult:
         """Run one inbound message through the loop. `mode` is the session's current
         conversation mode (ai | human_controlled). `transport_identifier` is the
         channel's stable sender key (phone/email/meta-id) used for lead capture +
-        identity resolution (§3.4.4/§3.4.9); None for the weak widget channel."""
+        identity resolution (§3.4.4/§3.4.9); None for the weak widget channel.
+        `received_at` is the inbound message's TRUE arrival time (adapter
+        received_at / request entry) — stamped on the lead transcript row so the
+        reply-time analytics measure real latency, not the shared transaction
+        timestamp (live-caught 2026-08-17: every widget turn read 0s)."""
         admin_id, instance_id = self.admin_id, self.instance_id
 
         # Human-controlled sessions STOP the loop (§3.4.12): persist the inbound for
@@ -307,6 +328,7 @@ class Orchestrator:
                 session_id=session_id,
                 role="lead",
                 text=inbound_text,
+                at=received_at,
             )
             return LoopResult(
                 reply_text="",
@@ -322,6 +344,7 @@ class Orchestrator:
             session_id=session_id,
             role="lead",
             text=inbound_text,
+            at=received_at,
         )
 
         # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
@@ -342,6 +365,7 @@ class Orchestrator:
                 session_id=session_id,
                 role="luciel",
                 text=AT_CAP_REPLY,
+                at=datetime.now(UTC),
             )
             return LoopResult(
                 reply_text=AT_CAP_REPLY,
@@ -459,6 +483,7 @@ class Orchestrator:
                 session_id=session_id,
                 role="luciel",
                 text=ack,
+                at=datetime.now(UTC),
             )
             # The first model-call attempt is the fire-once trigger even on failure?
             # No: §3.4.1b ties the counter to a model CALL succeeding/serving. A pure
@@ -541,6 +566,7 @@ class Orchestrator:
             text=reply_text,
             grounding_score=grounding.score,
             source_chunks=attributed_chunks,
+            at=datetime.now(UTC),
         )
         return LoopResult(
             reply_text=reply_text,
@@ -669,15 +695,17 @@ class Orchestrator:
         return outcomes
 
     async def _handoff_ack(self) -> str:
-        """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4).
+        """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4;
+        rewritten after the 2026-08-17 live run).
 
-        Used to say "connecting you with a person now" unconditionally. That is only
-        true if the admin has actually configured an escalation contact (§3.5.3); if
-        not, the only thing that happens is a best-effort email to the owner's own
-        account address whenever they next check it (§3.5.4 owner-fallback), which is
-        not "right now" by any reasonable reading. The ack now reflects which of those
-        is actually going to happen, instead of promising immediacy the platform cannot
-        back up.
+        NEITHER branch may claim a real-time connection. Even with an escalation
+        contact configured (§3.5.3), what actually happens is a notification to
+        that contact — a human sees it when they see it. The doctrine
+        (app/notifications/CLAUDE.md, root CLAUDE.md trust invariants) is explicit:
+        say the request was PASSED to the team, never "connecting you right now" —
+        and the first live widget conversation served exactly the forbidden
+        phrasing from the configured branch of this very method. The branches now
+        differ only in how much reach the platform can honestly claim.
         """
         inst = (
             await self.session.execute(
@@ -688,7 +716,10 @@ class Orchestrator:
         ).scalar_one_or_none()
         configured = has_configured_escalation_contact(inst.escalation if inst else None)
         if configured:
-            return "Of course — I'm connecting you with someone from the team right now."
+            return (
+                "Of course — I've flagged this for the team, and they'll follow up "
+                "with you shortly."
+            )
         return "I've passed this along to the team — they'll follow up with you shortly."
 
     async def _hand_off_with_ack(
@@ -722,6 +753,7 @@ class Orchestrator:
             session_id=session_id,
             role="luciel",
             text=ack,
+            at=datetime.now(UTC),
         )
         await handoff.take_over(
             self.session,

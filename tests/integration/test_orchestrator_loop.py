@@ -129,10 +129,12 @@ async def test_intake_handoff_ack_is_honest_when_no_escalation_contact_configure
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_intake_handoff_ack_promises_immediacy_only_when_a_contact_is_configured():
-    """The flip side: once the admin has actually configured a primary contact,
-    escalations really do reach someone promptly, so the more immediate copy is honest
-    and should be used."""
+async def test_handoff_ack_never_claims_realtime_connection_even_with_a_contact():
+    """Live-caught 2026-08-17: the configured-contact branch served "I'm connecting
+    you with someone from the team right now" to a real visitor. Doctrine
+    (app/notifications/CLAUDE.md, root trust invariants): an escalation NOTIFIES a
+    human — it never connects one in real time, so no branch of the ack may say so.
+    A configured contact may honestly promise a prompt follow-up; nothing more."""
     admin, iid = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
         s.add(
@@ -157,7 +159,55 @@ async def test_intake_handoff_ack_promises_immediacy_only_when_a_contact_is_conf
             mode="ai",
             inbound_text="I want to speak to a human please",
         )
-        assert "right now" in result.reply_text.lower()
+        assert result.handed_off is True
+        assert "right now" not in result.reply_text.lower()
+        assert "connecting" not in result.reply_text.lower()
+        assert "team" in result.reply_text.lower()
+        assert "follow up" in result.reply_text.lower()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_turn_timestamps_measure_real_latency_not_the_transaction_stamp():
+    """Live-caught 2026-08-17: Postgres now() is the TRANSACTION timestamp — constant
+    across the whole request — so a turn's lead and reply rows shared one `at` and
+    the reply-time analytics read 0s for every widget conversation ever. The lead
+    row must carry true arrival time and the reply row wall-clock persist time,
+    inside ONE transaction (the exact condition that hid this)."""
+    from datetime import UTC, datetime
+
+    from app.models.conversation import Transcript
+    from sqlalchemy import select as sa_select
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel())
+        arrival = datetime.now(UTC)
+        await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="what are your hours?",
+            received_at=arrival,
+        )
+        rows = (
+            (
+                await s.execute(
+                    sa_select(Transcript)
+                    .where(Transcript.session_id == sid)
+                    .order_by(Transcript.at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        lead = next(r for r in rows if r.role == "lead")
+        reply = next(r for r in rows if r.role == "luciel")
+        lead_at = lead.at if lead.at.tzinfo else lead.at.replace(tzinfo=UTC)
+        assert abs((lead_at - arrival).total_seconds()) < 1  # the row carries ARRIVAL
+        assert reply.at > lead.at  # a real, positive latency — never the shared stamp
+        assert (reply.at - lead.at).total_seconds() < 60
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

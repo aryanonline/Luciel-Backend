@@ -193,6 +193,12 @@ Run focused tests while iterating, then run the full command above before commit
   down even after failure.
 - Keep deploy-time secrets out of git and do not rotate or activate production
   credentials without the owner’s explicit direction.
+- Email deliverability is OUT-OF-BAND ops (no CDK): the SES identity
+  `vantagemind.ai` has DKIM enabled AND a custom MAIL FROM `mail.vantagemind.ai`
+  (Route53: MX → feedback-smtp.ca-central-1.amazonses.com, TXT SPF include);
+  `_dmarc` is `p=quarantine; adkim=s; aspf=r`. Set 2026-08-17 after live sends
+  quarantined: strict-SPF DMARC with no custom MAIL FROM fails SPF alignment on
+  every SES send. Do not re-strict `aspf` without keeping the MAIL FROM domain.
 
 ## Before handing off
 

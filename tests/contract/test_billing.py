@@ -175,6 +175,41 @@ async def test_checkout_returns_url(client) -> None:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_checkout_return_urls_derive_from_app_base_url(client, monkeypatch) -> None:
+    """Live-caught 2026-08-17: the return URLs were hardcoded to a placeholder
+    domain the product does not serve, so after saving a card Stripe redirected
+    the admin off-site. They must derive from app_base_url (the verify-link rule,
+    auth.py) and land on the REAL dashboard route /dashboard/billing."""
+    from app.config import get_settings
+
+    class _RecordingGateway(FakeStripeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checkout_urls: list[tuple[str, str]] = []
+
+        async def create_checkout_session(self, *, customer_id, success_url, cancel_url):
+            self.checkout_urls.append((success_url, cancel_url))
+            return await super().create_checkout_session(
+                customer_id=customer_id, success_url=success_url, cancel_url=cancel_url
+            )
+
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin)
+    # Trailing slash on purpose: the derivation must not compose a double slash.
+    monkeypatch.setattr(get_settings(), "app_base_url", "https://www.vantagemind.ai/")
+    gateway = _RecordingGateway()
+    set_stripe_gateway(gateway)
+    try:
+        r = await client.post("/api/v1/billing/checkout")
+        assert r.status_code == 200
+        ((success, cancel),) = gateway.checkout_urls
+        assert success == "https://www.vantagemind.ai/dashboard/billing?checkout=success"
+        assert cancel == "https://www.vantagemind.ai/dashboard/billing?checkout=cancel"
+    finally:
+        set_stripe_gateway(None)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_remove_payment_method_returns_billing_info_and_reverts(client) -> None:
     # Axis10-F01: removePaymentMethod returns 200 + the updated BillingInfo (matching
     # the frontend `Promise<BillingInfo>` and the mock adapter), not a bare 204.

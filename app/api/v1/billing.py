@@ -29,6 +29,7 @@ from app.api.errors import not_found
 from app.audit import log as audit
 from app.billing import dunning, metering
 from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
+from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 from app.models.instance import Account, Instance
@@ -105,10 +106,17 @@ async def start_checkout(
             )
             await s.flush()
 
+        # Return URLs derive from app_base_url (the auth.py:109 verify-link rule):
+        # the customer must land back on THEIR dashboard's billing page. These were
+        # hardcoded to a placeholder domain the product does not serve — live-caught
+        # 2026-08-17: after saving a card, Stripe redirected the admin off-site.
+        # The path is the REAL frontend route /dashboard/billing ((app) is a route
+        # group and contributes no segment; a bare /billing 404s).
+        base = get_settings().app_base_url.rstrip("/")
         session = await gateway.create_checkout_session(
             customer_id=account.stripe_customer_id,
-            success_url="https://app.luciel.ai/billing?checkout=success",
-            cancel_url="https://app.luciel.ai/billing?checkout=cancel",
+            success_url=f"{base}/dashboard/billing?checkout=success",
+            cancel_url=f"{base}/dashboard/billing?checkout=cancel",
         )
         # No charge at save (CJ §6): the card attach + billingState flip is driven by
         # the Stripe payment_method webhook, not by this call.
