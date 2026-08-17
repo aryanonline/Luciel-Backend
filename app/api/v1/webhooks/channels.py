@@ -137,8 +137,10 @@ class TwilioSayDelivery:
     """Honest 'TTS' for TwiML delivery: the spoken reply is rendered by Twilio's
     ``<Say>`` in the webhook response — no synthesis API is called, because
     paying a TTS provider to produce audio the response then discards would be
-    waste, not delivery. ElevenLabs binds when a ``<Play>`` audio-hosting
-    surface exists (flagged follow-up, not silently skipped)."""
+    waste, not delivery. The ``<Play>`` audio-hosting surface now exists
+    (app/runtime/voice_audio.py): in live mode with a provisioned bucket the
+    route binds ``HostedAudioTts`` instead, and this class remains the mock
+    posture AND the fallback whenever hosting cannot serve."""
 
     name = "twilio_say_tts"
 
@@ -198,13 +200,13 @@ async def twilio_voice_inbound(request: Request) -> Response:
     """Call start: verify → resolve → admit, then play the mandatory disclosure
     and gather the caller's first utterance (§3.1.2 — disclosure BEFORE any
     caller audio is processed)."""
-    from app.channels.voice_adapter import VoiceAdapter  # noqa: PLC0415
-    from app.channels.base import InboundMessage, InboundRejected  # noqa: PLC0415
-    from app.channels import pipeline  # noqa: PLC0415
-    from app.runtime import voice_pipeline  # noqa: PLC0415
-    from app.models.instance import Instance, is_paused  # noqa: PLC0415
-
     from sqlalchemy import select  # noqa: PLC0415
+
+    from app.channels import pipeline  # noqa: PLC0415
+    from app.channels.base import InboundMessage, InboundRejected  # noqa: PLC0415
+    from app.channels.voice_adapter import VoiceAdapter  # noqa: PLC0415
+    from app.models.instance import Instance, is_paused  # noqa: PLC0415
+    from app.runtime import voice_pipeline  # noqa: PLC0415
 
     req = await _voice_request(request)
     async with untenanted_session() as s:
@@ -241,6 +243,8 @@ async def twilio_voice_inbound(request: Request) -> Response:
 async def twilio_voice_turn(request: Request) -> Response:
     """One caller utterance (Twilio ``<Gather>`` action) → spoken reply, through
     the SAME orchestrator + budget gate as every other channel (§3.4.1b)."""
+    from sqlalchemy import select  # noqa: PLC0415
+
     from app.billing import metering  # noqa: PLC0415
     from app.channels import pipeline  # noqa: PLC0415
     from app.channels.base import InboundMessage, InboundRejected  # noqa: PLC0415
@@ -248,8 +252,7 @@ async def twilio_voice_turn(request: Request) -> Response:
     from app.models.instance import Instance  # noqa: PLC0415
     from app.runtime import voice_pipeline  # noqa: PLC0415
     from app.runtime.provider_factory import build_llm_router  # noqa: PLC0415
-
-    from sqlalchemy import select  # noqa: PLC0415
+    from app.runtime.voice_audio import build_hosted_voice_tts  # noqa: PLC0415
 
     req = await _voice_request(request)
     async with untenanted_session() as s:
@@ -276,6 +279,7 @@ async def twilio_voice_turn(request: Request) -> Response:
             return _voice_unavailable_twiml()
         # handle_turn owns the paused branch (spoken unavailable + hangup, the
         # shared is_paused gate) and the at-cap graceful no-LLM reply.
+        call_sid = str(outcome.channel_metadata.get("call_sid") or "")
         result = await voice_pipeline.handle_turn(
             s,
             instance=inst,
@@ -285,10 +289,17 @@ async def twilio_voice_turn(request: Request) -> Response:
             speech_audio_ref=outcome.body,
             action_url=action_url,
             stt=TwilioGatherTranscript(),
-            tts=TwilioSayDelivery(),
+            # Hosted synthesis (<Play> via ElevenLabs + S3, §3.1.2) when live mode
+            # AND the bucket exist; the honest <Say> delivery otherwise — and the
+            # hosted wrapper itself degrades to <Say> on any failure, so a worse
+            # voice never becomes a dead call.
+            tts=build_hosted_voice_tts(
+                admin_id=outcome.admin_id, instance_id=outcome.instance_id, call_sid=call_sid
+            )
+            or TwilioSayDelivery(),
             router=build_llm_router(admin_id=outcome.admin_id),
             has_payment_method=await metering.has_live_card(s, admin_id=outcome.admin_id),
-            provider_call_id=str(outcome.channel_metadata.get("call_sid") or "") or None,
+            provider_call_id=call_sid or None,
         )
     return Response(content=result.twiml, media_type="application/xml")
 

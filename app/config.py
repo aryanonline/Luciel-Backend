@@ -163,6 +163,15 @@ class Settings(BaseSettings):
     # offload's home. Same per-env naming rule as export_bucket — CDK injects the
     # real name (LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET); this default is the local fallback.
     transcript_archive_bucket: str = "vm-transcript-archive"
+    # Voice reply audio bucket (§3.1.2 <Play> hosting): where ElevenLabs-synthesized
+    # turn audio lives for the seconds Twilio needs to fetch it. Same per-env naming
+    # rule — CDK injects LUCIEL_VOICE_AUDIO_BUCKET; the presence of that env var (not
+    # this default) is what binds the real store, mirroring transcript_archive_bucket.
+    voice_audio_bucket: str = "vm-voice-audio"
+    # How long a voice-audio presigned link stays valid. A call turn needs it for
+    # seconds; 15 minutes covers Twilio's retries with margin. The BUCKET lifecycle
+    # (1 day) is the storage bound; this is only the link's life.
+    voice_audio_link_ttl_seconds: int = 900
     # Platform sender identity for outbound notification email (verify-email,
     # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
     # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).

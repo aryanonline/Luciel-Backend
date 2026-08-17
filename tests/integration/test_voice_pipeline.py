@@ -229,3 +229,84 @@ async def test_normal_turn_runs_through_orchestrator_and_speaks_reply():
         assert result.counted is True
         # Normal turn keeps the line open to gather the next utterance.
         assert "<Gather" in result.twiml
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hosted_synthesis_upgrades_the_reply_to_play():
+    """The §3.1.2 hosting layer end-to-end through the pipeline: Echo synthesis →
+    LocalVoiceAudioStore upload → presigned URL → <Play> TwiML, hermetically."""
+    from app.runtime.voice_audio import HostedAudioTts, LocalVoiceAudioStore
+
+    LocalVoiceAudioStore.reset()
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        inst = _instance(admin, iid, state=LucielState.active)
+        s.add(inst)
+        await s.flush()
+        result = await handle_turn(
+            s,
+            instance=inst,
+            admin_id=admin,
+            instance_id=iid,
+            from_number="+15557654321",
+            speech_audio_ref="do you have any openings?",
+            action_url=_ACTION_URL,
+            stt=EchoSpeechToText(),
+            tts=HostedAudioTts(
+                inner=EchoTextToSpeech(),
+                store=LocalVoiceAudioStore(),
+                admin_id=admin,
+                instance_id=iid,
+                call_sid="CA_hosted",
+                ttl_seconds=900,
+            ),
+            router=_router(),
+            has_payment_method=False,
+        )
+        assert result.counted is True  # a played reply is still one billed turn
+        assert result.audio_url is not None
+        assert result.audio_url.startswith(f"https://voice-audio.local/vm/{admin}/voice/")
+        assert "<Play>" in result.twiml and "<Say>" not in result.twiml
+        # The presigned query's & separators are escaped into valid XML.
+        assert "&amp;" in result.twiml
+    LocalVoiceAudioStore.reset()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hosting_failure_degrades_to_say_and_still_serves_the_turn():
+    """Never a dead call: the store exploding mid-upload demotes the reply to the
+    honest <Say> of the same text — the turn is served and billed normally."""
+    from app.runtime.voice_audio import HostedAudioTts
+
+    class ExplodingStore:
+        async def put_and_presign(self, *, key: str, data: bytes, ttl_seconds: int) -> str:
+            raise ConnectionError("s3 down")
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        inst = _instance(admin, iid, state=LucielState.active)
+        s.add(inst)
+        await s.flush()
+        result = await handle_turn(
+            s,
+            instance=inst,
+            admin_id=admin,
+            instance_id=iid,
+            from_number="+15557654321",
+            speech_audio_ref="hello there",
+            action_url=_ACTION_URL,
+            stt=EchoSpeechToText(),
+            tts=HostedAudioTts(
+                inner=EchoTextToSpeech(),
+                store=ExplodingStore(),
+                admin_id=admin,
+                instance_id=iid,
+                call_sid="CA_broken",
+                ttl_seconds=900,
+            ),
+            router=_router(),
+            has_payment_method=False,
+        )
+        assert result.audio_url is None
+        assert "<Say>" in result.twiml and "<Play>" not in result.twiml
+        assert result.counted is True

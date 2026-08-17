@@ -36,6 +36,8 @@ export interface ComputeStackProps extends StackProps {
   readonly cmkArn: string;
   readonly transcriptArchiveBucket: s3.IBucket;
   readonly exportBucket: s3.IBucket;
+  /** Voice reply audio (§3.1.2 <Play> hosting) — presigned by the app planes. */
+  readonly voiceAudioBucket: s3.IBucket;
   /** DB master-secret ARN (imported by ARN - avoids cross-stack cycle via its KMS key). */
   readonly dbSecretArn: string;
   /** Platform secret ARN (imported by ARN to avoid a cross-stack cycle via its KMS key). */
@@ -62,7 +64,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, voiceAudioBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -134,6 +136,11 @@ export class ComputeStack extends Stack {
     // Account-export ZIPs (§3.6.6). Without this the live put_object is AccessDenied
     // and the export the tenant was promised never appears (P1-14).
     exportBucket.grantReadWrite(taskRole);
+    // Voice reply audio (§3.1.2 <Play>): the data plane uploads each turn's mp3 and
+    // presigns the GET Twilio fetches. The presigned URL is authorized AS this role,
+    // so this grant plus UseCmk (the objects are CMK-encrypted) are what make the
+    // fetch succeed — Twilio itself needs nothing.
+    voiceAudioBucket.grantReadWrite(taskRole);
     taskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ReadSecrets',
@@ -254,6 +261,10 @@ export class ComputeStack extends Stack {
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
           // Transcript cold storage (Commitment #38) — same per-env naming rule.
           LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
+          // Voice reply audio (§3.1.2 <Play> hosting). The PRESENCE of this var is
+          // the binding gate (voice_audio.get_voice_audio_store) — deliberately not
+          // injected into the sweep container, which never touches call audio.
+          LUCIEL_VOICE_AUDIO_BUCKET: voiceAudioBucket.bucketName,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),

@@ -80,6 +80,10 @@ class VoiceTurnResult:
     handed_off: bool = False
     paused: bool = False
     stt_failed: bool = False
+    # The hosted <Play> URL when this turn's reply is synthesized audio (§3.1.2
+    # hosting layer); None means the reply went out as <Say>. An honest assertion
+    # handle — set only from a playable synthesis result, never inferred.
+    audio_url: str | None = None
 
 
 async def start_call(
@@ -161,11 +165,15 @@ async def handle_turn(
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
     # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.
     if is_paused(instance):
-        await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
+        speech = await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
+        audio_url = speech.audio_ref if speech.playable else None
         return VoiceTurnResult(
-            twiml=reply_twiml(VOICE_UNAVAILABLE_REPLY, action_url, hang_up=True),
+            twiml=reply_twiml(
+                VOICE_UNAVAILABLE_REPLY, action_url, hang_up=True, audio_url=audio_url
+            ),
             spoken_text=VOICE_UNAVAILABLE_REPLY,
             paused=True,
+            audio_url=audio_url,
         )
 
     # Transcribe inbound caller audio (STT). A provider failure degrades gracefully:
@@ -177,11 +185,13 @@ async def handle_turn(
             "I'm sorry, I'm having trouble hearing you. Let me connect you with "
             "someone who can help."
         )
-        await tts.synthesize(apology)
+        speech = await tts.synthesize(apology)
+        audio_url = speech.audio_ref if speech.playable else None
         return VoiceTurnResult(
-            twiml=reply_twiml(apology, action_url, hang_up=True),
+            twiml=reply_twiml(apology, action_url, hang_up=True, audio_url=audio_url),
             spoken_text=apology,
             stt_failed=True,
+            audio_url=audio_url,
         )
 
     # Voice identity is STRONG (E.164, §3.4.9) but lead linkage is the identity arc's
@@ -243,14 +253,19 @@ async def handle_turn(
     # at_cap → the orchestrator already produced the graceful no-LLM reply (§3.4.1b);
     # speak it. handed_off / normal → speak the loop's reply, shaped for voice.
     spoken = shape_for_voice(result.reply_text or AT_CAP_REPLY)
-    await tts.synthesize(spoken)
+    # A playable result (the hosting layer minted a <Play> URL) upgrades the reply
+    # to the synthesized voice; anything else — including every failure inside the
+    # hosting wrapper, which never raises — keeps the honest <Say> of the same text.
+    speech = await tts.synthesize(spoken)
+    audio_url = speech.audio_ref if speech.playable else None
     # End the call on at_cap or handoff (nothing more for the AI to say); otherwise
     # gather the next utterance.
     hang_up = result.at_cap or result.handed_off
     return VoiceTurnResult(
-        twiml=reply_twiml(spoken, action_url, hang_up=hang_up),
+        twiml=reply_twiml(spoken, action_url, hang_up=hang_up, audio_url=audio_url),
         spoken_text=spoken,
         counted=result.counted,
         at_cap=result.at_cap,
         handed_off=result.handed_off,
+        audio_url=audio_url,
     )

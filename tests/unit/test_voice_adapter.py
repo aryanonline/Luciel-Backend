@@ -87,6 +87,29 @@ def test_reply_twiml_escapes_markup():
     assert "&amp;" in twiml and "&lt;here&gt;" in twiml
 
 
+def test_reply_twiml_plays_hosted_audio_with_escaped_presigned_query():
+    """The <Play> upgrade (§3.1.2 hosting layer). The presigned URL is element
+    TEXT, so its query-string `&` separators MUST become &amp; — Twilio unescapes
+    them on fetch; a raw `&` is malformed XML and kills the whole response."""
+    url = "https://bucket.s3.ca-central-1.amazonaws.com/vm/a/x.mp3?X-Amz-Expires=900&X-Amz-Signature=abc"
+    twiml = reply_twiml("We open at nine.", "https://x/voice/turn", audio_url=url)
+    assert "<Play>" in twiml and "</Play>" in twiml
+    assert "X-Amz-Expires=900&amp;X-Amz-Signature=abc" in twiml
+    # The reply is played, not spoken twice: no <Say> alongside the <Play>.
+    assert "<Say>" not in twiml
+    assert "<Gather" in twiml  # still gathers the caller's next utterance
+
+    hung = reply_twiml("Goodbye.", "https://x/voice/turn", hang_up=True, audio_url=url)
+    assert "<Play>" in hung and "<Hangup/>" in hung and "<Gather" not in hung
+
+
+def test_reply_twiml_without_audio_url_is_the_historical_say_output():
+    # No audio_url → byte-identical to the pre-hosting <Say> markup, so every
+    # mock-mode contract assertion stays true without edits.
+    twiml = reply_twiml("We open at nine.", "https://x/voice/turn")
+    assert "<Say>We open at nine.</Say>" in twiml and "<Play>" not in twiml
+
+
 @pytest.mark.asyncio
 async def test_verify_inbound_resolves_called_number_and_rejects_bad_signature():
     admin, iid = uuid.uuid4(), uuid.uuid4()

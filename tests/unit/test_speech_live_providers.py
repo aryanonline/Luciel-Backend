@@ -101,6 +101,10 @@ async def test_elevenlabs_tts_synthesizes_via_mocked_httpx():
     assert isinstance(out, SynthesizedSpeech)
     assert out.text == "We open at nine."
     assert out.audio_ref.startswith("tts://elevenlabs/")
+    # The mp3 bytes ride along for the hosting layer (voice_audio.HostedAudioTts)
+    # instead of being discarded — without them there is nothing to <Play>.
+    assert out.audio_bytes == b"fake-mp3-bytes"
+    assert out.playable is False  # only the hosting layer may mark a result playable
     # The API key never appears in the returned reference.
     assert "fake-elevenlabs-key" not in out.audio_ref
     fake_client.post.assert_awaited_once()

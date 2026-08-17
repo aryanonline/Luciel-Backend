@@ -44,7 +44,7 @@ function computeTemplate(envName: EnvName) {
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
     transcriptArchiveBucket: data.transcriptArchiveBucket,
-    exportBucket: data.exportBucket,
+    exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,

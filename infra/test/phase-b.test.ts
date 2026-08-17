@@ -149,7 +149,7 @@ describe('Edge layer / WAF (§5.6 — closes audit M2)', () => {
     const data = new DataStack(app, 'Data', { env: ENV, envConfig: getEnvConfig('dev'), vpc: net.vpc, cmk: sec.cmk });
     const compute = new ComputeStack(app, 'Compute', {
       env: ENV, envConfig: getEnvConfig('dev'), vpc: net.vpc, cmkArn: sec.cmk.keyArn,
-      transcriptArchiveBucket: data.transcriptArchiveBucket, exportBucket: data.exportBucket,
+      transcriptArchiveBucket: data.transcriptArchiveBucket, exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn, redisUrl: data.redisUrl,
     });

@@ -108,21 +108,29 @@ def opening_twiml(disclosure: str, action_url: str) -> str:
     )
 
 
-def reply_twiml(spoken_text: str, action_url: str, *, hang_up: bool = False) -> str:
+def reply_twiml(
+    spoken_text: str, action_url: str, *, hang_up: bool = False, audio_url: str | None = None
+) -> str:
     """TwiML for a subsequent turn: speak the loop's reply, then gather or hang up.
 
     Voice responses are short and contain NO markup/markdown (the channel arbiter +
     voice shaping enforce this, §3.4.2); only spoken words are emitted.
+
+    ``audio_url`` is the hosted-synthesis path (§3.1.2 <Play>): when the hosting
+    layer minted a playable URL the reply is ``<Play>`` instead of ``<Say>``. The
+    URL is element TEXT, so ``escape()`` turning a presigned query's ``&``
+    separators into ``&amp;`` is load-bearing — Twilio unescapes them on fetch.
+    No ``audio_url`` → byte-identical to the historical <Say> output.
     """
-    said = escape(spoken_text)
+    voiced = (
+        f"<Play>{escape(audio_url)}</Play>" if audio_url else f"<Say>{escape(spoken_text)}</Say>"
+    )
     if hang_up:
-        return (
-            f'<?xml version="1.0" encoding="UTF-8"?><Response><Say>{said}</Say><Hangup/></Response>'
-        )
+        return f'<?xml version="1.0" encoding="UTF-8"?><Response>{voiced}<Hangup/></Response>'
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"<Say>{said}</Say>"
+        f"{voiced}"
         f'<Gather input="speech" action="{escape(action_url)}" method="POST" '
         'speechTimeout="auto"/>'
         "</Response>"

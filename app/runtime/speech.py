@@ -43,6 +43,16 @@ class SynthesizedSpeech:
     # The exact text that was synthesized — retained so TwiML can fall back to <Say>
     # and so the transcript persists the spoken wording (§3.4.10 retention).
     text: str
+    # The synthesized audio itself, when the provider has it in hand. The hosting
+    # layer (app/runtime/voice_audio.HostedAudioTts) uploads these and mints the
+    # <Play> URL; a provider without bytes simply cannot be hosted. Defaulted so
+    # every pre-existing construction site is unaffected.
+    audio_bytes: bytes | None = None
+    # True ONLY when audio_ref is a URL the telephony layer may actually <Play> —
+    # set by the hosting layer after a real upload+presign, never inferred from
+    # the ref's shape (explicit state over inference). False means: speak `text`
+    # via <Say>.
+    playable: bool = False
 
 
 class SpeechToText(Protocol):
@@ -101,7 +111,14 @@ class EchoTextToSpeech:
     async def synthesize(self, text: str) -> SynthesizedSpeech:
         if self._raise:
             raise SpeechError(f"{self.name}_unavailable")
-        return SynthesizedSpeech(audio_ref=f"tts://echo/{abs(hash(text))}", text=text)
+        # Deterministic bytes so the HOSTING layer is exercisable hermetically:
+        # HostedAudioTts(inner=EchoTextToSpeech(), store=LocalVoiceAudioStore())
+        # walks the full synthesize→upload→presign path with no vendor and no AWS.
+        return SynthesizedSpeech(
+            audio_ref=f"tts://echo/{abs(hash(text))}",
+            text=text,
+            audio_bytes=f"echo:{text}".encode(),
+        )
 
 
 # --- live providers (§3.1.2 adapter table / §5.12 sub-processor register) ------ #
@@ -194,9 +211,12 @@ class ElevenLabsTextToSpeech:
         except httpx.HTTPError as exc:
             raise SpeechError(f"elevenlabs_error:{type(exc).__name__}") from exc
 
-        # The synthesized audio bytes aren't persisted to a file store here (out of
-        # scope for this workstream) — the reference records that synthesis
-        # succeeded and the exact text spoken (retained per §3.4.10), mirroring the
-        # EchoTextToSpeech contract shape so the pipeline/TwiML layer is unaffected.
+        # The mp3 bytes ride along for the hosting layer (voice_audio.HostedAudioTts)
+        # to upload and turn into a <Play> URL; the reference itself still records
+        # that synthesis succeeded and the exact text spoken (§3.4.10 retention).
         digest = abs(hash(resp.content))
-        return SynthesizedSpeech(audio_ref=f"tts://elevenlabs/{self._voice_id}/{digest}", text=text)
+        return SynthesizedSpeech(
+            audio_ref=f"tts://elevenlabs/{self._voice_id}/{digest}",
+            text=text,
+            audio_bytes=resp.content,
+        )

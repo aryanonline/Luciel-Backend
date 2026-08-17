@@ -199,6 +199,83 @@ async def test_a_caller_turn_runs_the_runtime_and_replies_as_twiml(client, monke
     assert int(counted) == 1
 
 
+async def test_hosted_synthesis_answers_play_twiml_and_still_bills_one_session(
+    client, monkeypatch
+):
+    """The §3.1.2 hosting layer on the wire: with a hosted delivery bound, the turn
+    answers <Play> with an escaped presigned URL — and the budget path is identical
+    to the <Say> turn (a nicer voice is not a second conversation)."""
+    from app.runtime import voice_audio
+    from app.runtime.speech import EchoTextToSpeech
+    from app.runtime.voice_audio import HostedAudioTts, LocalVoiceAudioStore
+
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, iid = await _seed()
+    LocalVoiceAudioStore.reset()
+
+    def hosted(*, admin_id, instance_id, call_sid):
+        return HostedAudioTts(
+            inner=EchoTextToSpeech(),
+            store=LocalVoiceAudioStore(),
+            admin_id=admin_id,
+            instance_id=instance_id,
+            call_sid=call_sid,
+            ttl_seconds=900,
+        )
+
+    monkeypatch.setattr(voice_audio, "build_hosted_voice_tts", hosted)
+
+    params = {
+        "From": CALLER,
+        "To": BYO_NUMBER,
+        "CallSid": "CA-hosted-1",
+        "SpeechResult": "Are you taking new clients this month?",
+    }
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/turn",
+        data=params,
+        headers=_signed(TURN_URL, params, auth_token),
+    )
+    assert r.status_code == 200
+    assert "<Play>" in r.text
+    assert f"https://voice-audio.local/vm/{admin}/voice/{iid}/CA-hosted-1/" in r.text
+    assert "&amp;" in r.text  # presigned query separators escaped into valid XML
+    async with tenant_session(admin) as s:
+        counted = (
+            await s.execute(
+                select(func.count()).select_from(CountedSession).where(
+                    CountedSession.admin_id == admin
+                )
+            )
+        ).scalar_one()
+    assert int(counted) == 1
+    LocalVoiceAudioStore.reset()
+
+
+async def test_mock_default_still_answers_say_never_a_fake_play(client, monkeypatch):
+    """Regression: in mock posture (no live mode, no bucket) the delivery builder
+    answers None and the turn speaks via Twilio's <Say> — a Local store's fake URL
+    must never be rendered into real TwiML."""
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, _ = await _seed()
+
+    params = {
+        "From": CALLER,
+        "To": BYO_NUMBER,
+        "CallSid": "CA-mockdefault-1",
+        "SpeechResult": "What are your hours?",
+    }
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/turn",
+        data=params,
+        headers=_signed(TURN_URL, params, auth_token),
+    )
+    assert r.status_code == 200
+    assert "<Say>" in r.text and "<Play>" not in r.text
+
+
 async def test_a_silent_gather_timeout_reprompts_without_burning_budget(client, monkeypatch):
     auth_token = "authtok-voice"
     monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)

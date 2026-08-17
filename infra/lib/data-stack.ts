@@ -32,6 +32,7 @@ export class DataStack extends Stack {
   public readonly db: rds.DatabaseInstance;
   public readonly transcriptArchiveBucket: s3.Bucket;
   public readonly exportBucket: s3.Bucket;
+  public readonly voiceAudioBucket: s3.Bucket;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
   /**
    * Redis connection URL for the app's `redis_url` (config.py, env prefix LUCIEL_).
@@ -158,6 +159,30 @@ export class DataStack extends Stack {
           // outlive the link by any meaningful margin; the extra day is slack for a
           // download started just before expiry, not a retention period.
           expiration: Duration.days(8),
+          abortIncompleteMultipartUploadAfter: Duration.days(1),
+        },
+      ],
+    });
+
+    // Voice reply audio (§3.1.2 <Play> hosting). One object per spoken turn:
+    // ElevenLabs-synthesized mp3 that Twilio fetches once through a ≤15-minute
+    // presigned link (app/runtime/voice_audio.py). The 1-day expiry is both the
+    // storage plateau AND the deleted-tenant bound — these objects are deliberately
+    // NOT in the delete cascade, because the lifecycle rule already erases a
+    // departed tenant's audio within ~24-48h (S3 expiry rounds to midnight UTC),
+    // vs the ~1-year exposure that forced transcripts into the cascade.
+    this.voiceAudioBucket = residency.hardenedBucket('VoiceAudio', {
+      key: cmk,
+      // Named because the app addresses it by name (LUCIEL_VOICE_AUDIO_BUCKET),
+      // per-env + per-account for global uniqueness (same rationale as exports).
+      bucketName: `luciel-${envConfig.envName}-voice-audio-${this.account}`,
+      removalPolicy:
+        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      lifecycleRules: [
+        {
+          id: 'voice-audio-expiry',
+          enabled: true,
+          expiration: Duration.days(1),
           abortIncompleteMultipartUploadAfter: Duration.days(1),
         },
       ],

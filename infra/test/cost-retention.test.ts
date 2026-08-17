@@ -48,7 +48,7 @@ function buildCompute(envName: EnvName = 'dev') {
     vpc: net.vpc,
     cmkArn: sec.cmk.keyArn,
     transcriptArchiveBucket: data.transcriptArchiveBucket,
-    exportBucket: data.exportBucket,
+    exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
@@ -187,7 +187,7 @@ describe('No log group retains forever', () => {
       vpc: net.vpc,
       cmkArn: sec.cmk.keyArn,
       transcriptArchiveBucket: data.transcriptArchiveBucket,
-      exportBucket: data.exportBucket,
+      exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
       redisUrl: data.redisUrl,
@@ -243,6 +243,23 @@ describe('Every S3 bucket plateaus', () => {
           Match.objectLike({
             Id: 'export-bundle-expiry',
             ExpirationInDays: 8,
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+          }),
+        ]),
+      },
+    });
+  });
+
+  test('the voice-audio bucket expires call audio within a day', () => {
+    // Single-call artifacts behind a ≤15-minute presigned link (§3.1.2 <Play>).
+    // The 1-day rule is both the storage plateau and the deleted-tenant bound —
+    // the documented reason voice audio is NOT in the delete cascade.
+    buildData().hasResourceProperties('AWS::S3::Bucket', {
+      LifecycleConfiguration: {
+        Rules: Match.arrayWith([
+          Match.objectLike({
+            Id: 'voice-audio-expiry',
+            ExpirationInDays: 1,
             AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
           }),
         ]),
