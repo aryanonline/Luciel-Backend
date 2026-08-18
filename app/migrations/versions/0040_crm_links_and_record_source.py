@@ -38,8 +38,7 @@ def _lock_down(table: str) -> None:
     op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
     op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
     op.execute(
-        f"CREATE POLICY tenant_isolation ON {table} "
-        f"USING ({_PREDICATE}) WITH CHECK ({_PREDICATE})"
+        f"CREATE POLICY tenant_isolation ON {table} USING ({_PREDICATE}) WITH CHECK ({_PREDICATE})"
     )
     op.execute(f"REVOKE ALL ON {table} FROM {APP_ROLE}")
     op.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {APP_ROLE}")

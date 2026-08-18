@@ -30,9 +30,7 @@ class NoticeDelivery(Base, TenantMixin, TimestampMixin):
     """One billing-notice email this tenant has already been sent."""
 
     __tablename__ = "notice_deliveries"
-    __table_args__ = (
-        UniqueConstraint("admin_id", "notice_id", name="uq_notice_delivery"),
-    )
+    __table_args__ = (UniqueConstraint("admin_id", "notice_id", name="uq_notice_delivery"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4

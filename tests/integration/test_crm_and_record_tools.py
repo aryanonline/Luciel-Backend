@@ -232,9 +232,7 @@ async def _lookup(seeded: _Seeded, query: str):
 
 
 async def test_lookup_record_reads_the_uploaded_rows_live():
-    seeded = await _seed(
-        crm_provider=None, record_provider="csv", authorize=("lookup_record",)
-    )
+    seeded = await _seed(crm_provider=None, record_provider="csv", authorize=("lookup_record",))
     await _seed_records(
         seeded,
         [

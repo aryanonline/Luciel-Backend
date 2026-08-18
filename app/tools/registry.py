@@ -338,16 +338,16 @@ class BringYourOwnWebhookTool:
             context=context,
         )
 
-    async def _connection_config(self, context: ToolContext) -> tuple[dict[str, object], str | None]:
+    async def _connection_config(
+        self, context: ToolContext
+    ) -> tuple[dict[str, object], str | None]:
         from sqlalchemy import select  # noqa: PLC0415 — keeps import cost off module load
 
         from app.models.connection import InstanceConnection  # noqa: PLC0415
 
         row = (
             await context.session.execute(
-                select(
-                    InstanceConnection.non_secret_config, InstanceConnection.secret_ref
-                ).where(
+                select(InstanceConnection.non_secret_config, InstanceConnection.secret_ref).where(
                     InstanceConnection.admin_id == context.admin_id,
                     InstanceConnection.instance_id == context.instance_id,
                     InstanceConnection.connection_type == "outbound_webhook",

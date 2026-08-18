@@ -208,7 +208,8 @@ async def test_dispatcher_routes_specced_providers_to_the_real_refresher_in_live
     monkeypatch.setattr(refresh, "live_mode", lambda: True)
     registry_refresher = _Registry()
     dispatcher = refresh.DispatchingRefresher(
-        fallback=_Fallback(), registry_refresher=registry_refresher  # type: ignore[arg-type]
+        fallback=_Fallback(),
+        registry_refresher=registry_refresher,  # type: ignore[arg-type]
     )
     assert await dispatcher.refresh(_row("hubspot"), LocalSecretStore()) is not None
     assert registry_refresher.seen == ["hubspot"]

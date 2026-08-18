@@ -91,9 +91,9 @@ async def _call_records(admin: uuid.UUID) -> int:
         return int(
             (
                 await s.execute(
-                    select(func.count()).select_from(VoiceCallRecord).where(
-                        VoiceCallRecord.admin_id == admin
-                    )
+                    select(func.count())
+                    .select_from(VoiceCallRecord)
+                    .where(VoiceCallRecord.admin_id == admin)
                 )
             ).scalar_one()
         )
@@ -191,17 +191,15 @@ async def test_a_caller_turn_runs_the_runtime_and_replies_as_twiml(client, monke
     async with tenant_session(admin) as s:
         counted = (
             await s.execute(
-                select(func.count()).select_from(CountedSession).where(
-                    CountedSession.admin_id == admin
-                )
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
             )
         ).scalar_one()
     assert int(counted) == 1
 
 
-async def test_hosted_synthesis_answers_play_twiml_and_still_bills_one_session(
-    client, monkeypatch
-):
+async def test_hosted_synthesis_answers_play_twiml_and_still_bills_one_session(client, monkeypatch):
     """The §3.1.2 hosting layer on the wire: with a hosted delivery bound, the turn
     answers <Play> with an escaped presigned URL — and the budget path is identical
     to the <Say> turn (a nicer voice is not a second conversation)."""
@@ -244,9 +242,9 @@ async def test_hosted_synthesis_answers_play_twiml_and_still_bills_one_session(
     async with tenant_session(admin) as s:
         counted = (
             await s.execute(
-                select(func.count()).select_from(CountedSession).where(
-                    CountedSession.admin_id == admin
-                )
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
             )
         ).scalar_one()
     assert int(counted) == 1
@@ -292,9 +290,9 @@ async def test_a_silent_gather_timeout_reprompts_without_burning_budget(client, 
     async with tenant_session(admin) as s:
         counted = (
             await s.execute(
-                select(func.count()).select_from(CountedSession).where(
-                    CountedSession.admin_id == admin
-                )
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
             )
         ).scalar_one()
     assert int(counted) == 0

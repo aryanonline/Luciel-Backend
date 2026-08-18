@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # provider call without refreshing on every use).
 REFRESH_LEAD = timedelta(minutes=5)
 
-STYLE_REFRESH_TOKEN_POST = "refresh_token_post"
+STYLE_REFRESH_TOKEN_POST = "refresh_token_post"  # noqa: S105 — a grant-style name, not a secret
 STYLE_IG_REFRESH_GET = "ig_refresh_get"
 STYLE_FB_EXCHANGE_GET = "fb_exchange_get"
 
@@ -152,9 +152,7 @@ def _transport_factory() -> Any:
 
 def _payload_of(response: Any) -> dict[str, Any] | None:
     if getattr(response, "status_code", None) != 200:
-        logger.warning(
-            "token_refresh_rejected status=%s", getattr(response, "status_code", "?")
-        )
+        logger.warning("token_refresh_rejected status=%s", getattr(response, "status_code", "?"))
         return None
     payload = response.json()
     return payload if isinstance(payload, dict) else None

@@ -581,9 +581,7 @@ async def test_byo_webhook_attaches_the_stored_auth_header(monkeypatch) -> None:
     assert tool is not None
     async with tenant_session(admin) as s:
         broker = ToolBroker(s)
-        res = await broker.dispatch(
-            tool, {"payload": {"a": 1}}, admin_id=admin, instance_id=iid
-        )
+        res = await broker.dispatch(tool, {"payload": {"a": 1}}, admin_id=admin, instance_id=iid)
     assert res.outcome is Outcome.ok
     assert seen["auth_header"] == "Bearer tenant-token"
     assert seen["url"] == "https://hooks.example.com/leads"

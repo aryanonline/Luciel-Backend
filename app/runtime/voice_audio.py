@@ -226,9 +226,7 @@ class HostedAudioTts:
                 ttl_seconds=self._ttl_seconds,
             )
         except Exception as exc:  # noqa: BLE001 — ANY hosting failure degrades to <Say>
-            logger.warning(
-                "voice_audio_hosting_failed stage=store error=%s", type(exc).__name__
-            )
+            logger.warning("voice_audio_hosting_failed stage=store error=%s", type(exc).__name__)
             return SynthesizedSpeech(audio_ref=speech.audio_ref, text=text)
         return SynthesizedSpeech(audio_ref=url, text=text, playable=True)
 

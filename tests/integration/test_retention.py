@@ -421,11 +421,7 @@ async def test_terminal_deferred_actions_are_pruned_but_the_queue_is_never_touch
         assert counts["deferred_action_terminal"] == 2
     async with tenant_session(admin) as s:
         left = (
-            (
-                await s.execute(
-                    select(DeferredAction.status).where(DeferredAction.admin_id == admin)
-                )
-            )
+            (await s.execute(select(DeferredAction.status).where(DeferredAction.admin_id == admin)))
             .scalars()
             .all()
         )
@@ -568,9 +564,7 @@ async def test_platform_data_enforcers_prune_contact_forms_and_cap_the_access_lo
     assert counts.get("internal_access_log") == 1
 
     async with untenanted_session() as s:
-        emails = (
-            (await s.execute(select(ContactSubmission.email))).scalars().all()
-        )
+        emails = (await s.execute(select(ContactSubmission.email))).scalars().all()
         assert emails == ["recent@example.com"]
         # The app role cannot read internal_access_log (§5.11 — reading the
         # compliance record needs its own approval), so the fresh entry's
@@ -579,8 +573,6 @@ async def test_platform_data_enforcers_prune_contact_forms_and_cap_the_access_lo
         from sqlalchemy import text as sa_text
 
         pruned_again = (
-            await s.execute(
-                sa_text("SELECT internal_access_prune(:cutoff)"), {"cutoff": now}
-            )
+            await s.execute(sa_text("SELECT internal_access_prune(:cutoff)"), {"cutoff": now})
         ).scalar_one()
         assert int(pruned_again or 0) == 0

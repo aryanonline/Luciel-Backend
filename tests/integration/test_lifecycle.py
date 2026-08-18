@@ -114,9 +114,7 @@ async def test_restore_of_a_legacy_grace_row_with_no_stash_mints_a_fresh_key() -
     await _seed_account_with_luciel(admin)
     async with tenant_session(admin) as s:
         await state_machine.delete_luciel(s, admin, admin)
-        inst = (
-            await s.execute(select(Instance).where(Instance.admin_id == admin))
-        ).scalar_one()
+        inst = (await s.execute(select(Instance).where(Instance.admin_id == admin))).scalar_one()
         inst.embed_key_stashed = None  # simulate the pre-migration grace row
     async with tenant_session(admin) as s:
         inst = await state_machine.restore(s, admin, admin)
@@ -151,20 +149,14 @@ async def test_delete_schedules_secret_cleanup_rather_than_claiming_it_happened(
         await state_machine.delete_luciel(s, admin, admin)
     async with tenant_session(admin) as s:
         events = (
-            (
-                await s.execute(
-                    select(AdminAuditLog).where(AdminAuditLog.admin_id == admin)
-                )
-            )
+            (await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin)))
             .scalars()
             .all()
         )
         kinds = {e.event_type for e in events}
         assert "connection_secret_cleanup_scheduled" in kinds
         assert "connection_secret_cleanup" not in kinds  # nothing was destroyed yet
-        scheduled = [
-            e for e in events if e.event_type == "connection_secret_cleanup_scheduled"
-        ]
+        scheduled = [e for e in events if e.event_type == "connection_secret_cleanup_scheduled"]
         assert scheduled[0].event_payload["secret_ref_present"] is True
 
 

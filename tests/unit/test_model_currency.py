@@ -82,9 +82,7 @@ class FakeTransport:
 
     async def get(self, url: str, *, params=None, headers=None):
         self.calls.append((url, params))
-        provider_error = (
-            self._anthropic_pages if "anthropic" in url else self._openai_listing
-        )
+        provider_error = self._anthropic_pages if "anthropic" in url else self._openai_listing
         if isinstance(provider_error, Exception):
             raise provider_error
         if url.endswith("/v1/models"):  # the listing
@@ -239,9 +237,7 @@ async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplo
     # sonnet-4-6 genuinely 404s; the listing (fetched for the successor) has 4-8.
     transport = FakeTransport(
         existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
-        anthropic_pages=_anthropic_pages(
-            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
-        ),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
         openai_listing=_openai_listing(("gpt-5.4", 400)),
     )
     sender, writer, restarter = RecordingSender(), FakeWriter(), FakeRestarter()
@@ -297,9 +293,7 @@ async def test_env_pinned_model_is_never_overridden(monkeypatch):
     monkeypatch.setenv("LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL", "claude-sonnet-4-6")
     transport = FakeTransport(
         existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
-        anthropic_pages=_anthropic_pages(
-            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
-        ),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
         openai_listing=_openai_listing(("gpt-5.4", 400)),
     )
     sender, writer = RecordingSender(), FakeWriter()
@@ -339,9 +333,7 @@ async def test_embedding_model_is_alert_only_even_when_a_successor_exists():
 async def test_secret_write_failure_becomes_an_alert_not_a_crash():
     transport = FakeTransport(
         existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
-        anthropic_pages=_anthropic_pages(
-            ("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)
-        ),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
         openai_listing=_openai_listing(("gpt-5.4", 400)),
     )
     sender = RecordingSender()

@@ -154,8 +154,10 @@ async def _send_payg_nudge_if_due(
     sender: EmailSender | None,
 ) -> int:
     instance_id = (
-        await session.execute(select(Instance.id).where(Instance.admin_id == admin_id))
-    ).scalars().first()
+        (await session.execute(select(Instance.id).where(Instance.admin_id == admin_id)))
+        .scalars()
+        .first()
+    )
     if instance_id is None:
         return 0
 

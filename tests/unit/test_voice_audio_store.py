@@ -59,9 +59,7 @@ def _hosted(inner, store) -> HostedAudioTts:
 
 def test_object_keys_are_tenant_prefixed_per_call():
     key = voice_audio_key_for(ADMIN, INSTANCE, "CA_abc")
-    assert re.fullmatch(
-        rf"vm/{ADMIN}/voice/{INSTANCE}/CA_abc/[0-9a-f-]{{36}}\.mp3", key
-    ), key
+    assert re.fullmatch(rf"vm/{ADMIN}/voice/{INSTANCE}/CA_abc/[0-9a-f-]{{36}}\.mp3", key), key
     # No CallSid (defensive): still a valid, still tenant-prefixed key.
     assert f"vm/{ADMIN}/voice/{INSTANCE}/unknown/" in voice_audio_key_for(ADMIN, INSTANCE, "")
 
@@ -95,9 +93,9 @@ async def test_happy_path_hosts_the_echo_bytes_and_answers_playable():
 
 
 async def test_provider_failure_degrades_to_say_never_raises():
-    result = await _hosted(
-        EchoTextToSpeech(raise_error=True), LocalVoiceAudioStore()
-    ).synthesize("hello")
+    result = await _hosted(EchoTextToSpeech(raise_error=True), LocalVoiceAudioStore()).synthesize(
+        "hello"
+    )
     assert result.playable is False
     assert result.text == "hello"  # the <Say> fallback speaks exactly this
 

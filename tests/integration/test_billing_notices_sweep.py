@@ -88,9 +88,7 @@ async def _seed(
 
 def _announce(monkeypatch, *, to: int, effective_at: datetime) -> None:
     settings = get_settings()
-    monkeypatch.setattr(
-        settings, "free_allowance_reduction_effective_at", effective_at.isoformat()
-    )
+    monkeypatch.setattr(settings, "free_allowance_reduction_effective_at", effective_at.isoformat())
     monkeypatch.setattr(settings, "free_allowance_reduction_to", to)
 
 
@@ -98,9 +96,7 @@ async def _delivery_rows(admin: uuid.UUID) -> list[NoticeDelivery]:
     async with tenant_session(admin) as s:
         return list(
             (
-                await s.execute(
-                    select(NoticeDelivery).where(NoticeDelivery.admin_id == admin)
-                )
+                await s.execute(select(NoticeDelivery).where(NoticeDelivery.admin_id == admin))
             ).scalars()
         )
 

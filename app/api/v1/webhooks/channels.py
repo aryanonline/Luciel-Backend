@@ -153,8 +153,7 @@ class TwilioSayDelivery:
 def _voice_enabled(inst: Any) -> bool:
     channels = inst.channels or []
     return any(
-        isinstance(c, dict) and c.get("id") == "voice" and bool(c.get("enabled"))
-        for c in channels
+        isinstance(c, dict) and c.get("id") == "voice" and bool(c.get("enabled")) for c in channels
     )
 
 

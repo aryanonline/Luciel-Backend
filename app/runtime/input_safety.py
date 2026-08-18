@@ -268,9 +268,7 @@ def build_system_prompt(
     from personality.assistantName → instance name (the same resolution the greeting
     uses), so it is interpolated into the identity stanza, never wrapped as untrusted.
     """
-    prompt = _INVARIANT_STANZAS.format(
-        assistant_name=(assistant_name or "").strip() or "Luciel"
-    )
+    prompt = _INVARIANT_STANZAS.format(assistant_name=(assistant_name or "").strip() or "Luciel")
     addr = (luciel_email_address or "").strip()
     if addr:
         prompt = prompt + _EMAIL_IDENTITY_STANZA.format(address=addr)

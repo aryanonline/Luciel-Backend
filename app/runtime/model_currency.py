@@ -143,16 +143,12 @@ async def anthropic_models(client: _Transport, *, api_key: str) -> list[dict]:
 
 
 async def openai_models(client: _Transport, *, api_key: str) -> list[dict]:
-    resp = await client.get(
-        _OPENAI_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"}
-    )
+    resp = await client.get(_OPENAI_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"})
     resp.raise_for_status()
     return list(resp.json().get("data") or [])
 
 
-async def model_exists(
-    client: _Transport, *, provider: str, api_key: str, model_id: str
-) -> bool:
+async def model_exists(client: _Transport, *, provider: str, api_key: str, model_id: str) -> bool:
     """Per-id ground truth: ``GET /v1/models/{id}`` — 200 means the pin resolves
     (alias or dated id alike), 404 means it is genuinely gone. This is the ONLY
     honest presence check: a valid alias can be absent from the listing (live
@@ -272,9 +268,7 @@ class BotoEcsServiceRestarter:
 
         client = boto3.client("ecs", region_name=self._region_name)
         for service in self._services:
-            client.update_service(
-                cluster=self._cluster, service=service, forceNewDeployment=True
-            )
+            client.update_service(cluster=self._cluster, service=service, forceNewDeployment=True)
 
     async def restart(self) -> None:
         await asyncio.to_thread(self._restart_sync)
@@ -425,9 +419,7 @@ async def run_model_currency_check(
                     try:
                         await restart.restart()
                     except Exception as exc:  # noqa: BLE001 — swap persisted; recoverable
-                        logger.warning(
-                            "model_currency_restart_failed error=%s", type(exc).__name__
-                        )
+                        logger.warning("model_currency_restart_failed error=%s", type(exc).__name__)
                         restart_note = "restart_failed"
                 logger.warning(
                     "%s setting=%s old=%s new=%s services=%s",
