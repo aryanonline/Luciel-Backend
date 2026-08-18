@@ -128,10 +128,54 @@ async def test_builder_is_honest_say_in_mock_and_without_a_bucket(monkeypatch):
     assert build_hosted_voice_tts(admin_id=ADMIN, instance_id=INSTANCE, call_sid="CA") is None
 
 
-async def test_builder_is_honest_say_when_live_speech_cannot_bind(monkeypatch, caplog):
-    """Live + bucket, but the platform secret has no ElevenLabs key: degraded voice
-    quality (Twilio <Say>), never a crashed webhook."""
+async def test_builder_is_honest_say_without_the_premium_opt_in(monkeypatch):
+    """Live + bucket + keys but NO ``LUCIEL_VOICE_PREMIUM_AUDIO=1``: the deferral
+    holds. The CDK wires the bucket unconditionally, so bucket-presence alone had
+    re-enabled the deferred hosting layer — a failing paid ElevenLabs round-trip
+    on every reply against the unfunded account (live-caught 2026-08-18)."""
     monkeypatch.setenv("LUCIEL_VOICE_AUDIO_BUCKET", "luciel-dev-voice-audio-123")
+    monkeypatch.delenv("LUCIEL_VOICE_PREMIUM_AUDIO", raising=False)
+    settings = __import__("app.config", fromlist=["get_settings"]).get_settings()
+    monkeypatch.setattr(settings, "integration_mode", "live")
+    monkeypatch.setattr(
+        settings,
+        "platform_secret",
+        '{"OPENAI_API_KEY": "sk-fake", "ELEVENLABS_API_KEY": "el-fake"}',
+    )
+    assert build_hosted_voice_tts(admin_id=ADMIN, instance_id=INSTANCE, call_sid="CA") is None
+
+
+async def test_slow_synthesis_degrades_to_say_within_the_webhook_window():
+    """A provider slower than the synthesize timeout is cut off and the reply
+    degrades to <Say> — Twilio abandons webhooks at ~15s, so a hung TTS call must
+    never be allowed to hold the turn past it (the c11 latency risk, now bound)."""
+    import asyncio as _asyncio
+
+    class SlowTts:
+        name = "slow"
+
+        async def synthesize(self, text: str):
+            await _asyncio.sleep(5)
+            raise AssertionError("unreachable — the timeout must fire first")
+
+    hosted = HostedAudioTts(
+        inner=SlowTts(),
+        store=LocalVoiceAudioStore(),
+        admin_id=ADMIN,
+        instance_id=INSTANCE,
+        call_sid="CA-slow",
+        ttl_seconds=900,
+        synthesize_timeout_seconds=0.05,
+    )
+    result = await hosted.synthesize("hello?")
+    assert result.playable is False and result.text == "hello?"
+
+
+async def test_builder_is_honest_say_when_live_speech_cannot_bind(monkeypatch, caplog):
+    """Live + bucket + opt-in, but the platform secret has no ElevenLabs key:
+    degraded voice quality (Twilio <Say>), never a crashed webhook."""
+    monkeypatch.setenv("LUCIEL_VOICE_AUDIO_BUCKET", "luciel-dev-voice-audio-123")
+    monkeypatch.setenv("LUCIEL_VOICE_PREMIUM_AUDIO", "1")
     settings = __import__("app.config", fromlist=["get_settings"]).get_settings()
     monkeypatch.setattr(settings, "integration_mode", "live")
     monkeypatch.setattr(settings, "platform_secret", "{}")
@@ -142,8 +186,9 @@ async def test_builder_is_honest_say_when_live_speech_cannot_bind(monkeypatch, c
     assert any("voice_audio_hosting_unavailable" in r.getMessage() for r in caplog.records)
 
 
-async def test_builder_hosts_when_live_with_bucket_and_keys(monkeypatch):
+async def test_builder_hosts_when_live_with_bucket_keys_and_opt_in(monkeypatch):
     monkeypatch.setenv("LUCIEL_VOICE_AUDIO_BUCKET", "luciel-dev-voice-audio-123")
+    monkeypatch.setenv("LUCIEL_VOICE_PREMIUM_AUDIO", "1")
     settings = __import__("app.config", fromlist=["get_settings"]).get_settings()
     monkeypatch.setattr(settings, "integration_mode", "live")
     monkeypatch.setattr(

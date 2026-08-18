@@ -90,6 +90,19 @@ def disclosure_contains_mandatory_facts(text: str) -> bool:
     )
 
 
+# Every <Say> names a Twilio-hosted Amazon Polly NEURAL voice. The attribute-less
+# <Say> falls back to Twilio's legacy robotic default — live-caught 2026-08-18 as
+# "didn't sound natural" on the disclosure. Polly neural is billed per character to
+# the TENANT's Twilio account (fractions of a cent per call, like the call minutes
+# themselves — BYO §3.1.4), so this costs the platform nothing and honors the
+# owner's premium-audio (ElevenLabs) deferral.
+SAY_VOICE = "Polly.Joanna-Neural"
+
+
+def _say(text: str) -> str:
+    return f'<Say voice="{SAY_VOICE}">{escape(text)}</Say>'
+
+
 def opening_twiml(disclosure: str, action_url: str) -> str:
     """TwiML for call start: play the mandatory disclosure, THEN gather caller speech.
 
@@ -97,11 +110,10 @@ def opening_twiml(disclosure: str, action_url: str) -> str:
     caller audio is captured for transcription (§3.1.2 "before any caller audio is
     processed"). action_url is where Twilio posts the captured SpeechResult.
     """
-    said = escape(disclosure)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"<Say>{said}</Say>"
+        f"{_say(disclosure)}"
         f'<Gather input="speech" action="{escape(action_url)}" method="POST" '
         'speechTimeout="auto"/>'
         "</Response>"
@@ -122,9 +134,7 @@ def reply_twiml(
     separators into ``&amp;`` is load-bearing — Twilio unescapes them on fetch.
     No ``audio_url`` → byte-identical to the historical <Say> output.
     """
-    voiced = (
-        f"<Play>{escape(audio_url)}</Play>" if audio_url else f"<Say>{escape(spoken_text)}</Say>"
-    )
+    voiced = f"<Play>{escape(audio_url)}</Play>" if audio_url else _say(spoken_text)
     if hang_up:
         return f'<?xml version="1.0" encoding="UTF-8"?><Response>{voiced}<Hangup/></Response>'
     return (

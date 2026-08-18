@@ -69,7 +69,7 @@ def test_opening_twiml_plays_disclosure_then_gathers_speech():
     twiml = opening_twiml(build_disclosure(), "https://x/voice/turn")
     # Disclosure <Say> precedes the <Gather> so the notice is delivered before any
     # caller audio is captured for transcription (§3.1.2).
-    assert twiml.index("<Say>") < twiml.index("<Gather")
+    assert twiml.index('<Say voice="Polly.Joanna-Neural">') < twiml.index("<Gather")
     assert 'input="speech"' in twiml
     assert "AI assistant" in twiml
 
@@ -96,7 +96,7 @@ def test_reply_twiml_plays_hosted_audio_with_escaped_presigned_query():
     assert "<Play>" in twiml and "</Play>" in twiml
     assert "X-Amz-Expires=900&amp;X-Amz-Signature=abc" in twiml
     # The reply is played, not spoken twice: no <Say> alongside the <Play>.
-    assert "<Say>" not in twiml
+    assert "<Say" not in twiml
     assert "<Gather" in twiml  # still gathers the caller's next utterance
 
     hung = reply_twiml("Goodbye.", "https://x/voice/turn", hang_up=True, audio_url=url)
@@ -107,7 +107,8 @@ def test_reply_twiml_without_audio_url_is_the_historical_say_output():
     # No audio_url → byte-identical to the pre-hosting <Say> markup, so every
     # mock-mode contract assertion stays true without edits.
     twiml = reply_twiml("We open at nine.", "https://x/voice/turn")
-    assert "<Say>We open at nine.</Say>" in twiml and "<Play>" not in twiml
+    assert '<Say voice="Polly.Joanna-Neural">We open at nine.</Say>' in twiml
+    assert "<Play>" not in twiml
 
 
 @pytest.mark.asyncio

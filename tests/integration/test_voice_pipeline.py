@@ -73,7 +73,7 @@ async def test_start_call_always_logs_mandatory_disclosure():
         )
         # Opening TwiML carries the disclosure before the gather (§3.1.2).
         assert "AI assistant" in twiml
-        assert twiml.index("<Say>") < twiml.index("<Gather")
+        assert twiml.index('<Say voice="Polly.Joanna-Neural">') < twiml.index("<Gather")
 
         # A VoiceCallRecord proving disclosure delivery exists, with a played timestamp.
         rec = (
@@ -266,7 +266,7 @@ async def test_hosted_synthesis_upgrades_the_reply_to_play():
         assert result.counted is True  # a played reply is still one billed turn
         assert result.audio_url is not None
         assert result.audio_url.startswith(f"https://voice-audio.local/vm/{admin}/voice/")
-        assert "<Play>" in result.twiml and "<Say>" not in result.twiml
+        assert "<Play>" in result.twiml and "<Say" not in result.twiml
         # The presigned query's & separators are escaped into valid XML.
         assert "&amp;" in result.twiml
     LocalVoiceAudioStore.reset()
@@ -308,5 +308,5 @@ async def test_hosting_failure_degrades_to_say_and_still_serves_the_turn():
             has_payment_method=False,
         )
         assert result.audio_url is None
-        assert "<Say>" in result.twiml and "<Play>" not in result.twiml
+        assert '<Say voice="Polly.Joanna-Neural">' in result.twiml and "<Play>" not in result.twiml
         assert result.counted is True

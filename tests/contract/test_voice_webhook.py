@@ -124,7 +124,7 @@ async def test_call_start_plays_disclosure_before_gather_and_logs_it(client, mon
     # Mandatory disclosure BEFORE any caller audio is captured (§3.1.2).
     assert "AI assistant" in body and "not a human" in body
     assert "recorded and transcribed" in body
-    assert body.index("<Say>") < body.index("<Gather")
+    assert body.index('<Say voice="Polly.Joanna-Neural">') < body.index("<Gather")
     assert 'action="http://test/api/v1/webhooks/twilio/voice/turn"' in body
 
     assert await _call_records(admin) == 1
@@ -186,7 +186,7 @@ async def test_a_caller_turn_runs_the_runtime_and_replies_as_twiml(client, monke
         headers=_signed(TURN_URL, params, auth_token),
     )
     assert r.status_code == 200
-    assert "<Say>" in r.text
+    assert '<Say voice="Polly.Joanna-Neural">' in r.text
     # The turn ran the real budget path: one billed session, counted once.
     async with tenant_session(admin) as s:
         counted = (
@@ -271,7 +271,7 @@ async def test_mock_default_still_answers_say_never_a_fake_play(client, monkeypa
         headers=_signed(TURN_URL, params, auth_token),
     )
     assert r.status_code == 200
-    assert "<Say>" in r.text and "<Play>" not in r.text
+    assert '<Say voice="Polly.Joanna-Neural">' in r.text and "<Play>" not in r.text
 
 
 async def test_a_silent_gather_timeout_reprompts_without_burning_budget(client, monkeypatch):

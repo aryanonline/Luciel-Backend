@@ -161,11 +161,13 @@ def _voice_unavailable_twiml() -> Response:
     """A closed, honest reply for every not-handled case (disabled channel,
     paused, rejected inbound): a spoken notice + hangup. Twilio must always
     receive valid TwiML — an empty 200 leaves dead air on a live call."""
+    from app.channels.voice_adapter import SAY_VOICE  # noqa: PLC0415
     from app.runtime.voice_pipeline import VOICE_UNAVAILABLE_REPLY  # noqa: PLC0415
 
     body = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        f"<Response><Say>{_xml_escape(VOICE_UNAVAILABLE_REPLY)}</Say><Hangup/></Response>"
+        f'<Response><Say voice="{SAY_VOICE}">{_xml_escape(VOICE_UNAVAILABLE_REPLY)}</Say>'
+        "<Hangup/></Response>"
     )
     return Response(content=body, media_type="application/xml")
 

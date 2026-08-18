@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # provider call without refreshing on every use).
 REFRESH_LEAD = timedelta(minutes=5)
 
-STYLE_REFRESH_TOKEN_POST = "refresh_token_post"  # noqa: S105 — a grant-style name, not a secret
+STYLE_REFRESH_TOKEN_POST = "refresh_token_post"  # noqa: S105 — a grant-style name, not a secret  # nosec B105
 STYLE_IG_REFRESH_GET = "ig_refresh_get"
 STYLE_FB_EXCHANGE_GET = "fb_exchange_get"
 

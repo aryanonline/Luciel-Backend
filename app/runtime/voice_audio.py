@@ -195,6 +195,7 @@ class HostedAudioTts:
         instance_id: uuid.UUID,
         call_sid: str,
         ttl_seconds: int,
+        synthesize_timeout_seconds: float = 6.0,
     ) -> None:
         self._inner = inner
         self._store = store
@@ -202,11 +203,25 @@ class HostedAudioTts:
         self._instance_id = instance_id
         self._call_sid = call_sid
         self._ttl_seconds = ttl_seconds
+        # Twilio abandons a webhook after ~15s; the reply TwiML also carries the
+        # LLM turn's latency, so a slow synthesis provider must be cut off early
+        # enough that the degraded <Say> answer still makes the window (the c11
+        # worst-case-latency risk, promoted to a hard bound 2026-08-18).
+        self._synthesize_timeout = synthesize_timeout_seconds
 
     async def synthesize(self, text: str) -> SynthesizedSpeech:
         inner_name = getattr(self._inner, "name", type(self._inner).__name__)
         try:
-            speech = await self._inner.synthesize(text)
+            speech = await asyncio.wait_for(
+                self._inner.synthesize(text), timeout=self._synthesize_timeout
+            )
+        except TimeoutError:
+            logger.warning(
+                "voice_audio_hosting_failed stage=synthesize_timeout provider=%s after=%ss",
+                inner_name,
+                self._synthesize_timeout,
+            )
+            return SynthesizedSpeech(audio_ref=f"say-fallback:{len(text)}", text=text)
         except SpeechError as exc:
             logger.warning(
                 "voice_audio_hosting_failed stage=synthesize provider=%s error=%s",
@@ -236,19 +251,28 @@ def build_hosted_voice_tts(
 ) -> TextToSpeech | None:
     """The per-request delivery builder the voice webhook calls.
 
-    Returns None — meaning "use the honest ``<Say>`` delivery" — unless BOTH
+    Returns None — meaning "use the honest ``<Say>`` delivery" — unless ALL THREE
     gates pass: live mode (the inner ElevenLabs synthesis is a paid third-party
-    call, so it obeys the same mode gate as every vendor) AND a real bucket
+    call, so it obeys the same mode gate as every vendor), a real bucket
     (``LUCIEL_VOICE_AUDIO_BUCKET`` injected by CDK — a Local store's fake URL
-    must never be rendered into real TwiML). A live deployment whose speech
-    providers fail to build (missing key) also answers None, logged: degraded
-    voice quality, never a dead call."""
+    must never be rendered into real TwiML), AND the explicit premium-audio
+    opt-in ``LUCIEL_VOICE_PREMIUM_AUDIO=1``. The opt-in exists because the CDK
+    wires the bucket unconditionally, so bucket-presence alone re-enabled the
+    hosting layer the owner deliberately deferred (2026-08-17 "ship with <Say>")
+    — live-caught as a failing paid ElevenLabs round-trip on EVERY reply against
+    the unfunded account. A live deployment whose speech providers fail to build
+    (missing key) also answers None, logged: degraded voice quality, never a
+    dead call."""
     import os  # noqa: PLC0415 — deployment shape, read per request
 
     from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
 
     settings = get_settings()
-    if settings.integration_mode != "live" or not os.environ.get("LUCIEL_VOICE_AUDIO_BUCKET"):
+    if (
+        settings.integration_mode != "live"
+        or not os.environ.get("LUCIEL_VOICE_AUDIO_BUCKET")
+        or os.environ.get("LUCIEL_VOICE_PREMIUM_AUDIO") != "1"
+    ):
         return None
     try:
         from app.runtime.provider_factory import build_speech_providers  # noqa: PLC0415

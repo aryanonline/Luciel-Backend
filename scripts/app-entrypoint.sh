@@ -22,4 +22,8 @@ PY
 # as http:// and Twilio's X-Twilio-Signature (signed over the https:// webhook URL)
 # never matches. Trusting XFF from any peer is safe here because tasks are only
 # reachable from the ALB security group. Keep in sync with the Dockerfile CMD.
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "*"
+# --timeout-keep-alive 75: MUST exceed the ALB idle timeout (60s default). With
+# uvicorn's 5s default the ALB reuses connections uvicorn has already closed ->
+# instant 502 with no app-side log (live-caught 2026-08-18: Twilio error 11200 on
+# /voice/turn — the caller's question died between the ALB and us).
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "*" --timeout-keep-alive 75
