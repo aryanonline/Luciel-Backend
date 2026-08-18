@@ -37,7 +37,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from app.runtime.speech import SpeechError, SynthesizedSpeech, TextToSpeech
 
@@ -259,7 +259,9 @@ def build_hosted_voice_tts(
         logger.warning("voice_audio_hosting_unavailable reason=%s", exc)
         return None
     return HostedAudioTts(
-        inner=tts,
+        # The factory is duck-typed (tuple[object, object]); every provider it
+        # returns satisfies the TextToSpeech Protocol.
+        inner=cast("TextToSpeech", tts),
         store=get_voice_audio_store(),
         admin_id=admin_id,
         instance_id=instance_id,

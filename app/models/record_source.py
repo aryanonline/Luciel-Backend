@@ -37,7 +37,7 @@ class RecordSourceRecord(Base, TenantMixin, TimestampMixin):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # The row's fields, keyed by the CSV header names (admin-defined schema —
     # the platform imposes no vertical ontology, §3.2.1).
-    fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    fields: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

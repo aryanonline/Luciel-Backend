@@ -44,8 +44,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from app.config import Settings, get_settings, parse_platform_secret
 from app.notifications.email_sender import EmailSender, build_email_sender
@@ -110,11 +111,22 @@ PINS: tuple[ModelPin, ...] = (
 
 
 class _Transport(Protocol):  # pragma: no cover - structural typing only
-    async def get(self, url: str, *, params: dict | None = None, headers: dict | None = None): ...
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any: ...
 
     async def __aenter__(self) -> _Transport: ...
 
-    async def __aexit__(self, *exc: object) -> None: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: Any = None,
+    ) -> None: ...
 
 
 def _transport_factory() -> _Transport:
@@ -123,13 +135,13 @@ def _transport_factory() -> _Transport:
     return httpx.AsyncClient(timeout=15.0)
 
 
-async def anthropic_models(client: _Transport, *, api_key: str) -> list[dict]:
+async def anthropic_models(client: _Transport, *, api_key: str) -> list[dict[str, Any]]:
     """Every model the Anthropic account can see (paginated, limit 1000/page)."""
     headers = {"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION}
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     after_id: str | None = None
     while True:
-        params: dict = {"limit": 1000}
+        params: dict[str, Any] = {"limit": 1000}
         if after_id:
             params["after_id"] = after_id
         resp = await client.get(_ANTHROPIC_MODELS_URL, params=params, headers=headers)
@@ -142,7 +154,7 @@ async def anthropic_models(client: _Transport, *, api_key: str) -> list[dict]:
         after_id = str(items[-1].get("id"))
 
 
-async def openai_models(client: _Transport, *, api_key: str) -> list[dict]:
+async def openai_models(client: _Transport, *, api_key: str) -> list[dict[str, Any]]:
     resp = await client.get(_OPENAI_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"})
     resp.raise_for_status()
     return list(resp.json().get("data") or [])
@@ -189,7 +201,7 @@ def model_family(model_id: str) -> str:
     return "-".join(parts)
 
 
-def _created_epoch(item: dict) -> int:
+def _created_epoch(item: dict[str, Any]) -> int:
     created = item.get("created")
     if isinstance(created, (int, float)):
         return int(created)
@@ -204,7 +216,7 @@ def _created_epoch(item: dict) -> int:
     return 0
 
 
-def pick_successor(retired_id: str, available: list[dict]) -> str | None:
+def pick_successor(retired_id: str, available: list[dict[str, Any]]) -> str | None:
     """The newest same-family model, or None (⇒ alert-only, never a cross-family guess)."""
     family = model_family(retired_id)
     candidates = [
@@ -313,7 +325,7 @@ _REMEDY = (
 async def run_model_currency_check(
     *,
     settings: Settings | None = None,
-    transport_factory=None,
+    transport_factory: Callable[[], _Transport] | None = None,
     email_sender: EmailSender | None = None,
     secret_writer: PlatformSecretWriter | None = None,
     restarter: EcsServiceRestarter | None = None,
@@ -353,9 +365,9 @@ async def run_model_currency_check(
     unreachable: set[str] = set()
     # The paginated listing is fetched LAZILY, only to resolve a successor for a
     # pin the retrieve proved gone — presence is never judged by list membership.
-    listings: dict[str, list[dict] | None] = {}
+    listings: dict[str, list[dict[str, Any]] | None] = {}
 
-    async def _listing_for(client: _Transport, provider: str) -> list[dict] | None:
+    async def _listing_for(client: _Transport, provider: str) -> list[dict[str, Any]] | None:
         if provider not in listings:
             fetch = anthropic_models if provider == "anthropic" else openai_models
             try:

@@ -40,7 +40,10 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from app.connections.health import TokenRefresher
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -283,7 +286,9 @@ class DispatchingRefresher:
     routed only ``outlook``); Outlook now rides the same generic table.
     """
 
-    def __init__(self, *, fallback: Any, registry_refresher: RegistryTokenRefresher | None = None):
+    def __init__(
+        self, *, fallback: TokenRefresher, registry_refresher: RegistryTokenRefresher | None = None
+    ):
         self._fallback = fallback
         self._registry = registry_refresher or RegistryTokenRefresher()
 
