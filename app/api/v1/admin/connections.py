@@ -204,6 +204,8 @@ async def provision_email(
 async def start_connection(
     req: StartConnectionRequest, subject: Subject = Depends(current_admin)
 ) -> StartConnectionResult:
+    from app.channels.phone_lifecycle import NumberAlreadyClaimed  # noqa: PLC0415
+
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
         try:
@@ -218,6 +220,8 @@ async def start_connection(
             )
         except service.ProviderNotRegistered as exc:
             raise validation_error(str(exc)) from exc
+        except NumberAlreadyClaimed as exc:
+            raise conflict(str(exc)) from exc
         return StartConnectionResult.model_validate(result)
 
 

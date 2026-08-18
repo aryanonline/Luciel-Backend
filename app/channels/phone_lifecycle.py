@@ -49,6 +49,20 @@ from app.channels.number_operability import NumberOperabilityProbe, OperabilityR
 from app.channels.tenant_twilio import build_tenant_operability_probe
 from app.models.connection import InstanceConnection
 
+
+class NumberAlreadyClaimed(Exception):
+    """The number is another tenant's inbound-routing destination.
+
+    Same security boundary as email/Meta destination binds: the destination is what
+    ``channel_resolve_destination`` routes inbound SMS *and voice calls* on, so a
+    tenant permitted to claim a number another tenant already holds could capture
+    their inbound conversations.
+    """
+
+    def __init__(self, number: str) -> None:
+        super().__init__(f"{number} is already connected to a different account")
+
+
 # Basic E.164: leading '+', first digit 1-9, then 7-14 more digits (8-15 total).
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
@@ -125,6 +139,16 @@ async def attach_sms_number(
     number never inherits the old number's status. Idempotent per tenant/instance.
     """
     number = _validate_e164(e164_number)
+    # Cross-tenant uniqueness (§3.1.3) BEFORE the operability probe: every other
+    # destination bind (email, Meta) runs this gate; this was the one path without
+    # it, which let a second tenant claim a number inbound routing already resolved
+    # to someone else. Checked through the same SECURITY DEFINER resolver delivery
+    # uses, because RLS hides foreign claims from an ordinary query.
+    from app.channels import routing  # noqa: PLC0415 — circular at module import
+
+    holder = await routing.owner_of_destination(session, "sms_sender", number)
+    if holder is not None and holder != admin_id:
+        raise NumberAlreadyClaimed(number)
     probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(number)
     status, detail = _status_for(result)

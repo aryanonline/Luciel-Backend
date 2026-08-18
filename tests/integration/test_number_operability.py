@@ -13,6 +13,7 @@ Covers the honesty invariants agreed for the BYO-number flow:
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from app.channels.number_operability import (
@@ -23,12 +24,15 @@ from app.channels.phone_lifecycle import (
     STATUS_NOT_OPERABLE,
     STATUS_PENDING_REGISTRATION,
     STATUS_UNCONFIGURED,
+    NumberAlreadyClaimed,
     attach_sms_number,
     reverify_sms_number,
     sms_number_status,
 )
-from app.db.session import tenant_session
+from app.db.session import tenant_session, untenanted_session
+from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
+from sqlalchemy import text
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -199,3 +203,102 @@ async def test_reverify_with_no_number_returns_none():
         assert await sms_number_status(s, admin_id=admin, instance_id=iid) == STATUS_UNCONFIGURED
         c = await reverify_sms_number(s, admin_id=admin, instance_id=iid)
         assert c is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_number_held_by_another_tenant_cannot_be_claimed():
+    """Cross-tenant uniqueness (§3.1.3): the destination is what inbound SMS AND
+    voice route on, so a second tenant claiming an already-held number would
+    capture the holder's inbound conversations. Live-caught 2026-08-17: this was
+    the one destination-bind path (email and Meta both gate) without the check."""
+    holder, claimant = uuid.uuid4(), uuid.uuid4()
+    holder_iid = await _seed(holder)
+    claimant_iid = await _seed(claimant)
+    async with tenant_session(holder) as s:
+        await attach_sms_number(
+            s,
+            admin_id=holder,
+            instance_id=holder_iid,
+            e164_number=NUM_A,
+            probe=NullOperabilityProbe(operable_numbers={NUM_A}),
+        )
+    async with tenant_session(claimant) as s:
+        with pytest.raises(NumberAlreadyClaimed):
+            await attach_sms_number(
+                s,
+                admin_id=claimant,
+                instance_id=claimant_iid,
+                e164_number=NUM_A,
+                probe=NullOperabilityProbe(operable_numbers={NUM_A}),
+            )
+        # The refusal left nothing behind: the claimant still has no sms_sender row.
+        assert (
+            await sms_number_status(s, admin_id=claimant, instance_id=claimant_iid)
+            == STATUS_UNCONFIGURED
+        )
+    # The holder's own re-attach of the SAME number is NOT a foreign claim.
+    async with tenant_session(holder) as s:
+        again = await attach_sms_number(
+            s,
+            admin_id=holder,
+            instance_id=holder_iid,
+            e164_number=NUM_A,
+            probe=NullOperabilityProbe(operable_numbers={NUM_A}),
+        )
+        assert again.status == STATUS_PENDING_REGISTRATION
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_legacy_duplicate_claims_resolve_to_the_newest():
+    """Rows claimed BEFORE the uniqueness gate existed can still collide. For those
+    legacy duplicates ``channel_resolve_destination`` must be deterministic — the
+    newest claim wins (its tenant passed a real Twilio verify most recently) — not
+    an arbitrary ``LIMIT 1`` pick, which live-routed a tenant's voice calls to a
+    stale claimant on 2026-08-17."""
+    old_admin, new_admin = uuid.uuid4(), uuid.uuid4()
+    old_iid = await _seed(old_admin)
+    new_iid = await _seed(new_admin)
+    # Simulate the pre-gate state with direct row writes: explicit created_at values,
+    # because rows flushed in one transaction share now() and would tie.
+    async with tenant_session(old_admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=old_admin,
+                instance_id=old_iid,
+                connection_type="sms_sender",
+                auth_class="api_key",
+                provider="twilio",
+                status="connected",
+                non_secret_config={"destination": NUM_A},
+                created_at=datetime(2026, 7, 28, tzinfo=UTC),
+            )
+        )
+        await s.flush()
+    async with tenant_session(new_admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=new_admin,
+                instance_id=new_iid,
+                connection_type="sms_sender",
+                auth_class="api_key",
+                provider="twilio",
+                status="pending_carrier_registration",
+                non_secret_config={"destination": NUM_A},
+                created_at=datetime(2026, 8, 17, tzinfo=UTC),
+            )
+        )
+        await s.flush()
+    async with untenanted_session() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT admin_id, instance_id"
+                    " FROM channel_resolve_destination('sms_sender', :d)"
+                ),
+                {"d": NUM_A},
+            )
+        ).one()
+    assert row.admin_id == new_admin
+    assert row.instance_id == new_iid

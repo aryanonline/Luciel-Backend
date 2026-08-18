@@ -560,3 +560,64 @@ async def test_vm_subdomain_reverify_is_a_harmless_noop(client):
 async def test_email_reverify_requires_auth(client):
     r = await client.post("/api/v1/admin/connections/email/reverify")
     assert r.status_code in (401, 403)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_sms_attach_of_a_foreign_held_number_is_409(client):
+    """Cross-tenant destination uniqueness at the HTTP surface (§3.1.3): a number
+    another tenant already holds cannot be claimed — the same 409 the email bind
+    serves. Inbound SMS/voice route on this destination, so before this gate a
+    second claim could capture the holder's conversations (live-caught 2026-08-17)."""
+    from app.channels.number_operability import NullOperabilityProbe
+    from app.channels.phone_lifecycle import attach_sms_number
+    from app.db.session import tenant_session
+    from app.models.instance import Account, AccountState, Instance, LucielState
+
+    number = "+16045550199"
+    holder = uuid.uuid4()
+    holder_iid = uuid.uuid4()
+    async with tenant_session(holder) as s:
+        s.add(
+            Account(
+                id=holder,
+                admin_id=holder,
+                user_id=holder,
+                email=f"{holder.hex[:8]}@x.com",
+                email_lower=f"{holder.hex[:8]}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        s.add(
+            Instance(
+                id=holder_iid,
+                admin_id=holder,
+                name="Holder Co",
+                state=LucielState.active,
+                embed_key_public_id=f"vm_live_{holder.hex[:8]}",
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        await s.flush()
+        await attach_sms_number(
+            s,
+            admin_id=holder,
+            instance_id=holder_iid,
+            e164_number=number,
+            probe=NullOperabilityProbe(operable_numbers={number}),
+        )
+
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "sms_sender", "provider": "twilio", "phoneNumber": number},
+    )
+    assert r.status_code == 409
+    assert "already connected to a different account" in r.json()["message"]
+    # The refusal wrote nothing: this account still has no sms_sender row.
+    g = await client.get("/api/v1/admin/connections")
+    assert not [c for c in g.json() if c["connectionType"] == "sms_sender"]
