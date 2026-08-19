@@ -123,9 +123,32 @@ def _fake_microsoft_transport(
 
 
 async def _provision_ses(client) -> str:
-    """The working sender the mailbox must not silently replace. Returns connection id."""
-    r = await client.post("/api/v1/admin/connections/email", json={"mode": "vm_subdomain"})
-    assert r.status_code == 200
+    """The working LEGACY sender the mailbox must not silently replace (seeded via
+    the service since c22 — the route no longer offers platform modes, but rows
+    provisioned before the removal keep serving). Returns connection id."""
+    from app.auth.tokens import decode_token
+    from app.config import get_settings
+    from app.connections import service as conn_service
+    from app.db.session import tenant_session
+    from app.models.instance import Instance
+    from sqlalchemy import select as _select
+
+    admin_id = uuid.UUID(
+        decode_token(client.cookies.get(get_settings().session_cookie_name))["sub"]
+    )
+    async with tenant_session(admin_id) as s:
+        iid = (
+            await s.execute(_select(Instance.id).where(Instance.admin_id == admin_id))
+        ).scalar_one()
+        await conn_service.provision_email(
+            s,
+            admin_id=admin_id,
+            instance_id=iid,
+            mode="vm_subdomain",
+            email_address=None,
+            instance_name="L",
+            user_id=None,
+        )
     rows = (await client.get("/api/v1/admin/connections")).json()
     row = next(c for c in rows if c["connectionType"] == "email_sender")
     assert row["provider"] == "ses"

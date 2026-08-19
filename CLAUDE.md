@@ -118,11 +118,15 @@ modules rather than duplicating business rules in a new location.
   disclosed in UI copy — best-effort (a failure surfaces manual guidance in
   status_detail, never fails the attach; requires the platform secret’s
   API_BASE_URL / settings.public_api_base_url).
-- Email is BYO-mailbox (§3.1.6a; Outlook first): the customer connects their own work
-  mailbox under the existing `email_sender` type; replies go out AS that mailbox with
-  no silent SES fallback, inbound arrives via the 5-minute `mailbox_poll` delta sweep
-  (the FIRST poll drains history unprocessed — the baseline rule), and the platform
-  SES / own-domain modes remain the non-mailbox alternative.
+- Email is BYO-mailbox ONLY (§3.1.6a; Outlook; owner decision 2026-08-18): the
+  customer connects their own work mailbox under the existing `email_sender` type;
+  replies go out AS that mailbox with no silent SES fallback, inbound arrives via
+  the 5-minute `mailbox_poll` delta sweep (the FIRST poll drains history
+  unprocessed — the baseline rule). The platform SES / own-domain modes are NO
+  LONGER OFFERED (POST /connections/email refuses); rows provisioned before the
+  removal keep serving as a legacy read/serve path (GET/email reverify/SES
+  inbound/outbound SES branch all retained), and their owners upgrade via the
+  staged mailbox swap.
 - One Meta connection serves WhatsApp and Messenger; Instagram is a separate
   Business Login connection. The wire/config enums carry SEPARATE `whatsapp`,
   `messenger`, and `instagram` channel ids (§3.1.2); the legacy combined

@@ -15,8 +15,10 @@ import pytest
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
 
-async def _ready_account_with_luciel(client) -> None:
+async def _ready_account_with_luciel(client) -> uuid.UUID:
     from app.auth import access
+    from app.auth.tokens import decode_token
+    from app.config import get_settings
 
     email = f"conn-{uuid.uuid4().hex[:8]}@x.com"
     await client.post(
@@ -28,6 +30,31 @@ async def _ready_account_with_luciel(client) -> None:
     await client.post(
         "/api/v1/admin/luciel", json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"}
     )
+    return uuid.UUID(decode_token(client.cookies.get(get_settings().session_cookie_name))["sub"])
+
+
+async def _seed_platform_email(admin_id: uuid.UUID, *, mode: str, address: str | None = None):
+    """Seed a LEGACY platform email row via the service layer (c22): the route no
+    longer offers platform modes, but existing rows keep serving and their wire
+    shapes stay pinned here."""
+    from app.connections import service as conn_service
+    from app.db.session import tenant_session
+    from app.models.instance import Instance
+    from sqlalchemy import select as _select
+
+    async with tenant_session(admin_id) as s:
+        iid = (
+            await s.execute(_select(Instance.id).where(Instance.admin_id == admin_id))
+        ).scalar_one()
+        return await conn_service.provision_email(
+            s,
+            admin_id=admin_id,
+            instance_id=iid,
+            mode=mode,
+            email_address=address,
+            instance_name="L",
+            user_id=None,
+        )
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -114,12 +141,8 @@ async def test_email_sender_overview_row_shows_amazon_ses_not_raw_code(client):
     else to render. Provisioning the platform email sender (provider "ses") must
     now come back with displayName "Amazon SES" so Overview never has to
     improvise a label from the raw code again."""
-    await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/connections/email",
-        json={"mode": "vm_subdomain"},
-    )
-    assert r.status_code == 200
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="vm_subdomain")
 
     rows = (await client.get("/api/v1/admin/connections")).json()
     row = next(x for x in rows if x["connectionType"] == "email_sender")
@@ -408,47 +431,55 @@ async def test_email_provisioning_absent_before_configured(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_own_domain_provisioning_is_pending_with_dns(client):
+async def test_platform_email_provisioning_is_refused(client):
+    """c22 (owner decision 2026-08-18): email is BYO-mailbox ONLY. Both platform
+    modes answer an actionable refusal, never a new platform address."""
     await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/connections/email",
-        json={"mode": "own_domain", "emailAddress": "hello@acme.com"},
-    )
-    assert r.status_code == 200
-    body = r.json()
+    for payload in (
+        {"mode": "own_domain", "emailAddress": "hello@acme.com"},
+        {"mode": "vm_subdomain"},
+    ):
+        r = await client.post("/api/v1/admin/connections/email", json=payload)
+        assert r.status_code == 422
+        assert "connect your own" in r.json()["message"].lower()
+    # Nothing was written.
+    g = await client.get("/api/v1/admin/connections/email")
+    assert g.json() is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_legacy_own_domain_row_still_serves_pending_with_dns(client):
+    """Existing own_domain tenants keep their wire shape: pending_email_routing
+    plus the DNS records that complete inbound routing."""
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="own_domain", address="hello@acme.com")
+    body = (await client.get("/api/v1/admin/connections/email")).json()
     assert set(body.keys()) <= _EMAIL_ALLOWED_KEYS
     assert body["mode"] == "own_domain"
     assert body["emailAddress"] == "hello@acme.com"
     assert body["status"] == "pending_email_routing"
-    # Own-domain requires walked-through DNS records to complete inbound routing.
     assert body["dnsRecords"] and len(body["dnsRecords"]) >= 1
     rec = body["dnsRecords"][0]
     assert set(rec.keys()) <= {"type", "host", "value", "priority"}
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_vm_subdomain_provisioning_is_connected(client):
-    await _ready_account_with_luciel(client)
-    r = await client.post("/api/v1/admin/connections/email", json={"mode": "vm_subdomain"})
-    assert r.status_code == 200
-    body = r.json()
+async def test_legacy_vm_subdomain_row_still_serves_connected(client):
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="vm_subdomain")
+    body = (await client.get("/api/v1/admin/connections/email")).json()
     assert body["mode"] == "vm_subdomain"
     assert body["status"] == "connected"
     assert "@" in body["emailAddress"]
-    # Subdomain mode skips DNS entirely.
+    # Subdomain mode never had DNS records.
     assert body.get("dnsRecords") in (None, [])
-    # GET reflects the provisioned identity.
-    g = await client.get("/api/v1/admin/connections/email")
-    assert g.json()["emailAddress"] == body["emailAddress"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_email_provisioning_never_leaks_secret_fields(client):
-    await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/connections/email",
-        json={"mode": "own_domain", "emailAddress": "hi@acme.com"},
-    )
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="own_domain", address="hi@acme.com")
+    r = await client.get("/api/v1/admin/connections/email")
     body = r.json()
     assert set(body.keys()) <= _EMAIL_ALLOWED_KEYS, f"unexpected: {set(body) - _EMAIL_ALLOWED_KEYS}"
     raw = r.text.lower()
@@ -517,13 +548,11 @@ async def test_own_domain_reverify_closes_the_pending_dead_end(client):
     responds 200, and -- honestly, since mock mode's MX probe never reports a domain
     as delegated -- repeatably reports the same non-live state rather than silently
     flipping to connected on a click."""
-    await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/connections/email",
-        json={"mode": "own_domain", "emailAddress": "hello@acme.com"},
-    )
-    assert r.status_code == 200
-    assert r.json()["status"] == "pending_email_routing"
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="own_domain", address="hello@acme.com")
+    assert (await client.get("/api/v1/admin/connections/email")).json()[
+        "status"
+    ] == "pending_email_routing"
 
     rv = await client.post("/api/v1/admin/connections/email/reverify")
     assert rv.status_code == 200
@@ -543,13 +572,9 @@ async def test_own_domain_reverify_closes_the_pending_dead_end(client):
 async def test_vm_subdomain_reverify_is_a_harmless_noop(client):
     """vm_subdomain is already connected with no DNS step -- re-verify must not error
     or regress its status."""
-    await _ready_account_with_luciel(client)
-    r = await client.post(
-        "/api/v1/admin/connections/email",
-        json={"mode": "vm_subdomain"},
-    )
-    assert r.status_code == 200
-    assert r.json()["status"] == "connected"
+    admin_id = await _ready_account_with_luciel(client)
+    await _seed_platform_email(admin_id, mode="vm_subdomain")
+    assert (await client.get("/api/v1/admin/connections/email")).json()["status"] == "connected"
 
     rv = await client.post("/api/v1/admin/connections/email/reverify")
     assert rv.status_code == 200

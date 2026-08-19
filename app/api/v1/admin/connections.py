@@ -152,7 +152,11 @@ def _email_provisioning_out(c: InstanceConnection) -> EmailProvisioningOut:
     # DNS records are derived (own_domain only). No secret_ref, no auth_class.
     cfg = c.non_secret_config or {}
     address = str(cfg.get("address", ""))
-    mode = str(cfg.get("mode", "vm_subdomain"))
+    # Mode-less rows (e.g. an outlook row after disconnect stripped its keys) used
+    # to default to "vm_subdomain" — a retired platform mode. An outlook row IS a
+    # mailbox; anything else legacy defaults to the subdomain it predates (c22).
+    fallback = "byo_mailbox" if c.provider == "outlook" else "vm_subdomain"
+    mode = str(cfg.get("mode", fallback))
     dns = service.dns_records_for(address) if mode == "own_domain" else None
     return EmailProvisioningOut.model_validate(
         {"mode": mode, "emailAddress": address, "status": c.status, "dnsRecords": dns}
@@ -183,21 +187,23 @@ async def get_email_provisioning(
 async def provision_email(
     req: ProvisionEmailRequest, subject: Subject = Depends(current_admin)
 ) -> EmailProvisioningOut:
-    async with tenant_session(subject.admin_id) as s:
-        inst = await _instance_row(s, subject.admin_id)
-        try:
-            conn = await service.provision_email(
-                s,
-                admin_id=subject.admin_id,
-                instance_id=inst.id,
-                mode=req.mode,
-                email_address=req.email_address,
-                instance_name=inst.name,
-                user_id=subject.user_id,
-            )
-        except service.EmailAddressTaken as exc:
-            raise conflict(str(exc)) from exc
-        return _email_provisioning_out(conn)
+    """REFUSED (owner decision 2026-08-18): email is BYO-mailbox ONLY.
+
+    The two platform modes (own_domain's DNS walk, the @vantagemind.ai subdomain
+    address) are no longer offered — "the other methods seem like a chore." The
+    route stays registered so a stale client gets a clean, actionable answer
+    instead of a 404. Existing platform rows keep serving (GET /email, the
+    reverify route, SES inbound, and the outbound SES branch are all retained as
+    the legacy read/serve path); their owners switch by connecting a mailbox —
+    already a staged swap that atomically releases the platform address.
+    ``service.provision_email`` is kept for the legacy-row test fixtures.
+    """
+    del req  # the request shape is still validated; every mode is refused
+    del subject
+    raise validation_error(
+        "Platform email addresses are no longer offered — connect your own "
+        "mailbox instead (Configure → Channels → Email → Connect Outlook mailbox)."
+    )
 
 
 @router.post("", response_model=StartConnectionResult)

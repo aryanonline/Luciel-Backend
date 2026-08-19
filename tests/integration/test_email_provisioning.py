@@ -6,6 +6,11 @@ own_domain — stores the admin-supplied address; status is pending_email_routin
 vm_subdomain — derives a zero-DNS address; immediately connected and usable.
 
 The address is non-secret config (§3.8.3): no secret material is written on this path.
+
+LEGACY posture (c22, owner decision 2026-08-18): email is BYO-mailbox only and
+the provisioning ROUTE refuses both platform modes. The service function stays —
+rows provisioned before the removal keep serving — and these tests pin exactly
+those legacy-row semantics (they seed via the service, never the route).
 """
 
 from __future__ import annotations
