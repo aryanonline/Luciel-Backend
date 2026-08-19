@@ -77,3 +77,25 @@ async def owner_of_destination(
         return (await resolve_destination(session, connection_type, destination)).admin_id
     except InboundRejected:
         return None
+
+
+async def lock_destination_claim(session: AsyncSession, destination: str) -> None:
+    """Serialize destination CLAIMS on this destination for the current transaction.
+
+    The claim gates are check-then-write: two concurrent claims for the same
+    destination in different tenants could both see ``owner_of_destination() is
+    None`` and both bind (TOCTOU). A transaction-scoped advisory lock around
+    check+write closes it: the loser BLOCKS (unlike the sweeps' ``try`` variant —
+    here the loser has something to wait for: the winner's commit, after which the
+    re-check answers the honest 409). Keys are two int4s derived in Python (the
+    sweeps' idiom, db/session.py: ``hashtext`` is not stable across PG versions).
+    Postgres releases the lock on commit OR rollback, so a failed claim can never
+    wedge the destination.
+    """
+    import zlib  # noqa: PLC0415
+
+    k1 = zlib.crc32(b"dest_claim") - 2**31
+    k2 = zlib.crc32(destination.strip().lower().encode()) - 2**31
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": k1, "k2": k2}
+    )

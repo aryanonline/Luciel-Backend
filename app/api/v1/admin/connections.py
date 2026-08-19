@@ -221,8 +221,45 @@ async def start_connection(
         except service.ProviderNotRegistered as exc:
             raise validation_error(str(exc)) from exc
         except NumberAlreadyClaimed as exc:
+            # c21 (409 oracle): the refusal is audited under the CLAIMANT in its
+            # own transaction (this one is about to roll back), and repeated
+            # conflicts are rate-limited — otherwise the 409 is an enumeration
+            # oracle for which numbers are claimed. The pipeline abuse-block
+            # (pipeline.py) is the precedent for the separate-session audit.
+            await _record_claim_rejection(subject.admin_id, req.phone_number or "")
+            from app.channels import rate_limit  # noqa: PLC0415
+
+            decision = rate_limit.get_store().check_source(
+                "destination_claim", str(subject.admin_id)
+            )
+            if not decision.allowed:
+                from app.api.errors import rate_limited  # noqa: PLC0415
+
+                raise rate_limited(
+                    "Too many attempts to connect numbers that belong to other "
+                    "accounts. Please wait a minute before trying again.",
+                    retry_after_seconds=60,
+                ) from exc
             raise conflict(str(exc)) from exc
         return StartConnectionResult.model_validate(result)
+
+
+async def _record_claim_rejection(admin_id: uuid.UUID, number: str) -> None:
+    """Audit a refused destination claim in its OWN transaction (the request's is
+    rolling back with the 409). No holder information and no full number in the
+    payload — the event records THAT this admin was refused, not whose number it is."""
+    async with tenant_session(admin_id) as s:
+        instance_id = (
+            await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
+        ).scalar_one_or_none()
+        await audit.emit(
+            s,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="destination_claim_rejected",
+            payload={"connection_type": "sms_sender", "number_suffix": number[-4:]},
+        )
 
 
 @router.post("/{connection_id}/credentials", response_model=ConnectionOut)
@@ -281,11 +318,17 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
     only on a confirmed live result; a still-non-operable number stays in the honest
     ``not_operable_hosting_required`` state. Reads the current number live, so a
     swapped-in number is what gets checked."""
-    from app.channels.phone_lifecycle import reverify_sms_number as _reverify
+    from app.channels.phone_lifecycle import NumberAlreadyClaimed as _Claimed  # noqa: PLC0415
+    from app.channels.phone_lifecycle import reverify_sms_number as _reverify  # noqa: PLC0415
 
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
-        conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
+        try:
+            conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
+        except _Claimed as exc:
+            # c21: promoting a pending number is a claim point — another tenant may
+            # have claimed it while this one was still hosting/registering.
+            raise conflict(str(exc)) from exc
         if conn is None:
             raise not_found("No SMS number attached to re-verify.")
         return _connection_out(conn)
@@ -699,6 +742,7 @@ async def complete_oauth_connect(
             # foreign claims from an ordinary query (routing.owner_of_destination).
             destination = str(verify_updates.get("destination", ""))
             if destination:
+                await routing.lock_destination_claim(s, destination)  # c21 TOCTOU guard
                 holder = await routing.owner_of_destination(s, connection_type, destination)
                 if holder is not None and holder != admin_id:
                     conflict_reason = f"{destination} is already connected to a different account"
@@ -871,6 +915,7 @@ async def bind_destination(
                 f"{'Instagram' if req.channel == 'instagram' else 'Meta'} connection."
             )
         instance_id = await _instance_id(s, subject.admin_id)
+        await routing.lock_destination_claim(s, req.destination)  # c21 TOCTOU guard
         owner = await routing.owner_of_destination(s, conn.connection_type, req.destination)
         if owner is not None and owner != subject.admin_id:
             raise conflict(

@@ -43,6 +43,11 @@ LIMITS: dict[str, ChannelLimits] = {
     # limits are an order of magnitude tighter — a human sends one enquiry, not five a
     # minute, and there is no tenant behind it to absorb the abuse.
     "contact": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
+    # Destination-claim CONFLICTS (c21, not conversational): repeated 409s on the
+    # number-designate route are an enumeration oracle for which numbers are
+    # claimed. Keyed per admin; contact-form-tight because a legitimate owner
+    # hits this at most once or twice by accident.
+    "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
 }
 
 # Per-tenant cross-channel inbound ceiling (messages/minute) — denial-of-wallet backstop.

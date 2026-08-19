@@ -621,3 +621,78 @@ async def test_sms_attach_of_a_foreign_held_number_is_409(client):
     # The refusal wrote nothing: this account still has no sms_sender row.
     g = await client.get("/api/v1/admin/connections")
     assert not [c for c in g.json() if c["connectionType"] == "sms_sender"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_repeated_foreign_claims_are_audited_and_rate_limited(client):
+    """c21 (409 oracle): every refused claim writes a destination_claim_rejected
+    audit row under the CLAIMANT (in its own transaction — the 409 rolls the
+    request's back), and repeated conflicts answer 429 instead of continuing to
+    enumerate which numbers are taken."""
+    from app.channels.number_operability import NullOperabilityProbe
+    from app.channels.phone_lifecycle import attach_sms_number
+    from app.db.session import tenant_session
+    from app.models.audit import AdminAuditLog
+    from app.models.instance import Account, AccountState, Instance, LucielState
+
+    number = "+16045550171"
+    holder = uuid.uuid4()
+    holder_iid = uuid.uuid4()
+    async with tenant_session(holder) as s:
+        s.add(
+            Account(
+                id=holder,
+                admin_id=holder,
+                user_id=holder,
+                email=f"{holder.hex[:8]}@x.com",
+                email_lower=f"{holder.hex[:8]}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        s.add(
+            Instance(
+                id=holder_iid,
+                admin_id=holder,
+                name="Holder Co",
+                state=LucielState.active,
+                embed_key_public_id=f"vm_live_{holder.hex[:8]}",
+                channels=[],
+                tools=[],
+                escalation={},
+                personality={},
+            )
+        )
+        await s.flush()
+        await attach_sms_number(
+            s,
+            admin_id=holder,
+            instance_id=holder_iid,
+            e164_number=number,
+            probe=NullOperabilityProbe(operable_numbers={number}),
+        )
+
+    await _ready_account_with_luciel(client)
+    payload = {"connectionType": "sms_sender", "provider": "twilio", "phoneNumber": number}
+    statuses = []
+    for _ in range(5):
+        r = await client.post("/api/v1/admin/connections", json=payload)
+        statuses.append(r.status_code)
+    assert statuses[0] == 409
+    assert 429 in statuses  # the oracle closes after the burst
+    # Every refusal was audited under the claimant, despite the rolled-back 409s.
+    from sqlalchemy import func, select
+
+    async with tenant_session(holder) as s:
+        held_audits = (
+            await s.execute(
+                select(func.count())
+                .select_from(AdminAuditLog)
+                .where(
+                    AdminAuditLog.admin_id == holder,
+                    AdminAuditLog.event_type == "destination_claim_rejected",
+                )
+            )
+        ).scalar_one()
+    assert int(held_audits) == 0  # never recorded under the HOLDER (victim)

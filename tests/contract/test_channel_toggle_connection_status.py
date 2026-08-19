@@ -36,6 +36,15 @@ pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 NUMBER = "+14155550188"
 
 
+def _number_on_file(conn) -> str | None:
+    """The owner's number survives toggles wherever it lives: as the routable
+    claim (destination) or, in mock mode where the operability probe never
+    confirms, parked under pending_destination (c21 anti-squatting)."""
+    cfg = conn.non_secret_config or {}
+    return cfg.get("destination") or cfg.get("pending_destination")
+
+
+
 async def _signup_verify_login(client) -> uuid.UUID:
     from app.auth import access
     from app.auth.tokens import decode_token
@@ -114,7 +123,7 @@ async def test_sms_disable_enable_round_trip_preserves_connection_and_number(cli
 
     conn_before = await _connection_row(admin_id, instance_id, "sms_sender")
     assert conn_before is not None
-    assert conn_before.non_secret_config["destination"] == NUMBER
+    assert _number_on_file(conn_before) == NUMBER
     connection_id_before = conn_before.connection_id
     status_before = conn_before.status
 
@@ -137,7 +146,7 @@ async def test_sms_disable_enable_round_trip_preserves_connection_and_number(cli
     conn_after_off = await _connection_row(admin_id, instance_id, "sms_sender")
     assert conn_after_off.connection_id == connection_id_before
     assert conn_after_off.status == status_before
-    assert conn_after_off.non_secret_config["destination"] == NUMBER
+    assert _number_on_file(conn_after_off) == NUMBER
 
     # Re-enable: must restore SILENTLY — no "add your number" state, connection intact.
     on_channels = _toggle(off_channels, "sms", enabled=True)
@@ -151,7 +160,7 @@ async def test_sms_disable_enable_round_trip_preserves_connection_and_number(cli
     conn_after_on = await _connection_row(admin_id, instance_id, "sms_sender")
     assert conn_after_on.connection_id == connection_id_before
     assert conn_after_on.status == status_before
-    assert conn_after_on.non_secret_config["destination"] == NUMBER
+    assert _number_on_file(conn_after_on) == NUMBER
 
     # A GET after the round trip must agree with the PUT response (single source of truth).
     g_final = await client.get("/api/v1/admin/luciel")

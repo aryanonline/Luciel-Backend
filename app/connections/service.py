@@ -323,6 +323,9 @@ async def submit_credentials(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.connection_id == connection_id,
+                # c21: a revoked row cannot re-enter service through this flow;
+                # lifecycle.restore is the only legitimate un-revoke.
+                InstanceConnection.status != "revoked",
             )
         )
     ).scalar_one_or_none()
@@ -371,14 +374,24 @@ async def submit_credentials(
     connection.non_secret_config = {**(connection.non_secret_config or {}), **non_secret}
 
     # A BYO SMS account with no designated number cannot send, so it must not claim to be
-    # connected — the channel row shows "add your number" instead (§3.1.4).
-    needs_number = connection.connection_type == "sms_sender" and not (
-        connection.non_secret_config or {}
-    ).get("destination")
+    # connected — the channel row shows "add your number" instead (§3.1.4). A number
+    # awaiting its operability confirmation (``pending_destination``, c21) keeps its
+    # honest not-operable status: credentials alone neither claim the number nor
+    # erase the "host it, then re-verify" guidance.
+    cfg_now = connection.non_secret_config or {}
+    is_sms = connection.connection_type == "sms_sender"
+    needs_number = is_sms and not cfg_now.get("destination") and not cfg_now.get(
+        "pending_destination"
+    )
+    number_pending = is_sms and not cfg_now.get("destination") and cfg_now.get(
+        "pending_destination"
+    )
     old_status = connection.status
     if needs_number:
         connection.status = "unconfigured"
         connection.status_detail = _SMS_NEEDS_NUMBER
+    elif number_pending:
+        pass  # keep the not-operable status + guidance the attach wrote
     else:
         connection.status = "connected"
         connection.status_detail = None
@@ -443,6 +456,9 @@ async def reconnect(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.connection_id == connection_id,
+                # c21: a revoked row cannot re-enter service through this flow;
+                # lifecycle.restore is the only legitimate un-revoke.
+                InstanceConnection.status != "revoked",
             )
         )
     ).scalar_one_or_none()
@@ -504,6 +520,9 @@ async def swap(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.connection_id == connection_id,
+                # c21: a revoked row cannot re-enter service through this flow;
+                # lifecycle.restore is the only legitimate un-revoke.
+                InstanceConnection.status != "revoked",
             )
         )
     ).scalar_one_or_none()
@@ -572,6 +591,9 @@ async def confirm_reconnect(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.connection_id == connection_id,
+                # c21: a revoked row cannot re-enter service through this flow;
+                # lifecycle.restore is the only legitimate un-revoke.
+                InstanceConnection.status != "revoked",
             )
         )
     ).scalar_one_or_none()
@@ -1119,6 +1141,7 @@ async def provision_email(
     # resolver delivery uses (RLS hides foreign claims from an ordinary query).
     from app.channels import routing  # noqa: PLC0415 — avoid import cycle at module load
 
+    await routing.lock_destination_claim(session, address)  # c21 TOCTOU guard
     holder = await routing.owner_of_destination(session, "email_sender", address)
     if holder is not None and holder != admin_id:
         raise EmailAddressTaken(address)

@@ -83,6 +83,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # failed = it could not, and the manual guidance was surfaced instead.
         "webhook_autoconfig_applied",
         "webhook_autoconfig_failed",
+        # c21: an attempt to claim a destination another tenant holds was refused.
+        # Recorded under the CLAIMANT (never the holder — an attacker must not be
+        # able to spam a victim's audit chain), in its own transaction because the
+        # 409 rolls the request's transaction back.
+        "destination_claim_rejected",
         "lead_pruned",
         "lead_archived",
         "lead_reactivated",

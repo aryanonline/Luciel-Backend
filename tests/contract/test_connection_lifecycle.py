@@ -350,7 +350,11 @@ async def test_disconnect_keeps_non_secret_operational_config(client):
 
     r = await client.post(f"/api/v1/admin/connections/{sms['connectionId']}/disconnect")
     assert r.status_code == 200
-    assert r.json()["connection"]["nonSecretConfig"]["destination"] == "+14155550111"
+    cfg = r.json()["connection"]["nonSecretConfig"]
+    # In mock mode the operability probe never confirms, so the number sits under
+    # pending_destination (c21 anti-squatting: only a CONFIRMED-operable number is
+    # the routable claim). Either way, disconnect keeps the owner's number on file.
+    assert (cfg.get("destination") or cfg.get("pending_destination")) == "+14155550111"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

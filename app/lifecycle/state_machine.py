@@ -181,11 +181,46 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
         .scalars()
         .all()
     )
+    # c21 hardening — restore is the ONE legitimate un-revoke, and un-revoking a row
+    # re-arms its destination claim in the inbound resolver. Two guards:
+    #   1. Another tenant may have LEGITIMATELY claimed the destination during the
+    #      30-day grace (the number/address was released the moment this tenant's
+    #      rows went revoked). Restoring the claim would capture their inbound —
+    #      so a foreign-held destination is STRIPPED and the row comes back
+    #      unconfigured with an honest detail, never silently re-routed.
+    #   2. If this tenant re-attached the same connection TYPE during grace (a new
+    #      non-revoked row exists), un-revoking the old row would violate the
+    #      single-active-per-type unique index — the superseded row stays revoked.
+    from app.channels import routing  # noqa: PLC0415 — circular at module import
+
+    active_types = {c.connection_type for c in conns if c.status != "revoked"}
     for c in conns:
+        if c.status != "revoked":
+            continue
+        if c.connection_type in active_types:
+            continue  # superseded during grace; the newer row is the live one
+        cfg = dict(c.non_secret_config or {})
+        destinations = [d for d in [cfg.get("destination")] if isinstance(d, str) and d]
+        dest_map = cfg.get("destinations")
+        if isinstance(dest_map, dict):
+            destinations += [v for v in dest_map.values() if isinstance(v, str) and v]
+        lost = False
+        for dest in destinations:
+            holder = await routing.owner_of_destination(session, c.connection_type, dest)
+            if holder is not None and holder != admin_id:
+                lost = True
+                break
+        if lost:
+            for key in ("destination", "destinations", "address", "mode"):
+                cfg.pop(key, None)
+            c.non_secret_config = cfg
+            c.status_detail = (
+                "While this Luciel was deleted, this number or address was connected "
+                "to a different account — designate a new one to bring the channel back."
+            )
         # Pre-delete connections were revoked; restore to 'unconfigured' so the
         # health worker / reconnect path re-establishes them (never silently 'connected').
-        if c.status == "revoked":
-            c.status = "unconfigured"
+        c.status = "unconfigured"
     sources = (
         (await session.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)))
         .scalars()

@@ -37,6 +37,16 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
   to manual guidance (appended to status_detail + audited) — a configuration failure
   must never fail the attach or the credential submit. Silent no-op when
   public_api_base_url is unset (mock/CI).
+- Destination-claim hardening (c21): every claim point (attach, pending→destination
+  promotion on re-verify, email provision, OAuth mailbox bind, Meta bind) runs
+  `routing.lock_destination_claim` (blocking per-destination advisory lock) around
+  the ownership check; only a CONFIRMED-operable number becomes the routable
+  `destination` (a failed probe parks it under `pending_destination` — no
+  squatting); the 0045 partial unique index makes duplicate live sms claims
+  structurally impossible; claim refusals audit `destination_claim_rejected`
+  under the claimant + rate-limit (`destination_claim` bucket) against
+  enumeration. Revoked rows cannot re-enter service outside `lifecycle.restore`,
+  which strips destinations another tenant claimed during grace.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

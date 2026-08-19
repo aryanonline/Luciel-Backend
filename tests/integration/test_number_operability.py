@@ -159,6 +159,10 @@ async def test_reverify_transitions_only_on_confirmed_operable():
             s, admin_id=admin, instance_id=iid, probe=NullOperabilityProbe(operable_numbers={NUM_A})
         )
         assert c is not None and c.status == STATUS_PENDING_REGISTRATION
+        # c21: the confirmed-operable re-verify PROMOTED the pending number to the
+        # routable claim.
+        assert c.non_secret_config["destination"] == NUM_A
+        assert "pending_destination" not in c.non_secret_config
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -186,7 +190,10 @@ async def test_reverify_reads_current_number_after_swap():
             probe=NullOperabilityProbe(operable_numbers={NUM_A}),  # only A operable, not B
         )
         assert b.connection_id == a.connection_id  # same row (retained)
-        assert b.non_secret_config["destination"] == NUM_B  # number changed
+        # c21 anti-squatting: a NOT-operable number is never the routable claim —
+        # it waits under pending_destination, and the old claim on A is released.
+        assert b.non_secret_config.get("destination") is None
+        assert b.non_secret_config["pending_destination"] == NUM_B
         assert b.status == STATUS_NOT_OPERABLE  # re-derived from scratch for B
         # Re-verify reads the CURRENT number (B); with only A operable, B stays non-live.
         c = await reverify_sms_number(
@@ -252,9 +259,11 @@ async def test_a_number_held_by_another_tenant_cannot_be_claimed():
 async def test_legacy_duplicate_claims_resolve_to_the_newest():
     """Rows claimed BEFORE the uniqueness gate existed can still collide. For those
     legacy duplicates ``channel_resolve_destination`` must be deterministic — the
-    newest claim wins (its tenant passed a real Twilio verify most recently) — not
-    an arbitrary ``LIMIT 1`` pick, which live-routed a tenant's voice calls to a
-    stale claimant on 2026-08-17."""
+    newest claim wins — not an arbitrary ``LIMIT 1`` pick, which live-routed a
+    tenant's voice calls to a stale claimant on 2026-08-17. Pinned on email_sender
+    rows since 0045: the partial unique index makes sms_sender duplicates
+    structurally impossible, while email_sender scalar duplicates remain possible
+    by design (a disconnected platform address keeps its claim)."""
     old_admin, new_admin = uuid.uuid4(), uuid.uuid4()
     old_iid = await _seed(old_admin)
     new_iid = await _seed(new_admin)
@@ -266,11 +275,11 @@ async def test_legacy_duplicate_claims_resolve_to_the_newest():
                 connection_id=uuid.uuid4(),
                 admin_id=old_admin,
                 instance_id=old_iid,
-                connection_type="sms_sender",
+                connection_type="email_sender",
                 auth_class="api_key",
-                provider="twilio",
+                provider="ses",
                 status="connected",
-                non_secret_config={"destination": NUM_A},
+                non_secret_config={"destination": "dup@reply.vantagemind.ai"},
                 created_at=datetime(2026, 7, 28, tzinfo=UTC),
             )
         )
@@ -281,11 +290,11 @@ async def test_legacy_duplicate_claims_resolve_to_the_newest():
                 connection_id=uuid.uuid4(),
                 admin_id=new_admin,
                 instance_id=new_iid,
-                connection_type="sms_sender",
+                connection_type="email_sender",
                 auth_class="api_key",
-                provider="twilio",
-                status="pending_carrier_registration",
-                non_secret_config={"destination": NUM_A},
+                provider="ses",
+                status="connected",
+                non_secret_config={"destination": "dup@reply.vantagemind.ai"},
                 created_at=datetime(2026, 8, 17, tzinfo=UTC),
             )
         )
@@ -295,9 +304,9 @@ async def test_legacy_duplicate_claims_resolve_to_the_newest():
             await s.execute(
                 text(
                     "SELECT admin_id, instance_id"
-                    " FROM channel_resolve_destination('sms_sender', :d)"
+                    " FROM channel_resolve_destination('email_sender', :d)"
                 ),
-                {"d": NUM_A},
+                {"d": "dup@reply.vantagemind.ai"},
             )
         ).one()
     assert row.admin_id == new_admin

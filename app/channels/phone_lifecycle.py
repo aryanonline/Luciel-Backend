@@ -151,6 +151,9 @@ async def attach_sms_number(
     # uses, because RLS hides foreign claims from an ordinary query.
     from app.channels import routing  # noqa: PLC0415 — circular at module import
 
+    # TOCTOU guard (c21): serialize concurrent claims on this number for the
+    # transaction, so two tenants racing the check below cannot both bind.
+    await routing.lock_destination_claim(session, number)
     holder = await routing.owner_of_destination(session, "sms_sender", number)
     if holder is not None and holder != admin_id:
         raise NumberAlreadyClaimed(number)
@@ -158,13 +161,27 @@ async def attach_sms_number(
     result = await probe.check(number)
     status, detail = _status_for(result)
 
+    # Anti-squatting (c21): the routable CLAIM (``destination``) is written only on
+    # a CONFIRMED-operable probe — a number the account cannot operate must not
+    # block the real owner's claim. A failed/unknown probe stores the number under
+    # ``pending_destination`` instead; a later confirmed re-verify PROMOTES it
+    # (re-running the ownership gate — promotion is a claim point too).
+    if result is OperabilityResult.OPERABLE:
+        cfg_update: dict[str, object] = {"destination": number}
+        cfg_pop = "pending_destination"
+    else:
+        cfg_update = {"pending_destination": number}
+        cfg_pop = "destination"
+
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is not None:
         existing.provider = "twilio"
         existing.auth_class = "api_key"
         # Merge, don't replace: the BYO Twilio account id (§3.1.4) also lives here, and
         # designating a number must not silently unbind the account it belongs to.
-        existing.non_secret_config = {**(existing.non_secret_config or {}), "destination": number}
+        merged = {**(existing.non_secret_config or {}), **cfg_update}
+        merged.pop(cfg_pop, None)
+        existing.non_secret_config = merged
         existing.status = status
         existing.status_detail = detail
         conn = existing
@@ -177,7 +194,7 @@ async def attach_sms_number(
             auth_class="api_key",
             provider="twilio",
             status=status,
-            non_secret_config={"destination": number},
+            non_secret_config=dict(cfg_update),
             status_detail=detail,
         )
         session.add(conn)
@@ -280,13 +297,31 @@ async def reverify_sms_number(
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is None:
         return None
-    destination = (existing.non_secret_config or {}).get("destination")
+    cfg = existing.non_secret_config or {}
+    destination = cfg.get("destination") or cfg.get("pending_destination")
     if not destination:
         return None
 
     probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(str(destination))
     status, detail = _status_for(result)
+
+    # Promotion (c21 anti-squatting): a pending number that just probed OPERABLE
+    # becomes the routable claim — a NEW claim point, so it re-runs the ownership
+    # gate under the same per-destination advisory lock as attach. A failed probe
+    # never strips an EXISTING claim (a transient Twilio outage must not de-route
+    # a working number); it only keeps a pending number pending.
+    if result is OperabilityResult.OPERABLE and not cfg.get("destination"):
+        from app.channels import routing  # noqa: PLC0415 — circular at module import
+
+        await routing.lock_destination_claim(session, str(destination))
+        holder = await routing.owner_of_destination(session, "sms_sender", str(destination))
+        if holder is not None and holder != admin_id:
+            raise NumberAlreadyClaimed(str(destination))
+        merged = {**cfg, "destination": destination}
+        merged.pop("pending_destination", None)
+        existing.non_secret_config = merged
+
     existing.status = status
     existing.status_detail = detail
     await session.flush()
