@@ -20,9 +20,10 @@ The platform's own Twilio survives only as the dev/mock fallback in
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.channels.twilio_sender import NullSmsSender, SmsSenderProtocol, TwilioSmsSender
 from app.connections.secrets import SecretStore, get_secret_store
 from app.models.connection import InstanceConnection
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from app.channels.number_operability import NumberOperabilityProbe
@@ -239,4 +242,125 @@ async def build_tenant_sms_sender(
         api_key_sid=creds.api_key_sid,
         api_key_secret=creds.api_key_secret,
         auth_token=creds.auth_token,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Webhook auto-configuration (c20, live-caught 2026-08-18)
+# --------------------------------------------------------------------------- #
+# Nothing in the product ever configured the designated number's webhooks — no
+# code and no copy. A number only answered if someone pointed its Voice/SMS URLs
+# at the platform by hand in the Twilio Console, and a number CHANGE silently
+# killed both channels. The customer's stored credentials authenticate the
+# IncomingPhoneNumbers update, so the platform now points the webhooks itself at
+# designate time (disclosed in UI copy). This is webhook ROUTING on the number
+# the customer designated — the platform still never provisions numbers and
+# never performs carrier registration.
+
+
+@dataclass(frozen=True)
+class WebhookUrls:
+    voice_url: str
+    sms_url: str
+    status_callback_url: str
+
+
+def build_webhook_urls(public_api_base_url: str) -> WebhookUrls | None:
+    """The three webhook endpoints, absolute against the public API origin."""
+    base = (public_api_base_url or "").rstrip("/")
+    if not base:
+        return None
+    return WebhookUrls(
+        voice_url=f"{base}/api/v1/webhooks/twilio/voice",
+        sms_url=f"{base}/api/v1/webhooks/twilio/sms",
+        status_callback_url=f"{base}/api/v1/webhooks/twilio/voice/status",
+    )
+
+
+class TwilioWebhookConfigurator(Protocol):
+    """Points a number's Voice/SMS/StatusCallback webhooks at the platform."""
+
+    async def configure(self, e164_number: str, urls: WebhookUrls) -> bool:
+        """True on success; False (never raise) when the number could not be
+        configured — the caller degrades to manual guidance."""
+        ...
+
+
+class NullWebhookConfigurator:
+    """Mock/CI and not-configured environments: configures nothing, reports it."""
+
+    async def configure(self, e164_number: str, urls: WebhookUrls) -> bool:
+        return False
+
+
+class TwilioApiWebhookConfigurator:
+    """The real thing: find the number in the TENANT's account, update its URLs."""
+
+    def __init__(
+        self,
+        *,
+        account_sid: str,
+        auth_token: str | None,
+        api_key_sid: str | None,
+        api_key_secret: str | None,
+    ) -> None:
+        self._account_sid = account_sid
+        self._auth_token = auth_token
+        self._api_key_sid = api_key_sid
+        self._api_key_secret = api_key_secret
+
+    def _client(self) -> Any:  # pragma: no cover - thin SDK construction
+        from twilio.rest import Client
+
+        if self._api_key_sid and self._api_key_secret:
+            return Client(self._api_key_sid, self._api_key_secret, self._account_sid)
+        return Client(self._account_sid, self._auth_token)
+
+    async def configure(self, e164_number: str, urls: WebhookUrls) -> bool:
+        import asyncio  # noqa: PLC0415
+
+        def _do() -> bool:
+            client = self._client()
+            numbers = client.incoming_phone_numbers.list(phone_number=e164_number, limit=1)
+            if not numbers:
+                return False
+            numbers[0].update(
+                voice_url=urls.voice_url,
+                sms_url=urls.sms_url,
+                status_callback=urls.status_callback_url,
+            )
+            return True
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as exc:  # noqa: BLE001 — ANY failure degrades to manual guidance
+            logger.warning("twilio_webhook_autoconfig_error error=%s", type(exc).__name__)
+            return False
+
+
+async def build_tenant_webhook_configurator(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+) -> TwilioWebhookConfigurator:
+    """The configurator for this tenant's account, or the honest Null.
+
+    Real only when ALL THREE hold: live mode, usable stored credentials, and a
+    configured public API origin (settings.public_api_base_url — without it there
+    is no URL to point anything at)."""
+    from app.config import get_settings
+
+    settings = get_settings()
+    if settings.integration_mode != "live" or not settings.public_api_base_url:
+        return NullWebhookConfigurator()
+    creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
+    if creds is None or not creds.usable:
+        return NullWebhookConfigurator()
+    return TwilioApiWebhookConfigurator(
+        account_sid=creds.account_sid,
+        auth_token=creds.auth_token,
+        api_key_sid=creds.api_key_sid,
+        api_key_secret=creds.api_key_secret,
     )

@@ -31,6 +31,12 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
 - THE BASELINE RULE (`mailbox_poll.py`): the first poll after a mailbox connects
   drains the entire delta chain WITHOUT processing — the customer's historical inbox
   is never conversation backlog. Do not weaken this to satisfy a test.
+- Webhook auto-config (c20, `tenant_twilio.TwilioWebhookConfigurator` +
+  `phone_lifecycle.configure_number_webhooks`): points the designated number's
+  Voice/SMS/StatusCallback at the platform using the TENANT's credentials. Fail-open
+  to manual guidance (appended to status_detail + audited) — a configuration failure
+  must never fail the attach or the credential submit. Silent no-op when
+  public_api_base_url is unset (mock/CI).
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

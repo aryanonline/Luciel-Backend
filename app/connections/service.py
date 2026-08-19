@@ -384,6 +384,23 @@ async def submit_credentials(
         connection.status_detail = None
     await session.flush()
 
+    # Credentials-after-number order (c20): a destination already on file means the
+    # webhook auto-config that the designate path runs could not have had working
+    # credentials yet — run it now that it does. Best-effort, never blocks the
+    # credential submission (see configure_number_webhooks).
+    if connection.connection_type == "sms_sender":
+        destination = (connection.non_secret_config or {}).get("destination")
+        if isinstance(destination, str) and destination:
+            from app.channels.phone_lifecycle import configure_number_webhooks  # noqa: PLC0415
+
+            await configure_number_webhooks(
+                session,
+                admin_id=admin_id,
+                instance_id=connection.instance_id,
+                conn=connection,
+                e164_number=destination,
+            )
+
     await audit.emit(
         session,
         admin_id=admin_id,

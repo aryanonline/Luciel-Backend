@@ -78,6 +78,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "voice_consent_ack",
         # Per-call proof the mandatory recording/AI disclosure was played (§3.1.2).
         "voice_disclosure_played",
+        # c20 webhook auto-config on the designated number (customer's own creds):
+        # applied = the platform pointed Voice/SMS/StatusCallback at itself;
+        # failed = it could not, and the manual guidance was surfaced instead.
+        "webhook_autoconfig_applied",
+        "webhook_autoconfig_failed",
         "lead_pruned",
         "lead_archived",
         "lead_reactivated",

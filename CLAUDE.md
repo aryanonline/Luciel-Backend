@@ -112,7 +112,12 @@ modules rather than duplicating business rules in a new location.
 - The product is BYO: customers provide their accounts and assets. Store per-tenant
   external secrets in Secrets Manager under the `vm/` prefix.
 - SMS and voice use the customer’s own Twilio account and designated number. Luciel
-  neither pools/resells numbers nor performs the customer’s A2P registration.
+  neither pools/resells numbers nor performs the customer’s A2P registration. The
+  platform DOES configure webhook routing (Voice/SMS/StatusCallback URLs) on the
+  number the customer designated, using the customer’s own stored credentials,
+  disclosed in UI copy — best-effort (a failure surfaces manual guidance in
+  status_detail, never fails the attach; requires the platform secret’s
+  API_BASE_URL / settings.public_api_base_url).
 - Email is BYO-mailbox (§3.1.6a; Outlook first): the customer connects their own work
   mailbox under the existing `email_sender` type; replies go out AS that mailbox with
   no silent SES fallback, inbound arrives via the 5-minute `mailbox_poll` delta sweep

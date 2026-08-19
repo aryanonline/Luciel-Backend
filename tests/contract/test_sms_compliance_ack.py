@@ -120,3 +120,74 @@ async def test_reverify_without_an_attached_number_is_not_found(client):
     await _create(client)
     r = await client.post("/api/v1/admin/connections/sms/reverify")
     assert r.status_code == 404
+
+
+def _voice(response) -> dict:
+    return next(c for c in response.json()["channels"] if c["id"] == "voice")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_channels_put_cannot_erase_the_voice_consent_stamp(client):
+    """PUT /channels is a full replace; a client omitting voiceConsentAcknowledgedAt
+    silently ERASED the one-time recording/AI-disclosure consent record (latent,
+    live-caught 2026-08-18) — after which voice could never re-enable and the audit
+    trail of the acceptance was gone. The stamp is server-carried like the SMS ack."""
+    await _signup_verify_login(client)
+    await _create(client)
+
+    r0 = await client.post("/api/v1/admin/luciel/voice-consent")
+    assert r0.status_code == 200
+    stamp = _voice(r0).get("voiceConsentAcknowledgedAt")
+    assert stamp
+
+    # A channels write that OMITS the field (a client echoing a partial shape).
+    r1 = await client.put(
+        PATH,
+        json={
+            "channels": [
+                {"id": "widget", "enabled": True},
+                {"id": "voice", "enabled": True},
+            ]
+        },
+    )
+    assert r1.status_code == 200
+    assert _voice(r1).get("voiceConsentAcknowledgedAt") == stamp  # survived
+
+    # Voice can still be toggled (the consent record is intact).
+    r2 = await client.put(
+        PATH,
+        json={
+            "channels": [
+                {"id": "widget", "enabled": True},
+                {"id": "voice", "enabled": False},
+            ]
+        },
+    )
+    assert r2.status_code == 200
+    assert _voice(r2).get("voiceConsentAcknowledgedAt") == stamp
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_voice_consent_stamp_is_never_overwritten_once_set(client):
+    """The ack happened once; a client-supplied later value must not rewrite it."""
+    await _signup_verify_login(client)
+    await _create(client)
+
+    r0 = await client.post("/api/v1/admin/luciel/voice-consent")
+    stamp = _voice(r0)["voiceConsentAcknowledgedAt"]
+
+    r1 = await client.put(
+        PATH,
+        json={
+            "channels": [
+                {"id": "widget", "enabled": True},
+                {
+                    "id": "voice",
+                    "enabled": True,
+                    "voiceConsentAcknowledgedAt": "2030-01-01T00:00:00Z",
+                },
+            ]
+        },
+    )
+    assert r1.status_code == 200
+    assert _voice(r1)["voiceConsentAcknowledgedAt"] == stamp

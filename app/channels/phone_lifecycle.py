@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +49,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.channels.number_operability import NumberOperabilityProbe, OperabilityResult
 from app.channels.tenant_twilio import build_tenant_operability_probe
 from app.models.connection import InstanceConnection
+
+if TYPE_CHECKING:
+    from app.channels.tenant_twilio import TwilioWebhookConfigurator
 
 
 class NumberAlreadyClaimed(Exception):
@@ -129,6 +133,7 @@ async def attach_sms_number(
     instance_id: uuid.UUID,
     e164_number: str,
     probe: NumberOperabilityProbe | None = None,
+    webhook_config: TwilioWebhookConfigurator | None = None,
 ) -> InstanceConnection:
     """Attach (or change) the tenant's BYO SMS number, gated on live operability.
 
@@ -162,23 +167,100 @@ async def attach_sms_number(
         existing.non_secret_config = {**(existing.non_secret_config or {}), "destination": number}
         existing.status = status
         existing.status_detail = detail
-        await session.flush()
-        return existing
-
-    conn = InstanceConnection(
-        connection_id=uuid.uuid4(),
-        admin_id=admin_id,
-        instance_id=instance_id,
-        connection_type="sms_sender",
-        auth_class="api_key",
-        provider="twilio",
-        status=status,
-        non_secret_config={"destination": number},
-        status_detail=detail,
-    )
-    session.add(conn)
+        conn = existing
+    else:
+        conn = InstanceConnection(
+            connection_id=uuid.uuid4(),
+            admin_id=admin_id,
+            instance_id=instance_id,
+            connection_type="sms_sender",
+            auth_class="api_key",
+            provider="twilio",
+            status=status,
+            non_secret_config={"destination": number},
+            status_detail=detail,
+        )
+        session.add(conn)
     await session.flush()
+
+    # Webhook auto-configuration (c20, live-caught 2026-08-18: nothing — code or
+    # copy — ever pointed the number's webhooks at the platform, so a designated
+    # number answered nothing until someone edited the Twilio Console by hand, and
+    # a number CHANGE silently killed both channels). Best-effort AFTER the row is
+    # written: a configuration failure NEVER fails the attach — the honest degraded
+    # state is the manual guidance appended to status_detail. Only an OPERABLE
+    # number is configured (a number not in the account has nothing to configure).
+    if result is OperabilityResult.OPERABLE:
+        await configure_number_webhooks(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            conn=conn,
+            e164_number=number,
+            webhook_config=webhook_config,
+        )
     return conn
+
+
+async def configure_number_webhooks(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    conn: InstanceConnection,
+    e164_number: str,
+    webhook_config: TwilioWebhookConfigurator | None = None,
+) -> bool:
+    """Point the number's Voice/SMS/StatusCallback webhooks at the platform.
+
+    Shared by the designate path (attach_sms_number) and the credentials path
+    (submit_credentials, for the credentials-after-number order). Best-effort:
+    False appends manual guidance to ``status_detail`` and audits the failure —
+    never raises, never blocks the flow that called it."""
+    from app.audit import log as audit_log  # noqa: PLC0415
+    from app.channels.tenant_twilio import (  # noqa: PLC0415
+        build_tenant_webhook_configurator,
+        build_webhook_urls,
+    )
+    from app.config import get_settings  # noqa: PLC0415
+    from app.models.audit import ActorType  # noqa: PLC0415
+
+    urls = build_webhook_urls(get_settings().public_api_base_url)
+    if urls is None:
+        # No public API origin configured (mock/CI/local): auto-config is not part
+        # of this deployment at all — a silent no-op, never a "failure" note.
+        return False
+    configurator = webhook_config or await build_tenant_webhook_configurator(
+        session, admin_id, instance_id
+    )
+    applied = await configurator.configure(e164_number, urls)
+    if applied:
+        await audit_log.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="webhook_autoconfig_applied",
+            payload={"connection_type": "sms_sender", "number": e164_number},
+        )
+    else:
+        manual = (
+            " We couldn't point your number at Luciel automatically. In your Twilio "
+            f"Console, set the number's Voice webhook to {urls.voice_url}, "
+            f"Messaging to {urls.sms_url}, and the call status callback to "
+            f"{urls.status_callback_url}."
+        )
+        conn.status_detail = (conn.status_detail or "").rstrip() + manual
+        await audit_log.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="webhook_autoconfig_failed",
+            payload={"connection_type": "sms_sender", "number": e164_number},
+        )
+    await session.flush()
+    return applied
 
 
 async def reverify_sms_number(

@@ -408,7 +408,12 @@ async def test_status_callback_with_a_bad_signature_finalizes_nothing(client, mo
 
     r = await client.post(
         "/api/v1/webhooks/twilio/voice/status",
-        data={"From": CALLER, "To": BYO_NUMBER, "CallSid": "CA-badsig-1", "CallStatus": "completed"},
+        data={
+            "From": CALLER,
+            "To": BYO_NUMBER,
+            "CallSid": "CA-badsig-1",
+            "CallStatus": "completed",
+        },
         headers={"X-Twilio-Signature": "forged"},
     )
     assert r.status_code == 403

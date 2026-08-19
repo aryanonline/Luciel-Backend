@@ -94,11 +94,15 @@ _CONVERSATIONAL_MAX_LEN = 80
 _CONVERSATIONAL_PATTERNS = re.compile(
     r"^(hi|hiya|hey|hello|good (morning|afternoon|evening)|greetings)\b"
     r"|\b(thanks|thank you|thankyou|thx|cheers|appreciate (it|that|you))\b"
-    r"|^(no|nope|nah)\b.{0,40}\b(alright|all right|okay|ok|fine|good|thanks|thank you|thankyou)\b"
-    r"|^(no thanks|no thank you|nothing else|that('s| is| was)? (all|it|everything))\b"
-    r"|^(ok(ay)?|sure|great|perfect|sounds good|got it|understood|alright|all right|will do|makes sense)\b"
+    r"|^(no|nope|nah)\b.{0,40}"
+    r"\b(alright|all right|okay|ok|fine|good|thanks|thank you|thankyou)\b"
+    r"|^(no thanks|no thank you|nothing else)\b"
+    r"|^that('s| is| was)? (all|it|everything)\b"
+    r"|^(ok(ay)?|sure|great|perfect|sounds good|got it|understood)\b"
+    r"|^(alright|all right|will do|makes sense)\b"
     r"|^(yes|yep|yeah|yes please|please do)\b"
-    r"|\b(bye|goodbye|good ?night|take care|have a (good|great|nice) (day|night|one)|talk (soon|later)|see you)\b"
+    r"|\b(bye|goodbye|good ?night|take care|talk (soon|later)|see you)\b"
+    r"|\bhave a (good|great|nice) (day|night|one)\b"
     r"|^(you'?re welcome|no (problem|worries))\b",
     re.IGNORECASE,
 )

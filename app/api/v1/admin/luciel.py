@@ -249,12 +249,41 @@ async def update_channels(
     def _build(inst: Instance) -> object:
         # Voice-enable requires prior consent-ack (Vision §3.1, Arch §3.1.2).
         validate_channels(req, inst)
-        return _stamp_sms_compliance_ack(req.channels, inst)
+        return _stamp_voice_consent_ack(_stamp_sms_compliance_ack(req.channels, inst), inst)
 
     return await _update_config(subject.admin_id, subject.user_id, "channels", _build)
 
 
 SMS_ACK_FIELD = "smsComplianceAcknowledgedAt"
+VOICE_ACK_FIELD = "voiceConsentAcknowledgedAt"
+
+
+def _stamp_voice_consent_ack(
+    channels: list[dict[str, object]], inst: Instance
+) -> list[dict[str, object]]:
+    """A persisted voice consent ack survives every channels PUT (Legal §3.1.2).
+
+    PUT /channels is a full replace, so a client that omitted the field silently
+    ERASED the one-time recording/AI-disclosure consent record — after which voice
+    could never be re-enabled without re-consenting, and the audit trail of the
+    original acceptance was gone (latent, live-caught 2026-08-18). Mirror of the
+    SMS stamper: an existing stamp is always re-carried and never overwritten by a
+    client value; a NEW inline ack on an enabling write is still accepted (that is
+    the validate_channels inline-ack path)."""
+    prior_stamp = next(
+        (
+            c.get(VOICE_ACK_FIELD)
+            for c in (inst.channels or [])
+            if isinstance(c, dict) and c.get("id") == "voice"
+        ),
+        None,
+    )
+    if not prior_stamp:
+        return channels
+    for ch in channels:
+        if ch.get("id") == "voice":
+            ch[VOICE_ACK_FIELD] = prior_stamp
+    return channels
 
 
 def _stamp_sms_compliance_ack(

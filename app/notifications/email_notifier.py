@@ -62,7 +62,8 @@ class EmailNotifier:
             f"Why: {_SIGNAL_LABELS.get(notification.signal, notification.signal)}",
         ]
         if notification.channel:
-            lines.append(f"Channel: {_CHANNEL_LABELS.get(notification.channel, notification.channel)}")
+            label = _CHANNEL_LABELS.get(notification.channel, notification.channel)
+            lines.append(f"Channel: {label}")
         if notification.fired_at:
             lines.append(f"When: {notification.fired_at.strftime('%Y-%m-%d %H:%M UTC')}")
         if notification.lead_intent:

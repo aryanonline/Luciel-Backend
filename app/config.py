@@ -179,6 +179,12 @@ class Settings(BaseSettings):
     # Public base URL used to build customer-facing links in emails (verify link,
     # export download). Falls back to a dev localhost for local runs.
     app_base_url: str = "http://127.0.0.1:3000"
+    # The PUBLIC API origin (https://api.vantagemind.ai in dev/prod) — what external
+    # providers must be pointed at (Twilio webhook auto-config, c20). Distinct from
+    # app_base_url (the FRONTEND origin used in customer-facing links). Empty default
+    # = auto-config disabled (the attach falls back to manual webhook guidance);
+    # deployed environments set it via the platform secret's API_BASE_URL.
+    public_api_base_url: str = ""
     # Dashboard page the provider's OAuth callback bounces the browser back to, relative
     # to app_base_url. Settable because the redirect URIs registered with the providers
     # are frozen but the frontend's route is not. Must name a route the frontend actually
@@ -371,6 +377,10 @@ class Settings(BaseSettings):
         # email link) must override the localhost default in deployed environments.
         if blob.get("APP_BASE_URL"):
             object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
+        # The public API origin is bridged the same way (env var wins over the
+        # secret; the secret wins over the empty default).
+        if blob.get("API_BASE_URL") and not self.public_api_base_url:
+            object.__setattr__(self, "public_api_base_url", blob["API_BASE_URL"])
 
         # LLM model IDs (§3.4.3 model-retirement contingency). These carry
         # non-empty defaults, so the generic empty-field overlay above never
