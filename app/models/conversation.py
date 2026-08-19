@@ -38,9 +38,10 @@ class Session(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     # Explicit session END (§3.4.8): stamped by the finalization sweep at
-    # last_message_at + channel timeout, or by an explicit end signal (widget close
-    # beacon / voice hangup). NULL = still live (or not yet finalized). An ended
-    # session is never resumed, even inside the inactivity window.
+    # last_message_at + channel timeout, or by an explicit end signal — the widget
+    # close beacon (POST /sessions/{id}/end) or the Twilio voice status callback
+    # (POST /webhooks/twilio/voice/status, fired at hangup). NULL = still live (or
+    # not yet finalized). An ended session is never resumed, even inside the window.
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Hot→cold transcript offload markers (Commitment #38, migration 0036). Session-
     # level because "moved" deletes the hot Transcript rows once the S3 object is

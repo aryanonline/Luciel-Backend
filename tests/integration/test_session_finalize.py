@@ -243,3 +243,19 @@ async def test_explicit_end_is_scoped_to_instance_and_channel():
             is False
         )
     assert (await _session(admin_id, sid)).ended_at is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_voice_session_missed_by_the_status_callback_is_swept():
+    """The 30-minute voice window is the BACKSTOP: a call normally ends at hangup
+    via the Twilio status callback, but a session whose callback never arrived
+    (network loss, misconfigured number) must still be sealed by the sweep."""
+    admin_id, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed_instance(admin_id, iid)
+    voice_sid = await _seed_session(admin_id, iid, channel="voice", idle=timedelta(minutes=45))
+
+    finalized = await _run_sweep(admin_id)
+    assert finalized == 1
+    sess = await _session(admin_id, voice_sid)
+    assert sess.ended_at == sess.last_message_at + timedelta(minutes=30)
+    assert sess.summary

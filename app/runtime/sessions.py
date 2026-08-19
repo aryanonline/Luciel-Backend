@@ -42,7 +42,9 @@ INACTIVITY_TIMEOUT = {
     # asynchronous-messaging class so an old open session closes correctly.
     "instagram_messenger": timedelta(hours=4),
     "email": timedelta(hours=24),
-    "voice": timedelta(minutes=30),  # post-call follow-up window
+    # Sweep BACKSTOP only: a call's session normally ends at hangup via the
+    # Twilio status callback; this window seals calls whose callback never came.
+    "voice": timedelta(minutes=30),
 }
 
 

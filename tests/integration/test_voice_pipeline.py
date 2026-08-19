@@ -310,3 +310,59 @@ async def test_hosting_failure_degrades_to_say_and_still_serves_the_turn():
         assert result.audio_url is None
         assert '<Say voice="Polly.Joanna-Neural">' in result.twiml and "<Play>" not in result.twiml
         assert result.counted is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_turns_of_one_call_share_a_session_and_a_second_call_opens_a_new_one():
+    """The CALL is the conversation (owner decision 2026-08-18): two turns with one
+    CallSid share a session; a second CallSid from the SAME caller opens a NEW
+    session and bills a NEW conversation — three calls never collapse into one row."""
+    from app.models.budget import CountedSession
+    from app.models.conversation import Session
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    caller = "+15557654321"
+
+    async def turn(call_sid: str, text: str):
+        async with tenant_session(admin) as s:
+            inst = (
+                await s.execute(select(Instance).where(Instance.id == iid))
+            ).scalar_one_or_none()
+            if inst is None:
+                inst = _instance(admin, iid, state=LucielState.active)
+                s.add(inst)
+                await s.flush()
+            return await handle_turn(
+                s,
+                instance=inst,
+                admin_id=admin,
+                instance_id=iid,
+                from_number=caller,
+                speech_audio_ref=text,
+                action_url=_ACTION_URL,
+                stt=EchoSpeechToText(),
+                tts=EchoTextToSpeech(),
+                router=_router(),
+                has_payment_method=False,
+                provider_call_id=call_sid,
+            )
+
+    await turn("CA_first", "do you have any openings?")
+    await turn("CA_first", "how about tuesday?")
+    await turn("CA_second", "hi, me again — one more question")
+
+    async with tenant_session(admin) as s:
+        sessions = (
+            await s.execute(
+                select(func.count()).select_from(Session).where(Session.admin_id == admin)
+            )
+        ).scalar_one()
+        counted = (
+            await s.execute(
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
+            )
+        ).scalar_one()
+    assert int(sessions) == 2  # one per CALL, not one per caller number
+    assert int(counted) == 2  # each call is its own billed conversation

@@ -200,16 +200,20 @@ async def handle_turn(
     # Voice identity is STRONG (E.164, §3.4.9) but lead linkage is the identity arc's
     # job; here resolved_lead_id stays None so this turn opens/uses a voice session
     # without inheriting another lead's history (the HARD RULE still holds in memory).
-    # The caller's number is the participant key (§3.4.8): every utterance of one call
-    # — and a quick follow-up call inside the 30-minute window — is ONE billed session,
-    # never a session (and a billed conversation) per utterance.
+    # The CALL is the conversation (owner decision 2026-08-18, live-caught: three
+    # separate calls rendered as one dashboard row): the participant key is the
+    # provider call id, so every utterance of ONE call shares one session — and a
+    # follow-up CALL is a NEW session and a NEW billed conversation, exactly like a
+    # fresh widget tab. §3.4.8's "transport identifier" for voice is the call.
+    # The from_number fallback covers callers that supply no call id (tests, future
+    # providers without one) — those degrade to number-keyed sessions.
     sess, _is_new = await resolve_or_open_session(
         session,
         admin_id=admin_id,
         instance_id=instance_id,
         channel="voice",
         resolved_lead_id=None,
-        participant_key=participant_key_for(admin_id, "voice", from_number),
+        participant_key=participant_key_for(admin_id, "voice", provider_call_id or from_number),
     )
     if provider_call_id is not None:
         # Join the session onto the call's disclosure record (§3.1.2): set once, never

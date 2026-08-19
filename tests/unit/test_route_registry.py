@@ -145,6 +145,10 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # before these, an enabled Voice channel had nowhere to receive a call.
         ("POST", "/api/v1/webhooks/twilio/voice"),
         ("POST", "/api/v1/webhooks/twilio/voice/turn"),
+        # Call-status callback (2026-08-18): finalizes the call's session at the
+        # REAL hangup — each CALL is one billed conversation, and its summary no
+        # longer waits for the hourly sweep. Auto-configured on the number.
+        ("POST", "/api/v1/webhooks/twilio/voice/status"),
         ("POST", "/api/v1/webhooks/ses/inbound"),
         ("GET", "/api/v1/webhooks/meta"),
         ("POST", "/api/v1/webhooks/meta"),

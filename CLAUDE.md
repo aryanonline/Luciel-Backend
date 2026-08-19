@@ -72,8 +72,11 @@ modules rather than duplicating business rules in a new location.
 - A conversation is a billed session. It counts once per billing period despite
   multiple turns and must mean the same thing in Overview, Billing, and Analytics.
   On every channel the session key is the transport identifier (participant key,
-  §3.4.8); sessions END deterministically (inactivity sweep / close beacon) and are
-  summarized at close (§3.4.7). Transcripts move to S3 cold storage at 90 days and
+  §3.4.8); on voice the transport identifier is the CALL (CallSid) — each call is
+  its own session and billed conversation, finalized at the real hangup by the
+  Twilio status callback (/webhooks/twilio/voice/status), with the hourly sweep as
+  backstop. Sessions END deterministically (inactivity sweep / close beacon /
+  voice status callback) and are summarized at close (§3.4.7). Transcripts move to S3 cold storage at 90 days and
   hard-delete at 1 year (Commitment #38).
 - The free-50 window is anchored to the Stripe billing period; before a card exists,
   use the calendar-month fallback.

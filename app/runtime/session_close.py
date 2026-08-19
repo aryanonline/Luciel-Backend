@@ -6,8 +6,8 @@ A session ends in exactly two ways, neither of them an LLM judgment:
       the ``session_finalize`` sweep (app/jobs/sweeps.py), which stamps ``ended_at``
       and fires the §3.4.7 summarization pipeline for every session past its window.
   (b) An explicit end signal where the channel provides one — the widget close beacon
-      (POST /sessions/{id}/end) and, when the voice route ships, the hangup handler —
-      via :func:`finalize_session`.
+      (POST /sessions/{id}/end) and the voice hangup (the Twilio status callback,
+      POST /webhooks/twilio/voice/status) — via :func:`finalize_session`.
 
 Until this module existed, session end was purely implicit (an expired
 ``last_message_at``): nothing ever summarized a conversation, so ``sessions.summary``

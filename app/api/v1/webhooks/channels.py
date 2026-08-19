@@ -305,6 +305,69 @@ async def twilio_voice_turn(request: Request) -> Response:
     return Response(content=result.twiml, media_type="application/xml")
 
 
+@router.post("/twilio/voice/status")
+async def twilio_voice_status(request: Request) -> Response:
+    """Call-status callback: finalize the call's session at the REAL hangup (§3.4.8
+    trigger (b) — the voice twin of the widget close beacon).
+
+    Twilio posts here when the call reaches a terminal state (auto-configured on the
+    designated number alongside the voice/SMS webhooks). Finalizing at hangup writes
+    the summary immediately and stamps ``ended_at`` with the call's actual end — so
+    the next call from the same caller is a NEW conversation and the dashboard row
+    stops reading as in-progress. The hourly inactivity sweep stays as the backstop
+    for calls whose callback never arrives. NOT the inbound pipeline: a status
+    callback carries no conversational content, so it takes signature → resolve →
+    finalize, with no admission/opt-out semantics.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.channels import pipeline  # noqa: PLC0415
+    from app.channels.signatures import verify_twilio  # noqa: PLC0415
+    from app.models.voice import VoiceCallRecord  # noqa: PLC0415
+    from app.runtime.session_close import finalize_session  # noqa: PLC0415
+
+    req = await _voice_request(request)
+    params: dict[str, str] = req["params"]
+    async with untenanted_session() as s:
+        if not verify_twilio(req["auth_token"], req["url"], params, req["x_twilio_signature"]):
+            await pipeline.record_inbound_rejection(
+                s, reason="twilio_signature_invalid", channel="voice"
+            )
+            return Response(status_code=403)
+        try:
+            ctx = await _resolve("sms_sender", params.get("To", ""))
+        except InboundRejected as rej:
+            await pipeline.record_inbound_rejection(s, reason=rej.reason, channel="voice")
+            return Response(status_code=200)
+
+    call_sid = params.get("CallSid", "")
+    call_status = params.get("CallStatus", "")
+    if not call_sid or call_status not in ("completed", "busy", "failed", "no-answer", "canceled"):
+        return Response(status_code=200)
+
+    async with tenant_session(ctx.admin_id) as s:
+        record = (
+            await s.execute(
+                select(VoiceCallRecord).where(
+                    VoiceCallRecord.admin_id == ctx.admin_id,
+                    VoiceCallRecord.instance_id == ctx.instance_id,
+                    VoiceCallRecord.provider_call_id == call_sid,
+                    VoiceCallRecord.session_id.is_not(None),
+                )
+            )
+        ).scalars().first()
+        if record is not None and record.session_id is not None:
+            # Idempotent: an already-ended session is a no-op inside finalize_session.
+            await finalize_session(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                channel="voice",
+                session_id=record.session_id,
+            )
+    return Response(status_code=200)
+
+
 # --------------------------------------------------------------------------- #
 # SES inbound email (delivered via SNS)
 # --------------------------------------------------------------------------- #

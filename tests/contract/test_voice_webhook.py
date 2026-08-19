@@ -296,3 +296,143 @@ async def test_a_silent_gather_timeout_reprompts_without_burning_budget(client, 
             )
         ).scalar_one()
     assert int(counted) == 0
+
+
+STATUS_URL = "http://test/api/v1/webhooks/twilio/voice/status"
+
+
+async def _turn(client, auth_token: str, call_sid: str, speech: str) -> None:
+    params = {"From": CALLER, "To": BYO_NUMBER, "CallSid": call_sid, "SpeechResult": speech}
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/turn",
+        data=params,
+        headers=_signed(TURN_URL, params, auth_token),
+    )
+    assert r.status_code == 200
+
+
+async def test_two_calls_from_the_same_number_are_two_sessions_and_two_billed(client, monkeypatch):
+    """Each CALL is one conversation (owner decision 2026-08-18, live-caught: three
+    separate calls collapsed into one dashboard row and one billed conversation).
+    Two CallSids from the SAME caller inside the old 30-minute window must open two
+    sessions and count two conversations."""
+    from app.models.conversation import Session
+
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, _ = await _seed()
+
+    await _turn(client, auth_token, "CA-call-one", "Do you replace water heaters?")
+    await _turn(client, auth_token, "CA-call-two", "What are your hours?")
+
+    async with tenant_session(admin) as s:
+        sessions = (
+            await s.execute(
+                select(func.count()).select_from(Session).where(Session.admin_id == admin)
+            )
+        ).scalar_one()
+        counted = (
+            await s.execute(
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
+            )
+        ).scalar_one()
+    assert int(sessions) == 2
+    assert int(counted) == 2
+
+
+async def test_status_callback_finalizes_the_calls_session_at_hangup(client, monkeypatch):
+    """The voice twin of the widget close beacon: a terminal CallStatus stamps
+    ended_at NOW and writes the summary immediately — the dashboard row stops
+    reading as in-progress at hangup, not at the next hourly sweep."""
+    from app.models.conversation import Session
+
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, _ = await _seed()
+
+    # The REAL call flow: call start writes the VoiceCallRecord (disclosure), the
+    # turn opens the session and joins it onto the record, the callback ends it.
+    open_params = {"From": CALLER, "To": BYO_NUMBER, "CallSid": "CA-hangup-1"}
+    r0 = await client.post(
+        "/api/v1/webhooks/twilio/voice",
+        data=open_params,
+        headers=_signed(VOICE_URL, open_params, auth_token),
+    )
+    assert r0.status_code == 200
+    await _turn(client, auth_token, "CA-hangup-1", "Do you serve North Vancouver?")
+
+    params = {
+        "From": CALLER,
+        "To": BYO_NUMBER,
+        "CallSid": "CA-hangup-1",
+        "CallStatus": "completed",
+    }
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/status",
+        data=params,
+        headers=_signed(STATUS_URL, params, auth_token),
+    )
+    assert r.status_code == 200
+    async with tenant_session(admin) as s:
+        sess = (
+            await s.execute(select(Session).where(Session.admin_id == admin))
+        ).scalar_one()
+        assert sess.ended_at is not None
+        assert sess.summary  # summarized at the REAL call end, not the sweep
+    # Idempotent: a duplicate callback is a quiet ack, nothing double-finalized.
+    r2 = await client.post(
+        "/api/v1/webhooks/twilio/voice/status",
+        data=params,
+        headers=_signed(STATUS_URL, params, auth_token),
+    )
+    assert r2.status_code == 200
+
+
+async def test_status_callback_with_a_bad_signature_finalizes_nothing(client, monkeypatch):
+    from app.models.conversation import Session
+
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, _ = await _seed()
+
+    open_params = {"From": CALLER, "To": BYO_NUMBER, "CallSid": "CA-badsig-1"}
+    r0 = await client.post(
+        "/api/v1/webhooks/twilio/voice",
+        data=open_params,
+        headers=_signed(VOICE_URL, open_params, auth_token),
+    )
+    assert r0.status_code == 200
+    await _turn(client, auth_token, "CA-badsig-1", "Do you do emergency call-outs?")
+
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/status",
+        data={"From": CALLER, "To": BYO_NUMBER, "CallSid": "CA-badsig-1", "CallStatus": "completed"},
+        headers={"X-Twilio-Signature": "forged"},
+    )
+    assert r.status_code == 403
+    async with tenant_session(admin) as s:
+        sess = (
+            await s.execute(select(Session).where(Session.admin_id == admin))
+        ).scalar_one()
+        assert sess.ended_at is None  # the forged callback ended nothing
+
+
+async def test_status_callback_for_an_unknown_call_is_a_quiet_ack(client, monkeypatch):
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    await _seed()
+
+    params = {
+        "From": CALLER,
+        "To": BYO_NUMBER,
+        "CallSid": "CA-never-existed",
+        "CallStatus": "completed",
+    }
+    r = await client.post(
+        "/api/v1/webhooks/twilio/voice/status",
+        data=params,
+        headers=_signed(STATUS_URL, params, auth_token),
+    )
+    assert r.status_code == 200
