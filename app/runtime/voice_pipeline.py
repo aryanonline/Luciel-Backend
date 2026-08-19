@@ -50,7 +50,7 @@ from app.models.voice import VoiceCallRecord
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
-from app.runtime.sessions import participant_key_for, resolve_or_open_session
+from app.runtime.sessions import effective_config, participant_key_for, resolve_or_open_session
 from app.runtime.speech import SpeechError, SpeechToText, TextToSpeech
 
 # Voice replies stay short — long answers switch channel or get truncated for speech
@@ -239,6 +239,14 @@ async def handle_turn(
     # the same honest evidence trail as a widget/SMS/email answer.
     chunk_attributor = make_chunk_attributor(session, admin_id=admin_id, instance_id=instance_id)
 
+    # The SAME instance context as every text channel (live-caught 2026-08-18: voice
+    # built the Orchestrator bare, so calls ran a generic persona with no business
+    # context and no configured assistant name — the c14 persona fix never reached
+    # the phone). Reuses runtime_entry's helpers instead of a third naming copy.
+    from app.channels.runtime_entry import disclosure_business_name, names  # noqa: PLC0415
+
+    effective = effective_config(sess.config_snapshot, instance, always_include_channel="voice")
+    _business, assistant = names(instance)
     orch = Orchestrator(
         session=session,
         router=router,
@@ -246,7 +254,11 @@ async def handle_turn(
         chunk_attributor=chunk_attributor,
         admin_id=admin_id,
         instance_id=instance_id,
-        enabled_channels={"voice"},
+        enabled_channels=effective.enabled_channels,
+        business_name=disclosure_business_name(instance),
+        assistant_name=assistant,
+        business_context=effective.business_context,
+        personality=effective.personality,
         has_payment_method=has_payment_method,
     )
     result = await orch.run_turn(
@@ -256,6 +268,9 @@ async def handle_turn(
         mode=sess.mode,
         inbound_text=transcription.text,
         received_at=received_at,
+        # The caller's number IS their identity (§3.4.9 strong channel) — this is
+        # what feeds voice lead capture at all.
+        transport_identifier=from_number,
     )
 
     # at_cap → the orchestrator already produced the graceful no-LLM reply (§3.4.1b);

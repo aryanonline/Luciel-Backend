@@ -52,8 +52,10 @@ class RuntimeReply:
     session_id: str
 
 
-def _names(inst: Instance) -> tuple[str, str]:
-    """Luciel display name + assistant speaker name (§3.4.16).
+def names(inst: Instance) -> tuple[str, str]:
+    """Luciel display name + assistant speaker name (§3.4.16). PUBLIC: the voice
+    pipeline reuses this and ``disclosure_business_name`` (2026-08-18) rather than
+    minting a third copy beside chat_widget's mirror.
 
     Mirrors app.api.v1.chat_widget._names. NOTE ON NAMING: the first element
     returned here (historically called "business") is ``inst.name`` -- the
@@ -74,7 +76,7 @@ def _names(inst: Instance) -> tuple[str, str]:
     return business, assistant
 
 
-def _disclosure_business_name(inst: Instance) -> str:
+def disclosure_business_name(inst: Instance) -> str:
     """Resolve the BUSINESS name for the AI-identity disclosure clause (§3.4.16).
 
     Mirrors app.api.v1.chat_widget._disclosure_business_name. Checked the
@@ -129,7 +131,7 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         session, admin_id=msg.admin_id, instance_id=msg.instance_id
     )
     effective = effective_config(sess.config_snapshot, inst, always_include_channel=msg.channel)
-    business, assistant = _names(inst)
+    business, assistant = names(inst)
 
     orch = Orchestrator(
         session=session,
@@ -141,7 +143,7 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         enabled_channels=effective.enabled_channels,
         # `business` above is inst.name (the Luciel's own name) -- never pass it as
         # business_name for the disclosure backstop; use _disclosure_business_name.
-        business_name=_disclosure_business_name(inst),
+        business_name=disclosure_business_name(inst),
         assistant_name=assistant,
         business_context=effective.business_context,
         personality=effective.personality,

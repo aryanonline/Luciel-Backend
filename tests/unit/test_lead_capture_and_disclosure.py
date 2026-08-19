@@ -116,3 +116,12 @@ def test_disclosure_never_contains_the_luciel_name_even_when_it_ends_in_assistan
         )
         clause = out.split(".", 1)[1]
         assert luciel_name not in clause
+
+
+def test_identity_only_turn_still_shows_unqualified_signals():
+    """extract_lead_signals stays PURE (it sees only text): a pleasantry carries no
+    signals. Identity-is-capture lives in capture_or_update_lead, where the
+    transport identifier exists — pinned by the integration tests."""
+    s = extract_lead_signals("No its alright thankyou")
+    assert not s.is_qualified
+    assert s.strong_identifier is None

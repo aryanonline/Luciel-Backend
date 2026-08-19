@@ -20,6 +20,10 @@ Delivers internal/customer notifications and runs the deferred escalation-dispat
 ## Gotchas from the 2026-08-06 truth delta
 - Missing contacts and grounding failures say the request was passed to the team, never “connecting you right now”.
 - Human replies to widget users are later poll delivery, not notification-driven real-time push.
+- The 2026-08-18 enrichment (channel/when/identity/quote/deep-link on
+  EscalationNotification) is DERIVED at send time in _build_notification from rows
+  already written — the deferred-queue payload is unchanged, replays render
+  identically, and no PII enters the queue. Keep it that way.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

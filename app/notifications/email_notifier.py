@@ -29,6 +29,16 @@ _SIGNAL_LABELS: dict[str, str] = {
     "llm_unavailable": "Luciel could not reach its model provider",
 }
 
+_CHANNEL_LABELS: dict[str, str] = {
+    "widget": "Website chat",
+    "voice": "Phone call",
+    "sms": "Text message",
+    "email": "Email",
+    "whatsapp": "WhatsApp",
+    "messenger": "Messenger",
+    "instagram": "Instagram",
+}
+
 
 class EmailNotifier:
     channel_id = "email"
@@ -43,26 +53,40 @@ class EmailNotifier:
         return f"Luciel needs you: {label}"
 
     def format(self, notification: EscalationNotification) -> str:
-        """The §3.5.1 payload as an email body: summary, contact info, next step."""
+        """The §3.5.1 payload as an email body: why/where/when, who, what they said,
+        next step, and a deep link that opens the exact conversation (2026-08-18
+        enrichment — the previous body carried nothing but a bare UUID)."""
         lines = [
             f"{notification.business_name}'s Luciel escalated a conversation.",
             "",
             f"Why: {_SIGNAL_LABELS.get(notification.signal, notification.signal)}",
         ]
+        if notification.channel:
+            lines.append(f"Channel: {_CHANNEL_LABELS.get(notification.channel, notification.channel)}")
+        if notification.fired_at:
+            lines.append(f"When: {notification.fired_at.strftime('%Y-%m-%d %H:%M UTC')}")
         if notification.lead_intent:
             lines.append(f"What they want: {notification.lead_intent}")
         if notification.lead_score is not None:
             lines.append(f"Lead score: {notification.lead_score:.2f}")
+        contact = notification.lead_contact or notification.customer_identifier
         lines += ["", "Who to reach:"]
         lines.append(f"  Name: {notification.lead_name or 'not captured'}")
-        lines.append(f"  Contact: {notification.lead_contact or 'not captured'}")
+        lines.append(f"  Contact: {contact or 'not captured'}")
+        if notification.triggering_message:
+            lines += ["", f'What they said: "{notification.triggering_message}"']
         lines += [
             "",
             f"What to do: {notification.next_step}",
             "",
-            f"Conversation: {notification.conversation_ref}",
-            "Open your dashboard to read the full transcript or take over the conversation.",
+            f"Conversation #{notification.short_ref}",
         ]
+        if notification.dashboard_url:
+            lines.append(f"Open it here: {notification.dashboard_url}")
+        else:
+            lines.append(
+                "Open your dashboard to read the full transcript or take over the conversation."
+            )
         return "\n".join(lines)
 
     async def send(

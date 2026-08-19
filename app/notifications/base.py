@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,7 +47,14 @@ _NEXT_STEP: dict[str, str] = {
 
 @dataclass(frozen=True)
 class EscalationNotification:
-    """The §3.5.1 escalation payload — everything needed to act without logging in."""
+    """The §3.5.1 escalation payload — everything needed to act without logging in.
+
+    The 2026-08-18 enrichment (live-caught: the email named nothing but a bare UUID
+    while the caller's phone number was sitting in the session): channel, when, the
+    customer's transport identity where the channel provides one, the message that
+    triggered the escalation, and a dashboard deep link. All optional/derived at
+    send time so the deferred-queue replay path needs no payload change and no PII
+    lands in the queue."""
 
     admin_id: uuid.UUID
     instance_id: uuid.UUID
@@ -58,12 +66,22 @@ class EscalationNotification:
     lead_contact: str | None = None
     lead_intent: str | None = None
     lead_score: float | None = None
+    channel: str | None = None
+    fired_at: datetime | None = None
+    customer_identifier: str | None = None
+    triggering_message: str | None = None
+    dashboard_url: str | None = None
 
     @property
     def conversation_ref(self) -> str:
         """Non-identifying session handle — the only lead reference safe for an audit
         payload (§5.2 / §3.4.11: never the lead's raw contact)."""
         return str(self.session_id)
+
+    @property
+    def short_ref(self) -> str:
+        """First 8 of the session id — matches the dashboard row's #ref."""
+        return str(self.session_id)[:8]
 
     @property
     def next_step(self) -> str:

@@ -41,7 +41,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.channels.base import DeliveryReceipt
+from app.config import get_settings
 from app.models.audit import ActorType
+from app.models.conversation import EscalationEvent, Transcript
+from app.models.conversation import Session as SessionModel
 from app.models.instance import Account, Instance
 from app.models.lead import Lead
 from app.notifications.base import EscalationNotification, NotificationAdapter
@@ -168,6 +171,51 @@ async def _build_notification(
                 select(Lead).where(Lead.admin_id == admin_id, Lead.id == resolved_lead_id)
             )
         ).scalar_one_or_none()
+
+    # Enrichment (2026-08-18): channel/when/who/what + a dashboard deep link, ALL
+    # derived here at send time from rows already written — the deferred-queue
+    # payload is unchanged, so replays render identically and no PII enters the
+    # queue. The live email previously carried nothing but a bare UUID while the
+    # caller's number sat in the session.
+    sess_row = (
+        await session.execute(
+            select(SessionModel).where(
+                SessionModel.admin_id == admin_id, SessionModel.id == session_id
+            )
+        )
+    ).scalar_one_or_none()
+    triggering_message = (
+        await session.execute(
+            select(Transcript.text)
+            .where(
+                Transcript.admin_id == admin_id,
+                Transcript.session_id == session_id,
+                Transcript.role == "lead",
+            )
+            .order_by(Transcript.at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    fired_at = (
+        await session.execute(
+            select(EscalationEvent.fired_at)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+            )
+            .order_by(EscalationEvent.fired_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    # The customer's transport identity — only where the channel PROVIDES one
+    # (voice/SMS number, email address, Meta id via the lead row). Widget visitors
+    # are genuinely anonymous unless they volunteered contact info (then the lead
+    # row carries it and lead_contact serves it).
+    customer_identifier = lead.contact_identifier if lead else None
+    base = get_settings().app_base_url.rstrip("/")
+    dashboard_url = f"{base}/dashboard/conversations?open={session_id}" if base else None
+
     notification = EscalationNotification(
         admin_id=admin_id,
         instance_id=instance_id,
@@ -180,6 +228,11 @@ async def _build_notification(
         lead_intent=lead.intent if lead else None,
         # The escalation's own score is the live one; the lead row's is capture-time.
         lead_score=score if score is not None else (lead.lead_score if lead else None),
+        channel=sess_row.channel if sess_row else None,
+        fired_at=fired_at,
+        customer_identifier=customer_identifier,
+        triggering_message=triggering_message,
+        dashboard_url=dashboard_url,
     )
     return notification, inst, owner_email
 

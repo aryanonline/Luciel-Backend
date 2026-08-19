@@ -151,3 +151,45 @@ def test_any_single_configured_contact_counts():
     assert has_configured_escalation_contact({"secondaryEmail": "backup@acme.example"}) is True
     assert has_configured_escalation_contact({"secondarySms": "+15552223333"}) is True
     assert has_configured_escalation_contact({"preferredChannel": "sms"}) is False
+
+
+def test_email_body_carries_channel_when_quote_and_deep_link():
+    """2026-08-18 enrichment: the live email named nothing but a bare UUID while the
+    caller's number sat in the session. Channel, time, the triggering message, the
+    #ref, and a deep link that opens the exact conversation are all in the body."""
+    from datetime import UTC, datetime
+
+    sid = uuid.uuid4()
+    body = EmailNotifier().format(
+        _notification(
+            session_id=sid,
+            channel="voice",
+            fired_at=datetime(2026, 8, 18, 2, 29, tzinfo=UTC),
+            customer_identifier="+16045550107",
+            triggering_message="How much is a new water heater installed?",
+            dashboard_url=f"https://www.vantagemind.ai/dashboard/conversations?open={sid}",
+        )
+    )
+    assert "Phone call" in body
+    assert "2026-08-18 02:29 UTC" in body
+    assert "How much is a new water heater installed?" in body
+    assert f"#{str(sid)[:8]}" in body
+    assert f"https://www.vantagemind.ai/dashboard/conversations?open={sid}" in body
+
+
+def test_email_contact_falls_back_to_the_transport_identity():
+    """A voice/SMS caller with no Lead row enrichment still has a KNOWN number —
+    'not captured' is reserved for the genuinely anonymous widget visitor."""
+    body = EmailNotifier().format(
+        _notification(lead_name=None, lead_contact=None, customer_identifier="+16045550107")
+    )
+    assert "+16045550107" in body
+    assert "Contact: not captured" not in body
+
+
+def test_sms_body_carries_the_short_ref():
+    """The SMS variant previously carried NO conversation handle at all."""
+    sid = uuid.uuid4()
+    body = SmsNotifier().format(_notification(session_id=sid))
+    assert f"#{str(sid)[:8]}" in body
+    assert "\n" not in body  # still the condensed single-line form

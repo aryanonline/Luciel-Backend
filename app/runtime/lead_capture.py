@@ -137,8 +137,19 @@ async def capture_or_update_lead(
             await session.flush()
             return lead.id
 
+    # Identity IS capture on strong channels (live-caught 2026-08-18): a voice
+    # caller's E.164 was DISCARDED because no intent keyword fired, and the
+    # escalation email then said "Contact: not captured" about a caller whose
+    # number we knew the whole time. When the transport itself names the person,
+    # the lead exists — signals only enrich it. The widget rule is unchanged:
+    # a weak token never carries identity, so an anonymous visitor still needs
+    # to volunteer a strong identifier before any row is written.
+    identity_is_capture = (
+        strength in (IdentityStrength.strong, IdentityStrength.platform_scoped_strong)
+        and bool(transport_identifier)
+    )
     # No lead yet and nothing qualifies → stay anonymous (no row written).
-    if contact_key is None or not signals.is_qualified:
+    if contact_key is None or not (signals.is_qualified or identity_is_capture):
         return None
 
     # Upsert on the stable contact key (update-in-place, never duplicate).
@@ -162,7 +173,10 @@ async def capture_or_update_lead(
             instance_id=instance_id,
             name=None,
             contact_identifier=contact_key,
-            intent=_summarize_intent(inbound_text),
+            # Intent only when the turn actually SIGNALED one: an identity-only
+            # capture ("No its alright thankyou" from a known number) must not
+            # store a pleasantry as the lead's recorded want.
+            intent=_summarize_intent(inbound_text) if signals.is_qualified else None,
             lead_score=score if score > 0 else None,
             state=LeadState.active,
         )

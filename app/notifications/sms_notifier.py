@@ -36,15 +36,18 @@ class SmsNotifier:
         return to.startswith("+") and digits.isdigit() and 2 <= len(digits) <= 15
 
     def format(self, notification: EscalationNotification) -> str:
-        """Condensed §3.5.1 payload: why, who to reach, what to do."""
+        """Condensed §3.5.1 payload: why, who to reach, what to do, which conversation."""
         parts = [f"{notification.business_name}: Luciel escalated ({notification.signal})."]
-        if notification.lead_name or notification.lead_contact:
-            who = " ".join(p for p in (notification.lead_name, notification.lead_contact) if p)
+        contact = notification.lead_contact or notification.customer_identifier
+        if notification.lead_name or contact:
+            who = " ".join(p for p in (notification.lead_name, contact) if p)
             parts.append(f"Lead: {who}.")
         if notification.lead_intent:
             intent = notification.lead_intent[:_MAX_INTENT].rstrip()
             parts.append(f"Wants: {intent}.")
         parts.append(notification.next_step)
+        # The dashboard row's #ref — the SMS previously carried NO conversation handle.
+        parts.append(f"#{notification.short_ref}")
         return " ".join(parts)
 
     async def send(

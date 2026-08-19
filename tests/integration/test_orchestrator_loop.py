@@ -473,3 +473,43 @@ async def test_a_second_session_escalates_again():
             )
         ).scalars().all()
         assert len(rows) == 2  # one per session
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_widget_escalation_asks_the_anonymous_visitor_for_contact():
+    """Owner-directed 2026-08-18: an escalation about someone the team cannot reach
+    is half an escalation. On the widget (no transport identity, no lead on file)
+    the served reply appends a deterministic contact ask; the visitor's next turn
+    is then captured by the existing extract_lead_signals machinery."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Do you offer a warranty?",  # ungrounded → escalates
+        )
+        assert result.escalation is not None
+        assert "what's your name and the best email or phone number" in result.reply_text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_strong_channel_escalation_never_asks_for_contact():
+    """The phone already names the caller — asking would be noise."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="voice",
+            mode="ai",
+            inbound_text="Do you offer a warranty?",
+            transport_identifier="+16045550107",
+        )
+        assert result.escalation is not None
+        assert "best email or phone number" not in result.reply_text

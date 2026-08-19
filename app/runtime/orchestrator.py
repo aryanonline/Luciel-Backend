@@ -573,6 +573,23 @@ class Orchestrator:
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
         reply_text = pre_send_check(resp.text)
+        # Escalation-time contact ask (owner-directed 2026-08-18): when this turn
+        # escalated on a channel that carries NO transport identity and no lead is
+        # on file, the team has been flagged about someone they cannot reach. Ask —
+        # deterministically, in code, never trusting the model to remember — so the
+        # visitor's NEXT turn can volunteer contact info that the existing
+        # extract_lead_signals capture promotes to a Lead row. Strong channels
+        # (voice/SMS/email/Meta) skip this: the transport already names the person.
+        if (
+            escalation is not None
+            and resolved_lead_id is None
+            and transport_identifier is None
+            and channel == "widget"
+        ):
+            reply_text = (
+                f"{reply_text}\n\nSo the team can reach you, what's your name and "
+                "the best email or phone number to contact you at?"
+            )
         # AI-identity disclosure backstop (§3.4.16): on the FIRST outbound of a new
         # conversation on a text channel, guarantee the disclosure in code rather than
         # trusting the model to include it. Surfaced once per conversation — a prior

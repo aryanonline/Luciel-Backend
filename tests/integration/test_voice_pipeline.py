@@ -366,3 +366,87 @@ async def test_turns_of_one_call_share_a_session_and_a_second_call_opens_a_new_o
         ).scalar_one()
     assert int(sessions) == 2  # one per CALL, not one per caller number
     assert int(counted) == 2  # each call is its own billed conversation
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_voice_turn_threads_the_instance_persona_and_context():
+    """Live-caught 2026-08-18: voice built the Orchestrator bare — generic persona,
+    no business context, no configured assistant name (the c14 persona fix never
+    reached the phone). The system prompt on a voice turn must carry both."""
+    captured: list[str] = []
+
+    class RecordingModel:
+        name = "recorder"
+
+        async def complete(self, system_prompt, messages):
+            captured.append(system_prompt)
+            from app.runtime.testing import EchoModel
+
+            return await EchoModel(confidence=0.9).complete(system_prompt, messages)
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        inst = _instance(
+            admin,
+            iid,
+            state=LucielState.active,
+            personality={
+                "assistantName": "Sunny",
+                "businessContext": "North Shore Plumbing: 24h emergency service.",
+            },
+        )
+        s.add(inst)
+        await s.flush()
+        rec = RecordingModel()
+        await handle_turn(
+            s,
+            instance=inst,
+            admin_id=admin,
+            instance_id=iid,
+            from_number="+15557654321",
+            speech_audio_ref="do you have any openings?",
+            action_url=_ACTION_URL,
+            stt=EchoSpeechToText(),
+            tts=EchoTextToSpeech(),
+            router=LLMRouter(primary=rec, fallback=rec),
+            has_payment_method=False,
+            provider_call_id="CA_persona",
+        )
+    assert captured, "the model was not called"
+    system_text = captured[0]
+    assert "Sunny" in system_text  # configured assistant name reached the prompt
+    assert "North Shore Plumbing" in system_text  # business context reached the prompt
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_voice_caller_number_alone_writes_the_lead():
+    """Identity IS capture on the phone (live-caught: the escalation email said
+    'Contact: not captured' about a caller whose number we knew the whole time).
+    A pleasantry from a known number still writes/keeps the Lead row — with no
+    fabricated intent."""
+    from app.models.lead import Lead
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        inst = _instance(admin, iid, state=LucielState.active)
+        s.add(inst)
+        await s.flush()
+        await handle_turn(
+            s,
+            instance=inst,
+            admin_id=admin,
+            instance_id=iid,
+            from_number="+15557654321",
+            speech_audio_ref="No its alright thankyou",
+            action_url=_ACTION_URL,
+            stt=EchoSpeechToText(),
+            tts=EchoTextToSpeech(),
+            router=_router(),
+            has_payment_method=False,
+            provider_call_id="CA_lead",
+        )
+        lead = (
+            await s.execute(select(Lead).where(Lead.admin_id == admin))
+        ).scalar_one()
+        assert lead.contact_identifier == "+15557654321"
+        assert lead.intent is None  # a pleasantry is not an "intent"
