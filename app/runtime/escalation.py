@@ -82,6 +82,56 @@ def classify_request_human(text: str) -> float:
     return 0.9 if _HUMAN_PATTERNS.search(text or "") else 0.0
 
 
+# Conversational (social) turns: greetings, thanks, declines, acknowledgments,
+# goodbyes. Live-caught 2026-08-18: a caller answering "No its alright thankyou"
+# to Luciel's own follow-up offer tripped the cannot_answer grounding gate — a
+# pleasantry retrieves nothing, scores 0.0, and (with live providers pinning
+# confidence at 1.0) the grounding floor alone decided. A social turn contains no
+# factual claim to ground, so the floor does not apply to it. Deterministic on
+# purpose (same doctrine as the other classifiers in this module): regexes over a
+# normalized short string, hermetically testable, no model in the loop.
+_CONVERSATIONAL_MAX_LEN = 80
+_CONVERSATIONAL_PATTERNS = re.compile(
+    r"^(hi|hiya|hey|hello|good (morning|afternoon|evening)|greetings)\b"
+    r"|\b(thanks|thank you|thankyou|thx|cheers|appreciate (it|that|you))\b"
+    r"|^(no|nope|nah)\b.{0,40}\b(alright|all right|okay|ok|fine|good|thanks|thank you|thankyou)\b"
+    r"|^(no thanks|no thank you|nothing else|that('s| is| was)? (all|it|everything))\b"
+    r"|^(ok(ay)?|sure|great|perfect|sounds good|got it|understood|alright|all right|will do|makes sense)\b"
+    r"|^(yes|yep|yeah|yes please|please do)\b"
+    r"|\b(bye|goodbye|good ?night|take care|have a (good|great|nice) (day|night|one)|talk (soon|later)|see you)\b"
+    r"|^(you'?re welcome|no (problem|worries))\b",
+    re.IGNORECASE,
+)
+# Hard guards: anything that looks like it SEEKS information or action is never
+# conversational, whatever else it matches — the grounding floor must keep
+# gating real questions (the OR-gate doctrine is untouched by this classifier).
+_SEEKING_PATTERNS = re.compile(
+    r"\?"
+    # Interrogatives ANYWHERE ("ok but what time do you open" hides one mid-turn);
+    # auxiliary-verb starters only ANCHORED ("that can work" is not a question).
+    r"|\b(what|how|when|where|why|which|who)\b"
+    r"|^(can|could|would|will|do|does|did|is|are|should|may|might)\b"
+    r"|\b(need|want|looking for|book|schedule|quote|price|cost|help me|tell me|explain)\b"
+    r"|[0-9$£€]",
+    re.IGNORECASE,
+)
+
+
+def is_conversational_turn(text: str) -> bool:
+    """True when the message is a social turn with no factual claim to ground.
+
+    Skips ONLY the gate-2 ``cannot_answer`` check (see ``evaluate_outcome``).
+    Gate 1 (human request / sentiment), moderation, lead capture, and
+    ``high_value_lead`` all still see every turn.
+    """
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > _CONVERSATIONAL_MAX_LEN:
+        return False
+    if _SEEKING_PATTERNS.search(stripped):
+        return False
+    return bool(_CONVERSATIONAL_PATTERNS.search(stripped))
+
+
 def sentiment_score(text: str) -> float:
     """Crude polarity in [-1, 1]; negative words push toward -1."""
     words = re.findall(r"[a-z']+", (text or "").lower())
@@ -167,7 +217,12 @@ def evaluate_outcome(
     if lead_score >= 0.5:
         return EscalationDecision(True, Signal.high_value_lead, Gate.outcome, lead_score)
 
-    if not resolving_tool_succeeded and (
+    # A conversational/social turn (thanks, declines, goodbyes — see
+    # is_conversational_turn) carries no factual claim, so the grounding floor
+    # does not apply to it. This narrows WHICH turns count as answers; for real
+    # questions the OR-gate below is byte-for-byte unchanged and must never
+    # become an AND (harmony fix above still binds).
+    if not resolving_tool_succeeded and not is_conversational_turn(message) and (
         grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE
     ):
         score = min(plan_confidence, grounding_score)

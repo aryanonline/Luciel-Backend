@@ -391,3 +391,85 @@ async def test_no_kb_confidently_fabricated_answer_escalates_instead_of_confiden
             )
         ).scalar_one()
         assert luciel_row.grounding_score == 0.0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_cannot_answer_fires_at_most_once_per_session():
+    """Live-caught 2026-08-18: every below-floor turn of one call wrote another
+    escalation row and sent another email. The signal is per-conversation news:
+    the first ungrounded answer escalates; repeats within the SAME session are
+    suppressed (the turn's LoopResult still reports the state honestly)."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0))
+        first = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Do you offer a warranty?",
+        )
+        second = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="What brands of water heater do you carry",
+        )
+        assert first.escalation is not None
+        assert second.escalation is not None  # the turn still reports its state
+        rows = (
+            await s.execute(
+                select(EscalationEvent).where(EscalationEvent.session_id == sid)
+            )
+        ).scalars().all()
+        assert len(rows) == 1  # one row, one notification — not one per turn
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_pleasantry_only_session_records_no_escalation():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="voice",
+            mode="ai",
+            inbound_text="No its alright thankyou",
+        )
+        assert result.escalation is None
+        rows = (
+            await s.execute(
+                select(EscalationEvent).where(EscalationEvent.session_id == sid)
+            )
+        ).scalars().all()
+        assert rows == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_second_session_escalates_again():
+    """The cannot_answer dedupe is per-SESSION (per call/conversation), never
+    per-lead or per-tenant: a new conversation with the same problem is new news."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid1 = await _seed_session(s, admin, iid)
+        sid2 = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0))
+        for sid in (sid1, sid2):
+            result = await orch.run_turn(
+                session_id=sid,
+                resolved_lead_id=None,
+                channel="widget",
+                mode="ai",
+                inbound_text="Do you offer a warranty?",
+            )
+            assert result.escalation is not None
+        rows = (
+            await s.execute(
+                select(EscalationEvent).where(EscalationEvent.admin_id == admin)
+            )
+        ).scalars().all()
+        assert len(rows) == 2  # one per session

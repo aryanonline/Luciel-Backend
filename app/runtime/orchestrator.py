@@ -177,6 +177,24 @@ async def persist_turn(
     return row
 
 
+async def _session_already_escalated(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID, signal: str
+) -> bool:
+    """True when this session already carries an escalation row for this signal."""
+    row = (
+        await session.execute(
+            select(EscalationEvent.escalation_id)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
 async def _record_escalation(
     session: AsyncSession,
     *,
@@ -525,16 +543,31 @@ class Orchestrator:
         escalation: EscalationDecision | None = None
         if outcome.fired:
             escalation = outcome
-            await _record_escalation(
-                self.session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                session_id=session_id,
-                resolved_lead_id=resolved_lead_id,
-                signal=(outcome.signal or Signal.cannot_answer).value,
-                gate="outcome",
-                score=outcome.score_or_confidence,
+            # cannot_answer fires AT MOST ONCE per session (live-caught 2026-08-18:
+            # every below-floor turn of one call emailed the owner again). The turn's
+            # own state still reports the escalation (LoopResult) — only the repeat
+            # row + repeat notification are suppressed. high_value_lead, budget, and
+            # llm_unavailable are NOT deduped: each is a fresh business event.
+            suppress = (
+                outcome.signal == Signal.cannot_answer
+                and await _session_already_escalated(
+                    self.session,
+                    admin_id=admin_id,
+                    session_id=session_id,
+                    signal=Signal.cannot_answer.value,
+                )
             )
+            if not suppress:
+                await _record_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=(outcome.signal or Signal.cannot_answer).value,
+                    gate="outcome",
+                    score=outcome.score_or_confidence,
+                )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the

@@ -148,3 +148,31 @@ def test_fabricated_answer_still_scores_at_or_near_zero_despite_wrapper() -> Non
     result = score_grounding(answer, [irrelevant_chunk], False)
     assert result.score < GROUNDING_FLOOR
     assert result.grounded is False
+
+
+def test_conversational_pleasantry_with_zero_grounding_does_not_escalate() -> None:
+    """Live-caught 2026-08-18: the caller declining Luciel's follow-up offer ("No its
+    alright thankyou") scored 0.0 grounding — a social turn retrieves nothing — and
+    escalated as cannot_answer. A conversational turn has no factual claim for the
+    floor to gate, so it must not fire."""
+    decision = evaluate_outcome(
+        message="No its alright thankyou",
+        plan_confidence=1.0,
+        grounding_score=0.0,
+        resolving_tool_succeeded=False,
+    )
+    assert decision.fired is False
+
+
+def test_conversational_skip_never_weakens_the_or_gate_for_questions() -> None:
+    """The classifier narrows WHICH turns count as answers; for a real question the
+    grounding OR-gate is unchanged (doctrine: never an AND). Sits deliberately beside
+    test_confident_but_ungrounded_answer_still_escalates."""
+    decision = evaluate_outcome(
+        message="how much is a water heater",
+        plan_confidence=1.0,
+        grounding_score=0.0,
+        resolving_tool_succeeded=False,
+    )
+    assert decision.fired is True
+    assert decision.signal is Signal.cannot_answer

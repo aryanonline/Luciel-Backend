@@ -90,7 +90,11 @@ modules rather than duplicating business rules in a new location.
 - State that Luciel is an AI on every customer channel; preserve the disclosure in
   greetings and never represent a human as answering.
 - Persist real grounding scores. The floor is 0.50; low grounding **or** low
-  confidence must refuse/escalate. Never change that to an AND gate.
+  confidence must refuse/escalate. Never change that to an AND gate. A
+  deterministic conversational-turn classifier (escalation.is_conversational_turn)
+  skips ONLY the gate-2 cannot_answer check for social turns (thanks/declines/
+  goodbyes — no factual claim to ground); the OR-gate for real questions is
+  untouched. cannot_answer fires at most once per session.
 - Use explicit evidence states: `has_sources`, `no_sources_retrieved`, or
   `attribution_unavailable`; legacy answers are “Not scored (before scoring existed)”.
 - Tool outcomes use `ok`, `empty`, `ambiguous`, `failed`, or `missing_input` and
