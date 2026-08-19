@@ -264,7 +264,10 @@ async def test_designating_the_byo_number_keeps_the_credential_and_runs_the_a2p_
         for c in (await client.get("/api/v1/admin/connections")).json()
         if c["connectionType"] == "sms_sender"
     )
-    assert row["nonSecretConfig"]["destination"] == number
+    # c21 anti-squatting: a number the probe could not confirm is NOT the routable
+    # claim — it waits under pending_destination until a confirmed re-verify.
+    assert row["nonSecretConfig"]["pending_destination"] == number
+    assert "destination" not in row["nonSecretConfig"]
     # The credential survived the designation — attaching a number must not re-open the
     # connect form the owner already completed.
     assert row["nonSecretConfig"]["accountSid"] == "AC" + "3" * 30
@@ -283,14 +286,19 @@ async def test_outbound_sms_sends_through_the_tenants_own_twilio(client, monkeyp
     admin_id = _admin_id(client)
     instance_id = await _instance_id(admin_id)
     await _connect_twilio(client, {"accountSid": "AC" + "4" * 30, "authToken": "tok-4"})
-    await client.post(
-        "/api/v1/admin/connections",
-        json={
-            "connectionType": "sms_sender",
-            "provider": "twilio",
-            "phoneNumber": "+15550000456",
-        },
-    )
+    # Attach with a CONFIRMED-operable probe (service layer): outbound needs the
+    # routable claim, which mock's never-operable probe deliberately withholds (c21).
+    from app.channels.number_operability import NullOperabilityProbe
+    from app.channels.phone_lifecycle import attach_sms_number
+
+    async with tenant_session(admin_id) as s:
+        await attach_sms_number(
+            s,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            e164_number="+15550000456",
+            probe=NullOperabilityProbe(operable_numbers={"+15550000456"}),
+        )
 
     async with tenant_session(admin_id) as s:
         creds = await tenant_twilio.load_tenant_credentials(s, admin_id, instance_id)
