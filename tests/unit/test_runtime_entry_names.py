@@ -1,7 +1,8 @@
 """LIVE-VERIFIED (Harmony wave 2, item 1): cross-channel speaker-name composition.
 
-app.channels.runtime_entry._names is the SMS/email/WhatsApp/Instagram-Messenger
-analogue of app.api.v1.chat_widget._names. Both must fall back to the business
+app.channels.runtime_entry.names is the SMS/email/WhatsApp/Instagram-Messenger
+analogue of app.api.v1.chat_widget._names (public since c19 — the voice
+pipeline reuses it). Both must fall back to the business
 name VERBATIM (never "{business}'s assistant") when no assistantName override is
 configured, or a business/Luciel name already ending in the word "Assistant"
 (e.g. "Aryan's Front-Desk Assistant") doubles into "...Assistant's assistant"
@@ -10,7 +11,7 @@ once the greeting template appends its own disclosure clause.
 
 from __future__ import annotations
 
-from app.channels.runtime_entry import _names as runtime_entry_names
+from app.channels.runtime_entry import names as runtime_entry_names
 from app.models.instance import Instance, LucielState
 
 
