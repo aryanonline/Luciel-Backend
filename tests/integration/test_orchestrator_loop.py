@@ -229,9 +229,13 @@ async def test_at_cap_returns_graceful_reply_without_counting():
             mode="ai",
             inbound_text="hello",
         )
-        # Graceful at-cap reply, no LLM, no increment (§3.4.1b).
+        # Graceful at-cap reply, no LLM, no increment (§3.4.1b). Since audit round 3
+        # (C5) the anonymous-widget contact ask rides on the at-cap reply too — the
+        # at-cap escalation flags the owner about a visitor the team must be able to
+        # reach ("leads still captured + escalated" at cap).
         assert result.at_cap is True
-        assert result.reply_text == AT_CAP_REPLY
+        assert result.reply_text.startswith(AT_CAP_REPLY)
+        assert "what's your name" in result.reply_text
         assert result.counted is False
         state = await budget.check_budget(s, admin_id=admin, instance_id=iid)
         assert state.counted == state.free_allowance  # unchanged by the capped turn

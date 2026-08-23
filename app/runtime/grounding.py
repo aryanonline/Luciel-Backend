@@ -175,12 +175,19 @@ def faithful_readback_ok(answer: str, allowed_fields: dict[str, object]) -> bool
     """Faithful-readback (§3.4.13): Luciel may only state fields a tool result actually
     contains. A naive but real guard: every numeric/value token claimed in the answer
     that looks like a confirming field must be present in allowed_fields' values.
+
+    The token pattern deliberately has NO trailing word boundary and includes ":" —
+    "booked for 3pm" must surface the claimed "3" (digit→letter is not a regex word
+    boundary, so a trailing ``\\b`` silently missed exactly the time-of-day drift this
+    guard exists for), and "14:00" reads as one token on both sides. Identifier-embedded
+    digits ("ref77") stay unclaimed: no boundary precedes them.
     """
     import re
 
-    claimed_numbers = set(re.findall(r"\b\d[\d,\.]*\b", answer))
+    token = r"\b\d[\d,\.:]*"
+    claimed_numbers = set(re.findall(token, answer))
     allowed_numbers: set[str] = set()
     for v in allowed_fields.values():
-        allowed_numbers |= set(re.findall(r"\b\d[\d,\.]*\b", str(v)))
+        allowed_numbers |= set(re.findall(token, str(v)))
     # Any claimed number not present in the allowed fields is a faithful-readback breach.
     return claimed_numbers.issubset(allowed_numbers) if claimed_numbers else True

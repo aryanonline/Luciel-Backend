@@ -378,11 +378,11 @@ async def test_voice_turn_threads_the_instance_persona_and_context():
     class RecordingModel:
         name = "recorder"
 
-        async def complete(self, system_prompt, messages):
+        async def complete(self, system_prompt, messages, *, tools=None):
             captured.append(system_prompt)
             from app.runtime.testing import EchoModel
 
-            return await EchoModel(confidence=0.9).complete(system_prompt, messages)
+            return await EchoModel(confidence=0.9).complete(system_prompt, messages, tools=tools)
 
     admin, iid = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:

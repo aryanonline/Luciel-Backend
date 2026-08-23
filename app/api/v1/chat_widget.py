@@ -23,7 +23,7 @@ for 'widget'); the loop enforces this in memory.load_cross_session_summaries.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import select
@@ -41,7 +41,7 @@ from app.models.instance import Instance, is_paused
 from app.runtime import budget, session_close
 from app.runtime.input_safety import _compose_greeting
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
-from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
+from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator, persist_turn
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import effective_config, resolve_or_open_session
 from app.schemas_api.widget import (
@@ -233,7 +233,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         # the widget had no multi-turn memory and each turn counted as a new conversation
         # (§9.5). Matching is scoped to this tenant/instance/channel, and the §3.4.9 rule
         # still holds — a resumed session replays only its own transcript.
-        sess, _is_new = await resolve_or_open_session(
+        sess, is_new = await resolve_or_open_session(
             s,
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
@@ -241,6 +241,25 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             resolved_lead_id=None,
             session_id=body.session_id,
         )
+
+        # Double-disclosure fix (audit round 3, C5): the visitor ALREADY saw the
+        # bootstrap opening bubble (the §3.4.16 disclosure), but nothing persisted
+        # it — so the loop's first-message backstop saw no prior assistant turn and
+        # prepended the same greeting again onto the first real reply. Persist the
+        # greeting as the new session's first `luciel` row: the transcript now
+        # matches what the visitor actually saw, and the backstop stands down.
+        # Stamped 1ms before the inbound so ordering is deterministic; reply-time
+        # analytics measure lead→NEXT-luciel gaps, which this row never is.
+        if is_new:
+            await persist_turn(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                session_id=sess.id,
+                role="luciel",
+                text=_disclosure(_disclosure_business_name(inst), _names(inst)[1]),
+                at=received_at - timedelta(milliseconds=1),
+            )
 
         # Arc 16 binds the production hybrid retriever (vector + intent-gated graph,
         # §3.2.1) behind the orchestrator's injected seam — closing the Arc 14/14b empty

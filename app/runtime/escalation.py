@@ -34,6 +34,12 @@ class Signal(str, enum.Enum):
     strong_negative_sentiment = "strong_negative_sentiment"
     cannot_answer = "cannot_answer"
     high_value_lead = "high_value_lead"
+    # Server-originated signals (§3.5.2): fired by the platform, not the judgment
+    # gates. Added (audit round 3, C4) so the LoopResult decision names the SAME
+    # signal the escalation_events row records — the at-cap path used to persist
+    # "budget_exhausted" while returning cannot_answer to the caller.
+    budget_exhausted = "budget_exhausted"
+    llm_unavailable = "llm_unavailable"
 
 
 class Gate(str, enum.Enum):
@@ -226,8 +232,10 @@ def evaluate_outcome(
     # does not apply to it. This narrows WHICH turns count as answers; for real
     # questions the OR-gate below is byte-for-byte unchanged and must never
     # become an AND (harmony fix above still binds).
-    if not resolving_tool_succeeded and not is_conversational_turn(message) and (
-        grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE
+    if (
+        not resolving_tool_succeeded
+        and not is_conversational_turn(message)
+        and (grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE)
     ):
         score = min(plan_confidence, grounding_score)
         return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, score)

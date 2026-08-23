@@ -139,9 +139,11 @@ async def test_send_runs_loop_and_returns_camelcase(client):
     assert body["renderState"] == "active"
     assert "sessionId" in body
     assert body["reply"]["role"] == "assistant"
-    # First reply on a new conversation carries the AI-identity disclosure (§3.4.16)
-    # then the (echoed) answer content.
-    assert "ai assistant" in body["reply"]["text"].lower()
+    # Since C5 (audit round 3) the disclosure is delivered ONCE, by the bootstrap
+    # opening bubble (persisted as the session's first luciel row) — the first reply
+    # must NOT repeat it (tests/contract/test_widget_single_disclosure.py pins the
+    # full arc). The reply is the (echoed) answer content.
+    assert "ai assistant" not in body["reply"]["text"].lower()
     assert "Echo:" in body["reply"]["text"]
 
 

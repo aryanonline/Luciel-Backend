@@ -247,6 +247,13 @@ async def handle_turn(
 
     effective = effective_config(sess.config_snapshot, instance, always_include_channel="voice")
     _business, assistant = names(instance)
+    # Tool wiring (audit round 3, C5 — voice parity): the voice Orchestrator was
+    # built with NO tool_resolver, so a caller could never be booked or looked up —
+    # every proposed tool resolved to `failed` while the text channels dispatched
+    # normally. Voice now mirrors runtime_entry.py exactly: same resolver, same
+    # snapshot capability set (§3.8.7 rule E).
+    from app.tools.registry import make_tool_resolver  # noqa: PLC0415
+
     orch = Orchestrator(
         session=session,
         router=router,
@@ -260,6 +267,8 @@ async def handle_turn(
         business_context=effective.business_context,
         personality=effective.personality,
         has_payment_method=has_payment_method,
+        snapshot_tool_ids=effective.snapshot_tool_ids,
+        tool_resolver=make_tool_resolver(),
     )
     result = await orch.run_turn(
         session_id=sess.id,

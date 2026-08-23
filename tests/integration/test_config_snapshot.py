@@ -262,7 +262,9 @@ async def test_capability_in_snapshot_and_live_authorized_succeeds():
         await s.flush()
     resolved: list[str] = []
     outcomes = await _run_tool_turn(admin, iid, snapshot_tool_ids={TOOL_ID}, resolved=resolved)
-    assert resolved == [TOOL_ID]  # capability present → resolver consulted
+    # Capability present → the resolver is consulted (since C4 twice: once building
+    # the turn's tool defs, once at dispatch) and only for this tool.
+    assert resolved and set(resolved) == {TOOL_ID}
     assert outcomes == ["ok"]
 
 
@@ -276,7 +278,7 @@ async def test_live_disable_still_blocks_a_snapshotted_capability_immediately():
     # NO InstanceToolAuthorization row → live authorization denied (mid-session disable).
     resolved: list[str] = []
     outcomes = await _run_tool_turn(admin, iid, snapshot_tool_ids={TOOL_ID}, resolved=resolved)
-    # Capability present → the broker IS consulted (the loop retries the denied tool up
-    # to MAX_ITERATIONS), but the LIVE authorization gate denies every attempt → failed.
+    # Capability present → the broker IS consulted, but the LIVE authorization gate
+    # denies the attempt → failed (never a silent success; §3.8.7 rule E safety side).
     assert resolved and all(t == TOOL_ID for t in resolved)
     assert outcomes and all(o == "failed" for o in outcomes)

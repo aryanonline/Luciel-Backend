@@ -29,7 +29,9 @@ class CapturingModel:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, str]]] = []
 
-    async def complete(self, system_prompt: str, messages: list[dict[str, str]]) -> LLMResponse:
+    async def complete(
+        self, system_prompt: str, messages: list[dict[str, str]], *, tools: object = None
+    ) -> LLMResponse:
         self.calls.append([dict(m) for m in messages])
         return LLMResponse(
             text="Happy to help again!",

@@ -45,10 +45,13 @@ and the production retriever binds behind the same signature.
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,7 +67,7 @@ from app.notifications.escalation_dispatch import (
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
-from app.runtime.grounding import score_grounding
+from app.runtime.grounding import faithful_readback_ok, score_grounding
 from app.runtime.input_safety import (
     build_system_prompt,
     detect_injection,
@@ -75,9 +78,38 @@ from app.runtime.input_safety import (
 )
 from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
-from app.tools.contract import Tool
+from app.tools import contract as tool_contract
+from app.tools.contract import Tool, ToolResult
+from app.tools.schemas import ACTION_TOOLS, build_tool_defs
 
 MAX_ITERATIONS = 5  # §3.4.1 — internal cost-control constant, identical on every tier.
+
+# §3.3.7 give-up condition (audit round 3, C4): after this many consecutive turns in
+# which the broker rejected the model's tool intent as missing_input/ambiguous with
+# nothing resolving, Luciel stops re-asking and hands the thread to a human with the
+# partial context. Deterministic, in code — never trusted to the model.
+ASK_ATTEMPT_BOUND = 2
+
+# Structured tool feedback caps (C4): the redacted result JSON fed back to the model
+# is length-capped, and an ambiguous candidate list is truncated, so a huge record or
+# candidate set cannot blow out the context window.
+TOOL_RESULT_CONTENT_CAP = 2000
+AMBIGUOUS_CANDIDATE_CAP = 5
+
+# Conservative success-claim detector (§3.3.4 rule 1 backstop): verbs a reply may not
+# use about an ACTION tool when no action returned `ok` this turn.
+_SUCCESS_CLAIM = re.compile(
+    r"\b(booked|scheduled|rescheduled|cancelled|canceled|confirmed|sent|delivered|"
+    r"added to (?:the|your) calendar|updated your)\b",
+    re.IGNORECASE,
+)
+
+# Honest replacement when the model claimed an action that did not happen (C4). The
+# copy follows the escalation-honesty doctrine: passed to the team, never "connecting".
+_UNFOUNDED_CLAIM_REPLACEMENT = (
+    "I wasn't able to complete that just now — I've flagged it for the team, and "
+    "someone will follow up with you shortly."
+)
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
@@ -365,39 +397,15 @@ class Orchestrator:
             at=received_at,
         )
 
-        # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
-        budget_state = await budget.check_budget(
-            self.session,
-            admin_id=admin_id,
-            instance_id=instance_id,
-            has_payment_method=self.has_payment_method,
-        )
-        if budget_state.at_cap:
-            # Graceful single-turn reply WITHOUT an LLM call; cannot_answer with
-            # reason budget_exhausted; counter does NOT increment (§3.4.1b).
-            await self._emit_budget_exhausted(session_id, resolved_lead_id)
-            await persist_turn(
-                self.session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                session_id=session_id,
-                role="luciel",
-                text=AT_CAP_REPLY,
-                at=datetime.now(UTC),
-            )
-            return LoopResult(
-                reply_text=AT_CAP_REPLY,
-                outbound_channel=channel,
-                counted=False,
-                at_cap=True,
-                escalation=EscalationDecision(True, Signal.cannot_answer),
-            )
-
         # --- LEAD CAPTURE COGNITION (§3.4.4 / §3.4.9) — always on ------------ #
         # Write/maintain the platform-owned Lead record and promote a weak widget
         # token to a real lead once a strong identifier is volunteered. The returned
         # id (if any) is threaded through escalation payloads + finalization so the
         # dashboard leads view and escalation notifications are actually populated.
+        # Runs BEFORE the budget gate (C5 — audit round 3): capture is deterministic
+        # cognition with no LLM call, and the docs promise "leads still captured +
+        # escalated" AT CAP — the at-cap escalation row used to carry no lead id
+        # because capture only ran after the gate.
         sess_obj = (
             await self.session.execute(
                 select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
@@ -416,6 +424,43 @@ class Orchestrator:
             if captured is not None:
                 resolved_lead_id = captured
 
+        # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
+        budget_state = await budget.check_budget(
+            self.session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            has_payment_method=self.has_payment_method,
+        )
+        if budget_state.at_cap:
+            # Graceful single-turn reply WITHOUT an LLM call; escalation row signal
+            # budget_exhausted; counter does NOT increment (§3.4.1b).
+            await self._emit_budget_exhausted(session_id, resolved_lead_id)
+            at_cap_reply = self._with_contact_ask(
+                AT_CAP_REPLY,
+                channel=channel,
+                resolved_lead_id=resolved_lead_id,
+                transport_identifier=transport_identifier,
+            )
+            await persist_turn(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                role="luciel",
+                text=at_cap_reply,
+                at=datetime.now(UTC),
+            )
+            return LoopResult(
+                reply_text=at_cap_reply,
+                outbound_channel=channel,
+                counted=False,
+                at_cap=True,
+                # The decision names the SAME signal the escalation row records (C4
+                # harmony fix — it used to say cannot_answer while the row said
+                # budget_exhausted).
+                escalation=EscalationDecision(True, Signal.budget_exhausted),
+            )
+
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
         mod = moderate(inbound_text)
         if mod.should_escalate:
@@ -427,7 +472,12 @@ class Orchestrator:
                 signal=Signal.explicit_human_request,
                 gate="intake",
                 score=None,
-                ack=await self._handoff_ack(),
+                ack=self._with_contact_ask(
+                    await self._handoff_ack(),
+                    channel=channel,
+                    resolved_lead_id=resolved_lead_id,
+                    transport_identifier=transport_identifier,
+                ),
             )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -448,7 +498,12 @@ class Orchestrator:
                 signal=intake.signal or Signal.explicit_human_request,
                 gate="intake",
                 score=intake.score_or_confidence,
-                ack=await self._handoff_ack(),
+                ack=self._with_contact_ask(
+                    await self._handoff_ack(),
+                    channel=channel,
+                    resolved_lead_id=resolved_lead_id,
+                    transport_identifier=transport_identifier,
+                ),
             )
 
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
@@ -478,6 +533,24 @@ class Orchestrator:
             exclude_session_id=session_id,
         )
 
+        # --- TOOL DEFS for this turn (C4) ------------------------------------ #
+        # The model is told about exactly the tools this conversation may dispatch:
+        # snapshot capability (§3.8.7 rule E) ∩ live enabled authorizations ∩
+        # resolver-known. The broker still enforces every gate in code at dispatch
+        # (§3.4.14 Defense 1) — this only determines what the model is TOLD.
+        tool_defs = await self._turn_tool_defs()
+        system_prompt = (
+            build_system_prompt(
+                self.business_context,
+                self.luciel_email_address,
+                self.personality,
+                assistant_name=self.assistant_name,
+                tool_catalog=tool_defs,
+            )
+            if tool_defs
+            else self.system_prompt
+        )
+
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
         resp, iterations, used_fallback, llm_failed = await self._reason(
             inbound_text,
@@ -485,14 +558,19 @@ class Orchestrator:
             wrapped_chunks,
             resolved_lead_id=resolved_lead_id,
             prior_summaries=prior_summaries,
+            system_prompt=system_prompt,
+            tool_defs=tool_defs,
         )
 
         if llm_failed:
             # Both providers down → llm_unavailable escalation (§3.4.5 server signal).
             await self._emit_llm_unavailable(session_id, resolved_lead_id)
-            ack = (
+            ack = self._with_contact_ask(
                 "I'm having a brief technical issue — I've flagged this so a person "
-                "can follow up with you shortly."
+                "can follow up with you shortly.",
+                channel=channel,
+                resolved_lead_id=resolved_lead_id,
+                transport_identifier=transport_identifier,
             )
             await persist_turn(
                 self.session,
@@ -511,7 +589,8 @@ class Orchestrator:
                 reply_text=ack,
                 outbound_channel=channel,
                 counted=False,
-                escalation=EscalationDecision(True, Signal.cannot_answer),
+                # Same-signal harmony as the persisted llm_unavailable row (C4).
+                escalation=EscalationDecision(True, Signal.llm_unavailable),
                 iterations=iterations,
             )
 
@@ -528,6 +607,40 @@ class Orchestrator:
             await metering.report_usage_after_count(
                 self.session, admin_id=admin_id, instance_id=instance_id
             )
+
+        # --- §3.3.7 ASK-ATTEMPT BOUND (C4) ----------------------------------- #
+        # A turn that ended with the broker rejecting the model's tool intent as
+        # missing_input/ambiguous and nothing resolving is a STALLED GATHER: the
+        # model's reply is (per the T1/T3 stanzas) a question back to the customer.
+        # Asking is bounded, not infinite — after ASK_ATTEMPT_BOUND consecutive
+        # stalled turns, Luciel stops re-asking and hands off with the context
+        # (§3.3.7 rule 4). An `ok` outcome resets the counter: the gather worked.
+        any_ok = any(r.outcome is tool_contract.Outcome.ok for _, r in resp.dispatched)
+        stalled = not any_ok and any(
+            r.outcome in (tool_contract.Outcome.missing_input, tool_contract.Outcome.ambiguous)
+            for _, r in resp.dispatched
+        )
+        if sess_obj is not None:
+            if stalled:
+                sess_obj.input_ask_attempts += 1
+                if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
+                    sess_obj.input_ask_attempts = 0
+                    return await self._hand_off_with_ack(
+                        session_id=session_id,
+                        resolved_lead_id=resolved_lead_id,
+                        channel=channel,
+                        signal=Signal.cannot_answer,
+                        gate="outcome",
+                        score=None,
+                        ack=self._with_contact_ask(
+                            await self._handoff_ack(),
+                            channel=channel,
+                            resolved_lead_id=resolved_lead_id,
+                            transport_identifier=transport_identifier,
+                        ),
+                    )
+            elif any_ok and sess_obj.input_ask_attempts:
+                sess_obj.input_ask_attempts = 0
 
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
         tool_succeeded = any(o == "ok" for o in resp.tool_outcomes)
@@ -548,14 +661,11 @@ class Orchestrator:
             # own state still reports the escalation (LoopResult) — only the repeat
             # row + repeat notification are suppressed. high_value_lead, budget, and
             # llm_unavailable are NOT deduped: each is a fresh business event.
-            suppress = (
-                outcome.signal == Signal.cannot_answer
-                and await _session_already_escalated(
-                    self.session,
-                    admin_id=admin_id,
-                    session_id=session_id,
-                    signal=Signal.cannot_answer.value,
-                )
+            suppress = outcome.signal == Signal.cannot_answer and await _session_already_escalated(
+                self.session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=Signal.cannot_answer.value,
             )
             if not suppress:
                 await _record_escalation(
@@ -573,22 +683,55 @@ class Orchestrator:
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
         reply_text = pre_send_check(resp.text)
-        # Escalation-time contact ask (owner-directed 2026-08-18): when this turn
-        # escalated on a channel that carries NO transport identity and no lead is
-        # on file, the team has been flagged about someone they cannot reach. Ask —
-        # deterministically, in code, never trusting the model to remember — so the
-        # visitor's NEXT turn can volunteer contact info that the existing
-        # extract_lead_signals capture promotes to a Lead row. Strong channels
-        # (voice/SMS/email/Meta) skip this: the transport already names the person.
-        if (
-            escalation is not None
-            and resolved_lead_id is None
-            and transport_identifier is None
-            and channel == "widget"
-        ):
-            reply_text = (
-                f"{reply_text}\n\nSo the team can reach you, what's your name and "
-                "the best email or phone number to contact you at?"
+
+        # --- FAITHFUL READBACK ENFORCEMENT (§3.3.4 rule 1 / §3.4.13, C4) ------ #
+        action_results = [
+            (call, r) for call, r in resp.dispatched if str(call.get("tool_id", "")) in ACTION_TOOLS
+        ]
+        ok_actions = [(c_, r) for c_, r in action_results if r.outcome is tool_contract.Outcome.ok]
+        if action_results and not ok_actions and _SUCCESS_CLAIM.search(reply_text):
+            # The model claimed an action no tool confirmed — replace with the honest
+            # failure ack and make sure a human is flagged (dedupe-suppressed like any
+            # other cannot_answer repeat).
+            reply_text = _UNFOUNDED_CLAIM_REPLACEMENT
+            if escalation is None:
+                escalation = EscalationDecision(True, Signal.cannot_answer, None, None)
+                if not await _session_already_escalated(
+                    self.session,
+                    admin_id=admin_id,
+                    session_id=session_id,
+                    signal=Signal.cannot_answer.value,
+                ):
+                    await _record_escalation(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        resolved_lead_id=resolved_lead_id,
+                        signal=Signal.cannot_answer.value,
+                        gate="outcome",
+                        score=None,
+                    )
+        elif ok_actions:
+            # A confirmed action's numbers must come from its payload; on a mismatch,
+            # append the deterministic confirmation built from what actually happened
+            # rather than shipping an embellished readback (grounding.py guard's first
+            # load-bearing caller).
+            confirmed_fields: dict[str, object] = {}
+            for _, r in ok_actions:
+                confirmed_fields.update(r.payload)
+            if not faithful_readback_ok(reply_text, confirmed_fields):
+                summary = ", ".join(
+                    f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
+                )
+                reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
+        # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
+        if escalation is not None:
+            reply_text = self._with_contact_ask(
+                reply_text,
+                channel=channel,
+                resolved_lead_id=resolved_lead_id,
+                transport_identifier=transport_identifier,
             )
         # AI-identity disclosure backstop (§3.4.16): on the FIRST outbound of a new
         # conversation on a text channel, guarantee the disclosure in code rather than
@@ -630,6 +773,63 @@ class Orchestrator:
         )
 
     # --- internals ---------------------------------------------------------- #
+    async def _turn_tool_defs(self) -> list[dict[str, Any]] | None:
+        """The provider-neutral tool defs THIS turn may propose (C4).
+
+        Intersection of: the session's frozen snapshot capability set (§3.8.7 rule E;
+        None = older session → no snapshot filter), the instance's LIVE enabled
+        authorizations (default-deny — an unauthorized tool is never even described
+        to the model), and the ids the resolver can bind. None when no tools are
+        wired — which keeps the call byte-identical to pre-tool-use behavior."""
+        if self.tool_resolver is None:
+            return None
+        from app.models.tool_auth import InstanceToolAuthorization  # noqa: PLC0415
+
+        rows = (
+            await self.session.execute(
+                select(InstanceToolAuthorization.tool_id).where(
+                    InstanceToolAuthorization.admin_id == self.admin_id,
+                    InstanceToolAuthorization.instance_id == self.instance_id,
+                    InstanceToolAuthorization.enabled.is_(True),
+                )
+            )
+        ).scalars()
+        enabled = set(rows)
+        if self.snapshot_tool_ids is not None:
+            enabled &= self.snapshot_tool_ids
+        enabled = {tid for tid in enabled if self.tool_resolver(tid) is not None}
+        return build_tool_defs(enabled) if enabled else None
+
+    @staticmethod
+    def _tool_result_feedback(call: dict[str, Any], result: ToolResult) -> str:
+        """The redacted, structured JSON the model reads back for one dispatch (C4).
+
+        Carries what §3.3.4 says the loop must be able to distinguish: the outcome
+        class, the confirming payload on ok, the candidate list on ambiguous
+        (truncated), the NAMED missing fields on missing_input, and the non-secret
+        reason on failed. Length-capped so a huge record cannot flood the context."""
+        body: dict[str, Any] = {
+            "tool": str(call.get("tool_id", "")),
+            "outcome": result.outcome.value,
+        }
+        if result.outcome is tool_contract.Outcome.ok:
+            body["payload"] = result.payload
+        elif result.outcome is tool_contract.Outcome.ambiguous:
+            candidates = list(result.payload.get("candidates") or [])
+            body["candidates"] = candidates[:AMBIGUOUS_CANDIDATE_CAP]
+            if len(candidates) > AMBIGUOUS_CANDIDATE_CAP:
+                body["more_candidates"] = len(candidates) - AMBIGUOUS_CANDIDATE_CAP
+        elif result.outcome is tool_contract.Outcome.missing_input:
+            body["missing_fields"] = list(result.missing_fields)
+        elif result.outcome is tool_contract.Outcome.empty:
+            body["payload"] = result.payload
+        else:  # failed
+            body["reason"] = result.reason or "failed"
+        text = json.dumps(body, default=str)
+        if len(text) > TOOL_RESULT_CONTENT_CAP:
+            text = text[:TOOL_RESULT_CONTENT_CAP] + '… (truncated)"}'
+        return text
+
     async def _reason(
         self,
         inbound_text: str,
@@ -638,11 +838,18 @@ class Orchestrator:
         *,
         resolved_lead_id: uuid.UUID | None = None,
         prior_summaries: list[str] | None = None,
+        system_prompt: str | None = None,
+        tool_defs: list[dict[str, Any]] | None = None,
     ) -> tuple[_Reasoned, int, bool, bool]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and
-        whether BOTH providers failed (llm_failed)."""
-        messages: list[dict[str, str]] = []
+        whether BOTH providers failed (llm_failed).
+
+        Termination (C4): the loop ends when a response proposes NO tool calls —
+        natural completion — or at the iteration bound. Tool results are fed back as
+        structured neutral ``tool_result`` turns (payloads, named missing fields,
+        candidate lists — §3.3.4), never as bare outcome-class strings."""
+        messages: list[dict[str, Any]] = []
         if prior_summaries:
             # §3.4.6 cross-session memory, injected BEFORE this session's history.
             # Summaries derive from lead-authored content, so they enter the context
@@ -661,43 +868,59 @@ class Orchestrator:
         if wrapped_chunks:
             messages.append({"role": "user", "content": "Knowledge:\n" + "\n".join(wrapped_chunks)})
 
+        prompt = system_prompt if system_prompt is not None else self.system_prompt
         used_fallback = False
         tool_outcomes: list[str] = []
+        dispatched: list[tuple[dict[str, Any], ToolResult]] = []
         last: LLMResponse | None = None
         iterations = 0
         for _ in range(MAX_ITERATIONS):
             iterations += 1
             try:
-                resp = await self.router.complete(self.system_prompt, messages)
+                resp = await self.router.complete(prompt, messages, tools=tool_defs)
             except ProviderError:
                 # Router already failed primary→fallback; a ProviderError here means
                 # BOTH providers are down (§3.4.3 immediate failover, no retry).
-                return _Reasoned("", 0.0, tool_outcomes), iterations, used_fallback, True
+                return (
+                    _Reasoned("", 0.0, tool_outcomes, dispatched),
+                    iterations,
+                    used_fallback,
+                    True,
+                )
             used_fallback = used_fallback or resp.used_fallback
             last = resp
-            # ACT: dispatch any proposed tool calls via the Arc 12 broker contract.
-            if resp.tool_calls:
-                outcomes = await self._dispatch_tools(
-                    resp.tool_calls, resolved_lead_id=resolved_lead_id
-                )
-                tool_outcomes.extend(outcomes)
-                # REFLECT: feed tool outcomes back as untrusted context, iterate.
+            if not resp.tool_calls:
+                # Natural completion: the model answered without (further) tool use.
+                break
+            # ACT: dispatch the proposed calls via the Arc 12 broker contract, then
+            # REFLECT: append the assistant's tool turn + one structured tool_result
+            # turn per call (untrusted-wrapped — results embed lead/provider content).
+            results = await self._dispatch_tools(resp.tool_calls, resolved_lead_id=resolved_lead_id)
+            dispatched.extend(results)
+            tool_outcomes.extend(r.outcome.value for _, r in results)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": resp.text,
+                    "tool_calls": resp.tool_calls,
+                }
+            )
+            for call, result in results:
                 messages.append(
                     {
-                        "role": "user",
-                        "content": wrap_untrusted("Tool outcomes: " + ",".join(outcomes)),
+                        "role": "tool_result",
+                        "call_id": str(call.get("call_id", "")),
+                        "tool_id": str(call.get("tool_id", "")),
+                        "content": wrap_untrusted(self._tool_result_feedback(call, result)),
+                        "is_error": result.outcome is tool_contract.Outcome.failed,
                     }
                 )
-                if all(o == "ok" for o in outcomes):
-                    break
-                continue
-            break
 
         if last is None:
             # Unreachable: MAX_ITERATIONS >= 1 so the loop always assigns or returns.
             raise RuntimeError("reasoning produced no response")
         return (
-            _Reasoned(last.text, last.confidence, tool_outcomes),
+            _Reasoned(last.text, last.confidence, tool_outcomes, dispatched),
             iterations,
             used_fallback,
             False,
@@ -708,15 +931,20 @@ class Orchestrator:
         tool_calls: list[dict[str, object]],
         *,
         resolved_lead_id: uuid.UUID | None = None,
-    ) -> list[str]:
-        """Dispatch PLAN tool intents via the Arc 12 broker, returning the
-        five-outcome class per call (§3.3.3/§3.3.4). The broker enforces
-        default-deny authorization + connection gating in code — the loop never
-        trusts the model to self-authorize a tool (§3.4.14)."""
+    ) -> list[tuple[dict[str, Any], ToolResult]]:
+        """Dispatch PLAN tool intents via the Arc 12 broker, returning each proposed
+        call paired with its full five-outcome result (§3.3.3/§3.3.4). The broker
+        enforces default-deny authorization + connection gating in code — the loop
+        never trusts the model to self-authorize a tool (§3.4.14).
+
+        The two loop-side refusals carry DISTINCT reasons (C4 harmony fix — both
+        used to read as a bare "failed", indistinguishable from a provider error):
+        ``tool_not_in_snapshot`` for the §3.8.7 rule-E capability gate, and
+        ``tool_unavailable`` for an id the resolver cannot bind."""
         from app.tools.broker import ToolBroker
 
         broker = ToolBroker(self.session)
-        outcomes: list[str] = []
+        results: list[tuple[dict[str, Any], ToolResult]] = []
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
             inputs = call.get("inputs", {})
@@ -726,13 +954,13 @@ class Orchestrator:
             # additive change → structured `failed`, never a silent success-claim
             # (§3.3.4 rule 1). None snapshot = older session → skip this filter.
             if self.snapshot_tool_ids is not None and tool_id not in self.snapshot_tool_ids:
-                outcomes.append("failed")
+                results.append((dict(call), tool_contract.failed("tool_not_in_snapshot")))
                 continue
             tool = self.tool_resolver(tool_id) if self.tool_resolver else None
             if tool is None:
                 # No backend wired (Arc 17) or unknown tool → structured failure,
                 # never a silent success-claim (§3.3.4 rule 1).
-                outcomes.append("failed")
+                results.append((dict(call), tool_contract.failed("tool_unavailable")))
                 continue
             result = await broker.dispatch(
                 tool,
@@ -741,8 +969,32 @@ class Orchestrator:
                 instance_id=self.instance_id,
                 resolved_lead_id=resolved_lead_id,
             )
-            outcomes.append(result.outcome.value)
-        return outcomes
+            results.append((dict(call), result))
+        return results
+
+    @staticmethod
+    def _with_contact_ask(
+        reply_text: str,
+        *,
+        channel: str,
+        resolved_lead_id: uuid.UUID | None,
+        transport_identifier: str | None,
+    ) -> str:
+        """Append the contact ask for an anonymous escalated visitor (C5).
+
+        Owner-directed 2026-08-18, extended audit round 3: when a turn escalates on a
+        channel that carries NO transport identity and no lead is on file, the team
+        has been flagged about someone they cannot reach — so ask, deterministically,
+        in code. Previously only the gate-2 path asked; gate-1 (the most likely
+        trigger: "can I talk to a human"), moderation, at-cap, and llm_unavailable
+        all escalated an anonymous widget visitor without asking. Strong channels
+        (voice/SMS/email/Meta) skip this: the transport already names the person."""
+        if resolved_lead_id is None and transport_identifier is None and channel == "widget":
+            return (
+                f"{reply_text}\n\nSo the team can reach you, what's your name and "
+                "the best email or phone number to contact you at?"
+            )
+        return reply_text
 
     async def _handoff_ack(self) -> str:
         """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4;
@@ -876,3 +1128,6 @@ class _Reasoned:
     text: str
     confidence: float
     tool_outcomes: list[str]
+    # Every (proposed call, broker result) pair this turn dispatched, in order —
+    # run_turn's ask-bound and faithful-readback enforcement read these (C4).
+    dispatched: list[tuple[dict[str, Any], ToolResult]] = field(default_factory=list)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -57,6 +57,13 @@ class Session(Base, TenantMixin, TimestampMixin):
     # set the orchestrator reads from. Usability of each capability stays LIVE via the
     # broker's connection/health gates (safety half wins). NULL → fall back to live config.
     config_snapshot: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # §3.3.7 ask-bound (audit round 3, migration 0046): consecutive turns in this
+    # session that stalled on a broker missing_input/ambiguous rejection with nothing
+    # resolving. Reset on any `ok` tool outcome; at ASK_ATTEMPT_BOUND the orchestrator
+    # stops re-asking and hands off with the partial context (§3.3.7 rule 4).
+    input_ask_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
 
 class Transcript(Base, TenantMixin, TimestampMixin):
