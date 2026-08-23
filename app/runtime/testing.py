@@ -12,11 +12,29 @@ content beyond the input, which keeps grounding/faithful-readback tests meaningf
 
 from __future__ import annotations
 
+import uuid
+from typing import Any
+
 from app.runtime.llm_router import LLMResponse, ModelClass, ProviderError
 
 
 class EchoModel:
-    """A deterministic LLMProvider. Echoes the last user message as the answer."""
+    """A deterministic LLMProvider. Echoes the last user message as the answer.
+
+    Tool-call modeling (audit round 3, C2/C4):
+
+      * ``tool_calls=`` (legacy ctor arg) proposes the given calls on the FIRST
+        ``complete()`` only. The loop's live termination rule is "stop when a
+        response proposes no tool calls" — an every-call proposer would spin every
+        mock tool test to MAX_ITERATIONS, so propose-once is the deterministic
+        equivalent of a model that calls its tool, reads the result, and answers.
+      * ``tool_call_script=`` scripts multi-step tool turns: each ``complete()``
+        pops the next list of calls (then empty). Lets a test model
+        call → result → follow-up call → answer sequences deterministically.
+
+    Every proposed call is normalized to carry a ``call_id`` (synthesized when the
+    test didn't supply one), matching the provider contract.
+    """
 
     def __init__(
         self,
@@ -24,29 +42,50 @@ class EchoModel:
         name: str = "echo",
         confidence: float = 0.9,
         tool_calls: list[dict[str, object]] | None = None,
+        tool_call_script: list[list[dict[str, object]]] | None = None,
         raise_provider_error: bool = False,
         fixed_reply: str | None = None,
     ) -> None:
         self.name = name
         self._confidence = confidence
-        self._tool_calls = tool_calls or []
         self._raise = raise_provider_error
         self._fixed_reply = fixed_reply
+        script = list(tool_call_script) if tool_call_script is not None else []
+        if tool_calls:
+            # Legacy arg = a one-entry script (propose once, then answer).
+            script.insert(0, list(tool_calls))
+        self._script = script
 
-    async def complete(self, system_prompt: str, messages: list[dict[str, str]]) -> LLMResponse:
+    @staticmethod
+    def _with_call_ids(calls: list[dict[str, object]]) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for call in calls:
+            normalized = dict(call)
+            normalized.setdefault("call_id", f"echo_{uuid.uuid4().hex[:8]}")
+            out.append(normalized)
+        return out
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         if self._raise:
             # Exercises immediate failover to the fallback provider (§3.4.3).
             raise ProviderError(f"{self.name}_unavailable")
         last_user = ""
         for m in reversed(messages):
             if m.get("role") == "user":
-                last_user = m.get("content", "")
+                last_user = str(m.get("content", ""))
                 break
         text = self._fixed_reply if self._fixed_reply is not None else f"Echo: {last_user}"
+        calls = self._with_call_ids(self._script.pop(0)) if self._script else []
         return LLMResponse(
             text=text,
             provider=self.name,
             model_class=ModelClass.primary,
             confidence=self._confidence,
-            tool_calls=list(self._tool_calls),
+            tool_calls=calls,
         )

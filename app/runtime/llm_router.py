@@ -17,7 +17,7 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 CONTEXT_TOKEN_BUDGET_FAST = 4000  # §7 #9
 
@@ -34,14 +34,40 @@ class LLMResponse:
     model_class: ModelClass
     confidence: float
     used_fallback: bool = False
-    # Tool-call intents the model proposes (PLAN phase). Each: {tool_id, inputs}.
+    # Tool-call intents the model proposes (PLAN phase). Each:
+    # {call_id, tool_id, inputs} — call_id is the provider's tool-use id (Anthropic
+    # block id / OpenAI tool_call id; synthesized for EchoModel) and MUST be echoed
+    # back on the matching tool_result turn, or the provider APIs reject the thread.
     tool_calls: list[dict[str, object]] = field(default_factory=list)
 
 
 class LLMProvider(Protocol):
+    """One LLM behind a neutral, provider-agnostic completion surface.
+
+    ``messages`` carries three neutral turn shapes (audit round 3, C2), which each
+    provider maps to its native wire format:
+
+      {"role": "user"|"assistant", "content": str}                    — plain turn
+      {"role": "assistant", "content": str,
+       "tool_calls": [{"call_id", "tool_id", "inputs"}]}              — model proposed tools
+      {"role": "tool_result", "call_id": str, "tool_id": str,
+       "content": str, "is_error": bool}                              — broker outcome fed back
+
+    ``tools`` is the provider-neutral tool-def list (app/tools/schemas.build_tool_defs);
+    None keeps the call byte-identical to the pre-tool-use behavior. The neutral shape
+    is what makes failover safe: a thread begun on Anthropic replays correctly through
+    OpenAI because the router stores only neutral turns, never native ones.
+    """
+
     name: str
 
-    async def complete(self, system_prompt: str, messages: list[dict[str, str]]) -> LLMResponse: ...
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse: ...
 
 
 class ProviderError(Exception):
@@ -82,12 +108,13 @@ class LLMRouter:
     async def complete(
         self,
         system_prompt: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         admin_id: uuid.UUID | None = None,
         requires_tools: bool = True,
         context_tokens: int = CONTEXT_TOKEN_BUDGET_FAST + 1,
         complexity: float = 1.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Complete with per-admin_id LLM concurrency cap enforcement (§9 C9).
 
@@ -119,7 +146,9 @@ class LLMRouter:
         )
         if use_fast:
             try:
-                resp = await self._fast.complete(system_prompt, messages)  # type: ignore[union-attr]
+                resp = await self._fast.complete(  # type: ignore[union-attr]
+                    system_prompt, messages, tools=tools
+                )
                 resp.model_class = ModelClass.fast
                 resp.used_fallback = False
                 return resp
@@ -130,11 +159,12 @@ class LLMRouter:
                 pass
 
         try:
-            resp = await self._primary.complete(system_prompt, messages)
+            resp = await self._primary.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = False
             return resp
         except ProviderError:
-            # Immediate failover, NO retry on primary (§3.4.3).
-            resp = await self._fallback.complete(system_prompt, messages)
+            # Immediate failover, NO retry on primary (§3.4.3). The neutral message
+            # shape replays any tool turns correctly through the other provider.
+            resp = await self._fallback.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = True
             return resp

@@ -81,7 +81,7 @@ async def test_anthropic_maps_response_text_and_tool_calls() -> None:
         content=[
             _Block(type="text", text="hello "),
             _Block(type="text", text="world"),
-            _Block(type="tool_use", name="lookup", input={"q": "x"}),
+            _Block(type="tool_use", id="toolu_abc", name="lookup", input={"q": "x"}),
         ]
     )
     p = AnthropicProvider(api_key="fake-anthropic-key", model="model-x")
@@ -91,7 +91,7 @@ async def test_anthropic_maps_response_text_and_tool_calls() -> None:
     assert isinstance(out, LLMResponse)
     assert out.text == "hello world"
     assert out.provider == "anthropic"
-    assert out.tool_calls == [{"tool_id": "lookup", "inputs": {"q": "x"}}]
+    assert out.tool_calls == [{"call_id": "toolu_abc", "tool_id": "lookup", "inputs": {"q": "x"}}]
 
 
 async def test_anthropic_error_maps_to_provider_error() -> None:
