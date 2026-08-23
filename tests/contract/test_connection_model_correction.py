@@ -84,18 +84,32 @@ async def test_providers_accepts_the_camelcase_filter_the_frontend_sends(client)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_salesforce_lead_push_is_honestly_unavailable_on_the_crm_surface(client):
-    """§3.3.6 owner scope: HubSpot push is real; Salesforce push has no effect
-    layer yet. The crm group must serve salesforce configured=false (the UI's
-    "not available yet" row) — a connect button that dead-ends after a real
-    consent screen is the exact dishonesty the registry exists to prevent.
-    KB-read is untouched: the unavailability is scoped to the crm surface."""
+async def test_salesforce_crm_availability_follows_the_oauth_app(client, monkeypatch):
+    """Phase 6.5 (owner decision 2026-08-23): Salesforce lead-push is REAL, so
+    its availability now tracks only whether the platform's Salesforce OAuth app
+    is provisioned — exactly like every other OAuth provider, with no
+    unavailable_for scoping left on the crm surface."""
+    from app.config import Settings
+    from app.connections import registry as registry_module
+
     await _ready_account_with_luciel(client)
     crm = await client.get("/api/v1/admin/connections/providers?connectionType=crm")
     options = {o["provider"]: o for o in crm.json()[0]["providers"]}
+    # This environment holds no Salesforce OAuth app → honestly not offerable yet.
     assert options["salesforce"]["configured"] is False
     # The custom-webhook CRM path is a credential form — always offerable.
     assert options["custom_webhook"]["configured"] is True
+
+    # Provision the app → salesforce becomes a live connect choice.
+    settings = Settings(
+        salesforce_consumer_key="sf-cid",
+        salesforce_consumer_secret="sf-secret",  # noqa: S106 — test fixture
+        salesforce_redirect_uri="https://api.vantagemind.ai/sf-callback",
+    )
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+    crm2 = await client.get("/api/v1/admin/connections/providers?connectionType=crm")
+    options2 = {o["provider"]: o for o in crm2.json()[0]["providers"]}
+    assert options2["salesforce"]["configured"] is True
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -150,8 +164,12 @@ async def test_unconfigured_oauth_providers_report_configured_false(client):
 
     for provider in ("google_calendar", "calendly", "meta", "instagram"):
         assert by_provider[provider]["configured"] is False, provider
+    # live_connector joined the honest-disabled set in Phase 4 (audit round 3):
+    # its lookup effect layer is unbuilt, so offering the form would take a
+    # credential for a tool that answers `failed` on every call.
+    assert by_provider["live_connector"]["configured"] is False
 
-    for provider in ("twilio", "custom_webhook", "csv", "live_connector"):
+    for provider in ("twilio", "custom_webhook", "csv"):
         assert by_provider[provider]["configured"] is True, provider
 
 
@@ -166,7 +184,9 @@ async def test_sms_sender_offers_a_twilio_credential_form(client):
     assert [p["provider"] for p in providers] == ["twilio"]
 
     twilio = providers[0]
-    assert twilio["authKind"] == "credential_form"
+    # OAuth-primary since C10 (owner decision 2026-08-23) — the credential form
+    # below is the explicit "use API keys instead" fallback and stays served.
+    assert twilio["authKind"] == "oauth"
     fields = {f["name"]: f for f in twilio["credentialFields"]}
     assert set(fields) == {"accountSid", "authToken", "apiKeySid", "apiKeySecret"}
     # The Account SID is an identifier and is stored on the row; the rest are secrets and
