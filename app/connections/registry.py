@@ -213,11 +213,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
         client_id_setting="salesforce_consumer_key",
         client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="salesforce_redirect_uri",
-        help_text="Push captured leads into Salesforce — not available yet.",
-        # Lead-PUSH has no Salesforce effect layer yet (owner scope decision:
-        # HubSpot first). KB-read (knowledge_source via _ALSO_ACCEPTED) stays
-        # live — the unavailability is scoped to the crm surface only.
-        unavailable_for=frozenset({"crm"}),
+        # Lead-push is REAL since Phase 6.5 (owner decision 2026-08-23):
+        # SalesforceCrmBackend upserts Lead records in the tenant's own org
+        # (instance_url from token_fields) with the same link/heal discipline
+        # as HubSpot — the crm unavailable_for scoping is gone.
+        help_text="Push captured leads into Salesforce Leads.",
     ),
     "custom_webhook": ProviderSpec(
         provider="custom_webhook",

@@ -19,18 +19,17 @@ Connection-backed (a real effect once the tenant has connected):
   * ``bring_your_own_webhook`` — admin-registered HTTP endpoint through the
     subprocess sandbox, with the admin's stored Authorization header attached
     by the parent process at dispatch (the subprocess never sees other secrets).
-  * ``push_to_crm``   — HubSpot contact upsert (maintains the SAME lead's record
-    via ``crm_lead_links``, §3.3.6) or the custom-webhook sandbox path; both in
-    ``app/tools/crm_backend.py``.
+  * ``push_to_crm``   — HubSpot contact / Salesforce Lead upsert (maintains the
+    SAME lead's record via ``crm_lead_links``, §3.3.6) or the custom-webhook
+    sandbox path; all in ``app/tools/crm_backend.py``.
   * ``lookup_record`` — the admin's uploaded CSV rows, read live at call time
     (``app/tools/record_backend.py``).
 
 Connection-gated (dispatch path is correct; the effect needs an OAuth backend that
 does not exist yet, so they resolve to a Tool and fail cleanly rather than silently):
-  * the scheduling tools on a CALENDLY connection — no registered OAuth client yet.
+  * the scheduling tools on a CALENDLY connection — no booking backend yet
+    (honest-disabled in the registry, audit round 3 Phase 4).
   * ``lookup_record`` on a LIVE-API connector (non-CSV) — no effect layer yet.
-  * ``push_to_crm`` on a SALESFORCE connection — honestly unavailable in the
-    registry (``unavailable_for``), HubSpot-first by owner decision.
 
 For the connection-gated set the broker's gate 3 refuses first (the connection can
 never reach ``connected`` without a real OAuth flow), so the unimplemented backend is
@@ -181,9 +180,9 @@ class _TenantCalendarBackend:
 
 class _TenantCrmBackend:
     """Dispatches ``push_to_crm`` on the PROVIDER the tenant actually connected
-    (same pattern as ``_TenantCalendarBackend``): HubSpot gets the real upsert
-    backend, the custom webhook posts through the sandbox envelope, and
-    Salesforce stays honestly unavailable until its effect layer exists."""
+    (same pattern as ``_TenantCalendarBackend``): HubSpot and Salesforce get
+    the real native upsert backends (same link/heal discipline, Phase 6.5),
+    and the custom webhook posts through the sandbox envelope."""
 
     def __init__(self) -> None:
         self._unavailable = _UnavailableExternalBackend()
@@ -196,6 +195,10 @@ class _TenantCrmBackend:
             from app.tools.crm_backend import HubSpotCrmBackend  # noqa: PLC0415
 
             return await HubSpotCrmBackend().upsert_lead(ctx, lead_key, fields)
+        if provider == "salesforce":
+            from app.tools.crm_backend import SalesforceCrmBackend  # noqa: PLC0415
+
+            return await SalesforceCrmBackend().upsert_lead(ctx, lead_key, fields)
         if provider == "custom_webhook":
             from app.tools.crm_backend import WebhookCrmBackend  # noqa: PLC0415
 

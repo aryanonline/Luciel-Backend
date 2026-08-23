@@ -8,8 +8,10 @@ This implements the owner-scoped effect layer:
   * ``custom_webhook`` — POST the captured-lead facts to the admin's registered
     endpoint through the SAME sandbox envelope as the BYO-webhook tool (SSRF
     allowlist, hard timeout, subprocess isolation, §3.8.6).
-  * ``salesforce``     — honestly unavailable (registry ``unavailable_for``),
-    so the choice renders "not available yet" instead of a dead connect button.
+  * ``salesforce``     — real Lead upsert against the TENANT's own Salesforce
+    org (``instance_url`` captured at the OAuth exchange), same link/heal
+    discipline with ``provider="salesforce"`` (audit round 3, Phase 6.5 —
+    owner decision 2026-08-23).
 
 THE MAINTENANCE SEMANTICS (owner-reconfirmed): a push is an idempotent upsert
 that keeps the SAME lead's record current over the lead's lifetime — never a
@@ -184,6 +186,108 @@ class HubSpotCrmApi:
         return CrmRecord(record_id=record_id)
 
 
+SALESFORCE_API_VERSION = "v59.0"
+
+
+def _soql_quote(value: str) -> str:
+    """Escape a value for interpolation inside SOQL single quotes.
+
+    The lead key is customer-typed text; unescaped quotes/backslashes would be a
+    SOQL injection into the TENANT's own org."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+class SalesforceCrmApi:
+    """Real Salesforce Lead transport against the TENANT's org (Phase 6.5).
+
+    ``instance_url`` is the org API base captured by the OAuth exchange
+    (``token_fields=("instance_url",)`` on the registry spec). Salesforce
+    requires ``LastName`` and ``Company`` on Lead create — captured facts map
+    onto them with honest "Unknown" fallbacks, stated in the frontend's
+    field-mapping disclosure, never invented values."""
+
+    def __init__(self, *, instance_url: str, transport_factory: Any = None) -> None:
+        self._base = instance_url.rstrip("/")
+        self._transport_factory = transport_factory or self._default_transport
+
+    def _default_transport(self) -> Any:
+        import httpx  # noqa: PLC0415 — live-path-only import
+
+        return httpx.AsyncClient(timeout=15.0, base_url=self._base)
+
+    @staticmethod
+    def _field_payload(lead_key: str, fields: dict[str, Any]) -> dict[str, str]:
+        """Captured-lead facts → Salesforce Lead fields (the disclosed mapping)."""
+        working = {str(k): str(v) for k, v in fields.items()}
+        payload = {
+            "Email": lead_key,
+            "LastName": working.pop("name", "") or "Unknown",
+            "Company": working.pop("business", "") or working.pop("company", "") or "Unknown",
+        }
+        phone = working.pop("phone", "")
+        if phone:
+            payload["Phone"] = phone
+        if working:
+            payload["Description"] = "\n".join(f"{k}: {v}" for k, v in sorted(working.items()))
+        return payload
+
+    async def find_by_key(self, token: str, lead_key: str) -> CrmRecord | None:
+        # SOQL has no parameter binding over the REST query endpoint; the value
+        # is escaped by _soql_quote (quotes + backslashes), which is the
+        # provider-documented mitigation. Not SQL against our own database.
+        soql = f"SELECT Id FROM Lead WHERE Email = '{_soql_quote(lead_key)}' LIMIT 1"  # noqa: S608  # nosec B608
+        async with self._transport_factory() as client:
+            resp = await client.get(
+                f"/services/data/{SALESFORCE_API_VERSION}/query",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": soql},
+            )
+        if resp.status_code != 200:
+            raise CrmUnavailable(f"salesforce_search_http_{resp.status_code}")
+        records = resp.json().get("records") or []
+        if not records:
+            return None
+        return CrmRecord(record_id=str(records[0]["Id"]))
+
+    async def get(self, token: str, record_id: str) -> CrmRecord | None:
+        async with self._transport_factory() as client:
+            resp = await client.get(
+                f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead/{record_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise CrmUnavailable(f"salesforce_get_http_{resp.status_code}")
+        return CrmRecord(record_id=record_id)
+
+    async def create(self, token: str, lead_key: str, fields: dict[str, Any]) -> CrmRecord:
+        async with self._transport_factory() as client:
+            resp = await client.post(
+                f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead",
+                headers={"Authorization": f"Bearer {token}"},
+                json=self._field_payload(lead_key, fields),
+            )
+        if resp.status_code not in (200, 201):
+            raise CrmUnavailable(f"salesforce_create_http_{resp.status_code}")
+        return CrmRecord(record_id=str(resp.json()["id"]))
+
+    async def update(
+        self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
+    ) -> CrmRecord | None:
+        async with self._transport_factory() as client:
+            resp = await client.patch(
+                f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead/{record_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=self._field_payload(lead_key, fields),
+            )
+        if resp.status_code == 404:
+            return None  # deleted inside the CRM — caller heals the link
+        if resp.status_code not in (200, 204):
+            raise CrmUnavailable(f"salesforce_update_http_{resp.status_code}")
+        return CrmRecord(record_id=record_id)
+
+
 _mock_api: InMemoryCrmApi | None = None
 
 
@@ -199,11 +303,20 @@ def build_crm_api() -> CrmApi:
     return _mock_api
 
 
-class HubSpotCrmBackend:
-    """``CrmBackend`` over the tenant's connected HubSpot account."""
+class _NativeCrmBackend:
+    """The shared upsert/link/heal discipline over any native ``CrmApi``.
+
+    Subclasses pin ``provider`` (the ``crm_lead_links`` namespace + audit label)
+    and how the transport is built. The discipline itself — linked-record PATCH,
+    heal-on-404, search-by-key relink, create+link — is provider-agnostic."""
+
+    provider: str = ""
 
     def __init__(self, api: CrmApi | None = None) -> None:
-        self._api = api if api is not None else build_crm_api()
+        self._api = api
+
+    async def _api_for(self, ctx: ToolContext) -> CrmApi:
+        return self._api if self._api is not None else build_crm_api()
 
     async def upsert_lead(
         self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
@@ -217,13 +330,14 @@ class HubSpotCrmBackend:
         )
         if not token:
             raise CrmUnavailable("crm_token_unavailable")
+        api = await self._api_for(ctx)
 
         link = (
             await ctx.session.execute(
                 select(CrmLeadLink).where(
                     CrmLeadLink.admin_id == ctx.admin_id,
                     CrmLeadLink.instance_id == ctx.instance_id,
-                    CrmLeadLink.provider == "hubspot",
+                    CrmLeadLink.provider == self.provider,
                     CrmLeadLink.lead_key == lead_key,
                 )
             )
@@ -231,31 +345,30 @@ class HubSpotCrmBackend:
 
         # 1. Linked record → update IN PLACE (the maintenance semantics).
         if link is not None:
-            updated = await self._api.update(token, link.crm_record_id, lead_key, fields)
+            updated = await api.update(token, link.crm_record_id, lead_key, fields)
             if updated is not None:
                 link.last_pushed_at = datetime.now(UTC)
                 await self._audit(ctx, "updated", updated.record_id)
                 return {"crm_record_id": updated.record_id, "action": "updated"}
             # Record deleted inside the CRM: fall through and HEAL the link.
-            logger.info("crm_link_heal provider=hubspot")
+            logger.info("crm_link_heal provider=%s", self.provider)
 
         # 2. Search by the stable key → update + (re)link.
-        found = await self._api.find_by_key(token, lead_key)
+        found = await api.find_by_key(token, lead_key)
         if found is not None:
-            updated = await self._api.update(token, found.record_id, lead_key, fields)
+            updated = await api.update(token, found.record_id, lead_key, fields)
             record_id = (updated or found).record_id
             await self._write_link(ctx, link, lead_key, record_id)
             await self._audit(ctx, "updated", record_id)
             return {"crm_record_id": record_id, "action": "updated"}
 
         # 3. Create + link.
-        created = await self._api.create(token, lead_key, fields)
+        created = await api.create(token, lead_key, fields)
         await self._write_link(ctx, link, lead_key, created.record_id)
         await self._audit(ctx, "created", created.record_id)
         return {"crm_record_id": created.record_id, "action": "created"}
 
-    @staticmethod
-    async def _audit(ctx: ToolContext, action: str, record_id: str) -> None:
+    async def _audit(self, ctx: ToolContext, action: str, record_id: str) -> None:
         from app.audit import log as audit  # noqa: PLC0415
         from app.models.audit import ActorType  # noqa: PLC0415
 
@@ -266,12 +379,11 @@ class HubSpotCrmBackend:
             instance_id=ctx.instance_id,
             actor_type=ActorType.luciel_runtime,
             event_type="crm_record_upserted",
-            payload={"provider": "hubspot", "action": action, "crm_record_id": record_id},
+            payload={"provider": self.provider, "action": action, "crm_record_id": record_id},
         )
 
-    @staticmethod
     async def _write_link(
-        ctx: ToolContext, existing: CrmLeadLink | None, lead_key: str, record_id: str
+        self, ctx: ToolContext, existing: CrmLeadLink | None, lead_key: str, record_id: str
     ) -> None:
         if existing is not None:
             existing.crm_record_id = record_id
@@ -281,12 +393,42 @@ class HubSpotCrmBackend:
             CrmLeadLink(
                 admin_id=ctx.admin_id,
                 instance_id=ctx.instance_id,
-                provider="hubspot",
+                provider=self.provider,
                 lead_key=lead_key,
                 crm_record_id=record_id,
                 last_pushed_at=datetime.now(UTC),
             )
         )
+
+
+class HubSpotCrmBackend(_NativeCrmBackend):
+    """``CrmBackend`` over the tenant's connected HubSpot account."""
+
+    provider = "hubspot"
+
+
+class SalesforceCrmBackend(_NativeCrmBackend):
+    """``CrmBackend`` over the tenant's own Salesforce org (Phase 6.5).
+
+    The transport is built PER CALL in live mode because its base URL is
+    tenant state: the ``instance_url`` the OAuth exchange captured into the
+    connection's secret material. Mock mode shares the in-memory store (the
+    discipline under test stays the production code path)."""
+
+    provider = "salesforce"
+
+    async def _api_for(self, ctx: ToolContext) -> CrmApi:
+        if self._api is not None:
+            return self._api
+        if not live_mode():
+            return build_crm_api()
+        from app.connections.secrets import get_secret_store, secret_ref_for  # noqa: PLC0415
+
+        material = (
+            await get_secret_store().get(secret_ref_for(ctx.admin_id, ctx.instance_id, "crm")) or {}
+        )
+        instance_url = material.get("instance_url") or "https://login.salesforce.com"
+        return SalesforceCrmApi(instance_url=instance_url)
 
 
 class WebhookCrmBackend:

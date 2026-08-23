@@ -204,11 +204,23 @@ async def test_upserts_are_audited_without_lead_pii():
         assert LEAD_KEY not in str(e.event_payload)  # never the lead's email
 
 
-async def test_salesforce_crm_stays_honestly_unavailable():
+async def test_salesforce_crm_pushes_with_its_own_link_namespace():
+    """Salesforce lead-push is REAL since Phase 6.5 (owner decision 2026-08-23):
+    the same upsert/link discipline as HubSpot, with crm_lead_links rows under
+    provider="salesforce" so the two CRMs can never claim each other's records."""
     seeded = await _seed(crm_provider="salesforce")
     res = await _push(seeded, {"budget": "5k"})
-    assert res.outcome is Outcome.failed
-    assert "crm_error" in (res.reason or "")
+    assert res.outcome is Outcome.ok
+    assert res.payload["action"] == "created"
+    again = await _push(seeded, {"budget": "50k"})
+    assert again.outcome is Outcome.ok
+    assert again.payload["action"] == "updated"
+    assert again.payload["crmRecordId"] == res.payload["crmRecordId"]  # never a duplicate
+    async with tenant_session(seeded.admin) as s:
+        link = (
+            await s.execute(select(CrmLeadLink).where(CrmLeadLink.admin_id == seeded.admin))
+        ).scalar_one()
+        assert link.provider == "salesforce"
 
 
 async def _seed_records(seeded: _Seeded, rows: list[dict[str, str]]) -> None:

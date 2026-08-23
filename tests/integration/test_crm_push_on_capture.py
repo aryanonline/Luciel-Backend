@@ -1,0 +1,193 @@
+"""Deterministic CRM push-on-capture (Phase 6.5).
+
+The Journey's "keeps each lead's record current" must not depend on the model
+remembering to call push_to_crm — a turn whose capture changed a fact pushes it
+through the SAME broker gates a model call would face. Pinned here, against the
+production upsert/link discipline (the in-memory CRM is transport only):
+
+  - create → update across turns maintains ONE record, never a duplicate;
+  - a turn that changes nothing pushes nothing;
+  - a disabled tool pushes nothing (default-deny authorization);
+  - a dormant/disconnected connection pushes nothing;
+  - a phone-keyed lead stays safe in the dashboard and is NOT pushed into an
+    email-keyed CRM.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from app.db.session import tenant_session
+from app.models.connection import InstanceConnection
+from app.models.conversation import Session as SessionModel
+from app.models.instance import Account, AccountState, Instance, LucielState
+from app.models.tool_auth import InstanceToolAuthorization
+from app.runtime.crm_push import push_captured_lead
+from app.runtime.lead_capture import capture_or_update_lead
+from app.tools import crm_backend
+from app.tools.registry import make_tool_resolver
+
+pytestmark = [pytest.mark.asyncio]
+
+
+@pytest.fixture(autouse=True)
+def fresh_mock_crm():
+    """Each test gets its own in-memory CRM store (it is a process global)."""
+    crm_backend._mock_api = crm_backend.InMemoryCrmApi()
+    yield crm_backend._mock_api
+    crm_backend._mock_api = None
+
+
+async def _seed_tenant(
+    admin: uuid.UUID,
+    *,
+    tool_enabled: bool = True,
+    crm_status: str = "connected",
+    provider: str = "salesforce",
+) -> tuple[uuid.UUID, uuid.UUID]:
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    iid = uuid.uuid4()
+    sid = uuid.uuid4()
+    ref = secret_ref_for(admin, iid, "crm")
+    await get_secret_store().put(
+        ref, {"access_token": "sf-tok", "instance_url": "https://acme.my.salesforce.com"}
+    )
+    async with tenant_session(admin) as s:
+        s.add(
+            Account(
+                id=admin,
+                admin_id=admin,
+                user_id=admin,
+                email=f"{admin.hex[:8]}@x.com",
+                email_lower=f"{admin.hex[:8]}@x.com",
+                password_hash="x",
+                state=AccountState.verified,
+                email_verified=True,
+            )
+        )
+        s.add(
+            Instance(
+                id=iid,
+                admin_id=admin,
+                name="Push Co",
+                state=LucielState.active,
+                embed_key_public_id=f"vm_live_{admin.hex[:8]}",
+                channels=[{"id": "widget", "enabled": True}],
+                tools=[{"id": "push_to_crm", "enabled": tool_enabled}],
+                escalation={},
+                personality={},
+            )
+        )
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type="crm",
+                provider=provider,
+                auth_class="oauth_token",
+                status=crm_status,
+                secret_ref=ref,
+                non_secret_config={},
+            )
+        )
+        # The broker's gate 1 reads the authorization TABLE, not the tools JSON.
+        s.add(
+            InstanceToolAuthorization(
+                admin_id=admin,
+                instance_id=iid,
+                tool_id="push_to_crm",
+                enabled=tool_enabled,
+            )
+        )
+        s.add(
+            SessionModel(
+                id=sid,
+                admin_id=admin,
+                instance_id=iid,
+                channel="widget",
+                mode="ai",
+            )
+        )
+        await s.flush()
+    return iid, sid
+
+
+async def _capture_and_push(
+    admin: uuid.UUID, iid: uuid.UUID, sid: uuid.UUID, inbound_text: str
+) -> None:
+    from sqlalchemy import select
+
+    async with tenant_session(admin) as s:
+        sess_obj = (
+            await s.execute(select(SessionModel).where(SessionModel.id == sid))
+        ).scalar_one()
+        captured = await capture_or_update_lead(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            sess=sess_obj,
+            inbound_text=inbound_text,
+            channel="widget",
+            transport_identifier=None,
+        )
+        if captured is not None:
+            await push_captured_lead(
+                s,
+                admin_id=admin,
+                instance_id=iid,
+                captured=captured,
+                lead_key=captured.lead_key,
+                snapshot_tool_ids=None,
+                tool_resolver=make_tool_resolver(),
+                session_id=sid,
+            )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_capture_creates_then_updates_one_crm_record(fresh_mock_crm):
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin)
+
+    await _capture_and_push(admin, iid, sid, "I'm jane@acme.com — I need a quote for a reno.")
+    assert len(fresh_mock_crm.records) == 1
+    record_id, rec = next(iter(fresh_mock_crm.records.items()))
+    assert rec["lead_key"] == "jane@acme.com"
+    assert "intent" in rec["fields"]
+
+    # A NEW fact on a later turn updates the SAME record — never a duplicate.
+    await _capture_and_push(admin, iid, sid, "Budget is around $12k, I want to book this month.")
+    assert len(fresh_mock_crm.records) == 1
+    assert "12" in (fresh_mock_crm.records[record_id]["fields"].get("intent") or "")
+
+    # A turn that changes nothing pushes nothing (fields stay as they were).
+    before = dict(fresh_mock_crm.records[record_id]["fields"])
+    await _capture_and_push(admin, iid, sid, "Ok thanks!")
+    assert fresh_mock_crm.records[record_id]["fields"] == before
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_disabled_tool_pushes_nothing(fresh_mock_crm):
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin, tool_enabled=False)
+    await _capture_and_push(admin, iid, sid, "I'm jane@acme.com — pricing please.")
+    # The lead is safe in the dashboard store; the CRM saw nothing.
+    assert fresh_mock_crm.records == {}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_dormant_connection_pushes_nothing(fresh_mock_crm):
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin, crm_status="dormant")
+    await _capture_and_push(admin, iid, sid, "I'm jane@acme.com — pricing please.")
+    assert fresh_mock_crm.records == {}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_phone_keyed_lead_is_not_pushed_into_an_email_keyed_crm(fresh_mock_crm):
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin)
+    await _capture_and_push(admin, iid, sid, "Call me at 604-555-0100 about pricing.")
+    assert fresh_mock_crm.records == {}

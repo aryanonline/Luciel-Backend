@@ -5,8 +5,7 @@
 could still start a consent/credential flow for a provider whose effect layer
 is unbuilt — a connected row with a dead tool behind it. Pinned here: calendly
 (calendar) and live_connector (record_source) are honestly unavailable at every
-layer, per-surface (Salesforce KB-read stays independently governed while its
-CRM push is unbuilt).
+layer. (Salesforce left this list in Phase 6.5, when its CRM push became real.)
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ def test_unavailable_for_wins_in_provider_available() -> None:
     assert registry.provider_available("calendly", "calendar") is False
     assert registry.provider_available("live_connector") is False
     assert registry.provider_available("live_connector", "record_source") is False
-    assert registry.provider_available("salesforce", "crm") is False
     # Non-OAuth providers with no unavailable surface stay available.
     assert registry.provider_available("csv") is True
     assert registry.provider_available("custom_webhook") is True

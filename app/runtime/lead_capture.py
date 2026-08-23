@@ -86,6 +86,20 @@ def _summarize_intent(text: str) -> str:
 # --- capture / upsert -------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class CaptureResult:
+    """One turn's capture outcome: which lead, and which facts actually changed.
+
+    ``changed`` is what the deterministic CRM push (Phase 6.5) forwards — pushing
+    only on real change is what keeps "keeps each lead's record current" from
+    degrading into a same-payload call to the tenant's CRM on every turn.
+    ``lead_key`` is the lead's stable contact identifier after this turn."""
+
+    lead_id: uuid.UUID
+    changed: dict[str, str]
+    lead_key: str | None = None
+
+
 async def capture_or_update_lead(
     session: AsyncSession,
     *,
@@ -95,9 +109,10 @@ async def capture_or_update_lead(
     inbound_text: str,
     channel: str,
     transport_identifier: str | None,
-) -> uuid.UUID | None:
-    """Always-on lead-capture cognition (§3.4.4). Returns the resolved_lead_id if a
-    lead exists/was created for this turn, else None.
+) -> CaptureResult | None:
+    """Always-on lead-capture cognition (§3.4.4). Returns the capture result (the
+    resolved lead id + the facts THIS turn changed) if a lead exists/was created
+    for this turn, else None.
 
     - Strong channels (email/sms/voice/whatsapp/messenger/instagram): the transport
       identifier IS the lead key — capture/upsert immediately on a qualified turn.
@@ -133,9 +148,9 @@ async def capture_or_update_lead(
             )
         ).scalar_one_or_none()
         if lead is not None:
-            _apply_signals(lead, signals, inbound_text, score)
+            changed = _apply_signals(lead, signals, inbound_text, score)
             await session.flush()
-            return lead.id
+            return CaptureResult(lead_id=lead.id, changed=changed, lead_key=lead.contact_identifier)
 
     # Identity IS capture on strong channels (live-caught 2026-08-18): a voice
     # caller's E.164 was DISCARDED because no intent keyword fired, and the
@@ -164,9 +179,11 @@ async def capture_or_update_lead(
     ).scalar_one_or_none()
 
     if existing is not None:
-        _apply_signals(existing, signals, inbound_text, score)
+        changed = _apply_signals(existing, signals, inbound_text, score)
         lead_id = existing.id
+        lead_key = existing.contact_identifier
     else:
+        intent = _summarize_intent(inbound_text) if signals.is_qualified else None
         lead = Lead(
             id=uuid.uuid4(),
             admin_id=admin_id,
@@ -176,28 +193,48 @@ async def capture_or_update_lead(
             # Intent only when the turn actually SIGNALED one: an identity-only
             # capture ("No its alright thankyou" from a known number) must not
             # store a pleasantry as the lead's recorded want.
-            intent=_summarize_intent(inbound_text) if signals.is_qualified else None,
+            intent=intent,
             lead_score=score if score > 0 else None,
             state=LeadState.active,
         )
         session.add(lead)
         lead_id = lead.id
+        lead_key = contact_key
+        changed = {"contact": contact_key}
+        if intent:
+            changed["intent"] = intent
+        if signals.phone:
+            changed["phone"] = signals.phone
 
     # Bind the session to the lead so escalation payloads + cross-session memory
     # (strong identities only) resolve against it going forward (§3.4.9).
     sess.resolved_lead_id = lead_id
     await session.flush()
-    return lead_id
+    return CaptureResult(lead_id=lead_id, changed=changed, lead_key=lead_key)
 
 
-def _apply_signals(lead: Lead, signals: LeadSignals, inbound_text: str, score: float) -> None:
+def _apply_signals(
+    lead: Lead, signals: LeadSignals, inbound_text: str, score: float
+) -> dict[str, str]:
     """Maintain the lead's record: fill missing contact + keep the latest intent and
-    the highest observed high-value score (§3.4.4 maintain-the-record)."""
+    the highest observed high-value score (§3.4.4 maintain-the-record). Returns the
+    facts this turn actually changed (the CRM push forwards exactly these)."""
+    changed: dict[str, str] = {}
     if lead.contact_identifier is None and signals.strong_identifier:
         lead.contact_identifier = signals.strong_identifier
+        changed["contact"] = signals.strong_identifier
     # Keep the most recent qualified intent as the working intent line.
     if signals.has_intent or signals.has_budget:
-        lead.intent = _summarize_intent(inbound_text)
+        intent = _summarize_intent(inbound_text)
+        if intent != lead.intent:
+            lead.intent = intent
+            changed["intent"] = intent
+    # A phone volunteered mid-conversation is a new reachable fact even when the
+    # lead is already email-keyed.
+    if signals.phone and signals.phone != lead.contact_identifier:
+        changed.setdefault("phone", signals.phone)
     # Keep the highest score seen across the lead's lifetime.
     if score > 0 and (lead.lead_score is None or score > lead.lead_score):
         lead.lead_score = score
+        changed["lead_score"] = f"{score:g}"
+    return changed

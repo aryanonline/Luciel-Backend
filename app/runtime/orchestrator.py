@@ -422,7 +422,26 @@ class Orchestrator:
                 transport_identifier=transport_identifier,
             )
             if captured is not None:
-                resolved_lead_id = captured
+                resolved_lead_id = captured.lead_id
+                # Deterministic CRM push-on-capture (Phase 6.5): a fact that
+                # actually changed goes to the tenant's CRM through the SAME
+                # broker gates a model-proposed push would face — the Journey's
+                # "keeps each lead's record current" no longer depends on the
+                # model remembering to call the tool. Runs on every path that
+                # captures (including at-cap and moderation turns below), and a
+                # refused/failed push never touches the customer reply.
+                from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+
+                await push_captured_lead(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    captured=captured,
+                    lead_key=captured.lead_key,
+                    snapshot_tool_ids=self.snapshot_tool_ids,
+                    tool_resolver=self.tool_resolver,
+                    session_id=session_id,
+                )
 
         # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
         budget_state = await budget.check_budget(
