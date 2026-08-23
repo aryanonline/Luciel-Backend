@@ -135,6 +135,16 @@ REFRESH_SPECS: dict[str, RefreshSpec] = {
         endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
         default_lifetime_seconds=60 * 24 * 3600,
     ),
+    # Twilio one-click connect (C10): standard refresh grant against the same
+    # token endpoint the exchange uses. Bearer tokens are short-lived; the
+    # exchange's expires_in dominates, the 1h default only covers a response
+    # that omits it. Credential-form tenants are auth_class api_key and never
+    # reach the refresh branch.
+    "twilio": RefreshSpec(
+        style=STYLE_REFRESH_TOKEN_POST,
+        endpoint="https://login.twilio.com/oauth2/token",
+        default_lifetime_seconds=3600,
+    ),
 }
 
 

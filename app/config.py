@@ -292,6 +292,18 @@ class Settings(BaseSettings):
     microsoft_client_id: str = ""
     microsoft_client_secret: str = ""  # noqa: S105
     microsoft_redirect_uri: str = ""
+    # Twilio OAuth app (audit round 3, C10 — the one-click SMS/voice connect).
+    # DISTINCT from the twilio_* API-key fields above: those are the PLATFORM's
+    # own account credentials (fallback sender/probe + inbound signature token);
+    # these identify the platform's Twilio OAuth *application* for the
+    # authorization-code flow that binds a CUSTOMER's account. Note the legacy
+    # blob alias TWILIO_CLIENT_SECRET maps to twilio_api_key_secret — the OAuth
+    # keys below are deliberately TWILIO_OAUTH_* so the two can never collide.
+    # Empty -> the connect flow falls back to the credential form (Twilio stays
+    # available: the customer's own API keys need no platform OAuth app).
+    twilio_oauth_client_id: str = ""
+    twilio_oauth_client_secret: str = ""  # noqa: S105
+    twilio_oauth_redirect_uri: str = ""
 
     # --- Website crawl (§3.2.3 crawl-sync note) ---------------------------------
     # No OAuth — just an httpx fetch. Bounded so a misconfigured crawl target can
@@ -366,6 +378,9 @@ class Settings(BaseSettings):
             "TWILIO_API_KEY_SID": "twilio_api_key_sid",
             "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
             "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
+            "TWILIO_OAUTH_CLIENT_ID": "twilio_oauth_client_id",
+            "TWILIO_OAUTH_CLIENT_SECRET": "twilio_oauth_client_secret",  # nosec B105
+            "TWILIO_OAUTH_REDIRECT_URI": "twilio_oauth_redirect_uri",
             "META_APP_SECRET": "meta_app_secret",  # nosec B105
             "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
             "INSTAGRAM_APP_SECRET": "instagram_app_secret",  # nosec B105

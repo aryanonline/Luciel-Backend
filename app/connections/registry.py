@@ -115,6 +115,12 @@ class ProviderSpec:
     # Scoped per type because one provider can be real on one surface and not
     # another — Salesforce KB-read works; Salesforce lead-push does not.
     unavailable_for: frozenset[str] = frozenset()
+    # OAuth-kind providers whose ``credential_fields`` form is a full, standalone
+    # connect path (audit round 3, C10 — Twilio). Availability then must NOT
+    # depend on the platform's OAuth app being provisioned: the customer's own
+    # credential needs nothing from us, so the provider stays available and the
+    # start flow degrades to the form when the OAuth client is unconfigured.
+    credential_fallback: bool = False
 
     @property
     def is_oauth(self) -> bool:
@@ -406,24 +412,41 @@ PROVIDERS: dict[str, ProviderSpec] = {
     ),
     # BYO telephony (§3.1.4): the customer connects their OWN Twilio account and Luciel
     # texts/calls through it. VantageMind is never in the telephony billing path, which is
-    # only true if the credential on the send path is theirs — so this is a real
-    # credential-form connection, not a platform-owned provisioned sender. It is ALWAYS
-    # available: the customer supplies the credential, so there is no platform OAuth app
-    # to be missing (that is what ``configured`` gates, and it does not apply here).
+    # only true if the credential on the send path is theirs. One-click OAuth is the
+    # PRIMARY connect (audit round 3, C10 — owner decision 2026-08-23); the credential
+    # form stays as the explicit "use API keys instead" fallback, which is why this
+    # provider is ALWAYS available (``credential_fallback``): the customer's own API
+    # keys need no platform OAuth app. An OAuth tenant's row carries auth_class
+    # "oauth_token" (bearer sends + refresh + capability-URL inbound verification, C11);
+    # a credential tenant's row is stamped back to "api_key" at submit_credentials.
     "twilio": ProviderSpec(
         provider="twilio",
         connection_type="sms_sender",
         display_name="Your Twilio account",
-        auth_kind=AUTH_CREDENTIAL_FORM,
+        auth_kind=AUTH_OAUTH,
+        authorize=ProviderAuthorize(
+            # Twilio's OAuth 2.0 authorization-code flow ("organizational API
+            # access"). Endpoints + scope string are validated against the real
+            # consent screen during the dev E2E — they are configuration, not
+            # security material; the state/PKCE/exchange machinery is generic.
+            endpoint="https://login.twilio.com/oauth2/authorize",
+            exchange_endpoint="https://login.twilio.com/oauth2/token",
+            scopes="offline_access",
+            supports_pkce=False,
+        ),
+        client_id_setting="twilio_oauth_client_id",
+        client_secret_setting="twilio_oauth_client_secret",  # noqa: S106 — field NAME  # nosec B106
+        redirect_uri_setting="twilio_oauth_redirect_uri",
         credential_fields=(
             CredentialField("accountSid", "Twilio Account SID (AC…)"),
             CredentialField("authToken", "Twilio Auth Token", secret=True, required=False),
             CredentialField("apiKeySid", "API Key SID (SK…)", required=False),
             CredentialField("apiKeySecret", "API Key Secret", secret=True, required=False),
         ),
-        auth_class="api_key",
+        auth_class="oauth_token",
         help_text="Connect your Twilio account so Luciel can text from your business "
         "number. Carrier costs stay on your own Twilio bill.",
+        credential_fallback=True,
     ),
     "outbound_webhook": ProviderSpec(
         provider="outbound_webhook",
@@ -555,6 +578,11 @@ def provider_available(provider: str, connection_type: str | None = None) -> boo
         return False
     if not spec.is_oauth:
         return True
+    # A standalone credential-form fallback (Twilio, C10) keeps the provider
+    # available with no platform OAuth app: the customer's own API keys need
+    # nothing from us, so "configured" does not gate this provider.
+    if spec.credential_fallback:
+        return True
     return oauth_client_config(spec.provider).configured
 
 
@@ -572,7 +600,10 @@ def oauth_client_label(provider: str) -> str:
     setting = spec.client_id_setting if spec is not None else None
     if not setting:
         return ""
-    for suffix in ("_client_id", "_consumer_key", "_app_id"):
+    # `_oauth_client_id` first: a provider whose OAuth app fields are namespaced
+    # away from its API-key fields (twilio_oauth_client_id vs twilio_api_key_*,
+    # C10) still gets the natural callback label ("twilio", not "twilio_oauth").
+    for suffix in ("_oauth_client_id", "_client_id", "_consumer_key", "_app_id"):
         if setting.endswith(suffix):
             return setting[: -len(suffix)]
     return setting

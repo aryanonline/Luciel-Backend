@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 GRAPH_ME_ENDPOINT = "https://graph.microsoft.com/v1.0/me"
+TWILIO_ACCOUNTS_ENDPOINT = "https://api.twilio.com/2010-04-01/Accounts.json"
 
 
 class PostExchangeVerifyFailed(Exception):
@@ -82,7 +83,57 @@ async def verify_outlook_mailbox(
     return updates
 
 
+async def verify_twilio_account(
+    *, material: dict[str, str], transport: _GetTransport
+) -> dict[str, object]:
+    """Resolve WHICH Twilio account authorized, with the just-exchanged bearer token.
+
+    The one-click connect (audit round 3, C10) never sees an Account SID typed in,
+    but every downstream surface — number listing, webhook auto-config, the send
+    path, the picker UI — keys on it, so the bind step needs it in
+    ``non_secret_config`` exactly where the credential-form path writes it
+    (``accountSid``, service.submit_credentials). ``GET /Accounts`` with the bearer
+    token is the cheapest call that both proves the token works against the REST
+    API (not just that the code was redeemable) and names the account.
+    """
+    token = material.get("access_token", "")
+    if not token:
+        raise PostExchangeVerifyFailed("exchange returned no access token")
+    try:
+        response = await transport.get(
+            TWILIO_ACCOUNTS_ENDPOINT, headers={"Authorization": f"Bearer {token}"}
+        )
+    except Exception as exc:  # noqa: BLE001 — transport errors all mean "not verified"
+        raise PostExchangeVerifyFailed(
+            f"could not reach Twilio to verify the account ({type(exc).__name__})"
+        ) from exc
+    if getattr(response, "status_code", None) != 200:
+        raise PostExchangeVerifyFailed(
+            "Twilio rejected the new token "
+            f"(HTTP {getattr(response, 'status_code', '?')}) — the account was not connected"
+        )
+    body = response.json()
+    accounts = body.get("accounts") if isinstance(body, dict) else None
+    first = accounts[0] if isinstance(accounts, list) and accounts else {}
+    sid = str(first.get("sid") or "").strip()
+    if not sid.startswith("AC"):
+        raise PostExchangeVerifyFailed("Twilio did not report an account for this grant")
+
+    updates: dict[str, object] = {
+        "accountSid": sid,
+        # Non-secret display name so the dashboard can say WHOSE account is bound.
+        "accountName": str(first.get("friendly_name") or "").strip(),
+        "mode": "oauth",
+    }
+    raw_expiry = str(material.get("expires_in", "")).strip()
+    if raw_expiry.isdigit():
+        expires_at = datetime.now(UTC) + timedelta(seconds=int(raw_expiry))
+        updates["token_expires_at"] = expires_at.isoformat()
+    return updates
+
+
 # Provider -> verifier. Absent means "no post-exchange verification", today's behavior.
 POST_EXCHANGE_VERIFIERS = {
     "outlook": verify_outlook_mailbox,
+    "twilio": verify_twilio_account,
 }

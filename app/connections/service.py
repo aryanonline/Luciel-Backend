@@ -98,6 +98,14 @@ def _start_result(
         instance_id=connection.instance_id,
         connection_id=connection.connection_id,
     )
+    if start.unconfigured:
+        # A provider with a standalone credential form (Twilio, C10) degrades
+        # honestly to that form when the platform OAuth app is unprovisioned —
+        # never a dead-end authorize URL for a connection the customer's own
+        # API keys can complete.
+        spec = registry.get_provider(provider)
+        if spec is not None and spec.credential_fallback and spec.credential_fields:
+            return {"requires_client_form": True}
     cfg["authorize_url"] = start.authorize_url
     cfg["oauth_state_jti"] = start.state_jti
     connection.non_secret_config = cfg
@@ -300,11 +308,13 @@ class CredentialRejected(ValueError):
 
 
 # The "add your number" state (§3.1.4): the Twilio account is connected but Luciel has
-# no number to send FROM, so the channel is not live and says so.
-_SMS_NEEDS_NUMBER = (
+# no number to send FROM, so the channel is not live and says so. Public name because
+# the OAuth-callback completion (C10) lands on the same state for a numberless account.
+SMS_NEEDS_NUMBER_DETAIL = (
     "Action needed: add your number. Your Twilio account is connected — designate the "
     "number Luciel should text from to bring the channel live."
 )
+_SMS_NEEDS_NUMBER = SMS_NEEDS_NUMBER_DETAIL
 
 
 async def submit_credentials(
@@ -349,15 +359,21 @@ async def submit_credentials(
     # after the secret is stored (a failed verify raises first, so the prior
     # provider + credential keep serving untouched).
     cfg_staged = connection.non_secret_config or {}
+
+    def _takes_form(candidate: registry.ProviderSpec | None) -> bool:
+        # A credential form is valid for credential-form providers AND for
+        # OAuth-primary providers that keep the form as their explicit
+        # fallback path (Twilio, C10 — "use API keys instead").
+        return candidate is not None and (
+            candidate.auth_kind == registry.AUTH_CREDENTIAL_FORM
+            or (candidate.credential_fallback and bool(candidate.credential_fields))
+        )
+
     staged_name = str(cfg_staged.get("pending_provider") or "")
     staged_spec = registry.get_provider(staged_name) if staged_name else None
-    effective_provider = (
-        staged_name
-        if staged_spec is not None and staged_spec.auth_kind == registry.AUTH_CREDENTIAL_FORM
-        else connection.provider
-    )
+    effective_provider = staged_name if _takes_form(staged_spec) else connection.provider
     spec = registry.get_provider(effective_provider)
-    if spec is None or spec.auth_kind != registry.AUTH_CREDENTIAL_FORM:
+    if spec is None or not _takes_form(spec):
         raise CredentialRejected(
             f"Provider '{connection.provider}' does not take a credential form."
         )
@@ -386,9 +402,15 @@ async def submit_credentials(
             raise CredentialRejected(str(exc)) from exc
         material = secret_material(creds)
         non_secret: dict[str, object] = {"accountSid": creds.account_sid}
+        # The FORM path is the API-key class even though the twilio spec is
+        # OAuth-primary (C10): this row now holds the customer's own keys, so
+        # health/refresh must treat it as api_key, not chase a refresh token
+        # it does not have.
+        submitted_auth_class = "api_key"
     else:
         material = {n: v for n, v in fields.items() if known[n].secret and v}
         non_secret = {n: v for n, v in fields.items() if not known[n].secret}
+        submitted_auth_class = spec.auth_class
 
     # Webhook endpoints (BYO outbound_webhook tool + the crm custom_webhook path)
     # are sandbox-executed against an egress ALLOWLIST (§3.8.6) — which nothing
@@ -430,7 +452,11 @@ async def submit_credentials(
         connection.non_secret_config = cfg_after
         if effective_provider != connection.provider:
             connection.provider = effective_provider
-            connection.auth_class = spec.auth_class
+    # The verified submit decides the row's behavior class — for most providers
+    # that is the spec's class (a no-op), but a Twilio form submit stamps
+    # api_key over the OAuth-primary default, including when an OAuth tenant
+    # deliberately switches to their own keys later (C10).
+    connection.auth_class = submitted_auth_class
 
     # A BYO SMS account with no designated number cannot send, so it must not claim to be
     # connected — the channel row shows "add your number" instead (§3.1.4). A number

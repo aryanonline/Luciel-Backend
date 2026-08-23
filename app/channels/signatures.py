@@ -40,6 +40,48 @@ def verify_twilio(auth_token: str, url: str, params: dict[str, str], header_sign
     return hmac.compare_digest(expected, header_signature or "")
 
 
+def capability_url_ok(capability_token: str | None, url: str) -> bool:
+    """Does the request URL carry this tenant's webhook capability token? (C11)
+
+    The one-click OAuth connect (C10) yields no Account Auth Token, and Twilio
+    signs webhooks with exactly that token — so signature verification cannot
+    ever pass for an OAuth tenant (nor for a credential tenant who supplied only
+    an API key). For them, webhook auto-config appends a per-connection random
+    ``cap`` query parameter to the URLs it registers on the number; possession
+    of that 256-bit secret in the posted URL is the authenticity proof, checked
+    constant-time. The token is resolved from the tenant that owns the To
+    number, so a matching token also IS the destination-claim check.
+    """
+    if not capability_token:
+        return False
+    from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+
+    presented = parse_qs(urlparse(url).query).get("cap") or []
+    expected = capability_token.encode("utf-8", errors="replace")
+    return any(
+        hmac.compare_digest(value.encode("utf-8", errors="replace"), expected)
+        for value in presented
+    )
+
+
+def verify_twilio_inbound(
+    auth_token: str,
+    url: str,
+    params: dict[str, str],
+    header_signature: str,
+    *,
+    capability_token: str | None = None,
+) -> bool:
+    """EITHER a valid X-Twilio-Signature OR the capability-URL token (C11).
+
+    The signature path is checked first and is byte-identical to before —
+    capability acceptance is ADDITIVE and never weakens verification for
+    tenants whose auth token we hold."""
+    if verify_twilio(auth_token, url, params, header_signature):
+        return True
+    return capability_url_ok(capability_token, url)
+
+
 def sns_canonical_string(message: dict[str, str]) -> str:
     """Build the canonical string SNS signs for a Notification message.
 

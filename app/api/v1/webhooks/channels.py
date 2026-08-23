@@ -55,22 +55,53 @@ async def _resolve(connection_type: str, destination: str) -> InstanceContext:
         return await routing.resolve_destination(s, connection_type, destination)
 
 
-async def _tenant_twilio_auth_token(to_number: str) -> str | None:
-    """The receiving tenant's own Twilio Auth Token, or None if they have not connected
-    one. Resolving the destination BEFORE verification is safe: it is the same
-    SECURITY DEFINER lookup routing performs, reads nothing but the tenant's own stored
-    credential, and an unresolvable number simply yields the platform fallback and then
-    fails the signature check as before."""
-    from app.channels.tenant_twilio import tenant_auth_token
+async def _tenant_twilio_inbound_auth(to_number: str) -> tuple[str | None, str | None]:
+    """The receiving tenant's inbound-authenticity secrets: (auth_token, capability).
+
+    Resolving the destination BEFORE verification is safe: it is the same
+    SECURITY DEFINER lookup routing performs, reads nothing but the tenant's own
+    stored credential, and an unresolvable number simply yields the platform
+    fallback and then fails the signature check as before. The capability token
+    (C11) covers tenants whose Account Auth Token the platform never holds —
+    the one-click OAuth grant and API-key-only submissions — whose registered
+    webhook URLs carry the matching ``cap`` parameter instead."""
+    from app.channels.tenant_twilio import tenant_inbound_verification
 
     if not to_number:
-        return None
+        return None, None
     try:
         ctx = await _resolve("sms_sender", to_number)
     except InboundRejected:
-        return None
+        return None, None
     async with tenant_session(ctx.admin_id) as s:
-        return await tenant_auth_token(s, ctx.admin_id, ctx.instance_id)
+        return await tenant_inbound_verification(s, ctx.admin_id, ctx.instance_id)
+
+
+async def _audit_capability_rejection(to_number: str) -> None:
+    """Audit a forged/mismatched capability-URL inbound under its tenant (C11).
+
+    Content-route rejections stay pre-tenant by design (Axis6-F06 — no tenant
+    scope before verification), but a bad ``cap`` on a RESOLVABLE number names
+    its tenant, and the owner deserves to see forged traffic against their
+    number in their audit log. Best-effort: an unresolvable number simply logs."""
+    from app.audit import log as audit_log  # noqa: PLC0415
+    from app.models.audit import ActorType  # noqa: PLC0415
+
+    if not to_number:
+        return
+    try:
+        ctx = await _resolve("sms_sender", to_number)
+    except InboundRejected:
+        return
+    async with tenant_session(ctx.admin_id) as s:
+        await audit_log.emit(
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            actor_type=ActorType.platform,
+            event_type="inbound_capability_rejected",
+            payload={"connection_type": "sms_sender", "number_suffix": to_number[-4:]},
+        )
 
 
 # Shared with the mailbox poll sweep (pull ingress) — see channels/inbound_dispatch.
@@ -86,13 +117,16 @@ async def twilio_sms_inbound(request: Request) -> Response:
     settings = get_settings()
     form = await request.form()
     params: dict[str, str] = {k: str(v) for k, v in form.items()}
+    # Account Auth Token for X-Twilio-Signature (distinct from the send API key).
+    # Under BYO (§3.1.4) the receiving number belongs to the TENANT's Twilio account,
+    # so Twilio signs with THEIR auth token — verifying against the platform's would
+    # reject every real inbound. The platform token remains the dev/mock fallback.
+    # The capability token (C11) is the alternate proof for tenants with no stored
+    # auth token; None for everyone else.
+    tenant_token, capability = await _tenant_twilio_inbound_auth(params.get("To", ""))
     req: dict[str, Any] = {
-        # Account Auth Token for X-Twilio-Signature (distinct from the send API key).
-        # Under BYO (§3.1.4) the receiving number belongs to the TENANT's Twilio account,
-        # so Twilio signs with THEIR auth token — verifying against the platform's would
-        # reject every real inbound. The platform token remains the dev/mock fallback.
-        "auth_token": await _tenant_twilio_auth_token(params.get("To", ""))
-        or settings.twilio_auth_token,
+        "auth_token": tenant_token or settings.twilio_auth_token,
+        "capability_token": capability,
         "url": str(request.url),
         "params": params,
         "x_twilio_signature": request.headers.get("X-Twilio-Signature", ""),
@@ -183,11 +217,13 @@ async def _voice_request(request: Request) -> dict[str, Any]:
     settings = get_settings()
     form = await request.form()
     params: dict[str, str] = {k: str(v) for k, v in form.items()}
+    # BYO (§3.1.4): the called number belongs to the TENANT's Twilio account,
+    # so Twilio signs with THEIR auth token — same resolution as SMS, and the
+    # same C11 capability-token alternate for tenants without a stored token.
+    tenant_token, capability = await _tenant_twilio_inbound_auth(params.get("To", ""))
     return {
-        # BYO (§3.1.4): the called number belongs to the TENANT's Twilio account,
-        # so Twilio signs with THEIR auth token — same resolution as SMS.
-        "auth_token": await _tenant_twilio_auth_token(params.get("To", ""))
-        or settings.twilio_auth_token,
+        "auth_token": tenant_token or settings.twilio_auth_token,
+        "capability_token": capability,
         "url": str(request.url),
         "params": params,
         "x_twilio_signature": request.headers.get("X-Twilio-Signature", ""),
@@ -321,18 +357,35 @@ async def twilio_voice_status(request: Request) -> Response:
     """
     from sqlalchemy import select  # noqa: PLC0415
 
-    from app.channels import pipeline  # noqa: PLC0415
-    from app.channels.signatures import verify_twilio  # noqa: PLC0415
+    from app.channels import pipeline, rate_limit  # noqa: PLC0415
+    from app.channels.signatures import verify_twilio_inbound  # noqa: PLC0415
     from app.models.voice import VoiceCallRecord  # noqa: PLC0415
     from app.runtime.session_close import finalize_session  # noqa: PLC0415
 
     req = await _voice_request(request)
     params: dict[str, str] = req["params"]
+    # C11: this route bypasses pipeline.ingest (no conversational content), so it
+    # previously had NO admission control at all. Per-destination-number bucket —
+    # legit volume is one callback per call plus retries.
+    admitted = rate_limit.get_store().check_source("voice_status", params.get("To", "") or "?")
+    if not admitted.allowed:
+        return Response(status_code=429)
     async with untenanted_session() as s:
-        if not verify_twilio(req["auth_token"], req["url"], params, req["x_twilio_signature"]):
+        if not verify_twilio_inbound(
+            req["auth_token"],
+            req["url"],
+            params,
+            req["x_twilio_signature"],
+            capability_token=req.get("capability_token"),
+        ):
             await pipeline.record_inbound_rejection(
                 s, reason="twilio_signature_invalid", channel="voice"
             )
+            # A cap parameter that was PRESENTED but did not verify is a forgery
+            # signal on a tenant we can name (the To number resolved when the
+            # capability token was fetched) — audit it under that tenant (C11).
+            if "cap=" in str(request.url.query or ""):
+                await _audit_capability_rejection(params.get("To", ""))
             return Response(status_code=403)
         try:
             ctx = await _resolve("sms_sender", params.get("To", ""))

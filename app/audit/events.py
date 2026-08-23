@@ -83,6 +83,13 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # failed = it could not, and the manual guidance was surfaced instead.
         "webhook_autoconfig_applied",
         "webhook_autoconfig_failed",
+        # C11 capability-URL inbound verification (tenants whose Twilio auth
+        # token the platform never holds): provisioned = a per-connection cap
+        # token was minted onto the registered webhook URLs; rejected = an
+        # inbound presented a cap parameter that did not verify for the number's
+        # tenant (forgery signal, number suffix only — never the token).
+        "webhook_capability_provisioned",
+        "inbound_capability_rejected",
         # c21: an attempt to claim a destination another tenant holds was refused.
         # Recorded under the CLAIMANT (never the holder — an attacker must not be
         # able to spam a victim's audit chain), in its own transaction because the

@@ -53,6 +53,28 @@ def test_canonical_google_key_wins_over_the_legacy_drive_key():
     assert Settings(platform_secret=blob).google_client_id == "canonical"
 
 
+def test_twilio_oauth_keys_bridge_without_touching_the_api_key_alias():
+    """C10: TWILIO_OAUTH_* configures the OAuth app; the legacy TWILIO_CLIENT_SECRET
+    alias keeps naming the PLATFORM API-key secret. One blob carrying all three must
+    land each on its own field — a collision here would swap a customer-facing OAuth
+    client secret with the platform's API key."""
+    blob = json.dumps(
+        {
+            "TWILIO_OAUTH_CLIENT_ID": "OQtest",
+            "TWILIO_OAUTH_CLIENT_SECRET": "oauth-secret",
+            "TWILIO_OAUTH_REDIRECT_URI": (
+                "https://api.vantagemind.ai/api/v1/connections/twilio/callback"
+            ),
+            "TWILIO_CLIENT_SECRET": "legacy-api-key-secret",
+        }
+    )
+    s = Settings(platform_secret=blob)
+    assert s.twilio_oauth_client_id == "OQtest"
+    assert s.twilio_oauth_client_secret == "oauth-secret"
+    assert s.twilio_oauth_redirect_uri.endswith("/connections/twilio/callback")
+    assert s.twilio_api_key_secret == "legacy-api-key-secret"
+
+
 def test_direct_env_var_wins_over_blob(monkeypatch):
     monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_ID", "env-wins")
     blob = json.dumps({"GOOGLE_CLIENT_ID": "blob-loses"})

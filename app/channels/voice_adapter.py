@@ -43,7 +43,7 @@ from app.channels.base import (
     InstanceContext,
     OutboundMessage,
 )
-from app.channels.signatures import verify_twilio
+from app.channels.signatures import verify_twilio_inbound
 
 CHANNEL_ID = "voice"
 
@@ -171,7 +171,16 @@ class VoiceAdapter:
         url = request["url"]
         params = request["params"]  # the Twilio Voice POST params
         signature = request.get("x_twilio_signature", "")
-        if not verify_twilio(auth_token, url, params, signature):
+        # Signature first, byte-identical to before; the capability-URL token
+        # (C11) is the ADDITIVE alternate for tenants whose Twilio auth token
+        # the platform never holds.
+        if not verify_twilio_inbound(
+            auth_token,
+            url,
+            params,
+            signature,
+            capability_token=request.get("capability_token"),
+        ):
             # Unsigned/invalid inbound is rejected, never routed (§3.1.3, §3.7.2).
             raise InboundRejected("twilio_signature_invalid")
         resolve = request["resolve"]

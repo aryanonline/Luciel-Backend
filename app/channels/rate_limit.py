@@ -48,6 +48,11 @@ LIMITS: dict[str, ChannelLimits] = {
     # claimed. Keyed per admin; contact-form-tight because a legitimate owner
     # hits this at most once or twice by accident.
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
+    # Voice status callbacks (C11, not conversational): the finalize-at-hangup
+    # route bypasses pipeline.ingest, so it gets its own per-destination-number
+    # bucket. Legit volume is one callback per call plus provider retries —
+    # generous headroom over the voice channel's own 200/day cap.
+    "voice_status": ChannelLimits(burst=10, refill_seconds=2.0, daily_cap=2000),
 }
 
 # Per-tenant cross-channel inbound ceiling (messages/minute) — denial-of-wallet backstop.

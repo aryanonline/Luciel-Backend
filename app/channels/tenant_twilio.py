@@ -43,6 +43,10 @@ FIELD_ACCOUNT_SID = "accountSid"
 FIELD_AUTH_TOKEN = "authToken"  # noqa: S105 — field NAME, not a credential  # nosec B105
 FIELD_API_KEY_SID = "apiKeySid"
 FIELD_API_KEY_SECRET = "apiKeySecret"  # noqa: S105 — field NAME, not a credential  # nosec B105
+# Per-connection random secret appended as ?cap= to auto-configured webhook URLs
+# (C11): the inbound-authenticity proof for tenants whose Account Auth Token the
+# platform does not hold (OAuth grants, API-key-only submissions).
+FIELD_CAPABILITY_TOKEN = "webhookCapabilityToken"  # noqa: S105 — field NAME  # nosec B105
 
 
 class InvalidTwilioCredentials(ValueError):
@@ -51,19 +55,30 @@ class InvalidTwilioCredentials(ValueError):
 
 @dataclass(frozen=True)
 class TwilioCredentials:
-    """One tenant's Twilio credential, reassembled from row + SecretStore."""
+    """One tenant's Twilio credential, reassembled from row + SecretStore.
+
+    Two shapes since C10: the credential-form pair (auth token / API key) and the
+    one-click OAuth grant (``access_token`` — a bearer token the ``twilio_bearer``
+    surface uses; possibly stale, so LIVE calls go through
+    ``refresh.ensure_fresh_access_token`` rather than reading it directly)."""
 
     account_sid: str
     auth_token: str = ""
     api_key_sid: str = ""
     api_key_secret: str = ""
+    access_token: str = ""
 
     @property
     def usable(self) -> bool:
-        """True iff this can actually authenticate a Twilio REST call."""
+        """True iff this can authenticate the SDK's credential-shape client."""
         return bool(self.account_sid) and bool(
             self.auth_token or (self.api_key_sid and self.api_key_secret)
         )
+
+    @property
+    def bearer_usable(self) -> bool:
+        """True iff this is the OAuth shape (bearer REST calls, C10)."""
+        return bool(self.account_sid) and bool(self.access_token)
 
 
 def validate_submitted_credentials(fields: dict[str, str]) -> TwilioCredentials:
@@ -174,6 +189,26 @@ async def load_tenant_credentials(
         auth_token=material.get(FIELD_AUTH_TOKEN, ""),
         api_key_sid=material.get(FIELD_API_KEY_SID, ""),
         api_key_secret=material.get(FIELD_API_KEY_SECRET, ""),
+        access_token=material.get("access_token", ""),
+    )
+
+
+async def _fresh_bearer_token(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+) -> str | None:
+    """A refresh-checked bearer token for the tenant's sms_sender row (C10).
+
+    OAuth access tokens are short-lived; a factory building a live surface must
+    not hand out a token that expires mid-use. ``None`` means reconnect needed —
+    every caller degrades to its honest Null."""
+    from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+    return await ensure_fresh_access_token(
+        session, admin_id, instance_id, connection_type="sms_sender", store=store
     )
 
 
@@ -191,6 +226,61 @@ async def tenant_auth_token(
     platform token would reject every real inbound."""
     creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
     return creds.auth_token if creds is not None and creds.auth_token else None
+
+
+async def tenant_inbound_verification(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+) -> tuple[str | None, str | None]:
+    """Both inbound-authenticity secrets for this tenant: (auth_token, capability_token).
+
+    The signature path verifies with the Account Auth Token when the tenant gave
+    us one; the capability-URL path (C11) covers the shapes that never yield it
+    (OAuth grant, API-key-only). Either may be None; both None means only the
+    platform-token fallback remains — which for a BYO number honestly fails."""
+    conn = await _sms_sender_row(session, admin_id, instance_id)
+    if conn is None or not conn.secret_ref:
+        return None, None
+    material = await (store or get_secret_store()).get(conn.secret_ref) or {}
+    return (
+        material.get(FIELD_AUTH_TOKEN) or None,
+        material.get(FIELD_CAPABILITY_TOKEN) or None,
+    )
+
+
+async def ensure_capability_token(
+    conn: InstanceConnection,
+    *,
+    store: SecretStore | None = None,
+) -> tuple[str | None, bool]:
+    """The connection's webhook capability token, minting one if absent (C11).
+
+    Returns ``(token, minted)``. Only for connections whose material lacks an
+    Account Auth Token — a tenant the signature path already covers gets
+    ``(None, False)``, so their verification stays byte-identical. Also None
+    when there is no secret material at all (nothing to anchor a webhook to).
+    The token is 256-bit urlsafe random, stored beside the credential in the
+    SecretStore, never on the row."""
+    import secrets as pysecrets  # noqa: PLC0415
+
+    if not conn.secret_ref:
+        return None, False
+    backing = store or get_secret_store()
+    material = await backing.get(conn.secret_ref)
+    if material is None:
+        return None, False
+    if material.get(FIELD_AUTH_TOKEN):
+        return None, False
+    existing = material.get(FIELD_CAPABILITY_TOKEN)
+    if existing:
+        return str(existing), False
+    token = pysecrets.token_urlsafe(32)
+    material[FIELD_CAPABILITY_TOKEN] = token
+    await backing.put(conn.secret_ref, material)
+    return token, True
 
 
 async def build_tenant_operability_probe(
@@ -211,14 +301,22 @@ async def build_tenant_operability_probe(
     if get_settings().integration_mode != "live":
         return NullOperabilityProbe()
     creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
-    if creds is None or not creds.usable:
+    if creds is None:
         return NullOperabilityProbe()
-    return TwilioOperabilityProbe(
-        account_sid=creds.account_sid,
-        api_key_sid=creds.api_key_sid,
-        api_key_secret=creds.api_key_secret,
-        auth_token=creds.auth_token,
-    )
+    if creds.usable:
+        return TwilioOperabilityProbe(
+            account_sid=creds.account_sid,
+            api_key_sid=creds.api_key_sid,
+            api_key_secret=creds.api_key_secret,
+            auth_token=creds.auth_token,
+        )
+    if creds.bearer_usable:
+        from app.channels.twilio_bearer import TwilioBearerOperabilityProbe  # noqa: PLC0415
+
+        token = await _fresh_bearer_token(session, admin_id, instance_id, store=store)
+        if token:
+            return TwilioBearerOperabilityProbe(account_sid=creds.account_sid, access_token=token)
+    return NullOperabilityProbe()
 
 
 @dataclass(frozen=True)
@@ -255,10 +353,26 @@ async def list_tenant_numbers(
     from app.config import get_settings
 
     creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
-    if creds is None or not creds.usable:
+    if creds is None or not (creds.usable or creds.bearer_usable):
         return None
     if get_settings().integration_mode != "live":
         return list(MOCK_TENANT_NUMBERS)
+    if not creds.usable:
+        # OAuth shape (C10): the same listing over bearer auth.
+        from app.channels.twilio_bearer import list_incoming_numbers  # noqa: PLC0415
+
+        token = await _fresh_bearer_token(session, admin_id, instance_id, store=store)
+        if not token:
+            return None
+        bearer_rows = await list_incoming_numbers(
+            access_token=token, account_sid=creds.account_sid, limit=limit
+        )
+        if bearer_rows is None:
+            return None
+        return [
+            TenantNumber(phone_number=r["phone_number"], friendly_name=r["friendly_name"])
+            for r in bearer_rows
+        ]
     try:
         import asyncio
 
@@ -303,14 +417,22 @@ async def build_tenant_sms_sender(
     if get_settings().integration_mode != "live":
         return NullSmsSender()
     creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
-    if creds is None or not creds.usable:
+    if creds is None:
         return NullSmsSender()
-    return TwilioSmsSender(
-        account_sid=creds.account_sid,
-        api_key_sid=creds.api_key_sid,
-        api_key_secret=creds.api_key_secret,
-        auth_token=creds.auth_token,
-    )
+    if creds.usable:
+        return TwilioSmsSender(
+            account_sid=creds.account_sid,
+            api_key_sid=creds.api_key_sid,
+            api_key_secret=creds.api_key_secret,
+            auth_token=creds.auth_token,
+        )
+    if creds.bearer_usable:
+        from app.channels.twilio_bearer import TwilioBearerSmsSender  # noqa: PLC0415
+
+        token = await _fresh_bearer_token(session, admin_id, instance_id, store=store)
+        if token:
+            return TwilioBearerSmsSender(account_sid=creds.account_sid, access_token=token)
+    return NullSmsSender()
 
 
 # --------------------------------------------------------------------------- #
@@ -333,15 +455,26 @@ class WebhookUrls:
     status_callback_url: str
 
 
-def build_webhook_urls(public_api_base_url: str) -> WebhookUrls | None:
-    """The three webhook endpoints, absolute against the public API origin."""
+def build_webhook_urls(
+    public_api_base_url: str, *, capability_token: str | None = None
+) -> WebhookUrls | None:
+    """The three webhook endpoints, absolute against the public API origin.
+
+    With ``capability_token`` (C11 — tenants whose auth token we do not hold),
+    each URL carries the per-connection ``cap`` parameter that inbound
+    verification accepts in place of an X-Twilio-Signature it can never check."""
     base = (public_api_base_url or "").rstrip("/")
     if not base:
         return None
+    suffix = ""
+    if capability_token:
+        from urllib.parse import quote  # noqa: PLC0415
+
+        suffix = f"?cap={quote(capability_token, safe='')}"
     return WebhookUrls(
-        voice_url=f"{base}/api/v1/webhooks/twilio/voice",
-        sms_url=f"{base}/api/v1/webhooks/twilio/sms",
-        status_callback_url=f"{base}/api/v1/webhooks/twilio/voice/status",
+        voice_url=f"{base}/api/v1/webhooks/twilio/voice{suffix}",
+        sms_url=f"{base}/api/v1/webhooks/twilio/sms{suffix}",
+        status_callback_url=f"{base}/api/v1/webhooks/twilio/voice/status{suffix}",
     )
 
 
@@ -424,11 +557,21 @@ async def build_tenant_webhook_configurator(
     if settings.integration_mode != "live" or not settings.public_api_base_url:
         return NullWebhookConfigurator()
     creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
-    if creds is None or not creds.usable:
+    if creds is None:
         return NullWebhookConfigurator()
-    return TwilioApiWebhookConfigurator(
-        account_sid=creds.account_sid,
-        auth_token=creds.auth_token,
-        api_key_sid=creds.api_key_sid,
-        api_key_secret=creds.api_key_secret,
-    )
+    if creds.usable:
+        return TwilioApiWebhookConfigurator(
+            account_sid=creds.account_sid,
+            auth_token=creds.auth_token,
+            api_key_sid=creds.api_key_sid,
+            api_key_secret=creds.api_key_secret,
+        )
+    if creds.bearer_usable:
+        from app.channels.twilio_bearer import TwilioBearerWebhookConfigurator  # noqa: PLC0415
+
+        token = await _fresh_bearer_token(session, admin_id, instance_id, store=store)
+        if token:
+            return TwilioBearerWebhookConfigurator(
+                account_sid=creds.account_sid, access_token=token
+            )
+    return NullWebhookConfigurator()

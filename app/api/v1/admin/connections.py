@@ -828,8 +828,20 @@ async def complete_oauth_connect(
                     raise OAuthExchangeRejected(detail)
             else:
                 old_status = conn.status
-                conn.status = "connected"
-                conn.status_detail = None
+                # §3.1.4 honesty on the OAuth path too (C10): a BYO SMS account
+                # with no designated number cannot send, so the one-click Twilio
+                # connect lands on "add your number" — exactly like the
+                # credential-form path — not on a false Connected.
+                cfg_now = conn.non_secret_config or {}
+                sms_needs_number = conn.connection_type == "sms_sender" and not (
+                    cfg_now.get("destination") or cfg_now.get("pending_destination")
+                )
+                if sms_needs_number:
+                    conn.status = "unconfigured"
+                    conn.status_detail = service.SMS_NEEDS_NUMBER_DETAIL
+                else:
+                    conn.status = "connected"
+                    conn.status_detail = None
                 await s.flush()
                 await audit.emit(
                     s,
@@ -841,7 +853,7 @@ async def complete_oauth_connect(
                     payload={
                         "connection_id": str(conn.connection_id),
                         "old_status": old_status,
-                        "new_status": "connected",
+                        "new_status": conn.status,
                         "reason": "oauth_callback_token_exchanged",
                     },
                 )

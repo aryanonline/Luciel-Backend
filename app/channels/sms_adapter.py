@@ -22,7 +22,7 @@ from app.channels.base import (
     InstanceContext,
     OutboundMessage,
 )
-from app.channels.signatures import verify_twilio
+from app.channels.signatures import verify_twilio_inbound
 
 # Inbound opt-out / help keywords the platform handles AT THE SMS ADAPTER
 # (Architecture §3.1.6 / Legal §A2). These are matched case-insensitively against
@@ -74,7 +74,16 @@ class SmsAdapter:
         url = request["url"]
         params = request["params"]  # the Twilio POST params
         signature = request.get("x_twilio_signature", "")
-        if not verify_twilio(auth_token, url, params, signature):
+        # Signature first, byte-identical to before; the capability-URL token
+        # (C11) is the ADDITIVE alternate for tenants whose Twilio auth token
+        # the platform never holds (OAuth grant / API-key-only submissions).
+        if not verify_twilio_inbound(
+            auth_token,
+            url,
+            params,
+            signature,
+            capability_token=request.get("capability_token"),
+        ):
             raise InboundRejected("twilio_signature_invalid")
         resolve = request["resolve"]
         to_number = params.get("To", "")

@@ -238,15 +238,35 @@ async def configure_number_webhooks(
     from app.channels.tenant_twilio import (  # noqa: PLC0415
         build_tenant_webhook_configurator,
         build_webhook_urls,
+        ensure_capability_token,
     )
     from app.config import get_settings  # noqa: PLC0415
     from app.models.audit import ActorType  # noqa: PLC0415
 
-    urls = build_webhook_urls(get_settings().public_api_base_url)
-    if urls is None:
+    plain_urls = build_webhook_urls(get_settings().public_api_base_url)
+    if plain_urls is None:
         # No public API origin configured (mock/CI/local): auto-config is not part
         # of this deployment at all — a silent no-op, never a "failure" note.
         return False
+    # C11: a tenant whose Account Auth Token we do not hold (OAuth grant,
+    # API-key-only form) can never pass X-Twilio-Signature verification — their
+    # registered URLs carry a per-connection capability token instead. Minted
+    # once, before URL construction; None for signature-covered tenants, whose
+    # URLs stay byte-identical.
+    capability, minted = await ensure_capability_token(conn)
+    if minted:
+        await audit_log.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="webhook_capability_provisioned",
+            payload={"connection_type": "sms_sender", "number": e164_number},
+        )
+    urls = (
+        build_webhook_urls(get_settings().public_api_base_url, capability_token=capability)
+        or plain_urls
+    )
     configurator = webhook_config or await build_tenant_webhook_configurator(
         session, admin_id, instance_id
     )
