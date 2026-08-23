@@ -130,6 +130,8 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
             "session": 1,
             "deferred_action_terminal": 0,
             "processed_stripe_event": 0,
+            "tool_trace_event": 0,
+            "retrieval_trace_event": 0,
         }
 
     async with tenant_session(admin) as s:
@@ -177,6 +179,8 @@ async def test_expire_aged_data_is_idempotent():
             "session": 1,
             "deferred_action_terminal": 0,
             "processed_stripe_event": 0,
+            "tool_trace_event": 0,
+            "retrieval_trace_event": 0,
         }
     # Re-run: nothing left aged → zero deletes (idempotent).
     async with tenant_session(admin) as s:
@@ -188,6 +192,8 @@ async def test_expire_aged_data_is_idempotent():
             "session": 0,
             "deferred_action_terminal": 0,
             "processed_stripe_event": 0,
+            "tool_trace_event": 0,
+            "retrieval_trace_event": 0,
         }
 
 

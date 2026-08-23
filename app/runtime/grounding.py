@@ -184,10 +184,10 @@ def faithful_readback_ok(answer: str, allowed_fields: dict[str, object]) -> bool
     """
     import re
 
-    token = r"\b\d[\d,\.:]*"
-    claimed_numbers = set(re.findall(token, answer))
+    number_pattern = r"\b\d[\d,\.:]*"
+    claimed_numbers = set(re.findall(number_pattern, answer))
     allowed_numbers: set[str] = set()
     for v in allowed_fields.values():
-        allowed_numbers |= set(re.findall(token, str(v)))
+        allowed_numbers |= set(re.findall(number_pattern, str(v)))
     # Any claimed number not present in the allowed fields is a faithful-readback breach.
     return claimed_numbers.issubset(allowed_numbers) if claimed_numbers else True

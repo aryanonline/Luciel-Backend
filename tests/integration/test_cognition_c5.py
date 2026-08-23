@@ -1,13 +1,13 @@
 """Cognition fixes from audit round 3, C5.
 
-  * Voice parity: the voice pipeline builds its Orchestrator WITH the tool
-    resolver + snapshot capability set (it used to build bare — every proposed
-    tool on a phone call resolved to `failed` while text channels dispatched).
-  * At-cap lead capture: deterministic capture runs BEFORE the budget gate, so
-    the at-cap escalation row carries the lead ("leads still captured +
-    escalated" at cap) — no LLM call is added.
-  * Gate-1 contact ask: an anonymous widget visitor who asks for a human gets
-    the contact ask appended to the handoff ack (previously only gate-2 asked).
+* Voice parity: the voice pipeline builds its Orchestrator WITH the tool
+  resolver + snapshot capability set (it used to build bare — every proposed
+  tool on a phone call resolved to `failed` while text channels dispatched).
+* At-cap lead capture: deterministic capture runs BEFORE the budget gate, so
+  the at-cap escalation row carries the lead ("leads still captured +
+  escalated" at cap) — no LLM call is added.
+* Gate-1 contact ask: an anonymous widget visitor who asks for a human gets
+  the contact ask appended to the handoff ack (previously only gate-2 asked).
 """
 
 from __future__ import annotations
@@ -116,9 +116,7 @@ async def test_at_cap_turn_still_captures_the_lead_and_links_the_escalation():
             transport_identifier="+15550100200",
         )
         assert result.at_cap is True
-        lead = (
-            await s.execute(select(Lead).where(Lead.admin_id == admin))
-        ).scalar_one_or_none()
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one_or_none()
         assert lead is not None, "capture is cognition — it must run even at cap (§3.4.1b)"
         ev = (
             (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
