@@ -339,7 +339,10 @@ async def run_model_currency(*, now: datetime | None = None) -> dict[str, object
     reach the sweep log group's SweepErrors alarm. Mock mode is a no-op."""
     from app.runtime.model_currency import run_model_currency_check  # noqa: PLC0415
 
-    return await run_model_currency_check(now=now)
+    # A real date always rides along: the weekly newer-same-family nudge
+    # (Phase 7) fires on its weekday only when the caller stamps one, and the
+    # scheduled entrypoint invokes sweeps with no arguments.
+    return await run_model_currency_check(now=now or datetime.now(UTC))
 
 
 SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {

@@ -233,6 +233,83 @@ async def test_presence_is_retrieve_based_and_listing_free_when_all_pins_resolve
     assert transport.listing_calls("openai") == []
 
 
+async def test_weekly_nudge_when_a_strictly_newer_family_member_exists(caplog):
+    """Phase 7 (owner concern #6): healthy pins + a newer same-family model in
+    the listing → ONE weekly INFO email naming current and newer, nothing
+    swapped, nothing raised — awareness, never an auto-upgrade."""
+    from datetime import UTC, datetime
+
+    transport = FakeTransport(
+        existing=set(ALL_PINS),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-6", 300), ("claude-sonnet-5", 900)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+    sender = RecordingSender()
+    monday = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
+    assert monday.weekday() == 0
+    with caplog.at_level(logging.INFO, logger="app.runtime.model_currency"):
+        result = await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=FakeWriter(),
+            restarter=FakeRestarter(),
+            now=monday,
+        )
+    assert result["swapped"] == []
+    assert result["nudges"] == [
+        {
+            "setting": "llm_anthropic_primary_model",
+            "current": "claude-sonnet-4-6",
+            "newer": "claude-sonnet-5",
+        }
+    ]
+    ((to, subject, body),) = sender.sent
+    assert "newer model" in subject
+    assert "claude-sonnet-5" in body and "never upgraded automatically" in body
+    assert to == "no-reply@unit.test"
+    assert any(model_currency.MODEL_CURRENCY_NUDGE in r.getMessage() for r in caplog.records)
+
+
+async def test_nudge_stays_quiet_off_day_and_when_the_pin_is_newest():
+    from datetime import UTC, datetime
+
+    # Same newer-model listing on a TUESDAY: no listing fetch, no email.
+    transport = FakeTransport(
+        existing=set(ALL_PINS),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-6", 300), ("claude-sonnet-5", 900)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+    sender = RecordingSender()
+    tuesday = datetime(2026, 8, 25, 9, 0, tzinfo=UTC)
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW),
+        transport_factory=lambda: transport,
+        email_sender=sender,
+        now=tuesday,
+    )
+    assert result["nudges"] == [] and sender.sent == []
+    assert transport.listing_calls("anthropic") == []
+
+    # Monday, but the pin IS the family's newest (an older sibling remains
+    # listed): pick_successor would offer the OLDER sibling — the strictness
+    # rule keeps that non-news out of the inbox.
+    transport = FakeTransport(
+        existing=set(ALL_PINS),
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-6", 900), ("claude-sonnet-4-5", 300)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+    sender = RecordingSender()
+    monday = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW),
+        transport_factory=lambda: transport,
+        email_sender=sender,
+        now=monday,
+    )
+    assert result["nudges"] == [] and sender.sent == []
+
+
 async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplog):
     # sonnet-4-6 genuinely 404s; the listing (fetched for the successor) has 4-8.
     transport = FakeTransport(

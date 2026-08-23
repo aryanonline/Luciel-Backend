@@ -55,6 +55,13 @@ logger = logging.getLogger(__name__)
 
 MODEL_CURRENCY_ALERT = "MODEL_CURRENCY_ALERT"
 MODEL_CURRENCY_SWAP = "MODEL_CURRENCY_SWAP"
+MODEL_CURRENCY_NUDGE = "MODEL_CURRENCY_NUDGE"
+
+# The newer-same-family nudge (audit round 3, Phase 7 — owner concern #6) goes
+# out at most on this weekday (Monday), keeping the module stateless (its
+# design doctrine) while bounding the noise to weekly. INFO-class: a nudge is
+# never an alarm, never an auto-upgrade — the pin moves only by owner decision.
+_NUDGE_WEEKDAY = 0
 
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
@@ -232,6 +239,41 @@ def pick_successor(retired_id: str, available: list[dict[str, Any]]) -> str | No
     return str(best["id"])
 
 
+def _pin_epoch(model_id: str, available: list[dict[str, Any]]) -> int:
+    """When the PINNED model was released, per the listing.
+
+    An alias pin (``claude-sonnet-4-6``) may be absent from the listing while
+    its dated snapshots (``claude-sonnet-4-6-20251101``) are present — those
+    snapshots ARE the pin for age purposes. 0 = the pin has no listing footprint
+    at all, so no honest age comparison is possible."""
+    matches = [
+        item
+        for item in available
+        if isinstance(item.get("id"), str)
+        and (item["id"] == model_id or item["id"].startswith(model_id + "-"))
+    ]
+    return max((_created_epoch(item) for item in matches), default=0)
+
+
+def newer_same_family(model_id: str, available: list[dict[str, Any]]) -> str | None:
+    """A same-family model STRICTLY newer than the pin, or None (Phase 7 nudge).
+
+    Strictness is the no-noise rule: when the pin IS the family's newest,
+    ``pick_successor`` would still return an older sibling — that is a swap
+    candidate for a retirement, not news. And with no listing footprint for the
+    pin there is no honest age comparison, so no claim is made."""
+    candidate = pick_successor(model_id, available)
+    if candidate is None:
+        return None
+    pin_epoch = _pin_epoch(model_id, available)
+    if pin_epoch == 0:
+        return None
+    candidate_epoch = max(
+        (_created_epoch(item) for item in available if item.get("id") == candidate), default=0
+    )
+    return candidate if candidate_epoch > pin_epoch else None
+
+
 # --- remediation seams (secret write + service restart) ------------------------ #
 
 
@@ -362,6 +404,8 @@ async def run_model_currency_check(
     checked: list[str] = []
     swapped: list[dict[str, str]] = []
     alerts: list[str] = []
+    nudges: list[dict[str, str]] = []
+    healthy_chat_pins: list[tuple[ModelPin, str]] = []
     unreachable: set[str] = set()
     # The paginated listing is fetched LAZILY, only to resolve a successor for a
     # pin the retrieve proved gone — presence is never judged by list membership.
@@ -400,6 +444,8 @@ async def run_model_currency_check(
                 continue
             if exists:
                 checked.append(pin.setting)
+                if pin.swappable:
+                    healthy_chat_pins.append((pin, model_id))
                 continue
 
             # The pin is GONE at the provider (a real 404, not a listing quirk).
@@ -482,6 +528,55 @@ async def run_model_currency_check(
             )
             alerts.append(f"{pin.setting} = '{model_id}' is gone from {pin.provider}; {reason}")
 
+        # --- newer-same-family nudge (Phase 7, owner concern #6) --------------- #
+        # A HEALTHY pin with a strictly newer family member gets a weekly INFO
+        # email — awareness, never an auto-upgrade (the pin moves only by owner
+        # decision; only a provider RETIREMENT auto-swaps, above). Weekly via the
+        # weekday gate keeps the module stateless and the mailbox quiet. Gated on
+        # an EXPLICIT datetime: the sweep wrapper stamps the real date; direct
+        # calls without one (the retirement-check tests) never nudge, so the
+        # listing-is-lazy contract holds for them unchanged.
+        from datetime import datetime as _datetime  # noqa: PLC0415
+
+        if isinstance(now, _datetime) and now.weekday() == _NUDGE_WEEKDAY:
+            for pin, model_id in healthy_chat_pins:
+                if pin.provider in unreachable:
+                    continue
+                listing = await _listing_for(client, pin.provider)
+                if not listing:
+                    continue
+                newer = newer_same_family(model_id, listing)
+                if newer:
+                    logger.info(
+                        "%s setting=%s current=%s newer=%s",
+                        MODEL_CURRENCY_NUDGE,
+                        pin.setting,
+                        model_id,
+                        newer,
+                    )
+                    nudges.append({"setting": pin.setting, "current": model_id, "newer": newer})
+            if nudges and operator:
+                lines = "\n".join(
+                    f"- {n['setting']}: pinned '{n['current']}', newest in family '{n['newer']}'"
+                    for n in nudges
+                )
+                await _send(
+                    sender,
+                    to=operator,
+                    subject=(
+                        f"Luciel model check ({settings.environment}): a newer model "
+                        "in the same family is available"
+                    ),
+                    body=(
+                        f"{lines}\n\n"
+                        "Nothing changed and nothing is wrong — your pinned models all "
+                        "work. This is the weekly §3.4.3 heads-up that the provider now "
+                        "offers a newer model in the same family. To move, set the LLM_* "
+                        "key in the platform secret and restart the app services (the "
+                        "deploy-free swap); the pin is never upgraded automatically."
+                    ),
+                )
+
     if alerts:
         logger.error("%s %s", MODEL_CURRENCY_ALERT, " | ".join(alerts))
         if operator:
@@ -499,5 +594,6 @@ async def run_model_currency_check(
     return {
         "checked": checked,
         "swapped": swapped,
+        "nudges": nudges,
         "unreachable": sorted(unreachable | {p for p, v in listings.items() if v is None}),
     }
