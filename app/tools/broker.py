@@ -33,17 +33,9 @@ from app.models.tool_auth import InstanceToolAuthorization
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
 
-ACTION_TOOLS = frozenset(
-    {
-        "book_appointment",
-        "reschedule_appointment",
-        "cancel_appointment",
-        "send_email",
-        "send_sms",
-        "schedule_callback",
-        "push_to_crm",
-    }
-)
+# The write-tool set lives with the schemas (single source, audit round 3 C3);
+# re-exported here for callers that reach it via the broker.
+from app.tools.schemas import ACTION_TOOLS as ACTION_TOOLS  # noqa: PLC0414
 
 
 class ToolBroker:

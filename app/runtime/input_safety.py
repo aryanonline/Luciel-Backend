@@ -184,6 +184,52 @@ _BUSINESS_CONTEXT_HEADER = (
     "identity, disclosure, grounding, escalation, or moderation behavior) ---\n"
 )
 
+# --- Tool use (§3.3.7 / audit round 3, C3) -----------------------------------------
+#
+# Platform-AUTHORED, placed WITH the invariants (above personality/style/admin
+# context): the required-input discipline — gather-in-PLAN, infer-but-confirm for
+# writes, never fabricate — is accuracy doctrine, not style. The catalog itself is
+# interpolated from app/tools/schemas.py so the model is never told about a tool the
+# broker doesn't enforce. The broker + code-side ask-bound remain the enforcement;
+# this stanza is the model-facing statement of the same rules.
+
+_TOOL_USE_STANZA_HEADER = (
+    "\n--- Tools (platform rules; these bind exactly like the numbered rules above) ---\n"
+    "You can take real actions for this business with the tools listed below. How you "
+    "use them is part of the platform rules:\n"
+    "T1. GATHER FIRST (§3.3.7): before calling a tool, obtain every input it requires. "
+    "If a required detail is missing from the conversation, ASK the customer for it by "
+    "name — never call the tool with a placeholder, a guess, or an invented value.\n"
+    "T2. CONFIRM BEFORE WRITING: for any action that changes something outside this "
+    "conversation (booking, rescheduling, cancelling, sending a message, scheduling a "
+    "follow-up, updating the CRM), restate any value you inferred rather than being "
+    "told directly — e.g. an email from earlier in the conversation — and get the "
+    "customer's confirmation before you call the tool.\n"
+    "T3. READ RESULTS FAITHFULLY: only claim an action happened when the tool result "
+    "says ok, and state only the fields the result actually contains. On empty say so "
+    "honestly; on ambiguous present the candidates and ask which; on failed say it "
+    "could not be completed and what happens next; on missing_input ask for the named "
+    "fields. Never present an action as done when it is not.\n"
+    "T4. CHECK BEFORE BOOKING: offer only times check_availability confirmed open, and "
+    "book only one of those.\n"
+    "Available tools:\n"
+)
+
+
+def compose_tool_use_stanza(tool_catalog: list[dict[str, object]] | None) -> str:
+    """The tool-use stanza for ``build_system_prompt`` — empty when no tools are wired.
+
+    ``tool_catalog`` is the provider-neutral def list (app/tools/schemas.build_tool_defs);
+    the stanza lists each tool's name + description so the prompt's catalog can never
+    drift from what the providers declare (one source, §3.3.1)."""
+    if not tool_catalog:
+        return ""
+    lines = "".join(
+        f"- {t['tool_id']}: {t['description']}\n" for t in tool_catalog if t.get("tool_id")
+    )
+    return _TOOL_USE_STANZA_HEADER + lines
+
+
 # Defensive cap mirroring Vision §3.5 (the field is tweet-sized).
 BUSINESS_CONTEXT_MAX_CHARS = 280
 
@@ -241,6 +287,7 @@ def build_system_prompt(
     luciel_email_address: str | None = None,
     personality: dict[str, object] | None = None,
     assistant_name: str = "Luciel",
+    tool_catalog: list[dict[str, object]] | None = None,
 ) -> str:
     """Compose the system prompt with platform invariants at higher precedence than
     the admin's business-context field (Defense 6, §3.4.14).
@@ -267,11 +314,21 @@ def build_system_prompt(
     "You are Luciel", reintroduced itself as Luciel one turn later). Platform-RESOLVED
     from personality.assistantName → instance name (the same resolution the greeting
     uses), so it is interpolated into the identity stanza, never wrapped as untrusted.
+
+    ``tool_catalog`` (audit round 3, C3) is the provider-neutral tool-def list for the
+    tools THIS turn may dispatch (already snapshot/authorization-gated by the caller).
+    It composes the §3.3.7 tool-use stanza with the invariants; None/empty keeps the
+    prompt byte-identical to the pre-tool-use composition. Platform-RESOLVED (from the
+    code's own schemas), never wrapped as untrusted.
     """
     prompt = _INVARIANT_STANZAS.format(assistant_name=(assistant_name or "").strip() or "Luciel")
     addr = (luciel_email_address or "").strip()
     if addr:
         prompt = prompt + _EMAIL_IDENTITY_STANZA.format(address=addr)
+    # Tool-use rules ride WITH the invariants (accuracy doctrine, §3.3.7) — above
+    # personality/style, and far above the untrusted admin field. Empty when the
+    # caller wired no tools, keeping the no-tool prompt byte-identical.
+    prompt = prompt + compose_tool_use_stanza(tool_catalog)
     prompt = prompt + compose_personality_stanza(personality)
     # After personality, so the concrete formatting rules are the last word on FORM, and
     # still above the untrusted admin field, which cannot relax them (Decision #1).
