@@ -163,7 +163,15 @@ PROVIDERS: dict[str, ProviderSpec] = {
         client_id_setting="calendly_client_id",
         client_secret_setting="calendly_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="calendly_redirect_uri",
-        help_text="Luciel books, moves, and cancels through your Calendly event types.",
+        help_text="Offer and book times from your Calendly availability — not available yet.",
+        # No Calendly effect layer exists (tools/registry falls to the honest
+        # unavailable backend), and Calendly's API books via a scheduling link
+        # the LEAD completes — a different conversational contract than
+        # book_appointment, deferred to its own round (audit round 3, Phase 4;
+        # owner decision 2026-08-23). Without this guard, provisioning
+        # CALENDLY_* creds would light a working consent screen with a dead
+        # tool behind it.
+        unavailable_for=frozenset({"calendar"}),
     ),
     # --- CRM (Decision #6: hubspot | salesforce | custom_webhook) -----------------
     "hubspot": ProviderSpec(
@@ -229,7 +237,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
             CredentialField("api_key", "API key", secret=True, required=False),
         ),
         auth_class="long_lived_token",
-        help_text="Look records up live from your system of record.",
+        help_text="Look records up live from your system of record — not available yet.",
+        # No live-connector effect layer exists (tools/registry falls to the honest
+        # unavailable backend), so offering the form would take credentials for a
+        # tool that then answers `failed` on every lookup (audit round 3, Phase 4).
+        unavailable_for=frozenset({"record_source"}),
     ),
     "csv": ProviderSpec(
         provider="csv",
@@ -437,6 +449,11 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "channel_auth": ("meta",),
     "instagram_auth": ("instagram",),
     "sms_sender": ("twilio",),
+    # The BYO webhook tool's endpoint registration (Phase 5): one provider, but
+    # listing it makes /connections/providers serve its credential form — the
+    # frontend previously had NO registry group at all and rendered a connect
+    # button with no URL field.
+    "outbound_webhook": ("outbound_webhook",),
     # The choice here is not between vendors but between MODES: keep the platform
     # SES address (never offered as a pick — it is provisioned via /connections/email)
     # or connect your own Outlook mailbox. Only the BYO option is choosable.
@@ -512,7 +529,7 @@ def is_valid_provider(connection_type: str, provider: str) -> bool:
     return spec is not None and spec.connection_type == connection_type
 
 
-def provider_available(provider: str) -> bool:
+def provider_available(provider: str, connection_type: str | None = None) -> bool:
     """True iff a connection to this provider can actually be (re)established today.
 
     Harmony wave 2 (item 3): a stale ``instance_connections`` row can outlive the
@@ -526,6 +543,15 @@ def provider_available(provider: str) -> bool:
     the two pages cannot disagree about the same provider ever again."""
     spec = get_provider(provider)
     if spec is None:
+        return False
+    # unavailable_for wins over everything else (audit round 3, Phase 4): a
+    # provider whose EFFECT layer is unbuilt for this surface is not available
+    # there even with a registered OAuth client — otherwise provisioning creds
+    # would light a consent flow with a dead tool behind it. Scoped per surface:
+    # the SAME provider can stay live for another connection type (Salesforce KB
+    # read vs. its unbuilt CRM push). Callers that know the row's type pass it;
+    # with no type given, the spec's own primary type is the surface asked about.
+    if (connection_type or spec.connection_type) in spec.unavailable_for:
         return False
     if not spec.is_oauth:
         return True

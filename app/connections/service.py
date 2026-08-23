@@ -212,6 +212,14 @@ async def start_connection(
         raise ProviderNotRegistered(
             f"'{provider}' is not an available provider for {connection_type}."
         )
+    # Honest-disabled is enforced at the WRITE too (audit round 3, Phase 4): the
+    # provider list already renders unavailable_for as "not available yet", but a
+    # direct POST must not be able to start a consent flow for a provider whose
+    # effect layer is unbuilt on this surface — a connected row with a dead tool
+    # behind it is the exact false-Connected state the registry guard exists for.
+    _spec = registry.get_provider(provider)
+    if _spec is not None and connection_type in _spec.unavailable_for:
+        raise ProviderNotRegistered(f"'{provider}' is not available yet for {connection_type}.")
     auth_class = _auth_class_for(connection_type, provider)
 
     # BYO SMS number intake (§3.1.4): delegate to the single source of truth in
@@ -377,10 +385,36 @@ async def submit_credentials(
         except InvalidTwilioCredentials as exc:
             raise CredentialRejected(str(exc)) from exc
         material = secret_material(creds)
-        non_secret = {"accountSid": creds.account_sid}
+        non_secret: dict[str, object] = {"accountSid": creds.account_sid}
     else:
         material = {n: v for n, v in fields.items() if known[n].secret and v}
         non_secret = {n: v for n, v in fields.items() if not known[n].secret}
+
+    # Webhook endpoints (BYO outbound_webhook tool + the crm custom_webhook path)
+    # are sandbox-executed against an egress ALLOWLIST (§3.8.6) — which nothing
+    # ever wrote, so every call was refused as egress_blocked (audit round 3,
+    # Phase 5). The submit derives the allowlist from the endpoint's own host and
+    # validates the URL up front: https-only, and in live mode the host must
+    # resolve to public addresses (the sandbox re-checks per call; this makes a
+    # bad endpoint an honest 422 at setup instead of a dead tool later).
+    raw_url = non_secret.get("url")
+    if raw_url and connection.connection_type in ("outbound_webhook", "crm"):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(raw_url))
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise CredentialRejected("The webhook URL must be a full https:// address.")
+        from app.config import get_settings as _get_settings
+
+        if _get_settings().integration_mode == "live":
+            from app.connections.sandbox import resolves_to_public_host
+
+            if not resolves_to_public_host(str(raw_url)):
+                raise CredentialRejected(
+                    "The webhook URL must resolve to a public address — private and "
+                    "internal hosts cannot be called."
+                )
+        non_secret["egressAllowlist"] = [parsed.hostname]
 
     if not connection.secret_ref:
         connection.secret_ref = secret_ref_for(

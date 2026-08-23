@@ -178,12 +178,16 @@ async def test_connect_rejects_a_provider_the_registry_does_not_offer(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_connect_accepts_each_offered_crm_provider(client):
-    """All three Decision-#6 CRM providers connect on the SAME surface — including the
-    custom webhook, whose non-OAuth auth class yields a client form, not a consent URL."""
+    """The OFFERED Decision-#6 CRM providers connect on the SAME surface — including the
+    custom webhook, whose non-OAuth auth class yields a client form, not a consent URL.
+
+    Salesforce lead-push has no effect layer yet (`unavailable_for={"crm"}`), so
+    start_connection refuses it the same way the provider list disables it — one
+    truth on both surfaces (audit round 3, Phase 4). The Phase 6.5 Salesforce
+    build removes that scoping and moves salesforce into the accepted list."""
     await _ready_account_with_luciel(client)
     for provider, expected_key in (
         ("hubspot", "authorizeUrl"),
-        ("salesforce", "authorizeUrl"),
         ("custom_webhook", "requiresClientForm"),
     ):
         r = await client.post(
@@ -192,6 +196,11 @@ async def test_connect_accepts_each_offered_crm_provider(client):
         )
         assert r.status_code == 200, provider
         assert r.json().get(expected_key), (provider, r.json())
+    r = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "crm", "provider": "salesforce"},
+    )
+    assert r.status_code == 422, "an honest-disabled provider must refuse to start"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

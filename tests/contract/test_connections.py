@@ -75,9 +75,12 @@ async def test_start_oauth_returns_authorize_url(client):
 async def test_start_non_oauth_returns_client_form(client):
     await _ready_account_with_luciel(client)
     # outbound_webhook is non-OAuth → requiresClientForm:true, no authorizeUrl.
+    # "outbound_webhook" is the registry's ONE offered provider for this surface
+    # (Phase 5) — start_connection now refuses ids the registry does not offer,
+    # so the old made-up "zapier" would honestly 422.
     r = await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "outbound_webhook", "provider": "zapier"},
+        json={"connectionType": "outbound_webhook", "provider": "outbound_webhook"},
     )
     assert r.status_code == 200
     body = r.json()

@@ -104,7 +104,7 @@ def _connection_out(c: InstanceConnection) -> ConnectionOut:
             # /connections/providers uses for ProviderOptionOut.configured, so a
             # stale row for a provider the platform cannot connect today is marked
             # here too instead of rendering the owner-actionable "Action needed".
-            "providerAvailable": registry.provider_available(c.provider),
+            "providerAvailable": registry.provider_available(c.provider, c.connection_type),
             # Harmony wave 2 (item 4): give Overview the SAME human label Configure
             # already shows, so it never has to derive one from the raw provider
             # code (that derivation is what produced "Ses" instead of "Amazon SES").
