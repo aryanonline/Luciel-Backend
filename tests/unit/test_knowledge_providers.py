@@ -67,10 +67,11 @@ class FakeTransport:
             return httpx.Response(200, text=self._text_body, request=httpx.Request("GET", url))
         return httpx.Response(200, json=self._json_body, request=httpx.Request("GET", url))
 
-    async def post(self, url, *, data=None, headers=None):
+    async def post(self, url, *, data=None, headers=None, json=None):
         self.last_url = url
         self.last_headers = headers
         self.last_data = data
+        self.last_json = json
         status = getattr(self, "_status", 200)
         if self._text_body is not None:
             return httpx.Response(status, text=self._text_body, request=httpx.Request("POST", url))
@@ -164,32 +165,104 @@ async def test_google_drive_provider_snapshot_maps_files(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Notion: last_edited_time delta marker, archived pages excluded.
+# Notion: REAL API shapes (audit round 3, Phase 8) — POST search with the object
+# filter in the body, title from the properties walk, body via blocks-children,
+# archived pages excluded, last_edited_time as the delta marker.
 # --------------------------------------------------------------------------- #
+
+
+def _notion_rich(text: str) -> list[dict]:
+    return [{"type": "text", "plain_text": text}]
+
+
+class NotionFakeTransport:
+    """Recorded-shape Notion fake: routes search (POST) and blocks (GET)."""
+
+    def __init__(self, search_body: dict, children: dict[str, dict]) -> None:
+        self._search_body = search_body
+        self._children = children
+        self.search_calls: list[dict] = []
+        self.children_calls: list[str] = []
+        self.last_headers: dict | None = None
+
+    async def post(self, url, *, data=None, headers=None, json=None):
+        assert url == "https://api.notion.com/v1/search"
+        self.search_calls.append(dict(json or {}))
+        self.last_headers = headers
+        return httpx.Response(200, json=self._search_body, request=httpx.Request("POST", url))
+
+    async def get(self, url, *, headers=None, params=None):
+        assert "/v1/blocks/" in url and url.endswith("/children")
+        page_id = url.rsplit("/", 2)[1]
+        self.children_calls.append(page_id)
+        body = self._children.get(page_id, {"results": [], "has_more": False})
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+
 @pytest.mark.asyncio
-async def test_notion_provider_snapshot_excludes_archived(monkeypatch):
+async def test_notion_provider_reads_real_page_shapes():
     admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
     store = FakeSecretStore({_secret_ref(admin_id, instance_id): {"access_token": "tok-abc"}})
-    transport = FakeTransport(
-        json_body={
+    transport = NotionFakeTransport(
+        search_body={
             "results": [
-                {"id": "p1", "title": "FAQ", "text": "hours", "last_edited_time": "t1"},
+                {
+                    "id": "p1",
+                    "object": "page",
+                    "last_edited_time": "t1",
+                    # The REAL title shape: a properties entry of type "title" —
+                    # no top-level "title"/"text" fields exist on a page object.
+                    "properties": {"title": {"type": "title", "title": _notion_rich("FAQ")}},
+                },
                 {
                     "id": "p2",
-                    "title": "Old",
-                    "text": "stale",
+                    "object": "page",
                     "last_edited_time": "t0",
                     "archived": True,
+                    "properties": {"title": {"type": "title", "title": _notion_rich("Old")}},
                 },
-            ]
-        }
+            ],
+            "has_more": False,
+        },
+        children={
+            "p1": {
+                "results": [
+                    {"type": "heading_1", "heading_1": {"rich_text": _notion_rich("Hours")}},
+                    {"type": "paragraph", "paragraph": {"rich_text": _notion_rich("Open 9-5.")}},
+                    {"type": "image", "image": {"file": {"url": "x"}}},  # no text — skipped
+                ],
+                "has_more": False,
+            }
+        },
     )
     provider = NotionProvider(
         admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
     )
     snap = await provider.snapshot(uuid.uuid4())
-    assert [i.external_id for i in snap.items] == ["p1"]
+    assert [i.external_id for i in snap.items] == ["p1"]  # archived p2 excluded
+    assert snap.items[0].name == "FAQ"  # the properties walk, not the UUID
+    assert snap.items[0].text == "Hours\nOpen 9-5."  # blocks-children body
+    assert snap.items[0].revision == "t1"
+    # The search went out as the REAL API shape: POST with the object filter.
+    assert transport.search_calls[0]["filter"] == {"property": "object", "value": "page"}
     assert transport.last_headers["Notion-Version"] == "2022-06-28"
+    # Children were fetched only for the page actually ingested.
+    assert transport.children_calls == ["p1"]
+
+
+def test_notion_title_walk_handles_database_rows_and_falls_back_to_id():
+    from app.knowledge.providers import notion_page_title
+
+    # Database rows name their title property freely ("Name", not "title").
+    row = {
+        "id": "p9",
+        "properties": {
+            "Status": {"type": "select"},
+            "Name": {"type": "title", "title": _notion_rich("Pricing table")},
+        },
+    }
+    assert notion_page_title(row) == "Pricing table"
+    assert notion_page_title({"id": "p0", "properties": {}}) == "p0"
 
 
 # --------------------------------------------------------------------------- #

@@ -75,6 +75,7 @@ class HttpTransport(Protocol):
         *,
         data: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
+        json: dict[str, object] | None = None,
     ) -> httpx.Response: ...
 
 
@@ -115,8 +116,9 @@ class HttpxTransport:
         *,
         data: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
+        json: dict[str, object] | None = None,
     ) -> httpx.Response:
-        return await self._send("POST", url, headers=headers, data=data)
+        return await self._send("POST", url, headers=headers, data=data, json=json)
 
     async def _send(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         try:
@@ -400,8 +402,71 @@ class GoogleDriveProvider:
 # --------------------------------------------------------------------------- #
 # Notion — `last_edited_time` filtering on connected pages/databases, §3.2.3.
 # --------------------------------------------------------------------------- #
+_NOTION_VERSION = "2022-06-28"
+
+# Block types whose payload carries readable rich_text (Notion blocks API). Not
+# exhaustive on purpose: tables/embeds/files have no flat text to ingest, and
+# omitting them is honest emptiness rather than mangled output.
+_NOTION_TEXT_BLOCKS = frozenset(
+    {
+        "paragraph",
+        "heading_1",
+        "heading_2",
+        "heading_3",
+        "bulleted_list_item",
+        "numbered_list_item",
+        "to_do",
+        "quote",
+        "callout",
+        "toggle",
+    }
+)
+
+
+def notion_page_title(page: dict[str, object]) -> str:
+    """The page's real title, from the properties walk (audit round 3, Phase 8).
+
+    A Notion page object has NO top-level ``title`` field: the title lives in
+    ``properties`` as the one property whose type is ``"title"`` (named "title"
+    on plain pages, anything on database rows), holding rich-text parts with
+    ``plain_text``. The old ``page.get("title")`` read a field the API never
+    sends, so every synced source was named by its UUID."""
+    properties = page.get("properties")
+    if isinstance(properties, dict):
+        for prop in properties.values():
+            if isinstance(prop, dict) and prop.get("type") == "title":
+                parts = prop.get("title") or []
+                text = "".join(
+                    str(part.get("plain_text", "")) for part in parts if isinstance(part, dict)
+                ).strip()
+                if text:
+                    return text
+    return str(page.get("id", ""))
+
+
+def notion_block_text(block: dict[str, object]) -> str:
+    """One block's readable text (``rich_text`` parts of a text-bearing type)."""
+    block_type = block.get("type")
+    if not isinstance(block_type, str) or block_type not in _NOTION_TEXT_BLOCKS:
+        return ""
+    payload = block.get(block_type)
+    if not isinstance(payload, dict):
+        return ""
+    parts = payload.get("rich_text") or []
+    return "".join(
+        str(part.get("plain_text", "")) for part in parts if isinstance(part, dict)
+    ).strip()
+
+
 class NotionProvider:
-    """Enumerates connected Notion pages/databases; delta via `last_edited_time`."""
+    """Enumerates connected Notion pages/databases; delta via `last_edited_time`.
+
+    Real API shapes since Phase 8 (audit round 3): search is a POST with the
+    object filter in the JSON body (the old ``GET ?filter=page`` was a shape the
+    API does not accept), the title comes from the properties walk, and the page
+    BODY is assembled from ``GET /v1/blocks/{page_id}/children`` — a page object
+    carries no text at all, so the old ``p.get("text")`` ingested empty strings
+    for every page."""
 
     origin = "notion"
 
@@ -421,6 +486,9 @@ class NotionProvider:
         # Selected page/database ids (Decision #9); empty = every page the grant reaches.
         self._scope_ids = list(scope_ids or [])
 
+    def _headers(self, token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}", "Notion-Version": _NOTION_VERSION}
+
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
         token = await _bearer_token(self._store, self._admin_id, self._instance_id)
         transport = self._transport
@@ -429,26 +497,66 @@ class NotionProvider:
                 "Notion live HTTP call is a provider-deferred seam in this arc; inject "
                 "an HttpTransport (real or fake) to exercise it."
             )
-        resp = await transport.get(
-            "https://api.notion.com/v1/search",
-            headers={"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28"},
-            params={"filter": "page"},
-        )
-        data = resp.json()
+        pages: list[dict[str, object]] = []
+        cursor: str | None = None
+        while True:
+            body: dict[str, object] = {
+                "filter": {"property": "object", "value": "page"},
+                "page_size": 100,
+            }
+            if cursor:
+                body["start_cursor"] = cursor
+            resp = await transport.post(
+                "https://api.notion.com/v1/search",
+                headers=self._headers(token),
+                json=body,
+            )
+            data = resp.json()
+            pages.extend(p for p in data.get("results", []) if isinstance(p, dict))
+            cursor = data.get("next_cursor") if data.get("has_more") else None
+            if not cursor:
+                break
         # Notion's search endpoint has NO ancestor filter, so the scope can only be
         # enforced on the results — which is why ``in_scope`` is not merely a backstop here.
-        items = [
-            RemoteItem(
-                external_id=p["id"],
-                name=p.get("title", p["id"]),
-                text=p.get("text", ""),
-                revision=p.get("last_edited_time", ""),
+        items = []
+        for p in pages:
+            if p.get("archived"):
+                continue
+            if not scope.in_scope(p, self._scope_ids, parent_keys=("parent", "parent_id")):
+                continue
+            items.append(
+                RemoteItem(
+                    external_id=str(p["id"]),
+                    name=notion_page_title(p),
+                    text=await self._page_text(transport, token, str(p["id"])),
+                    revision=str(p.get("last_edited_time", "")),
+                )
             )
-            for p in data.get("results", [])
-            if not p.get("archived")
-            and scope.in_scope(p, self._scope_ids, parent_keys=("parent", "parent_id"))
-        ]
         return RemoteSnapshot(items=items)
+
+    async def _page_text(self, transport: HttpTransport, token: str, page_id: str) -> str:
+        """The page body via the blocks-children walk (paginated)."""
+        lines: list[str] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, object] = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            resp = await transport.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=self._headers(token),
+                params=params,
+            )
+            data = resp.json()
+            for block in data.get("results", []):
+                if isinstance(block, dict):
+                    line = notion_block_text(block)
+                    if line:
+                        lines.append(line)
+            cursor = data.get("next_cursor") if data.get("has_more") else None
+            if not cursor:
+                break
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -693,15 +801,32 @@ async def list_scope_candidates(
             for f in resp.json().get("files", [])
         ]
     if provider_name == "notion":
-        resp = await transport.get(
+        # Search is a POST (real API shape, Phase 8); no object filter here — the
+        # scope picker offers pages AND databases. Names via the properties walk
+        # for pages; databases carry a top-level rich-text ``title`` list.
+        resp = await transport.post(
             "https://api.notion.com/v1/search",
-            headers={"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28"},
-            params={},
+            headers={"Authorization": f"Bearer {token}", "Notion-Version": _NOTION_VERSION},
+            json={"page_size": 100},
         )
+
+        def _candidate_name(p: dict[str, object]) -> str:
+            if p.get("object") == "database":
+                parts = p.get("title")
+                if not isinstance(parts, list):
+                    parts = []
+                text = "".join(
+                    str(part.get("plain_text", "")) for part in parts if isinstance(part, dict)
+                ).strip()
+                if text:
+                    return text
+                return str(p.get("id", ""))
+            return notion_page_title(p)
+
         return [
             {
                 "id": str(p["id"]),
-                "name": str(p.get("title", p["id"])),
+                "name": _candidate_name(p),
                 "kind": "database" if p.get("object") == "database" else "page",
             }
             for p in resp.json().get("results", [])

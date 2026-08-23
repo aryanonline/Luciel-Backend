@@ -49,7 +49,18 @@ class RecordingTransport:
 
     async def get(self, url, *, headers=None, params=None):
         self.calls.append({"url": url, "params": dict(params or {})})
+        # Notion page bodies ride the blocks-children walk (Phase 8): empty is
+        # fine here — this suite proves SCOPE enforcement, not text assembly.
+        if "/v1/blocks/" in url:
+            return httpx.Response(
+                200, json={"results": [], "has_more": False}, request=httpx.Request("GET", url)
+            )
         return httpx.Response(200, json=self._body, request=httpx.Request("GET", url))
+
+    async def post(self, url, *, data=None, headers=None, json=None):
+        # Notion search is a POST (Phase 8); same ignore-the-filter discipline.
+        self.calls.append({"url": url, "json": dict(json or {})})
+        return httpx.Response(200, json=self._body, request=httpx.Request("POST", url))
 
 
 _DRIVE_BODY = {
