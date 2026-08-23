@@ -462,17 +462,13 @@ async def list_providers(
                             "displayName": spec.display_name,
                             "authKind": spec.auth_kind,
                             "helpText": spec.help_text,
-                            # unavailable_for wins over OAuth-client presence: a
-                            # provider whose EFFECT layer is unbuilt for this
-                            # surface must render "not available yet", never a
-                            # connect button that dead-ends (honest-disabled).
-                            "configured": False
-                            if ct in spec.unavailable_for
-                            else (
-                                registry.oauth_client_config(spec.provider).configured
-                                if spec.is_oauth
-                                else True
-                            ),
+                            # THE availability truth (provider_available):
+                            # unavailable_for wins over OAuth-client presence,
+                            # and a credential_fallback provider (Twilio, C10)
+                            # stays available with no platform OAuth app — the
+                            # same answer start_connection enforces, so the two
+                            # surfaces can never disagree.
+                            "configured": registry.provider_available(spec.provider, ct),
                             "credentialFields": [
                                 {
                                     "name": f.name,
