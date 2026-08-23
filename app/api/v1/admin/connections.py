@@ -63,6 +63,8 @@ from app.schemas_api.connections import (
     SubmitCredentialsRequest,
     SwapConnectionRequest,
     SwitchConnectionRequest,
+    TenantNumberOut,
+    TenantNumbersOut,
 )
 from app.schemas_api.knowledge import OAuthCallbackRequest
 
@@ -338,6 +340,44 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
         if conn is None:
             raise not_found("No SMS number attached to re-verify.")
         return _connection_out(conn)
+
+
+@router.get("/{connection_id}/twilio/numbers", response_model=TenantNumbersOut)
+async def list_twilio_numbers(
+    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> TenantNumbersOut:
+    """The numbers in the tenant's own Twilio account, for the designate picker (C9).
+
+    The platform already authenticates with these credentials for webhook
+    auto-config, yet the owner was typing their E.164 by hand. ``numbers: null``
+    means listing wasn't possible (no usable credential, provider refused) — the
+    UI then falls back to manual entry; this convenience never blocks designate."""
+    from app.channels.tenant_twilio import list_tenant_numbers  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                    InstanceConnection.connection_type == "sms_sender",
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise not_found("Connection not found.")
+        numbers = await list_tenant_numbers(s, subject.admin_id, row.instance_id)
+        return TenantNumbersOut(
+            numbers=(
+                None
+                if numbers is None
+                else [
+                    TenantNumberOut(phone_number=n.phone_number, friendly_name=n.friendly_name)
+                    for n in numbers
+                ]
+            )
+        )
 
 
 @router.post("/email/reverify", response_model=ConnectionOut)

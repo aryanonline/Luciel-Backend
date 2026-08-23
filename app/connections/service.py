@@ -332,7 +332,23 @@ async def submit_credentials(
     if connection is None:
         return None
 
-    spec = registry.get_provider(connection.provider)
+    # Proven-before-cutover for credential-form swaps (C9): ``swap`` stages the
+    # candidate under ``pending_provider`` and cuts over only on verified success —
+    # the OAuth path completes that in confirm_reconnect, but this path validated
+    # against the OLD provider's spec and left the stage marker forever. When a
+    # credential-form provider is staged, THESE fields belong to the staged
+    # provider: validate + verify against it, and complete the cutover below only
+    # after the secret is stored (a failed verify raises first, so the prior
+    # provider + credential keep serving untouched).
+    cfg_staged = connection.non_secret_config or {}
+    staged_name = str(cfg_staged.get("pending_provider") or "")
+    staged_spec = registry.get_provider(staged_name) if staged_name else None
+    effective_provider = (
+        staged_name
+        if staged_spec is not None and staged_spec.auth_kind == registry.AUTH_CREDENTIAL_FORM
+        else connection.provider
+    )
+    spec = registry.get_provider(effective_provider)
     if spec is None or spec.auth_kind != registry.AUTH_CREDENTIAL_FORM:
         raise CredentialRejected(
             f"Provider '{connection.provider}' does not take a credential form."
@@ -372,6 +388,15 @@ async def submit_credentials(
         )
     await (store or get_secret_store()).put(connection.secret_ref, material)
     connection.non_secret_config = {**(connection.non_secret_config or {}), **non_secret}
+    # Complete the staged swap only now that the replacement is verified + stored
+    # (§3.8.7 rule B): the provider/auth_class flip is the LAST step, and the stale
+    # stage marker never outlives the submit either way.
+    cfg_after = dict(connection.non_secret_config or {})
+    if cfg_after.pop("pending_provider", None) is not None:
+        connection.non_secret_config = cfg_after
+        if effective_provider != connection.provider:
+            connection.provider = effective_provider
+            connection.auth_class = spec.auth_class
 
     # A BYO SMS account with no designated number cannot send, so it must not claim to be
     # connected — the channel row shows "add your number" instead (§3.1.4). A number

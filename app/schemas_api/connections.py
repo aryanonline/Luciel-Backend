@@ -33,6 +33,20 @@ EmailProvisioningModeOutWire = Literal["own_domain", "vm_subdomain", "byo_mailbo
 MetaChannelWire = Literal["whatsapp", "instagram", "messenger"]
 
 
+class TenantNumberOut(WireModel):
+    """One number in the tenant's own Twilio account (the designate picker, C9)."""
+
+    phone_number: str
+    friendly_name: str
+
+
+class TenantNumbersOut(WireModel):
+    """The picker payload. ``numbers`` is None when listing was not possible —
+    the UI falls back to manual E.164 entry rather than blocking the designate."""
+
+    numbers: list[TenantNumberOut] | None
+
+
 class ConnectionOut(WireModel):
     """Non-secret view of one instance_connections row (§3.8.3). NO secret field."""
 

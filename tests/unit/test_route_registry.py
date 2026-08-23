@@ -82,6 +82,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/v1/admin/connections/{connection_id}"),
         ("POST", "/api/v1/admin/connections/{connection_id}/reconnect"),
         ("POST", "/api/v1/admin/connections/{connection_id}/swap"),
+        # C9 number picker: list the tenant's own Twilio numbers for designate.
+        ("GET", "/api/v1/admin/connections/{connection_id}/twilio/numbers"),
         ("POST", "/api/v1/admin/connections/sms/reverify"),
         ("POST", "/api/v1/admin/connections/email/reverify"),
         # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every

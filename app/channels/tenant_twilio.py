@@ -221,6 +221,69 @@ async def build_tenant_operability_probe(
     )
 
 
+@dataclass(frozen=True)
+class TenantNumber:
+    """One number in the tenant's own Twilio account (the designate picker, C9)."""
+
+    phone_number: str  # E.164
+    friendly_name: str
+
+
+# Deterministic mock-mode picker fixture: the Twilio magic test number + a second
+# line, so the picker UX is exercisable end-to-end without any network.
+MOCK_TENANT_NUMBERS: tuple[TenantNumber, ...] = (
+    TenantNumber(phone_number="+15005550006", friendly_name="Test line"),
+    TenantNumber(phone_number="+15005550007", friendly_name="Second test line"),
+)
+
+
+async def list_tenant_numbers(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    store: SecretStore | None = None,
+    limit: int = 50,
+) -> list[TenantNumber] | None:
+    """The numbers in the TENANT's Twilio account, for the designate picker (C9).
+
+    The platform already holds credentials able to list them (it uses them for the
+    webhook auto-config), yet the owner was typing their E.164 by hand — the picker
+    closes that. Returns None when listing is not possible (no usable credential,
+    or the provider refused): the caller falls back to manual entry, honestly,
+    rather than blocking the designate step on this convenience."""
+    from app.config import get_settings
+
+    creds = await load_tenant_credentials(session, admin_id, instance_id, store=store)
+    if creds is None or not creds.usable:
+        return None
+    if get_settings().integration_mode != "live":
+        return list(MOCK_TENANT_NUMBERS)
+    try:
+        import asyncio
+
+        from twilio.rest import Client  # noqa: PLC0415 — lazy/guarded (CI has no network)
+
+        client = (
+            Client(creds.api_key_sid, creds.api_key_secret, creds.account_sid)
+            if creds.api_key_sid
+            else Client(creds.account_sid, creds.auth_token)
+        )
+        rows = await asyncio.to_thread(lambda: client.incoming_phone_numbers.list(limit=limit))
+    except ImportError:  # pragma: no cover - the SDK is a live-mode dependency
+        return None
+    except Exception:  # noqa: BLE001 — a listing failure degrades to manual entry
+        return None
+    return [
+        TenantNumber(
+            phone_number=str(getattr(r, "phone_number", "") or ""),
+            friendly_name=str(getattr(r, "friendly_name", "") or ""),
+        )
+        for r in rows
+        if getattr(r, "phone_number", None)
+    ]
+
+
 async def build_tenant_sms_sender(
     session: AsyncSession,
     admin_id: uuid.UUID,
