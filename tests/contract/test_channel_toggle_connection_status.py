@@ -44,7 +44,6 @@ def _number_on_file(conn) -> str | None:
     return cfg.get("destination") or cfg.get("pending_destination")
 
 
-
 async def _signup_verify_login(client) -> uuid.UUID:
     from app.auth import access
     from app.auth.tokens import decode_token

@@ -445,8 +445,6 @@ async def test_voice_caller_number_alone_writes_the_lead():
             has_payment_method=False,
             provider_call_id="CA_lead",
         )
-        lead = (
-            await s.execute(select(Lead).where(Lead.admin_id == admin))
-        ).scalar_one()
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
         assert lead.contact_identifier == "+15557654321"
         assert lead.intent is None  # a pleasantry is not an "intent"

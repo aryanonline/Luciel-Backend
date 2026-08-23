@@ -96,6 +96,4 @@ async def lock_destination_claim(session: AsyncSession, destination: str) -> Non
 
     k1 = zlib.crc32(b"dest_claim") - 2**31
     k2 = zlib.crc32(destination.strip().lower().encode()) - 2**31
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": k1, "k2": k2}
-    )
+    await session.execute(text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": k1, "k2": k2})

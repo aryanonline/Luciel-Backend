@@ -380,11 +380,11 @@ async def submit_credentials(
     # erase the "host it, then re-verify" guidance.
     cfg_now = connection.non_secret_config or {}
     is_sms = connection.connection_type == "sms_sender"
-    needs_number = is_sms and not cfg_now.get("destination") and not cfg_now.get(
-        "pending_destination"
+    needs_number = (
+        is_sms and not cfg_now.get("destination") and not cfg_now.get("pending_destination")
     )
-    number_pending = is_sms and not cfg_now.get("destination") and cfg_now.get(
-        "pending_destination"
+    number_pending = (
+        is_sms and not cfg_now.get("destination") and cfg_now.get("pending_destination")
     )
     old_status = connection.status
     if needs_number:

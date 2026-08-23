@@ -1,14 +1,14 @@
 """Destination-claim hardening (c21) — the four adversarially-reviewed gaps.
 
-  (a) a revoked row cannot quietly re-enter service: lifecycle restore is the ONE
-      legitimate un-revoke, and it strips a destination another tenant claimed
-      during the grace window (and never resurrects a superseded row);
-      submit_credentials / reconnect refuse revoked rows outright;
-  (b) concurrent claims serialize on a per-destination advisory lock, and the
-      0045 partial unique index makes duplicate live sms claims structurally
-      impossible;
-  (c) squatting: a failed-probe number holds NO claim, so the real owner can
-      still connect it; promotion of a pending number re-runs the ownership gate.
+(a) a revoked row cannot quietly re-enter service: lifecycle restore is the ONE
+    legitimate un-revoke, and it strips a destination another tenant claimed
+    during the grace window (and never resurrects a superseded row);
+    submit_credentials / reconnect refuse revoked rows outright;
+(b) concurrent claims serialize on a per-destination advisory lock, and the
+    0045 partial unique index makes duplicate live sms claims structurally
+    impossible;
+(c) squatting: a failed-probe number holds NO claim, so the real owner can
+    still connect it; promotion of a pending number re-runs the ownership gate.
 """
 
 from __future__ import annotations
@@ -83,13 +83,17 @@ async def _attach(admin: uuid.UUID, iid: uuid.UUID, number: str = NUM) -> None:
 async def _sms_row(admin: uuid.UUID) -> InstanceConnection | None:
     async with tenant_session(admin) as s:
         return (
-            await s.execute(
-                select(InstanceConnection).where(
-                    InstanceConnection.admin_id == admin,
-                    InstanceConnection.connection_type == "sms_sender",
+            (
+                await s.execute(
+                    select(InstanceConnection).where(
+                        InstanceConnection.admin_id == admin,
+                        InstanceConnection.connection_type == "sms_sender",
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
 
 # --------------------------------------------------------------------------- #

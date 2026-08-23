@@ -376,9 +376,7 @@ async def test_status_callback_finalizes_the_calls_session_at_hangup(client, mon
     )
     assert r.status_code == 200
     async with tenant_session(admin) as s:
-        sess = (
-            await s.execute(select(Session).where(Session.admin_id == admin))
-        ).scalar_one()
+        sess = (await s.execute(select(Session).where(Session.admin_id == admin))).scalar_one()
         assert sess.ended_at is not None
         assert sess.summary  # summarized at the REAL call end, not the sweep
     # Idempotent: a duplicate callback is a quiet ack, nothing double-finalized.
@@ -418,9 +416,7 @@ async def test_status_callback_with_a_bad_signature_finalizes_nothing(client, mo
     )
     assert r.status_code == 403
     async with tenant_session(admin) as s:
-        sess = (
-            await s.execute(select(Session).where(Session.admin_id == admin))
-        ).scalar_one()
+        sess = (await s.execute(select(Session).where(Session.admin_id == admin))).scalar_one()
         assert sess.ended_at is None  # the forged callback ended nothing
 
 

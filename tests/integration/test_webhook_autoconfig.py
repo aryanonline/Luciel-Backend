@@ -82,13 +82,17 @@ async def _seed(admin: uuid.UUID) -> uuid.UUID:
 async def _audit_events(admin: uuid.UUID, event_type: str) -> int:
     async with tenant_session(admin) as s:
         rows = (
-            await s.execute(
-                select(AdminAuditLog).where(
-                    AdminAuditLog.admin_id == admin,
-                    AdminAuditLog.event_type == event_type,
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == event_type,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     return len(rows)
 
 

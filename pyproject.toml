@@ -72,9 +72,14 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
-    "ruff>=0.8",
-    "mypy>=1.14",
-    "bandit>=1.8",
+    # The three CI gate tools are PINNED exactly: CI installs from this table at run
+    # time, so an unpinned floor makes the gate drift red on upstream releases with
+    # zero repo changes (live-caught twice: 2026-08-18 `86b83f3`, and again on the
+    # 2026-08-19 run for 9ed4f2c). Bump deliberately: upgrade the pin, reformat, and
+    # fix findings in the same commit.
+    "ruff==0.16.2",
+    "mypy==2.3.0",
+    "bandit==1.9.4",
     "pip-audit>=2.7",
     "detect-secrets>=1.5",
     "types-redis",

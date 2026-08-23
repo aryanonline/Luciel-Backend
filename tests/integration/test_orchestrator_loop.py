@@ -420,10 +420,10 @@ async def test_cannot_answer_fires_at_most_once_per_session():
         assert first.escalation is not None
         assert second.escalation is not None  # the turn still reports its state
         rows = (
-            await s.execute(
-                select(EscalationEvent).where(EscalationEvent.session_id == sid)
-            )
-        ).scalars().all()
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
         assert len(rows) == 1  # one row, one notification — not one per turn
 
 
@@ -442,10 +442,10 @@ async def test_a_pleasantry_only_session_records_no_escalation():
         )
         assert result.escalation is None
         rows = (
-            await s.execute(
-                select(EscalationEvent).where(EscalationEvent.session_id == sid)
-            )
-        ).scalars().all()
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
         assert rows == []
 
 
@@ -468,10 +468,10 @@ async def test_a_second_session_escalates_again():
             )
             assert result.escalation is not None
         rows = (
-            await s.execute(
-                select(EscalationEvent).where(EscalationEvent.admin_id == admin)
-            )
-        ).scalars().all()
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.admin_id == admin)))
+            .scalars()
+            .all()
+        )
         assert len(rows) == 2  # one per session
 
 

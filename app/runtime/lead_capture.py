@@ -144,10 +144,10 @@ async def capture_or_update_lead(
     # the lead exists — signals only enrich it. The widget rule is unchanged:
     # a weak token never carries identity, so an anonymous visitor still needs
     # to volunteer a strong identifier before any row is written.
-    identity_is_capture = (
-        strength in (IdentityStrength.strong, IdentityStrength.platform_scoped_strong)
-        and bool(transport_identifier)
-    )
+    identity_is_capture = strength in (
+        IdentityStrength.strong,
+        IdentityStrength.platform_scoped_strong,
+    ) and bool(transport_identifier)
     # No lead yet and nothing qualifies → stay anonymous (no row written).
     if contact_key is None or not (signals.is_qualified or identity_is_capture):
         return None

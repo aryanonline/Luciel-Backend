@@ -109,6 +109,11 @@ def secret_material(creds: TwilioCredentials) -> dict[str, str]:
 async def verify_credentials(creds: TwilioCredentials) -> None:
     """Prove the credential works, live. No-op outside live mode (hermetic CI).
 
+    The mock-mode skip is DELIBERATE and disclosed: outside live mode a submit is
+    accepted without any provider check (nothing to verify against), so a mock
+    "connected" status is a wiring statement, never a claim the credential was
+    proven. Live mode is the only place verification is asserted.
+
     A lightweight account fetch is the cheapest call that exercises exactly the auth
     path a send will use. Raises :class:`InvalidTwilioCredentials` on refusal."""
     from app.config import get_settings

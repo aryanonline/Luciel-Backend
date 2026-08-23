@@ -347,15 +347,19 @@ async def twilio_voice_status(request: Request) -> Response:
 
     async with tenant_session(ctx.admin_id) as s:
         record = (
-            await s.execute(
-                select(VoiceCallRecord).where(
-                    VoiceCallRecord.admin_id == ctx.admin_id,
-                    VoiceCallRecord.instance_id == ctx.instance_id,
-                    VoiceCallRecord.provider_call_id == call_sid,
-                    VoiceCallRecord.session_id.is_not(None),
+            (
+                await s.execute(
+                    select(VoiceCallRecord).where(
+                        VoiceCallRecord.admin_id == ctx.admin_id,
+                        VoiceCallRecord.instance_id == ctx.instance_id,
+                        VoiceCallRecord.provider_call_id == call_sid,
+                        VoiceCallRecord.session_id.is_not(None),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if record is not None and record.session_id is not None:
             # Idempotent: an already-ended session is a no-op inside finalize_session.
             await finalize_session(
