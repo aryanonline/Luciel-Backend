@@ -77,6 +77,7 @@ async def test_cross_tenant_invisible_for_every_model():
         KnowledgeSource,
     )
     from app.models.lead import Lead
+    from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
     from app.models.voice import VoiceCallRecord
 
     iid = uuid.uuid4()
@@ -225,6 +226,25 @@ async def test_cross_tenant_invisible_for_every_model():
             )
         )
         s.add(
+            ToolTraceEvent(
+                id=uuid.uuid4(),
+                admin_id=a,
+                instance_id=iid,
+                session_id=sid,
+                tool_id="lookup_record",
+                outcome="ok",
+            )
+        )
+        s.add(
+            RetrievalTraceEvent(
+                id=uuid.uuid4(),
+                admin_id=a,
+                instance_id=iid,
+                session_id=sid,
+                source_id=srcid,
+            )
+        )
+        s.add(
             BillingAccount(
                 id=uuid.uuid4(),
                 admin_id=a,
@@ -257,6 +277,8 @@ async def test_cross_tenant_invisible_for_every_model():
         ConversationBudget,
         VoiceCallRecord,
         DeferredAction,
+        ToolTraceEvent,
+        RetrievalTraceEvent,
         BillingAccount,
         AdminAuditLog,
     ]

@@ -100,7 +100,12 @@ class ToolBroker:
         admin_id: uuid.UUID,
         instance_id: uuid.UUID,
         resolved_lead_id: uuid.UUID | None = None,
+        session_id: uuid.UUID | None = None,
     ) -> ToolResult:
+        # Dispatch-scoped conversation handle for the durable trace rows (C6). The
+        # broker is per-request and the loop awaits each dispatch, so plain instance
+        # state is race-free here and keeps five _trace call sites unchanged.
+        self._session_id = session_id
         # Gate 1 — Authorization (default-deny).
         if not await self._authorized(admin_id, instance_id, tool.tool_id):
             result = c.failed("not_authorized")
@@ -182,12 +187,12 @@ class ToolBroker:
         )
         return result
 
-    # Collected outcome traces (the trace store §5.4 persists these in Arc 14).
-    # Kept in-memory on the broker for the loop + tests; NOT written to the audit
-    # log with a fabricated event_type — the §5.2 enum has no tool-dispatch event,
-    # and §3.3.4 rule 3 "every outcome is traced" is the trace store's job (§5.4),
-    # not the business audit log. Flagged: persist to trace_store in Arc 14.
+    # In-memory mirror of the traces this broker instance wrote (kept for the loop +
+    # existing tests). The DURABLE record is the tool_trace_events row written below
+    # (§5.4 / §3.3.4 rule 3, C6) — the previous in-memory-only list died with the
+    # request, so "every outcome is traced" was never actually persisted.
     traces: list[dict[str, Any]]
+    _session_id: uuid.UUID | None
 
     async def _trace(
         self,
@@ -208,4 +213,20 @@ class ToolBroker:
                 "missing_fields": result.missing_fields or None,
                 "reason": result.reason,  # non-secret
             }
+        )
+        # Durable trace row (C6). Field NAMES and non-secret reasons only — never
+        # customer-supplied input values (§3.4.11 PII posture).
+        from app.models.trace import ToolTraceEvent  # noqa: PLC0415
+
+        self.s.add(
+            ToolTraceEvent(
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=getattr(self, "_session_id", None),
+                tool_id=tool_id,
+                outcome=result.outcome.value,
+                connection_type=connection,
+                missing_fields=list(result.missing_fields) or None,
+                reason=result.reason or None,
+            )
         )

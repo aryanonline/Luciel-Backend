@@ -560,6 +560,7 @@ class Orchestrator:
             prior_summaries=prior_summaries,
             system_prompt=system_prompt,
             tool_defs=tool_defs,
+            session_id=session_id,
         )
 
         if llm_failed:
@@ -750,7 +751,7 @@ class Orchestrator:
             response_length=len(reply_text),
             is_urgent_escalation=outcome.fired,
         )
-        await persist_turn(
+        reply_row = await persist_turn(
             self.session,
             admin_id=admin_id,
             instance_id=instance_id,
@@ -761,6 +762,32 @@ class Orchestrator:
             source_chunks=attributed_chunks,
             at=datetime.now(UTC),
         )
+        # Durable retrieval trace (§5.4 / C6): one row per knowledge SOURCE this
+        # answer retrieved from (deduped — several chunks of one document are one
+        # "question used this source" fact). Feeds the §3.9 top-sources metric and
+        # the §3.2.2 delete-confirmation tooltip.
+        if attributed_chunks:
+            from app.models.trace import RetrievalTraceEvent  # noqa: PLC0415
+
+            seen_sources: set[str] = set()
+            for chunk in attributed_chunks:
+                raw_source = str(chunk.get("source_id", "") or "")
+                if not raw_source or raw_source in seen_sources:
+                    continue
+                seen_sources.add(raw_source)
+                try:
+                    source_uuid = uuid.UUID(raw_source)
+                except ValueError:
+                    continue
+                self.session.add(
+                    RetrievalTraceEvent(
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        transcript_id=reply_row.id,
+                        source_id=source_uuid,
+                    )
+                )
         return LoopResult(
             reply_text=reply_text,
             outbound_channel=outbound,
@@ -840,6 +867,7 @@ class Orchestrator:
         prior_summaries: list[str] | None = None,
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
+        session_id: uuid.UUID | None = None,
     ) -> tuple[_Reasoned, int, bool, bool]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and
@@ -895,7 +923,9 @@ class Orchestrator:
             # ACT: dispatch the proposed calls via the Arc 12 broker contract, then
             # REFLECT: append the assistant's tool turn + one structured tool_result
             # turn per call (untrusted-wrapped — results embed lead/provider content).
-            results = await self._dispatch_tools(resp.tool_calls, resolved_lead_id=resolved_lead_id)
+            results = await self._dispatch_tools(
+                resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+            )
             dispatched.extend(results)
             tool_outcomes.extend(r.outcome.value for _, r in results)
             messages.append(
@@ -931,6 +961,7 @@ class Orchestrator:
         tool_calls: list[dict[str, object]],
         *,
         resolved_lead_id: uuid.UUID | None = None,
+        session_id: uuid.UUID | None = None,
     ) -> list[tuple[dict[str, Any], ToolResult]]:
         """Dispatch PLAN tool intents via the Arc 12 broker, returning each proposed
         call paired with its full five-outcome result (§3.3.3/§3.3.4). The broker
@@ -968,6 +999,7 @@ class Orchestrator:
                 admin_id=self.admin_id,
                 instance_id=self.instance_id,
                 resolved_lead_id=resolved_lead_id,
+                session_id=session_id,
             )
             results.append((dict(call), result))
         return results

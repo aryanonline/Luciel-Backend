@@ -42,6 +42,7 @@ from app.models.conversation import EscalationEvent, Session, SessionSummary, Tr
 from app.models.deferred import DeferredAction
 from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
+from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
 
 # §3.4.10 / §4.4 / Decision #38: 1-year retention for transcripts + session
 # summaries. Platform policy, not admin-configurable (default; overridable per call
@@ -69,7 +70,14 @@ CONTACT_SUBMISSION_RETENTION_DAYS = 365
 # the session_summaries while leaving the parent row is not a 1-year retention. The
 # leftover shells also accumulate without bound on a tenant who never deletes anything,
 # which is exactly the plateau this sweep exists to produce.
-_RetainedModel = type[Transcript] | type[SessionSummary] | type[EscalationEvent] | type[Session]
+_RetainedModel = (
+    type[Transcript]
+    | type[SessionSummary]
+    | type[EscalationEvent]
+    | type[ToolTraceEvent]
+    | type[RetrievalTraceEvent]
+    | type[Session]
+)
 
 _RETAINED_CLASSES: tuple[tuple[_RetainedModel, str], ...] = (
     (Transcript, "transcript"),
@@ -79,6 +87,10 @@ _RETAINED_CLASSES: tuple[tuple[_RetainedModel, str], ...] = (
     # tenant. Analytics reads them period-scoped only, so the prune cannot
     # distort any served card. Removed before Session (they reference it).
     (EscalationEvent, "escalation_event"),
+    # Durable traces (C6, §5.4): same 1-year window as the session content they
+    # describe; both reference sessions, so they go before Session too.
+    (ToolTraceEvent, "tool_trace_event"),
+    (RetrievalTraceEvent, "retrieval_trace_event"),
     (Session, "session"),
 )
 

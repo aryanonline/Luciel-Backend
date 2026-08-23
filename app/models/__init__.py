@@ -30,9 +30,12 @@ from app.models.lead import Lead
 from app.models.notice_delivery import NoticeDelivery
 from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
+from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
 from app.models.voice import VoiceCallRecord
 
 __all__ = [
+    "ToolTraceEvent",
+    "RetrievalTraceEvent",
     "InstanceToolAuthorization",
     "Account",
     "Instance",

@@ -32,6 +32,7 @@ from app.models.lead import Lead
 from app.models.notice_delivery import NoticeDelivery
 from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
+from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
 from app.models.voice import VoiceCallRecord
 
 #: Tables that carry an admin_id but must NOT be cascaded, each for its own reason:
@@ -57,6 +58,8 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (SessionSummary, "session_summary"),
     (Lead, "lead_record"),
     (EscalationEvent, "escalation_event"),
+    (ToolTraceEvent, "tool_trace_event"),
+    (RetrievalTraceEvent, "retrieval_trace_event"),
     (VoiceCallRecord, "voice_call_record"),
     (CrmLeadLink, "crm_lead_link"),
     (RecordSourceRecord, "record_source_record"),
