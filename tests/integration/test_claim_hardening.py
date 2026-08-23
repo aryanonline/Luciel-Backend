@@ -129,15 +129,21 @@ async def test_restore_strips_a_destination_claimed_by_another_tenant_during_gra
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_restore_keeps_an_unclaimed_destination_intact():
-    """Nobody claimed the number during grace → restore brings it back exactly."""
+    """Nobody claimed the number during grace → restore brings it back exactly —
+    including its PRE-DELETE status (C8/0049): the number was parked at
+    pending_carrier_registration before the delete, and "exactly as it was"
+    (§3.6.4) means that honest state returns, not a blanket unconfigured."""
     a = uuid.uuid4()
     a_iid = await _seed(a)
     await _attach(a, a_iid)
+    pre_delete = await _sms_row(a)
+    assert pre_delete is not None
+    pre_status = pre_delete.status
     async with tenant_session(a) as s:
         await state_machine.delete_luciel(s, a, actor_user_id=a)
         await state_machine.restore(s, a, actor_user_id=a)
     row = await _sms_row(a)
-    assert row is not None and row.status == "unconfigured"
+    assert row is not None and row.status == pre_status
     assert (row.non_secret_config or {}).get("destination") == NUM
 
 

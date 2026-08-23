@@ -85,7 +85,12 @@ async def test_delete_fused_quiesce_to_grace_then_restore_active():
         inst = await state_machine.delete_luciel(s, admin, admin)
         assert inst.state == LucielState.luciel_grace_window
         assert inst.grace_window_started_at is not None
-        assert inst.embed_key_public_id is None  # quiesce revoked the embed key
+        # C8: the key STAYS live through grace — the resolver admits grace-window
+        # instances so an in-flight conversation can drain (§3.6.3 quiesce) while
+        # the channel gates refuse NEW sessions. A stashed copy still backs
+        # restore's same-key revival for pre-0048 rows.
+        assert inst.embed_key_public_id == "vm_live_seed"
+        assert inst.embed_key_stashed == "vm_live_seed"
     # Knowledge soft-deleted during quiesce.
     async with tenant_session(admin) as s:
         src = (
@@ -115,7 +120,10 @@ async def test_restore_of_a_legacy_grace_row_with_no_stash_mints_a_fresh_key() -
     async with tenant_session(admin) as s:
         await state_machine.delete_luciel(s, admin, admin)
         inst = (await s.execute(select(Instance).where(Instance.admin_id == admin))).scalar_one()
-        inst.embed_key_stashed = None  # simulate the pre-migration grace row
+        # Simulate the pre-0039 grace row: key nulled at delete (old behavior)
+        # AND no stash column value.
+        inst.embed_key_public_id = None
+        inst.embed_key_stashed = None
     async with tenant_session(admin) as s:
         inst = await state_machine.restore(s, admin, admin)
         assert inst.state == LucielState.active

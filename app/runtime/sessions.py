@@ -107,6 +107,58 @@ def participant_key_for(
     return hashlib.sha256(material).hexdigest()
 
 
+async def find_open_session(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    channel: str,
+    session_id: uuid.UUID | None = None,
+    participant_key: str | None = None,
+) -> Session | None:
+    """The read-only half of ``resolve_or_open_session`` — NEVER opens one (C8).
+
+    The §3.6.2 pause carve-out and the §3.6.3 fused-quiesce delete drain both need
+    exactly this question answered at the channel gates: does THIS inbound belong to
+    a conversation that was already in flight? If yes, the turn may proceed on a
+    non-serving instance (a live lead is never dropped mid-sentence); if no, intake
+    is refused — a non-serving Luciel opens no new sessions.
+    """
+    timeout = INACTIVITY_TIMEOUT.get(channel, timedelta(minutes=30))
+    cutoff = _now() - timeout
+    existing: Session | None = None
+    if session_id is not None:
+        existing = (
+            await session.execute(
+                select(Session).where(
+                    Session.admin_id == admin_id,
+                    Session.instance_id == instance_id,
+                    Session.channel == channel,
+                    Session.id == session_id,
+                    Session.ended_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+    if existing is None and participant_key is not None:
+        existing = (
+            await session.execute(
+                select(Session)
+                .where(
+                    Session.admin_id == admin_id,
+                    Session.instance_id == instance_id,
+                    Session.channel == channel,
+                    Session.participant_key == participant_key,
+                    Session.ended_at.is_(None),
+                )
+                .order_by(Session.last_message_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if existing is not None and existing.last_message_at >= cutoff:
+        return existing
+    return None
+
+
 async def resolve_or_open_session(
     session: AsyncSession,
     *,

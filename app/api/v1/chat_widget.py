@@ -43,7 +43,7 @@ from app.runtime.input_safety import _compose_greeting
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator, persist_turn
 from app.runtime.provider_factory import build_llm_router
-from app.runtime.sessions import effective_config, resolve_or_open_session
+from app.runtime.sessions import effective_config, find_open_session, resolve_or_open_session
 from app.schemas_api.widget import (
     WidgetBootstrapOut,
     WidgetBootstrapRequest,
@@ -212,17 +212,29 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             raise not_found("Unknown widget.")
 
         if is_paused(inst):
-            # Empty render directive — no session opened, no LLM (§3.6.2).
-            return WidgetSendResult(
-                session_id=body.session_id or uuid.uuid4(),
-                reply=WidgetMessageOut(
-                    message_id=uuid.uuid4(),
-                    role="assistant",
-                    text="",
-                    at=datetime.now(UTC),
-                ),
-                render_state="paused",
+            # §3.6.2 carve-out / §3.6.3 drain (C8): a conversation already in flight
+            # when the owner paused or deleted is allowed to FINISH on its channel —
+            # only NEW sessions are refused. The find is read-only; without a live
+            # in-window session this is the empty render directive, no session
+            # opened, no LLM.
+            draining = await find_open_session(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                channel=CHANNEL,
+                session_id=body.session_id,
             )
+            if draining is None:
+                return WidgetSendResult(
+                    session_id=body.session_id or uuid.uuid4(),
+                    reply=WidgetMessageOut(
+                        message_id=uuid.uuid4(),
+                        role="assistant",
+                        text="",
+                        at=datetime.now(UTC),
+                    ),
+                    render_state="paused",
+                )
 
         # Widget identity is WEAK (§3.4.9): no resolved lead is inherited from a prior
         # session. A lead is created/linked by the identity arc; here resolved_lead_id

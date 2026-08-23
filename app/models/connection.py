@@ -37,3 +37,9 @@ class InstanceConnection(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     status_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # §3.6.4 restore-to-pre-delete-status (C8, migration 0049): delete_luciel stashes
+    # the live status/detail here before overwriting with 'revoked'; restore puts them
+    # back (minus foreign-claimed destinations) and clears the stash. NULL outside a
+    # grace window and on legacy rows that entered grace before the column existed.
+    status_stashed: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status_detail_stashed: Mapped[str | None] = mapped_column(Text, nullable=True)

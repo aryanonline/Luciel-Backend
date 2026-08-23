@@ -50,7 +50,12 @@ from app.models.voice import VoiceCallRecord
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
-from app.runtime.sessions import effective_config, participant_key_for, resolve_or_open_session
+from app.runtime.sessions import (
+    effective_config,
+    find_open_session,
+    participant_key_for,
+    resolve_or_open_session,
+)
 from app.runtime.speech import SpeechError, SpeechToText, TextToSpeech
 
 # Voice replies stay short — long answers switch channel or get truncated for speech
@@ -166,18 +171,29 @@ async def handle_turn(
     """One caller utterance → spoken reply, through the Arc 14 orchestrator (§3.4.1)."""
     # TRUE arrival time for the lead transcript row (reply-time analytics, 2026-08-17).
     received_at = datetime.now(UTC)
-    # Paused / soft-deleted → no handling (§3.6.2): speak unavailable + hang up, no LLM.
+    # Paused / soft-deleted → no NEW handling (§3.6.2): speak unavailable + hang up,
+    # no LLM. The §3.6.2 carve-out (C8): a CALL already in progress at the pause or
+    # delete instant finishes — its session (keyed by the call id) is live, so the
+    # drain gate admits it; a fresh call after the pause gets the unavailable reply.
     if is_paused(instance):
-        speech = await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
-        audio_url = speech.audio_ref if speech.playable else None
-        return VoiceTurnResult(
-            twiml=reply_twiml(
-                VOICE_UNAVAILABLE_REPLY, action_url, hang_up=True, audio_url=audio_url
-            ),
-            spoken_text=VOICE_UNAVAILABLE_REPLY,
-            paused=True,
-            audio_url=audio_url,
+        draining = await find_open_session(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            channel="voice",
+            participant_key=participant_key_for(admin_id, "voice", provider_call_id or from_number),
         )
+        if draining is None:
+            speech = await tts.synthesize(VOICE_UNAVAILABLE_REPLY)
+            audio_url = speech.audio_ref if speech.playable else None
+            return VoiceTurnResult(
+                twiml=reply_twiml(
+                    VOICE_UNAVAILABLE_REPLY, action_url, hang_up=True, audio_url=audio_url
+                ),
+                spoken_text=VOICE_UNAVAILABLE_REPLY,
+                paused=True,
+                audio_url=audio_url,
+            )
 
     # Transcribe inbound caller audio (STT). A provider failure degrades gracefully:
     # speak an apology + hand the caller to a person rather than dropping the call.

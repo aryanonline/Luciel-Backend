@@ -101,13 +101,15 @@ async def delete_luciel(
         raise LifecycleError("cannot_delete_from_state")
     frm = inst.state.value
 
-    # 0. Quiesce: revoke embed key so no new inbound is accepted. The key VALUE
-    # is stashed, not destroyed: restore-within-grace must revive the SAME key
-    # ("exactly as it was", §3.6.4) or the customer's deployed embed snippet is
-    # permanently dead after a restore. The day-30 cascade deletes the whole
-    # instance row, stash included.
+    # 0. Quiesce (C8): the embed key STAYS live through the grace window — the
+    # resolver admits grace-window instances (migration 0048) precisely so the
+    # channel gates can serve the §3.6.3 drain: a conversation in flight at the
+    # delete instant finishes on its channel, while every gate refuses NEW
+    # sessions for a non-serving state (find_open_session, never open). A stashed
+    # copy is still written so restore's same-key revival and pre-0048 grace rows
+    # keep one code path; the day-30 cascade deletes the whole instance row, key
+    # and stash included.
     inst.embed_key_stashed = inst.embed_key_public_id
-    inst.embed_key_public_id = None
 
     # 1. instance_connections → revoked; secret destruction is SCHEDULED for the
     # day-30 cascade (restore must be able to revive the connection). The audit
@@ -124,6 +126,14 @@ async def delete_luciel(
     )
     for c in conns:
         if c.status != "revoked":
+            # Stash the pre-delete status (C8, migration 0049): §3.6.4 promises a
+            # restored Luciel comes back "exactly as it was", which includes each
+            # connection's honest chip — a healthy calendar restores Connected, an
+            # action-needed number restores its action-needed truth. The stash is
+            # what makes that possible; blanket 'unconfigured' told every restored
+            # owner to reconnect everything.
+            c.status_stashed = c.status
+            c.status_detail_stashed = c.status_detail
             c.status = "revoked"
             await audit.emit(
                 session,
@@ -214,13 +224,24 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
             for key in ("destination", "destinations", "address", "mode"):
                 cfg.pop(key, None)
             c.non_secret_config = cfg
+            c.status = "unconfigured"
             c.status_detail = (
                 "While this Luciel was deleted, this number or address was connected "
                 "to a different account — designate a new one to bring the channel back."
             )
-        # Pre-delete connections were revoked; restore to 'unconfigured' so the
-        # health worker / reconnect path re-establishes them (never silently 'connected').
-        c.status = "unconfigured"
+        else:
+            # §3.6.4 (C8): restore to the PRE-DELETE status the delete stashed —
+            # "exactly as it was". Secrets were never destroyed during grace, so a
+            # previously-connected row is genuinely connected again; the health
+            # sweep re-proves every non-revoked row on its normal cadence, and a
+            # credential that died during grace degrades to the honest Reconnect
+            # chip (§3.8.5) rather than everything restoring as "reconnect all".
+            # Legacy rows that entered grace before 0049 have no stash → the old
+            # conservative 'unconfigured'.
+            c.status = c.status_stashed or "unconfigured"
+            c.status_detail = c.status_detail_stashed
+        c.status_stashed = None
+        c.status_detail_stashed = None
     sources = (
         (await session.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)))
         .scalars()

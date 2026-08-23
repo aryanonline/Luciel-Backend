@@ -27,7 +27,12 @@ from app.models.instance import Instance, is_paused
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
-from app.runtime.sessions import effective_config, participant_key_for, resolve_or_open_session
+from app.runtime.sessions import (
+    effective_config,
+    find_open_session,
+    participant_key_for,
+    resolve_or_open_session,
+)
 from app.tools.registry import make_tool_resolver
 
 # Strong-identity channels: the transport identifier IS a stable lead key, so it is
@@ -104,10 +109,22 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         # Should not happen post-resolution, but never route into a missing instance.
         return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
-    # Paused → no session, no LLM (§3.6.2). Same predicate the widget and voice paths
-    # use: an owner who pauses Luciel must be paused on every channel, not just the web.
+    # Paused → no NEW session, no LLM (§3.6.2). Same predicate the widget and voice
+    # paths use: an owner who pauses Luciel must be paused on every channel, not just
+    # the web. The §3.6.2 carve-out (C8): a conversation already in flight at the
+    # pause/delete instant finishes on its channel — the drain gate below admits ONLY
+    # an existing live in-window session, never opens one.
     if is_paused(inst):
-        return RuntimeReply(reply_text="", render_state="paused", session_id="")
+        draining = await find_open_session(
+            session,
+            admin_id=msg.admin_id,
+            instance_id=msg.instance_id,
+            channel=msg.channel,
+            session_id=msg.session_id,
+            participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
+        )
+        if draining is None:
+            return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
     # Conversation = ONE billed session (§3.4.8). The transport identifier the adapter
     # already resolved (From number / from_address / Meta-scoped id) is the session key,
