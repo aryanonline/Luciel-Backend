@@ -90,6 +90,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # tenant (forgery signal, number suffix only — never the token).
         "webhook_capability_provisioned",
         "inbound_capability_rejected",
+        # §3.8.5 (Phase 6.6): the health worker emailed the owner because a
+        # connection transitioned into expired/error. Payload carries the
+        # delivery outcome, never credential material.
+        "connection_attention_emailed",
         # c21: an attempt to claim a destination another tenant holds was refused.
         # Recorded under the CLAIMANT (never the holder — an attacker must not be
         # able to spam a victim's audit chain), in its own transaction because the

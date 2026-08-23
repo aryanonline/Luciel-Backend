@@ -317,7 +317,7 @@ async def test_swap_keeps_old_live_until_confirm(client):
     # Start + drive to connected so there is a LIVE account to swap away from.
     await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "calendar", "provider": "google_calendar"},
+        json={"connectionType": "crm", "provider": "hubspot"},
     )
     cid = (await client.get("/api/v1/admin/connections")).json()[0]["connectionId"]
     token = client.cookies.get(get_settings().session_cookie_name)
@@ -328,9 +328,7 @@ async def test_swap_keeps_old_live_until_confirm(client):
         )
 
     # Swap to a different provider — returns authorizeUrl (calendar is OAuth-class).
-    r = await client.post(
-        f"/api/v1/admin/connections/{cid}/swap", json={"provider": "microsoft_calendar"}
-    )
+    r = await client.post(f"/api/v1/admin/connections/{cid}/swap", json={"provider": "salesforce"})
     assert r.status_code == 200
     assert "authorizeUrl" in r.json() and r.json()["authorizeUrl"]
 
@@ -347,7 +345,7 @@ async def test_swap_keeps_old_live_until_confirm(client):
     assert ok and state == "connected"
     row = (await client.get("/api/v1/admin/connections")).json()[0]
     assert row["status"] == "connected"
-    assert row["provider"] == "microsoft_calendar"
+    assert row["provider"] == "salesforce"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -364,7 +362,7 @@ async def test_swap_failed_probe_keeps_old_account_live(client):
     await _ready_account_with_luciel(client)
     await client.post(
         "/api/v1/admin/connections",
-        json={"connectionType": "calendar", "provider": "google_calendar"},
+        json={"connectionType": "crm", "provider": "hubspot"},
     )
     cid = (await client.get("/api/v1/admin/connections")).json()[0]["connectionId"]
     token = client.cookies.get(get_settings().session_cookie_name)
@@ -373,9 +371,7 @@ async def test_swap_failed_probe_keeps_old_account_live(client):
         await service.confirm_reconnect(
             s, admin_id=admin_id, connection_id=_uuid.UUID(cid), user_id=None, probe_ok=True
         )
-    await client.post(
-        f"/api/v1/admin/connections/{cid}/swap", json={"provider": "microsoft_calendar"}
-    )
+    await client.post(f"/api/v1/admin/connections/{cid}/swap", json={"provider": "salesforce"})
     # Probe fails → prior status restored; old account stays live (§3.8.7 rule B).
     async with tenant_session(admin_id) as s:
         ok, _reason = await service.confirm_reconnect(

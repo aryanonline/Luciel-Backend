@@ -61,26 +61,26 @@ async def test_swap_does_not_mutate_provider_before_confirm():
             s,
             admin_id=admin,
             instance_id=iid,
-            connection_type="calendar",
-            provider="google_calendar",
+            connection_type="crm",
+            provider="hubspot",
             user_id=None,
         )
         await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True
         )
-        assert conn.provider == "google_calendar"
+        assert conn.provider == "hubspot"
 
         swapped, _ = await service.swap(
             s,
             admin_id=admin,
             connection_id=conn.connection_id,
-            provider="microsoft_calendar",
+            provider="salesforce",
             user_id=None,
         )
         # Alongside-write: the live provider is UNCHANGED until confirm.
-        assert swapped.provider == "google_calendar"
+        assert swapped.provider == "hubspot"
         assert swapped.status == "connected"  # old stays live (rule B)
-        assert (swapped.non_secret_config or {}).get("pending_provider") == "microsoft_calendar"
+        assert (swapped.non_secret_config or {}).get("pending_provider") == "salesforce"
 
 
 @pytest.mark.usefixtures("db_engine_reset")
@@ -94,8 +94,8 @@ async def test_swap_failed_probe_reverts_provider_to_old_value():
             s,
             admin_id=admin,
             instance_id=iid,
-            connection_type="calendar",
-            provider="google_calendar",
+            connection_type="crm",
+            provider="hubspot",
             user_id=None,
         )
         await service.confirm_reconnect(
@@ -105,7 +105,7 @@ async def test_swap_failed_probe_reverts_provider_to_old_value():
             s,
             admin_id=admin,
             connection_id=conn.connection_id,
-            provider="microsoft_calendar",
+            provider="salesforce",
             user_id=None,
         )
         ok, reason = await service.confirm_reconnect(
@@ -117,7 +117,7 @@ async def test_swap_failed_probe_reverts_provider_to_old_value():
             probe_detail="bad_credentials",
         )
         assert not ok and reason == "bad_credentials"
-        assert conn.provider == "google_calendar"  # never touched — old stays live
+        assert conn.provider == "hubspot"  # never touched — old stays live
         assert conn.status == "connected"
         assert "pending_provider" not in (conn.non_secret_config or {})
 
@@ -133,8 +133,8 @@ async def test_swap_confirmed_probe_cuts_over_provider():
             s,
             admin_id=admin,
             instance_id=iid,
-            connection_type="calendar",
-            provider="google_calendar",
+            connection_type="crm",
+            provider="hubspot",
             user_id=None,
         )
         await service.confirm_reconnect(
@@ -144,13 +144,13 @@ async def test_swap_confirmed_probe_cuts_over_provider():
             s,
             admin_id=admin,
             connection_id=conn.connection_id,
-            provider="microsoft_calendar",
+            provider="salesforce",
             user_id=None,
         )
         ok, state = await service.confirm_reconnect(
             s, admin_id=admin, connection_id=conn.connection_id, user_id=None, probe_ok=True
         )
         assert ok and state == "connected"
-        assert conn.provider == "microsoft_calendar"
+        assert conn.provider == "salesforce"
         assert conn.status == "connected"
         assert "pending_provider" not in (conn.non_secret_config or {})

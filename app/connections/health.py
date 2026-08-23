@@ -245,6 +245,60 @@ async def _transition(
                 "reason": detail or "health_check",
             },
         )
+        # §3.8.5's second half (Phase 6.6): the TRANSITION into a broken state is
+        # the once-per-incident boundary — a still-broken row on the next sweep
+        # does not transition and sends nothing; a fixed-then-broken-again row
+        # transitions again and notifies again. Best-effort: the dispatcher
+        # swallows delivery errors (audited), so a mail outage cannot break the
+        # health sweep.
+        broken = ("expired", "error")
+        if new_status in broken and old_status not in broken:
+            await _notify_owner_attention(session, connection, new_status, detail)
+
+
+# Owner-facing surface names for the attention email (never raw enums).
+_SURFACE_LABELS: dict[str, str] = {
+    "calendar": "calendar",
+    "crm": "CRM",
+    "knowledge_source": "knowledge sync",
+    "sms_sender": "SMS & Voice number",
+    "email_sender": "email mailbox",
+    "channel_auth": "WhatsApp & Messenger sign-in",
+    "instagram_auth": "Instagram sign-in",
+    "outbound_webhook": "outbound webhook",
+    "record_source": "records source",
+}
+
+
+async def _notify_owner_attention(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    new_status: str,
+    detail: str | None,
+) -> None:
+    """Email the owner that this connection needs a reconnect (§3.8.5)."""
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    from app.connections import registry  # noqa: PLC0415
+    from app.models.instance import Account  # noqa: PLC0415
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+
+    email = (
+        await session.execute(_select(Account.email).where(Account.id == connection.admin_id))
+    ).scalar_one_or_none()
+    if not email:
+        return
+    spec = registry.get_provider(connection.provider)
+    provider_name = spec.display_name if spec is not None else connection.provider
+    await email_dispatcher.send_connection_attention(
+        session,
+        admin_id=connection.admin_id,
+        to=email,
+        provider_name=provider_name,
+        surface_label=_SURFACE_LABELS.get(connection.connection_type, "connection"),
+        status=new_status,
+        detail=detail,
+    )
 
 
 async def _propagate_knowledge_pause(session: AsyncSession, connection: InstanceConnection) -> None:

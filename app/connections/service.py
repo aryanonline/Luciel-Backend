@@ -614,6 +614,21 @@ async def swap(
     if connection is None:
         return None
 
+    # The staged TARGET faces the same honesty guards as a fresh start (Phase
+    # 6.6 matrix catch): an unoffered name must not stage, and an honest-disabled
+    # provider must not get a consent flow through the swap side door either.
+    # (An unconfigured-OAuth target is NOT refused — same as start_connection,
+    # it stages with the "Action needed" detail rather than a dead end.)
+    if not registry.is_valid_provider(connection.connection_type, provider):
+        raise ProviderNotRegistered(
+            f"'{provider}' is not an available provider for {connection.connection_type}."
+        )
+    _target_spec = registry.get_provider(provider)
+    if _target_spec is not None and connection.connection_type in _target_spec.unavailable_for:
+        raise ProviderNotRegistered(
+            f"'{provider}' is not available yet for {connection.connection_type}."
+        )
+
     # Proven-before-cutover: record intent + stage the candidate provider ALONGSIDE
     # the live one (non_secret_config), never mutating connection.provider here. The
     # live status is also preserved via the reconnect_pending marker. Cutover to the

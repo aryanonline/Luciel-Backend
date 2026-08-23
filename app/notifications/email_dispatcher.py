@@ -224,6 +224,50 @@ async def send_account_notice(
     )
 
 
+async def send_connection_attention(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    provider_name: str,
+    surface_label: str,
+    status: str,
+    detail: str | None,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """§3.8.5: a connection stopped working — tell the owner, with the fix.
+
+    Sent by the health worker at the moment a row TRANSITIONS into
+    expired/error (once per incident — a still-broken row on the next sweep is
+    not a new transition and sends nothing). Until Phase 6.6 wired this, the
+    owner's only signal was noticing the chip on their next dashboard visit."""
+    subject = f"Action needed: reconnect {provider_name}"
+    reason = (
+        "its saved sign-in expired and could not be renewed"
+        if status == "expired"
+        else "its saved credentials stopped working"
+    )
+    body = (
+        f"Your {provider_name} connection (your {surface_label}) needs attention: "
+        f"{reason}. Luciel has stopped using it so nothing fails silently.\n\n"
+        "To fix it, open the Configure page of your VantageMind dashboard and use "
+        "Reconnect on that connection — one sign-in, and everything that depends "
+        "on it switches back on by itself.\n\n"
+        f"Detail on the row: {detail or 'reconnect needed'}"
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="connection_attention",
+        audit_event="connection_attention_emailed",
+        extra_payload={"status": status},
+        sender=sender,
+    )
+
+
 async def send_payg_usage_nudge(
     session: AsyncSession,
     *,

@@ -414,13 +414,18 @@ async def swap_connection(
     against a (possibly different) provider while the CURRENT connection stays live
     until the new credential verifies (proven-before-cutover, Decision §45)."""
     async with tenant_session(subject.admin_id) as s:
-        out = await service.swap(
-            s,
-            admin_id=subject.admin_id,
-            connection_id=connection_id,
-            provider=req.provider,
-            user_id=subject.user_id,
-        )
+        try:
+            out = await service.swap(
+                s,
+                admin_id=subject.admin_id,
+                connection_id=connection_id,
+                provider=req.provider,
+                user_id=subject.user_id,
+            )
+        except service.ProviderNotRegistered as exc:
+            # Phase 6.6: the swap side door validates its target exactly like a
+            # fresh start — same refusal, same wire shape.
+            raise validation_error(str(exc)) from exc
         if out is None:
             raise not_found("Connection not found.")
         _, result = out
