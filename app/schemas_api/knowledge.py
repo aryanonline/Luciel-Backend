@@ -28,6 +28,11 @@ class KnowledgeSourceOut(WireModel):
     last_updated_at: datetime
     last_synced_at: datetime | None = None
     sync_status: KnowledgeSyncStatusWire | None = None
+    # §3.2.2 delete-confirmation truth (C14): how many answers in the last 7
+    # days drew on this source, read from the durable retrieval trace (C6).
+    # 0 is a real zero once the store exists — the trust-contract tooltip
+    # ("N questions used this source") reads this before a delete.
+    used_by_questions_7d: int = 0
 
 
 class KnowledgeChunkOut(WireModel):

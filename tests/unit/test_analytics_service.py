@@ -345,10 +345,13 @@ async def test_honest_gaps_never_fabricated() -> None:
     assert agg.response_time_p95_seconds is None
     assert agg.response_time_gap is not None  # empty state, not a build gap
 
+    # Real since C14: empty is an honest empty (no retrieval traces / no leads
+    # yet), never a permanent "coming soon" note.
     assert agg.top_knowledge_sources == []
-    assert agg.top_knowledge_sources_gap is not None
+    assert agg.top_knowledge_sources_gap is None
 
-    assert agg.conversion_by_source_gap is not None
+    assert agg.conversion_by_source == []
+    assert agg.conversion_by_source_gap is None
     assert agg.conversion_by_service_gap is not None
 
     # Owner-language empty states only: never leak internal engineering notes
@@ -419,7 +422,7 @@ def test_render_csv_unknown_view_raises() -> None:
         response_time_p95_seconds=None,
         response_time_gap=analytics_service.RESPONSE_TIME_EMPTY,
         top_knowledge_sources=[],
-        top_knowledge_sources_gap=analytics_service.RETRIEVAL_GAP,
+        top_knowledge_sources_gap=None,
     )
     with pytest.raises(ValueError):
         analytics_service.render_csv("not_a_real_view", agg)

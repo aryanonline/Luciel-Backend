@@ -91,6 +91,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "lead_pruned",
         "lead_archived",
         "lead_reactivated",
+        # Admin marked a lead's business outcome (Vision §7 conversion; C14).
+        "lead_outcome_marked",
         "lifecycle_notice_sent",
         # A billing/legal notice email left the platform (§A5 allowance
         # reduction, §A10 price change, the 80% pay-as-you-go heads-up).

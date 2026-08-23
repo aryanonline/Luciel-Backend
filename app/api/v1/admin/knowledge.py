@@ -88,7 +88,7 @@ _PROVIDER_TO_ORIGIN = {
 }
 
 
-def _source_out(src: KnowledgeSource) -> KnowledgeSourceOut:
+def _source_out(src: KnowledgeSource, used_7d: int = 0) -> KnowledgeSourceOut:
     return KnowledgeSourceOut.model_validate(
         {
             "sourceId": src.id,
@@ -99,8 +99,32 @@ def _source_out(src: KnowledgeSource) -> KnowledgeSourceOut:
             "lastUpdatedAt": src.last_updated_at,
             "lastSyncedAt": src.last_synced_at,
             "syncStatus": src.sync_status,
+            "usedByQuestions7d": used_7d,
         }
     )
+
+
+async def _used_by_questions_7d(s: AsyncSession, admin_id: uuid.UUID) -> dict[uuid.UUID, int]:
+    """Per-source answer counts over a 7-day rolling window (§3.2.2 tooltip; C14).
+
+    One grouped query over the durable retrieval trace (retrieval_trace_events,
+    C6) — the store §5.4 promised the "N questions used this source" confirmation
+    would read. Sources absent from the map genuinely served no answer."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import func
+
+    from app.models.trace import RetrievalTraceEvent
+
+    cutoff = datetime.now(UTC) - timedelta(days=7)
+    rows = (
+        await s.execute(
+            select(RetrievalTraceEvent.source_id, func.count())
+            .where(RetrievalTraceEvent.admin_id == admin_id, RetrievalTraceEvent.at >= cutoff)
+            .group_by(RetrievalTraceEvent.source_id)
+        )
+    ).all()
+    return {sid: int(count) for sid, count in rows}
 
 
 async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
@@ -117,7 +141,8 @@ async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
 async def list_sources(subject: Subject = Depends(current_admin)) -> list[KnowledgeSourceOut]:
     async with tenant_session(subject.admin_id) as s:
         sources = await service.list_sources(s, subject.admin_id)
-        return [_source_out(x) for x in sources]
+        used = await _used_by_questions_7d(s, subject.admin_id)
+        return [_source_out(x, used.get(x.id, 0)) for x in sources]
 
 
 @router.get("/sources/{source_id}/chunks", response_model=list[KnowledgeChunkOut])

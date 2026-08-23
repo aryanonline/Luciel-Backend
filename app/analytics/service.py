@@ -73,7 +73,9 @@ from app.models.billing import BillingAccount
 from app.models.booking import BookingEvent
 from app.models.budget import CountedSession
 from app.models.conversation import EscalationEvent, Session, Transcript
+from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead
+from app.models.trace import RetrievalTraceEvent
 
 # Vision §7 / Arch §3.9: heatmap is [dayOfWeek 0-6][hourOfDay 0-23] -> count.
 _DAYS = 7
@@ -101,6 +103,22 @@ class ChannelConversion:
 
 
 @dataclass
+class SourceConversion:
+    """Outcome-based conversion by lead SOURCE (Vision §7; C14).
+
+    ``source`` is the lead's first-contact channel — the honest source dimension
+    this product has (a lead "comes from" the channel they first reached Luciel
+    on). Rates read from the admin-marked ``leads.outcome`` (migration 0050),
+    which is what Vision §7 says conversion means — not the capture-rate proxy
+    ``ChannelConversion`` reports."""
+
+    source: str
+    leads: int
+    converted: int
+    conversion_rate: float  # converted / leads, 0.0 when no leads
+
+
+@dataclass
 class NotAvailable:
     """Honest gap marker (Arch §3.9 — aggregates only, never fabricated)."""
 
@@ -124,6 +142,7 @@ class AnalyticsAggregate:
     top_knowledge_sources: list[dict[str, object]]
     top_knowledge_sources_gap: NotAvailable | None
     conversion_by_channel: list[ChannelConversion] = field(default_factory=list)
+    conversion_by_source: list[SourceConversion] = field(default_factory=list)
     conversion_by_source_gap: NotAvailable | None = None
     conversion_by_service_gap: NotAvailable | None = None
 
@@ -134,13 +153,13 @@ class AnalyticsAggregate:
 # "code path" language). See module docstring above for the internal reasons;
 # keep any internals-facing detail in comments/docstrings, not in these
 # strings.
-RETRIEVAL_GAP = NotAvailable("Knowledge source usage isn't tracked yet — coming soon.")
 # Not a build gap any more — the honest EMPTY state for a period with no
 # customer→Luciel reply pairs yet (a new account, or a quiet period).
 RESPONSE_TIME_EMPTY = NotAvailable(
     "Shows up once Luciel has replied to customers this billing period."
 )
-CONVERSION_SOURCE_GAP = NotAvailable("Conversion by source isn't available yet — coming soon.")
+# The one remaining honest gap (C14): no service-type dimension is persisted
+# anywhere to group by — services are not yet a modeled concept.
 CONVERSION_SERVICE_GAP = NotAvailable("Conversion by service isn't available yet — coming soon.")
 
 
@@ -216,9 +235,41 @@ async def _busiest_times(s: AsyncSession, *, period_start: date) -> list[list[in
     return grid
 
 
-async def _top_knowledge_sources() -> tuple[list[dict[str, object]], NotAvailable]:
-    # See module docstring / RETRIEVAL_GAP — no retrieval-frequency log exists.
-    return [], RETRIEVAL_GAP
+async def _top_knowledge_sources(
+    s: AsyncSession, *, period_start: date
+) -> tuple[list[dict[str, object]], NotAvailable | None]:
+    """REAL top-N sources by retrieval frequency (Arch §3.9) — the gap ended when
+    the durable retrieval trace store landed (retrieval_trace_events, C6): one row
+    per (answer turn, source), so the count reads as "answers that drew on this
+    document". A source deleted since its retrievals still shows honestly under a
+    generic label rather than being silently dropped from history."""
+    rows = (
+        await s.execute(
+            select(RetrievalTraceEvent.source_id, func.count())
+            .where(RetrievalTraceEvent.at >= period_start)
+            .group_by(RetrievalTraceEvent.source_id)
+            .order_by(func.count().desc())
+            .limit(10)
+        )
+    ).all()
+    if not rows:
+        return [], None
+    name_rows = (
+        await s.execute(
+            select(KnowledgeSource.id, KnowledgeSource.name).where(
+                KnowledgeSource.id.in_([sid for sid, _ in rows])
+            )
+        )
+    ).all()
+    names: dict[uuid.UUID, str] = {sid: name for sid, name in name_rows}
+    return [
+        {
+            "source_id": str(sid),
+            "name": names.get(sid) or "A removed document",
+            "retrieval_count": int(count),
+        }
+        for sid, count in rows
+    ], None
 
 
 async def _appointments_booked(
@@ -316,6 +367,48 @@ async def _conversion_by_channel(s: AsyncSession, *, period_start: date) -> list
     ]
 
 
+async def _conversion_by_source(s: AsyncSession, *, period_start: date) -> list[SourceConversion]:
+    """Outcome-based conversion by lead source (Vision §7; C14).
+
+    Source = the lead's FIRST-contact channel (their earliest session), which is
+    the source dimension this product truly has. Conversion = admin-marked
+    ``leads.outcome == 'converted'`` over the leads captured this period. Leads
+    with no session on record (edge: erased/older rows) group under "unknown"
+    rather than being dropped, so the totals reconcile with leadsThisPeriod."""
+    leads = (
+        await s.execute(select(Lead.id, Lead.outcome).where(Lead.created_at >= period_start))
+    ).all()
+    if not leads:
+        return []
+    first_channel: dict[uuid.UUID, str] = {}
+    sessions = (
+        await s.execute(
+            select(Session.resolved_lead_id, Session.channel, Session.started_at)
+            .where(Session.resolved_lead_id.in_([lead_id for lead_id, _ in leads]))
+            .order_by(Session.started_at.asc())
+        )
+    ).all()
+    for lead_id, channel, _started in sessions:
+        if lead_id is not None and lead_id not in first_channel:
+            first_channel[lead_id] = channel
+    totals: dict[str, list[int]] = {}
+    for lead_id, outcome in leads:
+        source = first_channel.get(lead_id, "unknown")
+        bucket = totals.setdefault(source, [0, 0])
+        bucket[0] += 1
+        if outcome == "converted":
+            bucket[1] += 1
+    return [
+        SourceConversion(
+            source=source,
+            leads=count,
+            converted=converted,
+            conversion_rate=(converted / count) if count else 0.0,
+        )
+        for source, (count, converted) in sorted(totals.items())
+    ]
+
+
 async def build_overview(
     s: AsyncSession,
     *,
@@ -358,10 +451,11 @@ async def build_overview(
     escalations_by_signal = await _escalations_by_signal(s, period_start=period_start)
     channel_mix = await _channel_mix(s, period_start=period_start)
     busiest_times = await _busiest_times(s, period_start=period_start)
-    top_sources, sources_gap = await _top_knowledge_sources()
+    top_sources, sources_gap = await _top_knowledge_sources(s, period_start=period_start)
     appointments, appointments_gap = await _appointments_booked(s, period_start=period_start)
     p50, p95, response_gap = await _response_time_percentiles(s, period_start=period_start)
     conversion_by_channel = await _conversion_by_channel(s, period_start=period_start)
+    conversion_by_source = await _conversion_by_source(s, period_start=period_start)
 
     return AnalyticsAggregate(
         conversations_this_period=conversations_this_period,
@@ -378,7 +472,9 @@ async def build_overview(
         top_knowledge_sources=top_sources,
         top_knowledge_sources_gap=sources_gap,
         conversion_by_channel=conversion_by_channel,
-        conversion_by_source_gap=CONVERSION_SOURCE_GAP,
+        conversion_by_source=conversion_by_source,
+        # Real since C14 (leads.outcome + first-contact channel) — no note.
+        conversion_by_source_gap=None,
         conversion_by_service_gap=CONVERSION_SERVICE_GAP,
     )
 

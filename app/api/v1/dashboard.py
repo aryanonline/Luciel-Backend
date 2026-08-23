@@ -41,6 +41,7 @@ from app.schemas_api.conversations import (
     HumanReplyRequest,
     HumanReplyResult,
     LeadOut,
+    LeadOutcomeRequest,
     MessageOut,
     PruneRequest,
     SourceChunkOut,
@@ -444,6 +445,7 @@ async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]
                 contact_identifier=r.contact_identifier,
                 intent=r.intent,
                 state=r.state.value,
+                outcome=r.outcome,
                 last_activity_at=r.last_activity_at,
                 created_at=r.created_at,
             )
@@ -622,6 +624,47 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
             contact_identifier=lead.contact_identifier,
             intent=lead.intent,
             state=lead.state.value,
+            outcome=lead.outcome,
+            last_activity_at=lead.last_activity_at,
+            created_at=lead.created_at,
+        )
+
+
+@router.post("/leads/{lead_id}/outcome", response_model=LeadOut)
+async def mark_lead_outcome(
+    lead_id: uuid.UUID,
+    body: LeadOutcomeRequest,
+    subject: Subject = Depends(current_admin),
+) -> LeadOut:
+    """Mark a lead's business outcome (Vision §7 "where the admin marks a lead
+    outcome"; C14, migration 0050). This is what conversion analytics group by;
+    reversible — an owner can move a lead between in_progress/converted/lost as
+    the deal actually develops. Audited without lead PII (§3.4.11)."""
+    async with tenant_session(subject.admin_id) as s:
+        lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
+        old = lead.outcome
+        lead.outcome = body.outcome
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=lead.instance_id,
+            event_type="lead_outcome_marked",
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            payload={
+                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                "old_outcome": old,
+                "new_outcome": body.outcome,
+            },
+        )
+        await s.flush()
+        return LeadOut(
+            lead_id=lead.id,
+            name=lead.name,
+            contact_identifier=lead.contact_identifier,
+            intent=lead.intent,
+            state=lead.state.value,
+            outcome=lead.outcome,
             last_activity_at=lead.last_activity_at,
             created_at=lead.created_at,
         )

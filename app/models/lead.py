@@ -40,6 +40,13 @@ class Lead(Base, TenantMixin, TimestampMixin):
     state: Mapped[LeadState] = mapped_column(
         Enum(LeadState, name="lead_state"), default=LeadState.active, nullable=False
     )
+    # Admin-marked business outcome (Vision §7 "where the admin marks a lead
+    # outcome"; audit round 3 C14, migration 0050). Distinct from ``state``
+    # (active/archived — a VISIBILITY lifecycle): outcome is what the analytics
+    # conversion metrics group by. Wire values, CHECK-constrained in the migration.
+    outcome: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="in_progress", server_default="in_progress"
+    )
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

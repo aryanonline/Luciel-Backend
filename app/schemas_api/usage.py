@@ -45,6 +45,16 @@ class ChannelConversionOut(WireModel):
     conversion_rate: float
 
 
+class SourceConversionOut(WireModel):
+    """Outcome-based conversion by lead source (Vision §7; C14): source = the
+    lead's first-contact channel, conversion = admin-marked leads.outcome."""
+
+    source: str
+    leads: int
+    converted: int
+    conversion_rate: float
+
+
 class AnalyticsOverviewOut(WireModel):
     """Frozen analytics.ts ``analyticsOverview`` — exact field set + camelCase,
     widened with §3.9 fields that were previously hardcoded/missing (see
@@ -74,6 +84,11 @@ class AnalyticsOverviewOut(WireModel):
     # Channel is real (lead-capture-rate proxy); source/service are honest gaps —
     # no such dimension is persisted anywhere (see CONVERSION_SOURCE_GAP/SERVICE_GAP).
     conversion_by_channel: list[ChannelConversionOut]
+    # Real since C14 (leads.outcome, migration 0050 + first-contact channel):
+    # outcome-based conversion per lead source. The note is served only if a
+    # genuine gap returns; service-type remains the one honest gap (no service
+    # taxonomy is modeled anywhere).
+    conversion_by_source: list[SourceConversionOut] = []
     conversion_by_source_note: str | None
     conversion_by_service_note: str | None
     # New in this build (harmony fix 2026-08-04 item 4). False means escalations are

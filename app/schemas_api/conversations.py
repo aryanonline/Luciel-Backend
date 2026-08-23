@@ -149,8 +149,15 @@ class LeadOut(WireModel):
     contact_identifier: str | None = None
     intent: str | None = None
     state: LeadStateWire
+    # Admin-marked business outcome (Vision §7; C14). Distinct from `state`
+    # (visibility lifecycle): this is what conversion analytics group by.
+    outcome: Literal["in_progress", "converted", "lost"] = "in_progress"
     last_activity_at: datetime
     created_at: datetime
+
+
+class LeadOutcomeRequest(WireModel):
+    outcome: Literal["in_progress", "converted", "lost"]
 
 
 class PruneRequest(WireModel):

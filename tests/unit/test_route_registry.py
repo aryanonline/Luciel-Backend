@@ -120,6 +120,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/dashboard/leads/prune"),
         ("DELETE", "/api/v1/dashboard/leads/{lead_id}"),
         ("POST", "/api/v1/dashboard/leads/{lead_id}/archive"),
+        # C14 conversion dimension: admin marks a lead's business outcome.
+        ("POST", "/api/v1/dashboard/leads/{lead_id}/outcome"),
         # chat-widget (data plane)
         ("POST", "/api/v1/chat-widget/bootstrap"),
         ("POST", "/api/v1/chat-widget/messages"),

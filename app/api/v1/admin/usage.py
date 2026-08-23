@@ -40,6 +40,7 @@ from app.schemas_api.usage import (
     ChannelConversionOut,
     ChannelMix,
     EscalationBySignal,
+    SourceConversionOut,
     TopKnowledgeSource,
 )
 
@@ -133,6 +134,17 @@ async def _build_overview_out(
                     }
                 )
                 for c in agg.conversion_by_channel
+            ],
+            "conversionBySource": [
+                SourceConversionOut.model_validate(
+                    {
+                        "source": c.source,
+                        "leads": c.leads,
+                        "converted": c.converted,
+                        "conversionRate": c.conversion_rate,
+                    }
+                )
+                for c in agg.conversion_by_source
             ],
             "conversionBySourceNote": (
                 agg.conversion_by_source_gap.reason if agg.conversion_by_source_gap else None

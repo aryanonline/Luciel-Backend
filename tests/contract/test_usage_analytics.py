@@ -116,6 +116,7 @@ async def test_usage_overview_new_fields_present_and_honest(client) -> None:
         "topKnowledgeSources",
         "topKnowledgeSourcesNote",
         "conversionByChannel",
+        "conversionBySource",
         "conversionBySourceNote",
         "conversionByServiceNote",
     ):
@@ -130,10 +131,12 @@ async def test_usage_overview_new_fields_present_and_honest(client) -> None:
     assert body["responseTimeP50Seconds"] is None
     assert body["responseTimeP95Seconds"] is None
     assert body["responseTimeNote"]
-    # Still-real gaps: no retrieval-frequency store exists yet.
+    # Real since C14: an empty seed is an honest empty, not a "coming soon" note.
+    # Service-type stays the one honest gap (no service taxonomy is modeled).
     assert body["topKnowledgeSources"] == []
-    assert body["topKnowledgeSourcesNote"]
-    assert body["conversionBySourceNote"]
+    assert body["topKnowledgeSourcesNote"] is None
+    assert body["conversionBySource"] == []
+    assert body["conversionBySourceNote"] is None
     assert body["conversionByServiceNote"]
 
     # Real data: busiest-times heatmap shape + at least one session counted, and
