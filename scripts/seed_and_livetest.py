@@ -193,13 +193,28 @@ def widget_bootstrap(client: httpx.Client, embed_key: str) -> dict:
 
 
 def widget_send(client: httpx.Client, embed_key: str, text: str) -> dict:
-    return _check(
-        client.post(
+    """POST one widget message, honoring the §3.1.5 admission contract.
+
+    The widget rate limit answers a GRACEFUL 429 with ``retryAfterSeconds`` —
+    the shipped widget waits and retries, and so does this harness. T2's
+    cap-burning loop fires messages far faster than the per-source refill
+    (burst 5, ~3s), so without this the harness read the product's own
+    admission control as a failure (live-caught on the 2026-08-23 run)."""
+    for _ in range(40):
+        resp = client.post(
             f"{API_BASE}/api/v1/chat-widget/messages",
             json={"embedKey": embed_key, "text": text},
-        ),
-        "widget_send",
-    )
+        )
+        if resp.status_code == 429:
+            retry = 3.0
+            try:
+                retry = float(resp.json().get("retryAfterSeconds") or 3.0)
+            except Exception:  # noqa: BLE001 — a malformed body still means "wait"
+                pass
+            time.sleep(min(retry, 10.0) + 0.2)
+            continue
+        return _check(resp, "widget_send")
+    raise RuntimeError("widget_send: still rate-limited after bounded retries")
 
 
 def usage_conversations(client: httpx.Client) -> int:
