@@ -61,3 +61,61 @@ def test_superseded_meta_provider_ids_still_resolve_to_the_single_grant():
         spec = registry.get_provider(legacy)
         assert spec is not None, legacy
         assert spec.provider == "meta"
+
+
+def test_provider_available_requires_redirect_uri_for_oauth_providers(monkeypatch):
+    """GAP-N3 (round 4): id+secret without a redirect URI cannot START a consent
+    (build_authorize_start refuses), so advertising the provider as available
+    renders a Connect button that dead-ends on the placeholder URL. Availability
+    must key on authorize_ready (id+secret+redirect); the credential_fallback
+    provider (twilio) stays available regardless, because the customer's own API
+    keys need nothing from the platform."""
+    from app.config import Settings
+
+    partial = Settings(
+        notion_client_id="ncid",
+        notion_client_secret="ncsecret",  # noqa: S106 — test fixture value  # nosec B106
+        # notion_redirect_uri deliberately empty — the config trap this test pins.
+    )
+    monkeypatch.setattr(registry, "get_settings", lambda: partial)
+    assert registry.provider_available("notion") is False
+    assert registry.provider_available("twilio") is True  # credential fallback
+
+    complete = Settings(
+        notion_client_id="ncid",
+        notion_client_secret="ncsecret",  # noqa: S106 — test fixture value  # nosec B106
+        notion_redirect_uri="https://api.example.com/api/v1/connections/notion/callback",
+    )
+    monkeypatch.setattr(registry, "get_settings", lambda: complete)
+    assert registry.provider_available("notion") is True
+
+
+def test_every_oauth_authorize_host_is_mirrored_in_the_frontend_allowlist():
+    """This set must mirror PROVIDER_AUTHORIZE_HOSTS in Luciel-Frontend
+    apps/web/src/lib/oauth-connect.ts — the frontend refuses to navigate the
+    browser to any authorize host outside its allowlist, so adding a provider
+    here without adding its consent host there ships a Connect button that
+    always answers "We could not start a secure sign-in" (GAP-N1, round 4:
+    Notion's api.notion.com was missing and the flow was dead on arrival).
+    When this test fails, update BOTH this frozenset and the frontend list
+    (plus its oauth-connect-hosts.test.ts) in the same change."""
+    from urllib.parse import urlparse
+
+    registry_hosts = {
+        urlparse(spec.authorize.endpoint).netloc
+        for spec in registry.PROVIDERS.values()
+        if spec.is_oauth
+    }
+    assert registry_hosts == frozenset(
+        {
+            "accounts.google.com",
+            "login.salesforce.com",
+            "app.hubspot.com",
+            "auth.calendly.com",
+            "www.facebook.com",
+            "www.instagram.com",
+            "login.microsoftonline.com",
+            "login.twilio.com",
+            "api.notion.com",
+        }
+    )

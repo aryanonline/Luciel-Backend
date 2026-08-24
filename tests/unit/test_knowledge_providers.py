@@ -541,6 +541,9 @@ def _configured_settings(monkeypatch, provider_module):
         salesforce_consumer_key="scid",
         salesforce_consumer_secret="scsecret",
         salesforce_redirect_uri="https://api.example.com/sf-callback",
+        notion_client_id="ncid",
+        notion_client_secret="ncsecret",  # noqa: S106 — test fixture value  # nosec B106
+        notion_redirect_uri="https://api.example.com/n-callback",
     )
     monkeypatch.setattr(provider_module, "get_settings", lambda: fresh)
     # The OAuth app-credential lookup reads settings through the provider registry, so
@@ -580,6 +583,51 @@ async def test_exchange_code_for_token_salesforce_captures_instance_url(monkeypa
     assert material["access_token"] == "sf-access-1"
     assert material["instance_url"] == "https://myorg.my.salesforce.com"
     assert transport.last_url == "https://login.salesforce.com/services/oauth2/token"
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_notion_uses_basic_auth_and_json_body(monkeypatch):
+    """Notion's /v1/oauth/token requires HTTP Basic client auth with a JSON body
+    (round 4, GAP-N2): the form-encoded client_secret_post every other provider
+    uses gets a 401 there. The registry declares the style per provider; the one
+    exchange function must honor it — creds in the header, NEVER in the body."""
+    import base64
+
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(json_body={"access_token": "n-access-1"})
+    material = await exchange_code_for_token("notion", code="authcode-3", transport=transport)
+    assert material == {"access_token": "n-access-1"}
+    assert transport.last_url == "https://api.notion.com/v1/oauth/token"
+    # JSON body, not form.
+    assert transport.last_data is None
+    assert transport.last_json is not None
+    assert transport.last_json["grant_type"] == "authorization_code"
+    assert transport.last_json["code"] == "authcode-3"
+    assert transport.last_json["redirect_uri"] == "https://api.example.com/n-callback"
+    # Credentials travel ONLY in the Basic header.
+    assert "client_id" not in transport.last_json
+    assert "client_secret" not in transport.last_json
+    expected = "Basic " + base64.b64encode(b"ncid:ncsecret").decode()
+    assert transport.last_headers is not None
+    assert transport.last_headers["Authorization"] == expected
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_for_token_form_providers_unchanged_by_auth_style(monkeypatch):
+    """Regression for the GAP-N2 seam: providers on the default style still post
+    form-encoded credentials with no Authorization header."""
+    from app.knowledge import providers as providers_module
+
+    _configured_settings(monkeypatch, providers_module)
+    transport = FakeTransport(json_body={"access_token": "gd-a", "refresh_token": "gd-r"})
+    await exchange_code_for_token("google_drive", code="authcode-4", transport=transport)
+    assert transport.last_json is None
+    assert transport.last_data is not None
+    assert transport.last_data["client_id"] == "gcid"
+    assert transport.last_data["client_secret"] == "gcsecret"
+    assert "Authorization" not in (transport.last_headers or {})
 
 
 @pytest.mark.asyncio

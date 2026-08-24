@@ -38,6 +38,17 @@ class OAuthClientConfig:
     def configured(self) -> bool:
         return bool(self.client_id and self.client_secret)
 
+    @property
+    def authorize_ready(self) -> bool:
+        """Everything an authorize START needs — mirrors build_authorize_start's gate.
+
+        ``configured`` (id+secret) is enough for token REFRESH, but starting a new
+        consent also needs the registered redirect URI (oauth_flow refuses without
+        it). Availability surfaces must use THIS, or a provider with id+secret and
+        no redirect renders an enabled Connect button that dead-ends on the
+        placeholder URL (GAP-N3, round 4)."""
+        return self.configured and bool(self.redirect_uri)
+
 
 @dataclass(frozen=True)
 class ProviderAuthorize:
@@ -61,6 +72,16 @@ class ProviderAuthorize:
     # short-lived token is then never stored, because it expires in about an hour.
     long_lived_endpoint: str | None = None
     long_lived_grant_type: str | None = None
+    # How the client credential authenticates the token-exchange request (RFC 6749
+    # client auth): "post" sends client_id/client_secret as body fields
+    # (client_secret_post — the default every existing provider uses); "basic" sends
+    # an HTTP Basic Authorization header instead (client_secret_basic — Notion
+    # REQUIRES this and rejects body credentials). Declared here so the one exchange
+    # function stays provider-agnostic (same doctrine as token_fields above).
+    exchange_client_auth: str = "post"
+    # The exchange request body encoding: "form" (x-www-form-urlencoded, the OAuth
+    # default) or "json" (Notion's token endpoint takes a JSON body).
+    exchange_body: str = "form"
 
 
 @dataclass(frozen=True)
@@ -291,6 +312,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
             scopes="",
             supports_pkce=False,
             extra={"owner": "user"},
+            # Notion's /v1/oauth/token requires HTTP Basic client auth with a JSON
+            # body; the default form-encoded client_secret_post is rejected with a
+            # 401 (live-caught in the round-4 wiring review before any tenant hit it).
+            exchange_client_auth="basic",
+            exchange_body="json",
         ),
         client_id_setting="notion_client_id",
         client_secret_setting="notion_client_secret",  # noqa: S106 — field NAME  # nosec B106
@@ -583,7 +609,11 @@ def provider_available(provider: str, connection_type: str | None = None) -> boo
     # nothing from us, so "configured" does not gate this provider.
     if spec.credential_fallback:
         return True
-    return oauth_client_config(spec.provider).configured
+    # authorize_ready, not configured (GAP-N3, round 4): id+secret without a
+    # redirect URI cannot START a consent, so advertising it as available ships a
+    # Connect button that dead-ends. Refresh paths keep using `configured` — an
+    # already-granted token needs no redirect to renew.
+    return oauth_client_config(spec.provider).authorize_ready
 
 
 def oauth_client_label(provider: str) -> str:

@@ -670,7 +670,12 @@ async def oauth_callback(
         ).scalar_one_or_none()
         if conn is None:
             raise not_found("Sync connection not found.")
-        if conn.provider not in ("google_drive", "hubspot", "salesforce"):
+        # Registry truth, not a literal tuple (round 4): the old hardcoded
+        # ("google_drive", "hubspot", "salesforce") gate silently rejected notion on
+        # THIS surface while the browser callback accepted it — the two completion
+        # surfaces must always agree on which providers are OAuth-exchangeable.
+        provider_spec = registry.get_provider(conn.provider)
+        if provider_spec is None or not provider_spec.is_oauth:
             raise validation_error(
                 f"Provider '{conn.provider}' has no OAuth callback (not an OAuth-class provider)."
             )

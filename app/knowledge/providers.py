@@ -36,6 +36,7 @@ Manager/SSM in production). NEVER hardcoded here.
 
 from __future__ import annotations
 
+import base64
 import uuid
 from typing import Protocol
 from urllib.parse import urlparse
@@ -224,21 +225,31 @@ async def exchange_code_for_token(
     if authorize is None or endpoint is None:
         raise ProviderUnavailable(f"No token endpoint registered for provider '{provider}'.")
 
-    form: dict[str, object] = {
+    body: dict[str, object] = {
         "grant_type": "authorization_code",
         "code": code,
-        "client_id": cfg.client_id,
-        "client_secret": cfg.client_secret,
         "redirect_uri": cfg.redirect_uri,
     }
+    headers = {"Accept": "application/json"}
+    # Client auth per the registry's declared style (registry.ProviderAuthorize):
+    # client_secret_post (the OAuth default) puts the credentials in the body;
+    # client_secret_basic (Notion — it 401s body credentials) puts them in an HTTP
+    # Basic header and the body stays credential-free.
+    if authorize.exchange_client_auth == "basic":
+        raw = f"{cfg.client_id}:{cfg.client_secret}".encode()
+        headers["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+    else:
+        body["client_id"] = cfg.client_id
+        body["client_secret"] = cfg.client_secret
     if code_verifier:
-        form["code_verifier"] = code_verifier
+        body["code_verifier"] = code_verifier
 
-    resp = await transport.post(
-        endpoint,
-        data=form,
-        headers={"Accept": "application/json"},
-    )
+    # Body encoding likewise declared per provider: Notion's token endpoint takes
+    # JSON; everyone else takes the form encoding RFC 6749 specifies.
+    if authorize.exchange_body == "json":
+        resp = await transport.post(endpoint, json=body, headers=headers)
+    else:
+        resp = await transport.post(endpoint, data=body, headers=headers)
     if resp.status_code >= 400:
         raise OAuthExchangeError(
             f"{provider} token exchange failed (HTTP {resp.status_code}): "
