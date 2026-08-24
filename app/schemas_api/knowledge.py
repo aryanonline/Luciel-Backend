@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import HttpUrl
+from pydantic import Field, HttpUrl
 
 from app.schemas_api.common import WireModel
 
@@ -32,7 +32,12 @@ class KnowledgeSourceOut(WireModel):
     # days drew on this source, read from the durable retrieval trace (C6).
     # 0 is a real zero once the store exists — the trust-contract tooltip
     # ("N questions used this source") reads this before a delete.
-    used_by_questions_7d: int = 0
+    # Explicit alias: the generated camelization renders `_7d` as `7D`, which
+    # silently DROPPED the serializer's `usedByQuestions7d` input (field stayed
+    # 0 on the wire) and never matched the frontend schema's lowercase key —
+    # live-caught on the 2026-08-23 dev walkthrough (the modal claimed "no
+    # questions used this source" about a source analytics counted 6 for).
+    used_by_questions_7d: int = Field(0, alias="usedByQuestions7d")
 
 
 class KnowledgeChunkOut(WireModel):

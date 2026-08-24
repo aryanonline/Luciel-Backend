@@ -64,6 +64,50 @@ async def test_paste_ingest_then_list_and_chunks(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_used_by_questions_7d_reaches_the_wire_under_its_exact_key(client):
+    """Live-caught 2026-08-23: the alias generator camelized `_7d` to `7D`, so
+    the serializer's lowercase input key was silently DROPPED (the wire always
+    said 0, under a key the frontend never read) and the delete confirmation
+    claimed "no questions used this source" about a source analytics counted 6
+    for. Pins the exact wire key AND a real traced count end-to-end."""
+    from app.auth.tokens import decode_token
+    from app.config import get_settings
+    from app.db.session import tenant_session
+    from app.models.instance import Instance
+    from app.models.trace import RetrievalTraceEvent
+    from sqlalchemy import select
+
+    await _ready_account_with_luciel(client)
+    ri = await client.post(
+        "/api/v1/admin/knowledge/sources/paste",
+        json={"name": "Hours", "text": "Open weekdays 8-6."},
+    )
+    source_id = uuid.UUID(ri.json()["sourceId"])
+    admin_id = uuid.UUID(
+        decode_token(client.cookies.get(get_settings().session_cookie_name))["sub"]
+    )
+    async with tenant_session(admin_id) as s:
+        iid = (
+            await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
+        ).scalar_one()
+        s.add(
+            RetrievalTraceEvent(
+                id=uuid.uuid4(),
+                admin_id=admin_id,
+                instance_id=iid,
+                session_id=uuid.uuid4(),
+                source_id=source_id,
+            )
+        )
+        await s.flush()
+
+    body = (await client.get("/api/v1/admin/knowledge/sources")).json()
+    row = next(x for x in body if x["sourceId"] == str(source_id))
+    assert row["usedByQuestions7d"] == 1  # the exact key the frontend reads
+    assert "usedByQuestions7D" not in row  # the generator's casing never ships
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_delete_source_204(client):
     await _ready_account_with_luciel(client)
     ri = await client.post(
