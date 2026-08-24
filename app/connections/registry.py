@@ -452,11 +452,16 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
             # Twilio's OAuth 2.0 authorization-code flow ("organizational API
-            # access"). Endpoints + scope string are validated against the real
-            # consent screen during the dev E2E — they are configuration, not
-            # security material; the state/PKCE/exchange machinery is generic.
-            endpoint="https://login.twilio.com/oauth2/authorize",
-            exchange_endpoint="https://login.twilio.com/oauth2/token",
+            # access"). Endpoints validated live 2026-08-24 (round 4): the OWNER'S
+            # Twilio console emits authorize URIs on oauth.twilio.com/v2 for this
+            # app class (OQ… client ids), the vendored twilio SDK's OAuth module
+            # bases at oauth.twilio.com, and live probes confirm /v2/authorize
+            # (400 on missing params) and /v2/token (405 on GET) are the live
+            # pair. The previous login.twilio.com/oauth2/* pins matched neither
+            # that console URI nor login.twilio.com's own OIDC metadata — they
+            # were unvalidated configuration from C10.
+            endpoint="https://oauth.twilio.com/v2/authorize",
+            exchange_endpoint="https://oauth.twilio.com/v2/token",
             scopes="offline_access",
             supports_pkce=False,
         ),

@@ -23,7 +23,7 @@ from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
-TOKEN_URL = "https://login.twilio.com/oauth2/token"  # noqa: S105
+TOKEN_URL = "https://oauth.twilio.com/v2/token"  # noqa: S105
 ACCOUNTS_URL = "https://api.twilio.com/2010-04-01/Accounts.json"
 ACCOUNT_SID = "AC" + "4" * 32
 
@@ -112,7 +112,7 @@ async def _start_oauth(client) -> tuple[str, str]:
     body = r.json()
     assert body.get("authorizeUrl"), body  # OAuth-primary when the app is configured
     parsed = urlparse(body["authorizeUrl"])
-    assert parsed.netloc == "login.twilio.com"
+    assert parsed.netloc == "oauth.twilio.com"
     rows = (await client.get("/api/v1/admin/connections")).json()
     cid = next(row["connectionId"] for row in rows if row["connectionType"] == "sms_sender")
     return str(cid), parse_qs(parsed.query)["state"][0]

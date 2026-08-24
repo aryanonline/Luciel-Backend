@@ -115,7 +115,7 @@ def test_every_oauth_authorize_host_is_mirrored_in_the_frontend_allowlist():
             "www.facebook.com",
             "www.instagram.com",
             "login.microsoftonline.com",
-            "login.twilio.com",
+            "oauth.twilio.com",
             "api.notion.com",
         }
     )

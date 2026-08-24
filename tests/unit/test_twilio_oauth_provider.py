@@ -89,7 +89,7 @@ def test_start_yields_a_real_twilio_consent_url_when_configured(monkeypatch):
     )
     assert not start.unconfigured
     parsed = urlparse(start.authorize_url)
-    assert parsed.netloc == "login.twilio.com"
+    assert parsed.netloc == "oauth.twilio.com"
     params = parse_qs(parsed.query)
     assert params["client_id"] == ["OQtest"]
     assert params["redirect_uri"][0].endswith("/connections/twilio/callback")
@@ -98,7 +98,7 @@ def test_start_yields_a_real_twilio_consent_url_when_configured(monkeypatch):
 
 def test_twilio_has_a_refresh_spec():
     spec = REFRESH_SPECS["twilio"]
-    assert spec.endpoint == "https://login.twilio.com/oauth2/token"
+    assert spec.endpoint == "https://oauth.twilio.com/v2/token"
 
 
 class _FakeResponse:

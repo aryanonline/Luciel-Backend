@@ -142,7 +142,9 @@ REFRESH_SPECS: dict[str, RefreshSpec] = {
     # reach the refresh branch.
     "twilio": RefreshSpec(
         style=STYLE_REFRESH_TOKEN_POST,
-        endpoint="https://login.twilio.com/oauth2/token",
+        # Same live-validated token endpoint the exchange uses (round 4 — see the
+        # registry's twilio ProviderAuthorize comment).
+        endpoint="https://oauth.twilio.com/v2/token",
         default_lifetime_seconds=3600,
     ),
 }
