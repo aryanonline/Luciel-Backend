@@ -34,6 +34,32 @@ def test_anonymous_question_does_not_qualify():
     assert s.strong_identifier is None
 
 
+def test_name_extracted_from_explicit_self_introduction():
+    """#5d (live-caught 2026-08-23): 'I'm Jane Miller' left the lead named
+    'Unknown' in the dashboard and in the Salesforce LastName push."""
+    assert extract_lead_signals("Hi, I'm Jane Miller — do you do crowns?").name == "Jane Miller"
+    assert extract_lead_signals("my name is Priya and I need a cleaning").name == "Priya"
+    assert extract_lead_signals("Hello, this is Marcus O'Brien from Acme").name == "Marcus O'Brien"
+    assert extract_lead_signals("I am Jean-Luc, calling about pricing").name == "Jean-Luc"
+
+
+def test_name_extraction_is_conservative_not_greedy():
+    """A wrong capture pollutes the tenant's CRM, so anything that is not an
+    unambiguous capitalized self-introduction stays None (the honest 'Unknown'
+    fallback stands)."""
+    # Lowercase continuation — the everyday sentence shape.
+    assert extract_lead_signals("I'm interested in pricing").name is None
+    assert extract_lead_signals("I am here about the ad").name is None
+    # Capitalized continuations that are not names (stoplist).
+    assert extract_lead_signals("I'm Interested in the premium plan").name is None
+    assert extract_lead_signals("I'm Free Friday afternoon").name is None
+    assert extract_lead_signals("I am Available Monday").name is None
+    # No self-introduction lead-in at all.
+    assert extract_lead_signals("Jane Miller").name is None
+    # Contact-info shapes after the lead-in are not names.
+    assert extract_lead_signals("I'm jane@acme.com").name is None
+
+
 def test_disclosure_present_detection():
     assert disclosure_present("Hi, I'm Ava, the AI assistant for GTA Premier.")
     assert not disclosure_present("Sure, our hours are 9 to 5.")

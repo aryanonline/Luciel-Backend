@@ -117,6 +117,44 @@ async def test_messages_and_nested_evidence(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_evidence_deterministic_row_is_not_applicable_not_legacy(client):
+    """#5c (live-caught 2026-08-23): a fresh greeting/at-cap/ack row is composed in
+    code — scoring never applied to it. It used to serve not_scored_legacy and the
+    dashboard claimed the row was written "before scoring existed", false for a row
+    minutes old. The 0051 `deterministic` marker splits the two truths on the wire:
+    marked rows serve "not_applicable"; unmarked unscored rows (whose origin the
+    backend cannot reconstruct) honestly keep "not_scored_legacy"."""
+    admin = await _signup_verify_login(client)
+    iid, sid, legacy_mid = await _seed_conversation(admin)
+    det_id = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=det_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="Hi! I'm an AI assistant for this business. How can I help?",
+                deterministic=True,
+            )
+        )
+        await s.flush()
+
+    re_det = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{det_id}/evidence")
+    assert re_det.status_code == 200
+    ev = re_det.json()
+    assert ev["scoringStatus"] == "not_applicable"
+    assert ev["groundingScore"] is None
+    # The unmarked unscored row from _seed_conversation keeps the legacy status —
+    # the marker must never leak onto rows that don't carry it.
+    re_legacy = await client.get(
+        f"/api/v1/dashboard/conversations/{sid}/messages/{legacy_mid}/evidence"
+    )
+    assert re_legacy.json()["scoringStatus"] == "not_scored_legacy"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_evidence_returns_the_real_persisted_grounding_score(client):
     """This is the actual harmony fix: two different messages with two different
     REAL scores must return two different values, not both hitting the same

@@ -96,6 +96,15 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # three distinct attributionStatus values -- never collapses NULL and [] into
     # the same "no source backed this answer" claim.
     source_chunks: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
+    # #5c (live-caught 2026-08-23, migration 0051): True for luciel rows composed in
+    # CODE, not by the model — the persisted greeting, the at-cap graceful reply,
+    # escalation acks, the LLM-outage ack. Scoring does not APPLY to these (there is
+    # no knowledge answer to ground), which is a different truth from "this row
+    # predates scoring". The evidence endpoint maps deterministic+unscored to
+    # scoringStatus "not_applicable"; unscored rows without the marker stay
+    # "not_scored_legacy" (pre-0051 rows keep the default false — no backfill can
+    # honestly reconstruct their origin).
+    deterministic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

@@ -165,6 +165,7 @@ async def persist_turn(
     grounding_score: float | None = None,
     source_chunks: list[dict[str, object]] | None = None,
     at: datetime | None = None,
+    deterministic: bool = False,
 ) -> Transcript:
     """Append one message to the session transcript and return the persisted row.
 
@@ -189,7 +190,13 @@ async def persist_turn(
     ``now()`` — TRANSACTION timestamp, constant across the whole request — so a
     turn's lead row and reply row landed with an identical ``at`` and the
     reply-time analytics read 0s forever. Callers now stamp the honest moment:
-    arrival time for the inbound row, wall-clock persist time for the reply."""
+    arrival time for the inbound row, wall-clock persist time for the reply.
+
+    ``deterministic`` (#5c, live-caught 2026-08-23, migration 0051): True for luciel
+    rows composed in CODE (greeting, at-cap reply, escalation acks, LLM-outage ack).
+    Scoring does not apply to these, and the evidence endpoint serves
+    ``scoringStatus: "not_applicable"`` instead of the false temporal claim
+    "not_scored_legacy" a fresh greeting row used to carry."""
     if role not in TRANSCRIPT_ROLES:
         raise ValueError(f"unknown transcript role: {role}")
     row = Transcript(
@@ -201,6 +208,7 @@ async def persist_turn(
         text=text,
         grounding_score=grounding_score,
         source_chunks=source_chunks,
+        deterministic=deterministic,
     )
     if at is not None:
         row.at = at
@@ -468,6 +476,7 @@ class Orchestrator:
                 role="luciel",
                 text=at_cap_reply,
                 at=datetime.now(UTC),
+                deterministic=True,
             )
             return LoopResult(
                 reply_text=at_cap_reply,
@@ -600,6 +609,7 @@ class Orchestrator:
                 role="luciel",
                 text=ack,
                 at=datetime.now(UTC),
+                deterministic=True,
             )
             # The first model-call attempt is the fire-once trigger even on failure?
             # No: §3.4.1b ties the counter to a model CALL succeeding/serving. A pure
@@ -1107,6 +1117,7 @@ class Orchestrator:
             role="luciel",
             text=ack,
             at=datetime.now(UTC),
+            deterministic=True,
         )
         await handoff.take_over(
             self.session,

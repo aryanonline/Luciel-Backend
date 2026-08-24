@@ -271,6 +271,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
                 role="luciel",
                 text=_disclosure(_disclosure_business_name(inst), _names(inst)[1]),
                 at=received_at - timedelta(milliseconds=1),
+                deterministic=True,
             )
 
         # Arc 16 binds the production hybrid retriever (vector + intent-gated graph,

@@ -44,6 +44,7 @@ from app.schemas_api.conversations import (
     LeadOutcomeRequest,
     MessageOut,
     PruneRequest,
+    ScoringStatusWire,
     SourceChunkOut,
 )
 
@@ -347,10 +348,20 @@ async def get_answer_evidence(
                 for c in source_chunks_raw
             ]
 
+        # #5c (live-caught 2026-08-23): a deterministic code-composed reply (greeting,
+        # at-cap notice, escalation ack) is "not_applicable" — scoring never applied —
+        # not "not_scored_legacy", which claims the row predates scoring. Unscored
+        # rows without the 0051 marker keep the legacy status honestly.
+        if scored:
+            scoring_status: ScoringStatusWire = "scored"
+        elif msg.deterministic:
+            scoring_status = "not_applicable"
+        else:
+            scoring_status = "not_scored_legacy"
         return AnswerEvidenceOut(
             message_id=msg.id,
             grounding_score=msg.grounding_score if scored else None,
-            scoring_status="scored" if scored else "not_scored_legacy",
+            scoring_status=scoring_status,
             source_chunks=source_chunks,
             attribution_status=attribution_status,
             flagged_by_admin=False,

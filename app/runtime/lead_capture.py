@@ -42,6 +42,76 @@ _INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 _BUDGET_RE = re.compile(r"(\$\s?\d[\d,]*)|(\b\d+\s?k\b)|\bbudget\b", re.IGNORECASE)
+# #5d (live-caught 2026-08-23): "I'm Jane Miller" left the lead named "Unknown" —
+# in the dashboard AND in the Salesforce push, whose required LastName then read
+# the honest-but-avoidable "Unknown" fallback. Conservative by design: only an
+# explicit self-introduction lead-in, followed by 1–3 CAPITALIZED tokens (the
+# case-sensitive name group is what rejects "I'm interested in pricing" — the
+# lead-in match is case-insensitive, the name is not). A miss costs nothing (the
+# name stays unfilled and the CRM fallback stands); a wrong capture pollutes the
+# tenant's CRM, so precision wins over recall.
+# A word starts with a capital and is at least two characters: a lowercase run
+# ("Jane") or an apostrophe/hyphen joint straight after the capital ("O'Brien"),
+# with further joints allowed ("Jean-Luc"). A bare single capital never matches.
+_NAME_WORD = r"[A-Z](?:[a-z]+|['’-][A-Z][a-z]+)(?:['’-][A-Z][a-z]+)*"
+_NAME_RE = re.compile(
+    rf"\b(?i:my name is|i am|i'm|i’m|this is)[ \t]+({_NAME_WORD}(?:[ \t]+{_NAME_WORD}){{0,2}})"
+)
+# Capitalized sentence-continuations that follow the same lead-ins in real chat
+# ("I'm Interested…", "Hi, this is Urgent") — never treat these as a first name.
+_NAME_STOPWORDS = frozenset(
+    {
+        "Actually",
+        "Afraid",
+        "Available",
+        "Busy",
+        "Calling",
+        "Curious",
+        "Fine",
+        "Free",
+        "Good",
+        "Happy",
+        "Here",
+        "Hoping",
+        "Interested",
+        "Just",
+        "Looking",
+        "New",
+        "Not",
+        "Okay",
+        "Only",
+        "Open",
+        "Ready",
+        "Really",
+        "Sorry",
+        "Still",
+        "Sure",
+        "The",
+        "Trying",
+        "Urgent",
+        "Wondering",
+        "Writing",
+        # Scheduling turns capitalize these after the same lead-ins ("I'm Free
+        # Friday", "I am Monday…") — a closed set, never a first name here.
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    }
+)
+
+
+def _extract_name(text: str) -> str | None:
+    m = _NAME_RE.search(text or "")
+    if m is None:
+        return None
+    name = m.group(1)
+    if name.split()[0] in _NAME_STOPWORDS:
+        return None
+    return name
 
 
 @dataclass(frozen=True)
@@ -52,6 +122,9 @@ class LeadSignals:
     phone: str | None
     has_intent: bool
     has_budget: bool
+    # Self-introduced name ("I'm Jane Miller") — fill-when-absent only; a
+    # conservative miss is None (#5d).
+    name: str | None = None
 
     @property
     def strong_identifier(self) -> str | None:
@@ -75,6 +148,7 @@ def extract_lead_signals(text: str) -> LeadSignals:
         phone=phone_m.group(0) if phone_m else None,
         has_intent=bool(_INTENT_RE.search(t)),
         has_budget=bool(_BUDGET_RE.search(t)),
+        name=_extract_name(t),
     )
 
 
@@ -188,7 +262,10 @@ async def capture_or_update_lead(
             id=uuid.uuid4(),
             admin_id=admin_id,
             instance_id=instance_id,
-            name=None,
+            # A self-introduction on the capturing turn names the record from the
+            # start ("I'm Jane Miller, my email is…" used to create name=None and
+            # push LastName "Unknown" — #5d).
+            name=signals.name,
             contact_identifier=contact_key,
             # Intent only when the turn actually SIGNALED one: an identity-only
             # capture ("No its alright thankyou" from a known number) must not
@@ -201,6 +278,8 @@ async def capture_or_update_lead(
         lead_id = lead.id
         lead_key = contact_key
         changed = {"contact": contact_key}
+        if signals.name:
+            changed["name"] = signals.name
         if intent:
             changed["intent"] = intent
         if signals.phone:
@@ -223,6 +302,11 @@ def _apply_signals(
     if lead.contact_identifier is None and signals.strong_identifier:
         lead.contact_identifier = signals.strong_identifier
         changed["contact"] = signals.strong_identifier
+    # Fill-when-absent only (#5d): a later "I'm Jane" never overwrites a name the
+    # record already carries — the extractor is conservative, not authoritative.
+    if lead.name is None and signals.name:
+        lead.name = signals.name
+        changed["name"] = signals.name
     # Keep the most recent qualified intent as the working intent line.
     if signals.has_intent or signals.has_budget:
         intent = _summarize_intent(inbound_text)

@@ -109,6 +109,15 @@ class SourceChunkOut(WireModel):
 # the "Grounded 0.50" bug this item closes. groundingScore is null whenever
 # scoringStatus != "scored".
 #
+# "not_applicable" (#5c, live-caught 2026-08-23, migration 0051): the row is a
+# DETERMINISTIC code-composed reply (persisted greeting, at-cap notice, escalation
+# ack, LLM-outage ack) -- there was never a knowledge answer to score, which is a
+# different truth from "predates scoring". A fresh greeting row used to serve
+# not_scored_legacy and the dashboard claimed it was written "before scoring
+# existed" -- false for a row minutes old. Unscored rows persisted before the
+# Transcript.deterministic marker existed honestly stay not_scored_legacy (their
+# origin cannot be reconstructed).
+#
 # attributionStatus distinguishes "the retriever found no source for this answer"
 # from "we have no idea what backed this answer" (attribution simply wasn't
 # captured). sourceChunks == [] must NEVER be presented as "no source backed this
@@ -117,7 +126,7 @@ class SourceChunkOut(WireModel):
 # ungrounded reply. FRONTEND CONTRACT CHANGE: the dashboard's per-message evidence
 # panel must branch on attributionStatus, not on `sourceChunks.length === 0` alone,
 # to decide which copy to render (see register note for the sibling FE task).
-ScoringStatusWire = Literal["scored", "not_scored_legacy"]
+ScoringStatusWire = Literal["scored", "not_scored_legacy", "not_applicable"]
 AttributionStatusWire = Literal["has_sources", "no_sources_retrieved", "attribution_unavailable"]
 
 

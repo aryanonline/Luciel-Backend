@@ -186,6 +186,36 @@ async def test_dormant_connection_pushes_nothing(fresh_mock_crm):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_self_introduced_name_reaches_the_lead_and_the_crm_push(fresh_mock_crm):
+    """#5d (live-caught 2026-08-23): 'I'm Jane Miller' left the Lead named None and
+    the Salesforce push fell back to LastName 'Unknown'. The capture now fills the
+    name (fill-when-absent only) and forwards it as a changed fact."""
+    from app.models.lead import Lead
+    from sqlalchemy import select
+
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin)
+
+    await _capture_and_push(
+        admin, iid, sid, "Hi, I'm Jane Miller — email me at jane@acme.com about a quote."
+    )
+    assert len(fresh_mock_crm.records) == 1
+    record_id, rec = next(iter(fresh_mock_crm.records.items()))
+    assert rec["fields"].get("name") == "Jane Miller"
+    async with tenant_session(admin) as s:
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
+        assert lead.name == "Jane Miller"
+
+    # A later differing self-introduction never overwrites the recorded name —
+    # the extractor is conservative, not authoritative.
+    await _capture_and_push(admin, iid, sid, "Actually I'm Bob — also, budget is $9k.")
+    async with tenant_session(admin) as s:
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
+        assert lead.name == "Jane Miller"
+    assert fresh_mock_crm.records[record_id]["fields"].get("name") == "Jane Miller"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_phone_keyed_lead_is_not_pushed_into_an_email_keyed_crm(fresh_mock_crm):
     admin = uuid.uuid4()
     iid, sid = await _seed_tenant(admin)

@@ -90,6 +90,10 @@ async def test_first_reply_does_not_repeat_the_bootstrap_disclosure(client):
     assert rows[0].role == "luciel"
     assert rows[0].text == opening
     assert [r_.role for r_ in rows[1:]] == ["lead", "luciel"]
+    # #5c: the greeting is a code-composed row — it carries the deterministic
+    # marker so the evidence endpoint serves "not_applicable", never the false
+    # "before scoring existed" claim a fresh greeting used to render.
+    assert rows[0].deterministic is True
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
