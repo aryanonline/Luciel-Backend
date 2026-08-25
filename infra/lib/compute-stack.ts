@@ -23,6 +23,8 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as ses from 'aws-cdk-lib/aws-ses';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
@@ -200,6 +202,186 @@ export class ComputeStack extends Stack {
       }),
     );
 
+    // The public API origin, composed exactly the way WebStack composes
+    // NEXT_PUBLIC_API_BASE_URL: `https://${DOMAINS.api}`. Both SNS webhook
+    // subscriptions below land on routes under this origin (the ALB HTTPS:443
+    // listener -> data plane, wired further down in this stack).
+    const publicApiBaseUrl = `https://${DOMAINS.api}`;
+
+    // --- SES events pipeline (bounce/complaint) ------------------------------------
+    // Outbound platform email (verification, reset, export links, dunning/billing
+    // notices) is sent through SES with NO feedback loop: a hard bounce or a spam
+    // complaint today lands in the void, so the app keeps mailing a dead or
+    // complaining address — the exact behavior that erodes SES sender reputation.
+    // This wires the loop: sends stamped with the configuration set below publish
+    // BOUNCE/COMPLAINT events to an SNS topic, which POSTs them to the app's
+    // events webhook. Lives HERE because this stack owns the SES send IAM
+    // (SendPlatformEmail above — note its configuration-set/* resource already
+    // authorizes sending with this set).
+    const sesConfigurationSetName = `luciel-${envConfig.envName}-platform`;
+    const sesConfigSet = new ses.CfnConfigurationSet(this, 'SesConfigurationSet', {
+      name: sesConfigurationSetName,
+    });
+
+    const sesEventsTopic = new sns.Topic(this, 'SesEventsTopic', {
+      topicName: `luciel-${envConfig.envName}-ses-events`,
+      displayName: `Luciel ${envConfig.envName} SES bounce/complaint events`,
+    });
+    // Only SES — and only SES acting for THIS account — may publish. Without the
+    // SourceAccount condition any AWS customer could point their own SES event
+    // destination at this topic and inject forged bounce events into the webhook.
+    const sesEventsTopicPolicy = new sns.TopicPolicy(this, 'SesEventsTopicPolicy', {
+      topics: [sesEventsTopic],
+    });
+    sesEventsTopicPolicy.document.addStatements(
+      new iam.PolicyStatement({
+        sid: 'AllowSesPublish',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('ses.amazonaws.com')],
+        actions: ['sns:Publish'],
+        resources: [sesEventsTopic.topicArn],
+        conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+      }),
+    );
+
+    const sesEventsDestination = new ses.CfnConfigurationSetEventDestination(
+      this,
+      'SesEventsDestination',
+      {
+        configurationSetName: sesConfigurationSetName,
+        eventDestination: {
+          name: `luciel-${envConfig.envName}-bounce-complaint`,
+          enabled: true,
+          matchingEventTypes: ['BOUNCE', 'COMPLAINT'],
+          snsDestination: { topicArn: sesEventsTopic.topicArn },
+        },
+      },
+    );
+    // configurationSetName is a literal (no Ref), so CFN sees no implicit edge to
+    // the config set; and SES validates it can publish at destination-creation
+    // time, so the topic policy must exist first. Both orderings made explicit.
+    sesEventsDestination.addDependency(sesConfigSet);
+    sesEventsDestination.node.addDependency(sesEventsTopicPolicy);
+
+    // CFN creates this subscription in PendingConfirmation: SNS POSTs a
+    // SubscriptionConfirmation to the endpoint and the app route auto-confirms it
+    // in LIVE integration mode only. A mock environment deliberately leaves the
+    // subscription unconfirmed (there is no live consumer to confirm it) — that
+    // is correct standing state, not a deploy failure.
+    new sns.Subscription(this, 'SesEventsHttpsSubscription', {
+      topic: sesEventsTopic,
+      protocol: sns.SubscriptionProtocol.HTTPS,
+      endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/events`,
+    });
+
+    // --- SES inbound for platform reply addresses (codified console state) ---------
+    // Round 5B item 17. Root CLAUDE.md documents the inbound path as OUT-OF-BAND
+    // console ops (stood up 2026-08-17 after the vm_subdomain reply addresses
+    // shipped unreceivable): receipt rule set `luciel-<env>-inbound` matching
+    // `.reply.vantagemind.ai` -> SNS topic `luciel-<env>-ses-inbound` (content
+    // inline) -> HTTPS subscription to /api/v1/webhooks/ses/inbound. This block
+    // codifies those pieces so a NEW environment gets them from IaC.
+    //
+    // ============================ OPS CUTOVER NOTE =================================
+    // DEPLOYMENT SAFETY — why every physical name below carries a `-v2` suffix:
+    // the console-created rule set (`luciel-dev-inbound`) and topic
+    // (`luciel-dev-ses-inbound`) ALREADY EXIST in the dev account. CloudFormation
+    // cannot create a resource whose physical name is taken, and this repo has no
+    // CDK import/adoption precedent (DnsStack's fromHostedZoneAttributes is a
+    // by-reference lookup, not resource adoption), so reusing the exact names
+    // would fail the very first deploy. The safest option — chosen and documented
+    // here — is parallel `-v2` resources plus a deliberate operator cutover:
+    //
+    //   1. Deploy this stack: creates rule set `luciel-<env>-inbound-v2` (INERT —
+    //      CFN never activates a receipt rule set) + topic
+    //      `luciel-<env>-ses-inbound-v2` + its pending HTTPS subscription.
+    //   2. Confirm the v2 topic's HTTPS subscription is Confirmed (live envs
+    //      auto-confirm via the webhook route; see the events note above).
+    //   3. Activate the v2 rule set: `aws ses set-active-receipt-rule-set
+    //      --rule-set-name luciel-<env>-inbound-v2`. SES allows ONE active rule
+    //      set per account+region, so this atomically deactivates the console
+    //      rule set — inbound mail flow is uninterrupted.
+    //   4. After verifying inbound replies still reach the webhook, delete the
+    //      console-created rule set + topic by hand (they are unmanaged).
+    //
+    // Until step 3 runs, deploys are a no-op for live mail flow: the console rule
+    // set stays active and the v2 resources sit idle. That is the intended safe
+    // default — activation is an explicit ops decision, never a deploy side effect.
+    // ===============================================================================
+    //
+    // ROUTE53 (documented, deliberately NOT codified): inbound also requires ONE
+    // zone-global wildcard MX in the vantagemind.ai zone:
+    //
+    //   *.reply.vantagemind.ai  MX  10 inbound-smtp.ca-central-1.amazonaws.com
+    //
+    // The hosted zone IS referenced in-code (DnsStack), but the record is not
+    // created here for two reasons: (1) it ALREADY EXISTS (console-created
+    // 2026-08-17, root CLAUDE.md) and CloudFormation fails when creating an
+    // existing record set — unlike the resources above, an MX record's NAME is
+    // its contract, so it cannot be suffixed around the collision; (2) the record
+    // is ZONE-GLOBAL while this stack is per-environment — dev and prod stacks
+    // would both claim the same record, and tearing either down would delete it
+    // out from under the other. Adoption would need `cdk import` or the
+    // deleteExisting custom resource, both riskier than one documented record.
+    const sesInboundTopic = new sns.Topic(this, 'SesInboundTopic', {
+      topicName: `luciel-${envConfig.envName}-ses-inbound-v2`,
+      displayName: `Luciel ${envConfig.envName} SES inbound reply mail (v2)`,
+    });
+    // Same publish lockdown as the events topic: SES only, this account only.
+    const sesInboundTopicPolicy = new sns.TopicPolicy(this, 'SesInboundTopicPolicy', {
+      topics: [sesInboundTopic],
+    });
+    sesInboundTopicPolicy.document.addStatements(
+      new iam.PolicyStatement({
+        sid: 'AllowSesPublish',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('ses.amazonaws.com')],
+        actions: ['sns:Publish'],
+        resources: [sesInboundTopic.topicArn],
+        conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+      }),
+    );
+
+    const sesInboundRuleSetName = `luciel-${envConfig.envName}-inbound-v2`;
+    const sesInboundRuleSet = new ses.CfnReceiptRuleSet(this, 'SesInboundRuleSet', {
+      ruleSetName: sesInboundRuleSetName,
+    });
+    const sesInboundRule = new ses.CfnReceiptRule(this, 'SesInboundRule', {
+      ruleSetName: sesInboundRuleSetName,
+      rule: {
+        name: `luciel-${envConfig.envName}-inbound-reply`,
+        enabled: true,
+        // Leading dot = every address under the reply subdomain (the per-session
+        // vm_* reply addresses), exactly what the console rule matched.
+        recipients: [`.reply.${DOMAINS.apex}`],
+        // SNS action = the full raw message delivered INLINE in the notification
+        // ("content inline", matching the console rule), UTF-8 encoded. Only the
+        // console-documented settings are codified — no scanEnabled/tlsPolicy
+        // beyond the SES defaults the console rule ran with.
+        actions: [
+          {
+            snsAction: {
+              topicArn: sesInboundTopic.topicArn,
+              encoding: 'UTF-8',
+            },
+          },
+        ],
+      },
+    });
+    // Same explicit ordering as the events destination: the literal ruleSetName
+    // carries no Ref, and SES validates topic access when the rule is created.
+    sesInboundRule.addDependency(sesInboundRuleSet);
+    sesInboundRule.node.addDependency(sesInboundTopicPolicy);
+
+    // Pending-confirmation semantics identical to the events subscription above:
+    // the inbound route auto-confirms in live mode only; unconfirmed in mock
+    // environments is the correct standing state.
+    new sns.Subscription(this, 'SesInboundHttpsSubscription', {
+      topic: sesInboundTopic,
+      protocol: sns.SubscriptionProtocol.HTTPS,
+      endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/inbound`,
+    });
+
     // Every awsLogs driver below names an EXPLICIT log group. Left to itself the driver
     // creates one on first write with retention "Never expire", which is the one AWS
     // default in this stack that converts a fixed cost into a growing one — and it is
@@ -265,6 +447,11 @@ export class ComputeStack extends Stack {
           // the binding gate (voice_audio.get_voice_audio_store) — deliberately not
           // injected into the sweep container, which never touches call audio.
           LUCIEL_VOICE_AUDIO_BUCKET: voiceAudioBucket.bucketName,
+          // SES events pipeline: sends stamped with this configuration set get
+          // bounce/complaint feedback published to the events topic; the webhook
+          // route uses the topic ARN to pin which topic's envelopes it accepts.
+          SES_CONFIGURATION_SET: sesConfigurationSetName,
+          SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -521,6 +708,14 @@ export class ComputeStack extends Stack {
         // was never told where the bucket is.
         LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
         LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
+        // SES events pipeline — MUST match the app planes for the same reason the
+        // Stripe posture above must: the billing_notices and dunning sweeps send
+        // platform email through the same sender seam, and a sweep-sent notice
+        // without the configuration set would be a send with no bounce/complaint
+        // feedback. (The seedtest task carries neither: it exercises email only
+        // through the live API, never by sending directly.)
+        SES_CONFIGURATION_SET: sesConfigurationSetName,
+        SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
         // model_currency auto-swap targets (§3.4.3): WHERE to write the successor
         // model ID and WHICH services to redeploy so it takes effect. Absent in
         // local/CI runs, where the watchdog degrades to alert-only by design.
