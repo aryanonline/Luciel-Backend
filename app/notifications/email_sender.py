@@ -24,11 +24,20 @@ class SentEmail:
     body: str
     message_id: str
     from_address: str | None = None
+    # Round 5B item 13: SES message tags (vm_admin_id / vm_purpose) recorded so
+    # tests can assert bounce attribution rides every platform send.
+    tags: dict[str, str] | None = None
 
 
 class EmailSender(Protocol):
     async def send(
-        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+        self,
+        *,
+        to: str,
+        subject: str,
+        body_text: str,
+        from_address: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> str | None:
         """Send an email; return a provider message id, or None when nothing was put on
         the wire. Raises on hard failure.
@@ -37,6 +46,10 @@ class EmailSender(Protocol):
         channel reply must come FROM the tenant's own provisioned address (§3.1.6a); a
         platform notice (verification, dunning, escalation) omits it and uses the platform
         identity.
+
+        ``tags`` become SES message tags, echoed back on bounce/complaint events —
+        that is how a bounce names its tenant without any address→tenant scan
+        (round 5B item 13). Values must be tag-safe (alphanumerics, ``-``, ``_``).
         """
         ...
 
@@ -48,7 +61,13 @@ class NullEmailSender:
         self.sent: list[SentEmail] = []
 
     async def send(
-        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+        self,
+        *,
+        to: str,
+        subject: str,
+        body_text: str,
+        from_address: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> str | None:
         from app.config import live_mode  # noqa: PLC0415 — avoids an import cycle
 
@@ -60,6 +79,7 @@ class NullEmailSender:
                 body=body_text,
                 message_id=mid,
                 from_address=from_address,
+                tags=dict(tags) if tags else None,
             )
         )
         # Live mode with no verified sender identity: nothing left the system, and the
@@ -84,19 +104,37 @@ class SesEmailSender:
         return self._client
 
     async def send(
-        self, *, to: str, subject: str, body_text: str, from_address: str | None = None
+        self,
+        *,
+        to: str,
+        subject: str,
+        body_text: str,
+        from_address: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> str | None:
+        from app.config import get_settings  # noqa: PLC0415
+
         client = self._get_client()
-        resp = client.send_email(  # type: ignore[attr-defined]
-            FromEmailAddress=from_address or self.sender_identity,
-            Destination={"ToAddresses": [to]},
-            Content={
+        kwargs: dict[str, object] = {
+            "FromEmailAddress": from_address or self.sender_identity,
+            "Destination": {"ToAddresses": [to]},
+            "Content": {
                 "Simple": {
                     "Subject": {"Data": subject, "Charset": "UTF-8"},
                     "Body": {"Text": {"Data": body_text, "Charset": "UTF-8"}},
                 }
             },
-        )
+        }
+        # Round 5B item 13: the configuration set routes bounce/complaint events
+        # to SNS, and the tags are echoed back on those events so the webhook can
+        # attribute them to a tenant. Both optional: an env without the config
+        # set keeps sending exactly as before.
+        config_set = get_settings().ses_configuration_set
+        if config_set:
+            kwargs["ConfigurationSetName"] = config_set
+        if tags:
+            kwargs["EmailTags"] = [{"Name": k, "Value": v} for k, v in tags.items()]
+        resp = client.send_email(**kwargs)  # type: ignore[attr-defined]
         return str(resp.get("MessageId", ""))
 
 

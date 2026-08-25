@@ -431,9 +431,9 @@ def _configure_meta(monkeypatch) -> None:
 def _fake_meta_token_exchange(expected_code: str, monkeypatch) -> None:
     """A transport standing in for both Meta token servers.
 
-    Facebook returns a long-lived token from the code alone; Instagram Login returns a
-    SHORT-lived one and requires the ``ig_exchange_token`` GET to upgrade it, so the fake
-    has to answer both verbs or the Instagram callback path is never exercised.
+    Both grants redeem the code to a SHORT-lived token and upgrade it with a second
+    GET — Facebook via ``fb_exchange_token``, Instagram via ``ig_exchange_token`` —
+    so the fake has to answer both verbs or neither callback path completes.
     """
     import app.api.v1.admin.connections as connections_api
     import httpx
@@ -447,6 +447,14 @@ def _fake_meta_token_exchange(expected_code: str, monkeypatch) -> None:
             return httpx.Response(200, json=body, request=httpx.Request("POST", url))
 
         async def get(self, url, *, params=None, headers=None):
+            if params["grant_type"] == "fb_exchange_token":
+                assert params["client_id"] == "meta-cid"
+                assert params["fb_exchange_token"] == "meta-tok"
+                return httpx.Response(
+                    200,
+                    json={"access_token": "meta-tok-long", "expires_in": 5184000},
+                    request=httpx.Request("GET", url),
+                )
             assert params["grant_type"] == "ig_exchange_token"
             assert params["access_token"] == "ig-short-tok"
             return httpx.Response(

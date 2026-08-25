@@ -306,6 +306,17 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
                 request=httpx.Request("POST", url),
             )
 
+        async def get(self, url, *, params=None, headers=None):
+            # Facebook's own long-lived upgrade (round 5B item 14) — same endpoint, GET.
+            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert params["grant_type"] == "fb_exchange_token"
+            assert params["fb_exchange_token"] == "fb-tok"
+            return httpx.Response(
+                200,
+                json={"access_token": "fb-tok-long", "expires_in": 5184000},
+                request=httpx.Request("GET", url),
+            )
+
         async def __aenter__(self):
             return self
 
@@ -332,7 +343,7 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
     store = get_secret_store()
     facebook = await store.get(secret_ref_for(admin_id, instance_id, "channel_auth"))
     instagram = await store.get(secret_ref_for(admin_id, instance_id, "instagram_auth"))
-    assert facebook is not None and facebook["access_token"] == "fb-tok"
+    assert facebook is not None and facebook["access_token"] == "fb-tok-long"
     assert instagram is not None and instagram["access_token"] == LONG_LIVED
 
     by_type = {

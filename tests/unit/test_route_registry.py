@@ -85,6 +85,19 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # C9 number picker: list the tenant's own Twilio numbers for designate.
         ("GET", "/api/v1/admin/connections/{connection_id}/twilio/numbers"),
         ("POST", "/api/v1/admin/connections/sms/reverify"),
+        # Round 5B item 10: the owner's audited A2P-registration attestation —
+        # the honest operable→connected transition for texting.
+        ("POST", "/api/v1/admin/connections/sms/attest-registration"),
+        # Round 5B item 17: leaked-embed-key remedy without recreating the Luciel.
+        ("POST", "/api/v1/admin/luciel/rotate-embed-key"),
+        # Round 5B item 17: capability-token rotation + webhook re-point in one step.
+        ("POST", "/api/v1/admin/connections/sms/rotate-capability"),
+        # Round 5B item 13: escalation-contact reliability — SES bounce/complaint
+        # ingestion (SNS), the public token-authorized confirm, and the owner's
+        # resend with cooldown.
+        ("POST", "/api/v1/webhooks/ses/events"),
+        ("POST", "/api/v1/escalation-contact/confirm"),
+        ("POST", "/api/v1/admin/luciel/escalation/resend-confirmation"),
         ("POST", "/api/v1/admin/connections/email/reverify"),
         # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every
         # connection type is connect / disconnect / switch-able through these three.

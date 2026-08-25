@@ -96,6 +96,17 @@ async def sync_due_connections(
             if now - newest < _cadence_for(conn.provider):
                 continue  # fresh enough under the origin's cadence
         try:
+            # Round 5B item 12: refresh the token at CALL time like every other
+            # live consumer (calendar/CRM/outlook do this). Google tokens live
+            # ~1h; the sync only worked because the schedule happened to run ten
+            # minutes after the health sweep, and the manual Re-sync button had
+            # no such luck. The refreshed token is persisted, so the provider's
+            # store read below picks it up.
+            from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+            await ensure_fresh_access_token(
+                session, admin_id, conn.instance_id, connection_type="knowledge_source"
+            )
             await sync.sync_connection(
                 session,
                 admin_id=admin_id,
@@ -105,14 +116,32 @@ async def sync_due_connections(
                 provider=provider_for_connection(conn, get_secret_store()),
             )
             synced += 1
-        except ProviderUnavailable:
+        except ProviderUnavailable as exc:
             # Dead credential: pause + flag (§3.2.3) — never silently serve
             # stale content, never crash the rest of the tenant's connections.
+            # Round 5B item 12: the BACKING connection flips through the health
+            # transition machinery too (audit + once-per-incident attention
+            # email + the dashboard attention counter) — a broken sync used to
+            # pause with no notification anywhere.
             await sync.pause_sync_on_revocation(
                 session, admin_id=admin_id, connection_id=conn.connection_id
             )
-            logger.info("knowledge_sync_paused provider=%s", conn.provider)
+            from app.connections.health import mark_connection_broken  # noqa: PLC0415
+
+            await mark_connection_broken(
+                session,
+                conn,
+                detail="knowledge sync could not use the stored credential — reconnect",
+            )
+            logger.info(
+                "knowledge_sync_paused provider=%s error=%s", conn.provider, type(exc).__name__
+            )
         except Exception as exc:  # noqa: BLE001 — one bad source must not stop the sweep
+            # Non-credential failure (quota, parse, provider 500): the sources
+            # show the honest "error" sync state instead of a quietly aging
+            # "synced" (round 5B item 12); the connection row itself stays as-is
+            # (the credential is not implicated).
+            await sync.mark_sync_error(session, admin_id=admin_id, connection_id=conn.connection_id)
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )

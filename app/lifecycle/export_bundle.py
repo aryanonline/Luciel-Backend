@@ -57,8 +57,10 @@ def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
             "leadId": str(le.id),
             "name": le.name,
             "contactIdentifier": le.contact_identifier,
+            "email": le.email,
             "intent": le.intent,
             "state": le.state.value,
+            "outcome": le.outcome,
             "lastActivityAt": le.last_activity_at.isoformat(),
         }
         for le in leads

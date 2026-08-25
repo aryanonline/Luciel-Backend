@@ -141,7 +141,66 @@ async def deliver_due_notices(
     sent += await _send_payg_nudge_if_due(
         session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=sender
     )
+    sent += await _send_card_expiry_notice_if_due(
+        session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=sender
+    )
     return sent
+
+
+# Round 5B item 17: how far ahead of the card's expiry month the heads-up goes.
+CARD_EXPIRY_LEAD_DAYS = 45
+CARD_EXPIRY_KIND = "card_expiry_notice"
+
+
+async def _send_card_expiry_notice_if_due(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    email: str,
+    delivered: set[str],
+    now: datetime,
+    sender: EmailSender | None,
+) -> int:
+    """Proactive card-expiry notice (round 5B item 17): the stored pm_exp_* was
+    display-only and the first DECLINED charge was the detector. Once per
+    (card expiry month) via the ledger — a replaced card changes the notice id."""
+    from datetime import timedelta  # noqa: PLC0415
+
+    account = await metering.get_or_create_billing_account(session, admin_id=admin_id)
+    if not account.pm_last4 or not account.pm_exp_month or not account.pm_exp_year:
+        return 0
+    # The card dies at the END of its expiry month.
+    if account.pm_exp_month == 12:
+        expires_at = datetime(account.pm_exp_year + 1, 1, 1, tzinfo=now.tzinfo)
+    else:
+        expires_at = datetime(account.pm_exp_year, account.pm_exp_month + 1, 1, tzinfo=now.tzinfo)
+    if now + timedelta(days=CARD_EXPIRY_LEAD_DAYS) < expires_at:
+        return 0
+    notice_id = f"card_expiry:{account.pm_last4}:{account.pm_exp_year}-{account.pm_exp_month:02d}"
+    if notice_id in delivered:
+        return 0
+    outcome = await email_dispatcher.send_card_expiry_notice(
+        session,
+        admin_id=admin_id,
+        to=email,
+        notice_id=notice_id,
+        exp_month=account.pm_exp_month,
+        exp_year=account.pm_exp_year,
+        last4=account.pm_last4,
+        sender=sender,
+    )
+    if outcome.status == "failed":
+        return 0
+    session.add(
+        NoticeDelivery(
+            admin_id=admin_id,
+            notice_id=notice_id,
+            kind=CARD_EXPIRY_KIND,
+            delivery_status=outcome.status,
+            sent_at=now,
+        )
+    )
+    return 1
 
 
 async def _send_payg_nudge_if_due(

@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, EmailStr, Field
 
 from app.schemas_api.common import WireModel
 
@@ -159,6 +159,20 @@ class PersonalityConfigWire(WireModel):
     assistant_name: str | None = Field(default=None, max_length=80)
 
 
+class EscalationContactHealthOut(WireModel):
+    """Per-address deliverability/verification state (round 5B item 13).
+
+    Served as a SIBLING of the escalation blob, never inside it — the pillar PUT
+    is a strict full-replace the frontend echoes back, and server-owned state
+    inside it would be wiped or 422 on every save."""
+
+    address: str
+    # unverified (no confirmation ever) | pending_confirmation | verified | bouncing
+    state: str
+    verified_at: datetime | None = None
+    last_bounced_at: datetime | None = None
+
+
 class LucielOut(WireModel):
     instance_id: uuid.UUID
     name: str
@@ -168,10 +182,25 @@ class LucielOut(WireModel):
     channels: list[ChannelConfigOut]
     tools: list[AddonToolOut]
     escalation: EscalationContactWire
+    # Round 5B item 13: deliverability truth for the configured email contacts.
+    escalation_contact_health: list[EscalationContactHealthOut] = Field(default_factory=list)
     personality: PersonalityConfigWire
     # Opt-in lead auto-prune window in days; null means the rule is off (§3.4.10a).
     lead_retention_days: int | None = None
     grace_window_started_at: datetime | None = None
+
+
+class ResendContactConfirmationRequest(WireModel):
+    """POST /admin/luciel/escalation/resend-confirmation body (round 5B item 13)."""
+
+    address: str = Field(min_length=3, max_length=320)
+
+
+class ConfirmEscalationContactRequest(WireModel):
+    """POST /api/v1/escalation-contact/confirm body — token-authorized, public
+    (the contact may not be the account owner and has no session)."""
+
+    token: str = Field(min_length=8)
 
 
 class CreateLucielRequest(WireModel):
@@ -249,9 +278,13 @@ class UpdateEscalationRequest(StrictWireModel):
     # of signals themselves is NOT a field here (it is fixed in code), so an admin cannot
     # add/remove/disable a signal (Vision §3.4, Arch §3.4.5). routing references are
     # validated against the 4 fixed signals by EscalationRoutingRuleIn.
-    primary_email: str | None = None
+    # EmailStr (round 5B item 13): a malformed contact is a 422 at save time —
+    # SES would happily "accept" it and the hot lead would vanish. IN model
+    # only; the read model stays `str` so a previously stored malformed value
+    # cannot crash the read/routing path.
+    primary_email: EmailStr | None = None
     primary_sms: str | None = None
-    secondary_email: str | None = None
+    secondary_email: EmailStr | None = None
     secondary_sms: str | None = None
     preferred_channel: NotificationChannelWire | None = None
     routing: list[EscalationRoutingRuleIn] | None = None

@@ -305,6 +305,31 @@ async def run_sweep(
         action.next_attempt_at = now + _backoff(action.attempts)
         counts["retried"] += 1
 
+    # Round 5B item 13 — 48h catch-up: an abandon whose owner EMAIL failed left
+    # no ledger row (mirror of the billing-notices retry rule), and the sweep
+    # never revisits abandoned rows. Re-attempt recent abandons here; the
+    # per-item ledger inside _send_abandon_notice_once makes this idempotent,
+    # and only the email half runs — the abandon's audit row is never duplicated.
+    from datetime import timedelta as _timedelta  # noqa: PLC0415
+
+    recent_abandoned = (
+        (
+            await session.execute(
+                select(DeferredAction).where(
+                    DeferredAction.admin_id == admin_id,
+                    DeferredAction.status == "abandoned",
+                    # No updated_at column; the abandon happens at/after
+                    # expires_at, so a recent expiry bounds "recent abandon".
+                    DeferredAction.expires_at >= now - _timedelta(hours=48),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for action in recent_abandoned:
+        await _send_abandon_notice_once(session, action)
+
     await session.flush()
     return counts
 
@@ -336,3 +361,57 @@ async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction)
             "reason": "undeliverable > 24h TTL",
         },
     )
+    await _send_abandon_notice_once(session, action)
+
+
+async def _send_abandon_notice_once(session: AsyncSession, action: DeferredAction) -> None:
+    """The owner-email half of the abandon notification, ledger-guarded.
+
+    Round 5B item 13: the owner EMAIL the abandon docstring used to flag as
+    unbuilt — "abandoned WITH an owner notification" was audit-only, so a
+    terminal miss was discoverable only by scrolling the audit page. Once per
+    item via the notice ledger (at-least-once sweeps); a FAILED send leaves no
+    ledger row, and the 48h catch-up pass in the sweep retries THIS half only —
+    the audit row belongs to the abandon moment and is never re-emitted."""
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    from app.models.instance import Account  # noqa: PLC0415
+    from app.models.notice_delivery import NoticeDelivery  # noqa: PLC0415
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+
+    notice_id = f"deferred_abandon:{action.id}"
+    already = (
+        await session.execute(
+            _select(NoticeDelivery.id).where(
+                NoticeDelivery.admin_id == action.admin_id,
+                NoticeDelivery.notice_id == notice_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if already is not None:
+        return
+    owner_email = (
+        await session.execute(_select(Account.email).where(Account.id == action.admin_id))
+    ).scalar_one_or_none()
+    if not owner_email:
+        return
+    conversation_ref = None
+    payload = action.payload or {}
+    if isinstance(payload, dict) and payload.get("session_id"):
+        conversation_ref = str(payload["session_id"])[:8]
+    outcome = await email_dispatcher.send_deferred_abandon_notice(
+        session,
+        admin_id=action.admin_id,
+        to=owner_email,
+        action_type=action.action_type,
+        conversation_ref=conversation_ref,
+    )
+    if outcome.status != "failed":
+        session.add(
+            NoticeDelivery(
+                admin_id=action.admin_id,
+                notice_id=notice_id,
+                kind="deferred_abandon",
+                delivery_status=outcome.status,
+            )
+        )

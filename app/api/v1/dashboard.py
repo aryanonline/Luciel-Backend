@@ -13,6 +13,7 @@ Sources: Architecture §3.4.7 (summary list), §3.4.12 (take-over / hand-back),
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime
 from typing import cast
@@ -47,6 +48,8 @@ from app.schemas_api.conversations import (
     ScoringStatusWire,
     SourceChunkOut,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
@@ -454,6 +457,7 @@ async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]
                 lead_id=r.id,
                 name=r.name,
                 contact_identifier=r.contact_identifier,
+                email=r.email,
                 intent=r.intent,
                 state=r.state.value,
                 outcome=r.outcome,
@@ -561,6 +565,11 @@ async def erase_lead(
             )
         )
 
+        # Round 5A item 2: the CRM link rows carry the person's email in
+        # plaintext — an erasure that leaves them behind is not an erasure.
+        from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
+
+        links_deleted = await delete_links_for_lead(s, admin_id=subject.admin_id, lead=lead)
         await s.delete(lead)
         await audit.emit(
             s,
@@ -575,6 +584,7 @@ async def erase_lead(
                 "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
                 "transcripts_deleted": len(session_rows),
                 "summaries_deleted": True,
+                "crm_links_deleted": links_deleted,
             },
         )
     response.status_code = 204
@@ -599,6 +609,9 @@ async def prune_leads(
             if lead is None:
                 continue  # idempotent — already gone.
             instance_id = lead.instance_id
+            from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
+
+            links_deleted = await delete_links_for_lead(s, admin_id=subject.admin_id, lead=lead)
             await s.delete(lead)
             await audit.emit(
                 s,
@@ -607,7 +620,10 @@ async def prune_leads(
                 event_type="lead_pruned",
                 actor_type=ActorType.admin_user,
                 actor_user_id=subject.user_id,
-                payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
+                payload={
+                    "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                    "crm_links_deleted": links_deleted,
+                },
             )
     response.status_code = 204
     return response
@@ -633,6 +649,7 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
             lead_id=lead.id,
             name=lead.name,
             contact_identifier=lead.contact_identifier,
+            email=lead.email,
             intent=lead.intent,
             state=lead.state.value,
             outcome=lead.outcome,
@@ -669,10 +686,37 @@ async def mark_lead_outcome(
             },
         )
         await s.flush()
+        # Round 5A item 3: the outcome is the most commercially meaningful fact a
+        # tenant maintains, and it never reached their CRM — the deterministic
+        # push now carries it through the SAME broker gates a capture push uses
+        # (disabled tool / disconnected / dormant → quiet trace-recorded no-op).
+        # session_id=None: a dashboard action is not a conversation; the trace
+        # column is nullable for exactly this. A push failure never fails the
+        # outcome save — the lead record here is already the source of truth.
+        from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+        from app.runtime.lead_capture import CaptureResult, crm_lead_key  # noqa: PLC0415
+        from app.tools.registry import make_tool_resolver  # noqa: PLC0415
+
+        try:
+            await push_captured_lead(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=lead.instance_id,
+                captured=CaptureResult(
+                    lead_id=lead.id, changed={"outcome": body.outcome}, lead_key=crm_lead_key(lead)
+                ),
+                lead_key=crm_lead_key(lead),
+                snapshot_tool_ids=None,
+                tool_resolver=make_tool_resolver(),
+                session_id=None,
+            )
+        except Exception:  # noqa: BLE001 — the outcome save must never fail on a push
+            logger.exception("lead_outcome_crm_push_failed")
         return LeadOut(
             lead_id=lead.id,
             name=lead.name,
             contact_identifier=lead.contact_identifier,
+            email=lead.email,
             intent=lead.intent,
             state=lead.state.value,
             outcome=lead.outcome,

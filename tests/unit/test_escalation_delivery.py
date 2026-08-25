@@ -9,12 +9,14 @@ the audit log instead of dropping the escalation on the floor.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from app.connections.secrets import secret_ref_for
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.connection import InstanceConnection
+from app.models.email_incident import EmailDeliveryIncident
 from app.models.instance import Account, AccountState, Instance
 from app.models.lead import Lead
 from app.notifications import email_notifier, sms_notifier
@@ -30,7 +32,7 @@ class FakeEmailSender:
     def __init__(self) -> None:
         self.sent: list[dict[str, str | None]] = []
 
-    async def send(self, *, to, subject, body_text, from_address=None):
+    async def send(self, *, to, subject, body_text, from_address=None, tags=None):
         self.sent.append(
             {"to": to, "subject": subject, "body": body_text, "from_address": from_address}
         )
@@ -65,10 +67,26 @@ async def _seed_tenant(
     *,
     escalation: dict[str, object],
     sms_number: str | None = None,
+    verified_contacts: tuple[str, ...] = (),
 ) -> uuid.UUID:
-    """One verified account + one Luciel with the given escalation pillar, plus a lead."""
+    """One verified account + one Luciel with the given escalation pillar, plus a lead.
+
+    ``verified_contacts`` marks escalation email addresses as CONFIRMED (round 5B
+    item 13): a delivered-but-unverified contact additionally copies the account
+    owner, so routing tests that pin exact recipient lists seed the confirmation.
+    The unverified-copy behavior itself is pinned in
+    ``tests/contract/test_escalation_contact_reliability.py``.
+    """
     lead_id = uuid.uuid4()
     async with tenant_session(admin_id) as s:
+        for address in verified_contacts:
+            s.add(
+                EmailDeliveryIncident(
+                    admin_id=admin_id,
+                    email_lower=address.strip().lower(),
+                    verified_at=datetime.now(UTC),
+                )
+            )
         s.add(
             Account(
                 id=admin_id,
@@ -160,7 +178,10 @@ async def test_escalation_notifies_the_primary_contact(senders):
     email_fake, _ = senders
     admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
     lead_id = await _seed_tenant(
-        admin_id, instance_id, escalation={"primaryEmail": "sales@acme.example"}
+        admin_id,
+        instance_id,
+        escalation={"primaryEmail": "sales@acme.example"},
+        verified_contacts=("sales@acme.example",),
     )
 
     rows = await _fire(admin_id, instance_id, lead_id)
@@ -248,6 +269,7 @@ async def test_secondary_contact_takes_over_when_the_primary_send_fails(senders)
             "primaryEmail": "+15550001111",
             "secondaryEmail": "backup@acme.example",
         },
+        verified_contacts=("backup@acme.example",),
     )
 
     rows = await _fire(admin_id, instance_id, lead_id)

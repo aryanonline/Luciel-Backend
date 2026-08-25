@@ -4,8 +4,9 @@ Until the orchestrator called ``load_cross_session_summaries``, the summary stor
 write-only: summaries existed (once finalization ran) but no turn ever read them, so
 "Luciel remembers past conversations" was doctrine without a mechanism. These tests
 pin the injection: prior summaries enter the model context — wrapped as UNTRUSTED
-data (§3.4.14 Defense 2), before this session's history — for a resolved lead on a
-memory-carrying channel, and never for the weak widget identity (§3.4.9 HARD RULE).
+data (§3.4.14 Defense 2), before this session's history — for a resolved lead, and
+never for the widget token alone (§3.4.9 HARD RULE; a lead resolved by an
+in-conversation identifier unlocks memory on the widget too, round 5C item 19).
 """
 
 from __future__ import annotations
@@ -118,15 +119,33 @@ async def test_prior_summaries_are_injected_untrusted_for_a_returning_lead():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_widget_turns_never_receive_cross_session_memory():
-    """HARD RULE §3.4.9: a weak widget token never inherits history — even when a
-    lead id is resolved mid-conversation, the widget channel carries no memory."""
+async def test_widget_turn_with_an_in_session_identity_receives_memory():
+    """Round 5C item 19: §3.4.9 forbids the widget TOKEN inheriting history — a
+    resolved lead on a widget turn was proven by an in-conversation identifier,
+    not by the token, so the lead's own summaries are injected like any channel."""
     admin, iid, lead = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await _seed(admin, iid)
     await _seed_prior_summary(admin, iid, lead, "Intent: patio quote | Turns: 4")
 
     model = CapturingModel()
     await _run_turn(admin, iid, channel="widget", lead_id=lead, model=model)
+
+    assert model.calls
+    joined = " ".join(m["content"] for m in model.calls[0])
+    assert "Prior conversation summaries:" in joined
+    assert "patio quote" in joined
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_widget_token_alone_never_receives_cross_session_memory():
+    """HARD RULE §3.4.9 intact: with no resolved lead, the widget token alone
+    carries nothing — the un-identified visitor never inherits anyone's history."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed(admin, iid)
+    await _seed_prior_summary(admin, iid, uuid.uuid4(), "Intent: patio quote | Turns: 4")
+
+    model = CapturingModel()
+    await _run_turn(admin, iid, channel="widget", lead_id=None, model=model)
 
     assert model.calls
     joined = " ".join(m["content"] for m in model.calls[0])

@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import conflict, not_found
+from app.api.errors import conflict, not_found, validation_error
 from app.api.v1.admin.luciel_invariants import (
     ensure_config_editable,
     validate_channels,
@@ -33,6 +33,7 @@ from app.schemas_api.luciel import (
     ChannelConfigIn,
     CreateLucielRequest,
     LucielOut,
+    ResendContactConfirmationRequest,
     UpdateChannelsRequest,
     UpdateEscalationRequest,
     UpdateLeadRetentionRequest,
@@ -81,7 +82,50 @@ def _merge_live_channel_status(
     ]
 
 
-def _to_out(inst: Instance, *, live_channel_status: dict[str, str] | None = None) -> LucielOut:
+async def _contact_health(
+    s: AsyncSession, admin_id: uuid.UUID, escalation: dict[str, object] | None
+) -> list[dict[str, object]]:
+    """Deliverability truth for the configured email contacts (round 5B #13)."""
+    from app.models.email_incident import is_suppressed, is_verified  # noqa: PLC0415
+    from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
+
+    escalation = escalation or {}
+    addresses = [
+        str(a) for a in (escalation.get("primaryEmail"), escalation.get("secondaryEmail")) if a
+    ]
+    if not addresses:
+        return []
+    states = await states_for(s, admin_id, addresses)
+    out: list[dict[str, object]] = []
+    for address in addresses:
+        row = states.get(address.strip().lower())
+        if is_suppressed(row):
+            state = "bouncing"
+        elif is_verified(row):
+            state = "verified"
+        elif row is not None and row.verification_pending_jti:
+            state = "pending_confirmation"
+        else:
+            state = "unverified"
+        out.append(
+            {
+                "address": address,
+                "state": state,
+                "verifiedAt": row.verified_at.isoformat() if row and row.verified_at else None,
+                "lastBouncedAt": (
+                    row.hard_bounced_at.isoformat() if row and row.hard_bounced_at else None
+                ),
+            }
+        )
+    return out
+
+
+def _to_out(
+    inst: Instance,
+    *,
+    live_channel_status: dict[str, str] | None = None,
+    contact_health: list[dict[str, object]] | None = None,
+) -> LucielOut:
     channels = inst.channels or []
     if live_channel_status:
         channels = _merge_live_channel_status(channels, live_channel_status)
@@ -95,6 +139,7 @@ def _to_out(inst: Instance, *, live_channel_status: dict[str, str] | None = None
             "channels": channels,
             "tools": inst.tools or [],
             "escalation": inst.escalation or {},
+            "escalationContactHealth": contact_health or [],
             "personality": inst.personality or {"preset": "warm_concierge"},
             "leadRetentionDays": inst.lead_retention_days,
             "graceWindowStartedAt": (
@@ -121,7 +166,8 @@ async def get_luciel(subject: Subject = Depends(current_admin)) -> LucielOut | N
         live_status = await gate.channel_connection_statuses(
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
-    return _to_out(inst, live_channel_status=live_status)
+        health = await _contact_health(s, subject.admin_id, inst.escalation)
+    return _to_out(inst, live_channel_status=live_status, contact_health=health)
 
 
 @router.get("/capabilities", response_model=list[CapabilityGroupOut])
@@ -239,7 +285,8 @@ async def _update_config(
             if field == "channels"
             else None
         )
-        return _to_out(inst, live_channel_status=live_status)
+        health = await _contact_health(s, admin_id, inst.escalation)
+        return _to_out(inst, live_channel_status=live_status, contact_health=health)
 
 
 @router.put("/channels", response_model=LucielOut)
@@ -339,6 +386,39 @@ async def update_tools(
     )
 
 
+async def _kick_contact_verification(
+    s: AsyncSession, admin_id: uuid.UUID, addresses: list[str]
+) -> None:
+    """Start the confirm loop for each configured email contact not yet verified
+    (round 5B item 13). Same-transaction with the pillar write; an address
+    already verified (or already pending) is not re-mailed on a re-save."""
+    from app.auth.tokens import mint_link_token  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+    from app.notifications.delivery_incidents import begin_verification, states_for  # noqa: PLC0415
+
+    settings = get_settings()
+    states = await states_for(s, admin_id, addresses)
+    for address in addresses:
+        state = states.get(address.strip().lower())
+        if state is not None and (state.verified_at or state.verification_pending_jti):
+            continue
+        jti = uuid.uuid4().hex
+        token = mint_link_token(
+            admin_id,
+            "escalation_contact",
+            settings.escalation_contact_link_ttl_seconds,
+            jti,
+        )
+        await begin_verification(s, admin_id=admin_id, email=address, jti=jti)
+        await email_dispatcher.send_escalation_contact_confirm(
+            s,
+            admin_id=admin_id,
+            to=address,
+            confirm_url=f"{settings.app_base_url}/escalation-contact/confirm?token={token}",
+        )
+
+
 @router.put("/escalation", response_model=LucielOut)
 async def update_escalation(
     req: UpdateEscalationRequest, subject: Subject = Depends(current_admin)
@@ -351,7 +431,78 @@ async def update_escalation(
     def _build(_: Instance) -> object:
         return req.model_dump(by_alias=True, exclude_none=True)
 
-    return await _update_config(subject.admin_id, subject.user_id, "escalation", _build)
+    async def _after(s: AsyncSession, _inst: Instance) -> None:
+        # Round 5B item 13: saving a contact starts its confirmation loop.
+        await _kick_contact_verification(
+            s,
+            subject.admin_id,
+            [a for a in (req.primary_email, req.secondary_email) if a],
+        )
+
+    return await _update_config(
+        subject.admin_id, subject.user_id, "escalation", _build, after=_after
+    )
+
+
+@router.post("/escalation/resend-confirmation", response_model=LucielOut)
+async def resend_contact_confirmation(
+    req: ResendContactConfirmationRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """Re-send the confirmation link for a currently configured contact (round 5B
+    item 13). Re-minting invalidates the previous link; a 5-minute cooldown keeps
+    this from becoming a send-spam vector."""
+    from datetime import timedelta  # noqa: PLC0415
+
+    from app.auth.tokens import mint_link_token  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+    from app.notifications.delivery_incidents import begin_verification, states_for  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        escalation = inst.escalation or {}
+        configured = {
+            str(a).strip().lower()
+            for a in (escalation.get("primaryEmail"), escalation.get("secondaryEmail"))
+            if a
+        }
+        address = req.address.strip().lower()
+        if address not in configured:
+            raise validation_error(
+                "That address is not currently configured as an escalation contact."
+            )
+        settings = get_settings()
+        states = await states_for(s, subject.admin_id, [address])
+        state = states.get(address)
+        if state is not None and state.verification_sent_at is not None:
+            age = datetime.now(UTC) - state.verification_sent_at
+            if age < timedelta(minutes=5):
+                raise validation_error(
+                    "A confirmation was sent moments ago — give it a few minutes, then retry."
+                )
+        jti = uuid.uuid4().hex
+        token = mint_link_token(
+            subject.admin_id,
+            "escalation_contact",
+            settings.escalation_contact_link_ttl_seconds,
+            jti,
+        )
+        await begin_verification(s, admin_id=subject.admin_id, email=address, jti=jti)
+        await email_dispatcher.send_escalation_contact_confirm(
+            s,
+            admin_id=subject.admin_id,
+            to=address,
+            confirm_url=f"{settings.app_base_url}/escalation-contact/confirm?token={token}",
+        )
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        health = await _contact_health(s, subject.admin_id, inst.escalation)
+        return _to_out(inst, live_channel_status=live_status, contact_health=health)
 
 
 @router.put("/lead-retention", response_model=LucielOut)
@@ -387,6 +538,39 @@ async def update_personality(
         return dumped
 
     return await _update_config(subject.admin_id, subject.user_id, "personality", _build)
+
+
+@router.post("/rotate-embed-key", response_model=LucielOut)
+async def rotate_embed_key(subject: Subject = Depends(current_admin)) -> LucielOut:
+    """Mint a fresh widget embed key (round 5B item 17). A leaked key's only
+    remedy used to be deleting and recreating the whole Luciel. Rotation is
+    IMMEDIATE and breaking on purpose: the old key stops resolving the moment
+    this returns, and every embedded site must update its snippet — the response
+    (and the Embed page) carries the new one. Audited with both key ids (embed
+    keys are public identifiers, not secrets)."""
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        ensure_config_editable(inst)
+        old_key = inst.embed_key_public_id
+        inst.embed_key_public_id = f"vm_live_{uuid.uuid4().hex[:12]}"
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="embed_key_rotated",
+            payload={"old_embed_key": old_key, "new_embed_key": inst.embed_key_public_id},
+        )
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        return _to_out(inst, live_channel_status=live_status)
 
 
 @router.post("/voice-consent", response_model=LucielOut)

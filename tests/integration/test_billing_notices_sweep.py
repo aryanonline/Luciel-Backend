@@ -43,13 +43,13 @@ class _CapturingSender:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str]] = []
 
-    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+    async def send(self, *, to: str, subject: str, body_text: str, tags=None) -> str:
         self.sent.append((to, subject, body_text))
         return f"msg-{len(self.sent)}"
 
 
 class _FailingSender:
-    async def send(self, *, to: str, subject: str, body_text: str) -> str:
+    async def send(self, *, to: str, subject: str, body_text: str, tags=None) -> str:
         raise ConnectionError("smtp down")
 
 

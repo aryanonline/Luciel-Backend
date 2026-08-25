@@ -26,19 +26,14 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
-from app.connections.secrets import SecretStore, get_secret_store
-from app.models.connection import InstanceConnection
+from app.connections.secrets import SecretStore
 
 _GRAPH_BASE = "https://graph.facebook.com/v19.0"
 # Instagram Login tokens are issued by, and only accepted at, Instagram's own Graph host.
 _INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com/v23.0"
-
-#: The key ``exchange_code_for_token`` writes the Graph token under.
-FIELD_ACCESS_TOKEN = "access_token"  # noqa: S105 — field NAME, not a credential  # nosec B105
 
 
 class GraphMetaSender:
@@ -86,10 +81,29 @@ class GraphMetaSender:
         return str(data.get("message_id")) if data.get("message_id") else None
 
 
-async def _channel_auth_row(
-    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
-) -> InstanceConnection | None:
-    return (
+async def load_tenant_meta_token(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    connection_type: str = "channel_auth",
+    store: SecretStore | None = None,
+) -> str | None:
+    """The tenant's Graph access token for this grant, or None if it is not connected.
+
+    Round 5B item 14: refreshed at CALL time when the stored expiry HINT says the
+    token is near/past expiry — this was the one sender reading only the raw
+    stored token, so an expired grant meant dead WhatsApp/Messenger sends until
+    the 6-hourly sweep noticed. A row with NO hint keeps the raw read (legacy
+    rows predate hints; treating absent-as-stale here would force a live
+    fb_exchange round-trip on every send-build, which the sweep, not the send
+    path, owns)."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.connections.secrets import get_secret_store  # noqa: PLC0415
+    from app.models.connection import InstanceConnection  # noqa: PLC0415
+
+    conn = (
         await session.execute(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
@@ -99,22 +113,24 @@ async def _channel_auth_row(
             )
         )
     ).scalar_one_or_none()
-
-
-async def load_tenant_meta_token(
-    session: AsyncSession,
-    admin_id: uuid.UUID,
-    instance_id: uuid.UUID,
-    *,
-    connection_type: str = "channel_auth",
-    store: SecretStore | None = None,
-) -> str | None:
-    """The tenant's Graph access token for this grant, or None if it is not connected."""
-    conn = await _channel_auth_row(session, admin_id, instance_id, connection_type)
     if conn is None or not conn.secret_ref:
         return None
+
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from app.connections.health import REFRESH_LEAD, _expiry_of  # noqa: PLC0415
+
+    expiry = _expiry_of(conn)
+    if expiry is not None and datetime.now(UTC) >= expiry - REFRESH_LEAD:
+        from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+        token = await ensure_fresh_access_token(
+            session, admin_id, instance_id, connection_type=connection_type, store=store
+        )
+        return token or None
+
     material = await (store or get_secret_store()).get(conn.secret_ref) or {}
-    token = material.get(FIELD_ACCESS_TOKEN, "")
+    token = material.get("access_token", "")
     return token or None
 
 

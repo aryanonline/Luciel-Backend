@@ -69,7 +69,13 @@ async def _dispatch(
     message_id: str | None = None
     delivery_status: DeliveryStatus = "recorded"
     try:
-        message_id = await sender.send(to=to, subject=subject, body_text=body)
+        message_id = await sender.send(
+            to=to,
+            subject=subject,
+            body_text=body,
+            # Round 5B item 13: bounce attribution rides every platform send.
+            tags={"vm_admin_id": str(admin_id), "vm_purpose": notice_type},
+        )
         delivery_status = "sent" if not isinstance(sender, NullEmailSender) else "recorded"
     except Exception as exc:  # noqa: BLE001 — never let a delivery error break the flow
         delivery_status = "failed"
@@ -308,6 +314,123 @@ async def send_payg_usage_nudge(
             "kind": "payg_usage_nudge",
             "conversations_this_period": conversations_this_period,
         },
+        sender=sender,
+    )
+
+
+async def send_escalation_contact_confirm(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    confirm_url: str,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Escalation-contact confirmation link (round 5B item 13).
+
+    Hot-lead notifications go to this address; until it is confirmed the owner's
+    account email is copied on every escalation, so a typo cannot black-hole a
+    lead. Clicking proves the mailbox both delivers and is wanted."""
+    body = (
+        "This address is set as an escalation contact for a VantageMind Luciel — the "
+        "AI assistant will send its hand-off alerts (a customer asking for a person, "
+        "a high-value lead) here.\n\n"
+        f"Please confirm you can receive these: {confirm_url}\n\n"
+        "Until confirmed, alerts are also copied to the account owner's email. If you "
+        "didn't expect this, you can ignore it — nothing else changes."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Confirm this escalation contact for your Luciel",
+        body=body,
+        notice_type="escalation_contact_confirm",
+        audit_event="escalation_contact_verification_sent",
+        extra_payload={"recipient": to},
+        sender=sender,
+    )
+
+
+async def send_deferred_abandon_notice(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    action_type: str,
+    conversation_ref: str | None,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Owner email for an ABANDONED deferred item (§3.8.7 rule D — round 5B #13).
+
+    The abandon used to be audit-only (flagged in the queue's own docstring):
+    "abandoned WITH an owner notification" was a promise the audit page kept and
+    the inbox did not. Escalation retries get the hot-lead wording."""
+    if action_type == "escalation_retry":
+        ref = f" (conversation #{conversation_ref})" if conversation_ref else ""
+        body = (
+            "VantageMind could not deliver an escalation alert after retrying for 24 "
+            f"hours, and has stopped retrying{ref}.\n\n"
+            "You may have missed a hot lead — please open the conversation in your "
+            "dashboard and check your escalation contact on the Configure page."
+        )
+        subject = "A Luciel escalation alert could not be delivered"
+    else:
+        body = (
+            "Luciel queued a follow-up action that could not be completed after "
+            "retrying for 24 hours, and has stopped retrying.\n\n"
+            "The details are in your dashboard's audit log; the related connection "
+            "may need attention on the Configure page."
+        )
+        subject = "A queued Luciel follow-up was abandoned"
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="deferred_abandon",
+        audit_event="deferred_abandon_emailed",
+        extra_payload={"action_type": action_type},
+        sender=sender,
+    )
+
+
+async def send_card_expiry_notice(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    notice_id: str,
+    exp_month: int,
+    exp_year: int,
+    last4: str | None,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Proactive card-expiry heads-up (round 5B item 17).
+
+    The expiry was stored and displayed but never compared to the clock — the
+    first DECLINED charge was the detector, which put the account into dunning
+    over a fully predictable event. Sent once per (card, expiry month) by the
+    daily billing_notices sweep; nothing changes automatically."""
+    card = f"card ending {last4}" if last4 else "payment card"
+    body = (
+        "A quick heads-up from VantageMind.\n\n"
+        f"The {card} on your account expires {exp_month:02d}/{exp_year}. Updating it "
+        "before then keeps pay-as-you-go billing uninterrupted — an expired card's "
+        "first failed charge would start the normal 7-day retry window.\n\n"
+        "You can update your payment method any time from the Billing page of your "
+        "dashboard. Nothing changes automatically."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Your payment card is expiring soon",
+        body=body,
+        notice_type="card_expiry_notice",
+        audit_event="billing_notice_sent",
+        extra_payload={"notice_id": notice_id, "kind": "card_expiry_notice"},
         sender=sender,
     )
 

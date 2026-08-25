@@ -98,6 +98,11 @@ class AnalyticsOverviewOut(WireModel):
     # escalation history, which would be empty for a brand-new account with zero fired
     # escalations yet and wrongly imply nothing needs configuring.
     escalation_contact_configured: bool
+    # Round 5B item 13: True when a CONFIGURED escalation email contact is
+    # currently suppressed (hard bounce / complaint, unresolved by a
+    # re-confirmation) — the FE banner "your escalation contact is bouncing"
+    # reads this. Escalations meanwhile fall back to the account owner's email.
+    escalation_contact_bouncing: bool = False
 
 
 class AuditEventOut(WireModel):

@@ -24,12 +24,30 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
+from app.models.audit import ActorType
 from app.models.conversation import Session
 from app.models.lead import Lead, LeadState
+
+
+def crm_lead_key(lead: Lead) -> str | None:
+    """The email key the CRM push dedupes on (§3.3.6, round 5A item 5).
+
+    Prefers the volunteered ``email`` column (a phone-keyed SMS/voice lead who
+    later shared an address), falls back to an email-shaped
+    ``contact_identifier``. None means the lead has no CRM-usable key yet — the
+    push honestly declines rather than keying a CRM record on a phone number."""
+    if lead.email and "@" in lead.email:
+        return lead.email
+    if lead.contact_identifier and "@" in lead.contact_identifier:
+        return lead.contact_identifier
+    return None
+
 
 # --- signal extraction (deterministic; production extractor binds here) ------ #
 
@@ -172,6 +190,12 @@ class CaptureResult:
     lead_id: uuid.UUID
     changed: dict[str, str]
     lead_key: str | None = None
+    # Snapshot of the record's owner-facing facts (round 5C item 6): what the
+    # runtime injects as lead context so Luciel stops re-asking a name it has on
+    # file. NEVER contact identifiers — a matching identifier never authorizes
+    # PII readback (§3.4.9).
+    known_name: str | None = None
+    known_intent: str | None = None
 
 
 async def capture_or_update_lead(
@@ -222,9 +246,77 @@ async def capture_or_update_lead(
             )
         ).scalar_one_or_none()
         if lead is not None:
+            # Round 5A item 7: a volunteered identifier that belongs to a
+            # DIFFERENT existing row proves two records are one person — unify
+            # instead of maintaining a duplicate. Exact-equality only (emails
+            # case-folded); the older row survives; the turn continues against
+            # the survivor.
+            volunteered = signals.strong_identifier
+            if volunteered:
+                folded = volunteered.strip().lower()
+                own = {
+                    (lead.contact_identifier or "").strip().lower(),
+                    (lead.email or "").strip().lower(),
+                }
+                if folded not in own:
+                    match_conditions = [Lead.contact_identifier == volunteered]
+                    if "@" in volunteered:
+                        match_conditions = [
+                            func.lower(Lead.contact_identifier) == folded,
+                            Lead.email == folded,
+                        ]
+                    other = (
+                        (
+                            await session.execute(
+                                select(Lead)
+                                .where(
+                                    Lead.admin_id == admin_id,
+                                    Lead.instance_id == instance_id,
+                                    Lead.id != lead.id,
+                                    or_(*match_conditions),
+                                )
+                                .order_by(Lead.created_at.asc(), Lead.id.asc())
+                                .limit(1)
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if other is not None:
+                        keep, absorb = (
+                            (other, lead) if other.created_at <= lead.created_at else (lead, other)
+                        )
+                        gained = await _unify_leads(
+                            session, admin_id=admin_id, keep=keep, absorb=absorb
+                        )
+                        sess.resolved_lead_id = keep.id
+                        lead = keep
+                        changed = _apply_signals(lead, signals, inbound_text, score)
+                        changed.update(gained)
+                        lead.last_activity_at = datetime.now(UTC)
+                        await _reactivate_if_archived(session, lead)
+                        await session.flush()
+                        return CaptureResult(
+                            lead_id=lead.id,
+                            changed=changed,
+                            lead_key=crm_lead_key(lead),
+                            known_name=lead.name,
+                            known_intent=lead.intent,
+                        )
             changed = _apply_signals(lead, signals, inbound_text, score)
+            # Item 4: activity is a WRITE, not an inference — auto-prune measures
+            # inactivity against this, and it was never written before (a lead
+            # conversing for months read as stale as their creation date).
+            lead.last_activity_at = datetime.now(UTC)
+            await _reactivate_if_archived(session, lead)
             await session.flush()
-            return CaptureResult(lead_id=lead.id, changed=changed, lead_key=lead.contact_identifier)
+            return CaptureResult(
+                lead_id=lead.id,
+                changed=changed,
+                lead_key=crm_lead_key(lead),
+                known_name=lead.name,
+                known_intent=lead.intent,
+            )
 
     # Identity IS capture on strong channels (live-caught 2026-08-18): a voice
     # caller's E.164 was DISCARDED because no intent keyword fired, and the
@@ -242,22 +334,50 @@ async def capture_or_update_lead(
         return None
 
     # Upsert on the stable contact key (update-in-place, never duplicate).
+    # Round 5A item 7: an email key also matches a lead that knows that email
+    # under EITHER column, case-folded — the returning visitor typing the same
+    # address resolves to their existing record instead of duplicating it.
+    # order_by replaces scalar_one_or_none's implicit uniqueness assumption:
+    # the oldest row wins, deterministically (pre-existing duplicates absorb
+    # lazily via the bound-branch unification).
+    conditions = [Lead.contact_identifier == contact_key]
+    if "@" in contact_key:
+        folded = contact_key.strip().lower()
+        conditions = [func.lower(Lead.contact_identifier) == folded, Lead.email == folded]
     existing = (
-        await session.execute(
-            select(Lead).where(
-                Lead.admin_id == admin_id,
-                Lead.instance_id == instance_id,
-                Lead.contact_identifier == contact_key,
+        (
+            await session.execute(
+                select(Lead)
+                .where(
+                    Lead.admin_id == admin_id,
+                    Lead.instance_id == instance_id,
+                    or_(*conditions),
+                )
+                .order_by(Lead.created_at.asc(), Lead.id.asc())
+                .limit(1)
             )
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
 
     if existing is not None:
         changed = _apply_signals(existing, signals, inbound_text, score)
+        existing.last_activity_at = datetime.now(UTC)  # item 4: real inactivity
+        await _reactivate_if_archived(session, existing)
         lead_id = existing.id
-        lead_key = existing.contact_identifier
+        lead_key = crm_lead_key(existing)
+        known_name, known_intent = existing.name, existing.intent
     else:
         intent = _summarize_intent(inbound_text) if signals.is_qualified else None
+        # Item 5: a phone/transport-keyed capture that ALSO volunteered an email
+        # stores it (normalized lower-case, matching participant-key folding) —
+        # the CRM key exists from the very first turn.
+        volunteered_email = (
+            signals.email.strip().lower()
+            if signals.email and signals.email.strip().lower() != contact_key.strip().lower()
+            else None
+        )
         lead = Lead(
             id=uuid.uuid4(),
             admin_id=admin_id,
@@ -267,6 +387,7 @@ async def capture_or_update_lead(
             # push LastName "Unknown" — #5d).
             name=signals.name,
             contact_identifier=contact_key,
+            email=volunteered_email,
             # Intent only when the turn actually SIGNALED one: an identity-only
             # capture ("No its alright thankyou" from a known number) must not
             # store a pleasantry as the lead's recorded want.
@@ -276,8 +397,11 @@ async def capture_or_update_lead(
         )
         session.add(lead)
         lead_id = lead.id
-        lead_key = contact_key
+        lead_key = crm_lead_key(lead)
+        known_name, known_intent = lead.name, lead.intent
         changed = {"contact": contact_key}
+        if volunteered_email:
+            changed["email"] = volunteered_email
         if signals.name:
             changed["name"] = signals.name
         if intent:
@@ -289,7 +413,135 @@ async def capture_or_update_lead(
     # (strong identities only) resolve against it going forward (§3.4.9).
     sess.resolved_lead_id = lead_id
     await session.flush()
-    return CaptureResult(lead_id=lead_id, changed=changed, lead_key=lead_key)
+    return CaptureResult(
+        lead_id=lead_id,
+        changed=changed,
+        lead_key=lead_key,
+        known_name=known_name,
+        known_intent=known_intent,
+    )
+
+
+_OUTCOME_RANK = {"in_progress": 0, "lost": 1, "converted": 2}
+
+
+async def _unify_leads(
+    session: AsyncSession, *, admin_id: uuid.UUID, keep: Lead, absorb: Lead
+) -> dict[str, str]:
+    """Merge two rows proven to be the same person (round 5A item 7).
+
+    Trigger: exact identifier equality (emails case-folded) discovered at
+    capture time — the same visitor returning under a second identity used to
+    become a duplicate Lead AND a duplicate CRM record with no way back.
+    Survivor = the older row. The loser is hard-deleted (there is no tombstone
+    state for leads — mirrors "prune is not a state") after every
+    resolved_lead_id carrier re-points. Scope boundary: any CRM-side duplicate
+    the loser created is NOT merged there — §3.3.6 is one-way; future pushes
+    maintain the survivor's record only. Returns the facts the survivor gained
+    (they ride the turn's CRM push)."""
+    from app.models.conversation import EscalationEvent, SessionSummary  # noqa: PLC0415
+    from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
+    from app.models.deferred import DeferredAction  # noqa: PLC0415
+
+    gained: dict[str, str] = {}
+    if keep.name is None and absorb.name:
+        keep.name = absorb.name
+        gained["name"] = absorb.name
+    if keep.email is None and absorb.email:
+        keep.email = absorb.email
+        gained["email"] = absorb.email
+    if keep.contact_identifier is None and absorb.contact_identifier:
+        keep.contact_identifier = absorb.contact_identifier
+        gained["contact"] = absorb.contact_identifier
+    if absorb.intent and (keep.intent is None or absorb.last_activity_at > keep.last_activity_at):
+        if absorb.intent != keep.intent:
+            keep.intent = absorb.intent
+            gained["intent"] = absorb.intent
+    if absorb.lead_score is not None and (
+        keep.lead_score is None or absorb.lead_score > keep.lead_score
+    ):
+        keep.lead_score = absorb.lead_score
+    # An opt-out on EITHER identity must survive (§3.3.5 callback safety).
+    keep.opted_out = keep.opted_out or absorb.opted_out
+    if LeadState.active in (keep.state, absorb.state):
+        keep.state = LeadState.active
+    if _OUTCOME_RANK.get(absorb.outcome, 0) > _OUTCOME_RANK.get(keep.outcome, 0):
+        keep.outcome = absorb.outcome
+    keep.last_activity_at = max(keep.last_activity_at, absorb.last_activity_at)
+
+    # Re-point every resolved_lead_id carrier before the loser row goes.
+    for model in (Session, SessionSummary, EscalationEvent, DeferredAction):
+        await session.execute(
+            update(model)
+            .where(model.admin_id == admin_id, model.resolved_lead_id == absorb.id)
+            .values(resolved_lead_id=keep.id)
+        )
+    # CRM links: re-point the loser's rows unless the survivor already holds a
+    # link for that provider — then the loser's is the duplicate, delete it.
+    absorb_links = (
+        (
+            await session.execute(
+                select(CrmLeadLink).where(
+                    CrmLeadLink.admin_id == admin_id, CrmLeadLink.lead_id == absorb.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for link in absorb_links:
+        survivor_has = (
+            await session.execute(
+                select(CrmLeadLink.id).where(
+                    CrmLeadLink.admin_id == admin_id,
+                    CrmLeadLink.instance_id == link.instance_id,
+                    CrmLeadLink.provider == link.provider,
+                    CrmLeadLink.lead_id == keep.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if survivor_has is not None:
+            await session.delete(link)
+        else:
+            link.lead_id = keep.id
+
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=keep.instance_id,
+        actor_type=ActorType.luciel_runtime,
+        event_type="lead_merged",
+        payload={
+            "surviving_lead_id_hash": audit.hash_lead_id(keep.id),
+            "merged_lead_id_hash": audit.hash_lead_id(absorb.id),
+            "reason": "identifier_match",
+        },
+    )
+    await session.delete(absorb)
+    await session.flush()
+    return gained
+
+
+async def _reactivate_if_archived(session: AsyncSession, lead: Lead) -> None:
+    """Archived → active on inbound contact (§3.4.10a, round 5C item 6).
+
+    The Journey promises a returning archived lead is "recognized and history
+    restored". The sessions-module reactivation hook only ran when a caller
+    passed a resolved_lead_id at session-open — which no live channel path does
+    (leads resolve INSIDE the turn, here) — so reactivation was dead code in
+    production and an archived lead kept conversing while reading archived in
+    the dashboard."""
+    if lead.state != LeadState.archived:
+        return
+    lead.state = LeadState.active
+    await audit.emit(
+        session,
+        admin_id=lead.admin_id,
+        instance_id=lead.instance_id,
+        actor_type=ActorType.platform,
+        event_type="lead_reactivated",
+        payload={"lead_id": str(lead.id)},
+    )
 
 
 def _apply_signals(
@@ -307,6 +559,28 @@ def _apply_signals(
     if lead.name is None and signals.name:
         lead.name = signals.name
         changed["name"] = signals.name
+    # Item 5: a phone-keyed lead volunteering an email finally gets it STORED —
+    # it used to be discarded entirely (contact_identifier was already set and
+    # nothing else had a home for it). Fill-when-absent: the first volunteered
+    # address is the CRM dedupe key from then on; a later different address is a
+    # correction a human should make, not a silent rekey.
+    incoming_email = signals.email.strip().lower() if signals.email else None
+    if (
+        lead.email is None
+        and incoming_email
+        and incoming_email != (lead.contact_identifier or "").strip().lower()
+    ):
+        lead.email = incoming_email
+        changed["email"] = incoming_email
+        # This is the first moment a phone-keyed lead CAN reach the CRM (the
+        # push refuses non-email keys), so the record's known facts ride along —
+        # otherwise the created CRM record would carry nothing but the key.
+        if lead.name:
+            changed.setdefault("name", lead.name)
+        if lead.intent:
+            changed.setdefault("intent", lead.intent)
+        if lead.contact_identifier and "@" not in lead.contact_identifier:
+            changed.setdefault("phone", lead.contact_identifier)
     # Keep the most recent qualified intent as the working intent line.
     if signals.has_intent or signals.has_budget:
         intent = _summarize_intent(inbound_text)

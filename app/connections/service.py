@@ -263,6 +263,16 @@ async def start_connection(
         return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
     existing = await _single_active(session, admin_id, instance_id, connection_type)
+    if existing is not None and existing.status == "dormant":
+        # Round 5B item 16: dormant is BILLING-suspended (Legal §A3) — only the
+        # payment webhooks may leave it. Reusing the row here reset it to
+        # unconfigured, so a non-paying tenant could click Connect, redo the
+        # consent, and re-arm their action tools around the suspension.
+        raise DormantConnection(
+            "This connection is paused because your account is on the free "
+            "allowance. Add a payment method to restore it — your saved "
+            "configuration comes back as it was, no re-setup."
+        )
     if existing is not None:
         existing.provider = provider
         existing.auth_class = auth_class
@@ -301,6 +311,14 @@ async def start_connection(
         },
     )
     return connection, _start_result(auth_class, connection, admin_id=admin_id)
+
+
+class DormantConnection(ValueError):
+    """A billing-dormant row cannot be re-armed via Connect (round 5B item 16).
+
+    Dormancy is the payment layer's suspension (Legal §A3): credentials are
+    retained and restore automatically when a valid payment method returns —
+    the connect flow must not offer a side door around it."""
 
 
 class CredentialRejected(ValueError):
@@ -477,6 +495,14 @@ async def submit_credentials(
         connection.status_detail = _SMS_NEEDS_NUMBER
     elif number_pending:
         pass  # keep the not-operable status + guidance the attach wrote
+    elif is_sms:
+        # Round 5B item 10: a credential (re)submit on a confirmed number must
+        # not blanket-promote past the carrier-registration gate — connected iff
+        # the owner has attested, else honestly pending (this side-door used to
+        # be one of the ways an unregistered sender ended up texting-enabled).
+        from app.channels.phone_lifecycle import status_for_confirmed_number  # noqa: PLC0415
+
+        connection.status, connection.status_detail = status_for_confirmed_number(dict(cfg_now))
     else:
         connection.status = "connected"
         connection.status_detail = None
@@ -724,8 +750,22 @@ async def confirm_reconnect(
                 connection.connection_type, str(pending_provider)
             )
         connection.non_secret_config = config
-        connection.status = "connected"
-        connection.status_detail = None
+        if connection.connection_type == "sms_sender":
+            # Round 5B item 10: an sms row never blanket-promotes past the
+            # carrier-registration gate — connected iff attested; no destination
+            # yet means the honest "add your number" state.
+            from app.channels.phone_lifecycle import (  # noqa: PLC0415
+                status_for_confirmed_number,
+            )
+
+            if config.get("destination"):
+                connection.status, connection.status_detail = status_for_confirmed_number(config)
+            else:
+                connection.status = "unconfigured"
+                connection.status_detail = _SMS_NEEDS_NUMBER
+        else:
+            connection.status = "connected"
+            connection.status_detail = None
         await session.flush()
         await audit.emit(
             session,
@@ -737,11 +777,11 @@ async def confirm_reconnect(
             payload={
                 "connection_id": str(connection.connection_id),
                 "old_status": prior_status,
-                "new_status": "connected",
+                "new_status": connection.status,
                 "reason": "reconnect_confirmed",
             },
         )
-        return True, "connected"
+        return True, connection.status
     else:
         # Health check failed — keep the prior connection live (Decision §45 rule B).
         # The staged pending_provider is simply discarded here; `connection.provider`
@@ -1051,6 +1091,38 @@ async def disconnect(
             "deleted": deleted,
         },
     )
+    # Round 5A item 9: a CRM disconnect clears the instance's link rows. The
+    # credential is destroyed and nothing stored identifies WHICH account it was
+    # (no portal id; instance_url is unread at reconnect), so a later reconnect
+    # may be a different account — stale record ids would then 404 and silently
+    # heal into duplicate records there. A fresh connect relinks by the
+    # documented search-by-email step. Clearing ALL providers' rows also removes
+    # leftovers from earlier provider switches.
+    if connection.connection_type == "crm":
+        from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+        from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
+
+        cleared_result = await session.execute(
+            sa_delete(CrmLeadLink).where(
+                CrmLeadLink.admin_id == admin_id,
+                CrmLeadLink.instance_id == connection.instance_id,
+            )
+        )
+        cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=connection.instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="crm_links_cleared",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "provider": connection.provider,
+                "count": cleared_count,
+            },
+        )
     return {
         "connection": connection,
         "secret_deleted": deleted,

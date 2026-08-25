@@ -90,6 +90,12 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # tenant (forgery signal, number suffix only — never the token).
         "webhook_capability_provisioned",
         "inbound_capability_rejected",
+        # Round 5B item 10: the owner's audited attestation that their A2P 10DLC
+        # carrier registration is approved (or inapplicable) — the honest exit
+        # from pending_carrier_registration, since the A2P status API is
+        # unreachable with the deployment's auth. Payload: connection_id, the
+        # attested number, and who attested — never credential material.
+        "carrier_registration_attested",
         # §3.8.5 (Phase 6.6): the health worker emailed the owner because a
         # connection transitioned into expired/error. Payload carries the
         # delivery outcome, never credential material.
@@ -102,6 +108,31 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "lead_pruned",
         "lead_archived",
         "lead_reactivated",
+        # Round 5C item 8: an inbound STOP/START keyword changed the lead's
+        # recorded consent state (Lead.opted_out — the callback dispatcher's
+        # gate). Payload: channel + keyword + the new state; no PII.
+        "lead_opt_out_recorded",
+        # Round 5A item 9: a CRM disconnect cleared the instance's crm_lead_links
+        # rows (stale record ids from a possibly-different account would silently
+        # 404-heal into duplicates on reconnect). Payload: connection, provider,
+        # count — never lead PII.
+        "crm_links_cleared",
+        # Round 5A item 7: two lead rows proved to be the same person (exact
+        # identifier match) and were unified. Hashed ids only (§3.4.11).
+        "lead_merged",
+        # Round 5B item 17: the owner minted a fresh widget embed key (a leaked
+        # key's remedy used to be delete-and-recreate). Keys are public
+        # identifiers, so both ride the payload.
+        "embed_key_rotated",
+        # Round 5B item 13 — escalation-contact reliability. bounced: an SES
+        # bounce/complaint event was recorded against a configured contact;
+        # verification_sent/verified: the confirm-loop's two ends;
+        # deferred_abandon_emailed: the owner was emailed about an abandoned
+        # deferred item (the audit-only gap the module docstring flagged).
+        "email_contact_bounced",
+        "escalation_contact_verification_sent",
+        "escalation_contact_verified",
+        "deferred_abandon_emailed",
         # Admin marked a lead's business outcome (Vision §7 conversion; C14).
         "lead_outcome_marked",
         "lifecycle_notice_sent",

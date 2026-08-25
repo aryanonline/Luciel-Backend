@@ -55,7 +55,11 @@ async def test_cross_session_summaries_empty_without_resolved_lead():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_cross_session_summaries_empty_for_weak_widget_channel():
+async def test_widget_summaries_load_only_behind_a_resolved_lead():
+    """Round 5C item 19: the widget stays a WEAK channel for session identity
+    (§3.4.9 — a widget token alone never inherits history), but a resolved lead
+    on a widget turn was proven by an in-conversation identifier, and THAT proof
+    is what unlocks the lead's prior summaries — same bar as a strong channel."""
     admin, iid, lead = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
         await memory.persist_summary(
@@ -66,12 +70,17 @@ async def test_cross_session_summaries_empty_for_weak_widget_channel():
             resolved_lead_id=lead,
             summary="prior chat",
         )
-        # Even with a resolved lead, the WIDGET channel cannot carry memory (§3.4.9).
+        # In-session identity proof (a resolved lead) carries the memory.
         out = await memory.load_cross_session_summaries(
             s, admin_id=admin, instance_id=iid, channel="widget", resolved_lead_id=lead
         )
-        assert out == []
-        # A strong channel (email) for the same lead does carry it.
+        assert out == ["prior chat"]
+        # The widget token alone (no resolved lead) still carries NOTHING.
+        anonymous = await memory.load_cross_session_summaries(
+            s, admin_id=admin, instance_id=iid, channel="widget", resolved_lead_id=None
+        )
+        assert anonymous == []
+        # A strong channel (email) for the same lead carries it as before.
         strong = await memory.load_cross_session_summaries(
             s, admin_id=admin, instance_id=iid, channel="email", resolved_lead_id=lead
         )

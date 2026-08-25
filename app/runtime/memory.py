@@ -90,8 +90,17 @@ async def load_cross_session_summaries(
     """
     if resolved_lead_id is None:
         return []
-    # HARD RULE §3.4.9: only strong / platform-scoped-strong identifiers carry memory.
-    if not can_carry_cross_session_memory(channel):
+    # HARD RULE §3.4.9: memory attaches only to a proven identity. On strong /
+    # platform-scoped-strong channels the transport identifier IS the proof. On
+    # the weak widget (round 5C item 19) a session carries resolved_lead_id ONLY
+    # when the visitor volunteered a strong identifier IN THIS SESSION (weak
+    # tokens never inherit a binding across sessions — sessions resume by id
+    # alone, and capture binds only on a volunteered email/phone), so a resolved
+    # lead here is the same in-conversation proof, and the returning visitor who
+    # re-states their email gets their continuity instead of a blank slate. A
+    # matching identifier still never authorizes PII READBACK — that rule lives
+    # in the prompt/readback layer, not here.
+    if not can_carry_cross_session_memory(channel) and channel != "widget":
         return []
     now = now or datetime.now(UTC)
     window_start = now - CROSS_SESSION_SUMMARY_WINDOW

@@ -30,6 +30,13 @@ class Lead(Base, TenantMixin, TimestampMixin):
     instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     contact_identifier: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Round 5A item 5 (migration 0052): the lead's volunteered email when the
+    # TRANSPORT key is a phone/meta id. An SMS caller who later says "email me at
+    # jane@…" used to have that email silently DISCARDED (contact_identifier was
+    # already set and nothing else stored it) — with it, the CRM push gains its
+    # email dedupe key and a phone-keyed lead finally reaches the tenant's CRM.
+    # NULL when unknown or when contact_identifier already IS the email.
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     intent: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Normalized high-value-lead score at capture time (§3.4.5); nullable when a lead
     # was captured without a scored high-value signal.

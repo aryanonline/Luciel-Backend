@@ -283,6 +283,33 @@ async def ensure_capability_token(
     return token, True
 
 
+async def rotate_capability_token(
+    conn: InstanceConnection,
+    *,
+    store: SecretStore | None = None,
+) -> str | None:
+    """Force-mint a NEW webhook capability token (round 5B item 17).
+
+    The token rides the registered webhook URLs, which are visible in the
+    customer's own Twilio console and request logs — a leak's only remedy used
+    to be disconnect + reconnect. Only meaningful for capability-path tenants
+    (no Account Auth Token in the material); signature-path tenants get None.
+    The caller must re-apply the webhook URLs afterwards or inbound dies on the
+    old token."""
+    import secrets as pysecrets  # noqa: PLC0415
+
+    if not conn.secret_ref:
+        return None
+    backing = store or get_secret_store()
+    material = await backing.get(conn.secret_ref)
+    if material is None or material.get(FIELD_AUTH_TOKEN):
+        return None
+    token = pysecrets.token_urlsafe(32)
+    material[FIELD_CAPABILITY_TOKEN] = token
+    await backing.put(conn.secret_ref, material)
+    return token
+
+
 async def build_tenant_operability_probe(
     session: AsyncSession,
     admin_id: uuid.UUID,

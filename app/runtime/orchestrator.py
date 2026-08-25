@@ -66,7 +66,13 @@ from app.notifications.escalation_dispatch import (
 )
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
-from app.runtime.escalation import EscalationDecision, Signal, evaluate_intake, evaluate_outcome
+from app.runtime.escalation import (
+    EscalationDecision,
+    Signal,
+    evaluate_intake,
+    evaluate_outcome,
+    is_repeated_question,
+)
 from app.runtime.grounding import faithful_readback_ok, score_grounding
 from app.runtime.input_safety import (
     build_system_prompt,
@@ -419,6 +425,7 @@ class Orchestrator:
                 select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
             )
         ).scalar_one_or_none()
+        lead_context: str | None = None
         if sess_obj is not None:
             captured = await capture_or_update_lead(
                 self.session,
@@ -431,6 +438,17 @@ class Orchestrator:
             )
             if captured is not None:
                 resolved_lead_id = captured.lead_id
+                # Round 5C item 6: the record's owner-facing facts ride into the
+                # prompt as untrusted DATA (pure facts, no in-band instructions,
+                # no contact identifiers — §3.4.9) so Luciel stops re-asking a
+                # name it has on file.
+                facts = []
+                if captured.known_name:
+                    facts.append(f"name: {captured.known_name}")
+                if captured.known_intent:
+                    facts.append(f"interest: {captured.known_intent}")
+                if facts:
+                    lead_context = "Lead record on file — " + "; ".join(facts)
                 # Deterministic CRM push-on-capture (Phase 6.5): a fact that
                 # actually changed goes to the tenant's CRM through the SAME
                 # broker gates a model-proposed push would face — the Journey's
@@ -586,6 +604,7 @@ class Orchestrator:
             wrapped_chunks,
             resolved_lead_id=resolved_lead_id,
             prior_summaries=prior_summaries,
+            lead_context=lead_context,
             system_prompt=system_prompt,
             tool_defs=tool_defs,
             session_id=session_id,
@@ -650,6 +669,14 @@ class Orchestrator:
             r.outcome in (tool_contract.Outcome.missing_input, tool_contract.Outcome.ambiguous)
             for _, r in resp.dispatched
         )
+        # Round 5C item 18: a model that re-asks in PROSE (no tool proposed, so no
+        # broker rejection) is the same stall — the bound must count it or
+        # "repeated re-asking" (§3.3.7's prohibited failure mode) is unbounded.
+        # Deterministic: this reply's last question near-matches the previous
+        # luciel reply's last question. Distinct gather questions never match.
+        if not stalled and not resp.dispatched:
+            previous_luciel = next((t.text for t in reversed(history) if t.role == "luciel"), None)
+            stalled = is_repeated_question(resp.text, previous_luciel)
         if sess_obj is not None:
             if stalled:
                 sess_obj.input_ask_attempts += 1
@@ -894,6 +921,7 @@ class Orchestrator:
         *,
         resolved_lead_id: uuid.UUID | None = None,
         prior_summaries: list[str] | None = None,
+        lead_context: str | None = None,
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
@@ -907,6 +935,14 @@ class Orchestrator:
         structured neutral ``tool_result`` turns (payloads, named missing fields,
         candidate lists — §3.3.4), never as bare outcome-class strings."""
         messages: list[dict[str, Any]] = []
+        if lead_context:
+            # Round 5C item 6: the lead's own RECORD (name/interest), so Luciel
+            # stops re-asking facts it has on file ("never re-explains
+            # themselves", Journey §7). Untrusted — it derives from lead-authored
+            # content — and it deliberately carries NO contact identifiers: a
+            # matching identifier never authorizes PII readback (§3.4.9); the
+            # lead must re-state contact details themselves.
+            messages.append({"role": "user", "content": wrap_untrusted(lead_context)})
         if prior_summaries:
             # §3.4.6 cross-session memory, injected BEFORE this session's history.
             # Summaries derive from lead-authored content, so they enter the context

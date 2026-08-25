@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # JWT signing key. In production this is sourced from Secrets Manager and injected
     # as an env var; the default here is a dev-only placeholder, never a real secret.
     jwt_signing_key: str = "dev-only-not-a-secret-rotate-in-prod"  # noqa: S105
+    # Round 5B item 17 — dual-key rotation window: set to the OLD key while
+    # rotating so existing sessions/links/OAuth states verify until their own
+    # TTLs expire; signing always uses the current key. Unset to close the
+    # window. Empty = no window open.
+    jwt_signing_key_previous: str = ""  # noqa: S105 — empty placeholder, not a secret
     jwt_algorithm: str = "HS256"
     session_ttl_seconds: int = 60 * 60 * 12  # short-lived session token
     session_cookie_name: str = "luciel_session"
@@ -176,6 +181,14 @@ class Settings(BaseSettings):
     # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
     # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).
     platform_email_sender: str = ""
+    # Round 5B item 13 — SES configuration set routing bounce/complaint events to
+    # SNS, and the topic the events webhook pins its subscriptions to. Empty =
+    # the pipeline is off (mock/CI); deployed envs set both via the platform
+    # secret / task env (SES_CONFIGURATION_SET / SES_EVENTS_TOPIC_ARN).
+    ses_configuration_set: str = ""
+    ses_events_topic_arn: str = ""
+    # TTL for escalation-contact confirmation links (round 5B item 13).
+    escalation_contact_link_ttl_seconds: int = 7 * 24 * 3600
     # Public base URL used to build customer-facing links in emails (verify link,
     # export download). Falls back to a dev localhost for local runs.
     app_base_url: str = "http://127.0.0.1:3000"
@@ -385,6 +398,10 @@ class Settings(BaseSettings):
             "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
             "INSTAGRAM_APP_SECRET": "instagram_app_secret",  # nosec B105
             "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
+            # Round 5B item 13: the SES events pipeline (bounce/complaint) —
+            # also settable as plain task env (the CDK wires both ways).
+            "SES_CONFIGURATION_SET": "ses_configuration_set",
+            "SES_EVENTS_TOPIC_ARN": "ses_events_topic_arn",
         }
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
         # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
@@ -396,6 +413,16 @@ class Settings(BaseSettings):
         # secret; the secret wins over the empty default).
         if blob.get("API_BASE_URL") and not self.public_api_base_url:
             object.__setattr__(self, "public_api_base_url", blob["API_BASE_URL"])
+        # Round 5B item 13: the CDK sets these as PLAIN task env vars (no
+        # LUCIEL_ prefix, matching the AWS-side names), so pydantic's prefixed
+        # loader never sees them — bridge from os.environ, blob still filling
+        # any remaining gap via the map above.
+        for plain_env, ses_field in (
+            ("SES_CONFIGURATION_SET", "ses_configuration_set"),
+            ("SES_EVENTS_TOPIC_ARN", "ses_events_topic_arn"),
+        ):
+            if not getattr(self, ses_field) and os.environ.get(plain_env):
+                object.__setattr__(self, ses_field, os.environ[plain_env])
 
         # LLM model IDs (§3.4.3 model-retirement contingency). These carry
         # non-empty defaults, so the generic empty-field overlay above never
@@ -431,6 +458,8 @@ class Settings(BaseSettings):
         # if it wasn't overridden — a forgeable-session vuln must never reach a real env.
         if blob.get("JWT_SIGNING_KEY"):
             object.__setattr__(self, "jwt_signing_key", blob["JWT_SIGNING_KEY"])
+        if blob.get("JWT_SIGNING_KEY_PREVIOUS"):
+            object.__setattr__(self, "jwt_signing_key_previous", blob["JWT_SIGNING_KEY_PREVIOUS"])
         if (
             self.integration_mode == "live"
             and self.jwt_signing_key == "dev-only-not-a-secret-rotate-in-prod"

@@ -96,7 +96,15 @@ class EmailNotifier:
         sender = build_email_sender()
         try:
             message_id = await sender.send(
-                to=to, subject=self.subject(notification), body_text=self.format(notification)
+                to=to,
+                subject=self.subject(notification),
+                body_text=self.format(notification),
+                # Round 5B item 13: bounce attribution — the SES event echoes
+                # these back so the events webhook knows whose contact bounced.
+                tags={
+                    "vm_admin_id": str(notification.admin_id),
+                    "vm_purpose": "escalation_notification",
+                },
             )
         except Exception as exc:  # noqa: BLE001 — a send failure is data, not a raise
             return DeliveryReceipt(accepted=False, detail=f"ses_error:{type(exc).__name__}")

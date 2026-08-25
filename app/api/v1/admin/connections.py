@@ -228,6 +228,10 @@ async def start_connection(
             )
         except service.ProviderNotRegistered as exc:
             raise validation_error(str(exc)) from exc
+        except service.DormantConnection as exc:
+            # Round 5B item 16: dormant is billing-suspended — Connect must not
+            # re-arm it; the fix is a payment method, and the copy says so.
+            raise validation_error(str(exc)) from exc
         except NumberAlreadyClaimed as exc:
             # c21 (409 oracle): the refusal is audited under the CLAIMANT in its
             # own transaction (this one is about to roll back), and repeated
@@ -340,6 +344,87 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
         if conn is None:
             raise not_found("No SMS number attached to re-verify.")
         return _connection_out(conn)
+
+
+@router.post("/sms/attest-registration", response_model=ConnectionOut)
+async def attest_sms_registration(subject: Subject = Depends(current_admin)) -> ConnectionOut:
+    """Owner attests their A2P 10DLC carrier registration is approved (round 5B
+    item 10) — the honest exit from ``pending_carrier_registration``, since the
+    A2P status API is unreachable with the deployment's auth. Audited under the
+    owner; texting enables on their word, never on a fabricated verification.
+    Idempotent; 422 when the row isn't ready (no confirmed number, or a
+    credential/operability problem to repair first)."""
+    from app.channels.phone_lifecycle import (  # noqa: PLC0415
+        AttestationNotReady,
+        attest_carrier_registration,
+    )
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        try:
+            conn = await attest_carrier_registration(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                user_id=subject.user_id,
+            )
+        except AttestationNotReady as exc:
+            raise validation_error(str(exc)) from exc
+        if conn is None:
+            raise not_found("No SMS number connection to attest for.")
+        return _connection_out(conn)
+
+
+@router.post("/sms/rotate-capability", response_model=ConnectionOut)
+async def rotate_sms_capability(subject: Subject = Depends(current_admin)) -> ConnectionOut:
+    """Rotate the webhook capability token and re-point the number's webhooks at
+    the new URLs in one step (round 5B item 17). The token is visible in the
+    customer's own Twilio console, so a suspected leak needs a remedy short of
+    disconnect+reconnect. 404 when there is no sms row; 422 for signature-path
+    tenants (their Auth Token IS the verification — nothing to rotate)."""
+    from app.channels.phone_lifecycle import configure_number_webhooks  # noqa: PLC0415
+    from app.channels.tenant_twilio import rotate_capability_token  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.instance_id == instance_id,
+                    InstanceConnection.connection_type == "sms_sender",
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise not_found("No SMS connection to rotate for.")
+        token = await rotate_capability_token(row)
+        if token is None:
+            raise validation_error(
+                "This connection verifies inbound with your Twilio Auth Token signature — "
+                "there is no capability token to rotate. Rotate the Auth Token in Twilio "
+                "and update your credentials here instead."
+            )
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="webhook_capability_provisioned",
+            payload={"connection_type": "sms_sender", "rotated": True},
+        )
+        destination = (row.non_secret_config or {}).get("destination")
+        if isinstance(destination, str) and destination:
+            await configure_number_webhooks(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                conn=row,
+                e164_number=destination,
+            )
+        return _connection_out(row)
 
 
 @router.get("/{connection_id}/twilio/numbers", response_model=TenantNumbersOut)
@@ -840,6 +925,17 @@ async def complete_oauth_connect(
                 if sms_needs_number:
                     conn.status = "unconfigured"
                     conn.status_detail = service.SMS_NEEDS_NUMBER_DETAIL
+                elif conn.connection_type == "sms_sender" and cfg_now.get("destination"):
+                    # Round 5B item 10: never blanket-promote an sms row past the
+                    # carrier-registration gate — connected iff the owner attested.
+                    from app.channels.phone_lifecycle import (  # noqa: PLC0415
+                        status_for_confirmed_number,
+                    )
+
+                    conn.status, conn.status_detail = status_for_confirmed_number(dict(cfg_now))
+                elif conn.connection_type == "sms_sender":
+                    # pending_destination only: keep the attach-written guidance.
+                    pass
                 else:
                     conn.status = "connected"
                     conn.status_detail = None

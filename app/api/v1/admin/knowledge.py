@@ -487,6 +487,14 @@ async def trigger_sync(
         if conn.status == "revoked":
             raise conflict("Connection is revoked; reconnect before syncing.")
         instance_id = await _instance_id(s, subject.admin_id)
+        # Round 5B item 12: refresh at call time — the manual Re-sync button ran
+        # on the raw stored token and failed on an hour-old Google token, landing
+        # the sources in a silent pause.
+        from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+        await ensure_fresh_access_token(
+            s, subject.admin_id, instance_id, connection_type="knowledge_source"
+        )
         provider = provider_for_connection(conn, get_secret_store())
         try:
             result = await sync.sync_connection(
@@ -562,6 +570,16 @@ async def list_scope_candidates_endpoint(
         conn = await _scoped_connection(s, subject.admin_id, connection_id)
         if conn.status == "revoked":
             raise conflict("Connection is revoked; reconnect before choosing a scope.")
+        # Round 5B item 12: same call-time refresh as the sync paths — the scope
+        # picker is a live provider call and an hour-old token 401s it.
+        from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+
+        await ensure_fresh_access_token(
+            s,
+            subject.admin_id,
+            await _instance_id(s, subject.admin_id),
+            connection_type="knowledge_source",
+        )
         transport = oauth_transport()
         try:
             # httpx.AsyncClient's precise stub types are wider than the narrow

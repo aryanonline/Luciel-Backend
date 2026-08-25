@@ -43,7 +43,7 @@ class FlakyEmailSender:
         self.up = False
         self.sent: list[str] = []
 
-    async def send(self, *, to, subject, body_text, from_address=None):
+    async def send(self, *, to, subject, body_text, from_address=None, tags=None):
         if not self.up:
             raise RuntimeError("throttled")
         self.sent.append(to)
@@ -63,8 +63,22 @@ async def _seed(
     *,
     escalation: dict[str, object],
     with_account: bool = True,
+    verified_contacts: tuple[str, ...] = (),
 ) -> None:
     async with tenant_session(admin_id) as s:
+        for address in verified_contacts:
+            # Round 5B item 13: a delivered-but-UNVERIFIED contact additionally
+            # copies the owner; tests pinning exact recipient lists confirm the
+            # contact first (the copy behavior has its own contract tests).
+            from app.models.email_incident import EmailDeliveryIncident  # noqa: PLC0415
+
+            s.add(
+                EmailDeliveryIncident(
+                    admin_id=admin_id,
+                    email_lower=address.strip().lower(),
+                    verified_at=datetime.now(UTC),
+                )
+            )
         if with_account:
             s.add(
                 Account(
@@ -186,7 +200,12 @@ async def test_a_replay_that_fails_again_backs_off_rather_than_forking_a_new_ttl
 async def test_the_owner_is_paged_once_the_provider_recovers(ses):
     """The whole point: the admin hears about the lead late instead of never."""
     admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
-    await _seed(admin_id, instance_id, escalation={"primaryEmail": CONTACT})
+    await _seed(
+        admin_id,
+        instance_id,
+        escalation={"primaryEmail": CONTACT},
+        verified_contacts=(CONTACT,),
+    )
     await _fire(admin_id, instance_id)
 
     ses.up = True

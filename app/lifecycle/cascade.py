@@ -26,6 +26,7 @@ from app.models.connection import InstanceConnection
 from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
 from app.models.crm_link import CrmLeadLink
 from app.models.deferred import DeferredAction
+from app.models.email_incident import EmailDeliveryIncident
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
 from app.models.lead import Lead
@@ -62,6 +63,7 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (RetrievalTraceEvent, "retrieval_trace_event"),
     (VoiceCallRecord, "voice_call_record"),
     (CrmLeadLink, "crm_lead_link"),
+    (EmailDeliveryIncident, "email_delivery_incident"),
     (RecordSourceRecord, "record_source_record"),
     (BookingEvent, "booking_event"),
     (DeferredAction, "deferred_action"),

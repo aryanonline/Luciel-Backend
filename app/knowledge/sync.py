@@ -206,3 +206,31 @@ async def pause_sync_on_revocation(
         s.sync_status = "paused_reconnect_needed"  # §3.2.3 vocabulary (Axis4-F02)
     await session.flush()
     return len(sources)
+
+
+async def mark_sync_error(
+    session: AsyncSession, *, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> int:
+    """Flag this connection's live sources ``sync_status = "error"`` (round 5B
+    item 12). The wire vocabulary carried "error" since §3.2.3 but nothing ever
+    WROTE it — a repeatedly failing non-credential sync (quota, parse, provider
+    500) read "synced" with a quietly aging last_synced_at forever. The raw
+    knowledge view now shows the honest state; the failure detail stays in the
+    sweep log (it may carry provider wording — never surfaced raw)."""
+    sources = (
+        (
+            await session.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == admin_id,
+                    KnowledgeSource.connection_id == connection_id,
+                    KnowledgeSource.soft_deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for s in sources:
+        s.sync_status = "error"
+    await session.flush()
+    return len(sources)

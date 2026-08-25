@@ -50,8 +50,10 @@ from app.knowledge import sync as knowledge_sync
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 
-# §3.8.5 cadence keyed to auth_class (minutes). The worker reads auth_class, never
-# the provider brand, so the catalog can grow without touching this table.
+# §3.8.5 TARGET cadence per auth_class. Honesty note (round 5B): the deployed
+# scheduler runs ONE 6-hour EventBridge cron for every class — this table is the
+# design target a per-class scheduler would read, not a description of what runs
+# today. Kept because the sweep entrypoint is cadence-agnostic either way.
 HEALTH_CADENCE: dict[str, timedelta] = {
     "oauth_token": timedelta(minutes=15),
     "long_lived_token": timedelta(minutes=60),
@@ -60,6 +62,27 @@ HEALTH_CADENCE: dict[str, timedelta] = {
 }
 # §3.8.5 refresh path: refresh proactively ~30 min before known expiry.
 REFRESH_LEAD = timedelta(minutes=30)
+
+# Statuses the health worker OWNS and may transition between (§3.8.4/§3.8.5 —
+# round 5B item 10). Everything else is SETUP-OWNED: the connect flows, billing,
+# and lifecycle own unconfigured / not_connected / pending_carrier_registration /
+# pending_email_routing / not_operable_hosting_required / dormant / revoked, and
+# the sweep must never touch them. Live-caught 2026-08-24: the old denylist
+# (revoked, dormant) let one sweep promote a not-yet-operable number to a false
+# Connected, erase setup guidance out of status_detail, and flip never-consented
+# rows to a false "error" with a false attention email.
+HEALTH_OWNED_STATUSES: frozenset[str] = frozenset({"connected", "expired", "error"})
+
+
+def health_owned(connection: InstanceConnection) -> bool:
+    """True iff the health worker may transition this row (§3.8.4 taxonomy).
+
+    A row mid staged-swap (``reconnect_pending:`` marker, service.py rule B) is
+    setup-owned regardless of status — transitioning it would erase the rollback
+    target ``confirm_reconnect`` needs."""
+    if connection.status not in HEALTH_OWNED_STATUSES:
+        return False
+    return not (connection.status_detail or "").startswith("reconnect_pending:")
 
 
 @dataclass
@@ -113,6 +136,16 @@ class StoredCredentialProbe:
         self._store = store
 
     async def probe(self, connection: InstanceConnection) -> ProbeResult:
+        # Round 5B item 11: only report a loss the probe can PROVE. Rows whose
+        # shape legitimately holds no secret — legacy platform ses rows, a
+        # credential form whose only fields were non-secret (custom_webhook with
+        # just a URL), providers with no stored material contract — used to flip
+        # to a false "error — stored credential is missing" with a false
+        # attention email (live-caught 2026-08-24 on the dev tenant's webhook CRM).
+        from app.connections import registry  # noqa: PLC0415 — avoids an import cycle
+
+        if not registry.secret_material_expected(connection.provider, connection.auth_class):
+            return ProbeResult(ok=True)
         if not connection.secret_ref:
             return ProbeResult(ok=True)
         store = self._store or get_secret_store()
@@ -177,8 +210,12 @@ async def check_connection(
     on refresh failure go expired immediately (don't probe a dead token). (2) Probe
     liveness. Always stamps last_health_check_at; emits connection_status_changed
     on a real transition. ``dormant`` rows never reach here (the sweep excludes
-    them — billing owns that state, module docstring)."""
+    them — billing owns that state, module docstring), and setup-owned rows
+    (``health_owned`` False) are returned untouched even when a caller hands one
+    in directly — no stamp, no transition, no email (round 5B item 10)."""
     now = now or datetime.now(UTC)
+    if not health_owned(connection):
+        return connection.status
     old_status = connection.status
 
     # (1) Proactive token refresh ahead of expiry (§3.8.5 refresh path).
@@ -215,6 +252,24 @@ async def check_connection(
     # (3) Healthy → connected.
     await _transition(session, connection, "connected", None, now, old_status)
     return connection.status
+
+
+async def mark_connection_broken(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    *,
+    detail: str,
+    status: str = "error",
+    now: datetime | None = None,
+) -> None:
+    """Flip a connection into a broken health status through the SAME transition
+    machinery the sweep uses — audit + once-per-incident attention email (round
+    5B item 12: a live-call failure discovered outside the sweep, e.g. a
+    knowledge sync whose token the provider rejected, must surface exactly like
+    a sweep-detected one instead of pausing silently)."""
+    await _transition(
+        session, connection, status, detail, now or datetime.now(UTC), connection.status
+    )
 
 
 async def _transition(
@@ -334,11 +389,17 @@ async def run_health_sweep(
             await session.execute(
                 select(InstanceConnection).where(
                     InstanceConnection.admin_id == admin_id,
-                    # revoked is terminal; dormant is billing-suspended (Legal
-                    # §A3) — probing a healthy dormant row would flip it back to
-                    # connected and re-arm action tools for a non-paying
-                    # account. Only the payment webhooks may leave dormant.
-                    InstanceConnection.status.notin_(("revoked", "dormant")),
+                    # POSITIVE allowlist (round 5B item 10): the sweep owns only
+                    # the health statuses. The old denylist (revoked, dormant)
+                    # swept up every SETUP-owned status too — promoting
+                    # not-yet-operable numbers to a false Connected, erasing
+                    # setup guidance, and false-erroring never-consented rows
+                    # (live-caught 2026-08-24). revoked stays terminal; dormant
+                    # is billing-suspended (Legal §A3) and only the payment
+                    # webhooks may leave it; a future unknown status is now safe
+                    # by default. The staged-swap marker is guarded per-row in
+                    # health_owned (it rides status_detail, not status).
+                    InstanceConnection.status.in_(HEALTH_OWNED_STATUSES),
                 )
             )
         )

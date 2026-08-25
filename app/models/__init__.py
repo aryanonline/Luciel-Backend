@@ -19,6 +19,7 @@ from app.models.conversation import (
 )
 from app.models.crm_link import CrmLeadLink
 from app.models.deferred import DeferredAction
+from app.models.email_incident import EmailDeliveryIncident
 from app.models.instance import Account, Instance
 from app.models.knowledge import (
     KnowledgeChunk,
@@ -44,6 +45,7 @@ __all__ = [
     "BillingAccount",
     "BookingEvent",
     "CrmLeadLink",
+    "EmailDeliveryIncident",
     "KnowledgeSource",
     "KnowledgeChunk",
     "KnowledgeEntity",

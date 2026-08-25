@@ -277,6 +277,7 @@ async def exchange_code_for_token(
         long_lived_token, long_lived_expires_in = await _upgrade_to_long_lived(
             provider,
             authorize,
+            client_id=cfg.client_id,
             client_secret=cfg.client_secret,
             short_lived=material["access_token"],
             transport=transport,
@@ -295,11 +296,12 @@ async def _upgrade_to_long_lived(
     provider: str,
     authorize: registry.ProviderAuthorize,
     *,
+    client_id: str,
     client_secret: str,
     short_lived: str,
     transport: HttpTransport,
 ) -> tuple[str, str | None]:
-    """Trade a short-lived token for a long-lived one (Instagram Login, §3.8.3).
+    """Trade a short-lived token for a long-lived one (Meta family, §3.8.3).
 
     Returns ``(token, expires_in_or_None)`` — the long-lived expiry (~60 days) is
     the hint the proactive-refresh worker needs; the caller replaces the
@@ -307,14 +309,22 @@ async def _upgrade_to_long_lived(
     falling back to the short-lived token: the fallback would look like a
     successful connect and then break about an hour later, with nothing in the
     connection's status to explain why.
+
+    The two Meta grants name their parameters differently (item 14): Facebook's
+    ``fb_exchange_token`` grant wants ``client_id`` + the short token under
+    ``fb_exchange_token``; Instagram's ``ig_exchange_token`` wants it under
+    ``access_token`` with no client_id.
     """
+    grant = str(authorize.long_lived_grant_type)
+    params: dict[str, object] = {"grant_type": grant, "client_secret": client_secret}
+    if grant == "fb_exchange_token":  # noqa: S105 — a grant type, not a secret
+        params["client_id"] = client_id
+        params["fb_exchange_token"] = short_lived
+    else:
+        params["access_token"] = short_lived
     resp = await transport.get(
         str(authorize.long_lived_endpoint),
-        params={
-            "grant_type": str(authorize.long_lived_grant_type),
-            "client_secret": client_secret,
-            "access_token": short_lived,
-        },
+        params=params,
         headers={"Accept": "application/json"},
     )
     if resp.status_code >= 400:

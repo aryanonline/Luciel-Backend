@@ -215,9 +215,17 @@ async def test_expiry_notifies_once_and_reconnect_offers_a_flow(ct: str, provide
     )
     status = await _run_check(admin, cid)
 
-    if auth_class == "provisioned_resource":
-        # Nothing to expire: the platform owns the resource — staying connected
-        # with no notification IS the honest cell.
+    if (
+        not registry.secret_material_expected(provider, auth_class)
+        and auth_class not in _REFRESH_CLASSES
+    ):
+        # Round 5B item 11: a row whose shape holds no secret to lose — the
+        # provisioned resource (csv), the legacy platform ses row, a credential
+        # form of only-optional secrets (custom_webhook url-only). Staying
+        # connected with no notification IS the honest cell; the old probe
+        # false-errored these (live-caught 2026-08-24). Token-class rows still
+        # expire below via the seeded expiry hint — refresh honesty is separate
+        # from stored-material honesty.
         assert status == "connected"
         assert await _attention_emails(admin) == 0
         return

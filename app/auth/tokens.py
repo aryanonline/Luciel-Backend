@@ -38,8 +38,20 @@ def mint_session_token(admin_id: uuid.UUID, user_id: uuid.UUID, session_epoch: i
 
 
 def decode_token(token: str) -> dict[str, Any]:
+    """Decode with the current key, falling back to the previous one during a
+    rotation window (round 5B item 17). Rotation used to be a hard cutover:
+    every session, every verify/reset link, and every in-flight OAuth ``state``
+    died the instant the key changed — mid-consent-screen included. Signing
+    always uses the CURRENT key; the previous key only ever verifies, so old
+    tokens age out on their own TTLs and the window closes by unsetting
+    JWT_SIGNING_KEY_PREVIOUS."""
     s = get_settings()
-    return jwt.decode(token, s.jwt_signing_key, algorithms=[s.jwt_algorithm])
+    try:
+        return jwt.decode(token, s.jwt_signing_key, algorithms=[s.jwt_algorithm])
+    except jwt.InvalidSignatureError:
+        if not s.jwt_signing_key_previous:
+            raise
+        return jwt.decode(token, s.jwt_signing_key_previous, algorithms=[s.jwt_algorithm])
 
 
 def mint_link_token(admin_id: uuid.UUID, purpose: str, ttl_seconds: int, jti: str) -> str:

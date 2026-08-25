@@ -221,3 +221,42 @@ async def test_phone_keyed_lead_is_not_pushed_into_an_email_keyed_crm(fresh_mock
     iid, sid = await _seed_tenant(admin)
     await _capture_and_push(admin, iid, sid, "Call me at 604-555-0100 about pricing.")
     assert fresh_mock_crm.records == {}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_email_volunteered_later_finally_reaches_the_crm(fresh_mock_crm):
+    """Round 5A item 5 (live-audited 2026-08-24): an SMS/voice lead who later
+    volunteered an email had it silently DISCARDED — never stored, never pushed.
+    Now the address is the record's CRM key from the moment it is known, and the
+    first push carries the record's standing facts, not just that turn's delta."""
+    from app.models.lead import Lead
+    from sqlalchemy import select
+
+    admin = uuid.uuid4()
+    iid, sid = await _seed_tenant(admin)
+
+    # Phone-keyed capture: name + intent land in the dashboard, nothing in CRM.
+    await _capture_and_push(
+        admin, iid, sid, "Hi, I'm Jane Miller — call me at 604-555-0100 for a reno quote."
+    )
+    assert fresh_mock_crm.records == {}
+
+    # The email arrives → the CRM record exists, keyed on it, carrying the
+    # already-known facts.
+    await _capture_and_push(admin, iid, sid, "Better yet, email me at Jane.M@Acme.com")
+    assert len(fresh_mock_crm.records) == 1
+    rec = next(iter(fresh_mock_crm.records.values()))
+    assert rec["lead_key"] == "jane.m@acme.com"  # normalized lower-case
+    assert rec["fields"].get("name") == "Jane Miller"
+    async with tenant_session(admin) as s:
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
+        assert lead.email == "jane.m@acme.com"
+        # The transport key is untouched — inbound routing still knows them.
+        assert lead.contact_identifier != lead.email
+
+    # Fill-when-absent: a second, different address never rekeys.
+    await _capture_and_push(admin, iid, sid, "or try other@else.com maybe")
+    async with tenant_session(admin) as s:
+        lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
+        assert lead.email == "jane.m@acme.com"
+    assert len(fresh_mock_crm.records) == 1

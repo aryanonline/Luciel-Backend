@@ -268,16 +268,67 @@ async def notify_escalation(
     )
     routing = resolve_routing(inst.escalation if inst else None, signal)
 
+    # Round 5B item 13: suppression + verification state for the email contacts.
+    # A hard-bounced/complained address is never attempted (SES "accepting" it
+    # proved nothing — the delivery still died, silently); an address never
+    # confirmed gets the owner copied so a typo can't black-hole a hot lead.
+    from app.models.email_incident import (  # noqa: PLC0415
+        EmailDeliveryIncident,
+        is_suppressed,
+        is_verified,
+    )
+    from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
+
+    email_states = await states_for(
+        session,
+        admin_id,
+        [c for c in (routing.primary, routing.secondary, owner_email) if c],
+    )
+
+    def _state_of(address: str) -> EmailDeliveryIncident | None:
+        return email_states.get(address.strip().lower())
+
     delivered = False
+    delivered_unverified = False
     attempted: set[tuple[str, str]] = set()
     for role, contact in (("primary", routing.primary), ("secondary", routing.secondary)):
         if not contact:
+            continue
+        if routing.channel == "email" and is_suppressed(_state_of(contact)):
+            # Refusal, not absence: counted as attempted (the owner fallback
+            # below is then a real fallback), audited with the reason.
+            attempted.add((routing.channel, contact))
+            state = _state_of(contact)
+            reason = (
+                "contact_suppressed_complaint"
+                if state is not None and state.complained_at is not None
+                else "contact_suppressed_hard_bounce"
+            )
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="escalation_delivery_failed",
+                actor_type=ActorType.platform,
+                payload={
+                    "signal": signal,
+                    "gate": gate,
+                    "conversation_ref": notification.conversation_ref,
+                    "delivery_method": routing.channel,
+                    "recipient": contact,
+                    "recipient_role": role,
+                    "failure_reason": reason,
+                },
+            )
             continue
         attempted.add((routing.channel, contact))
         delivered = await _deliver(
             session, notification, channel=routing.channel, to=contact, role=role
         )
         if delivered:
+            delivered_unverified = routing.channel == "email" and not is_verified(
+                _state_of(contact)
+            )
             break
 
     # cc-owner-email is fan-out, not fallback: it goes out even on a successful primary.
@@ -288,6 +339,29 @@ async def notify_escalation(
         )
 
     if delivered:
+        # Round 5B item 13: an UNCONFIRMED contact accepted the send — copy the
+        # account owner too. SES acceptance is not delivery, and until the
+        # contact proves out (or for legacy contacts saved before verification
+        # existed), silence toward a typo'd address must not be trusted.
+        if delivered_unverified and owner_email and ("email", owner_email) not in attempted:
+            attempted.add(("email", owner_email))
+            await _deliver(
+                session, notification, channel="email", to=owner_email, role="owner_unverified_copy"
+            )
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="escalation_owner_fallback",
+                actor_type=ActorType.platform,
+                payload={
+                    "signal": signal,
+                    "gate": gate,
+                    "conversation_ref": notification.conversation_ref,
+                    "reason": "contact_unverified",
+                    "configured_channel": routing.channel,
+                },
+            )
         return True
     # Nothing reached the configured contacts — fall back to the account owner (§3.5.4).
     if owner_email and ("email", owner_email) not in attempted:

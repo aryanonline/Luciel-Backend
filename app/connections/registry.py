@@ -354,6 +354,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "pages_messaging,pages_show_list,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
             supports_pkce=False,
+            # Round 5B item 14: the code redeems to a SHORT-lived (~1-2h) user
+            # token; the fb_exchange_token upgrade mints the ~60-day one. Without
+            # this, WhatsApp/Messenger died an hour after connect and stayed dead
+            # until the 6-hourly sweep happened to re-exchange — instagram below
+            # always had its equivalent.
+            long_lived_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+            long_lived_grant_type="fb_exchange_token",  # noqa: S106 — a grant type
         ),
         client_id_setting="meta_app_id",
         client_secret_setting="meta_app_secret",  # noqa: S106 — field NAME  # nosec B106
@@ -619,6 +626,33 @@ def provider_available(provider: str, connection_type: str | None = None) -> boo
     # Connect button that dead-ends. Refresh paths keep using `configured` — an
     # already-granted token needs no redirect to renew.
     return oauth_client_config(spec.provider).authorize_ready
+
+
+def secret_material_expected(provider: str, auth_class: str) -> bool:
+    """True iff a connected row of this provider MUST hold secret material —
+    i.e. an unresolvable/empty secret is evidence of LOSS, not a legitimate
+    shape (round 5B item 11, §3.8.5 probe honesty).
+
+    - Provisioned providers (ses, csv): platform-owned, no tenant secret —
+      False. (Legacy ses rows carry auth_class api_key with a stamped-but-empty
+      secret_ref; the SPEC lookup is what catches them.)
+    - Credential-form providers: True only when some field is secret AND
+      required. custom_webhook / outbound_webhook / live_connector collect only
+      OPTIONAL secrets (the URL can be the whole credential), so an empty store
+      is a legitimate connected shape — live-caught 2026-08-24 when the sweep
+      false-errored exactly such a row.
+    - OAuth providers: True — a connected row stored a token at exchange, and
+      the Twilio credential fallback always stores material too.
+    - Unregistered provider: fall back on auth_class alone.
+    """
+    spec = get_provider(provider)
+    if spec is not None:
+        if spec.auth_kind == AUTH_PROVISIONED:
+            return False
+        if spec.auth_kind == AUTH_CREDENTIAL_FORM:
+            return any(f.secret and f.required for f in spec.credential_fields)
+        return True
+    return auth_class != "provisioned_resource"
 
 
 def oauth_client_label(provider: str) -> str:

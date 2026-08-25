@@ -602,10 +602,26 @@ def _fake_meta_transport(expected_code: str, monkeypatch):
             self.calls.append((url, dict(data or {})))
             assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
             assert data["code"] == expected_code
+            # The code redeems to a SHORT-lived (~1h) token (round 5B item 14) —
+            # storing this one is exactly the bug the long-lived upgrade closes.
+            return httpx.Response(
+                200,
+                json={"access_token": "meta-short-1", "expires_in": 3600},
+                request=httpx.Request("POST", url),
+            )
+
+        async def get(self, url, *, params=None, headers=None):
+            # The mandatory fb_exchange_token upgrade (round 5B item 14): Meta's
+            # own grant shape — client_id + the short token under fb_exchange_token.
+            self.calls.append((url, dict(params or {})))
+            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert params["grant_type"] == "fb_exchange_token"
+            assert params["fb_exchange_token"] == "meta-short-1"
+            assert params.get("client_id"), "fb_exchange_token requires client_id"
             return httpx.Response(
                 200,
                 json={"access_token": "meta-tok-1", "expires_in": 5184000},
-                request=httpx.Request("POST", url),
+                request=httpx.Request("GET", url),
             )
 
         async def __aenter__(self):
@@ -665,8 +681,12 @@ async def test_meta_oauth_callback_stores_the_token_and_connects(client, monkeyp
 
     stored = await get_secret_store().get(secret_ref_for(admin_id, instance_id, "channel_auth"))
     assert stored is not None, "the callback must persist the token for the channel"
+    # Round 5B item 14: the LONG-lived token is what persists — storing the
+    # short-lived redeem left WhatsApp/Messenger dead within the hour. Two calls:
+    # the code redeem plus the mandatory fb_exchange_token upgrade.
     assert stored["access_token"] == "meta-tok-1"
-    assert len(transport.calls) == 1
+    assert stored["expires_in"] == "5184000"
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

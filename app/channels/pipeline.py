@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -70,6 +71,41 @@ async def ingest(
     # carrier sends the canonical reply; we never route the keyword to the runtime.
     opt_keyword = msg.channel_metadata.get("opt_keyword")
     if opt_keyword:
+        # Round 5C item 8: RECORD the consent state, not just suppress the
+        # keyword — Lead.opted_out gates scheduled callbacks (§3.3.5) and was
+        # never written by any runtime path. Only an existing lead is touched:
+        # a bare STOP from a number we never captured has no record to update
+        # (and schedule_callback requires a captured lead anyway).
+        kw = str(opt_keyword)
+        if kw in ("stop", "start") and msg.customer_identifier:
+            from app.models.lead import Lead  # noqa: PLC0415
+
+            async with tenant_session(ctx.admin_id) as s:
+                lead = (
+                    await s.execute(
+                        select(Lead).where(
+                            Lead.admin_id == ctx.admin_id,
+                            Lead.instance_id == ctx.instance_id,
+                            Lead.contact_identifier == msg.customer_identifier,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if lead is not None:
+                    opted_out = kw == "stop"
+                    if lead.opted_out != opted_out:
+                        lead.opted_out = opted_out
+                        await audit.emit(
+                            s,
+                            admin_id=ctx.admin_id,
+                            instance_id=ctx.instance_id,
+                            actor_type=ActorType.platform,
+                            event_type="lead_opt_out_recorded",
+                            payload={
+                                "channel": adapter.channel_id,
+                                "keyword": kw,
+                                "opted_out": opted_out,
+                            },
+                        )
         return OptOutHandled(
             keyword=str(opt_keyword),
             channel=adapter.channel_id,

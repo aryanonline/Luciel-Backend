@@ -27,6 +27,7 @@ import base64
 import binascii
 import hmac
 import json
+import uuid
 from email import message_from_bytes
 from email import policy as email_policy
 from email.utils import parseaddr
@@ -452,6 +453,66 @@ async def ses_inbound(request: Request) -> dict[str, str]:
     }
     result = await _dispatch(_build_email_adapter(), req)
     return {"status": "ok" if isinstance(result, str) else "not_routed"}
+
+
+# --------------------------------------------------------------------------- #
+# SES delivery events — bounce/complaint (delivered via SNS, round 5B item 13)
+# --------------------------------------------------------------------------- #
+@router.post("/ses/events")
+async def ses_events(request: Request) -> dict[str, str]:
+    """Record SES bounce/complaint events against the tenant's contact addresses.
+
+    SES accepting a message proves nothing — a bouncing escalation contact used
+    to swallow hot-lead notifications with a green audit trail. The event's
+    ``mail.tags`` carry ``vm_admin_id`` (stamped on every platform send), so
+    attribution needs no address scan; an untagged event is unattributable and
+    ignored. TOPIC PINNING on top of signature verification: any AWS account can
+    subscribe this public URL to THEIR topic and send genuinely-signed
+    notifications — with a fabricated vm_admin_id that would let an attacker
+    suppress a victim's escalation contact (a DoS on hot-lead delivery). In live
+    mode only the configured events topic is accepted."""
+    raw = await request.body()
+    try:
+        sns_message = json.loads(raw or b"{}")
+    except ValueError:
+        return {"status": "ignored", "reason": "bad_sns_envelope"}
+    settings = get_settings()
+    live = settings.integration_mode == "live"
+    pinned_topic = settings.ses_events_topic_arn
+    if live and pinned_topic and sns_message.get("TopicArn") != pinned_topic:
+        return {"status": "rejected", "reason": "topic_mismatch"}
+    if sns_message.get("Type") == "SubscriptionConfirmation":
+        verifier = ConfigGatedSnsVerifier()
+        if not verifier.verify(sns_message):
+            return {"status": "rejected", "reason": "sns_signature_invalid"}
+        confirmed = live and confirm_subscription(sns_message)
+        return {"status": "subscription_confirmed" if confirmed else "subscription_acknowledged"}
+    verifier = ConfigGatedSnsVerifier()
+    if not verifier.verify(sns_message):
+        return {"status": "rejected", "reason": "sns_signature_invalid"}
+    try:
+        event = json.loads(sns_message.get("Message") or "{}")
+    except ValueError:
+        return {"status": "ignored", "reason": "bad_event_payload"}
+    event_type = event.get("eventType") or event.get("notificationType") or ""
+    if event_type not in ("Bounce", "Complaint"):
+        return {"status": "ignored", "reason": "not_a_delivery_incident"}
+    tags = (event.get("mail") or {}).get("tags") or {}
+    admin_raw = tags.get("vm_admin_id") or []
+    admin_value = admin_raw[0] if isinstance(admin_raw, list) and admin_raw else admin_raw
+    try:
+        admin_id = uuid.UUID(str(admin_value))
+    except (ValueError, TypeError):
+        return {"status": "ignored", "reason": "unattributable"}
+    purpose_raw = tags.get("vm_purpose") or []
+    purpose = purpose_raw[0] if isinstance(purpose_raw, list) and purpose_raw else str(purpose_raw)
+
+    from app.notifications.delivery_incidents import record_ses_event  # noqa: PLC0415
+
+    recorded = await record_ses_event(
+        admin_id=admin_id, event_type=event_type, event=event, purpose=str(purpose or "")
+    )
+    return {"status": "ok" if recorded else "ignored"}
 
 
 # --------------------------------------------------------------------------- #

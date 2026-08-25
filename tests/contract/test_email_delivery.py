@@ -123,7 +123,7 @@ async def test_a_raising_sender_is_logged_and_audited_not_swallowed(caplog):
     from sqlalchemy import select
 
     class ExplodingSender:
-        async def send(self, *, to, subject, body_text):
+        async def send(self, *, to, subject, body_text, tags=None):
             raise RuntimeError("SES said no")
 
     admin = uuid.uuid4()

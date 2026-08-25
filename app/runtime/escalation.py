@@ -63,7 +63,14 @@ class EscalationDecision:
 # --- pluggable classifiers (deterministic heuristics for dev/test) ---------- #
 _HUMAN_PATTERNS = re.compile(
     r"\b(speak|talk|connect)\b.{0,20}\b(human|person|someone|representative|agent|real)\b"
-    r"|\bhuman\b|\breal person\b|\bspeak to a\b",
+    r"|\bhuman\b|\breal person\b|\bspeak to a\b"
+    # Round 5C item 8: a data-deletion/right-to-be-forgotten request is a request
+    # only a HUMAN can honor (erasure is the tenant's dashboard action, §3.4.11)
+    # — Luciel must hand it off with context, never answer around it or fabricate
+    # a deletion it cannot perform.
+    r"|\b(delete|erase|remove|forget)\b.{0,20}"
+    r"\bmy (data|info|information|details|records?|number)\b"
+    r"|\bforget me\b|\bright to be forgotten\b|\bstop (storing|keeping) my\b",
     re.IGNORECASE,
 )
 _NEGATIVE_WORDS = {
@@ -140,6 +147,46 @@ def is_conversational_turn(text: str) -> bool:
     if _SEEKING_PATTERNS.search(stripped):
         return False
     return bool(_CONVERSATIONAL_PATTERNS.search(stripped))
+
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+# Below this Jaccard overlap two questions count as different asks; at or above
+# it, the model is re-asking the same thing in fresh clothes. Conservative on
+# purpose: a missed repeat costs one more polite turn, a false positive hands a
+# productive gather to a human mid-flow.
+_REPEATED_QUESTION_OVERLAP = 0.75
+
+
+def _last_question(text: str) -> frozenset[str] | None:
+    """Token set of the LAST question sentence in ``text``; None if no question."""
+    questions = re.findall(r"[^?]*\?", text or "")
+    if not questions:
+        return None
+    tokens = frozenset(_WORD_RE.findall(questions[-1].lower()))
+    return tokens or None
+
+
+def is_repeated_question(reply: str, previous_luciel_reply: str | None) -> bool:
+    """True when this reply re-asks (near-)the-same question as the previous one.
+
+    §3.3.7: "repeated re-asking of the same input is an explicitly prohibited
+    failure mode." The broker-side ask-bound only counts turns where a proposed
+    tool call was rejected — a model that asks in PROSE, gets a non-answer, and
+    asks again never incremented it (round 5C item 18). This deterministic check
+    closes that: the last question sentence of two consecutive replies matching
+    at ≥ 0.75 token overlap is the same ask, and counts against the bound.
+    Distinct follow-up questions in a healthy gather ("which day?" → "what
+    time?") share almost no tokens and never trip it.
+    """
+    current = _last_question(reply)
+    previous = _last_question(previous_luciel_reply or "")
+    if current is None or previous is None:
+        return False
+    union = current | previous
+    if not union:
+        return False
+    overlap = len(current & previous) / len(union)
+    return overlap >= _REPEATED_QUESTION_OVERLAP
 
 
 def sentiment_score(text: str) -> float:

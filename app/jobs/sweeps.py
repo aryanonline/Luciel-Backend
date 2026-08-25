@@ -58,7 +58,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import reaper
@@ -67,6 +67,7 @@ from app.connections import deferred_queue, health
 from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
 from app.lifecycle import audit_retention, grace_expiry, retention, transcript_archive
 from app.lifecycle.close_purge import purge_closed_account_if_due
+from app.models.connection import InstanceConnection
 from app.runtime import session_close
 
 RETENTION = "retention"
@@ -221,7 +222,7 @@ async def _check_connections(
 ) -> dict[str, str]:
     from app.connections.refresh import DispatchingRefresher
 
-    return await health.run_health_sweep(
+    result = await health.run_health_sweep(
         session,
         admin_id=admin_id,
         probe=health.StoredCredentialProbe(),
@@ -234,6 +235,43 @@ async def _check_connections(
         refresher=DispatchingRefresher(fallback=health.ReconnectOnExpiry()),
         now=now,
     )
+    await _reapply_sms_webhooks(session, admin_id=admin_id)
+    return result
+
+
+async def _reapply_sms_webhooks(session: AsyncSession, *, admin_id: uuid.UUID) -> None:
+    """Round 5B item 15 — periodic webhook-drift repair, piggybacked on the
+    health sweep's cadence. A console edit to the number's Voice/SMS URLs, or a
+    platform base-URL change, used to kill inbound with the row still reading
+    Connected and NOTHING ever re-checking. Best-effort and self-limiting:
+    configure_number_webhooks is a silent no-op without public_api_base_url
+    (mock/CI) and never raises; a healthy number gets an idempotent re-point."""
+    from app.channels.phone_lifecycle import configure_number_webhooks  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_type == "sms_sender",
+                    InstanceConnection.status.in_(("connected", "pending_carrier_registration")),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        destination = (row.non_secret_config or {}).get("destination")
+        if isinstance(destination, str) and destination:
+            await configure_number_webhooks(
+                session,
+                admin_id=admin_id,
+                instance_id=row.instance_id,
+                conn=row,
+                e164_number=destination,
+                audit_on_success=False,
+            )
 
 
 async def run_connection_health(*, now: datetime | None = None) -> list[str]:

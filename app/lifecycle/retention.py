@@ -295,6 +295,11 @@ async def prune_stale_leads(
     )
     for lead in stale:
         lead_id = lead.id
+        # Round 5A item 2: the prune takes the lead's CRM link rows (plaintext
+        # email) with it — same hygiene as the dashboard erase/prune actions.
+        from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
+
+        links_deleted = await delete_links_for_lead(session, admin_id=admin_id, lead=lead)
         await session.delete(lead)
         await audit.emit(
             session,
@@ -305,6 +310,7 @@ async def prune_stale_leads(
             payload={
                 "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
                 "retention_policy": f"lead_auto_prune:{inst.lead_retention_days}d",
+                "crm_links_deleted": links_deleted,
             },
         )
     await session.flush()

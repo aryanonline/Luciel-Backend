@@ -92,6 +92,25 @@ _DETAIL_UNKNOWN = (
     "Couldn't reach Twilio to verify this number right now. It has not been marked live; "
     "click Re-verify to try again."
 )
+# Round 5B item 10: the honest exit from pending_carrier_registration. The A2P
+# status API is unreachable with our auth (number_operability.py), so the OWNER'S
+# audited attestation — not a fabricated verification — is what turns texting on.
+_DETAIL_ATTESTED = (
+    "Texting is enabled on your attestation that your A2P 10DLC carrier registration "
+    "is approved (or does not apply to your recipients). VantageMind cannot verify "
+    "campaign approval on your behalf. Re-verify still checks that the number remains "
+    "operable on your account."
+)
+# non_secret_config keys (JSONB, non-secret §3.8.3) the attestation writes:
+#   carrier_registration_attested_at: ISO timestamp
+#   carrier_registration_attested_by: str(user_id) or "" when unknown
+_ATTESTED_AT_KEY = "carrier_registration_attested_at"
+_ATTESTED_BY_KEY = "carrier_registration_attested_by"
+
+
+class AttestationNotReady(ValueError):
+    """Attestation preconditions unmet: no confirmed number, or a row whose
+    credential/operability problem must be repaired first."""
 
 
 def _validate_e164(e164_number: str) -> str:
@@ -101,14 +120,31 @@ def _validate_e164(e164_number: str) -> str:
     return number
 
 
-def _status_for(result: OperabilityResult) -> tuple[str, str]:
+def _status_for(result: OperabilityResult, cfg: dict[str, object] | None = None) -> tuple[str, str]:
     """Map an operability result to (status, status_detail). NOT_OPERABLE and UNKNOWN
-    both stay non-live (honest) — only OPERABLE advances to pending-registration."""
+    both stay non-live (honest) — only OPERABLE advances, to pending-registration
+    or, when the owner has attested their carrier registration (round 5B item 10),
+    to connected. An inoperable number outranks any attestation."""
     if result is OperabilityResult.OPERABLE:
+        if cfg and cfg.get(_ATTESTED_AT_KEY):
+            return STATUS_CONNECTED, _DETAIL_ATTESTED
         return STATUS_PENDING_REGISTRATION, _DETAIL_PENDING
     if result is OperabilityResult.NOT_OPERABLE:
         return STATUS_NOT_OPERABLE, _DETAIL_NOT_OPERABLE
     return STATUS_NOT_OPERABLE, _DETAIL_UNKNOWN
+
+
+def status_for_confirmed_number(cfg: dict[str, object]) -> tuple[str, str]:
+    """(status, detail) for an sms row whose ``destination`` is already the
+    confirmed-operable claim: connected iff attested, else pending (§3.1.4).
+
+    Used by the credential/reconnect paths, which have no fresh probe in hand —
+    they must not blanket-promote to connected past the registration gate (round
+    5B: the sweep's promotion bug used to do exactly that, and submit_credentials
+    had the same blanket ``connected``)."""
+    if cfg.get(_ATTESTED_AT_KEY):
+        return STATUS_CONNECTED, _DETAIL_ATTESTED
+    return STATUS_PENDING_REGISTRATION, _DETAIL_PENDING
 
 
 async def _find_sms_sender(
@@ -159,7 +195,6 @@ async def attach_sms_number(
         raise NumberAlreadyClaimed(number)
     probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(number)
-    status, detail = _status_for(result)
 
     # Anti-squatting (c21): the routable CLAIM (``destination``) is written only on
     # a CONFIRMED-operable probe — a number the account cannot operate must not
@@ -179,13 +214,23 @@ async def attach_sms_number(
         existing.auth_class = "api_key"
         # Merge, don't replace: the BYO Twilio account id (§3.1.4) also lives here, and
         # designating a number must not silently unbind the account it belongs to.
-        merged = {**(existing.non_secret_config or {}), **cfg_update}
+        prior_cfg = existing.non_secret_config or {}
+        merged = {**prior_cfg, **cfg_update}
         merged.pop(cfg_pop, None)
+        # Number-change invalidation extends to the attestation (round 5B item
+        # 10): the owner attested THAT number's registration, so a different
+        # number re-derives from scratch. A same-number re-attach keeps it.
+        prior_number = prior_cfg.get("destination") or prior_cfg.get("pending_destination")
+        if prior_number and prior_number != number:
+            merged.pop(_ATTESTED_AT_KEY, None)
+            merged.pop(_ATTESTED_BY_KEY, None)
+        status, detail = _status_for(result, merged)
         existing.non_secret_config = merged
         existing.status = status
         existing.status_detail = detail
         conn = existing
     else:
+        status, detail = _status_for(result, dict(cfg_update))
         conn = InstanceConnection(
             connection_id=uuid.uuid4(),
             admin_id=admin_id,
@@ -227,6 +272,7 @@ async def configure_number_webhooks(
     conn: InstanceConnection,
     e164_number: str,
     webhook_config: TwilioWebhookConfigurator | None = None,
+    audit_on_success: bool = True,
 ) -> bool:
     """Point the number's Voice/SMS/StatusCallback webhooks at the platform.
 
@@ -271,6 +317,12 @@ async def configure_number_webhooks(
         session, admin_id, instance_id
     )
     applied = await configurator.configure(e164_number, urls)
+    if applied and not audit_on_success:
+        # The periodic drift re-apply (round 5B item 15) is an idempotent
+        # re-point every sweep — auditing each quiet success would spam the
+        # customer's audit page 4×/day. Failures always audit below.
+        await session.flush()
+        return True
     if applied:
         await audit_log.emit(
             session,
@@ -287,7 +339,11 @@ async def configure_number_webhooks(
             f"Messaging to {urls.sms_url}, and the call status callback to "
             f"{urls.status_callback_url}."
         )
-        conn.status_detail = (conn.status_detail or "").rstrip() + manual
+        # Idempotent append: the periodic re-apply (round 5B item 15) runs every
+        # sweep — a persistently failing configurator must not grow the detail
+        # without bound.
+        if manual.strip() not in (conn.status_detail or ""):
+            conn.status_detail = (conn.status_detail or "").rstrip() + manual
         await audit_log.emit(
             session,
             admin_id=admin_id,
@@ -324,7 +380,6 @@ async def reverify_sms_number(
 
     probe = probe or await build_tenant_operability_probe(session, admin_id, instance_id)
     result = await probe.check(str(destination))
-    status, detail = _status_for(result)
 
     # Promotion (c21 anti-squatting): a pending number that just probed OPERABLE
     # becomes the routable claim — a NEW claim point, so it re-runs the ownership
@@ -342,8 +397,104 @@ async def reverify_sms_number(
         merged.pop("pending_destination", None)
         existing.non_secret_config = merged
 
+    # Post-promotion cfg: an attested row that re-probes OPERABLE stays connected;
+    # a failed probe demotes honestly but RETAINS the attestation keys (a Twilio
+    # outage must not erase the owner's attestation — round 5B item 10).
+    status, detail = _status_for(result, existing.non_secret_config or {})
     existing.status = status
     existing.status_detail = detail
+    await session.flush()
+
+    # Round 5B item 15 — webhook drift repair: Re-verify is the customer's "make
+    # my number work again" action, so it also re-points the number's webhooks at
+    # the platform (best-effort, same configurator as attach). A console edit or
+    # a platform base-URL change used to kill inbound with the row still reading
+    # Connected and NOTHING re-checking the number's config, ever.
+    if result is OperabilityResult.OPERABLE:
+        await configure_number_webhooks(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            conn=existing,
+            e164_number=str(destination),
+        )
+    return existing
+
+
+async def attest_carrier_registration(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+) -> InstanceConnection | None:
+    """Owner attests their A2P 10DLC registration is approved — or does not apply
+    to their recipients (round 5B item 10).
+
+    The A2P status API is unreachable with our auth (number_operability.py), so
+    the owner's AUDITED word is the honest exit from pending_carrier_registration
+    — consistent with BYO doctrine: the customer is the registered sender of
+    record; the platform guides and verifies operability, never registration.
+
+    Preconditions: a confirmed ``destination`` (operability proven at claim time)
+    AND status in (pending_carrier_registration, connected) — an error/expired
+    row must repair credentials first; a not-operable row must re-verify first.
+    Returns None when no sms row exists; raises AttestationNotReady on unmet
+    preconditions. Idempotent when already attested."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from app.audit import log as audit_log  # noqa: PLC0415
+    from app.models.audit import ActorType  # noqa: PLC0415
+
+    existing = await _find_sms_sender(session, admin_id, instance_id)
+    if existing is None:
+        return None
+    cfg = dict(existing.non_secret_config or {})
+    number = cfg.get("destination")
+    if not number:
+        raise AttestationNotReady(
+            "Add and verify your number first — attestation applies to a working number."
+        )
+    if existing.status not in (STATUS_PENDING_REGISTRATION, STATUS_CONNECTED):
+        raise AttestationNotReady(
+            "This connection needs repair first (re-verify the number or fix its "
+            "credentials), then attest."
+        )
+    if cfg.get(_ATTESTED_AT_KEY):
+        return existing  # idempotent — the first attestation stands
+    cfg[_ATTESTED_AT_KEY] = datetime.now(UTC).isoformat()
+    cfg[_ATTESTED_BY_KEY] = str(user_id) if user_id else ""
+    existing.non_secret_config = cfg
+    old_status = existing.status
+    existing.status, existing.status_detail = status_for_confirmed_number(cfg)
+    await audit_log.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="carrier_registration_attested",
+        payload={
+            "connection_id": str(existing.connection_id),
+            "number": str(number),
+            "attested_by": str(user_id) if user_id else "",
+        },
+    )
+    if existing.status != old_status:
+        await audit_log.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(existing.connection_id),
+                "old_status": old_status,
+                "new_status": existing.status,
+                "reason": "carrier_registration_attested",
+            },
+        )
     await session.flush()
     return existing
 

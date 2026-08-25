@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Index, String, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,9 +30,19 @@ class CrmLeadLink(Base, TenantMixin, TimestampMixin):
 
     __tablename__ = "crm_lead_links"
     __table_args__ = (
-        UniqueConstraint(
-            "admin_id", "instance_id", "provider", "lead_key", name="uq_crm_lead_link"
+        # Round 5A item 9 (migration 0053): the REAL invariant is one CRM record
+        # per LEAD per provider — lead_key is mutable once emails can change, so
+        # the old unique-on-key constraint could only ever pin the wrong thing.
+        Index(
+            "uq_crm_lead_link_lead",
+            "admin_id",
+            "instance_id",
+            "provider",
+            "lead_id",
+            unique=True,
+            postgresql_where=text("lead_id IS NOT NULL"),
         ),
+        Index("ix_crm_lead_links_key", "admin_id", "instance_id", "provider", "lead_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -41,8 +51,14 @@ class CrmLeadLink(Base, TenantMixin, TimestampMixin):
     instance_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     # CRM provider the record lives in (hubspot | salesforce | custom_webhook).
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
-    # The stable lead key the runtime pushes under (the resolved lead's dedupe
-    # identity — e-mail today). What makes "the same lead" the same lead.
+    # The platform Lead this link belongs to (round 5A item 9, migration 0053).
+    # Nullable: legacy rows are adopted lazily — lead_id is stamped on the next
+    # successful push whose resolved lead OWNS the key. This — not lead_key — is
+    # what makes "the link survives an email change" actually true.
+    lead_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    # The lead key of the LAST SUCCESSFUL push (e-mail). Refreshed on every
+    # touch; a mismatch with the incoming key is the "the identity field moved —
+    # tell the CRM" signal.
     lead_key: Mapped[str] = mapped_column(String(320), nullable=False)
     # The provider's record id our first push created (or found). All later
     # pushes update THIS record in place.

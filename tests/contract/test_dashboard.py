@@ -507,8 +507,10 @@ async def test_export_leads_as_json(client):
         "leadId": str(lead_id),
         "name": "Jane",
         "contactIdentifier": "jane@x.com",
+        "email": None,  # volunteered-email column (round 5A item 5) — NULL here
         "intent": "quote",
         "state": "active",
+        "outcome": "in_progress",
         "lastActivityAt": row["lastActivityAt"],
     }
 

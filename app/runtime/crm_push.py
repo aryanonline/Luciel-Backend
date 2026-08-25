@@ -55,9 +55,12 @@ async def push_captured_lead(
     dormant connection) resolve inside dispatch and land in the tool trace —
     exactly as a model-proposed call would."""
     changed = dict(captured.changed)
-    # The stable CRM key is the email; `contact` inside changed is that same key
-    # on first capture and is not a separate CRM field.
+    # `contact` and `email` are the CRM KEY, not CRM fields — the key rides as
+    # lead_key, never in the payload. (When a phone-keyed lead's volunteered
+    # email arrives, capture enriches `changed` with the record's known facts,
+    # so stripping the key here never empties the first pushable moment.)
     changed.pop("contact", None)
+    changed.pop("email", None)
     if not changed:
         return
     if not lead_key or "@" not in lead_key:

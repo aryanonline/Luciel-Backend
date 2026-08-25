@@ -101,8 +101,8 @@ class InMemoryCrmApi:
         rec = self.records.get(record_id)
         if rec is None:
             return None
+        del lead_key  # updates never rewrite the key (item 1) — mirror the live APIs
         rec["fields"].update(fields)
-        rec["lead_key"] = lead_key
         return CrmRecord(record_id=record_id)
 
 
@@ -173,11 +173,17 @@ class HubSpotCrmApi:
     async def update(
         self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
     ) -> CrmRecord | None:
+        # lead_key deliberately unused on update (item 1): re-sending the email
+        # property on every PATCH reverted a tenant's in-CRM correction; the
+        # record id already addresses the contact, so only changed facts ride.
+        del lead_key
+        if not fields:
+            return CrmRecord(record_id=record_id)
         async with self._transport_factory() as client:
             resp = await client.patch(
                 f"/crm/v3/objects/contacts/{record_id}",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"properties": self._properties(lead_key, fields)},
+                json={"properties": {str(k): str(v) for k, v in fields.items()}},
             )
         if resp.status_code == 404:
             return None  # deleted inside the CRM — caller heals the link
@@ -216,14 +222,50 @@ class SalesforceCrmApi:
         return httpx.AsyncClient(timeout=15.0, base_url=self._base)
 
     @staticmethod
-    def _field_payload(lead_key: str, fields: dict[str, Any]) -> dict[str, str]:
-        """Captured-lead facts → Salesforce Lead fields (the disclosed mapping)."""
+    def _create_payload(lead_key: str, fields: dict[str, Any]) -> dict[str, str]:
+        """Captured-lead facts → a NEW Salesforce Lead (the disclosed mapping).
+
+        Salesforce requires LastName and Company on create, so the honest
+        "Unknown" placeholder appears HERE and only here — never on update."""
         working = {str(k): str(v) for k, v in fields.items()}
         payload = {
             "Email": lead_key,
             "LastName": working.pop("name", "") or "Unknown",
             "Company": working.pop("business", "") or working.pop("company", "") or "Unknown",
         }
+        phone = working.pop("phone", "")
+        if phone:
+            payload["Phone"] = phone
+        if working:
+            payload["Description"] = "\n".join(f"{k}: {v}" for k, v in sorted(working.items()))
+        return payload
+
+    @staticmethod
+    def _update_payload(fields: dict[str, Any]) -> dict[str, str]:
+        """ONLY the facts this push changed → PATCH fields (round 5A, item 1).
+
+        The old shared payload builder re-sent Email/LastName/Company on every
+        update with the "Unknown" fallback, so a routine intent-only push
+        OVERWROTE whatever the tenant had typed into their own org — the exact
+        opposite of "keeps each lead's record current". An update never carries
+        Email (the tenant's in-CRM correction stands; our link row pins the
+        record id, so the key is not needed to address it) and never fabricates
+        a fallback for a field that did not change. Description carries the
+        latest non-mapped facts and is Luciel-maintained, as the mapping
+        disclosure states."""
+        working = {str(k): str(v) for k, v in fields.items()}
+        payload: dict[str, str] = {}
+        # "email" appears in an update's fields ONLY when the identity moved
+        # (the link's last-pushed key differs) — the one legitimate Email write.
+        moved_email = working.pop("email", "")
+        if moved_email:
+            payload["Email"] = moved_email
+        name = working.pop("name", "")
+        if name:
+            payload["LastName"] = name
+        company = working.pop("business", "") or working.pop("company", "")
+        if company:
+            payload["Company"] = company
         phone = working.pop("phone", "")
         if phone:
             payload["Phone"] = phone
@@ -266,7 +308,7 @@ class SalesforceCrmApi:
             resp = await client.post(
                 f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead",
                 headers={"Authorization": f"Bearer {token}"},
-                json=self._field_payload(lead_key, fields),
+                json=self._create_payload(lead_key, fields),
             )
         if resp.status_code not in (200, 201):
             raise CrmUnavailable(f"salesforce_create_http_{resp.status_code}")
@@ -275,11 +317,17 @@ class SalesforceCrmApi:
     async def update(
         self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
     ) -> CrmRecord | None:
+        # lead_key deliberately unused on update (item 1): the link row already
+        # pins the record id, and re-sending Email reverted tenant corrections.
+        del lead_key
+        payload = self._update_payload(fields)
+        if not payload:
+            return CrmRecord(record_id=record_id)
         async with self._transport_factory() as client:
             resp = await client.patch(
                 f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead/{record_id}",
                 headers={"Authorization": f"Bearer {token}"},
-                json=self._field_payload(lead_key, fields),
+                json=payload,
             )
         if resp.status_code == 404:
             return None  # deleted inside the CRM — caller heals the link
@@ -332,22 +380,71 @@ class _NativeCrmBackend:
             raise CrmUnavailable("crm_token_unavailable")
         api = await self._api_for(ctx)
 
-        link = (
-            await ctx.session.execute(
-                select(CrmLeadLink).where(
-                    CrmLeadLink.admin_id == ctx.admin_id,
-                    CrmLeadLink.instance_id == ctx.instance_id,
-                    CrmLeadLink.provider == self.provider,
-                    CrmLeadLink.lead_key == lead_key,
+        # Round 5A item 9 — resolve the link by LEAD first, key second. The
+        # key-ownership guard is what makes lead_id trustworthy: a model-proposed
+        # push can carry any email, and without the guard a stranger's key would
+        # PATCH the current lead's record with someone else's identity.
+        verified_lead_id: uuid.UUID | None = None
+        if ctx.resolved_lead_id is not None:
+            from app.models.lead import Lead  # noqa: PLC0415
+
+            lead_row = (
+                await ctx.session.execute(
+                    select(Lead).where(
+                        Lead.admin_id == ctx.admin_id, Lead.id == ctx.resolved_lead_id
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
+            if lead_row is not None:
+                owned_keys = {
+                    k.strip().lower()
+                    for k in (lead_row.email, lead_row.contact_identifier)
+                    if k and "@" in k
+                }
+                if lead_key.strip().lower() in owned_keys:
+                    verified_lead_id = lead_row.id
+
+        link: CrmLeadLink | None = None
+        if verified_lead_id is not None:
+            link = (
+                await ctx.session.execute(
+                    select(CrmLeadLink).where(
+                        CrmLeadLink.admin_id == ctx.admin_id,
+                        CrmLeadLink.instance_id == ctx.instance_id,
+                        CrmLeadLink.provider == self.provider,
+                        CrmLeadLink.lead_id == verified_lead_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        if link is None:
+            link = (
+                await ctx.session.execute(
+                    select(CrmLeadLink)
+                    .where(
+                        CrmLeadLink.admin_id == ctx.admin_id,
+                        CrmLeadLink.instance_id == ctx.instance_id,
+                        CrmLeadLink.provider == self.provider,
+                        CrmLeadLink.lead_key == lead_key,
+                    )
+                    .order_by(CrmLeadLink.last_pushed_at.asc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if link is not None and link.lead_id is not None and link.lead_id != verified_lead_id:
+                # That key's link belongs to ANOTHER lead — never adopt it.
+                link = None
+
+        # The identity field moved (email change since the last successful push):
+        # tell the CRM, exactly once — link.lead_key refreshes only on success,
+        # so the discrepancy persists until the CRM actually heard about it.
+        if link is not None and link.lead_key != lead_key:
+            fields = {**fields, "email": lead_key}
 
         # 1. Linked record → update IN PLACE (the maintenance semantics).
         if link is not None:
             updated = await api.update(token, link.crm_record_id, lead_key, fields)
             if updated is not None:
-                link.last_pushed_at = datetime.now(UTC)
+                await self._write_link(ctx, link, lead_key, updated.record_id, verified_lead_id)
                 await self._audit(ctx, "updated", updated.record_id)
                 return {"crm_record_id": updated.record_id, "action": "updated"}
             # Record deleted inside the CRM: fall through and HEAL the link.
@@ -358,13 +455,13 @@ class _NativeCrmBackend:
         if found is not None:
             updated = await api.update(token, found.record_id, lead_key, fields)
             record_id = (updated or found).record_id
-            await self._write_link(ctx, link, lead_key, record_id)
+            await self._write_link(ctx, link, lead_key, record_id, verified_lead_id)
             await self._audit(ctx, "updated", record_id)
             return {"crm_record_id": record_id, "action": "updated"}
 
         # 3. Create + link.
         created = await api.create(token, lead_key, fields)
-        await self._write_link(ctx, link, lead_key, created.record_id)
+        await self._write_link(ctx, link, lead_key, created.record_id, verified_lead_id)
         await self._audit(ctx, "created", created.record_id)
         return {"crm_record_id": created.record_id, "action": "created"}
 
@@ -383,10 +480,20 @@ class _NativeCrmBackend:
         )
 
     async def _write_link(
-        self, ctx: ToolContext, existing: CrmLeadLink | None, lead_key: str, record_id: str
+        self,
+        ctx: ToolContext,
+        existing: CrmLeadLink | None,
+        lead_key: str,
+        record_id: str,
+        lead_id: uuid.UUID | None,
     ) -> None:
+        # Every successful touch refreshes the key (the "identity moved" signal
+        # depends on it) and adopts the verified lead id onto legacy rows.
         if existing is not None:
             existing.crm_record_id = record_id
+            existing.lead_key = lead_key
+            if lead_id is not None:
+                existing.lead_id = lead_id
             existing.last_pushed_at = datetime.now(UTC)
             return
         ctx.session.add(
@@ -394,11 +501,38 @@ class _NativeCrmBackend:
                 admin_id=ctx.admin_id,
                 instance_id=ctx.instance_id,
                 provider=self.provider,
+                lead_id=lead_id,
                 lead_key=lead_key,
                 crm_record_id=record_id,
                 last_pushed_at=datetime.now(UTC),
             )
         )
+
+
+async def delete_links_for_lead(session: Any, *, admin_id: uuid.UUID, lead: Any) -> int:
+    """Delete every CRM link row belonging to this lead (round 5A item 2).
+
+    Erase/prune deleted the Lead but left its ``crm_lead_links`` rows — including
+    the person's email in plaintext — orphaned in our database after a
+    right-to-erasure action. Matches by lead_id AND by the lead's identifiers
+    (legacy rows without a lead_id). The EXTERNAL CRM record is deliberately not
+    touched: §3.3.6 is one-way, and the UI/legal copy now states that the record
+    inside the tenant's own CRM is theirs to delete there."""
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+    from sqlalchemy import or_  # noqa: PLC0415
+
+    keys = [k for k in (lead.contact_identifier, lead.email) if k]
+    cond = CrmLeadLink.lead_id == lead.id
+    if keys:
+        cond = or_(cond, CrmLeadLink.lead_key.in_(keys))
+    result = await session.execute(
+        sa_delete(CrmLeadLink).where(
+            CrmLeadLink.admin_id == admin_id,
+            CrmLeadLink.instance_id == lead.instance_id,
+            cond,
+        )
+    )
+    return int(result.rowcount or 0)
 
 
 class HubSpotCrmBackend(_NativeCrmBackend):

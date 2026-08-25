@@ -100,6 +100,13 @@ def degraded_bindings() -> list[str]:
         degraded.append("stripe_gateway:FakeStripeGateway")
     if not live_mode():
         degraded.append("llm:EchoModel")
+    # Round 5B item 17: hCaptcha in live mode. With no secret configured, captcha
+    # enforcement is OFF and live signups run unprotected — a binding problem
+    # this list exists to surface. (A configured-but-failing hCaptcha service
+    # fails signups CLOSED and is visible in logs; a static health check cannot
+    # probe it without spending a verification.)
+    if live_mode() and not settings.hcaptcha_secret_key:
+        degraded.append("hcaptcha:unconfigured")
     return degraded
 
 

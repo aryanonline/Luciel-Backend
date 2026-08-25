@@ -156,6 +156,10 @@ class LeadOut(WireModel):
     lead_id: uuid.UUID
     name: str | None = None
     contact_identifier: str | None = None
+    # Round 5A item 5: the volunteered email beside a phone transport key — the
+    # CRM dedupe key once known. Null when unknown or when contactIdentifier
+    # already is the email.
+    email: str | None = None
     intent: str | None = None
     state: LeadStateWire
     # Admin-marked business outcome (Vision §7; C14). Distinct from `state`

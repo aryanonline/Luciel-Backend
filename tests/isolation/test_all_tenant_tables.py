@@ -68,7 +68,9 @@ async def test_cross_tenant_invisible_for_every_model():
     from app.models.budget import ConversationBudget
     from app.models.connection import InstanceConnection
     from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
+    from app.models.crm_link import CrmLeadLink
     from app.models.deferred import DeferredAction
+    from app.models.email_incident import EmailDeliveryIncident
     from app.models.instance import Account, AccountState, Instance, LucielState
     from app.models.knowledge import (
         KnowledgeChunk,
@@ -252,6 +254,23 @@ async def test_cross_tenant_invisible_for_every_model():
                 dunning_state="none",
             )
         )
+        s.add(
+            CrmLeadLink(
+                admin_id=a,
+                instance_id=iid,
+                provider="hubspot",
+                lead_id=uuid.uuid4(),
+                lead_key="isolated@example.com",
+                crm_record_id="rec-1",
+            )
+        )
+        s.add(
+            EmailDeliveryIncident(
+                admin_id=a,
+                email_lower="owner@example.com",
+                soft_bounce_count=1,
+            )
+        )
 
     # admin_audit_log via the writer (chained).
     from app.audit import log as audit
@@ -280,6 +299,8 @@ async def test_cross_tenant_invisible_for_every_model():
         ToolTraceEvent,
         RetrievalTraceEvent,
         BillingAccount,
+        CrmLeadLink,
+        EmailDeliveryIncident,
         AdminAuditLog,
     ]
     async with tenant_session(b) as s:

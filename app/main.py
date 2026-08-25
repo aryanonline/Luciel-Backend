@@ -126,6 +126,7 @@ def create_app() -> FastAPI:
     from app.api.v1.connections_callback import router as connections_callback_router
     from app.api.v1.contact import router as contact_router
     from app.api.v1.dashboard import router as dashboard_router
+    from app.api.v1.escalation_contact import router as escalation_contact_router
     from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
 
@@ -153,6 +154,10 @@ def create_app() -> FastAPI:
     # Marketing contact form: unauthenticated by necessity, captcha + IP bucket instead
     # of a session (ruling 1).
     app.include_router(contact_router)
+    # Escalation-contact confirmation (round 5B item 13): public by necessity —
+    # the contact may not be the account owner; the signed single-use token in
+    # the confirmation email is the authorization.
+    app.include_router(escalation_contact_router)
 
     return app
 

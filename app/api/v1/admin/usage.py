@@ -88,6 +88,25 @@ async def _build_overview_out(
             await s.execute(select(Instance.escalation).where(Instance.id == instance_id))
         ).scalar_one_or_none()
     escalation_contact_configured = has_configured_escalation_contact(escalation_config)
+    # Round 5B item 13: is a configured email contact currently suppressed?
+    escalation_contact_bouncing = False
+    if escalation_config:
+        from app.models.email_incident import is_suppressed  # noqa: PLC0415
+        from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
+
+        contacts = [
+            str(a)
+            for a in (
+                escalation_config.get("primaryEmail"),
+                escalation_config.get("secondaryEmail"),
+            )
+            if a
+        ]
+        if contacts:
+            states = await states_for(s, subject.admin_id, contacts)
+            escalation_contact_bouncing = any(
+                is_suppressed(states.get(c.strip().lower())) for c in contacts
+            )
 
     out = AnalyticsOverviewOut.model_validate(
         {
@@ -153,6 +172,7 @@ async def _build_overview_out(
                 agg.conversion_by_service_gap.reason if agg.conversion_by_service_gap else None
             ),
             "escalationContactConfigured": escalation_contact_configured,
+            "escalationContactBouncing": escalation_contact_bouncing,
         }
     )
     return out, agg
