@@ -27,20 +27,25 @@ path (no Redis import in the billing/budget modules today).
 
 from __future__ import annotations
 
+import logging
 import math
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
 from app.billing import dunning
 from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.config import get_settings
+from app.models.audit import ActorType
 from app.models.billing import BillingAccount
-from app.models.budget import ConversationBudget
-from app.runtime.budget import period_start_for
+from app.models.budget import ConversationBudget, CountedSession
+from app.runtime.budget import current_period, period_start_for
+
+_log = logging.getLogger(__name__)
 
 
 # --- pure metering math (the locked-number core) ---------------------------- #
@@ -147,7 +152,7 @@ async def build_budget(
 
     # Read the counter from the Arc 14 source of truth — do NOT recount (§3.4.1b).
     # Same anchor the counter was written under, so the read cannot miss the row.
-    period = period_start_for(account, now)
+    period, resets_at = current_period(account, now)
     budget_row = (
         await session.execute(
             select(ConversationBudget).where(
@@ -187,16 +192,9 @@ async def build_budget(
         else 0
     )
 
-    # periodResetsAt: the Stripe period end (set on invoice.paid). Until a Stripe
-    # period is established we surface the calendar-anchored fallback so the wire
-    # field is always a valid timestamp (flagged: real anchor lands with Stripe).
-    resets_at = account.period_resets_at or datetime(
-        now.year + (1 if now.month == 12 else 0),
-        1 if now.month == 12 else now.month + 1,
-        1,
-        tzinfo=UTC,
-    )
-
+    # periodResetsAt: the end of the period the counter is keyed on — the Stripe
+    # period once one exists (rolled forward by whole cycles if an invoice.paid never
+    # came), the calendar month before that. Always the same anchor as ``period``.
     return MeteredBudget(
         billing_state=account.billing_state,
         dunning_state=account.dunning_state,
@@ -252,6 +250,10 @@ async def report_usage_after_count(
     try:
         return await report_usage(session, admin_id=admin_id, instance_id=instance_id, now=now)
     except Exception:  # noqa: BLE001 — never let billing break a conversation
+        # Swallowed for the lead's turn, NOT for the operator (audit F038): the watermark
+        # is unmoved so the next turn / reconcile sweep retries, and this line is what
+        # the sweep log group's error alarm sees.
+        _log.exception("usage report failed admin_id=%s instance_id=%s", admin_id, instance_id)
         return 0
 
 
@@ -273,6 +275,9 @@ async def report_usage(
     gateway = gateway or get_stripe_gateway()
     now = now or datetime.now(UTC)
     account = await get_or_create_billing_account(session, admin_id=admin_id)
+
+    period = period_start_for(account, now)
+    await _roll_accrual_period(session, account=account, period=period, gateway=gateway)
 
     budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
     # The accrual is the period high-water mark, not the current reading: build_budget
@@ -301,8 +306,156 @@ async def report_usage(
             return 0  # no metered price bound → report nothing rather than mis-bill
         account.stripe_subscription_id = sub_id
         await session.flush()
+        # Billing has begun: from here the free 50 is "per Stripe billing period", so
+        # the counter's anchor moves from the calendar month to the subscription's
+        # cycle and the rows counted so far move with it (audit F004/F030).
+        period = await _anchor_to_subscription(
+            session, account=account, instance_id=instance_id, sub_id=sub_id, gateway=gateway
+        )
 
-    return await _post_usage(session, account=account, quantity=quantity, gateway=gateway, now=now)
+    return await _post_usage(
+        session, account=account, quantity=quantity, gateway=gateway, period=period
+    )
+
+
+async def _anchor_to_subscription(
+    session: AsyncSession,
+    *,
+    account: BillingAccount,
+    instance_id: uuid.UUID,
+    sub_id: str,
+    gateway: StripeGateway,
+) -> date:
+    """Re-key the tenant's period from the calendar fallback to the Stripe cycle.
+
+    The subscription's current period is the truth of when the free allowance resets
+    (§3.4.1b). The conversations already counted this calendar month belong to the
+    cycle that just opened — they are the reason it opened — so the counter row and
+    the fire-once ledger rows keyed on the old anchor move to the new one rather than
+    resetting to zero (which would hand out a second free 50) or being stranded under
+    a key nothing reads again (which would freeze the counter).
+
+    Returns the period the counter is now keyed on."""
+    old_period = period_start_for(account)
+    try:
+        bounds = await gateway.get_subscription_period(subscription_id=sub_id)
+    except Exception:  # noqa: BLE001 — the calendar anchor keeps working until the next try
+        _log.exception("subscription period read failed admin_id=%s", account.admin_id)
+        return old_period
+    if bounds is None:
+        return old_period
+    start, end = bounds
+    account.period_start = start
+    account.period_resets_at = end
+    new_period = start.astimezone(UTC).date()
+    if new_period == old_period:
+        await session.flush()
+        return new_period
+    await _rekey_period(session, account=account, old=old_period, new=new_period)
+    account.accrual_period_start = new_period
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=account.admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="billing_period_anchored",
+        payload={
+            "from_period_start": old_period.isoformat(),
+            "to_period_start": new_period.isoformat(),
+            "period_resets_at": end.isoformat(),
+            "subscription_id": sub_id,
+        },
+    )
+    return new_period
+
+
+async def _rekey_period(
+    session: AsyncSession, *, account: BillingAccount, old: date, new: date
+) -> None:
+    """Move this tenant's counter + fire-once rows from period ``old`` to ``new``.
+
+    A counter row can already exist under ``new`` (a webhook raced ahead); then the
+    counts merge into it and the old row goes, so ``uq_budget_period`` is never
+    violated and no conversation is counted twice or lost."""
+    admin_id = account.admin_id
+    old_rows = (
+        (
+            await session.execute(
+                select(ConversationBudget).where(
+                    ConversationBudget.admin_id == admin_id,
+                    ConversationBudget.billing_period_start == old,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in old_rows:
+        target = (
+            await session.execute(
+                select(ConversationBudget).where(
+                    ConversationBudget.admin_id == admin_id,
+                    ConversationBudget.instance_id == row.instance_id,
+                    ConversationBudget.billing_period_start == new,
+                )
+            )
+        ).scalar_one_or_none()
+        if target is None:
+            row.billing_period_start = new
+        else:
+            target.counted_conversations += row.counted_conversations
+            target.counted_session_ids = list(target.counted_session_ids) + list(
+                row.counted_session_ids
+            )
+            await session.execute(delete(ConversationBudget).where(ConversationBudget.id == row.id))
+    await session.execute(
+        update(CountedSession)
+        .where(
+            CountedSession.admin_id == admin_id,
+            CountedSession.billing_period_start == old,
+        )
+        .values(billing_period_start=new)
+    )
+    await session.flush()
+
+
+async def _roll_accrual_period(
+    session: AsyncSession,
+    *,
+    account: BillingAccount,
+    period: date,
+    gateway: StripeGateway,
+) -> None:
+    """Bring the usage watermarks into the period the counter is keyed on.
+
+    The counter rolls on its own (``current_period``), but the watermarks belong to
+    whichever period they were accrued in. If a period ended without an
+    ``invoice.paid`` — a failed invoice, a delayed or lost webhook — the old
+    watermarks used to persist, so the new period's first block was silently
+    withheld until its total exceeded the previous period's (audit F030/F004).
+
+    Any residual the old period still owes is flushed under the OLD period's
+    identifiers first; only then do the watermarks reset for the new period. A
+    failing flush raises, leaving everything as it was for the next retry."""
+    if account.accrual_period_start is None:
+        account.accrual_period_start = period
+        await session.flush()
+        return
+    if account.accrual_period_start == period:
+        return
+    if account.accrued_blocks > account.last_reported_blocks and account.stripe_subscription_id:
+        await _post_usage(
+            session,
+            account=account,
+            quantity=account.accrued_blocks,
+            gateway=gateway,
+            period=account.accrual_period_start,
+        )
+    account.accrued_blocks = 0
+    account.last_reported_blocks = 0
+    account.accrual_period_start = period
+    await session.flush()
 
 
 async def _post_usage(
@@ -311,7 +464,7 @@ async def _post_usage(
     account: BillingAccount,
     quantity: int,
     gateway: StripeGateway,
-    now: datetime,
+    period: date,
 ) -> int:
     """Post the blocks accrued since the watermark as a meter event, then advance it.
 
@@ -339,7 +492,7 @@ async def _post_usage(
         value=delta,
         identifier=meter_event_identifier(
             customer_id=account.stripe_customer_id,
-            period_start=period_start_for(account, now),
+            period_start=period,
             from_block=from_block,
             to_block=quantity,
         ),
@@ -373,6 +526,9 @@ async def report_accrued_usage(
         return 0
     if account.stripe_subscription_id is None:
         return 0  # nothing was ever metered against this tenant
+    # The residual belongs to the period it accrued in, which is not necessarily the
+    # current one (the counter may have rolled since the last turn).
+    period = account.accrual_period_start or period_start_for(account, now)
     return await _post_usage(
-        session, account=account, quantity=account.accrued_blocks, gateway=gateway, now=now
+        session, account=account, quantity=account.accrued_blocks, gateway=gateway, period=period
     )

@@ -7,12 +7,19 @@ then dispatches here. Idempotent on the Stripe event id (HARD CONSTRAINT, §3.4.
 a redelivered event is a no-op — Stripe may redeliver.
 
 Events handled:
-  * invoice.paid                    → reset period + counter (NO rollover), clear dunning,
+  * invoice.paid                    → advance the period anchor to the NEXT Stripe period
+                                      (the counter is keyed by period, so it starts at
+                                      zero by construction — NO rollover), clear dunning,
                                       restore dormant connections (Legal §A3 / §3.6.7).
+                                      The settled period's ledger rows are KEPT: they are
+                                      the evidence behind the invoice (audit F005/F042).
   * invoice.payment_failed          → drive dunning none→retrying, email notification +
                                       lifecycle_notice_sent audit (Legal §A3 / §3.6.7).
+                                      The attempt number is Stripe's own ``attempt_count``.
   * payment_method.attached         → flip billingState→payg_enabled + store display tuple,
-                                      restore dormant connections (Legal §A3).
+                                      make the card the invoice default, clear any dunning
+                                      (a new card IS the remedy, F012), restore dormant
+                                      connections to their pre-dormant status (Legal §A3).
   * payment_method.detached         → flip billingState→free_cap + clear display tuple.
   * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
 """
@@ -23,17 +30,16 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.billing import dunning, metering
 from app.billing.metering import get_or_create_billing_account
-from app.billing.stripe_gateway import StripeEvent
+from app.billing.stripe_gateway import StripeEvent, add_months, get_stripe_gateway
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
-from app.models.budget import ConversationBudget, CountedSession
 from app.models.connection import InstanceConnection
 from app.notifications import notifier as notify
 
@@ -78,7 +84,9 @@ async def handle_event(
     if event.type == "invoice.paid":
         action = await _on_invoice_paid(session, admin_id=admin_id, account=account, event=event)
     elif event.type == "invoice.payment_failed":
-        action = await _on_payment_failed(session, admin_id=admin_id, account=account, now=now)
+        action = await _on_payment_failed(
+            session, admin_id=admin_id, account=account, event=event, now=now
+        )
     elif event.type == "payment_method.attached":
         action = await _on_pm_attached(session, admin_id=admin_id, account=account, event=event)
     elif event.type == "payment_method.detached":
@@ -101,30 +109,58 @@ async def _on_invoice_paid(
     account: BillingAccount,
     event: StripeEvent,
 ) -> str:
-    """invoice.paid → reset the period + counter (NO rollover), clear dunning,
-    and restore dormant connections (Legal §A3 / Architecture §3.6.7).
+    """invoice.paid → the NEXT period begins, dunning clears, dormant connections restore.
 
-    Period is Stripe-billing-date anchored (§3.4.1b): the new period bounds come
-    from the invoice's period fields when present."""
-    # Set the new Stripe-anchored period bounds (when the invoice carries them).
+    Period is Stripe-billing-date anchored (§3.4.1b). The invoice's ``period_start`` /
+    ``period_end`` describe the period that was JUST BILLED, so the new anchor is the
+    invoice's ``period_end`` (which is the next period's start) — the old code wrote
+    ``period_start`` back as the anchor, re-opening the period that had just been paid
+    for (audit F005). When the invoice carries no period the anchor advances one cycle.
+
+    The counter is keyed by period start, so the new period reads zero without deleting
+    anything: the settled period's ``conversation_budgets`` / ``counted_sessions`` rows
+    are the evidence behind the invoice and are KEPT for disputes (F042). Deleting them
+    also made the fire-once guard forget every session, so a conversation that straddled
+    the boundary was counted again on its next turn (F029).
+    """
+    prev_start = account.period_start
     ps = event.data.get("period_start")
     pe = event.data.get("period_end")
-    if isinstance(ps, (int, float)):
-        account.period_start = datetime.fromtimestamp(ps, tz=UTC)
     if isinstance(pe, (int, float)):
-        account.period_resets_at = datetime.fromtimestamp(pe, tz=UTC)
+        new_start = datetime.fromtimestamp(pe, tz=UTC)
+    elif isinstance(ps, (int, float)):
+        new_start = add_months(datetime.fromtimestamp(ps, tz=UTC), 1)
+    elif account.period_resets_at is not None:
+        new_start = account.period_resets_at.astimezone(UTC)
+    elif account.period_start is not None:
+        new_start = add_months(account.period_start.astimezone(UTC), 1)
+    else:
+        new_start = datetime.now(UTC)
+    # Never move the anchor backwards: a late-delivered invoice for a period the anchor
+    # has already rolled past (current_period advances on its own) must not re-open it.
+    if prev_start is not None and new_start <= prev_start.astimezone(UTC):
+        new_start = prev_start.astimezone(UTC)
+    account.period_start = new_start
+    account.period_resets_at = add_months(new_start, 1)
 
-    # Counter reset, NO rollover (§3.4.1b): drop the tenant's budget rows so the
-    # new period starts at zero. The counter is the source of truth (budget.py).
-    await session.execute(delete(ConversationBudget).where(ConversationBudget.admin_id == admin_id))
-    # The fire-once guard is keyed on the period too, so its rows are spent along with
-    # the counter they guarded — leaving them would only accumulate.
-    await session.execute(delete(CountedSession).where(CountedSession.admin_id == admin_id))
-
-    # The usage watermark is period-scoped like the counter: the invoice just settled
-    # everything reported so far, so the new period starts owing Stripe nothing.
-    account.accrued_blocks = 0
-    account.last_reported_blocks = 0
+    # The usage watermarks reset ONLY when they still describe the period this invoice
+    # settled. Two cases must leave them alone: the $0 invoice Stripe issues at
+    # subscription creation (its period_end is the anchor that was just set — nothing
+    # was settled), and an invoice that lands after a counted turn already rolled the
+    # watermarks into the new period (metering._roll_accrual_period). Zeroing in either
+    # case re-posts the same block later under an identifier Stripe only dedupes for
+    # 24 hours — a double bill. Any residual of the settled period is flushed first,
+    # under that period's own identifiers, so it lands on the next invoice.
+    new_period = new_start.date()
+    if account.accrual_period_start is None or account.accrual_period_start < new_period:
+        try:
+            await metering.report_accrued_usage(session, admin_id=admin_id)
+        except Exception:  # noqa: BLE001 — the watermark stays; the reconcile sweep retries
+            _log.exception("settled-period residual flush failed admin_id=%s", admin_id)
+        else:
+            account.accrued_blocks = 0
+            account.last_reported_blocks = 0
+            account.accrual_period_start = new_period
 
     # A successful payment clears any dunning sequence (CJ §6).
     prev_dunning = account.dunning_state
@@ -137,7 +173,15 @@ async def _on_invoice_paid(
         admin_id=admin_id,
         actor_type=ActorType.platform,
         event_type="invoice_paid",
-        payload={"reset": "period_and_counter", "rollover": False},
+        payload={
+            "reset": "period_advanced",
+            "rollover": False,
+            "ledger_retained": True,
+            "period_start": new_start.date().isoformat(),
+            "previous_period_start": (
+                prev_start.astimezone(UTC).date().isoformat() if prev_start else None
+            ),
+        },
     )
     if prev_dunning != account.dunning_state:
         await audit.emit(
@@ -149,8 +193,19 @@ async def _on_invoice_paid(
         )
 
     # Legal §A3: restore dormant connections on successful payment.
-    await _restore_dormant_connections(session, admin_id=admin_id)
+    await _restore_dormant_connections(session, admin_id=admin_id, reason="invoice_paid")
     return "invoice_paid"
+
+
+def _attempt_number(event: StripeEvent, account: BillingAccount, now: datetime) -> int:
+    raw = event.data.get("attempt_count")
+    if isinstance(raw, (int, float)) and int(raw) >= 1:
+        return int(raw)
+    # Legacy fallback (an event without the field): position in the CJ §6 schedule.
+    if account.dunning_started_at is None:
+        return 1
+    elapsed_days = (now - account.dunning_started_at).days
+    return sum(1 for d in dunning.RETRY_DAYS if elapsed_days >= d) or 1
 
 
 async def _on_payment_failed(
@@ -158,6 +213,7 @@ async def _on_payment_failed(
     *,
     admin_id: uuid.UUID,
     account: BillingAccount,
+    event: StripeEvent,
     now: datetime,
 ) -> str:
     """invoice.payment_failed → enter/continue dunning + notify admin (CJ §6 / Legal §A3).
@@ -177,13 +233,11 @@ async def _on_payment_failed(
     # Apply the time-driven advance (retrying → reduced once day 7 is reached).
     account.dunning_state = dunning.advance(account.dunning_state, account.dunning_started_at, now)
 
-    # Compute the attempt number (1-based: which retry attempt this is, days 1/3/5/7).
-    attempt_number = 1
-    if account.dunning_started_at is not None:
-        elapsed_days = (now - account.dunning_started_at).days
-        retry_days = dunning.RETRY_DAYS  # (1, 3, 5, 7)
-        # attempt_number = position in the retry schedule (1-indexed).
-        attempt_number = sum(1 for d in retry_days if elapsed_days >= d) or 1
+    # The attempt number is Stripe's own ``attempt_count`` on the invoice: it is what
+    # the email tells the owner ("attempt 2 of 4"), and deriving it from elapsed days
+    # (audit F027) said "attempt 1" for every retry inside the first day and skipped
+    # numbers when Stripe's smart retries did not land exactly on days 1/3/5/7.
+    attempt_number = _attempt_number(event, account, now)
 
     await session.flush()
 
@@ -243,6 +297,30 @@ async def _on_pm_attached(
         account.pm_exp_year = int(ey) if isinstance(ey, (int, float)) else None
     prev_billing_state = account.billing_state
     account.billing_state = "payg_enabled"  # adding a card flips behavior >50 (Vision §7)
+
+    # A card attached through Checkout in setup mode is NOT automatically the customer's
+    # invoice default (audit F006): without this, the first metered invoice had no
+    # payment method to charge and went straight to payment_failed. The event's ``id``
+    # is the payment-method id; Stripe holds the card, we hold the pointer.
+    pm_id = event.data.get("id")
+    default_set: bool | None = None
+    if isinstance(pm_id, str) and pm_id and account.stripe_customer_id:
+        try:
+            default_set = await get_stripe_gateway().set_default_payment_method(
+                customer_id=account.stripe_customer_id, payment_method_id=pm_id
+            )
+        except Exception:  # noqa: BLE001 — never strand the attach event on a Stripe blip
+            _log.exception("default payment method set failed admin_id=%s", admin_id)
+            default_set = False
+
+    # A new card is the remedy for a failing one: leaving dunning in place (F012) kept
+    # the account in ``reduced`` — capped at 50 with tools dormant — with a valid card
+    # on file until an invoice.paid happened to arrive. Stripe retries the open invoice
+    # against the new default on its own schedule.
+    prev_dunning = account.dunning_state
+    if prev_dunning != dunning.NONE:
+        account.dunning_state = dunning.on_payment_succeeded()
+        account.dunning_started_at = None
     await session.flush()
 
     await audit.emit(
@@ -250,8 +328,24 @@ async def _on_pm_attached(
         admin_id=admin_id,
         actor_type=ActorType.platform,
         event_type="payment_method_added",
-        payload={"brand": account.pm_brand, "last4": account.pm_last4},
+        payload={
+            "brand": account.pm_brand,
+            "last4": account.pm_last4,
+            "invoice_default_set": default_set,
+        },
     )
+    if prev_dunning != account.dunning_state:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="dunning_state_changed",
+            payload={
+                "from": prev_dunning,
+                "to": account.dunning_state,
+                "reason": "payment_method_attached",
+            },
+        )
     # Architecture §3.6.7 / §5.2: the billing state change itself is the canonical
     # lifecycle_transition (free_cap → payg_enabled). payment_method_added above is
     # supplementary detail. Emit only on an actual state change so idempotent webhook
@@ -267,37 +361,56 @@ async def _on_pm_attached(
 
     # Legal §A3: "connections that go dormant … are restored automatically if a valid
     # payment method is added within the retention window."
-    await _restore_dormant_connections(session, admin_id=admin_id)
+    await _restore_dormant_connections(session, admin_id=admin_id, reason="payment_method")
     return "payment_method.attached"
 
 
-async def _restore_dormant_connections(session: AsyncSession, *, admin_id: uuid.UUID) -> int:
-    """Restore dormant connections to unconfigured for re-health-check (Legal §A3 / §3.6.7).
+async def _restore_dormant_connections(
+    session: AsyncSession, *, admin_id: uuid.UUID, reason: str = "payment"
+) -> int:
+    """Return dormant connections to the status they held BEFORE going dormant
+    (Legal §A3 / §3.6.7).
 
-    When a valid payment method is added or invoice.paid fires after dunning, any
-    connections placed in ``dormant`` state must be made re-checkable (unconfigured).
-    The health worker will then probe them and promote to ``connected`` if healthy.
+    ``set_dormant_for_action_tools`` stashes each row's prior status and detail (the
+    same stash columns the delete/restore pair uses, migration 0049). A connection
+    that was ``connected`` comes back ``connected`` — a card re-add is a billing
+    event, not a credential event, and blanket ``unconfigured`` (audit F069) told the
+    owner to reconnect a calendar whose OAuth grant never changed. Pre-0049 dormant
+    rows carry no stash and fall back to ``unconfigured`` so the health worker
+    re-probes them.
 
     Returns the number of rows transitioned."""
-    result = await session.execute(
-        update(InstanceConnection)
-        .where(
-            InstanceConnection.admin_id == admin_id,
-            InstanceConnection.status == "dormant",
+    rows = (
+        (
+            await session.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.status == "dormant",
+                )
+            )
         )
-        .values(status="unconfigured", status_detail="restored_after_payment")
+        .scalars()
+        .all()
     )
-    restored = int(result.rowcount or 0)  # type: ignore[attr-defined]
+    for row in rows:
+        row.status = row.status_stashed or "unconfigured"
+        row.status_detail = (
+            row.status_detail_stashed if row.status_stashed else "restored_after_payment"
+        )
+        row.status_stashed = None
+        row.status_detail_stashed = None
+    restored = len(rows)
     if restored > 0:
+        await session.flush()
         await audit.emit(
             session,
             admin_id=admin_id,
             actor_type=ActorType.platform,
             event_type="connection_status_changed",
             payload={
-                "reason": "dormant_connections_restored_on_payment",
+                "reason": f"dormant_connections_restored_on_{reason}",
                 "count": restored,
-                "new_status": "unconfigured",
+                "new_status": "prior_status",
             },
         )
     return restored

@@ -52,3 +52,126 @@ def test_admit_combines_source_and_tenant():
     rate_limit._store = TokenBucketStore()
     r = rate_limit.admit("email", "sender@x.com", "tenantC")
     assert r.allowed is True
+
+
+def _drain_daily(store: TokenBucketStore, channel: str, src: str, cap: int) -> None:
+    """Consume `cap` admissions with the bucket kept full (refill faked by the clock)."""
+    clock = [0.0]
+
+    def fake_now() -> float:
+        clock[0] += 1000.0  # far past any refill interval → bucket is always full
+        return clock[0]
+
+    store._now = fake_now  # type: ignore[method-assign]
+    for _ in range(cap):
+        assert store.check_source(channel, src).allowed
+
+
+def test_daily_cap_resets_at_utc_midnight(monkeypatch):
+    """Audit F033: the daily counter never reset, so a source that hit the cap once was
+    denied for the life of the process. The cap is a per-day figure (§3.1.5)."""
+    store = TokenBucketStore()
+    day = ["20260905"]
+    monkeypatch.setattr(rate_limit, "_utc_day", lambda _wall: day[0])
+    limits = rate_limit.LIMITS["contact"]
+    _drain_daily(store, "contact", "1.2.3.4", limits.daily_cap)
+    assert store.check_source("contact", "1.2.3.4").reason == "daily_cap"
+    day[0] = "20260906"  # the calendar rolls over
+    assert store.check_source("contact", "1.2.3.4").allowed is True
+
+
+def test_auto_block_expires_instead_of_lasting_forever():
+    store = TokenBucketStore()
+    src = "shared-office-nat"
+    for _ in range(5 + AUTO_BLOCK_ABUSE_THRESHOLD + 1):
+        store.check_source("sms", src)
+    assert store.is_blocked("sms", src) is True
+    # Jump the monotonic clock past the block window: the source is admitted again.
+    later = store._now() + rate_limit.AUTO_BLOCK_SECONDS + 1
+    store._now = lambda: later  # type: ignore[method-assign]
+    assert store.is_blocked("sms", src) is False
+    assert store.check_source("sms", src).allowed is True
+
+
+def test_idle_entries_are_evicted_so_memory_is_bounded():
+    """Audit F033: none of the dictionaries were ever evicted — an unbounded leak keyed
+    on attacker-chosen source ids. Idle entries now age out on the eviction cadence."""
+    store = TokenBucketStore()
+    for i in range(300):
+        store.check_source("sms", f"+1555000{i:04d}")
+    assert len(store._tokens) == 300
+    later = store._now() + rate_limit.IDLE_EVICT_SECONDS + 1
+    store._now = lambda: later  # type: ignore[method-assign]
+    # Enough operations to cross the eviction cadence.
+    for _ in range(rate_limit._EVICT_EVERY_N_OPS):
+        store.check_source("sms", "+15559999999")
+    assert len(store._tokens) == 1
+    assert list(store._tokens) == ["sms:+15559999999"]
+
+
+def test_redis_store_mirrors_the_in_memory_semantics():
+    """Audit F167: the module documented a Redis backend that did not exist, so every
+    ceiling was per-process and reset on each deploy. The Redis store must enforce the
+    same burst / daily / tenant / auto-block outcomes, atomically via INCR+EXPIRE."""
+    import fakeredis
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    store = rate_limit.RedisTokenBucketStore(client)
+    assert store.kind == "redis"
+    allowed = sum(1 for _ in range(6) if store.check_source("sms", "+15550001111").allowed)
+    assert allowed == 5, "burst of 5 within one window, the 6th is rate_limited"
+    # Tenant ceiling is shared across every source and every process.
+    admitted = sum(
+        1 for _ in range(TENANT_INBOUND_PER_MINUTE + 5) if store.check_tenant("tenantR").allowed
+    )
+    assert admitted == TENANT_INBOUND_PER_MINUTE
+    # Repeated abuse from one source auto-blocks with an EXPIRING key.
+    for _ in range(5 + AUTO_BLOCK_ABUSE_THRESHOLD + 1):
+        store.check_source("sms", "abuser")
+    assert store.is_blocked("sms", "abuser") is True
+    assert client.ttl("rl:b:sms:abuser") > 0
+    assert store.check_source("sms", "abuser").reason == "auto_blocked"
+    # Every counter carries its own expiry — nothing accumulates in Redis either.
+    for key in client.keys("rl:*"):
+        assert client.ttl(key) > 0, f"{key} has no expiry"
+
+
+def test_redis_store_degrades_to_in_memory_on_redis_error():
+    """A Redis outage must not fail OPEN (cap removed) nor drop all traffic."""
+
+    class _Broken:
+        def __getattr__(self, name: str):  # every command raises
+            def _boom(*_a, **_k):
+                raise ConnectionError("redis down")
+
+            return _boom
+
+    store = rate_limit.RedisTokenBucketStore(_Broken())
+    allowed = sum(1 for _ in range(6) if store.check_source("sms", "+15550002222").allowed)
+    assert allowed == 5, "the in-memory fallback keeps enforcing the burst"
+    assert store.check_tenant("tenantD").allowed is True
+
+
+def test_store_kind_reports_the_bound_backend(monkeypatch):
+    rate_limit._store = TokenBucketStore()
+    assert rate_limit.store_kind() == "in_memory"
+    import fakeredis
+
+    rate_limit._store = rate_limit.RedisTokenBucketStore(fakeredis.FakeRedis(decode_responses=True))
+    assert rate_limit.store_kind() == "redis"
+    rate_limit._store = TokenBucketStore()
+
+
+def test_widget_buckets_exist_for_every_admission_stage():
+    """The widget gate keys on trusted identity across four buckets (§3.1.5)."""
+    for channel in (
+        "widget",
+        "widget_ip",
+        "widget_session_open",
+        "widget_bootstrap",
+        "widget_poll",
+    ):
+        assert channel in rate_limit.LIMITS, channel
+    # Opening a conversation is the billable event: its cap must be tighter than the
+    # per-IP message allowance.
+    assert rate_limit.LIMITS["widget_session_open"].burst < rate_limit.LIMITS["widget_ip"].burst

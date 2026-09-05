@@ -17,9 +17,9 @@ end surfaced to the UI as ``periodResetsAt``; the counter resets on the Stripe
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import Date, DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,6 +70,14 @@ class BillingAccount(Base, TenantMixin, TimestampMixin):
     # next turn instead of losing the block forever.
     accrued_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_reported_blocks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # The billing period the two watermarks above belong to (migration 0055). A period
+    # can roll WITHOUT an invoice.paid (a failed invoice, a cancelled subscription, a
+    # delayed webhook) — the counter is keyed by period and rolls on its own, but the
+    # watermarks used to persist across the boundary, so the new period's first blocks
+    # were never reported until they exceeded the OLD period's total. Metering compares
+    # this to the current period and rolls the watermarks (flushing any residual under
+    # the old period's identifiers first).
+    accrual_period_start: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # Monotonic ALL-TIME billed-conversation count (migration 0035). Incremented in
     # count_session_once inside the same transaction as the counted_sessions claim

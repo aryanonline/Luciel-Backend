@@ -44,10 +44,17 @@ class PaymentMethodOut(WireModel):
 
 
 class BillingInfoOut(WireModel):
-    """{budget, paymentMethod?} — paymentMethod present only when payg_enabled."""
+    """{budget, paymentMethod?, paymentsAvailable} — paymentMethod only when payg_enabled.
+
+    ``paymentsAvailable`` is false while the deployment's Stripe posture is "mock":
+    the dashboard then says payments are not live yet instead of offering a checkout
+    button whose URL is a placeholder (audit F026). Additive — the frozen schema
+    ignores unknown keys, so older clients are unaffected.
+    """
 
     budget: BudgetOut
     payment_method: PaymentMethodOut | None = None
+    payments_available: bool = True
 
 
 class CheckoutSessionOut(WireModel):

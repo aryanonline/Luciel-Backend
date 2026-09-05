@@ -99,17 +99,40 @@ def test_unreadable_scan_json_fails_closed(tmp_path):
     assert gate.main([str(scan_file), str(allow_file), "--today", TODAY]) == 1
 
 
-def test_lower_severities_never_block(tmp_path):
+def test_medium_and_low_never_block(tmp_path):
     scan = {
         "imageScanStatus": {"status": "COMPLETE"},
         "imageScanFindings": {
             "findings": [
-                {"name": "CVE-HIGH-1", "severity": "HIGH"},
                 {"name": "CVE-MED-1", "severity": "MEDIUM"},
+                {"name": "CVE-LOW-2", "severity": "LOW"},
             ]
         },
     }
     assert _run(tmp_path, scan, _allowlist()) == 0
+
+
+def test_an_unlisted_high_blocks_and_a_listed_high_passes(tmp_path):
+    """§5.14: HIGH blocks promotion the same way CRITICAL does, under the same governance."""
+    scan = {
+        "imageScanStatus": {"status": "COMPLETE"},
+        "imageScanFindings": {"findings": [{"name": "CVE-HIGH-1", "severity": "HIGH"}]},
+    }
+    assert _run(tmp_path, scan, _allowlist()) == 1
+    assert _run(tmp_path, scan, _allowlist(_entry("CVE-HIGH-1"))) == 0
+
+
+def test_severity_scope_is_configurable(tmp_path):
+    scan = {
+        "imageScanStatus": {"status": "COMPLETE"},
+        "imageScanFindings": {"findings": [{"name": "CVE-HIGH-1", "severity": "HIGH"}]},
+    }
+    scan_file = tmp_path / "scan.json"
+    allow_file = tmp_path / "allow.json"
+    scan_file.write_text(json.dumps(scan), encoding="utf-8")
+    allow_file.write_text(json.dumps(_allowlist()), encoding="utf-8")
+    argv = [str(scan_file), str(allow_file), "--today", TODAY, "--severities", "CRITICAL"]
+    assert gate.main(argv) == 0
 
 
 def test_the_shipped_allowlist_is_valid_and_every_entry_carries_a_reason():
@@ -121,6 +144,8 @@ def test_the_shipped_allowlist_is_valid_and_every_entry_carries_a_reason():
     assert entries, "shipped allowlist should not be empty while the base CVEs persist"
     for cve, entry in entries.items():
         assert len(entry["reason"]) > 40, f"{cve}: a governed exception needs a real reason"
+        # A re-reviewed entry names the tracker check so the next reviewer can diff it.
+        assert "security tracker" in entry["reason"], f"{cve}: reason must cite the tracker check"
 
 
 @pytest.mark.parametrize("severity", ["critical", "Critical"])

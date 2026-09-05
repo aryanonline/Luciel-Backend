@@ -12,7 +12,14 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from pydantic import Field
+
 from app.schemas_api.common import WireModel
+
+# One visitor turn. Long enough for a pasted paragraph, short enough that a single
+# request cannot carry an unbounded prompt into the model (cost + prompt-injection
+# surface, §3.1.5 / §3.4.14). The shipped widget input enforces the same limit.
+WIDGET_TEXT_MAX_CHARS = 4000
 
 WidgetRenderStateWire = Literal["active", "paused", "at_cap"]
 WidgetRoleWire = Literal["visitor", "assistant"]
@@ -43,7 +50,7 @@ class WidgetSendRequest(WireModel):
     # embed_key arrives in the body (widget-adapters.ts: send → { embedKey, ...req }).
     embed_key: str
     session_id: uuid.UUID | None = None  # omitted on first message; server assigns.
-    text: str
+    text: str = Field(min_length=1, max_length=WIDGET_TEXT_MAX_CHARS)
 
 
 class WidgetBootstrapRequest(WireModel):

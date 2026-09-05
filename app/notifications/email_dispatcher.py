@@ -318,6 +318,52 @@ async def send_payg_usage_nudge(
     )
 
 
+async def send_payg_block_started(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    notice_id: str,
+    block_number: int,
+    conversations_this_period: int,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """A new pay-as-you-go block has started (§3.4.1b block notification).
+
+    Informational: the block is billed in arrears on the next invoice, Luciel keeps
+    answering, nothing changes automatically. Sent once per block per billing period
+    (``paygblock:<period_start>:<block>``)."""
+    settings = get_settings()
+    price_dollars = settings.payg_price_per_block_cents // 100
+    ordinal = {1: "first", 2: "second", 3: "third"}.get(block_number, f"{block_number}th")
+    body = (
+        "A quick update from VantageMind.\n\n"
+        f"Luciel has handled {conversations_this_period} conversations so far this billing "
+        f"period, which is past your {settings.free_allowance} free conversations and into "
+        f"your {ordinal} pay-as-you-go block of {settings.payg_block_size} conversations "
+        f"(${price_dollars}).\n\n"
+        "This block will appear on your next invoice. Nothing changes automatically and "
+        "Luciel keeps answering your customers as usual. You can review your usage and "
+        "billing setup any time from the Billing page of your dashboard."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=f"Your {ordinal} pay-as-you-go block has started",
+        body=body,
+        notice_type="payg_block_started",
+        audit_event="billing_notice_sent",
+        extra_payload={
+            "notice_id": notice_id,
+            "kind": "payg_block_started",
+            "block_number": block_number,
+            "conversations_this_period": conversations_this_period,
+        },
+        sender=sender,
+    )
+
+
 async def send_escalation_contact_confirm(
     session: AsyncSession,
     *,

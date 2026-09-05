@@ -18,6 +18,7 @@ payment-required rejections per transport.ts, not for this read.
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends
@@ -41,6 +42,16 @@ from app.schemas_api.billing import (
 )
 
 router = APIRouter(prefix="/api/v1/billing", tags=["billing"])
+_log = logging.getLogger(__name__)
+
+
+def _payments_available() -> bool:
+    """Whether a card can actually be saved through this deployment (audit F026).
+
+    In the "mock" Stripe posture the checkout URL is a placeholder that goes nowhere,
+    so the dashboard must say so instead of rendering a button that pretends to work.
+    """
+    return get_settings().stripe_integration_posture != "mock"
 
 
 async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
@@ -86,7 +97,13 @@ async def get_billing(subject: Subject = Depends(current_admin)) -> BillingInfoO
                     "expYear": account.pm_exp_year,
                 }
             )
-        return BillingInfoOut.model_validate({"budget": _budget_out(budget), "paymentMethod": pm})
+        return BillingInfoOut.model_validate(
+            {
+                "budget": _budget_out(budget),
+                "paymentMethod": pm,
+                "paymentsAvailable": _payments_available(),
+            }
+        )
 
 
 @router.post("/checkout", response_model=CheckoutSessionOut)
@@ -144,6 +161,22 @@ async def remove_payment_method(
     """
     async with tenant_session(subject.admin_id) as s:
         account = await metering.get_or_create_billing_account(s, admin_id=subject.admin_id)
+        # Bill what they already ran BEFORE the account stops looking billable — the
+        # same order the Stripe-side detach webhook uses (audit F031): flush the
+        # accrued residual to the meter, end the metered subscription with a final
+        # invoice while the card can still be charged, and only then detach the card.
+        try:
+            await metering.report_accrued_usage(s, admin_id=subject.admin_id, gateway=gateway)
+        except Exception:  # noqa: BLE001 — the watermark stays; the reconcile sweep retries
+            _log.exception("accrued usage flush failed at card removal %s", subject.admin_id)
+        if account.stripe_subscription_id is not None:
+            try:
+                if await gateway.cancel_subscription(
+                    subscription_id=account.stripe_subscription_id, invoice_now=True
+                ):
+                    account.stripe_subscription_id = None
+            except Exception:  # noqa: BLE001
+                _log.exception("subscription cancel failed at card removal %s", subject.admin_id)
         if account.stripe_customer_id is not None:
             await gateway.remove_payment_method(customer_id=account.stripe_customer_id)
         # Reverting to free_cap: above 50 now blocks (at-cap data), not metered.
@@ -170,4 +203,10 @@ async def remove_payment_method(
         instance_id = await _instance_id(s, subject.admin_id)
         budget = await metering.build_budget(s, admin_id=subject.admin_id, instance_id=instance_id)
         # After removal the account is free_cap, so paymentMethod is omitted.
-        return BillingInfoOut.model_validate({"budget": _budget_out(budget), "paymentMethod": None})
+        return BillingInfoOut.model_validate(
+            {
+                "budget": _budget_out(budget),
+                "paymentMethod": None,
+                "paymentsAvailable": _payments_available(),
+            }
+        )

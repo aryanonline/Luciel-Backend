@@ -43,12 +43,24 @@ def test_launch_line_trusts_the_alb_forwarded_proto(name: str):
         f"{name} launches uvicorn without --proxy-headers; request.url will "
         "reconstruct as http:// behind the ALB and Twilio signature checks will fail"
     )
-    # Separator differs by file: `="*"`/` "*"` in shell, `", "*` in the Dockerfile
-    # JSON exec form.
-    assert re.search(r"""--forwarded-allow-ips["',= ]+\*""", line), (
-        f"{name} sets --proxy-headers without --forwarded-allow-ips; uvicorn only "
-        "trusts 127.0.0.1 by default, so the ALB's headers are still ignored"
+    # Trust is scoped to the VPC CIDR CDK injects (LUCIEL_TRUSTED_PROXY_CIDRS), with
+    # "*" only as the no-proxy local fallback. Trusting "*" outright made uvicorn take
+    # the LEFTMOST X-Forwarded-For entry — the client-written one — so a spoofed
+    # header impersonated any visitor's IP at the per-IP abuse ceilings (audit F047).
+    trusted = r"""--forwarded-allow-ips["',= ]+\$\{LUCIEL_TRUSTED_PROXY_CIDRS:-\*\}"""
+    assert re.search(trusted, line), (
+        f'{name} must pass --forwarded-allow-ips "${{LUCIEL_TRUSTED_PROXY_CIDRS:-*}}" — '
+        "the ALB's headers are trusted only from the VPC, never from the open internet"
     )
+    assert re.search(r"""--forwarded-allow-ips["',= ]+\*["']""", line) is None, (
+        f"{name} trusts X-Forwarded-For from any peer again"
+    )
+
+
+def test_cdk_injects_the_trusted_proxy_cidr_on_the_app_planes():
+    """The env var the launch line reads must actually be set by the task definition."""
+    stack = (_ROOT / "infra" / "lib" / "compute-stack.ts").read_text(encoding="utf-8")
+    assert "LUCIEL_TRUSTED_PROXY_CIDRS: vpc.vpcCidrBlock" in stack
 
 
 def test_ecs_runs_the_entrypoint_that_was_asserted_above():

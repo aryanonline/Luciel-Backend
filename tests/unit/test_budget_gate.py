@@ -90,7 +90,18 @@ async def test_the_counter_is_keyed_on_the_stripe_period_not_the_calendar_month(
         row = (
             await s.execute(select(ConversationBudget).where(ConversationBudget.admin_id == admin))
         ).scalar_one()
-        assert row.billing_period_start == date(2026, 5, 15)
+        # The 15th-anchored cycle that contains TODAY (the anchor rolls forward by
+        # whole cycles when no invoice.paid moved it — 2026-09-05 audit F030), never
+        # the calendar 1st.
+        assert row.billing_period_start.day == 15
+        assert (
+            row.billing_period_start
+            <= date.today()
+            < row.billing_period_start.replace(
+                year=row.billing_period_start.year + (row.billing_period_start.month == 12),
+                month=row.billing_period_start.month % 12 + 1,
+            )
+        )
         assert row.billing_period_start != budget.current_billing_period_start()
 
 

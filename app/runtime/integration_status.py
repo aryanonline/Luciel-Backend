@@ -107,6 +107,14 @@ def degraded_bindings() -> list[str]:
     # probe it without spending a verification.)
     if live_mode() and not settings.hcaptcha_secret_key:
         degraded.append("hcaptcha:unconfigured")
+    # §3.1.5 / §4.5: the abuse ceilings are only platform-wide when the Redis store is
+    # bound. A live task counting in-process still enforces them, but per task and
+    # reset on every deploy — a degraded binding this list exists to surface.
+    if live_mode():
+        from app.channels import rate_limit  # noqa: PLC0415 — avoid import cycle
+
+        if rate_limit.store_kind() != "redis":
+            degraded.append("rate_limit_store:InMemory")
     return degraded
 
 

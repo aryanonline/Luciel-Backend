@@ -116,6 +116,42 @@ def signup(client: httpx.Client, email: str) -> None:
     _check(client.post(f"{API_BASE}/api/v1/auth/signup", json=body), "signup")
 
 
+async def seed_counted_conversations(email: str, n: int) -> int:
+    """Count ``n`` synthetic conversations for the tenant through the REAL fire-once
+    counter (``budget.count_session_once``), not by editing the ledger row.
+
+    T2 used to burn the free allowance by firing 50 unthreaded widget messages —
+    which is exactly the "new session per message from one address" pattern the
+    widget edge now rate-limits (2026-09-05 audit, new-session-per-source cap:
+    burst 5, one every 15 s), so the honest harness path is to count the first
+    ``n`` conversations here and drive the boundary turns over the wire. Returns
+    the counter reading afterwards."""
+    from app.auth.lookup import lookup_account_by_email
+    from app.db.engine import dispose_engine
+    from app.db.session import tenant_session, untenanted_session
+    from app.models.instance import Instance
+    from app.runtime import budget
+    from sqlalchemy import select
+
+    try:
+        async with untenanted_session() as s:
+            found = await lookup_account_by_email(s, email)
+        if found is None:
+            raise RuntimeError(f"account not found: {email}")
+        async with tenant_session(found.account_id) as s:
+            iid = (
+                await s.execute(select(Instance.id).where(Instance.admin_id == found.account_id))
+            ).scalar_one()
+            for _ in range(n):
+                await budget.count_session_once(
+                    s, admin_id=found.account_id, instance_id=iid, session_id=uuid.uuid4()
+                )
+            state = await budget.check_budget(s, admin_id=found.account_id, instance_id=iid)
+            return state.counted
+    finally:
+        await dispose_engine()
+
+
 async def mint_verify_token(email: str) -> str:
     """Read the pending verify JTI from the DB and mint the matching verify token.
 
@@ -264,31 +300,36 @@ def test_happy_path(r: Results, t: Tenant) -> None:
 def test_free_cap_zero_llm(r: Results, t: Tenant) -> None:
     """T2 / Row 9 — at the free conversation cap the next request makes ZERO LLM calls.
 
-    The widget opens a NEW session per message, so each served message counts one
-    conversation. We drive exactly `free_allowance` messages to consume the cap, then
-    send one more. The over-cap request must (a) return the canned at-cap reply, NOT a
-    generated answer, and (b) NOT advance the conversation counter — proving no LLM call
-    was made (a served LLM turn would fire the fire-once counter)."""
+    The widget opens a NEW session per unthreaded message, so each served message
+    counts one conversation. The first ``free_allowance - 1`` conversations are counted
+    through the real fire-once counter in-process (the widget edge deliberately caps
+    new sessions per source, so 50 unthreaded messages from one address is the abuse
+    pattern, not a customer); the 50th and 51st go over the wire. The over-cap request
+    must (a) return the canned at-cap reply, NOT a generated answer, and (b) NOT
+    advance the conversation counter — proving no LLM call was made (a served LLM
+    turn would fire the fire-once counter)."""
     from app.config import get_settings
 
     cap = get_settings().free_allowance
-    # Drive to the cap. (Counter starts at 0 for this fresh tenant.)
-    for i in range(cap):
-        widget_send(t.client, t.embed_key, f"Question number {i} please")
+    seeded = asyncio.run(seed_counted_conversations(t.email, cap - 1))
+    # The 50th conversation is a real served turn: still inside the allowance.
+    last_free = widget_send(t.client, t.embed_key, "Question number fifty please")
     counted_at_cap = usage_conversations(t.client)
 
     over = widget_send(t.client, t.embed_key, "One more question over the cap?")
     counted_after = usage_conversations(t.client)
     reply = over["reply"]["text"]
 
+    served_last_free = last_free.get("renderState") == "active"
     at_cap_render = over.get("renderState") == "at_cap"
     no_increment = counted_after == counted_at_cap == cap
     not_generated = GROUNDED_TOKEN not in reply and not reply.startswith("Echo:")
-    ok = at_cap_render and no_increment and not_generated
+    ok = served_last_free and at_cap_render and no_increment and not_generated
     r.record(
         "T2 row9-free-cap-zero-LLM",
         ok,
-        f"cap={cap} counted@cap={counted_at_cap} counted_after_51st={counted_after} "
+        f"cap={cap} seeded={seeded} counted@cap={counted_at_cap} "
+        f"counted_after_51st={counted_after} last_free={last_free.get('renderState')} "
         f"renderState={over.get('renderState')} reply={reply[:90]!r}",
     )
 

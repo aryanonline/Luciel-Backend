@@ -198,15 +198,75 @@ async def test_payg_nudge_goes_out_once_per_period_and_never_to_free_cap() -> No
     async with tenant_session(capless_admin) as s:
         capless = await deliver_due_notices(s, admin_id=capless_admin, now=NOW, sender=sender)
 
-    assert (first, second, capless) == (1, 0, 0)
-    assert len(sender.sent) == 1
-    _, subject, body = sender.sent[0]
-    assert "pay-as-you-go" in subject
-    assert "131" in body and "$39" in body
+    # Two notices for a tenant 81 into block 1: the block-started announcement for
+    # block 1 (never sent before) and the 80%-through-block-1 heads-up. Neither repeats.
+    assert (first, second, capless) == (2, 0, 0)
+    assert len(sender.sent) == 2
+    subjects = [subject for _, subject, _ in sender.sent]
+    assert any("approaching your next pay-as-you-go block" in sj for sj in subjects)
+    assert any("first pay-as-you-go block has started" in sj for sj in subjects)
+    for _, _, body in sender.sent:
+        assert "131" in body and "$39" in body
 
-    (row,) = await _delivery_rows(payg_admin)
-    assert row.notice_id == f"payg80:{period.isoformat()}"
-    assert row.kind == "payg_usage_nudge"
+    rows = {row.notice_id: row.kind for row in await _delivery_rows(payg_admin)}
+    assert rows == {
+        f"payg80:{period.isoformat()}:1": "payg_usage_nudge",
+        f"paygblock:{period.isoformat()}:1": "payg_block_started",
+    }
+
+
+async def test_each_block_start_is_announced_once_and_audited() -> None:
+    """§3.4.1b promises a notice when a new 100-conversation block starts plus a
+    ``budget_overage_threshold`` audit event; the event type existed and nothing emitted
+    it (audit F011). Per block, per period, exactly once — and the per-turn helper the
+    runtime calls after a count behaves the same as the daily sweep."""
+    from app.billing.notice_delivery import send_usage_notices_after_count
+    from app.models.audit import AdminAuditLog
+
+    period = date(2026, 8, 1)
+    admin, iid = await _seed()
+    async with tenant_session(admin) as s:
+        s.add(
+            BillingAccount(
+                id=uuid.uuid4(), admin_id=admin, billing_state="payg_enabled", dunning_state="none"
+            )
+        )
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=period,
+                counted_conversations=151,  # block 2 just started (51-150 was block 1)
+                counted_session_ids=[],
+            )
+        )
+    async with tenant_session(admin) as s:
+        first = await send_usage_notices_after_count(s, admin_id=admin, now=NOW)
+    async with tenant_session(admin) as s:
+        again = await send_usage_notices_after_count(s, admin_id=admin, now=NOW)
+    async with tenant_session(admin) as s:
+        swept = await deliver_due_notices(s, admin_id=admin, now=NOW + timedelta(days=1))
+    assert (first, again, swept) == (1, 0, 0)
+
+    rows = {row.notice_id: row.kind for row in await _delivery_rows(admin)}
+    assert rows == {f"paygblock:{period.isoformat()}:2": "payg_block_started"}
+    async with tenant_session(admin) as s:
+        events = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "budget_overage_threshold",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [e.event_payload["block_number"] for e in events] == [2]
+    assert events[0].event_payload["conversations_this_period"] == 151
+    assert events[0].event_payload["billed_cents"] == 7800
 
 
 async def test_failed_delivery_leaves_no_ledger_row_so_the_next_sweep_retries(

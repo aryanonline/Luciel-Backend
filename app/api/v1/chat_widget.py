@@ -36,6 +36,7 @@ from app.channels.base import InboundRejected, InstanceContext
 from app.channels.routing import resolve_widget
 from app.db.session import tenant_session, untenanted_session
 from app.models.audit import ActorType
+from app.models.conversation import Session as ConversationSession
 from app.models.conversation import Transcript
 from app.models.instance import Instance, is_paused
 from app.runtime import budget, session_close
@@ -75,35 +76,69 @@ async def _resolve_embed_key(embed_key: str) -> InstanceContext:
             raise not_found("Unknown widget.") from exc
 
 
-async def _widget_abuse_gate(
-    ctx: InstanceContext, request: Request, session_id: uuid.UUID | None
-) -> None:
-    """Pre-budget abuse / rate-limit admission for the widget (§3.1.5).
+def _client_ip(request: Request) -> str:
+    """The ALB-reported client address (uvicorn --forwarded-allow-ips = VPC CIDR).
+
+    Trusted precisely because the launch line trusts X-Forwarded-For only from the
+    VPC: uvicorn then resolves the client to the entry the ALB appended, never to a
+    leftmost value the caller wrote. Behind no proxy (local), it is the peer address.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+async def _deny_widget(ctx: InstanceContext, reason: str | None) -> None:
+    """Audit an admission denial (no raw PII) and answer the documented 429 (§3.1.5)."""
+    async with tenant_session(ctx.admin_id) as s:
+        await audit.emit(
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            actor_type=ActorType.platform,
+            event_type="widget_abuse_blocked",
+            # No raw PII: channel + reason only (§3.1.5 / §3.4.11).
+            payload={"channel": "widget", "reason": reason},
+        )
+    raise rate_limited("Too many messages — please slow down.", retry_after_seconds=3)
+
+
+async def _widget_ip_gate(ctx: InstanceContext, request: Request, bucket: str) -> str:
+    """Stage-one widget admission: per TRUSTED client IP per instance, before any DB work.
 
     The widget is a direct browser POST (no channel webhook), so it does not flow
     through channels.pipeline.ingest(); this is the widget's equivalent pre-budget
     gate. It MUST run before the budget gate and before any LLM call, so a flood can
     never drain a tenant's conversation budget or run up cost (denial-of-wallet).
 
-    Source identifier per §3.1.5: the per-session widget token + client IP. On a
-    denial we audit widget_abuse_blocked (no raw PII) and return HTTP 429, which the
-    frontend transport maps to `rate_limited` via the documented error contract (§4).
+    The key is the ALB-reported client IP — never a caller-supplied value. The
+    previous gate keyed on ``body.sessionId``, so rotating a made-up id minted a
+    fresh full bucket per request AND opened a new billed session each time
+    (audit F046). Returns the client IP for the stage-two gate.
     """
-    client_ip = request.client.host if request.client else "unknown"
-    source_id = f"{session_id or 'new'}:{client_ip}"
-    decision = rate_limit.admit("widget", source_id, str(ctx.admin_id))
+    client_ip = _client_ip(request)
+    decision = rate_limit.admit(bucket, f"{ctx.instance_id}:{client_ip}", str(ctx.admin_id))
     if not decision.allowed:
-        async with tenant_session(ctx.admin_id) as s:
-            await audit.emit(
-                s,
-                admin_id=ctx.admin_id,
-                instance_id=ctx.instance_id,
-                actor_type=ActorType.platform,
-                event_type="widget_abuse_blocked",
-                # No raw PII: channel + reason only (§3.1.5 / §3.4.11).
-                payload={"channel": "widget", "reason": decision.reason},
-            )
-        raise rate_limited("Too many messages — please slow down.", retry_after_seconds=3)
+        await _deny_widget(ctx, decision.reason)
+    return client_ip
+
+
+def _widget_session_gate(
+    ctx: InstanceContext, client_ip: str, existing_session_id: uuid.UUID | None
+) -> rate_limit.RateLimitResult:
+    """Stage-two widget admission, once the supplied session id has been checked.
+
+    - A session id that resolved to an OPEN session of this tenant gets the per-session
+      bucket (§3.1.5: burst 5, sustained 1 msg / 3 s) keyed on the server-side id.
+    - Anything else is a NEW conversation: it must pass the per-IP new-session cap
+      (opening a session is the billable event, §3.4.1b) and then shares one
+      per-IP "new" bucket — a fabricated id buys no tokens.
+    """
+    store = rate_limit.get_store()
+    if existing_session_id is not None:
+        return store.check_source("widget", f"{existing_session_id}:{client_ip}")
+    opened = store.check_source("widget_session_open", f"{ctx.instance_id}:{client_ip}")
+    if not opened.allowed:
+        return opened
+    return store.check_source("widget", f"new:{ctx.instance_id}:{client_ip}")
 
 
 def _names(inst: Instance) -> tuple[str, str]:
@@ -149,9 +184,12 @@ def _disclosure_business_name(inst: Instance) -> str:
 
 
 @router.post("/bootstrap", response_model=WidgetBootstrapOut)
-async def bootstrap(body: WidgetBootstrapRequest) -> WidgetBootstrapOut:
+async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBootstrapOut:
     """Resolve the host page's embed key → render directive + disclosure (§3.6.2/§3.4.16)."""
     ctx = await _resolve_embed_key(body.embed_key)
+    # Unauthenticated and DB-backed: a page-view storm from one address is bounded
+    # at the edge before it reaches the tenant's tables (§3.1.5).
+    await _widget_ip_gate(ctx, request, "widget_bootstrap")
     async with tenant_session(ctx.admin_id) as s:
         inst = (
             await s.execute(select(Instance).where(Instance.id == ctx.instance_id))
@@ -201,9 +239,11 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
     # adapter InboundMessage.received_at; this is its equivalent).
     received_at = datetime.now(UTC)
     ctx = await _resolve_embed_key(body.embed_key)
-    # Pre-budget abuse gate (§3.1.5): runs BEFORE the budget gate / any LLM call so a
-    # widget flood can never drain budget or run up cost (denial-of-wallet). 429 on deny.
-    await _widget_abuse_gate(ctx, request, body.session_id)
+    # Pre-budget abuse gate, stage one (§3.1.5): per trusted client IP, BEFORE the
+    # budget gate / any DB or LLM work, so a widget flood can never drain budget or
+    # run up cost (denial-of-wallet). 429 on deny.
+    client_ip = await _widget_ip_gate(ctx, request, "widget_ip")
+    deny_reason: str | None = None
     async with tenant_session(ctx.admin_id) as s:
         inst = (
             await s.execute(select(Instance).where(Instance.id == ctx.instance_id))
@@ -211,30 +251,45 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         if inst is None:
             raise not_found("Unknown widget.")
 
-        if is_paused(inst):
-            # §3.6.2 carve-out / §3.6.3 drain (C8): a conversation already in flight
-            # when the owner paused or deleted is allowed to FINISH on its channel —
-            # only NEW sessions are refused. The find is read-only; without a live
-            # in-window session this is the empty render directive, no session
-            # opened, no LLM.
-            draining = await find_open_session(
-                s,
-                admin_id=ctx.admin_id,
-                instance_id=ctx.instance_id,
-                channel=CHANNEL,
-                session_id=body.session_id,
+        # Does the supplied session id belong to a conversation of THIS tenant that is
+        # still in flight? Read-only. It decides three things at once: the §3.6.2 /
+        # §3.6.3 drain (a paused or deleting Luciel finishes in-flight chats but opens
+        # none), the stage-two admission bucket, and whether this turn opens a session.
+        existing = await find_open_session(
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            channel=CHANNEL,
+            session_id=body.session_id,
+        )
+
+        if is_paused(inst) and existing is None:
+            # Without a live in-window session this is the empty render directive —
+            # no session opened, no LLM.
+            return WidgetSendResult(
+                session_id=body.session_id or uuid.uuid4(),
+                reply=WidgetMessageOut(
+                    message_id=uuid.uuid4(),
+                    role="assistant",
+                    text="",
+                    at=datetime.now(UTC),
+                ),
+                render_state="paused",
             )
-            if draining is None:
-                return WidgetSendResult(
-                    session_id=body.session_id or uuid.uuid4(),
-                    reply=WidgetMessageOut(
-                        message_id=uuid.uuid4(),
-                        role="assistant",
-                        text="",
-                        at=datetime.now(UTC),
-                    ),
-                    render_state="paused",
-                )
+
+        # Stage two (§3.1.5): the per-session bucket only for a PROVEN open session;
+        # otherwise the new-session cap — a rotating made-up id opens nothing for free.
+        gate = _widget_session_gate(ctx, client_ip, existing.id if existing else None)
+        if not gate.allowed:
+            deny_reason = gate.reason or "rate_limited"
+    if deny_reason is not None:
+        await _deny_widget(ctx, deny_reason)
+    async with tenant_session(ctx.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.id == ctx.instance_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("Unknown widget.")
 
         # Widget identity is WEAK (§3.4.9): no resolved lead is inherited from a prior
         # session. A lead is created/linked by the identity arc; here resolved_lead_id
@@ -380,6 +435,7 @@ async def end_session(
 @router.get("/sessions/{session_id}", response_model=list[WidgetMessageOut])
 async def get_history(
     session_id: uuid.UUID,
+    request: Request,
     # Query key is camelCase to match widget-adapters.ts history() (?embedKey=...).
     embed_key: str = Query(alias="embedKey"),
 ) -> list[WidgetMessageOut]:
@@ -387,17 +443,26 @@ async def get_history(
 
     Roles are mapped to the visitor/assistant vocabulary — the widget never sees the
     internal lead/luciel/human_agent roles. embed_key authenticates the request
-    (query param, mirroring widget-adapters.ts history()).
+    (query param, mirroring widget-adapters.ts history()). This is also how a
+    takeover reply reaches the visitor: the shipped widget polls it (§3.4.12).
+
+    Scoped to WIDGET sessions of THIS instance: a public embed key plus a guessed
+    session id must never read an SMS/email/voice transcript of the same tenant
+    (audit F075) — the widget can only ever replay conversations it could have had.
     """
     ctx = await _resolve_embed_key(embed_key)
+    await _widget_ip_gate(ctx, request, "widget_poll")
     async with tenant_session(ctx.admin_id) as s:
         rows = (
             (
                 await s.execute(
                     select(Transcript)
+                    .join(ConversationSession, ConversationSession.id == Transcript.session_id)
                     .where(
                         Transcript.admin_id == ctx.admin_id,
+                        Transcript.instance_id == ctx.instance_id,
                         Transcript.session_id == session_id,
+                        ConversationSession.channel == CHANNEL,
                     )
                     .order_by(Transcript.at.asc())
                 )

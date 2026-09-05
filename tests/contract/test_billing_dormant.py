@@ -132,7 +132,8 @@ async def test_dunning_reduced_sends_action_tools_dormant_not_channels(client) -
     assert statuses["channel_auth"] == "connected"
     assert statuses["knowledge_source"] == "connected"
 
-    # Path back: invoice.paid restores dormant → unconfigured (pre-existing path).
+    # Path back: invoice.paid restores dormant → the status each row HAD (F069): these
+    # were connected, and a billing dormancy never touched their credentials.
     gw2 = FakeStripeGateway()
     set_stripe_gateway(gw2)
     try:
@@ -154,7 +155,7 @@ async def test_dunning_reduced_sends_action_tools_dormant_not_channels(client) -
 
     restored = await _connection_statuses(admin)
     for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert restored[ctype] == "unconfigured"
+        assert restored[ctype] == "connected"
     assert restored["channel_auth"] == "connected"  # untouched throughout
 
 
@@ -204,7 +205,7 @@ async def test_delete_payment_method_sends_dormant_then_pm_attached_restores(cli
         assert statuses[ctype] == "dormant"
     assert statuses["channel_auth"] == "connected"
 
-    # Repayment restore: payment_method.attached restores dormant → unconfigured.
+    # Repayment restore: payment_method.attached restores dormant → prior status (F069).
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
@@ -236,7 +237,7 @@ async def test_delete_payment_method_sends_dormant_then_pm_attached_restores(cli
 
     restored = await _connection_statuses(admin)
     for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert restored[ctype] == "unconfigured"
+        assert restored[ctype] == "connected"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

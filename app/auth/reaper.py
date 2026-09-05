@@ -58,7 +58,7 @@ async def _purge(session: AsyncSession, admin_id: uuid.UUID, now: datetime) -> N
             "reaped_at": now.isoformat(),
         },
     )
-    await hard_delete_cascade(session, admin_id)
+    await hard_delete_cascade(session, admin_id, include_account_scope=True)
     await session.execute(delete(Account).where(Account.id == admin_id))
 
 

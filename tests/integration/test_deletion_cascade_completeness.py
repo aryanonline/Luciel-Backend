@@ -74,7 +74,7 @@ async def test_deleting_a_tenant_empties_every_cascade_table():
     await _seed(neighbour)
 
     async with tenant_session(doomed) as s:
-        counts = await hard_delete_cascade(s, doomed)
+        counts = await hard_delete_cascade(s, doomed, include_account_scope=True)
 
     assert set(counts) == _CASCADE_TABLES, "cascade did not report on every table it owns"
     untouched = sorted(table for table, n in counts.items() if n == 0)
@@ -103,7 +103,7 @@ async def test_the_account_shell_and_audit_log_survive():
     admin = uuid.uuid4()
     await _seed(admin)
     async with tenant_session(admin) as s:
-        await hard_delete_cascade(s, admin)
+        await hard_delete_cascade(s, admin, include_account_scope=True)
     async with tenant_session(admin) as s:
         assert (
             await s.execute(select(Account).where(Account.id == admin))
@@ -116,6 +116,27 @@ async def test_the_account_shell_and_audit_log_survive():
             )
         ).scalar_one()
         assert audited > 0
+
+
+async def test_the_luciel_scope_keeps_the_billing_identity():
+    """F014/F019: the Luciel cascade (grace expiry) must not take the account's billing
+    identity with it — the card, the Stripe customer and the lifetime count belong to the
+    shell that survives. Only the account purge (``include_account_scope``) removes them."""
+    from app.lifecycle.cascade import ACCOUNT_SCOPE_MODELS, LUCIEL_SCOPE_MODELS
+
+    admin = uuid.uuid4()
+    await _seed(admin)
+    async with tenant_session(admin) as s:
+        counts = await hard_delete_cascade(s, admin)
+    assert set(counts) == {m.__tablename__ for m, _ in LUCIEL_SCOPE_MODELS}
+    for model, _ in ACCOUNT_SCOPE_MODELS:
+        async with tenant_session(admin) as s:
+            kept = (
+                await s.execute(
+                    select(func.count()).select_from(model).where(model.admin_id == admin)
+                )
+            ).scalar_one()
+        assert kept == 1, f"{model.__tablename__} was destroyed by a Luciel-scope cascade"
 
 
 async def test_orphaned_tenant_secrets_are_swept_by_prefix(monkeypatch):

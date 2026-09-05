@@ -12,8 +12,13 @@ run by the daily ``billing_notices`` sweep for every verified account:
     with the ``notice_deliveries`` ledger making "once" durable across
     at-least-once schedule delivery;
   * the ~80%-through-a-block pay-as-you-go heads-up is emailed at most once per
-    billing period (``payg80:<period_start>``) — the email twin of the
-    dashboard's ``nearNextBlock`` flag.
+    BLOCK per billing period (``payg80:<period_start>:<block>``) — the email twin
+    of the dashboard's ``nearNextBlock`` flag — and each block that actually
+    starts is announced once (``paygblock:<period_start>:<block>``) together with
+    the ``budget_overage_threshold`` audit event §3.4.1b promises. Both are
+    evaluated after every counted conversation (``send_usage_notices_after_count``)
+    as well as by the daily sweep, so the notice lands the moment the threshold is
+    crossed rather than up to a day later (audit F011).
 
 Lead-time enforcement (§A5): a reduction announced with less than
 NOTICE_LEAD_DAYS of lead left is a compliance defect the OPERATOR must fix by
@@ -43,6 +48,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
 from app.billing import metering
 from app.billing.notices import (
     ALLOWANCE_REDUCTION,
@@ -50,6 +56,8 @@ from app.billing.notices import (
     AccountNotice,
     account_notices,
 )
+from app.config import get_settings
+from app.models.audit import ActorType
 from app.models.instance import Account, Instance
 from app.models.notice_delivery import NoticeDelivery
 from app.notifications import email_dispatcher
@@ -60,6 +68,56 @@ logger = logging.getLogger(__name__)
 
 PAYG_NUDGE_PREFIX = "payg80"
 PAYG_NUDGE_KIND = "payg_usage_nudge"
+PAYG_BLOCK_PREFIX = "paygblock"
+PAYG_BLOCK_KIND = "payg_block_started"
+
+
+def _current_block(counted: int, free: int, block_size: int) -> int:
+    """1-based index of the paid block the tenant is currently inside (0 = none)."""
+    over = counted - free
+    if over <= 0:
+        return 0
+    return (over - 1) // block_size + 1
+
+
+async def _delivered_ids(session: AsyncSession, admin_id: uuid.UUID) -> set[str]:
+    return set(
+        (
+            await session.execute(
+                select(NoticeDelivery.notice_id).where(NoticeDelivery.admin_id == admin_id)
+            )
+        ).scalars()
+    )
+
+
+async def send_usage_notices_after_count(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime,
+) -> int:
+    """The per-turn half of the usage notices: called right after a conversation counts.
+
+    Never raises — a notice failure must not touch the lead's turn; the failure is on
+    the audit trail via ``_dispatch`` and the daily sweep retries it.
+    """
+    try:
+        email = (
+            await session.execute(select(Account.email).where(Account.id == admin_id))
+        ).scalar_one_or_none()
+        if not email:
+            return 0
+        delivered = await _delivered_ids(session, admin_id)
+        sent = await _send_payg_block_started_if_due(
+            session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=None
+        )
+        sent += await _send_payg_nudge_if_due(
+            session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=None
+        )
+        return sent
+    except Exception:  # noqa: BLE001 — never let a notice break a conversation
+        logger.exception("usage notices failed admin_id=%s", admin_id)
+        return 0
 
 
 def _lead_days(notice: AccountNotice, now: datetime) -> int | None:
@@ -82,13 +140,7 @@ async def deliver_due_notices(
     if not email:
         return 0
 
-    delivered: set[str] = set(
-        (
-            await session.execute(
-                select(NoticeDelivery.notice_id).where(NoticeDelivery.admin_id == admin_id)
-            )
-        ).scalars()
-    )
+    delivered = await _delivered_ids(session, admin_id)
 
     sent = 0
     for notice in account_notices(now=now):
@@ -138,6 +190,9 @@ async def deliver_due_notices(
         delivered.add(notice_id)
         sent += 1
 
+    sent += await _send_payg_block_started_if_due(
+        session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=sender
+    )
     sent += await _send_payg_nudge_if_due(
         session, admin_id=admin_id, email=email, delivered=delivered, now=now, sender=sender
     )
@@ -229,8 +284,14 @@ async def _send_payg_nudge_if_due(
         return 0
 
     account = await metering.get_or_create_billing_account(session, admin_id=admin_id)
+    settings = get_settings()
     period = period_start_for(account, now)
-    notice_id = f"{PAYG_NUDGE_PREFIX}:{period.isoformat()}"
+    block = _current_block(
+        budget.conversations_this_period, budget.free_allowance, settings.payg_block_size
+    )
+    # Once per BLOCK, not once per period (audit F011): the heads-up before block 3
+    # is as real as the one before block 2.
+    notice_id = f"{PAYG_NUDGE_PREFIX}:{period.isoformat()}:{block}"
     if notice_id in delivered:
         return 0
 
@@ -252,5 +313,81 @@ async def _send_payg_nudge_if_due(
             delivery_status=outcome.status,
             sent_at=now,
         )
+    )
+    delivered.add(notice_id)
+    return 1
+
+
+async def _send_payg_block_started_if_due(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    email: str,
+    delivered: set[str],
+    now: datetime,
+    sender: EmailSender | None,
+) -> int:
+    """Announce the pay-as-you-go block the tenant is now inside, once per block.
+
+    §3.4.1b promises a notification "when a new 100-conversation block starts" and
+    a ``budget_overage_threshold`` audit event to go with it; the audit event type
+    existed and nothing ever emitted it (audit F011). The email is informational —
+    the block is already billed in arrears — so it names the block, the running
+    count and the price, and nothing changes automatically."""
+    instance_id = (
+        (await session.execute(select(Instance.id).where(Instance.admin_id == admin_id)))
+        .scalars()
+        .first()
+    )
+    if instance_id is None:
+        return 0
+    budget = await metering.build_budget(
+        session, admin_id=admin_id, instance_id=instance_id, now=now
+    )
+    # billed_blocks is zero without a live card (metering.build_budget): a capped
+    # tenant is never told a block started, because none did.
+    if budget.billed_blocks <= 0:
+        return 0
+    account = await metering.get_or_create_billing_account(session, admin_id=admin_id)
+    period = period_start_for(account, now)
+    block = budget.billed_blocks
+    notice_id = f"{PAYG_BLOCK_PREFIX}:{period.isoformat()}:{block}"
+    if notice_id in delivered:
+        return 0
+
+    outcome = await email_dispatcher.send_payg_block_started(
+        session,
+        admin_id=admin_id,
+        to=email,
+        notice_id=notice_id,
+        block_number=block,
+        conversations_this_period=budget.conversations_this_period,
+        sender=sender,
+    )
+    if outcome.status == "failed":
+        return 0
+    session.add(
+        NoticeDelivery(
+            admin_id=admin_id,
+            notice_id=notice_id,
+            kind=PAYG_BLOCK_KIND,
+            delivery_status=outcome.status,
+            sent_at=now,
+        )
+    )
+    delivered.add(notice_id)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="budget_overage_threshold",
+        payload={
+            "block_number": block,
+            "conversations_this_period": budget.conversations_this_period,
+            "billed_cents": budget.billed_cents,
+            "period_start": period.isoformat(),
+            "notice_id": notice_id,
+        },
     )
     return 1

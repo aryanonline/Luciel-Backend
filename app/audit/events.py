@@ -33,6 +33,15 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "invoice_paid",
         "payment_failed",
         "dunning_state_changed",
+        # Legal §A4: at closure the metered subscription is ended with a final invoice
+        # for the partial period (payload: subscription id + whether usage was owed).
+        "billing_closure_settled",
+        # §3.6.6 / Legal §B5: the Stripe customer object is destroyed at account purge,
+        # so the processor holds no billing identity for a tenant that no longer exists.
+        "stripe_customer_deleted",
+        # §3.4.1b: the free-allowance anchor moved from the calendar month to the Stripe
+        # billing period the moment billing began (payload: old + new anchor dates).
+        "billing_period_anchored",
         "connection_status_changed",
         # A push_to_crm upsert landed (§3.3.6 traced create-vs-update history).
         # Payload: provider + action + record id — never lead PII (§3.4.11).

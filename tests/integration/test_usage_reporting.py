@@ -10,7 +10,7 @@ as importantly, that they do NOT land anywhere else.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 
 import pytest
 from app.billing import metering
@@ -20,7 +20,7 @@ from app.db.session import tenant_session
 from app.models.budget import ConversationBudget
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime.budget import current_billing_period_start
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -297,7 +297,9 @@ async def test_a_mid_month_stripe_period_bills_the_counter_it_actually_counted(
     the rollover reused an identifier already spent on the first block. Stripe deduped
     it, so that block was never invoiced at all.
     """
-    anchor = datetime(2026, 5, 15, tzinfo=UTC)
+    # A Stripe anchor inside the CURRENT cycle (a stale one rolls forward — F030 — and
+    # would read an empty counter, which is a different, separately-tested truth).
+    anchor = datetime.combine((datetime.now(UTC) - timedelta(days=10)).date(), time.min, UTC)
     admin = uuid.uuid4()
     iid = await _seed(admin, counted=51, subscription_id="sub_test", period_start=anchor)
 
@@ -310,9 +312,10 @@ async def test_a_mid_month_stripe_period_bills_the_counter_it_actually_counted(
     # The identifier names the Stripe anchor the counter is keyed on, not the calendar
     # month, and the watermark span rather than a bare quantity.
     cus = _customer(admin)
+    day = anchor.date().isoformat()
     assert [e.identifier for e in gateway.meter_events] == [
-        f"usage:{cus}:2026-05-15:0-1",
-        f"usage:{cus}:2026-05-15:1-2",
+        f"usage:{cus}:{day}:0-1",
+        f"usage:{cus}:{day}:1-2",
     ]
 
 
@@ -555,3 +558,338 @@ async def test_the_new_period_starts_owing_stripe_nothing(gateway: FakeStripeGat
     async with tenant_session(admin) as s:
         acct = await metering.get_or_create_billing_account(s, admin_id=admin)
         assert (acct.accrued_blocks, acct.last_reported_blocks) == (0, 0)
+
+
+# --- period truth (2026-09-05 audit: F029 / F030 / F004 / F043 / F038) -------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_session_that_straddles_a_period_boundary_counts_once(
+    gateway: FakeStripeGateway,
+) -> None:
+    """One conversation is one conversation even when the billing period rolls under it
+    (F029): the fire-once claim is keyed on the session, not (session, period)."""
+    from app.runtime import budget as budget_mod
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=0, period_start=datetime(2030, 1, 1, tzinfo=UTC))
+    sid = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        assert await budget_mod.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=sid
+        )
+        # The period rolls (an invoice.paid, or the anchor simply advancing).
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_start = datetime(2030, 2, 1, tzinfo=UTC)
+        acct.period_resets_at = datetime(2030, 3, 1, tzinfo=UTC)
+        await s.flush()
+        assert not await budget_mod.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=sid
+        ), "the same session was counted again after the period rolled"
+        state = await budget_mod.check_budget(s, admin_id=admin, instance_id=iid)
+        assert state.counted == 0  # the new period owes nothing for the old conversation
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_free_fifty_resets_when_a_period_ends_without_an_invoice(
+    gateway: FakeStripeGateway,
+) -> None:
+    """F030: the anchor used to freeze the first time an invoice.paid never arrived (a
+    failed invoice, a lost webhook), so the free 50 never reset again. The period now
+    rolls forward by whole cycles from the last known anchor."""
+    from app.runtime.budget import current_period
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=120, period_start=datetime(2030, 1, 15, tzinfo=UTC))
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_resets_at = datetime(2030, 2, 15, tzinfo=UTC)
+        await s.flush()
+        assert current_period(acct, datetime(2030, 2, 10, tzinfo=UTC)) == (
+            date(2030, 1, 15),
+            datetime(2030, 2, 15, tzinfo=UTC),
+        )
+        # Two cycles later, no invoice ever came: the third period is current.
+        assert current_period(acct, datetime(2030, 3, 20, tzinfo=UTC)) == (
+            date(2030, 3, 15),
+            datetime(2030, 4, 15, tzinfo=UTC),
+        )
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=datetime(2030, 3, 20, tzinfo=UTC)
+        )
+        assert b.conversations_this_period == 0
+        assert b.period_resets_at == datetime(2030, 4, 15, tzinfo=UTC)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rolled_period_flushes_the_old_residual_and_starts_the_watermark_fresh(
+    gateway: FakeStripeGateway,
+) -> None:
+    """F030/F004: the watermarks belong to the period they accrued in. When the counter
+    rolls without an invoice.paid, the old period's unreported block is posted under the
+    OLD period's identifier and the new period's first block is not withheld until its
+    total exceeds the previous period's."""
+    admin = uuid.uuid4()
+    old_anchor = datetime(2030, 1, 15, tzinfo=UTC)
+    iid = await _seed(admin, counted=151, subscription_id="sub_test", period_start=old_anchor)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.accrual_period_start = old_anchor.date()
+        acct.accrued_blocks = 2
+        acct.last_reported_blocks = 1  # one block still owed for January
+        await s.flush()
+
+    # February: 60 conversations so far this period → one new block.
+    async with tenant_session(admin) as s:
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=date(2030, 2, 15),
+                counted_conversations=60,
+                counted_session_ids=[],
+            )
+        )
+    async with tenant_session(admin) as s:
+        reported = await metering.report_usage(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            now=datetime(2030, 2, 20, tzinfo=UTC),
+            gateway=gateway,
+        )
+    assert reported == 1
+    cus = _customer(admin)
+    assert [(e.identifier, e.value) for e in gateway.meter_events] == [
+        (f"usage:{cus}:2030-01-15:1-2", 1),  # January's residual, under January's key
+        (f"usage:{cus}:2030-02-15:0-1", 1),  # February's first block, not withheld
+    ]
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.accrual_period_start == date(2030, 2, 15)
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (1, 1)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_first_block_anchors_the_counter_to_the_stripe_period(
+    gateway: FakeStripeGateway,
+) -> None:
+    """F004: once billing begins the free 50 is per Stripe period, so the calendar anchor
+    hands over to the subscription's cycle and the conversations already counted move
+    with it — no second free 50, no stranded counter."""
+    from app.models.audit import AdminAuditLog
+    from app.models.budget import CountedSession
+    from app.runtime import budget as budget_mod
+
+    # A Stripe anchor on the 10th of the CURRENT calendar month: inside the seeded
+    # calendar period (so the rows exist) and never equal to its 1st (so the re-anchor
+    # is a real move whatever today's date is).
+    gateway.now = STRIPE_PERIOD_START + timedelta(days=9, hours=9)
+    anchor_day = gateway.now.date()
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=50, subscription_id=None)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_start = None  # calendar fallback: no Stripe period yet (row keyed on it)
+        await s.flush()
+    # The 51st conversation is counted under the calendar month...
+    async with tenant_session(admin) as s:
+        await budget_mod.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+        )
+        calendar_key = await budget_mod.resolve_billing_period_start(s, admin_id=admin)
+    # ...and reporting it creates the subscription and re-anchors.
+    async with tenant_session(admin) as s:
+        assert (
+            await metering.report_usage(
+                s, admin_id=admin, instance_id=iid, now=gateway.now, gateway=gateway
+            )
+            == 1
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.period_start == gateway.now
+        assert acct.accrual_period_start == anchor_day
+        assert acct.period_resets_at is not None and acct.period_resets_at > gateway.now
+        b = await metering.build_budget(s, admin_id=admin, instance_id=iid, now=gateway.now)
+        assert b.conversations_this_period == 51, "the counted conversations moved with the anchor"
+        claims = (
+            (
+                await s.execute(
+                    select(CountedSession.billing_period_start).where(
+                        CountedSession.admin_id == admin
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert claims == [anchor_day]
+        anchored = (
+            await s.execute(
+                select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "billing_period_anchored",
+                )
+            )
+        ).scalar_one()
+        assert anchored.event_payload["from_period_start"] == calendar_key.isoformat()
+        assert anchored.event_payload["to_period_start"] == anchor_day.isoformat()
+    cus = _customer(admin)
+    assert [e.identifier for e in gateway.meter_events] == [f"usage:{cus}:{anchor_day}:0-1"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_takeover_before_any_model_call_reports_the_block(
+    gateway: FakeStripeGateway,
+) -> None:
+    """F043: the takeover path counts the session (§3.4.1b) so it must meter it too — the
+    51st conversation taken over by a human used to be counted but never reported."""
+    from app.models.conversation import Session as SessionModel
+    from app.runtime import handoff
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=50, subscription_id="sub_test")
+    sid = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(SessionModel(id=sid, admin_id=admin, instance_id=iid, channel="widget", mode="ai"))
+        await s.flush()
+        await handoff.take_over(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+    assert gateway.billed_quantity(_customer(admin)) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_stripe_failure_is_logged_not_silent(caplog) -> None:
+    """F038: the lead's turn is protected, the operator is not blinded — a report that
+    raises leaves an ERROR in the log the sweep alarms read."""
+    import logging
+
+    class _Boom(FakeStripeGateway):
+        async def report_meter_event(self, **_kw):  # type: ignore[override]
+            raise RuntimeError("stripe down")
+
+    set_stripe_gateway(_Boom())
+    try:
+        admin = uuid.uuid4()
+        iid = await _seed(admin, counted=51, subscription_id="sub_test")
+        with caplog.at_level(logging.ERROR, logger="app.billing.metering"):
+            assert await _report(admin, iid) == 0
+        assert any("usage report failed" in r.message for r in caplog.records)
+    finally:
+        set_stripe_gateway(None)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_invoice_that_lands_after_the_counter_rolled_keeps_the_new_watermarks(
+    gateway: FakeStripeGateway,
+) -> None:
+    """invoice.paid usually arrives minutes after the cycle end. If a turn was counted in
+    between, the watermarks already describe the NEW period; zeroing them would re-post
+    that block later under an identifier Stripe dedupes for only 24 hours."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    admin = uuid.uuid4()
+    old_anchor = datetime(2030, 1, 15, tzinfo=UTC)
+    iid = await _seed(admin, counted=0, subscription_id="sub_test", period_start=old_anchor)
+    async with tenant_session(admin) as s:
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=date(2030, 2, 15),
+                counted_conversations=60,
+                counted_session_ids=[],
+            )
+        )
+    # A counted turn in the new period already rolled the watermarks and billed block 1.
+    async with tenant_session(admin) as s:
+        assert (
+            await metering.report_usage(
+                s,
+                admin_id=admin,
+                instance_id=iid,
+                now=datetime(2030, 2, 15, 0, 10, tzinfo=UTC),
+                gateway=gateway,
+            )
+            == 1
+        )
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(
+                event_id="evt_late_cycle",
+                type="invoice.paid",
+                data={
+                    "period_start": int(old_anchor.timestamp()),
+                    "period_end": int(datetime(2030, 2, 15, tzinfo=UTC).timestamp()),
+                },
+            ),
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.period_start == datetime(2030, 2, 15, tzinfo=UTC)
+        assert acct.accrual_period_start == date(2030, 2, 15)
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (1, 1), "not reset"
+    # Another counted turn later does not re-post block 1.
+    async with tenant_session(admin) as s:
+        assert (
+            await metering.report_usage(
+                s,
+                admin_id=admin,
+                instance_id=iid,
+                now=datetime(2030, 2, 20, tzinfo=UTC),
+                gateway=gateway,
+            )
+            == 0
+        )
+    assert [e.value for e in gateway.meter_events] == [1]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_zero_dollar_creation_invoice_does_not_reset_the_first_block(
+    gateway: FakeStripeGateway,
+) -> None:
+    """Stripe issues a $0 invoice the moment a metered subscription is created; its
+    period_end is the anchor that was just set, so nothing was settled and the block
+    that opened the subscription must stay reported."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    gateway.now = STRIPE_PERIOD_START + timedelta(days=9, hours=9)
+    admin = uuid.uuid4()
+    iid = await _seed(admin, counted=51, subscription_id=None)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_start = None
+        await s.flush()
+    async with tenant_session(admin) as s:
+        assert (
+            await metering.report_usage(
+                s, admin_id=admin, instance_id=iid, now=gateway.now, gateway=gateway
+            )
+            == 1
+        )
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(
+                event_id="evt_creation_zero",
+                type="invoice.paid",
+                data={
+                    "period_start": int(gateway.now.timestamp()),
+                    "period_end": int(gateway.now.timestamp()),
+                },
+            ),
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (1, 1)
+        assert acct.period_start == gateway.now
+    assert [e.value for e in gateway.meter_events] == [1]

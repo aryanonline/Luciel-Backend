@@ -1,11 +1,12 @@
 """Close-account purge sweep (Architecture §3.6.6, Legal §B5).
 
-``cascade.close_account`` destroys the tenant's Luciel data and flips the account
-shell to ``closed`` synchronously. What it deliberately does NOT do is destroy the
-account row itself — Legal §B5 promises the closure is recoverable through the same
-30-day window as a Luciel deletion, and only then is the credential material (email
-+ password hash) permanently deleted, which is also what releases the email address
-for signup again.
+``cascade.close_account`` puts the tenant's Luciel into its 30-day grace window and
+flips the account shell to ``closed``. What it deliberately does NOT do is destroy
+anything — Legal §B5 promises the closure is recoverable through the same 30-day
+window as a Luciel deletion, and only then is the credential material (email +
+password hash) permanently deleted, which is also what releases the email address
+for signup again. This sweep is where the Luciel cascade, the billing identity
+(Stripe customer retired first) and the account row all go.
 
 This module is the "and then permanently deleted" half. There is no ``closed_at``
 column; the closure instant is read from the tenant's ``account_closure_initiated``
@@ -84,12 +85,12 @@ async def purge_closed_account_if_due(
     if now < started + timedelta(days=get_settings().grace_window_days):
         return False
 
-    # Belt to close_account's braces: a Luciel created/restored after closure, or a
-    # closure that failed mid-cascade, must not survive the purge. Unconditional
-    # because tenant data does not require a Luciel to exist — an account that attached
-    # a card and connected Google without finishing onboarding still owns billing rows
-    # and credentials, and this is the last caller that could ever remove them.
-    await hard_delete_cascade(session, admin_id)
+    # The whole tenant goes here: the Luciel (if the grace-expiry sweep has not already
+    # taken it), and — account scope — the billing identity. Unconditional because
+    # tenant data does not require a Luciel to exist: an account that attached a card
+    # and connected Google without finishing onboarding still owns billing rows and
+    # credentials, and this is the last caller that could ever remove them.
+    await hard_delete_cascade(session, admin_id, include_account_scope=True)
 
     await audit.emit(
         session,

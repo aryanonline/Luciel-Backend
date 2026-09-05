@@ -213,6 +213,8 @@ async def test_hard_delete_cascade_preserves_account_shell_and_audit():
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_close_account_deletes_luciel_first_then_closes():
+    """Closure subsumes deletion (§3.6.6) — the SAME deletion every owner gets, with its
+    30-day grace window (audit F001), not a synchronous hard-delete the copy never promised."""
     admin = uuid.uuid4()
     await _seed_account_with_luciel(admin)
     async with tenant_session(admin) as s:
@@ -220,9 +222,113 @@ async def test_close_account_deletes_luciel_first_then_closes():
     async with tenant_session(admin) as s:
         acct = (await s.execute(select(Account).where(Account.id == admin))).scalar_one()
         assert acct.state == AccountState.closed
-        # Luciel was deleted as part of the nested close flow.
-        assert (await s.execute(select(func.count()).select_from(Instance))).scalar_one() == 0
+        inst = (await s.execute(select(Instance))).scalar_one()
+        assert inst.state == LucielState.luciel_grace_window
+        assert inst.grace_window_started_at is not None
+        # The Luciel's data is still there for the window: restorable, not destroyed.
+        assert (await s.execute(select(func.count()).select_from(Lead))).scalar_one() == 1
         assert await verify_chain(s, admin) is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_close_account_settles_outstanding_usage_while_the_card_is_on_file():
+    """Legal §A4 / audit F002: the metered subscription ends with a final invoice for
+    the partial period, and the accrued residual is flushed first — closing used to
+    abandon the subscription and forgive the last blocks."""
+    from app.billing import metering
+    from app.billing.stripe_gateway import FakeStripeGateway
+    from app.models.billing import BillingAccount
+
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)
+    gw = FakeStripeGateway()
+    gw.seed_customer("cus_closing", subscription_id="sub_closing")
+    async with tenant_session(admin) as s:
+        s.add(
+            BillingAccount(
+                admin_id=admin,
+                billing_state="payg_enabled",
+                stripe_customer_id="cus_closing",
+                stripe_subscription_id="sub_closing",
+                accrued_blocks=3,
+                last_reported_blocks=2,
+            )
+        )
+    async with tenant_session(admin) as s:
+        await cascade.close_account(s, admin, admin, gateway=gw)
+    assert [e.value for e in gw.meter_events] == [1], "the residual block was billed"
+    assert gw.cancelled_subscriptions == [("sub_closing", True)]
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.stripe_subscription_id is None
+        assert acct.stripe_customer_id == "cus_closing"  # retired at purge, not at close
+        settled = (
+            await s.execute(
+                select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "billing_closure_settled",
+                )
+            )
+        ).scalar_one()
+        assert settled.event_payload["subscription_cancelled"] is True
+        assert settled.event_payload["usage_owed"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_grace_expiry_keeps_the_billing_identity_and_purge_retires_it():
+    """F014/F019: a hard-deleted Luciel leaves an account that still owns its card, its
+    lifetime count and its Stripe customer (the owner may build a new Luciel). Only the
+    account purge destroys that, and it deletes the Stripe customer first."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.billing.stripe_gateway import FakeStripeGateway, set_stripe_gateway
+    from app.lifecycle import close_purge
+    from app.models.billing import BillingAccount
+
+    admin = uuid.uuid4()
+    await _seed_account_with_luciel(admin)
+    async with tenant_session(admin) as s:
+        s.add(
+            BillingAccount(admin_id=admin, stripe_customer_id="cus_keep", lifetime_conversations=77)
+        )
+    async with tenant_session(admin) as s:
+        await cascade.hard_delete_cascade(s, admin)  # the day-30 Luciel cascade
+    async with tenant_session(admin) as s:
+        acct = (await s.execute(select(BillingAccount))).scalar_one()
+        assert acct.lifetime_conversations == 77
+        assert acct.stripe_customer_id == "cus_keep"
+
+    gw = FakeStripeGateway()
+    gw.seed_customer("cus_keep")
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            await cascade.close_account(s, admin, admin, gateway=gw)
+        async with tenant_session(admin) as s:
+            purged = await close_purge.purge_closed_account_if_due(
+                s, admin_id=admin, now=datetime.now(UTC) + timedelta(days=31)
+            )
+        assert purged is True
+    finally:
+        set_stripe_gateway(None)
+    assert gw.deleted_customers == ["cus_keep"]
+    async with tenant_session(admin) as s:
+        assert (await s.execute(select(BillingAccount))).scalar_one_or_none() is None
+        retired = (
+            await s.execute(
+                select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "stripe_customer_deleted",
+                )
+            )
+        ).scalar_one()
+        assert retired.event_payload == {
+            "customer_id": "cus_keep",
+            "subscription_id": None,
+            "deleted": True,
+            "error": None,
+            "context": "hard_delete_cascade",
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,14 @@ NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 #: the internal access log is a platform-STAFF record with its own 3-year floor), plus
 #: ``accounts`` for the sweeps whose contract is to keep the shell alive.
 _SURVIVES_ANY_SWEEP = frozenset({"admin_audit_log", "internal_access_log"})
+#: The Luciel cascade (grace expiry) leaves the account shell AND its billing identity —
+#: the card, the Stripe customer, the lifetime count belong to the account, which lives
+#: on and may build a new Luciel (audit F014/F019). Only the account purge takes them.
+_SURVIVES_LUCIEL_CASCADE = _SURVIVES_ANY_SWEEP | {
+    "accounts",
+    "billing_accounts",
+    "processed_stripe_events",
+}
 
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -625,8 +633,6 @@ async def test_grace_expiry_cascade_strands_nothing_and_releases_the_pages(
         "sessions",
         "leads",
         "counted_sessions",
-        "processed_stripe_events",
-        "billing_accounts",
         "instance_connections",
         "instances",
     ]
@@ -653,7 +659,7 @@ async def test_grace_expiry_cascade_strands_nothing_and_releases_the_pages(
     await sweep()
     assert len(seeded) == 2, "the reuse helper is expected to seed exactly twice"
     for admin_id in seeded:
-        await _assert_no_orphans(admin_id, survivors=_SURVIVES_ANY_SWEEP | {"accounts"})
+        await _assert_no_orphans(admin_id, survivors=_SURVIVES_LUCIEL_CASCADE)
         _assert_secrets_gone(admin_id)
 
 
@@ -679,7 +685,7 @@ async def test_grace_expiry_is_idempotent_and_respects_the_window(secret_store) 
     assert list(first) == [str(due)]
     assert second == {}, f"a second grace sweep re-deleted an already-deleted tenant: {second}"
 
-    await _assert_no_orphans(due, survivors=_SURVIVES_ANY_SWEEP | {"accounts"})
+    await _assert_no_orphans(due, survivors=_SURVIVES_LUCIEL_CASCADE)
     _assert_secrets_gone(due, neighbour_ref=inside_ref)
 
     async with tenant_session(inside) as s:

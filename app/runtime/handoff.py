@@ -78,9 +78,16 @@ async def take_over(
 
     # Budget: one session = one conversation. Becoming human-controlled before any
     # model call is the fire-once trigger (§3.4.1b Counter precision / §7 #33).
-    await count_session_once(
+    counted = await count_session_once(
         session, admin_id=admin_id, instance_id=instance_id, session_id=session_id
     )
+    if counted:
+        # The takeover path is a counting path, so it is a metering path too (audit
+        # F043): a conversation that crossed a block boundary here used to be counted
+        # but never reported until some later model-call turn happened to run.
+        from app.billing import metering  # noqa: PLC0415 — avoids an import cycle
+
+        await metering.report_usage_after_count(session, admin_id=admin_id, instance_id=instance_id)
 
     if not already:
         await audit.emit(

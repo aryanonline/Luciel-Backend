@@ -50,21 +50,55 @@ def current_billing_period_start(now: datetime | None = None) -> date:
     return date(now.year, now.month, 1)
 
 
-def period_start_for(account: BillingAccount | None, now: datetime | None = None) -> date:
-    """The period the conversation counter is keyed on (§3.4.1b).
+def _next_calendar_month(now: datetime) -> datetime:
+    return datetime(
+        now.year + (1 if now.month == 12 else 0),
+        1 if now.month == 12 else now.month + 1,
+        1,
+        tzinfo=UTC,
+    )
 
-    Reset is driven by Stripe ``invoice.paid``, so the anchor is the account's
-    Stripe-anchored ``period_start``; the calendar month is used only when no billing
-    account exists yet and there is therefore no Stripe period to anchor on.
+
+def current_period(
+    account: BillingAccount | None, now: datetime | None = None
+) -> tuple[date, datetime]:
+    """The billing period ``now`` falls in: ``(period_start, resets_at)`` (§3.4.1b).
+
+    Before billing exists there is no Stripe period, so the free allowance anchors to
+    the calendar month. Once the account carries a Stripe anchor (set when the metered
+    subscription is created, and moved forward by every ``invoice.paid``), the period
+    is that anchor's — and if the anchored period has ENDED without an ``invoice.paid``
+    (a failed invoice under dunning, a cancelled subscription, a delayed webhook), the
+    anchor rolls forward by whole billing cycles here rather than freezing (audit
+    F030: the free 50 stopped resetting the first time a webhook never came).
+    """
+    from app.billing.stripe_gateway import add_months  # noqa: PLC0415 — avoid import cycle
+
+    now = now or datetime.now(UTC)
+    if account is None or account.period_start is None:
+        return current_billing_period_start(now), _next_calendar_month(now)
+    start = account.period_start.astimezone(UTC)
+    resets = (
+        account.period_resets_at.astimezone(UTC)
+        if account.period_resets_at is not None
+        else add_months(start, 1)
+    )
+    if resets <= start:
+        resets = add_months(start, 1)
+    while now >= resets:
+        start, resets = resets, add_months(resets, 1)
+    return start.date(), resets
+
+
+def period_start_for(account: BillingAccount | None, now: datetime | None = None) -> date:
+    """The period the conversation counter is keyed on (§3.4.1b) — see ``current_period``.
 
     Keying on the calendar instead zeroed the counter on the 1st for a tenant whose
     Stripe period runs (say) the 15th to the 15th — a second free 50 every month — while
     the Stripe usage idempotency key still named the Stripe period, so the second block
     crossed in the same Stripe period reused a spent key and was never billed at all.
     """
-    if account is not None and account.period_start is not None:
-        return account.period_start.astimezone(UTC).date()
-    return current_billing_period_start(now)
+    return current_period(account, now)[0]
 
 
 async def resolve_billing_period_start(
@@ -170,6 +204,9 @@ async def count_session_once(
     both halves: concurrent turns on one session double-counted and clobbered each
     other's session ids, and concurrent turns on different sessions lost an increment
     outright.
+
+    The claim is keyed on the SESSION, not the (session, period) pair: a conversation
+    that straddles a period boundary is still one conversation (audit F029).
     """
     period = await resolve_billing_period_start(session, admin_id=admin_id)
     await _get_or_create_row(session, admin_id=admin_id, instance_id=instance_id, period=period)
@@ -183,9 +220,7 @@ async def count_session_once(
             session_id=session_id,
             billing_period_start=period,
         )
-        .on_conflict_do_nothing(
-            index_elements=["admin_id", "instance_id", "session_id", "billing_period_start"]
-        )
+        .on_conflict_do_nothing(index_elements=["admin_id", "instance_id", "session_id"])
     )
     if claimed.rowcount == 0:  # type: ignore[attr-defined]  # another turn already counted this session
         return False

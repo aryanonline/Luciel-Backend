@@ -24,7 +24,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -154,18 +154,31 @@ async def set_dormant_for_action_tools(
 
     Emits ``connection_status_changed`` (Architecture §3.8.4) so the existing
     restore path (``billing.webhooks._restore_dormant_connections``) has
-    something to restore. Returns the number of rows transitioned."""
-    result = await session.execute(
-        update(InstanceConnection)
-        .where(
-            InstanceConnection.admin_id == admin_id,
-            InstanceConnection.connection_type.in_(ACTION_TOOL_CONNECTION_TYPES),
-            InstanceConnection.status == "connected",
+    something to restore. The prior status + detail are STASHED on the row
+    (migration 0049 columns) so the restore returns the connection to exactly
+    what it was — a billing dormancy never changed the credential's health.
+    Returns the number of rows transitioned."""
+    rows = (
+        (
+            await session.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_type.in_(ACTION_TOOL_CONNECTION_TYPES),
+                    InstanceConnection.status == "connected",
+                )
+            )
         )
-        .values(status="dormant", status_detail=reason)
+        .scalars()
+        .all()
     )
-    changed = int(result.rowcount or 0)  # type: ignore[attr-defined]
+    for row in rows:
+        row.status_stashed = row.status
+        row.status_detail_stashed = row.status_detail
+        row.status = "dormant"
+        row.status_detail = reason
+    changed = len(rows)
     if changed > 0:
+        await session.flush()
         await audit.emit(
             session,
             admin_id=admin_id,

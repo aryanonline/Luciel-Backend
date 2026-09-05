@@ -651,10 +651,15 @@ class Orchestrator:
             # PAYG usage is billed in arrears from this counter (Vision §7): report the
             # new block to Stripe as it opens, so overage past the free 50 is actually
             # billed rather than only computed.
-            from app.billing import metering  # noqa: PLC0415 — avoids an import cycle
+            from app.billing import metering, notice_delivery  # noqa: PLC0415 — import cycle
 
             await metering.report_usage_after_count(
                 self.session, admin_id=admin_id, instance_id=instance_id
+            )
+            # The block-start / 80% notices are evaluated the moment the count moves
+            # (audit F011), not only by the daily sweep. Never raises.
+            await notice_delivery.send_usage_notices_after_count(
+                self.session, admin_id=admin_id, now=datetime.now(UTC)
             )
 
         # --- §3.3.7 ASK-ATTEMPT BOUND (C4) ----------------------------------- #
@@ -713,16 +718,18 @@ class Orchestrator:
         escalation: EscalationDecision | None = None
         if outcome.fired:
             escalation = outcome
-            # cannot_answer fires AT MOST ONCE per session (live-caught 2026-08-18:
-            # every below-floor turn of one call emailed the owner again). The turn's
-            # own state still reports the escalation (LoopResult) — only the repeat
-            # row + repeat notification are suppressed. high_value_lead, budget, and
-            # llm_unavailable are NOT deduped: each is a fresh business event.
-            suppress = outcome.signal == Signal.cannot_answer and await _session_already_escalated(
+            # Every signal fires AT MOST ONCE per session (live-caught 2026-08-18 for
+            # cannot_answer: every below-floor turn of one call emailed the owner
+            # again; the audit's cost review found high_value_lead re-firing on every
+            # turn of a hot lead the same way). The turn's own state still reports the
+            # escalation (LoopResult) — only the repeat row + repeat notification are
+            # suppressed. One conversation is one business event per signal.
+            fired_signal = (outcome.signal or Signal.cannot_answer).value
+            suppress = await _session_already_escalated(
                 self.session,
                 admin_id=admin_id,
                 session_id=session_id,
-                signal=Signal.cannot_answer.value,
+                signal=fired_signal,
             )
             if not suppress:
                 await _record_escalation(
@@ -1174,7 +1181,16 @@ class Orchestrator:
     async def _emit_budget_exhausted(
         self, session_id: uuid.UUID, resolved_lead_id: uuid.UUID | None
     ) -> None:
-        # cannot_answer with reason budget_exhausted (§3.4.1b at-cap behavior).
+        # cannot_answer with reason budget_exhausted (§3.4.1b at-cap behavior). Once
+        # per session: an at-cap tenant's visitor sending twenty messages is one
+        # escalation and one owner notification, not twenty (cost review).
+        if await _session_already_escalated(
+            self.session,
+            admin_id=self.admin_id,
+            session_id=session_id,
+            signal="budget_exhausted",
+        ):
+            return
         await _record_escalation(
             self.session,
             admin_id=self.admin_id,
@@ -1189,6 +1205,15 @@ class Orchestrator:
     async def _emit_llm_unavailable(
         self, session_id: uuid.UUID, resolved_lead_id: uuid.UUID | None
     ) -> None:
+        # Once per session, same reasoning as budget_exhausted: an outage is one
+        # event for the conversation, however many turns it spans.
+        if await _session_already_escalated(
+            self.session,
+            admin_id=self.admin_id,
+            session_id=session_id,
+            signal="llm_unavailable",
+        ):
+            return
         await _record_escalation(
             self.session,
             admin_id=self.admin_id,

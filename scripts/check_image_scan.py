@@ -13,7 +13,9 @@ Replaces a raw count check (`CRITICAL != 0 -> fail`) that had two dishonest edge
 This gate fails CLOSED and makes exceptions explicit, bounded, and reviewed:
 
   * scan not COMPLETE, unreadable findings, malformed allowlist  -> FAIL
-  * any CRITICAL finding not in .security/cve-allowlist.json     -> FAIL
+  * any CRITICAL or HIGH finding not in .security/cve-allowlist.json -> FAIL
+    (§5.14: "images failing on a high/critical CVE do not promote to production";
+    `--severities` narrows the blocking set for tests/ops, default CRITICAL,HIGH)
   * a listed CVE still present past its entry's `expires` date   -> FAIL
     (expiry forces a human re-review; renewing = editing the file in a commit)
   * a listed CVE no longer present in the scan                   -> warning only,
@@ -64,7 +66,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("scan_file")
     parser.add_argument("allowlist_file")
     parser.add_argument("--today", default=None, help="ISO date override (tests only)")
+    parser.add_argument(
+        "--severities",
+        default="CRITICAL,HIGH",
+        help="comma-separated severities that block promotion (default: CRITICAL,HIGH)",
+    )
     args = parser.parse_args(argv)
+    blocking = {s.strip().upper() for s in args.severities.split(",") if s.strip()}
     today = date.fromisoformat(args.today) if args.today else date.today()
 
     try:
@@ -84,14 +92,15 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(f"scan status is {status or 'absent'!r}, not COMPLETE — failing closed")
 
     findings = scan.get("imageScanFindings", {}).get("findings", []) or []
-    criticals = [f for f in findings if str(f.get("severity", "")).upper() == "CRITICAL"]
+    criticals = [f for f in findings if str(f.get("severity", "")).upper() in blocking]
 
     failures: list[str] = []
     for finding in criticals:
         cve = str(finding.get("name", ""))
         entry = allowlist.get(cve)
         if entry is None:
-            failures.append(f"{cve}: CRITICAL and not allowlisted")
+            sev = str(finding.get("severity", "")).upper()
+            failures.append(f"{cve}: {sev} and not allowlisted")
         elif today > date.fromisoformat(entry["expires"]):
             failures.append(
                 f"{cve}: allowlist entry expired {entry['expires']} and the CVE is still "
@@ -109,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
         for line in failures:
             print(f"::error::{line}")
         return 1
-    print(f"[gate] PASS — {len(criticals)} critical finding(s), all under governed exceptions")
+    print(
+        f"[gate] PASS — {len(criticals)} blocking finding(s) ({'/'.join(sorted(blocking))}), "
+        "all under governed exceptions"
+    )
     return 0
 
 

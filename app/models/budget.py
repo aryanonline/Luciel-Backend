@@ -57,10 +57,14 @@ class ConversationBudget(Base, TenantMixin, TimestampMixin):
 class CountedSession(Base, TenantMixin, TimestampMixin):
     """One row per conversation counted — the fire-once guard (§3.4.1b Counter precision).
 
-    The uniqueness of (admin_id, instance_id, session_id, billing_period_start) is what
-    makes the increment idempotent, and Postgres enforces it: the caller inserts with
-    ``ON CONFLICT DO NOTHING`` and the rowcount says whether this call is the one that
-    counted. Concurrency is then the database's problem rather than a lost update.
+    The uniqueness of (admin_id, instance_id, session_id) is what makes the increment
+    idempotent, and Postgres enforces it: the caller inserts with ``ON CONFLICT DO
+    NOTHING`` and the rowcount says whether this call is the one that counted.
+    Concurrency is then the database's problem rather than a lost update.
+
+    The period is recorded but deliberately NOT part of the key (migration 0055): a
+    session that straddles a period boundary is still ONE conversation — keying on the
+    period counted it once in each (audit F029), against the "counted once" rule.
     """
 
     __tablename__ = "counted_sessions"
@@ -69,8 +73,7 @@ class CountedSession(Base, TenantMixin, TimestampMixin):
             "admin_id",
             "instance_id",
             "session_id",
-            "billing_period_start",
-            name="uq_counted_session",
+            name="uq_counted_session_once",
         ),
     )
 

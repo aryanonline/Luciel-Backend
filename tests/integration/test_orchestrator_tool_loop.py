@@ -420,3 +420,35 @@ async def test_at_cap_decision_signal_matches_the_persisted_row():
             .all()
         )
         assert any(e.signal == "budget_exhausted" for e in ev)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_at_cap_turns_escalate_once_per_session():
+    """Cost review (2026-09-05 audit): every at-cap turn wrote a fresh budget_exhausted
+    row and notified the owner again. One conversation is one business event — the
+    visitor's twentieth message at the cap is not the twentieth escalation."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        state0 = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+        for _ in range(state0.free_allowance):
+            await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+            )
+        sid = await _seed(s, admin, iid, tool=None)
+        orch = _orch(s, admin, iid, primary=EchoModel(), tool=None)
+        for text in ("hello", "anyone there?", "hello??"):
+            result = await orch.run_turn(
+                session_id=sid,
+                resolved_lead_id=None,
+                channel="widget",
+                mode="ai",
+                inbound_text=text,
+            )
+            assert result.at_cap is True
+            assert result.escalation is not None  # every turn still REPORTS the state
+        rows = (
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
+        assert [r.signal for r in rows] == ["budget_exhausted"]

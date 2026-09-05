@@ -241,6 +241,56 @@ async def test_remove_payment_method_returns_billing_info_and_reverts(client) ->
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_remove_payment_method_settles_the_residual_before_detaching(client) -> None:
+    """Audit F031: the admin's own card removal is a loss of PAYG exactly like a
+    Stripe-side detach, so it flushes the accrued residual and ends the metered
+    subscription with a final invoice BEFORE the card goes — not after, when there is
+    nothing left to charge."""
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=210)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.stripe_customer_id = "cus_settle"
+        acct.stripe_subscription_id = "sub_settle"
+        acct.accrued_blocks = 2
+        acct.last_reported_blocks = 1
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        await s.flush()
+    gw = FakeStripeGateway()
+    gw.seed_customer("cus_settle", subscription_id="sub_settle")
+    set_stripe_gateway(gw)
+    try:
+        r = await client.delete("/api/v1/billing/payment-method")
+        assert r.status_code == 200
+    finally:
+        set_stripe_gateway(None)
+    assert [e.value for e in gw.meter_events] == [1], "the owed block was billed first"
+    assert gw.cancelled_subscriptions == [("sub_settle", True)]
+    assert gw.default_payment_methods == {}
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.stripe_subscription_id is None
+        assert acct.billing_state == "free_cap"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_billing_read_says_when_payments_are_not_live(client, monkeypatch) -> None:
+    """Audit F026: in the mock Stripe posture the checkout URL goes nowhere, so the read
+    carries ``paymentsAvailable`` and the dashboard can say so instead of offering a
+    button that pretends to work."""
+    from app.config import get_settings
+
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=0)
+    monkeypatch.setattr(get_settings(), "stripe_integration_posture", "mock")
+    assert (await client.get("/api/v1/billing")).json()["paymentsAvailable"] is False
+    monkeypatch.setattr(get_settings(), "stripe_integration_posture", "test")
+    assert (await client.get("/api/v1/billing")).json()["paymentsAvailable"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_usage_overview_shape(client) -> None:
     admin = await _signup_verify_login(client)
     await _seed_instance(admin, counted=12)

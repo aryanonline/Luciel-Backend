@@ -375,6 +375,120 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_widget_flood_with_rotating_session_ids_is_still_rate_limited(client):
+    """Audit F046 (denial-of-wallet): the old bucket was keyed on the CALLER-supplied
+    sessionId, so a fresh random id per request minted a fresh full bucket AND opened
+    a new billed session each time. Now a made-up id buys nothing: the per-IP and
+    new-session caps hold, and the tenant's conversation counter barely moves."""
+    from app.models.conversation import Session
+    from sqlalchemy import func, select
+
+    admin, embed_key = await _seed_active_instance()
+    statuses = []
+    for _ in range(20):
+        r = await client.post(
+            "/api/v1/chat-widget/messages",
+            json={"embedKey": embed_key, "sessionId": str(uuid.uuid4()), "text": "hi"},
+        )
+        statuses.append(r.status_code)
+    assert 429 in statuses, f"rotating session ids must not escape the limiter: {statuses}"
+    opened = statuses.count(200)
+    cap = __import__("app.channels.rate_limit", fromlist=["LIMITS"]).LIMITS["widget_session_open"]
+    assert opened <= cap.burst, f"{opened} sessions opened from one address in one burst"
+    async with tenant_session(admin) as s:
+        n = (await s.execute(select(func.count()).select_from(Session))).scalar_one()
+    assert n <= cap.burst, "a fabricated sessionId must not open (and bill) a fresh session"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_resumed_session_is_not_charged_against_the_new_session_cap(client):
+    """The new-session cap must never throttle a real visitor continuing THEIR chat."""
+    _admin, embed_key = await _seed_active_instance()
+    first = await client.post(
+        "/api/v1/chat-widget/messages", json={"embedKey": embed_key, "text": "hello"}
+    )
+    assert first.status_code == 200
+    sid = first.json()["sessionId"]
+    # Well past the new-session burst, all on the SAME open session: the per-session
+    # bucket (burst 5) is what governs, and only the burst-exhaustion 429 may appear.
+    statuses = []
+    for _ in range(4):
+        r = await client.post(
+            "/api/v1/chat-widget/messages",
+            json={"embedKey": embed_key, "sessionId": sid, "text": "more"},
+        )
+        statuses.append(r.status_code)
+    assert statuses == [200, 200, 200, 200], statuses
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_history_is_scoped_to_widget_sessions_of_this_instance(client):
+    """Audit F075: an embed key plus a guessed session id could read ANY channel's
+    transcript of the tenant. The widget can only replay widget conversations."""
+    from datetime import UTC, datetime
+
+    from app.models.conversation import Session, Transcript
+
+    admin, embed_key = await _seed_active_instance()
+    sms_session = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Session(
+                id=sms_session,
+                admin_id=admin,
+                instance_id=admin,
+                channel="sms",
+                mode="ai",
+                counted=False,
+                started_at=datetime.now(UTC),
+                last_message_at=datetime.now(UTC),
+            )
+        )
+        s.add(
+            Transcript(
+                admin_id=admin,
+                instance_id=admin,
+                session_id=sms_session,
+                role="lead",
+                text="my phone number is private",
+            )
+        )
+        await s.flush()
+    r = await client.get(
+        f"/api/v1/chat-widget/sessions/{sms_session}", params={"embedKey": embed_key}
+    )
+    assert r.status_code == 200
+    assert r.json() == [], "an SMS transcript must be invisible to the public widget key"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_oversized_visitor_text_is_rejected_before_any_tenant_work(client):
+    from app.schemas_api.widget import WIDGET_TEXT_MAX_CHARS
+
+    _admin, embed_key = await _seed_active_instance()
+    r = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "text": "x" * (WIDGET_TEXT_MAX_CHARS + 1)},
+    )
+    assert r.status_code == 422
+    r = await client.post("/api/v1/chat-widget/messages", json={"embedKey": embed_key, "text": ""})
+    assert r.status_code == 422
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_bootstrap_storm_from_one_address_is_bounded(client):
+    """The unauthenticated bootstrap performs tenant DB work; it gets its own ceiling."""
+    _admin, embed_key = await _seed_active_instance()
+    statuses = [
+        (
+            await client.post("/api/v1/chat-widget/bootstrap", json={"embedKey": embed_key})
+        ).status_code
+        for _ in range(14)
+    ]
+    assert 429 in statuses, statuses
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_bootstrap_disclosure_clause_never_names_the_luciel(client):
     """LIVE-VERIFIED regression: the opening greeting read "Hi — I'm Aryan's
     Front-Desk Assistant. I'm an AI assistant for Aryan's Front-Desk Assistant,

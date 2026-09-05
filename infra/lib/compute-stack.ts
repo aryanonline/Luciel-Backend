@@ -436,9 +436,15 @@ export class ComputeStack extends Stack {
           // Set on BOTH planes: the data plane reports usage on the conversation path
           // and the control plane serves the billing webhook and card routes.
           LUCIEL_STRIPE_INTEGRATION_POSTURE: envConfig.stripeIntegrationPosture,
-          // Redis-backed LLM cap (§9 C9). Same URL on both planes (makeTaskDef is
-          // called for data-plane + control-plane). App reads it as redis_url.
+          // Redis-backed LLM cap (§9 C9) and abuse counters (§3.1.5). Same URL on both
+          // planes (makeTaskDef is called for data-plane + control-plane). App reads
+          // it as redis_url.
           LUCIEL_REDIS_URL: redisUrl,
+          // uvicorn --forwarded-allow-ips: trust X-Forwarded-For only from the VPC
+          // (the ALB), so request.client.host is the address the ALB appended and a
+          // client-written leftmost entry can never impersonate another visitor's IP
+          // (per-IP abuse ceilings, §3.1.5).
+          LUCIEL_TRUSTED_PROXY_CIDRS: vpc.vpcCidrBlock,
           // Per-env, so a dev export can never be written to the prod bucket.
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
           // Transcript cold storage (Commitment #38) — same per-env naming rule.

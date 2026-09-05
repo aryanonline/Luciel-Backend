@@ -5,18 +5,31 @@ explicit skip-grace confirm). Ordered to respect FK dependencies and to LOG each
 data class deletion (``data_retention_hard_delete``) BEFORE the rows are gone.
 It destroys the Luciel and everything attached, but NOT the account shell and NOT
 the admin_audit_log (the proof of deletion is retained, §3.6.5).
+
+Two scopes (audit F014/F019). The LUCIEL scope is everything the Luciel owns; the
+ACCOUNT scope adds the billing identity (``billing_accounts`` + the Stripe replay
+gate), which belongs to the account shell, not the Luciel: a hard-deleted Luciel
+leaves an account that still has its card on file, its lifetime count, and its
+Stripe customer — the owner may create a new Luciel against it. Only the account
+purge (closure day 30, unverified reap) destroys that scope, and it retires the
+Stripe customer object first so the processor holds no identity for a tenant that
+no longer exists.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.billing import metering
+from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.connections.secrets import get_secret_store, tenant_secret_prefix
 from app.db.base import TenantMixin
+from app.lifecycle import state_machine
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
@@ -36,6 +49,8 @@ from app.models.tool_auth import InstanceToolAuthorization
 from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
 from app.models.voice import VoiceCallRecord
 
+_log = logging.getLogger(__name__)
+
 #: Tables that carry an admin_id but must NOT be cascaded, each for its own reason:
 #:   accounts             — the shell outlives its Luciel (§3.6.5); closure destroys it.
 #:   admin_audit_log      — the proof the deletion happened. Erasing it erases the evidence.
@@ -50,7 +65,7 @@ CASCADE_EXEMPT_TABLES = frozenset({"accounts", "admin_audit_log", "internal_acce
 #: will error if a table is forgotten — a missed table just leaves a live tenant's rows
 #: behind under a deleted admin_id. ``tests/integration/test_deletion_cascade_completeness``
 #: walks information_schema against this tuple; that test is the only backstop there is.
-CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
+LUCIEL_SCOPE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (KnowledgeChunk, "knowledge_chunk"),
     (KnowledgeEdge, "knowledge_edge"),
     (KnowledgeEntity, "knowledge_entity"),
@@ -71,11 +86,20 @@ CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (ConversationBudget, "conversation_budget"),
     (CountedSession, "counted_session"),
     (NoticeDelivery, "notice_delivery"),
-    (ProcessedStripeEvent, "processed_stripe_event"),
-    (BillingAccount, "billing_account"),
     (InstanceConnection, "instance_connection"),
     (Session, "session"),
     (Instance, "luciel_instance"),
+)
+
+#: The billing identity: destroyed only with the account shell (see module docstring).
+ACCOUNT_SCOPE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
+    (ProcessedStripeEvent, "processed_stripe_event"),
+    (BillingAccount, "billing_account"),
+)
+
+#: Everything tenant deletion can ever destroy — the completeness test's registry.
+CASCADE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
+    LUCIEL_SCOPE_MODELS + ACCOUNT_SCOPE_MODELS
 )
 
 
@@ -203,12 +227,57 @@ async def _delete_tenant_transcript_archive(
     )
 
 
-async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dict[str, int]:
+async def _retire_stripe_customer(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    *,
+    context: str,
+    gateway: StripeGateway | None = None,
+) -> None:
+    """Destroy the tenant's Stripe customer before the row that names it is deleted
+    (§3.6.6 / Legal §B5). Best-effort with the outcome audited: a processor outage
+    must not strand a purge the owner already confirmed, and the audit row is what
+    an operator uses to finish the job by hand."""
+    account = (
+        await session.execute(select(BillingAccount).where(BillingAccount.admin_id == admin_id))
+    ).scalar_one_or_none()
+    if account is None or account.stripe_customer_id is None:
+        return
+    gateway = gateway or get_stripe_gateway()
+    try:
+        deleted = await gateway.delete_customer(customer_id=account.stripe_customer_id)
+        error: str | None = None
+    except Exception as exc:  # noqa: BLE001 — a broken processor must not strand the purge
+        deleted, error = False, type(exc).__name__
+        _log.exception("stripe customer retirement failed admin_id=%s", admin_id)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type="stripe_customer_deleted",
+        payload={
+            "customer_id": account.stripe_customer_id,
+            "subscription_id": account.stripe_subscription_id,
+            "deleted": deleted,
+            "error": error,
+            "context": context,
+        },
+    )
+
+
+async def hard_delete_cascade(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    *,
+    include_account_scope: bool = False,
+    gateway: StripeGateway | None = None,
+) -> dict[str, int]:
     """Run the ordered cascade for the tenant's Luciel. Returns per-table row counts.
 
-    Destroys every table in ``CASCADE_MODELS`` (child data first, instance row last) plus
-    the tenant's secret material. The account shell and the admin_audit_log survive
-    (§3.6.5).
+    Destroys every table in ``LUCIEL_SCOPE_MODELS`` (child data first, instance row
+    last) plus the tenant's secret material. The account shell and the admin_audit_log
+    survive (§3.6.5). With ``include_account_scope`` — the account PURGE paths only —
+    the billing identity goes too, after the Stripe customer is retired.
 
     A tenant with no Instance row is still cascaded. The Luciel is not what makes the
     other rows tenant data: an account can attach a card, connect Google, and close
@@ -226,12 +295,18 @@ async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dic
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted
     await session.flush()
+    models = LUCIEL_SCOPE_MODELS
+    if include_account_scope:
+        await _retire_stripe_customer(
+            session, admin_id, context="hard_delete_cascade", gateway=gateway
+        )
+        models = models + ACCOUNT_SCOPE_MODELS
     counts = {
         # __tablename__ lives on each concrete model, not on the TenantMixin bound.
         str(getattr(model, "__tablename__")): await _log_and_delete(  # noqa: B009
             session, admin_id, iid, model, data_class
         )
-        for model, data_class in CASCADE_MODELS
+        for model, data_class in models
     }
 
     # Mark account empty: hasLuciel false, account shell survives.
@@ -251,20 +326,93 @@ async def hard_delete_cascade(session: AsyncSession, admin_id: uuid.UUID) -> dic
     return counts
 
 
-async def close_account(
-    session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uuid.UUID
-) -> None:
-    """Close the account shell (Architecture §3.6.6). Precondition: Luciel deleted.
+async def settle_billing_at_closure(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    *,
+    gateway: StripeGateway | None = None,
+) -> dict[str, object]:
+    """Charge what the tenant already ran, then end the metered subscription (Legal §A4).
 
-    If a Luciel still exists, the close flow runs delete + cascade first (the
-    nested model), then destroys the shell. Audit tombstones are retained.
+    Closure is the last moment the card is reliably on file. The accrued-but-unreported
+    residual is flushed to the meter first (the same path card detach uses), then the
+    subscription is cancelled WITH a final invoice for the partial period so the last
+    blocks are actually collected — before this the subscription was simply abandoned
+    and the residual quietly forgiven (audit F001/F002). Best-effort against Stripe with
+    the outcome audited; the day-30 purge retires the customer regardless.
+    """
+    account = (
+        await session.execute(select(BillingAccount).where(BillingAccount.admin_id == admin_id))
+    ).scalar_one_or_none()
+    outcome: dict[str, object] = {
+        "subscription_id": None,
+        "usage_reported_blocks": 0,
+        "usage_owed": False,
+        "subscription_cancelled": None,
+        "error": None,
+    }
+    if account is None:
+        return outcome
+    gateway = gateway or get_stripe_gateway()
+    outcome["subscription_id"] = account.stripe_subscription_id
+    try:
+        reported = await metering.report_accrued_usage(session, admin_id=admin_id, gateway=gateway)
+        outcome["usage_reported_blocks"] = reported
+        outcome["usage_owed"] = account.accrued_blocks > 0
+    except Exception as exc:  # noqa: BLE001 — closure must complete; the failure is audited
+        outcome["error"] = type(exc).__name__
+        _log.exception("closure usage flush failed admin_id=%s", admin_id)
+    if account.stripe_subscription_id is not None:
+        try:
+            cancelled = await gateway.cancel_subscription(
+                subscription_id=account.stripe_subscription_id, invoice_now=True
+            )
+            outcome["subscription_cancelled"] = cancelled
+            if cancelled:
+                account.stripe_subscription_id = None
+        except Exception as exc:  # noqa: BLE001
+            outcome["subscription_cancelled"] = False
+            outcome["error"] = type(exc).__name__
+            _log.exception("closure subscription cancel failed admin_id=%s", admin_id)
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type="billing_closure_settled",
+        payload={**outcome, "invoice_now": True},
+    )
+    return outcome
+
+
+async def close_account(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    *,
+    gateway: StripeGateway | None = None,
+) -> None:
+    """Close the account shell (Architecture §3.6.6) — the nested model.
+
+    Closure SUBSUMES deletion, it does not skip it: a Luciel that is still serving is
+    put through the same fused-quiesce delete every owner gets (embed key stashed,
+    connections revoked with their status stashed, knowledge soft-deleted, 30-day grace
+    window stamped), so the closure is recoverable for the window Legal §B5 promises
+    and the in-flight conversations drain (§3.6.3). The hard cascade runs at day 30 —
+    from the grace-expiry sweep or the closure purge, whichever comes first. Synchronous
+    destruction here (audit F001) contradicted the product's own copy.
+
+    Outstanding pay-as-you-go usage is settled at closure while the card is still on
+    file (Legal §A4). Audit tombstones are retained.
     """
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()
-    if inst is not None:
-        # Subsumes deletion: cascade the Luciel first (export is offered upstream).
-        await hard_delete_cascade(session, admin_id)
+    if inst is not None and inst.state in (LucielState.active, LucielState.paused):
+        await state_machine.delete_luciel(session, admin_id, actor_user_id)
+    # Already in the grace window or hard-deleted: nothing more to quiesce.
+
+    await settle_billing_at_closure(session, admin_id, gateway=gateway)
 
     await audit.emit(
         session,
@@ -290,5 +438,8 @@ async def close_account(
         event_type="lifecycle_transition",
         actor_type=ActorType.admin_user,
         actor_user_id=actor_user_id,
-        payload={"from": "account:empty", "to": "account_closing"},
+        payload={
+            "from": "luciel_grace_window" if inst is not None else "account:empty",
+            "to": "account_closing",
+        },
     )

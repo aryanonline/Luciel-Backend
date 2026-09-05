@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from app.billing import metering
@@ -67,13 +68,18 @@ async def _seed_instance(admin: uuid.UUID, counted: int) -> uuid.UUID:
 
 
 def _signed_webhook(
-    gw: FakeStripeGateway, *, event_id: str, event_type: str, admin: uuid.UUID
+    gw: FakeStripeGateway,
+    *,
+    event_id: str,
+    event_type: str,
+    admin: uuid.UUID,
+    extra: dict | None = None,
 ) -> bytes:
     return json.dumps(
         {
             "id": event_id,
             "type": event_type,
-            "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+            "data": {"object": {"metadata": {"admin_id": str(admin)}, **(extra or {})}},
         }
     ).encode()
 
@@ -120,7 +126,7 @@ async def test_payg_math_at_151_conversations_matches_locked_numbers(client) -> 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_signed_invoice_paid_webhook_resets_budget_no_rollover(client) -> None:
     admin = await _signup_verify_login(client)
-    await _seed_instance(admin, counted=240)  # well above free_allowance=50
+    iid = await _seed_instance(admin, counted=240)  # well above free_allowance=50
     await _make_payg_enabled(admin)
 
     g = await client.get("/api/v1/billing")
@@ -130,8 +136,16 @@ async def test_signed_invoice_paid_webhook_resets_budget_no_rollover(client) -> 
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
+        # A real invoice names the period it settled; the next period starts at its end.
         payload = _signed_webhook(
-            gw, event_id="evt_payg_paid", event_type="invoice.paid", admin=admin
+            gw,
+            event_id="evt_payg_paid",
+            event_type="invoice.paid",
+            admin=admin,
+            extra={
+                "period_start": int(datetime(2030, 1, 15, tzinfo=UTC).timestamp()),
+                "period_end": int(datetime(2030, 2, 15, tzinfo=UTC).timestamp()),
+            },
         )
         header = build_signature_header(gw.WEBHOOK_SECRET, payload)
         r = await client.post(
@@ -142,10 +156,15 @@ async def test_signed_invoice_paid_webhook_resets_budget_no_rollover(client) -> 
     finally:
         set_stripe_gateway(None)
 
-    g2 = await client.get("/api/v1/billing")
+    async with tenant_session(admin) as s:
+        # The dashboard read is "now"-relative; assert the new period through the same
+        # metering read at an instant inside it.
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=datetime(2030, 2, 20, tzinfo=UTC)
+        )
     # Reset to zero, NO rollover of the prior 240 (§3.4.1b).
-    assert g2.json()["budget"]["conversationsThisPeriod"] == 0
-    assert g2.json()["budget"]["billedThisPeriod"] == 0
+    assert b.conversations_this_period == 0
+    assert b.billed_this_period == 0
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

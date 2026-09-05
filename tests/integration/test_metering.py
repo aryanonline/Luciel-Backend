@@ -13,7 +13,7 @@ import uuid
 from datetime import UTC, datetime, time, timedelta
 
 import pytest
-from app.billing import metering
+from app.billing import dunning, metering
 from app.billing import webhooks as billing_webhooks
 from app.billing.stripe_gateway import FakeStripeGateway, StripeEvent
 from app.db.session import tenant_session
@@ -111,24 +111,44 @@ async def test_payg_above_50_billed_not_at_cap() -> None:
 
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_invoice_paid_resets_counter_no_rollover() -> None:
+    """The invoice settles the period it names; the NEXT period (its ``period_end``)
+    starts at zero — and the settled period's ledger is kept as the invoice's evidence
+    (audit F005/F042), not deleted."""
     admin = uuid.uuid4()
     iid = await _seed_tenant(admin, counted=120)
     async with tenant_session(admin) as s:
         await metering.get_or_create_billing_account(s, admin_id=admin)
+    settled_end = datetime(2030, 2, 15, tzinfo=UTC)
     event = StripeEvent(
         event_id="evt_1",
         type="invoice.paid",
         data={
-            "period_start": int(datetime(2026, 6, 1, tzinfo=UTC).timestamp()),
-            "period_end": int(datetime(2026, 7, 1, tzinfo=UTC).timestamp()),
+            "period_start": int(datetime(2030, 1, 15, tzinfo=UTC).timestamp()),
+            "period_end": int(settled_end.timestamp()),
         },
     )
     async with tenant_session(admin) as s:
         action = await billing_webhooks.handle_event(s, admin_id=admin, event=event)
     assert action == "invoice_paid"
     async with tenant_session(admin) as s:
-        b = await metering.build_budget(s, admin_id=admin, instance_id=iid)
-    assert b.conversations_this_period == 0  # reset, NO rollover
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.period_start == settled_end  # the NEW period begins where the paid one ended
+        assert acct.accrual_period_start == settled_end.date()
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=settled_end + timedelta(days=5)
+        )
+        assert b.conversations_this_period == 0  # reset, NO rollover
+        from sqlalchemy import func as sa_func
+        from sqlalchemy import select as sa_select
+
+        kept = (
+            await s.execute(
+                sa_select(sa_func.count())
+                .select_from(ConversationBudget)
+                .where(ConversationBudget.admin_id == admin)
+            )
+        ).scalar_one()
+        assert kept == 1, "the settled period's ledger row is the evidence behind the invoice"
 
 
 @pytest.mark.usefixtures("db_engine_reset")
@@ -289,7 +309,7 @@ async def test_payment_failed_emits_lifecycle_notice_sent():
 async def test_subscription_renewed_resets_budget():
     """Axis8-F02: customer.subscription.renewed triggers same budget reset as invoice.paid."""
     admin = uuid.uuid4()
-    await _seed_tenant(admin, counted=30)
+    iid = await _seed_tenant(admin, counted=30)
     now = datetime(2026, 6, 20, tzinfo=UTC)
     ps = int(now.timestamp())
     pe = int((now.replace(month=7)).timestamp())
@@ -303,11 +323,15 @@ async def test_subscription_renewed_resets_budget():
         action = await billing_webhooks.handle_event(s, admin_id=admin, event=event, now=now)
     assert action == "invoice_paid"
 
-    # Budget should be reset: no budget rows remain.
+    # The renewed period reads zero; the previous period's ledger row is retained.
     async with tenant_session(admin) as s:
         from sqlalchemy import func
         from sqlalchemy import select as sa_select
 
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=datetime(2026, 7, 25, tzinfo=UTC)
+        )
+        assert b.conversations_this_period == 0
         count = (
             await s.execute(
                 sa_select(func.count())
@@ -315,7 +339,7 @@ async def test_subscription_renewed_resets_budget():
                 .where(ConversationBudget.admin_id == admin)
             )
         ).scalar_one()
-        assert count == 0, f"Budget rows must be reset on subscription.renewed; got {count}"
+        assert count == 1, f"the settled period's ledger must be retained; got {count}"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -404,6 +428,164 @@ async def test_pm_attached_restores_dormant_connections():
         assert conn.status == "unconfigured", (
             f"Dormant connection must be restored on pm.attached; got {conn.status!r}"
         )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_late_invoice_never_moves_the_anchor_backwards() -> None:
+    """The counter rolls forward on its own (F030); an invoice for a period the anchor has
+    already passed must not re-open it and hand back a spent free 50."""
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_start = datetime(2030, 3, 1, tzinfo=UTC)
+        acct.period_resets_at = datetime(2030, 4, 1, tzinfo=UTC)
+        await s.flush()
+    event = StripeEvent(
+        event_id="evt_late",
+        type="invoice.paid",
+        data={
+            "period_start": int(datetime(2030, 1, 1, tzinfo=UTC).timestamp()),
+            "period_end": int(datetime(2030, 2, 1, tzinfo=UTC).timestamp()),
+        },
+    )
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=event)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.period_start == datetime(2030, 3, 1, tzinfo=UTC)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_pm_attached_clears_dunning_and_makes_the_card_the_invoice_default() -> None:
+    """A new card is the remedy for a failing one (F012): dunning clears on attach instead
+    of holding the account in reduced service until an invoice happens to succeed. And the
+    card becomes the customer's invoice default (F006) — Checkout in setup mode does not
+    do that by itself, so the first metered invoice had nothing to charge."""
+    from app.billing.stripe_gateway import FakeStripeGateway, set_stripe_gateway
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    gw = FakeStripeGateway()
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+            acct.stripe_customer_id = "cus_dunned"
+            acct.dunning_state = dunning.REDUCED
+            acct.dunning_started_at = datetime(2026, 6, 1, tzinfo=UTC)
+            await s.flush()
+        event = StripeEvent(
+            event_id="evt_new_card",
+            type="payment_method.attached",
+            data={
+                "id": "pm_new",
+                "customer": "cus_dunned",
+                "card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2030},
+            },
+        )
+        async with tenant_session(admin) as s:
+            await billing_webhooks.handle_event(s, admin_id=admin, event=event)
+        async with tenant_session(admin) as s:
+            acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+            assert acct.dunning_state == dunning.NONE
+            assert acct.dunning_started_at is None
+            assert acct.billing_state == "payg_enabled"
+            rows = (
+                (
+                    await s.execute(
+                        sa_select(AdminAuditLog).where(
+                            AdminAuditLog.admin_id == admin,
+                            AdminAuditLog.event_type == "dunning_state_changed",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [r.event_payload["reason"] for r in rows] == ["payment_method_attached"]
+        assert gw.default_payment_methods == {"cus_dunned": "pm_new"}
+    finally:
+        set_stripe_gateway(None)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_payment_failed_tells_the_owner_stripes_attempt_count() -> None:
+    """The retry email names Stripe's own attempt number (F027), not a number derived from
+    elapsed days that said "attempt 1" for every retry inside the first day."""
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    event = StripeEvent(
+        event_id="evt_fail_3", type="invoice.payment_failed", data={"attempt_count": 3}
+    )
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=event, now=now)
+    async with tenant_session(admin) as s:
+        notice = (
+            await s.execute(
+                sa_select(AdminAuditLog).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "lifecycle_notice_sent",
+                )
+            )
+        ).scalar_one()
+        assert notice.event_payload.get("attempt_number") == 3
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_dormant_connections_restore_to_the_status_they_had_before(dormant_rows) -> None:
+    """Legal §A3 restores a dormant connection; F069: to what it WAS, not to a blanket
+    ``unconfigured`` that told the owner to reconnect a calendar whose grant never changed."""
+    admin, statuses_before = dormant_rows
+    event = StripeEvent(event_id="evt_restore", type="invoice.paid", data={})
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(s, admin_id=admin, event=event)
+    async with tenant_session(admin) as s:
+        from app.models.connection import InstanceConnection
+        from sqlalchemy import select as sa_select
+
+        rows = (await s.execute(sa_select(InstanceConnection))).scalars().all()
+        after = {r.connection_type: (r.status, r.status_detail) for r in rows}
+    assert after == statuses_before
+    for status, _ in after.values():
+        assert status != "unconfigured"
+
+
+@pytest.fixture
+async def dormant_rows() -> tuple[uuid.UUID, dict[str, tuple[str, str | None]]]:
+    """Two connected action tools with distinct details, sent dormant by the real path."""
+    from app.models.connection import InstanceConnection
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    before: dict[str, tuple[str, str | None]] = {}
+    async with tenant_session(admin) as s:
+        for ctype, provider, detail in (
+            ("calendar", "google", None),
+            ("crm", "hubspot", "verified 2026-08-30"),
+        ):
+            s.add(
+                InstanceConnection(
+                    connection_id=uuid.uuid4(),
+                    admin_id=admin,
+                    instance_id=iid,
+                    connection_type=ctype,
+                    auth_class="oauth_token",
+                    provider=provider,
+                    status="connected",
+                    status_detail=detail,
+                )
+            )
+            before[ctype] = ("connected", detail)
+        await s.flush()
+        assert await dunning.set_dormant_for_action_tools(s, admin_id=admin, reason="test") == 2
+    return admin, before
 
 
 # --- the replay window (P0-6) ------------------------------------------------ #

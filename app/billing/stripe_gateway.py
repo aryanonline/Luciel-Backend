@@ -33,12 +33,31 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from app.config import FAKE_STRIPE_WEBHOOK_SECRET
+
+_log = logging.getLogger(__name__)
+
+
+def add_months(moment: datetime, months: int) -> datetime:
+    """``moment`` shifted by whole months, clamping the day the way Stripe anchors do
+    (a Jan-31 anchor bills on Feb-28, then Mar-31)."""
+    month_index = moment.month - 1 + months
+    year = moment.year + month_index // 12
+    month = month_index % 12 + 1
+    # Last day of the target month, so the clamp never overflows.
+    if month == 12:
+        last_day = 31
+    else:
+        first_of_next = datetime(year, month + 1, 1, tzinfo=moment.tzinfo)
+        last_day = (first_of_next - datetime(year, month, 1, tzinfo=moment.tzinfo)).days
+    return moment.replace(year=year, month=month, day=min(moment.day, last_day))
 
 
 @dataclass(frozen=True)
@@ -154,6 +173,36 @@ class StripeGateway(Protocol):
 
     async def remove_payment_method(self, *, customer_id: str) -> bool:
         """Detach the card from the customer. Idempotent. Returns True if removed."""
+        ...
+
+    async def set_default_payment_method(self, *, customer_id: str, payment_method_id: str) -> bool:
+        """Make ``payment_method_id`` the customer's default for invoices (audit F006).
+
+        Checkout in setup mode attaches the card to the customer but does NOT make it
+        the invoice default, so without this every PAYG invoice would have nothing to
+        charge and ``remove_payment_method`` (which detaches the default) was a no-op."""
+        ...
+
+    async def get_subscription_period(
+        self, *, subscription_id: str
+    ) -> tuple[datetime, datetime] | None:
+        """The subscription's current billing period as (start, end), or None if unknown.
+
+        This is the anchor the free allowance moves to the moment billing exists
+        (§3.4.1b): the calendar month is only the pre-subscription fallback."""
+        ...
+
+    async def cancel_subscription(self, *, subscription_id: str, invoice_now: bool) -> bool:
+        """End the metered subscription. ``invoice_now`` bills the period's usage
+        immediately — Legal §A4: "outstanding PAYG usage for the final partial billing
+        period is charged at closure". Idempotent; False if already gone."""
+        ...
+
+    async def delete_customer(self, *, customer_id: str) -> bool:
+        """Delete the Stripe customer (cancels any subscription, detaches every card).
+
+        Called only at the account purge — the point at which the billing identity is
+        destroyed (§3.6.6 / Legal §B5). Idempotent; False if already gone."""
         ...
 
     def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
@@ -274,11 +323,38 @@ class FakeStripeGateway:
         # per-call values can each be right while the total is wrong.
         # See :meth:`billed_quantity`.
         self._billed_quantity: dict[str, int] = {}
+        # customer_id -> the payment method made the invoice default (audit F006).
+        self.default_payment_methods: dict[str, str] = {}
+        # subscription id -> (current_period_start, current_period_end). Stamped at
+        # creation from ``now`` so the anchor rekey (§3.4.1b) is exercisable in tests.
+        self.subscription_periods: dict[str, tuple[datetime, datetime]] = {}
+        # (subscription id, invoice_now) per cancellation, in order — proves the final
+        # partial period was actually invoiced at closure (Legal §A4).
+        self.cancelled_subscriptions: list[tuple[str, bool]] = []
+        self.deleted_customers: list[str] = []
+        self._existing_customers: set[str] = set()
+        # Injectable clock so a test can place the subscription anchor deliberately.
+        self.now: datetime | None = None
+
+    def _clock(self) -> datetime:
+        return self.now or datetime.now(UTC)
+
+    def seed_customer(self, customer_id: str, *, subscription_id: str | None = None) -> None:
+        """Test helper: register a customer (and optionally its metered subscription) that
+        Stripe already knows — the state a tenant carries when a test seeds Stripe ids
+        onto its billing row instead of minting them through the fake."""
+        self._existing_customers.add(customer_id)
+        self._cards.setdefault(customer_id, None)
+        if subscription_id is not None:
+            self._subscriptions[customer_id] = subscription_id
+            start = self._clock()
+            self.subscription_periods.setdefault(subscription_id, (start, add_months(start, 1)))
 
     async def create_customer(self, *, admin_id: uuid.UUID, email: str) -> str:
         # Deterministic id derived from the tenant so repeated calls are stable.
         cid = f"cus_fake_{admin_id.hex[:16]}"
         self._cards.setdefault(cid, None)
+        self._existing_customers.add(cid)
         return cid
 
     async def create_checkout_session(
@@ -303,6 +379,10 @@ class FakeStripeGateway:
         # Deterministic id derived from the customer so repeated calls are stable and
         # the mock never mints a second subscription for the same tenant.
         sub_id = f"sub_fake_{customer_id.removeprefix('cus_fake_')}"
+        if customer_id not in self._subscriptions:
+            # Stripe anchors the first period at creation: [now, now + 1 month).
+            start = self._clock()
+            self.subscription_periods[sub_id] = (start, add_months(start, 1))
         self._subscriptions[customer_id] = sub_id
         self._subscription_prices[sub_id] = price_id
         return sub_id
@@ -349,7 +429,38 @@ class FakeStripeGateway:
     async def remove_payment_method(self, *, customer_id: str) -> bool:
         had = self._cards.get(customer_id) is not None
         self._cards[customer_id] = None
+        self.default_payment_methods.pop(customer_id, None)
         return had  # idempotent: removing twice just returns False the second time
+
+    async def set_default_payment_method(self, *, customer_id: str, payment_method_id: str) -> bool:
+        self.default_payment_methods[customer_id] = payment_method_id
+        return True
+
+    async def get_subscription_period(
+        self, *, subscription_id: str
+    ) -> tuple[datetime, datetime] | None:
+        return self.subscription_periods.get(subscription_id)
+
+    async def cancel_subscription(self, *, subscription_id: str, invoice_now: bool) -> bool:
+        owners = [c for c, s in self._subscriptions.items() if s == subscription_id]
+        if not owners:
+            return False
+        for customer_id in owners:
+            del self._subscriptions[customer_id]
+        self.cancelled_subscriptions.append((subscription_id, invoice_now))
+        return True
+
+    async def delete_customer(self, *, customer_id: str) -> bool:
+        if customer_id not in self._existing_customers:
+            return False
+        self._existing_customers.discard(customer_id)
+        sub = self._subscriptions.pop(customer_id, None)
+        if sub is not None:
+            self.cancelled_subscriptions.append((sub, False))
+        self._cards[customer_id] = None
+        self.default_payment_methods.pop(customer_id, None)
+        self.deleted_customers.append(customer_id)
+        return True
 
     def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
         return _verify_and_parse(
@@ -506,8 +617,66 @@ class RealStripeGateway:
         inv = customer["invoice_settings"] if "invoice_settings" in customer else None
         pm_id = inv["default_payment_method"] if inv and "default_payment_method" in inv else None
         if not pm_id:
-            return False
+            # No invoice default (a card attached before F006 was fixed): detach every
+            # card on file so "remove my card" is never a silent no-op.
+            listed = client.PaymentMethod.list(customer=customer_id, type="card")  # type: ignore[attr-defined]
+            cards = listed["data"] if "data" in listed else []
+            for card in cards:
+                client.PaymentMethod.detach(card["id"])  # type: ignore[attr-defined]
+            return bool(cards)
         client.PaymentMethod.detach(pm_id)  # type: ignore[attr-defined]
+        return True
+
+    async def set_default_payment_method(self, *, customer_id: str, payment_method_id: str) -> bool:
+        client = self._get_client()
+        client.Customer.modify(  # type: ignore[attr-defined]
+            customer_id, invoice_settings={"default_payment_method": payment_method_id}
+        )
+        return True
+
+    async def get_subscription_period(
+        self, *, subscription_id: str
+    ) -> tuple[datetime, datetime] | None:
+        client = self._get_client()
+        try:
+            sub = client.Subscription.retrieve(subscription_id)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — an unknown/cancelled subscription has no period
+            _log.warning("subscription period unavailable for %s", subscription_id, exc_info=True)
+            return None
+        # API 2025-03-31 (basil) moved current_period_* from the subscription onto its
+        # items; older objects still carry them at the top level. Read either.
+        start = sub["current_period_start"] if "current_period_start" in sub else None
+        end = sub["current_period_end"] if "current_period_end" in sub else None
+        if start is None or end is None:
+            items = sub["items"]["data"] if "items" in sub and "data" in sub["items"] else []
+            if items:
+                item = items[0]
+                start = item["current_period_start"] if "current_period_start" in item else None
+                end = item["current_period_end"] if "current_period_end" in item else None
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return None
+        return (datetime.fromtimestamp(start, tz=UTC), datetime.fromtimestamp(end, tz=UTC))
+
+    async def cancel_subscription(self, *, subscription_id: str, invoice_now: bool) -> bool:
+        client = self._get_client()
+        try:
+            client.Subscription.cancel(  # type: ignore[attr-defined]
+                subscription_id, invoice_now=invoice_now, prorate=False
+            )
+        except Exception as exc:  # noqa: BLE001 — already cancelled / gone is a no-op
+            if "No such subscription" in str(exc) or "already" in str(exc).lower():
+                return False
+            raise
+        return True
+
+    async def delete_customer(self, *, customer_id: str) -> bool:
+        client = self._get_client()
+        try:
+            client.Customer.delete(customer_id)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — already deleted is a no-op
+            if "No such customer" in str(exc):
+                return False
+            raise
         return True
 
     def verify_and_parse(self, *, payload: bytes, signature_header: str) -> StripeEvent:
