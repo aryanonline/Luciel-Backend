@@ -173,6 +173,11 @@ class Settings(BaseSettings):
     # rule — CDK injects LUCIEL_VOICE_AUDIO_BUCKET; the presence of that env var (not
     # this default) is what binds the real store, mirroring transcript_archive_bucket.
     voice_audio_bucket: str = "vm-voice-audio"
+    # The customer's original uploaded knowledge files (§5.10 export promise). Same
+    # per-env naming rule — CDK injects LUCIEL_KNOWLEDGE_ORIGINALS_BUCKET; the presence
+    # of that env var binds the real store (knowledge.original_store), mirroring
+    # transcript_archive_bucket. No lifecycle expiry: an original lives with its source.
+    knowledge_originals_bucket: str = "vm-knowledge-originals"
     # How long a voice-audio presigned link stays valid. A call turn needs it for
     # seconds; 15 minutes covers Twilio's retries with margin. The BUCKET lifecycle
     # (1 day) is the storage bound; this is only the link's life.

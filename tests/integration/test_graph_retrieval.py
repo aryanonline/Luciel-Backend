@@ -196,8 +196,30 @@ async def test_source_delete_cascades_graph():
         )
         src_id = src.id
     async with tenant_session(admin) as s:
+        facts_before = await graph.graph_facts_for_terms(
+            s, admin_id=admin, instance_id=iid, terms=["Python"]
+        )
+        assert facts_before, "precondition: the graph answers before the delete"
         await service.delete_source(s, admin, src_id)
     async with tenant_session(admin) as s:
+        # The rows stay for the 30-day undo window (audit F109) but the graph must
+        # stop answering from a deleted source immediately (§3.2.2).
+        facts = await graph.graph_facts_for_terms(
+            s, admin_id=admin, instance_id=iid, terms=["Python"]
+        )
+        assert facts == []
+        ents = (await s.execute(select(func.count()).select_from(KnowledgeEntity))).scalar_one()
+        assert ents > 0
+    # Past the window the purge takes the graph rows with the source.
+    from datetime import UTC, datetime, timedelta
+
+    async with tenant_session(admin) as s:
+        assert (
+            await service.purge_expired_deletions(
+                s, admin_id=admin, now=datetime.now(UTC) + timedelta(days=31)
+            )
+            == 1
+        )
         ents = (await s.execute(select(func.count()).select_from(KnowledgeEntity))).scalar_one()
         edges = (await s.execute(select(func.count()).select_from(KnowledgeEdge))).scalar_one()
         assert ents == 0

@@ -37,7 +37,9 @@ original uploaded files). Nothing here requires VantageMind software to open.
 Layout:
   conversations/      one JSON per session (transcript + summary) + conversations.csv
   leads.json/.csv     captured lead records
-  knowledge/          your original uploaded files + manifest.json
+  knowledge/          originals/ (your uploaded files as you sent them),
+                      text/ (pasted, crawled and synced sources as ingested text),
+                      manifest.json (one entry per source, with the file it maps to)
   instance.json       your Luciel config: provider + NON-secret config + status.
                       Secret material (OAuth tokens, API keys) is NEVER included.
   audit_log.jsonl     your audit log within the retention window.
@@ -144,27 +146,74 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
         z.writestr("leads.json", json.dumps(lead_dicts, indent=2))
         z.writestr("leads.csv", to_csv(lead_dicts))
 
-        # knowledge manifest (original files would be copied from S3 in prod)
-        from app.models.knowledge import KnowledgeSource
+        # knowledge/: the original uploaded files (originals store, F016) and, for
+        # sources with no file behind them (pasted text, crawled pages, synced
+        # documents), the ingested text reassembled from their chunks — so every
+        # source the owner gave Luciel comes back in a form they can read.
+        from app.knowledge.original_store import get_original_store, safe_filename
+        from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 
         sources = (
             (
                 await session.execute(
-                    select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)
+                    select(KnowledgeSource)
+                    .where(KnowledgeSource.admin_id == admin_id)
+                    .order_by(KnowledgeSource.created_at.asc())
                 )
             )
             .scalars()
             .all()
         )
-        manifest = [
-            {
-                "name": s.name,
-                "origin": s.origin,
-                "sizeBytes": s.size_bytes,
-                "ingestedAt": s.created_at.isoformat(),
+        originals = get_original_store()
+        manifest: list[dict[str, object]] = []
+        used_names: set[str] = set()
+        for src in sources:
+            entry: dict[str, object] = {
+                "name": src.name,
+                "origin": src.origin,
+                "sizeBytes": src.size_bytes,
+                "ingestedAt": src.created_at.isoformat(),
+                "deletedAt": src.soft_deleted_at.isoformat() if src.soft_deleted_at else None,
+                "file": None,
+                "note": None,
             }
-            for s in sources
-        ]
+            base = safe_filename(src.name) or str(src.id)
+            unique = base if base not in used_names else f"{src.id.hex[:8]}-{base}"
+            used_names.add(unique)
+            stored = None
+            if src.original_key:
+                stored = await originals.get(key=src.original_key)
+            if stored is not None:
+                path = f"knowledge/originals/{unique}"
+                z.writestr(path, stored.data)
+                entry["file"] = path
+            else:
+                chunks = (
+                    (
+                        await session.execute(
+                            select(KnowledgeChunk.text)
+                            .where(
+                                KnowledgeChunk.admin_id == admin_id,
+                                KnowledgeChunk.source_id == src.id,
+                            )
+                            .order_by(KnowledgeChunk.ordinal.asc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if chunks:
+                    path = f"knowledge/text/{unique}.txt"
+                    z.writestr(path, "\n\n".join(chunks))
+                    entry["file"] = path
+                    entry["note"] = (
+                        "original file not on record; this is the ingested text"
+                        if src.original_key
+                        else "no uploaded file for this source; this is the ingested text"
+                    )
+                else:
+                    entry["note"] = "no content on record for this source"
+            manifest.append(entry)
         z.writestr("knowledge/manifest.json", json.dumps(manifest, indent=2))
 
         # instance.json — NON-secret config only

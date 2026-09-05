@@ -16,6 +16,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "knowledge_source_viewed",
         "knowledge_source_edited",
         "knowledge_source_deleted",
+        # An owner delete undone inside its 30-day window (§3.2.2).
+        "knowledge_source_restored",
         # Which folders/pages of a connected source Luciel may read (Decision #9).
         # Widening the scope is as consequential as narrowing it, so both are audited.
         "knowledge_source_scope_changed",
@@ -61,6 +63,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "data_export_requested",
         "data_export_ready",
         "data_export_self_serve",
+        # The owner opened their export link (a fresh short presign was minted).
+        "data_export_downloaded",
         "account_closure_initiated",
         "llm_unavailable_escalation",
         "widget_abuse_blocked",

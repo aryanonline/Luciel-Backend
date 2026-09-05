@@ -208,6 +208,29 @@ async def expire_aged_data(
         )
         counts[data_class] = int(result.rowcount or 0)  # type: ignore[attr-defined]
 
+    # Owner-deleted knowledge sources past their 30-day undo window (audit F109):
+    # the delete only tombstoned them so "undo" had something to restore; this is
+    # the hard delete the tombstone promised.
+    from app.knowledge import service as knowledge_service  # noqa: PLC0415 — import cycle
+
+    purged_sources = await knowledge_service.purge_expired_deletions(
+        session, admin_id=admin_id, now=now
+    )
+    if purged_sources:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="data_retention_hard_delete",
+            payload={
+                "data_class": "knowledge_source_grace_expired",
+                "count": purged_sources,
+                "retention_policy": f"owner_delete_grace:{knowledge_service.DELETE_GRACE_DAYS}d",
+            },
+        )
+    counts["knowledge_source_grace_expired"] = purged_sources
+
     # Terminal deferred-action rows: receipts of delivered/abandoned follow-ups,
     # kept 90 days for support forensics, then pruned. The QUEUE (status=queued)
     # is never touched — a pending promise to a customer is not "aged data".
@@ -294,24 +317,17 @@ async def prune_stale_leads(
         .all()
     )
     for lead in stale:
-        lead_id = lead.id
-        # Round 5A item 2: the prune takes the lead's CRM link rows (plaintext
-        # email) with it — same hygiene as the dashboard erase/prune actions.
-        from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
+        # The same full erasure cascade the dashboard runs (audit F091): a pruned
+        # lead's transcripts, summaries, cold-storage objects and follow-ups go too.
+        from app.lifecycle.lead_erasure import erase_lead_data  # noqa: PLC0415
 
-        links_deleted = await delete_links_for_lead(session, admin_id=admin_id, lead=lead)
-        await session.delete(lead)
-        await audit.emit(
+        await erase_lead_data(
             session,
             admin_id=admin_id,
-            instance_id=lead.instance_id,
-            actor_type=ActorType.platform,
+            lead=lead,
             event_type="lead_pruned",
-            payload={
-                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
-                "retention_policy": f"lead_auto_prune:{inst.lead_retention_days}d",
-                "crm_links_deleted": links_deleted,
-            },
+            actor_type=ActorType.platform,
+            extra_payload={"retention_policy": f"lead_auto_prune:{inst.lead_retention_days}d"},
         )
     await session.flush()
     return len(stale)

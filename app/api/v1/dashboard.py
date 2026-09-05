@@ -15,11 +15,11 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import cast
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
@@ -27,9 +27,10 @@ from app.api.errors import not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
+from app.lifecycle import lead_erasure
 from app.lifecycle.export_bundle import lead_export_rows, to_csv
 from app.models.audit import ActorType
-from app.models.conversation import EscalationEvent, SessionSummary, Transcript
+from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
@@ -529,63 +530,18 @@ async def _require_lead(s: AsyncSession, *, admin_id: uuid.UUID, lead_id: uuid.U
 async def erase_lead(
     lead_id: uuid.UUID, response: Response, subject: Subject = Depends(current_admin)
 ) -> Response:
-    """Right-to-erasure: hard-delete one lead + all transcripts + all session
-    summaries associated with that resolved_lead_id (Architecture §3.4.11). Irreversible."""
+    """Right-to-erasure: hard-delete one lead + everything held about them
+    (Architecture §3.4.11) through the ONE erasure cascade every lead-destroying
+    path shares (``lifecycle.lead_erasure``). Irreversible."""
     async with tenant_session(subject.admin_id) as s:
         lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
-        instance_id = lead.instance_id
-
-        # §3.4.11 cascade: collect sessions for this lead, then delete transcripts.
-        session_rows = (
-            (
-                await s.execute(
-                    select(SessionModel.id).where(
-                        SessionModel.admin_id == subject.admin_id,
-                        SessionModel.resolved_lead_id == lead_id,
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-        if session_rows:
-            await s.execute(
-                delete(Transcript).where(
-                    Transcript.admin_id == subject.admin_id,
-                    Transcript.session_id.in_(list(session_rows)),
-                )
-            )
-
-        # §3.4.11: delete all SessionSummary rows for this resolved_lead_id.
-        await s.execute(
-            delete(SessionSummary).where(
-                SessionSummary.admin_id == subject.admin_id,
-                SessionSummary.resolved_lead_id == lead_id,
-            )
-        )
-
-        # Round 5A item 2: the CRM link rows carry the person's email in
-        # plaintext — an erasure that leaves them behind is not an erasure.
-        from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
-
-        links_deleted = await delete_links_for_lead(s, admin_id=subject.admin_id, lead=lead)
-        await s.delete(lead)
-        await audit.emit(
+        await lead_erasure.erase_lead_data(
             s,
             admin_id=subject.admin_id,
-            instance_id=instance_id,
+            lead=lead,
             event_type="lead_erasure",
             actor_type=ActorType.admin_user,
             actor_user_id=subject.user_id,
-            # No raw PII in the chained payload — store the HASHED resolved_lead_id
-            # so erasure-by-key-destruction holds against the immutable log (§3.4.11/§5.3).
-            payload={
-                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
-                "transcripts_deleted": len(session_rows),
-                "summaries_deleted": True,
-                "crm_links_deleted": links_deleted,
-            },
         )
     response.status_code = 204
     return response
@@ -597,7 +553,10 @@ async def prune_leads(
 ) -> Response:
     """Bulk prune: permanently DELETE the named leads (§3.4.10a — prune is not a state).
 
-    Prune differs from archive: there is no 'pruned' state, the rows are removed.
+    Prune differs from archive: there is no 'pruned' state, the rows are removed —
+    and "removed" means the same full erasure cascade the explicit erase runs
+    (audit F091: prune used to leave the person's transcripts and summaries behind
+    under a dead lead id while the modal said everything was removed).
     """
     async with tenant_session(subject.admin_id) as s:
         for lead_id in body.lead_ids:
@@ -608,22 +567,13 @@ async def prune_leads(
             ).scalar_one_or_none()
             if lead is None:
                 continue  # idempotent — already gone.
-            instance_id = lead.instance_id
-            from app.tools.crm_backend import delete_links_for_lead  # noqa: PLC0415
-
-            links_deleted = await delete_links_for_lead(s, admin_id=subject.admin_id, lead=lead)
-            await s.delete(lead)
-            await audit.emit(
+            await lead_erasure.erase_lead_data(
                 s,
                 admin_id=subject.admin_id,
-                instance_id=instance_id,
+                lead=lead,
                 event_type="lead_pruned",
                 actor_type=ActorType.admin_user,
                 actor_user_id=subject.user_id,
-                payload={
-                    "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
-                    "crm_links_deleted": links_deleted,
-                },
             )
     response.status_code = 204
     return response
@@ -635,6 +585,9 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
     async with tenant_session(subject.admin_id) as s:
         lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
         lead.state = LeadState.archived
+        # An owner action IS activity (§3.4.10a "no update"): the auto-prune window
+        # measures from here, not from the last customer message (audit F096).
+        lead.last_activity_at = datetime.now(UTC)
         await audit.emit(
             s,
             admin_id=subject.admin_id,
@@ -672,6 +625,9 @@ async def mark_lead_outcome(
         lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
         old = lead.outcome
         lead.outcome = body.outcome
+        # Marking an outcome is the owner working the lead — a lead they just marked
+        # Won must not read as "inactive" to the auto-prune rule (audit F096).
+        lead.last_activity_at = datetime.now(UTC)
         await audit.emit(
             s,
             admin_id=subject.admin_id,

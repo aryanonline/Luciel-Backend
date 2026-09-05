@@ -180,6 +180,19 @@ async def delete_source(
     return response
 
 
+@router.post("/sources/{source_id}/restore", response_model=KnowledgeSourceOut)
+async def restore_source(
+    source_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> KnowledgeSourceOut:
+    """Undo a delete inside its 30-day window (§3.2.2, audit F109)."""
+    async with tenant_session(subject.admin_id) as s:
+        src = await service.restore_source(s, subject.admin_id, source_id, subject.user_id)
+        if src is None:
+            raise not_found("Nothing to restore: the source is not in its undo window.")
+        used = await _used_by_questions_7d(s, subject.admin_id)
+        return _source_out(src, used.get(src.id, 0))
+
+
 @router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
 async def resync_source(
     source_id: uuid.UUID, subject: Subject = Depends(current_admin)
@@ -355,6 +368,13 @@ async def ingest_upload(
             )
         except QuotaError as exc:
             raise validation_error(f"Knowledge quota: {exc}") from exc
+        await service.keep_original(
+            s,
+            source=src,
+            data=raw,
+            filename=file.filename or name,
+            content_type=file.content_type or "application/octet-stream",
+        )
         return _source_out(src)
 
 
@@ -390,6 +410,9 @@ async def ingest_csv(
             )
         except QuotaError as exc:
             raise validation_error(f"Knowledge quota: {exc}") from exc
+        await service.keep_original(
+            s, source=src, data=raw, filename=file.filename or name, content_type="text/csv"
+        )
         return _source_out(src)
 
 

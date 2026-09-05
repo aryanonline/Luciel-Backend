@@ -49,6 +49,7 @@ function buildCompute(envName: EnvName = 'dev') {
     cmkArn: sec.cmk.keyArn,
     transcriptArchiveBucket: data.transcriptArchiveBucket,
     exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
+    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,
@@ -188,6 +189,7 @@ describe('No log group retains forever', () => {
       cmkArn: sec.cmk.keyArn,
       transcriptArchiveBucket: data.transcriptArchiveBucket,
       exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
+    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
       dbSecretArn: data.db.secret!.secretArn,
       platformSecretArn: sec.platformSecret.secretArn,
       redisUrl: data.redisUrl,
@@ -278,10 +280,40 @@ describe('Every S3 bucket plateaus', () => {
           Match.objectLike({
             Id: 'transcript-archive-backstop',
             ExpirationInDays: 365,
-            NoncurrentVersionExpiration: { NoncurrentDays: 30 },
+            // One day (2026-09-05 audit F022): the app deletes every version itself;
+            // the tail only ever holds what a failed app delete left behind.
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 },
             AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 },
           }),
+          // The backstop's expiration writes a delete marker on a versioned bucket;
+          // this is what finally removes the marker (F022).
+          Match.objectLike({
+            Id: 'transcript-archive-delete-marker-cleanup',
+            ExpiredObjectDeleteMarker: true,
+          }),
         ]),
+      },
+    });
+  });
+
+  test('the knowledge originals bucket keeps files for the life of their source', () => {
+    // §5.10 export promise (audit F016): no expiration rule at all — the source purge
+    // and the tenant cascade are the deleters; only multipart hygiene is scheduled.
+    buildData().hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: Match.stringLikeRegexp('knowledge-originals'),
+      LifecycleConfiguration: {
+        Rules: [
+          Match.objectLike({
+            Id: 'knowledge-originals-hygiene',
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 },
+          }),
+        ],
+      },
+    });
+    buildData().hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: Match.stringLikeRegexp('knowledge-originals'),
+      LifecycleConfiguration: {
+        Rules: Match.not(Match.arrayWith([Match.objectLike({ ExpirationInDays: Match.anyValue() })])),
       },
     });
   });

@@ -24,6 +24,10 @@ from fastapi.testclient import TestClient
 EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/healthz"),
+        # 2026-09-05 audit F028: the 7-day export link is a signed API token that
+        # redirects to a fresh short presign, not a presign that dies with the
+        # task-role credentials.
+        ("GET", "/api/v1/exports/{token}"),
         # auth
         ("POST", "/api/v1/auth/signup"),
         ("POST", "/api/v1/auth/login"),
@@ -59,6 +63,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("GET", "/api/v1/admin/knowledge/sources/{source_id}/chunks"),
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/resync"),
+        # 2026-09-05 audit F109: an owner delete is undo-able for 30 days.
+        ("POST", "/api/v1/admin/knowledge/sources/{source_id}/restore"),
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/replace"),
         # admin/knowledge — live-sync connectors (Architecture §3.2.3, this build).
         # FLAGGED per Build Brief rule 5: new knowledge routes added to this frozen
@@ -216,6 +222,8 @@ def test_every_route_resolves_not_404(method: str, path: str) -> None:
         message_id="00000000-0000-0000-0000-000000000000",
         lead_id="00000000-0000-0000-0000-000000000000",
         client="google",
+        # The export door answers 410 Gone for a token it cannot verify — routed.
+        token="not-a-real-token",
     )
     response = client.request(method, concrete)
     assert response.status_code != 404, f"{method} {concrete} is not routed (404)"

@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.db.session import tenant_session
 from app.lifecycle import cascade
 from app.lifecycle.export_bundle import build_export_zip
+from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
 from app.models.audit import ActorType
 from app.models.instance import Account
@@ -49,9 +50,12 @@ async def _build_upload_and_notify(
     zip_bytes = await build_export_zip(s, admin_id)
     export_id = uuid.uuid4()
     key = export_key_for(admin_id, export_id)
-    url = await store.put_and_presign(
-        key=key, data=zip_bytes, ttl_days=settings.export_link_ttl_days
-    )
+    await store.put(key=key, data=zip_bytes)
+    # The 7-day life is the TOKEN's (audit F028): a presigned S3 URL dies with the
+    # task-role credentials that signed it, within hours. The link the owner gets
+    # points at the API, which mints a fresh minutes-long presign on every visit
+    # for as long as the token verifies.
+    url = export_download_url(admin_id, export_id, ttl_days=settings.export_link_ttl_days)
     payload: dict[str, object] = {
         "size_bytes": len(zip_bytes),
         "export_id": str(export_id),

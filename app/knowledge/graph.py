@@ -42,10 +42,14 @@ async def find_entities_by_names(
     canon = sorted({canonicalize(n) for n in names if n.strip()})
     if not canon:
         return []
+    # A tombstoned source's graph stays for its undo window but must not be
+    # traversed: the runtime stops answering from deleted knowledge at once (§3.2.2).
     stmt = text(
-        "SELECT id FROM knowledge_entities "
-        "WHERE admin_id = :admin_id AND instance_id = :instance_id "
-        "AND canonical = ANY(:canon)"
+        "SELECT e.id FROM knowledge_entities e "
+        "WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id "
+        "AND e.canonical = ANY(:canon) "
+        "AND NOT EXISTS (SELECT 1 FROM knowledge_sources ks "
+        "  WHERE ks.id = e.source_id AND ks.soft_deleted_at IS NOT NULL)"
     ).bindparams(
         bindparam("admin_id", type_=PGUUID(as_uuid=True)),
         bindparam("instance_id", type_=PGUUID(as_uuid=True)),
@@ -83,19 +87,24 @@ async def traverse(
     # direction is a relevant hop-1 fact; subsequent hops then walk forward src→dst.
     sql = text(
         """
-        WITH RECURSIVE walk AS (
+        WITH RECURSIVE live_edges AS (
+            -- Edges of tombstoned sources exist for the undo window but are never
+            -- walked (§3.2.2: deleted knowledge stops answering immediately).
+            SELECT e.* FROM knowledge_edges e
+            WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id
+              AND NOT EXISTS (SELECT 1 FROM knowledge_sources ks
+                              WHERE ks.id = e.source_id AND ks.soft_deleted_at IS NOT NULL)
+        ), walk AS (
             SELECT e.src_entity_id, e.dst_entity_id, e.relationship_type,
                    1 AS depth, ARRAY[e.src_entity_id, e.dst_entity_id] AS visited
-            FROM knowledge_edges e
-            WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id
-              AND (e.src_entity_id = ANY(:seeds) OR e.dst_entity_id = ANY(:seeds))
+            FROM live_edges e
+            WHERE (e.src_entity_id = ANY(:seeds) OR e.dst_entity_id = ANY(:seeds))
             UNION ALL
             SELECT e.src_entity_id, e.dst_entity_id, e.relationship_type,
                    w.depth + 1, w.visited || e.dst_entity_id
-            FROM knowledge_edges e
+            FROM live_edges e
             JOIN walk w ON e.src_entity_id = w.dst_entity_id
-            WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id
-              AND w.depth < :max_hops
+            WHERE w.depth < :max_hops
               AND NOT (e.dst_entity_id = ANY(w.visited))
         )
         SELECT DISTINCT w.depth,

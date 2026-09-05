@@ -30,7 +30,13 @@ import { ComputeStack } from '../lib/compute-stack';
 import { EnvName, getEnvConfig, OFFERING_REGION } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
-const COLD_STORAGE_VARS = ['LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET', 'LUCIEL_EXPORT_BUCKET'] as const;
+const COLD_STORAGE_VARS = [
+  'LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET',
+  'LUCIEL_EXPORT_BUCKET',
+  // Original uploaded knowledge files (F016): written by the app planes, purged
+  // by the sweep plane — both must know the bucket.
+  'LUCIEL_KNOWLEDGE_ORIGINALS_BUCKET',
+] as const;
 
 function computeTemplate(envName: EnvName) {
   const app = new App();
@@ -45,6 +51,7 @@ function computeTemplate(envName: EnvName) {
     cmkArn: sec.cmk.keyArn,
     transcriptArchiveBucket: data.transcriptArchiveBucket,
     exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
+    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,

@@ -79,6 +79,26 @@ async def owner_of_destination(
         return None
 
 
+#: Inbound Meta resolution tries BOTH grants for an entry id (meta_messaging_adapter),
+#: so a claim on either must be visible to a claim on the other (audit F052).
+META_GRANT_CONNECTION_TYPES: tuple[str, ...] = ("instagram_auth", "channel_auth")
+
+
+async def owner_of_meta_destination(session: AsyncSession, destination: str) -> uuid.UUID | None:
+    """Which tenant holds this Meta asset id on EITHER Meta grant, if any.
+
+    A page/IG id bound under ``instagram_auth`` by tenant A used to be invisible to
+    tenant B's ``channel_auth`` bind (and vice versa), while inbound delivery resolved
+    across both in a fixed order — so the same id could be claimed twice and one
+    tenant's messages arrived at the other's Luciel.
+    """
+    for connection_type in META_GRANT_CONNECTION_TYPES:
+        holder = await owner_of_destination(session, connection_type, destination)
+        if holder is not None:
+            return holder
+    return None
+
+
 async def lock_destination_claim(session: AsyncSession, destination: str) -> None:
     """Serialize destination CLAIMS on this destination for the current transaction.
 

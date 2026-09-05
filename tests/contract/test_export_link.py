@@ -47,10 +47,18 @@ async def test_request_export_uploads_and_issues_presigned_link(client):
     r = await client.post("/api/v1/admin/account/export")
     assert r.status_code == 200
     assert r.json()["ok"] is True
-    # The presigned link is delivered in the API response (and by email) — the
-    # channels the owner actually reads it from.
+    # The link is delivered in the API response (and by email) — the channels the
+    # owner actually reads it from. It is an API door with a signed 7-day token
+    # (2026-09-05 audit F028), not a presign that dies with the task-role
+    # credentials within hours; opening it mints a fresh short presign.
     url = r.json()["download_url"]
-    assert "export.local" in url
+    assert "/api/v1/exports/" in url
+    assert "export.local" not in url
+    door = url.split("/api/v1", 1)[1]
+    opened = await client.get(f"/api/v1{door}", follow_redirects=False)
+    assert opened.status_code == 302, opened.text
+    presigned = opened.headers["location"]
+    assert "export.local" in presigned
 
     # The data_export_ready audit event records THAT an export was minted (id, size,
     # TTL) — and deliberately NOT the presigned link: the audit log is append-only,
@@ -71,9 +79,9 @@ async def test_request_export_uploads_and_issues_presigned_link(client):
     assert payload["export_id"]
     assert "download_url" not in payload
 
-    # Extract the key from the fake URL and read back the persisted bundle —
-    # proves put_and_presign actually stored the bytes, not just minted a URL.
-    key = url.split("https://export.local/", 1)[1].split("?expires=")[0]
+    # Extract the key from the presign and read back the persisted bundle —
+    # proves the export actually stored the bytes, not just minted a URL.
+    key = presigned.split("https://export.local/", 1)[1].split("?expires=")[0]
     zip_bytes = LocalExportStore.get_bytes(key)
     assert zip_bytes is not None
 
@@ -114,3 +122,68 @@ async def test_close_account_also_uploads_export_with_context(client):
     payload = rows[0].event_payload
     assert payload["context"] == "account_close"
     assert payload["ttl_days"] == 7
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_bad_or_expired_export_link_is_a_plain_410(client):
+    from app.auth.tokens import mint_link_token
+
+    bad = await client.get("/api/v1/exports/not-a-token", follow_redirects=False)
+    assert bad.status_code == 410
+    assert "expired" in bad.text
+    # A token of the wrong purpose never opens an export, however valid its signature.
+    verify_token = mint_link_token(uuid.uuid4(), "verify", 600, "jti")
+    wrong = await client.get(f"/api/v1/exports/{verify_token}", follow_redirects=False)
+    assert wrong.status_code == 410
+    # An expired export token is refused the same way.
+    stale = mint_link_token(uuid.uuid4(), "export", -1, str(uuid.uuid4()))
+    assert (await client.get(f"/api/v1/exports/{stale}", follow_redirects=False)).status_code == 410
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_bundle_contains_the_original_uploaded_files(client):
+    """§5.10 / the bundle README: "your original uploaded files" (audit F016) — the
+    upload's bytes come back as sent, and a pasted source comes back as its text."""
+    from app.knowledge.original_store import LocalOriginalStore, set_original_store
+
+    LocalExportStore.reset()
+    LocalOriginalStore.reset()
+    set_original_store(LocalOriginalStore())
+    try:
+        await _signup_verify_login(client)
+        await client.post(
+            "/api/v1/admin/luciel",
+            json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"},
+        )
+        original = b"Return policy: 30 days, receipt required.\nExchanges welcome."
+        up = await client.post(
+            "/api/v1/admin/knowledge/sources/upload",
+            files={"file": ("Return policy.txt", original, "text/plain")},
+            data={"name": "Return policy.txt"},
+        )
+        assert up.status_code == 201, up.text
+        pasted = await client.post(
+            "/api/v1/admin/knowledge/sources/paste",
+            json={"name": "Hours", "text": "Open 9 to 5 weekdays, closed Sunday."},
+        )
+        assert pasted.status_code == 201, pasted.text
+
+        r = await client.post("/api/v1/admin/account/export")
+        assert r.status_code == 200
+        door = r.json()["download_url"].split("/api/v1", 1)[1]
+        presigned = (await client.get(f"/api/v1{door}", follow_redirects=False)).headers["location"]
+        key = presigned.split("https://export.local/", 1)[1].split("?expires=")[0]
+        with zipfile.ZipFile(io.BytesIO(LocalExportStore.get_bytes(key))) as z:
+            names = set(z.namelist())
+            assert "knowledge/originals/Return policy.txt" in names, sorted(names)
+            assert z.read("knowledge/originals/Return policy.txt") == original
+            assert "knowledge/text/Hours.txt" in names, sorted(names)
+            assert b"Open 9 to 5" in z.read("knowledge/text/Hours.txt")
+            manifest = {
+                m["name"]: m for m in __import__("json").loads(z.read("knowledge/manifest.json"))
+            }
+            assert manifest["Return policy.txt"]["file"] == "knowledge/originals/Return policy.txt"
+            assert manifest["Hours"]["file"] == "knowledge/text/Hours.txt"
+    finally:
+        set_original_store(None)
+        LocalOriginalStore.reset()

@@ -139,7 +139,8 @@ async def test_delete_removes_chunks_from_retrieval():
             s, admin_id=admin, instance_id=iid, query="starter engagement price", k=5
         )
         assert results == []  # soft-deleted source no longer retrievable
-        # chunks hard-removed
+        # Chunks are KEPT for the 30-day undo window (audit F109) — the tombstone
+        # is what hides them, and restore has something to bring back.
         cnt = (
             await s.execute(
                 select(func.count())
@@ -147,7 +148,102 @@ async def test_delete_removes_chunks_from_retrieval():
                 .where(KnowledgeChunk.source_id == sid)
             )
         ).scalar_one()
-        assert cnt == 0
+        assert cnt > 0
+        assert await service.delete_source(s, admin, sid) is False  # already tombstoned
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_owner_delete_can_be_undone_inside_its_window():
+    """F109: the advertised 30-day grace window has something to restore."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        src = await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="p.txt", text="starter engagement price 899"
+        )
+        sid = src.id
+        assert await service.delete_source(s, admin, sid, admin) is True
+    async with tenant_session(admin) as s:
+        assert [x.id for x in await service.list_sources(s, admin)] == []
+        restored = await service.restore_source(s, admin, sid, admin)
+        assert restored is not None and restored.soft_deleted_at is None
+    async with tenant_session(admin) as s:
+        assert [x.id for x in await service.list_sources(s, admin)] == [sid]
+        results = await service.retrieve(
+            s, admin_id=admin, instance_id=iid, query="starter engagement price", k=5
+        )
+        assert results, "a restored source answers again"
+        assert await service.restore_source(s, admin, sid, admin) is None  # nothing to undo
+        events = [
+            r.event_type
+            for r in (await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin)))
+            .scalars()
+            .all()
+        ]
+        assert "knowledge_source_deleted" in events and "knowledge_source_restored" in events
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_retention_pass_purges_an_expired_owner_delete():
+    from datetime import UTC, datetime, timedelta
+
+    from app.lifecycle import retention
+    from app.models.knowledge import KnowledgeSource
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        src = await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="old.txt", text="expired words here"
+        )
+        sid = src.id
+        await service.delete_source(s, admin, sid)
+    async with tenant_session(admin) as s:
+        # Inside the window: nothing purged.
+        assert await service.purge_expired_deletions(s, admin_id=admin) == 0
+        counts = await retention.expire_aged_data(
+            s, admin_id=admin, now=datetime.now(UTC) + timedelta(days=31)
+        )
+    assert counts["knowledge_source_grace_expired"] == 1
+    async with tenant_session(admin) as s:
+        assert (
+            await s.execute(select(KnowledgeSource).where(KnowledgeSource.id == sid))
+        ).scalar_one_or_none() is None
+        left = (
+            await s.execute(
+                select(func.count())
+                .select_from(KnowledgeChunk)
+                .where(KnowledgeChunk.source_id == sid)
+            )
+        ).scalar_one()
+        assert left == 0
+        assert await service.restore_source(s, admin, sid) is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_restoring_a_luciel_leaves_owner_deleted_sources_deleted():
+    """F024: restore revived EVERY tombstone, including sources the owner had
+    deliberately deleted before the Luciel delete."""
+    from app.lifecycle import state_machine
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        keep = await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="keep.txt", text="keep this content"
+        )
+        gone = await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="gone.txt", text="owner removed this"
+        )
+        keep_id, gone_id = keep.id, gone.id
+        await service.delete_source(s, admin, gone_id, admin)
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+    async with tenant_session(admin) as s:
+        await state_machine.restore(s, admin, admin)
+    async with tenant_session(admin) as s:
+        listed = {x.id for x in await service.list_sources(s, admin)}
+    assert listed == {keep_id}
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

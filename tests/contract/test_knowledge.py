@@ -122,6 +122,27 @@ async def test_delete_source_204(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_delete_can_be_undone_through_the_api(client):
+    """F109: POST .../restore inside the window brings the source back; a second
+    restore (nothing to undo) is a 404 with owner-facing copy."""
+    await _ready_account_with_luciel(client)
+    ri = await client.post(
+        "/api/v1/admin/knowledge/sources/paste",
+        json={"name": "undo me", "text": "content the owner will want back"},
+    )
+    source_id = ri.json()["sourceId"]
+    assert (await client.delete(f"/api/v1/admin/knowledge/sources/{source_id}")).status_code == 204
+    rr = await client.post(f"/api/v1/admin/knowledge/sources/{source_id}/restore")
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["sourceId"] == source_id
+    rl = await client.get("/api/v1/admin/knowledge/sources")
+    assert any(x["sourceId"] == source_id for x in rl.json())
+    again = await client.post(f"/api/v1/admin/knowledge/sources/{source_id}/restore")
+    assert again.status_code == 404
+    assert "undo window" in again.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_delete_missing_source_404(client):
     await _ready_account_with_luciel(client)
     rd = await client.delete(f"/api/v1/admin/knowledge/sources/{uuid.uuid4()}")

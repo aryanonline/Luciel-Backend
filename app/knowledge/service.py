@@ -11,8 +11,9 @@ RLS guarantees a tenant only ever ingests/retrieves its own knowledge.
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +32,8 @@ from app.models.knowledge import (
 
 TOTAL_QUOTA_BYTES = 5 * 1000 * 1000 * 1000  # 5 GB (Vision §7)
 PER_FILE_MAX_BYTES = 50 * 1000 * 1000  # 50 MB
+
+logger = logging.getLogger(__name__)
 
 
 class QuotaError(Exception):
@@ -299,16 +302,28 @@ async def view_chunks(
     return chunks
 
 
+DELETE_GRACE_DAYS = 30
+
+#: Who tombstoned a source (``knowledge_sources.deleted_by``, migration 0056).
+DELETED_BY_OWNER = "owner"
+DELETED_BY_LIFECYCLE = "lifecycle"
+
+
 async def delete_source(
     session: AsyncSession,
     admin_id: uuid.UUID,
     source_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
 ) -> bool:
-    """Soft-delete the source and hard-remove its chunks (Architecture §3.2.2).
+    """Tombstone the source for the documented 30-day undo window (§3.2.2).
 
-    The source row keeps a soft_deleted_at tombstone (30-day grace pattern); its
-    embeddings are removed so the runtime stops retrieving from it immediately.
+    The runtime stops retrieving from it IMMEDIATELY — every retrieval path (vector,
+    graph, listing, quota) filters on ``soft_deleted_at`` — but its chunks, embeddings
+    and graph rows stay for ``DELETE_GRACE_DAYS`` so ``restore_source`` has something
+    to bring back. Before the 2026-09-05 audit (F109) the tombstone was written AND
+    the chunks hard-deleted in the same call, so the advertised grace window had
+    nothing to restore and no sweep ever purged the tombstones. The hard delete now
+    happens in ``purge_expired_deletions`` (the nightly retention pass).
     """
     source = (
         await session.execute(
@@ -317,17 +332,118 @@ async def delete_source(
             )
         )
     ).scalar_one_or_none()
-    if source is None:
+    if source is None or source.soft_deleted_at is not None:
         return False
     source.soft_deleted_at = datetime.now(UTC)
+    source.deleted_by = DELETED_BY_OWNER
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        actor_user_id=actor_user_id,
+        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+        event_type="knowledge_source_deleted",
+        payload={"source_id": str(source_id), "grace_days": DELETE_GRACE_DAYS},
+    )
+    return True
+
+
+async def restore_source(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None = None,
+) -> KnowledgeSource | None:
+    """Undo an owner delete inside its grace window (§3.2.2).
+
+    Only OWNER tombstones are restorable here: a source tombstoned by the Luciel
+    delete (``deleted_by = lifecycle``) comes back with the Luciel, through
+    ``state_machine.restore`` — and never through this call, which would otherwise
+    revive one source of a Luciel that is itself deleted. Returns None when there is
+    nothing to restore (unknown id, not deleted, lifecycle-deleted, or already purged).
+    """
+    source = (
+        await session.execute(
+            select(KnowledgeSource).where(
+                KnowledgeSource.admin_id == admin_id, KnowledgeSource.id == source_id
+            )
+        )
+    ).scalar_one_or_none()
+    if source is None or source.soft_deleted_at is None or source.deleted_by != DELETED_BY_OWNER:
+        return None
+    source.soft_deleted_at = None
+    source.deleted_by = None
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=source.instance_id,
+        actor_user_id=actor_user_id,
+        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+        event_type="knowledge_source_restored",
+        payload={"source_id": str(source_id)},
+    )
+    return source
+
+
+async def keep_original(
+    session: AsyncSession,
+    *,
+    source: KnowledgeSource,
+    data: bytes,
+    filename: str,
+    content_type: str,
+) -> None:
+    """Keep the uploaded bytes so the account export can return them (§5.10, F016).
+
+    Best-effort against the store: a storage blip must not fail an ingest that already
+    succeeded — the row simply carries no original, the export says so for that file,
+    and the failure is on the log the alarms read.
+    """
+    from app.knowledge.original_store import (  # noqa: PLC0415 — avoid import cycle
+        get_original_store,
+        original_key_for,
+    )
+
+    key = original_key_for(source.admin_id, source.id, filename)
+    try:
+        await get_original_store().put(key=key, data=data, content_type=content_type)
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception(
+            "original upload keep failed admin_id=%s source=%s", source.admin_id, source.id
+        )
+        return
+    source.original_key = key
+    source.original_content_type = content_type
+    await session.flush()
+
+
+async def _hard_delete_source_rows(
+    session: AsyncSession, *, admin_id: uuid.UUID, source_id: uuid.UUID
+) -> None:
+    """Remove a source's chunks, graph rows, stored original and the source row itself
+    (no audit here — the caller records the reason)."""
+    from app.knowledge.original_store import get_original_store  # noqa: PLC0415
+
+    source = (
+        await session.execute(
+            select(KnowledgeSource.original_key).where(
+                KnowledgeSource.admin_id == admin_id, KnowledgeSource.id == source_id
+            )
+        )
+    ).scalar_one_or_none()
+    if source:
+        try:
+            await get_original_store().delete(key=source)
+        except Exception:  # noqa: BLE001 — the tenant prefix sweep at the cascade is the backstop
+            logger.exception("original delete failed admin_id=%s source=%s", admin_id, source_id)
     await session.execute(
         delete(KnowledgeChunk).where(
             KnowledgeChunk.admin_id == admin_id, KnowledgeChunk.source_id == source_id
         )
     )
-    # The source's graph nodes/edges cascade exactly like its chunks (§3.2.1 rule 5 /
-    # §3.2.2): once the source is gone the runtime must stop traversing its graph too.
-    # Delete edges first (they reference entities) then the entities themselves.
+    # Edges first (they reference entities), then the entities (§3.2.1 rule 5).
     await session.execute(
         delete(KnowledgeEdge).where(
             KnowledgeEdge.admin_id == admin_id, KnowledgeEdge.source_id == source_id
@@ -338,17 +454,46 @@ async def delete_source(
             KnowledgeEntity.admin_id == admin_id, KnowledgeEntity.source_id == source_id
         )
     )
-    await session.flush()
-    await audit.emit(
-        session,
-        admin_id=admin_id,
-        instance_id=source.instance_id,
-        actor_user_id=actor_user_id,
-        actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
-        event_type="knowledge_source_deleted",
-        payload={"source_id": str(source_id)},
+    await session.execute(
+        delete(KnowledgeSource).where(
+            KnowledgeSource.admin_id == admin_id, KnowledgeSource.id == source_id
+        )
     )
-    return True
+
+
+async def purge_expired_deletions(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+    grace_days: int = DELETE_GRACE_DAYS,
+) -> int:
+    """Hard-delete owner-tombstoned sources whose undo window has closed.
+
+    Returns the number of sources destroyed. Lifecycle tombstones are not touched —
+    they belong to the Luciel's own grace window and its day-30 cascade. Idempotent.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=grace_days)
+    expired = (
+        (
+            await session.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == admin_id,
+                    KnowledgeSource.deleted_by == DELETED_BY_OWNER,
+                    KnowledgeSource.soft_deleted_at.is_not(None),
+                    KnowledgeSource.soft_deleted_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for source in expired:
+        await _hard_delete_source_rows(session, admin_id=admin_id, source_id=source.id)
+    if expired:
+        await session.flush()
+    return len(expired)
 
 
 async def rename_source(

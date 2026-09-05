@@ -40,6 +40,8 @@ export interface ComputeStackProps extends StackProps {
   readonly exportBucket: s3.IBucket;
   /** Voice reply audio (§3.1.2 <Play> hosting) — presigned by the app planes. */
   readonly voiceAudioBucket: s3.IBucket;
+  /** Original uploaded knowledge files (§5.10 export promise, audit F016). */
+  readonly knowledgeOriginalsBucket: s3.IBucket;
   /** DB master-secret ARN (imported by ARN - avoids cross-stack cycle via its KMS key). */
   readonly dbSecretArn: string;
   /** Platform secret ARN (imported by ARN to avoid a cross-stack cycle via its KMS key). */
@@ -66,7 +68,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, voiceAudioBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, voiceAudioBucket, knowledgeOriginalsBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -143,6 +145,10 @@ export class ComputeStack extends Stack {
     // so this grant plus UseCmk (the objects are CMK-encrypted) are what make the
     // fetch succeed — Twilio itself needs nothing.
     voiceAudioBucket.grantReadWrite(taskRole);
+    // Original uploaded knowledge files (F016): the app planes write them at upload
+    // and read them into the export; the sweep plane deletes them at source purge /
+    // tenant cascade. grantReadWrite covers all three.
+    knowledgeOriginalsBucket.grantReadWrite(taskRole);
     taskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ReadSecrets',
@@ -449,6 +455,8 @@ export class ComputeStack extends Stack {
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
           // Transcript cold storage (Commitment #38) — same per-env naming rule.
           LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
+          // Original uploaded knowledge files (F016). PRESENCE binds the S3 store.
+          LUCIEL_KNOWLEDGE_ORIGINALS_BUCKET: knowledgeOriginalsBucket.bucketName,
           // Voice reply audio (§3.1.2 <Play> hosting). The PRESENCE of this var is
           // the binding gate (voice_audio.get_voice_audio_store) — deliberately not
           // injected into the sweep container, which never touches call audio.
@@ -714,6 +722,9 @@ export class ComputeStack extends Stack {
         // was never told where the bucket is.
         LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
         LUCIEL_TRANSCRIPT_ARCHIVE_BUCKET: transcriptArchiveBucket.bucketName,
+        // The retention pass purges expired owner-deleted sources (their originals
+        // with them) and the cascade sweeps the tenant prefix — from this plane.
+        LUCIEL_KNOWLEDGE_ORIGINALS_BUCKET: knowledgeOriginalsBucket.bucketName,
         // SES events pipeline — MUST match the app planes for the same reason the
         // Stripe posture above must: the billing_notices and dunning sweeps send
         // platform email through the same sender seam, and a sweep-sent notice

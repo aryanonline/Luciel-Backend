@@ -155,7 +155,11 @@ async def delete_luciel(
         .all()
     )
     for src in sources:
-        src.soft_deleted_at = _now()
+        if src.soft_deleted_at is None:
+            # A source the owner already deleted keeps its own tombstone + clock; the
+            # Luciel delete only tombstones what was live (audit F024).
+            src.soft_deleted_at = _now()
+            src.deleted_by = "lifecycle"
 
     # 3. state → grace window.
     inst.state = LucielState.luciel_grace_window
@@ -248,7 +252,13 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
         .all()
     )
     for src in sources:
-        src.soft_deleted_at = None
+        # Only what the Luciel delete tombstoned comes back with it. A source the
+        # owner deleted deliberately stays deleted (its own undo window and purge
+        # apply) — reviving it here handed back knowledge with nothing behind it
+        # (audit F024).
+        if src.deleted_by == "lifecycle":
+            src.soft_deleted_at = None
+            src.deleted_by = None
     await session.flush()
     await _emit_transition(
         session, inst, actor_user_id=actor_user_id, frm="luciel_grace_window", to="active"

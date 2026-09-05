@@ -33,7 +33,17 @@ class KnowledgeSource(Base, TenantMixin, TimestampMixin):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sync_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Who tombstoned the row (migration 0056): "owner" (undo-able for 30 days, then
+    # purged by the retention pass) or "lifecycle" (the Luciel delete; comes back with
+    # the Luciel). Restore paths read this so a Luciel restore never revives a source
+    # the owner had deleted on purpose (audit F024/F109).
+    deleted_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # ``original_object_key`` is the SYNC revision marker (knowledge/sync.py), not an
+    # object key. The uploaded file itself lives under ``original_key`` in the
+    # originals store (migration 0056, audit F016) so the account export can return it.
     original_object_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    original_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    original_content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

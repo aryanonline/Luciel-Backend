@@ -720,3 +720,39 @@ async def test_repeated_foreign_claims_are_audited_and_rate_limited(client):
             )
         ).scalar_one()
     assert int(held_audits) == 0  # never recorded under the HOLDER (victim)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_reverify_claim_conflict_is_audited_and_rate_limited(client, monkeypatch):
+    """2026-09-05 audit F087: promoting a pending number at re-verify is a claim point
+    too — the 409 there was neither audited nor rate-limited, so it was the same
+    enumeration oracle the attach path had already closed (c21)."""
+    from app.channels import phone_lifecycle
+    from app.db.session import tenant_session
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import func, select
+
+    async def _claimed(*_a, **_k):
+        raise phone_lifecycle.NumberAlreadyClaimed("+16045550171 is connected to another account")
+
+    monkeypatch.setattr(phone_lifecycle, "reverify_sms_number", _claimed)
+    admin_id = await _ready_account_with_luciel(client)
+
+    statuses = [
+        (await client.post("/api/v1/admin/connections/sms/reverify")).status_code for _ in range(5)
+    ]
+    assert statuses[0] == 409
+    assert 429 in statuses
+
+    async with tenant_session(admin_id) as s:
+        audited = (
+            await s.execute(
+                select(func.count())
+                .select_from(AdminAuditLog)
+                .where(
+                    AdminAuditLog.admin_id == admin_id,
+                    AdminAuditLog.event_type == "destination_claim_rejected",
+                )
+            )
+        ).scalar_one()
+    assert int(audited) >= 1

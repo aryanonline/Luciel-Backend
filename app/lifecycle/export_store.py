@@ -42,11 +42,26 @@ def export_key_for(admin_id: uuid.UUID, export_id: uuid.UUID) -> str:
 
 @runtime_checkable
 class ExportStore(Protocol):
-    """Persist an export ZIP and mint a time-limited download URL (§3.6.6 / §5.10)."""
+    """Persist an export ZIP and mint short-lived download links (§3.6.6).
+
+    The 7-day promise is carried by the API's signed link token (``/api/v1/exports/
+    {token}``), NOT by a 7-day presign: a presigned URL is only valid while the
+    credentials that signed it are, and the ECS task role's are rotated within hours
+    (2026-09-05 audit F028). Each visit to the token route mints a fresh, minutes-long
+    presign instead.
+    """
+
+    async def put(self, *, key: str, data: bytes) -> None:
+        """Upload ``data`` under ``key``."""
+        ...
+
+    async def presign(self, *, key: str, ttl_seconds: int) -> str:
+        """A GET URL for ``key`` valid for ``ttl_seconds`` (short: minutes)."""
+        ...
 
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
-        """Upload ``data`` under ``key`` and return a presigned URL valid for
-        ``ttl_days`` days (§3.6.6: 7-day TTL, ``config.export_link_ttl_days``)."""
+        """Legacy one-shot: upload then presign for ``ttl_days`` (see class docstring
+        for why the export flow no longer uses it)."""
         ...
 
 
@@ -61,13 +76,18 @@ class LocalExportStore:
     _store: dict[str, bytes] = {}
     _lock = threading.Lock()
 
-    async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
+    async def put(self, *, key: str, data: bytes) -> None:
         with self._lock:
             type(self)._store[key] = data
-        expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
-        # Deterministic fake URL — no network call, but shaped like a real
-        # presigned link (key + expiry) so tests can assert the TTL is honored.
+
+    async def presign(self, *, key: str, ttl_seconds: int) -> str:
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+        # Deterministic fake URL shape: tests assert the host + key + the expiry.
         return f"https://export.local/{key}?expires={int(expires_at.timestamp())}"
+
+    async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
+        await self.put(key=key, data=data)
+        return await self.presign(key=key, ttl_seconds=ttl_days * 24 * 60 * 60)
 
     @classmethod
     def get_bytes(cls, key: str) -> bytes | None:
@@ -123,21 +143,26 @@ class S3ExportStore:
             )
         return self._client
 
-    async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
-        client = self._get_client()
-        client.put_object(  # type: ignore[attr-defined]
+    async def put(self, *, key: str, data: bytes) -> None:
+        self._get_client().put_object(  # type: ignore[attr-defined]
             Bucket=self._bucket,
             Key=key,
             Body=data,
             ContentType="application/zip",
             ServerSideEncryption="aws:kms",
         )
-        url = client.generate_presigned_url(  # type: ignore[attr-defined]
+
+    async def presign(self, *, key: str, ttl_seconds: int) -> str:
+        url = self._get_client().generate_presigned_url(  # type: ignore[attr-defined]
             "get_object",
             Params={"Bucket": self._bucket, "Key": key},
-            ExpiresIn=ttl_days * 24 * 60 * 60,
+            ExpiresIn=ttl_seconds,
         )
         return str(url)
+
+    async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
+        await self.put(key=key, data=data)
+        return await self.presign(key=key, ttl_seconds=ttl_days * 24 * 60 * 60)
 
 
 _default: ExportStore | None = None

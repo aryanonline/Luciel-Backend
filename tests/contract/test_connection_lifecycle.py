@@ -990,3 +990,149 @@ async def test_an_empty_destination_is_rejected_at_parse_time(client, monkeypatc
     cid = await _connected_meta(client, monkeypatch)
     r = await client.put(f"/api/v1/admin/connections/{cid}/destination", json={"destination": ""})
     assert r.status_code == 422, r.text
+
+
+# --- 2026-09-05 audit: OAuth staging (F050), Meta uniqueness across grants (F052),
+# --- grant-asset validation (F082) ------------------------------------------------ #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_failed_verify_never_replaces_the_live_credential(client, monkeypatch):
+    """F050: the exchanged token is STAGED; the credential that was serving stays
+    untouched unless verify and the destination check both pass."""
+    from app.connections import verify as verify_module
+    from app.connections.secrets import LocalSecretStore, get_secret_store, secret_ref_for
+    from app.knowledge.providers import staged_secret_ref
+
+    _configure_meta(monkeypatch)
+    _fake_meta_transport("meta-code-stage", monkeypatch)
+
+    async def _refuse(**_kw):
+        raise verify_module.PostExchangeVerifyFailed("that account does not manage any page")
+
+    monkeypatch.setitem(verify_module.POST_EXCHANGE_VERIFIERS, "meta", _refuse)
+
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    instance_id = await _instance_id(admin_id)
+    live_ref = secret_ref_for(admin_id, instance_id, "channel_auth")
+    await get_secret_store().put(live_ref, {"access_token": "the-working-token"})
+
+    rs = await client.post(
+        "/api/v1/admin/connections", json={"connectionType": "channel_auth", "provider": "meta"}
+    )
+    state = _state_from_authorize_url(rs.json()["authorizeUrl"])
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+    rcb = await client.post(
+        f"/api/v1/admin/connections/{cid}/oauth-callback",
+        json={"code": "meta-code-stage", "state": state},
+    )
+    assert rcb.status_code >= 400, rcb.text
+
+    stored = await get_secret_store().get(live_ref)
+    assert stored == {"access_token": "the-working-token"}, "the live credential was replaced"
+    assert staged_secret_ref(live_ref) not in LocalSecretStore._store, "staged material left behind"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_successful_verify_promotes_the_staged_credential(client, monkeypatch):
+    from app.connections.secrets import LocalSecretStore, get_secret_store, secret_ref_for
+    from app.knowledge.providers import staged_secret_ref
+
+    await _ready_account_with_luciel(client)
+    admin_id = _admin_id(client)
+    instance_id = await _instance_id(admin_id)
+    await _connected_meta(client, monkeypatch)
+    live_ref = secret_ref_for(admin_id, instance_id, "channel_auth")
+    stored = await get_secret_store().get(live_ref)
+    assert stored is not None and stored["access_token"] == "meta-tok-1"
+    assert staged_secret_ref(live_ref) not in LocalSecretStore._store
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_meta_id_held_on_the_other_grant_cannot_be_claimed(client, monkeypatch):
+    """F052: inbound resolves an entry id against instagram_auth AND channel_auth, so a
+    page id one tenant bound on its Instagram grant must not be claimable by another
+    tenant on its Facebook grant (or vice versa)."""
+    from app.db.session import tenant_session
+    from app.models.connection import InstanceConnection
+
+    await _ready_account_with_luciel(client)
+    holder = _admin_id(client)
+    holder_iid = await _instance_id(holder)
+    shared = f"ig-{uuid.uuid4().hex[:10]}"
+    async with tenant_session(holder) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=holder,
+                instance_id=holder_iid,
+                connection_type="instagram_auth",
+                auth_class="oauth_token",
+                provider="instagram",
+                status="connected",
+                non_secret_config={"destinations": {"instagram": shared}},
+            )
+        )
+
+    await _ready_account_with_luciel(client)
+    claimant = _admin_id(client)
+    assert claimant != holder
+    cid = await _connected_meta(client, monkeypatch)
+    clash = await client.put(
+        f"/api/v1/admin/connections/{cid}/destination",
+        json={"destination": shared, "channel": "messenger"},
+    )
+    assert clash.status_code == 409, clash.text
+    assert "another account" in clash.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_meta_id_the_grant_does_not_cover_is_refused(client, monkeypatch):
+    """F082: the bind checks the id against what Meta says the authorized account
+    manages; a mistyped id used to bind cleanly into a channel that received nothing."""
+    from app.connections import meta_assets
+
+    seen: list[str] = []
+
+    async def _lister(*, material, connection_type, transport):
+        seen.append(connection_type)
+        assert material.get("access_token") == "meta-tok-1"
+        return {"page-777", "pnid-888"}
+
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: _lister)
+    await _ready_account_with_luciel(client)
+    cid = await _connected_meta(client, monkeypatch)
+    path = f"/api/v1/admin/connections/{cid}/destination"
+
+    wrong = await client.put(path, json={"destination": "page-typo", "channel": "messenger"})
+    assert wrong.status_code == 422, wrong.text
+    assert "doesn't list that id" in wrong.text
+    right = await client.put(path, json={"destination": "page-777", "channel": "messenger"})
+    assert right.status_code == 200, right.text
+    assert seen == ["channel_auth", "channel_auth"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_when_meta_cannot_be_asked_the_bind_is_refused_not_guessed(client, monkeypatch):
+    from app.connections import meta_assets
+
+    async def _down(**_kw):
+        raise meta_assets.AssetLookupFailed("could not reach Meta (ConnectError)")
+
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: _down)
+    await _ready_account_with_luciel(client)
+    cid = await _connected_meta(client, monkeypatch)
+    r = await client.put(
+        f"/api/v1/admin/connections/{cid}/destination",
+        json={"destination": "page-777", "channel": "messenger"},
+    )
+    assert r.status_code == 503, r.text
+    assert "Nothing was changed" in r.text
+    row = next(
+        c
+        for c in (await client.get("/api/v1/admin/connections")).json()
+        if c["connectionId"] == cid
+    )
+    assert not (row["nonSecretConfig"] or {}).get("destinations")

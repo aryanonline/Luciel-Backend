@@ -32,6 +32,7 @@ function computeTemplate(envName: EnvName, imageTag?: string) {
     cmkArn: sec.cmk.keyArn,
     transcriptArchiveBucket: data.transcriptArchiveBucket,
     exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
+    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
     dbSecretArn: data.db.secret!.secretArn,
     platformSecretArn: sec.platformSecret.secretArn,
     redisUrl: data.redisUrl,

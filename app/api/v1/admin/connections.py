@@ -32,18 +32,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CLOSED_ACCOUNT_STATES, Subject, current_admin
-from app.api.errors import conflict, not_found, validation_error
+from app.api.errors import conflict, not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.channels import routing
-from app.connections import oauth_flow, registry, service
-from app.connections.secrets import get_secret_store
+from app.connections import meta_assets, oauth_flow, registry, service
+from app.connections.secrets import get_secret_store, secret_ref_for
 from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
 from app.knowledge.providers import (
     HttpTransport,
     OAuthExchangeError,
     ProviderUnavailable,
+    discard_staged_token,
     exchange_code_for_token,
+    promote_staged_token,
     store_oauth_token,
 )
 from app.models.audit import ActorType
@@ -339,11 +341,50 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
             conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
         except _Claimed as exc:
             # c21: promoting a pending number is a claim point — another tenant may
-            # have claimed it while this one was still hosting/registering.
-            raise conflict(str(exc)) from exc
+            # have claimed it while this one was still hosting/registering. Audited
+            # and rate-limited exactly like the attach-time refusal (audit F087):
+            # this 409 is the same enumeration oracle as that one.
+            claimed = str(exc)
+            number = await _pending_sms_number(s, subject.admin_id, instance_id)
+            await _record_claim_rejection(subject.admin_id, number)
+            from app.channels import rate_limit  # noqa: PLC0415
+
+            decision = rate_limit.get_store().check_source(
+                "destination_claim", str(subject.admin_id)
+            )
+            if not decision.allowed:
+                from app.api.errors import rate_limited  # noqa: PLC0415
+
+                raise rate_limited(
+                    "Too many attempts to connect numbers that belong to other "
+                    "accounts. Please wait a minute before trying again.",
+                    retry_after_seconds=60,
+                ) from exc
+            raise conflict(claimed) from exc
         if conn is None:
             raise not_found("No SMS number attached to re-verify.")
         return _connection_out(conn)
+
+
+async def _pending_sms_number(s: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
+    """The number this tenant's SMS row is trying to promote (for the audit suffix)."""
+    row = (
+        (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.instance_id == instance_id,
+                    InstanceConnection.connection_type == "sms_sender",
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    cfg = (row.non_secret_config or {}) if row is not None else {}
+    number = cfg.get("pending_destination") or cfg.get("destination") or ""
+    return str(number)
 
 
 @router.post("/sms/attest-registration", response_model=ConnectionOut)
@@ -838,16 +879,20 @@ async def complete_oauth_connect(
             await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, str(exc))
             raise OAuthExchangeRejected(str(exc)) from exc
 
-        # The token is durable before the row claims to be connected, so a crash in
-        # between leaves a retryable "not connected yet" rather than a connection with
-        # no credential. It also runs before VERIFY on purpose: a verify retry can
-        # reuse the stored token, whereas an unstored token is gone with the code.
+        # STAGED, not live (audit F050): the credential is durable before the row
+        # claims anything (a crash leaves a retryable "not connected yet"), but the
+        # credential currently serving at the live ref is untouched until verify AND
+        # the destination check pass. Writing straight to the live ref replaced a
+        # working token with an unverified one — a failed verify left the row
+        # "connected" on the old provider with the new account's token behind it.
+        secret_store = get_secret_store()
         await store_oauth_token(
-            get_secret_store(),
+            secret_store,
             admin_id=admin_id,
             instance_id=instance_id,
             material=material,
             connection_type=connection_type,
+            staged=True,
         )
 
         # §3.1.6a "connect, VERIFY, bind, then live": providers with a registered
@@ -859,6 +904,12 @@ async def complete_oauth_connect(
             try:
                 verify_updates = await provider_verifier(material=material, transport=transport)
             except PostExchangeVerifyFailed as exc:
+                await discard_staged_token(
+                    secret_store,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    connection_type=connection_type,
+                )
                 await _fail_exchange(
                     admin_id, connection_id, actor_user_id, pending_provider, str(exc)
                 )
@@ -898,6 +949,14 @@ async def complete_oauth_connect(
                 ).isoformat()
                 conn.non_secret_config = cfg
         if conflict_reason is None:
+            # Verified and unclaimed: the staged credential becomes the live one. This
+            # is the cutover instant — before it the previous credential still served.
+            await promote_staged_token(
+                secret_store,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                connection_type=connection_type,
+            )
             if pending_provider is not None:
                 # A swap completes through confirm_reconnect — the ONLY place a staged
                 # provider becomes authoritative — so the cutover semantics (flip
@@ -957,7 +1016,11 @@ async def complete_oauth_connect(
             return _connection_out(conn)
 
     # Destination conflict: fail exactly like a failed verify — previous sender stays
-    # live, the owner gets an actionable reason, nothing half-binds.
+    # live (its credential was never overwritten), the owner gets an actionable
+    # reason, nothing half-binds.
+    await discard_staged_token(
+        secret_store, admin_id=admin_id, instance_id=instance_id, connection_type=connection_type
+    )
     await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, conflict_reason)
     raise OAuthExchangeRejected(conflict_reason)
 
@@ -1023,6 +1086,44 @@ _BINDABLE_CHANNELS: dict[str, frozenset[str]] = {
 }
 
 
+async def _require_asset_on_grant(
+    *, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str, destination: str
+) -> None:
+    """Refuse a Meta asset id the authorized grant does not actually cover (F082).
+
+    A mistyped Page / phone-number / IG-account id used to bind cleanly and produce a
+    channel that read "Answering on …" while every inbound resolved to no tenant. Meta
+    is asked what the grant owns; in a posture with no Meta to ask (``lister_for_posture``
+    returns None) the check is skipped explicitly. "Could not ask" is a 503, never a
+    pass — the owner is told to retry rather than handed a silent dead channel.
+    """
+    lister = meta_assets.lister_for_posture()
+    if lister is None:
+        return
+    material = await get_secret_store().get(secret_ref_for(admin_id, instance_id, connection_type))
+    if not material:
+        raise validation_error(
+            "This connection holds no authorization yet — connect it with Meta before "
+            "choosing which page or number it answers on."
+        )
+    try:
+        async with oauth_transport() as transport:
+            assets = await lister(
+                material=material, connection_type=connection_type, transport=transport
+            )
+    except meta_assets.AssetLookupFailed as exc:
+        raise service_unavailable(
+            f"We couldn't confirm that id with Meta just now ({exc}). Nothing was changed — "
+            "please try again in a moment."
+        ) from exc
+    if destination not in assets:
+        raise validation_error(
+            "Meta doesn't list that id under the account you authorized. Check the Page, "
+            "WhatsApp phone-number or Instagram account id, or re-authorize with an "
+            "account that manages it."
+        )
+
+
 @router.put("/{connection_id}/destination", response_model=ConnectionOut)
 async def bind_destination(
     connection_id: uuid.UUID,
@@ -1071,12 +1172,21 @@ async def bind_destination(
             )
         instance_id = await _instance_id(s, subject.admin_id)
         await routing.lock_destination_claim(s, req.destination)  # c21 TOCTOU guard
-        owner = await routing.owner_of_destination(s, conn.connection_type, req.destination)
+        # Across BOTH Meta grants (audit F052): inbound resolves an entry id against
+        # instagram_auth and channel_auth in turn, so a claim on either must block a
+        # claim on the other or one tenant's messages land on another's Luciel.
+        owner = await routing.owner_of_meta_destination(s, req.destination)
         if owner is not None and owner != subject.admin_id:
             raise conflict(
                 "That Meta destination is already connected to another account. "
                 "Disconnect it there first."
             )
+        await _require_asset_on_grant(
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            connection_type=conn.connection_type,
+            destination=req.destination,
+        )
         cfg = dict(conn.non_secret_config or {})
         if req.channel:
             existing_map = cfg.get("destinations")

@@ -157,6 +157,13 @@ async def _delete_tenant_secrets(
             deleted = await store.delete(conn.secret_ref)
         except Exception:  # noqa: BLE001 — a broken store must not strand the deletion
             deleted = False
+            # An ERROR line, not only an audit payload nobody queries (audit F041):
+            # this is what the sweep/app error alarms read.
+            _log.exception(
+                "cascade: secret delete failed admin_id=%s connection=%s",
+                admin_id,
+                conn.connection_id,
+            )
         await audit.emit(
             session,
             admin_id=admin_id,
@@ -177,6 +184,7 @@ async def _delete_tenant_secrets(
         error: str | None = None
     except Exception as exc:  # noqa: BLE001
         swept, error = 0, type(exc).__name__
+        _log.exception("cascade: secret prefix sweep failed admin_id=%s", admin_id)
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -212,6 +220,7 @@ async def _delete_tenant_transcript_archive(
         error: str | None = None
     except Exception as exc:  # noqa: BLE001 — a broken store must not strand the deletion
         swept, error = 0, type(exc).__name__
+        _log.exception("cascade: transcript archive sweep failed admin_id=%s", admin_id)
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -265,6 +274,39 @@ async def _retire_stripe_customer(
     )
 
 
+async def _delete_tenant_knowledge_originals(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
+) -> None:
+    """Destroy the tenant's original uploaded files (F016 store) by prefix — same
+    best-effort-with-audit posture as the transcript archive sweep above."""
+    from app.knowledge.original_store import (  # noqa: PLC0415 — avoid import cycle
+        get_original_store,
+        original_prefix_for,
+    )
+
+    prefix = original_prefix_for(admin_id)
+    try:
+        swept = await get_original_store().delete_prefix(prefix=prefix)
+        error: str | None = None
+    except Exception as exc:  # noqa: BLE001 — a broken store must not strand the deletion
+        swept, error = 0, type(exc).__name__
+        _log.exception("cascade: knowledge originals sweep failed admin_id=%s", admin_id)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="data_retention_hard_delete",
+        payload={
+            "data_class": "knowledge_original_object",
+            "object_prefix": prefix,
+            "count": swept,
+            "error": error,
+            "retention_policy_applied": "luciel_hard_delete_cascade",
+        },
+    )
+
+
 async def hard_delete_cascade(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -291,6 +333,7 @@ async def hard_delete_cascade(
     iid = inst.id if inst is not None else None
     await _delete_tenant_secrets(session, admin_id, iid)
     await _delete_tenant_transcript_archive(session, admin_id, iid)
+    await _delete_tenant_knowledge_originals(session, admin_id, iid)
 
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted

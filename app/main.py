@@ -127,6 +127,7 @@ def create_app() -> FastAPI:
     from app.api.v1.contact import router as contact_router
     from app.api.v1.dashboard import router as dashboard_router
     from app.api.v1.escalation_contact import router as escalation_contact_router
+    from app.api.v1.exports import router as exports_router
     from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
 
@@ -158,6 +159,8 @@ def create_app() -> FastAPI:
     # the contact may not be the account owner; the signed single-use token in
     # the confirmation email is the authorization.
     app.include_router(escalation_contact_router)
+    # Account-export download door (§3.6.6): token-authorized, opened from email.
+    app.include_router(exports_router)
 
     return app
 

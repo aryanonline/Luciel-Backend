@@ -132,6 +132,8 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
             "processed_stripe_event": 0,
             "tool_trace_event": 0,
             "retrieval_trace_event": 0,
+            # Owner-deleted knowledge past its 30-day undo window (audit F109).
+            "knowledge_source_grace_expired": 0,
         }
 
     async with tenant_session(admin) as s:
@@ -181,6 +183,8 @@ async def test_expire_aged_data_is_idempotent():
             "processed_stripe_event": 0,
             "tool_trace_event": 0,
             "retrieval_trace_event": 0,
+            # Owner-deleted knowledge past its 30-day undo window (audit F109).
+            "knowledge_source_grace_expired": 0,
         }
     # Re-run: nothing left aged → zero deletes (idempotent).
     async with tenant_session(admin) as s:
@@ -194,6 +198,8 @@ async def test_expire_aged_data_is_idempotent():
             "processed_stripe_event": 0,
             "tool_trace_event": 0,
             "retrieval_trace_event": 0,
+            # Owner-deleted knowledge past its 30-day undo window (audit F109).
+            "knowledge_source_grace_expired": 0,
         }
 
 

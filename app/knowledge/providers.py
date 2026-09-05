@@ -349,6 +349,7 @@ async def store_oauth_token(
     instance_id: uuid.UUID,
     material: dict[str, str],
     connection_type: str = "knowledge_source",
+    staged: bool = False,
 ) -> str:
     """Write exchanged token material to the tenant-scoped secret_ref (§3.8.3).
 
@@ -359,8 +360,52 @@ async def store_oauth_token(
     Meta channel callback (Decision #7).
     """
     ref = secret_ref_for(admin_id, instance_id, connection_type)
+    if staged:
+        # A STAGED write (2026-09-05 audit F050): the live credential at ``ref`` keeps
+        # serving until the callback has verified the new one and cleared the
+        # destination check; ``promote_staged_token`` then makes it live. Writing
+        # straight to ``ref`` used to replace a working token with an unverified one
+        # — a failed verify left the row "connected" on the old provider with the
+        # new account's token behind it.
+        ref = staged_secret_ref(ref)
     await store.put(ref, material)
     return ref
+
+
+def staged_secret_ref(ref: str) -> str:
+    """Where a not-yet-verified credential waits. Under the same ``vm/{admin}/`` prefix
+    so IAM scoping and the cascade prefix sweep cover it."""
+    return f"{ref}/staged"
+
+
+async def promote_staged_token(
+    store: SecretStore,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    connection_type: str,
+) -> bool:
+    """Make the staged credential the live one. False if nothing was staged."""
+    ref = secret_ref_for(admin_id, instance_id, connection_type)
+    staged = staged_secret_ref(ref)
+    material = await store.get(staged)
+    if material is None:
+        return False
+    await store.put(ref, material)
+    await store.delete(staged)
+    return True
+
+
+async def discard_staged_token(
+    store: SecretStore,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    connection_type: str,
+) -> bool:
+    """Drop a staged credential that failed verification; the live one is untouched."""
+    ref = staged_secret_ref(secret_ref_for(admin_id, instance_id, connection_type))
+    return await store.delete(ref)
 
 
 # --------------------------------------------------------------------------- #

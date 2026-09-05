@@ -149,6 +149,13 @@ GRANT SELECT, INSERT ON admin_audit_log TO luciel_app;
 -- of the row guard: with the trigger in place, the widest thing this grant can express
 -- is "delete rows older than a year" — which is the retention commitment itself.
 GRANT DELETE ON admin_audit_log TO luciel_audit_owner;
+-- 2026-09-05 audit F023: the audit-retention sweep's discovery
+-- (platform_sweep_candidates('audit_retention'), a SECURITY DEFINER function owned by
+-- the BYPASSRLS luciel_auth role, migration 0056) also walks admin_audit_log itself,
+-- so a tenant whose accounts row was purged is still a candidate until its last row
+-- ages out. That read needs SELECT for the function's owner — ids only, never the
+-- payloads (the function returns admin_id and nothing else).
+GRANT SELECT ON admin_audit_log TO luciel_auth;
 
 -- admin_audit_log.seq defaults to nextval('admin_audit_log_seq'), so the append path
 -- still needs USAGE on that sequence after the grant reset above — the sequence is a

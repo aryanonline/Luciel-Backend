@@ -170,7 +170,10 @@ async def prune_audit_log_if_due(
             )
         ).scalar_one()
     )
-    if deleted:
+    if deleted and await _account_exists(session, admin_id):
+        # A PURGED tenant (audit F023: its rows are now candidates too) gets no new
+        # tombstone: there is no account to read it, and writing one would leave
+        # exactly one row per purged tenant per year in a table meant to empty.
         await audit.emit(
             session,
             admin_id=admin_id,
@@ -183,3 +186,11 @@ async def prune_audit_log_if_due(
             },
         )
     return deleted
+
+
+async def _account_exists(session: AsyncSession, admin_id: uuid.UUID) -> bool:
+    return (
+        await session.execute(
+            text("SELECT 1 FROM accounts WHERE id = :aid"), {"aid": str(admin_id)}
+        )
+    ).first() is not None

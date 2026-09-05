@@ -33,6 +33,8 @@ export class DataStack extends Stack {
   public readonly transcriptArchiveBucket: s3.Bucket;
   public readonly exportBucket: s3.Bucket;
   public readonly voiceAudioBucket: s3.Bucket;
+  /** Original uploaded knowledge files (§5.10 export promise, audit F016). */
+  public readonly knowledgeOriginalsBucket: s3.Bucket;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
   /**
    * Redis connection URL for the app's `redis_url` (config.py, env prefix LUCIEL_).
@@ -128,8 +130,38 @@ export class DataStack extends Stack {
           // Bound prior (noncurrent) versions so the versioned bucket doesn't accumulate:
           // a noncurrent version only exists after a re-archive overwrite or an app
           // delete, and neither is a state we retain (the app delete IS the deletion).
-          noncurrentVersionExpiration: Duration.days(30),
+          // ONE day, not 30 (2026-09-05 audit F022): the app's delete removes every
+          // version explicitly, so this tail only ever holds bytes a failed app
+          // delete left behind — and those must not outlive the promise by a month.
+          noncurrentVersionExpiration: Duration.days(1),
           // Reap incomplete multipart uploads (cost hygiene, no retention meaning).
+          abortIncompleteMultipartUploadAfter: Duration.days(7),
+        },
+        {
+          // The backstop's expiration on a versioned bucket writes a DELETE MARKER
+          // rather than deleting; without this rule the marker (and the listing
+          // entry behind it) lived on indefinitely (F022). S3 forbids combining
+          // expired-object-delete-marker with a Days/Date expiration in one rule.
+          id: 'transcript-archive-delete-marker-cleanup',
+          enabled: true,
+          expiredObjectDeleteMarker: true,
+        },
+      ],
+    });
+
+    // The customer's original uploaded knowledge files (§5.10 export promise; 2026-09-05
+    // audit F016). No expiration: an original lives exactly as long as its source —
+    // the source purge deletes its object and the tenant cascade sweeps the prefix.
+    // Unversioned: the app's delete IS the deletion, and there is no re-upload path.
+    this.knowledgeOriginalsBucket = residency.hardenedBucket('KnowledgeOriginals', {
+      key: cmk,
+      bucketName: `luciel-${envConfig.envName}-knowledge-originals-${this.account}`,
+      removalPolicy:
+        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      lifecycleRules: [
+        {
+          id: 'knowledge-originals-hygiene',
+          enabled: true,
           abortIncompleteMultipartUploadAfter: Duration.days(7),
         },
       ],

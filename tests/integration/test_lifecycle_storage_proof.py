@@ -941,6 +941,20 @@ async def test_audit_retention_deletes_only_aged_rows_and_is_idempotent() -> Non
     )
 
 
+async def test_audit_retention_reaches_a_purged_tenant() -> None:
+    """2026-09-05 audit F023: once the accounts row was purged the tenant was never
+    an audit-retention candidate again, so its rows lived forever. Discovery now
+    also walks the audit log itself, and a purged tenant gets no fresh tombstone
+    (there is no account to read it; it would only re-seed the table every year)."""
+    ghost = uuid.uuid4()  # no accounts row at all — the purge already took it
+    await _append_audit(ghost, age=timedelta(days=400), n=25)
+    await _append_audit(ghost, age=timedelta(days=10), n=3)
+
+    assert str(ghost) in await sweeps.run_audit_retention()
+    assert (await _row_counts(ghost, ["admin_audit_log"]))["admin_audit_log"] == 3
+    assert await sweeps.run_audit_retention() == []
+
+
 async def test_audit_retention_frees_the_storage_it_deletes() -> None:
     admin_id = uuid.uuid4()
     # Aged account: see test_audit_retention_deletes_only_aged_rows_and_is_idempotent.
