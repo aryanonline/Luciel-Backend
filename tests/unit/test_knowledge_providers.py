@@ -371,21 +371,23 @@ async def test_website_crawl_provider_revision_stable_when_content_unchanged():
 async def test_website_crawl_provider_multiple_urls():
     # Two different fake transports simulate two independently-fetched pages —
     # the provider fetches each configured URL and reports one item per URL.
-    calls = {"n": 0}
-    bodies = ["<p>Page one</p>", "<p>Page two</p>"]
+    pages = {"/a": "<p>Page one</p>", "/b": "<p>Page two</p>"}
+    page_calls: list[str] = []
 
     class MultiPageTransport:
         async def get(self, url, *, headers=None, params=None):
-            body = bodies[calls["n"]]
-            calls["n"] += 1
-            return httpx.Response(200, text=body, request=httpx.Request("GET", url))
+            path = httpx.URL(url).path
+            if path == "/robots.txt":  # consulted once per origin (F123); none here
+                return httpx.Response(404, text="", request=httpx.Request("GET", url))
+            page_calls.append(path)
+            return httpx.Response(200, text=pages[path], request=httpx.Request("GET", url))
 
     provider = WebsiteCrawlProvider(
         urls=["https://example.com/a", "https://example.com/b"], transport=MultiPageTransport()
     )
     snap = await provider.snapshot(uuid.uuid4())
     assert {i.external_id for i in snap.items} == {"https://example.com/a", "https://example.com/b"}
-    assert calls["n"] == 2
+    assert sorted(page_calls) == ["/a", "/b"]  # each page fetched exactly once
 
 
 # --------------------------------------------------------------------------- #

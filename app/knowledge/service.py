@@ -40,6 +40,13 @@ class QuotaError(Exception):
     """Raised when an ingest would exceed the storage quota (→ 422 at the edge)."""
 
 
+def embedding_model_name(embedder: object) -> str:
+    """The model an embedder stamps on chunks (F121). Production embedders declare
+    ``model_name``; a test double that does not is recorded as ``unknown`` rather
+    than crashing ingestion."""
+    return str(getattr(embedder, "model_name", None) or "unknown")
+
+
 async def used_bytes(session: AsyncSession, admin_id: uuid.UUID) -> int:
     total = (
         await session.execute(
@@ -110,7 +117,7 @@ async def ingest_text(
                     ordinal=ordinal,
                     text=chunk,
                     embedding=vec,
-                    embedding_model=embedder.model_name,
+                    embedding_model=embedding_model_name(embedder),
                 )
             )
     # --- Graph extraction at ingest (§3.2.1) ----------------------------------- #
@@ -608,7 +615,7 @@ async def replace_source(
                     ordinal=ordinal,
                     text=chunk,
                     embedding=vec,
-                    embedding_model=embedder.model_name,
+                    embedding_model=embedding_model_name(embedder),
                 )
             )
     await _store_graph(
@@ -733,7 +740,7 @@ async def reembed_outdated_chunks(
     knowledge over a few sweeps instead of one unbounded transaction. Returns the
     number of chunks rewritten."""
     embedder = get_embedder()
-    current = embedder.model_name
+    current = embedding_model_name(embedder)
     rows = (
         (
             await session.execute(

@@ -39,7 +39,10 @@ def test_the_export_bucket_expires_its_objects_close_to_the_link_ttl():
 
 
 def test_the_task_role_can_actually_write_to_it():
-    assert "exportBucket.grantReadWrite(taskRole)" in _COMPUTE_STACK
+    # Granted through the shared app-plane grant (F115): the control plane and the
+    # sweeps both receive it; the narrower data plane deliberately does not.
+    assert "exportBucket.grantReadWrite(role)" in _COMPUTE_STACK
+    assert "grantAppPlaneAccess(taskRole)" in _COMPUTE_STACK
 
 
 def test_the_bucket_name_is_injected_rather_than_hardcoded_in_the_app():

@@ -209,7 +209,7 @@ async def sync_connection(
                         ordinal=ordinal,
                         text=c,
                         embedding=vec,
-                        embedding_model=get_embedder().model_name,
+                        embedding_model=service.embedding_model_name(get_embedder()),
                     )
                 )
             prior.name = item.name

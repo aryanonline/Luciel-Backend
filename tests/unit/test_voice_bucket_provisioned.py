@@ -38,7 +38,10 @@ def test_the_voice_audio_bucket_expires_its_objects_within_a_day():
 
 
 def test_the_task_role_can_write_and_the_presigner_can_decrypt():
-    assert "voiceAudioBucket.grantReadWrite(taskRole)" in _COMPUTE_STACK
+    # Shared app-plane grant (F115) for the control plane + sweeps; the data plane
+    # holds its own explicit grant on the same bucket.
+    assert "voiceAudioBucket.grantReadWrite(role)" in _COMPUTE_STACK
+    assert "voiceAudioBucket.grantReadWrite(dataPlaneRole)" in _COMPUTE_STACK
     # The presigned GET is authorized AS the signing role and the object is
     # CMK-encrypted, so the role's kms:Decrypt (UseCmk) is load-bearing for
     # Twilio's fetch — losing it breaks <Play> invisibly.

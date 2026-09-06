@@ -343,9 +343,25 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
     # are never returned over the wire (§3.8.3), so we captured them directly
     # from account creation above instead of round-tripping the API for them.
     from app.connections.secrets import get_secret_store
+    from app.db.session import tenant_session
+    from app.models.connection import InstanceConnection
+    from sqlalchemy import select
 
     store = get_secret_store()
-    material = await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
+    # Since knowledge connections became many-per-tenant (F092) each row owns its
+    # own secret ref under the tenant prefix; the legacy per-type ref is not written.
+    async with tenant_session(admin_id) as s:
+        secret_ref = (
+            await s.execute(
+                select(InstanceConnection.secret_ref).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == uuid.UUID(connection_id),
+                )
+            )
+        ).scalar_one()
+    assert secret_ref and secret_ref.startswith(f"vm/{admin_id}/{instance_id}/")
+    assert await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source")) is None
+    material = await store.get(secret_ref)
     assert material is not None
     assert material["access_token"] == "gd-tok-from-callback"
 

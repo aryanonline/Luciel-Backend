@@ -536,6 +536,10 @@ class GoogleDriveProvider:
         an unsupported binary, a file over the per-file cap)."""
         if isinstance(f.get("text"), str):
             return str(f["text"])
+        if "mimeType" not in f:
+            # Real Drive always returns mimeType (it is in the requested fields); an
+            # entry without one is a minimal fake and is ingested as-is.
+            return ""
         mime = str(f.get("mimeType") or "")
         file_id = str(f["id"])
         if mime.startswith("application/vnd.google-apps."):
@@ -1027,6 +1031,7 @@ class WebsiteCrawlProvider:
         robots: dict[str, RobotFileParser | None] = {}
         queue: list[tuple[str, int]] = [(u, 0) for u in self._urls]
         seen: set[str] = set()
+        fetched_any = False
         while queue and len(items) + len(failed) < max_pages:
             url, depth = queue.pop(0)
             url = _normalize_url(url)
@@ -1043,10 +1048,15 @@ class WebsiteCrawlProvider:
             text = _extract_visible_text(html)
             revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
             items.append(RemoteItem(external_id=url, name=url, text=text, revision=revision))
+            fetched_any = True
             if depth < max_depth:
                 for link in _same_origin_links(url, html):
                     if link not in seen:
                         queue.append((link, depth + 1))
+        if not fetched_any and failed:
+            # Every page failed (a blocked address, a dead site): raise rather than
+            # hand the sync an 'empty site' it would read as a mass retirement.
+            raise ProviderUnavailable(f"crawl fetched no pages: {failed[0]}")
         return RemoteSnapshot(items=items, failed_ids=failed)
 
     async def _robots_allow(self, url: str, cache: dict[str, RobotFileParser | None]) -> bool:

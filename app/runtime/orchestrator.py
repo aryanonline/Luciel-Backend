@@ -914,18 +914,6 @@ class Orchestrator:
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
         reply_text = pre_send_check(resp.text)
-        if (
-            escalation is not None
-            and escalation.signal is Signal.cannot_answer
-            and not is_clarifying_question(reply_text)
-        ):
-            # Below the grounding floor the draft is a guess (2026-09-05 audit F100):
-            # it used to ship anyway with "I've flagged this" appended, so the
-            # visitor got a confident wrong answer AND a hand-off. An employee who
-            # does not know says so and gets a person — the draft never leaves. A
-            # bare clarifying question ("what's your email?") asserts nothing and
-            # still goes out.
-            reply_text = await self._handoff_ack()
 
         # --- FAITHFUL READBACK ENFORCEMENT (§3.3.4 rule 1 / §3.4.13, C4) ------ #
         action_results = [
@@ -972,6 +960,20 @@ class Orchestrator:
                     f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
                 )
                 reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
+        if (
+            not claimed_without_action
+            and escalation is not None
+            and escalation.signal is Signal.cannot_answer
+            and not is_clarifying_question(reply_text)
+        ):
+            # Below the grounding floor the draft is a guess (2026-09-05 audit F100):
+            # it used to ship anyway with "I've flagged this" appended, so the
+            # visitor got a confident wrong answer AND a hand-off. An employee who
+            # does not know says so and gets a person — the draft never leaves. A
+            # bare clarifying question ("what's your email?") asserts nothing and
+            # still goes out; an unfounded action claim keeps its own, more
+            # specific replacement above.
+            reply_text = await self._handoff_ack()
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
         if escalation is not None:
             reply_text = self._with_contact_ask(
@@ -1086,7 +1088,12 @@ class Orchestrator:
         from app.connections import gate  # noqa: PLC0415
         from app.tools import catalog  # noqa: PLC0415
 
-        connection_type = catalog.TOOL_CONNECTION_TYPE.get(tool_id)
+        tool = self.tool_resolver(tool_id) if self.tool_resolver is not None else None
+        connection_type = (
+            getattr(tool, "requires_connection", catalog.TOOL_CONNECTION_TYPE.get(tool_id))
+            if tool is not None
+            else catalog.TOOL_CONNECTION_TYPE.get(tool_id)
+        )
         if connection_type is not None:
             status = await gate.connection_status(
                 self.session,

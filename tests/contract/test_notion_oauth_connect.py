@@ -134,7 +134,7 @@ async def _status_of(client, connection_id: str) -> str:
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_browser_callback_completes_notion_with_basic_auth_json_exchange(client, monkeypatch):
-    from app.connections.secrets import get_secret_store, secret_ref_for
+    from app.connections.secrets import get_secret_store
 
     _configure_notion(monkeypatch)
     transport = _fake_notion_transport(monkeypatch)
@@ -153,7 +153,22 @@ async def test_browser_callback_completes_notion_with_basic_auth_json_exchange(c
     assert params["provider"] == "notion"
     assert await _status_of(client, connection_id) == "connected"
 
-    stored = await get_secret_store().get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
+    from app.db.session import tenant_session
+    from app.models.connection import InstanceConnection
+    from sqlalchemy import select
+
+    # Per-connection secret refs (F092): read the row's own ref, not the legacy one.
+    async with tenant_session(admin_id) as s:
+        secret_ref = (
+            await s.execute(
+                select(InstanceConnection.secret_ref).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == uuid.UUID(str(connection_id)),
+                )
+            )
+        ).scalar_one()
+    assert secret_ref and secret_ref.startswith(f"vm/{admin_id}/{instance_id}/")
+    stored = await get_secret_store().get(secret_ref)
     assert stored is not None, "the callback must persist the tenant's workspace token"
     assert stored["access_token"] == "n-tok-1"
     assert len(transport.calls) == 1
