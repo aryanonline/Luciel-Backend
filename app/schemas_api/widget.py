@@ -55,6 +55,9 @@ class WidgetSendRequest(WireModel):
 
 class WidgetBootstrapRequest(WireModel):
     embed_key: str
+    # The session this tab already holds (sessionStorage), when it has one: a
+    # paused Luciel still serves a conversation in progress (2026-09-06 E2E walk).
+    session_id: uuid.UUID | None = None
 
 
 class WidgetSendResult(WireModel):

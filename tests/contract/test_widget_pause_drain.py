@@ -98,6 +98,22 @@ async def test_in_flight_widget_session_finishes_across_a_pause(client):
     )
     assert fresh.json()["renderState"] == "paused"
 
+    # The same visitor clicks to the NEXT PAGE of the site: the new page's widget
+    # boots with the tab's stored session id and must still render (2026-09-06 E2E
+    # walk, E2E-9). A visitor without one, or with a made-up id, is held.
+    boot_mid = await client.post(
+        "/api/v1/chat-widget/bootstrap", json={"embedKey": embed_key, "sessionId": sid}
+    )
+    assert boot_mid.json()["renderState"] == "active"
+    assert boot_mid.json()["openingMessage"]  # the real chrome, not the empty directive
+    boot_new = await client.post("/api/v1/chat-widget/bootstrap", json={"embedKey": embed_key})
+    assert boot_new.json()["renderState"] == "paused"
+    boot_fake = await client.post(
+        "/api/v1/chat-widget/bootstrap",
+        json={"embedKey": embed_key, "sessionId": str(uuid.uuid4())},
+    )
+    assert boot_fake.json()["renderState"] == "paused"
+
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_delete_drains_in_flight_and_refuses_new_intake(client):

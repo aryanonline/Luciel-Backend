@@ -201,7 +201,20 @@ async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBoo
         if inst is None:
             raise not_found("Unknown widget.")
         business, assistant = _names(inst)
-        if is_paused(inst):
+        # A pause holds NEW conversations; one in progress finishes (§3.6.2). The
+        # visitor's tab carries its session id across pages, and the bootstrap
+        # used to ignore it — a paused Luciel rendered nothing for a visitor who
+        # was mid-sentence and clicked to the next page (2026-09-06 E2E walk).
+        in_flight = None
+        if is_paused(inst) and body.session_id is not None:
+            in_flight = await find_open_session(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                channel=CHANNEL,
+                session_id=body.session_id,
+            )
+        if is_paused(inst) and in_flight is None:
             # Paused → the widget renders an empty <div>; still honest literals.
             return WidgetBootstrapOut(
                 render_state="paused",
