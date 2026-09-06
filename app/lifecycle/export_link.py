@@ -15,7 +15,7 @@ import uuid
 from app.auth.tokens import decode_token, mint_link_token
 from app.config import get_settings
 
-EXPORT_TOKEN_PURPOSE = "export"  # noqa: S105 — a token PURPOSE label, not a secret
+EXPORT_TOKEN_PURPOSE = "export"  # noqa: S105 # nosec B105 — a token PURPOSE label, not a secret
 #: How long each minted presign lives — one download, not a standing door.
 PRESIGN_TTL_SECONDS = 15 * 60
 
