@@ -13,7 +13,8 @@ ObservabilityStack alarms reference:
     SweepTenantFailure   a sweep's per-tenant work raised (dim: Sweep)
     KnowledgeRetrievalDegraded
                          a turn ran with NO knowledge because the embedding
-                         provider failed (dim: Reason)
+                         provider failed, or an ingest could not embed
+                         (dim: Reason, prefixed ingest: for the latter)
 """
 
 from __future__ import annotations

@@ -126,3 +126,26 @@ def register_error_handlers(app: FastAPI) -> None:
                 "retryAfterSeconds": 5,
             },
         )
+
+    # The embedding provider failed while INDEXING (paste/upload/CSV/replace/sync).
+    # 2026-09-06 E2E walk (E2E-12): with OpenAI answering 429 this escaped as a bare
+    # 500 — no CORS headers on that path — and the dashboard told the owner
+    # "Network request failed." The write rolls back with the tenant session
+    # (nothing half-indexed), the owner reads what actually happened, and the
+    # operator is paged through the same metric the retrieval alarm watches.
+    from app.knowledge.embeddings import EmbeddingError  # noqa: PLC0415
+    from app.observability.metrics import emit_metric  # noqa: PLC0415
+
+    @app.exception_handler(EmbeddingError)
+    async def _handle_embedding_error(_: Request, exc: EmbeddingError) -> JSONResponse:
+        emit_metric("KnowledgeRetrievalDegraded", dimensions={"Reason": f"ingest:{exc}"[:120]})
+        return JSONResponse(
+            status_code=503,
+            content={
+                "message": (
+                    "Your knowledge couldn't be indexed right now — the embedding provider "
+                    "isn't answering. Nothing was saved; please try again in a few minutes."
+                ),
+                "retryAfterSeconds": 300,
+            },
+        )

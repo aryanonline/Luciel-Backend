@@ -36,6 +36,42 @@ async def test_quota_shape(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_paste_while_the_embedder_is_down_is_an_honest_503_and_saves_nothing(
+    client, monkeypatch, capsys
+):
+    """2026-09-06 E2E walk (E2E-12): OpenAI answered 429, the paste escaped as a bare
+    500 and the dashboard said "Network request failed." The owner must read what
+    happened, nothing may be half-indexed, and the operator must be paged."""
+    from app.knowledge import service
+    from app.knowledge.embeddings import EmbeddingError
+
+    class _DownEmbedder:
+        dim = 1536
+        model_name = "text-embedding-3-small"
+
+        async def embed(self, texts):
+            raise EmbeddingError("openai_error:RateLimitError")
+
+    monkeypatch.setattr(service, "get_embedder", lambda *a, **k: _DownEmbedder())
+    await _ready_account_with_luciel(client)
+    r = await client.post(
+        "/api/v1/admin/knowledge/sources/paste",
+        json={"name": "Walk-ins policy", "text": "We welcome walk-ins on weekdays."},
+    )
+    assert r.status_code == 503
+    body = r.json()
+    assert "couldn't be indexed" in body["message"]
+    assert body["retryAfterSeconds"] == 300
+    listed = await client.get("/api/v1/admin/knowledge/sources")
+    assert listed.status_code == 200
+    assert [s for s in listed.json() if s["name"] == "Walk-ins policy"] == []
+    metric_lines = [
+        ln for ln in capsys.readouterr().out.splitlines() if '"KnowledgeRetrievalDegraded"' in ln
+    ]
+    assert metric_lines and "ingest:openai_error:RateLimitError" in metric_lines[-1]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_paste_ingest_then_list_and_chunks(client):
     await _ready_account_with_luciel(client)
     ri = await client.post(
