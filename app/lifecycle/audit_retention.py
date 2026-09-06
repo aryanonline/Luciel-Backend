@@ -121,6 +121,12 @@ AUDIT_LOCK_CHECKS: tuple[LockCheck, ...] = (
         "OR has_table_privilege('luciel_app', 'admin_audit_log', 'TRUNCATE'))",
         "append-only means the app role can append and read, and nothing else",
     ),
+    LockCheck(
+        "luciel_app is not a member of the BYPASSRLS role luciel_auth",
+        "SELECT NOT pg_has_role('luciel_app', 'luciel_auth', 'MEMBER')",
+        "membership would let a SET ROLE switch off row-level security for every tenant; "
+        "it is granted for the migration step only and revoked by the lock script (F085)",
+    ),
 )
 
 

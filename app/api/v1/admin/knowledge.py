@@ -17,7 +17,7 @@ import uuid
 from typing import cast
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,6 +100,7 @@ def _source_out(src: KnowledgeSource, used_7d: int = 0) -> KnowledgeSourceOut:
             "lastSyncedAt": src.last_synced_at,
             "syncStatus": src.sync_status,
             "usedByQuestions7d": used_7d,
+            "connectionId": src.connection_id,
         }
     )
 
@@ -195,7 +196,9 @@ async def restore_source(
 
 @router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
 async def resync_source(
-    source_id: uuid.UUID, subject: Subject = Depends(current_admin)
+    source_id: uuid.UUID,
+    subject: Subject = Depends(current_admin),
+    confirm_shrink: bool = Query(False, alias="confirmShrink"),
 ) -> KnowledgeSourceOut:
     """Manual re-sync (Architecture §3.2.3: "the Admin can ... trigger a manual
     re-sync"). For a live-sync source this actually re-pulls via the source's
@@ -235,7 +238,15 @@ async def resync_source(
                     connection_id=conn.connection_id,
                     origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
                     provider=provider,
+                    allow_shrink=confirm_shrink,
                 )
+            except sync.SnapshotShrunk as exc:
+                # Nothing was deleted (F107); the owner confirms with ?confirmShrink=true.
+                raise conflict(
+                    f"The source now reports {exc.remote} item(s) where {exc.existing} are "
+                    "synced, so nothing was removed. If you did remove them at the source, "
+                    "sync again and confirm the shrink."
+                ) from exc
             except ProviderUnavailable as exc:
                 # Same clean-error rule as trigger_sync: a revoked/expired/never-
                 # connected credential surfaces a structured 409, never a crash.
@@ -489,7 +500,9 @@ async def create_sync_connection(
 
 @router.post("/sync-connections/{connection_id}/sync", response_model=SyncResultOut)
 async def trigger_sync(
-    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+    connection_id: uuid.UUID,
+    subject: Subject = Depends(current_admin),
+    confirm_shrink: bool = Query(False, alias="confirmShrink"),
 ) -> SyncResultOut:
     """Manually trigger a re-sync/crawl for one connection (§3.2.3 "manual
     re-sync ... always available for immediacy"). Reconciles the FULL connected
@@ -516,7 +529,11 @@ async def trigger_sync(
         from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
 
         await ensure_fresh_access_token(
-            s, subject.admin_id, instance_id, connection_type="knowledge_source"
+            s,
+            subject.admin_id,
+            instance_id,
+            connection_type="knowledge_source",
+            connection_id=conn.connection_id,
         )
         provider = provider_for_connection(conn, get_secret_store())
         try:
@@ -527,7 +544,16 @@ async def trigger_sync(
                 connection_id=conn.connection_id,
                 origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
                 provider=provider,
+                allow_shrink=confirm_shrink,
             )
+        except sync.SnapshotShrunk as exc:
+            # Nothing was deleted (F107). The owner confirms an intentional shrink
+            # by re-syncing with ?confirmShrink=true — the frontend offers exactly that.
+            raise conflict(
+                f"The source now reports {exc.remote} item(s) where {exc.existing} are "
+                "synced, so nothing was removed. If you did remove them at the source, "
+                "sync again and confirm the shrink."
+            ) from exc
         except ProviderUnavailable as exc:
             # No token on file (never connected / revoked / expired) or the
             # provider's live call isn't reachable in this posture: surface a
@@ -759,7 +785,11 @@ async def oauth_callback(
                 await s.flush()
                 raise conflict(f"OAuth token exchange failed: {exc}") from exc
         await store_oauth_token(
-            store, admin_id=subject.admin_id, instance_id=instance_id, material=material
+            store,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            material=material,
+            secret_ref=conn.secret_ref or None,  # this row's own ref (F092)
         )
         old_status = conn.status
         conn.status = "connected"

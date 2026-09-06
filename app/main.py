@@ -8,6 +8,8 @@ today).
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Sequence
 
 from fastapi import FastAPI
@@ -78,8 +80,40 @@ class PlaneAwareCORS:
         await self._control_plane(scope, receive, send)
 
 
+_CAP_TOKEN_RE = re.compile(r"(\bcap=)[^&\s\"']+")
+
+
+class _RedactCapabilityTokens(logging.Filter):
+    """Keep webhook capability tokens out of every log line (2026-09-05 audit F072).
+
+    A tenant whose Twilio auth token we do not hold authenticates its webhooks with a
+    per-connection ``?cap=`` token in the registered URL (C11). uvicorn's access log
+    prints the request path WITH its query string, so every inbound text or call wrote
+    a bearer-equivalent secret to CloudWatch. The token stays in the URL Twilio calls;
+    it never reaches a log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _CAP_TOKEN_RE.sub(r"\1REDACTED", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str) and "cap=" in record.msg:
+            record.msg = _CAP_TOKEN_RE.sub(r"\1REDACTED", record.msg)
+        return True
+
+
+def install_log_redaction() -> None:
+    """Attach the capability-token filter to the loggers that print request URLs."""
+    for name in ("uvicorn.access", "uvicorn.error", "app"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, _RedactCapabilityTokens) for f in logger.filters):
+            logger.addFilter(_RedactCapabilityTokens())
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
+    install_log_redaction()
     app = FastAPI(title="Luciel Backend", version="0.1.0")
 
     app.add_middleware(

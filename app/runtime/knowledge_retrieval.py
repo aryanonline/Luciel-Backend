@@ -30,12 +30,15 @@ never the knowledge stores — this retriever therefore never calls a live data 
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.knowledge import graph, service
+from app.knowledge.embeddings import EmbeddingError
 from app.knowledge.intent import QueryIntent, classify_intent, seed_terms
 
 # Matches app/runtime/orchestrator.py Retriever; re-declared here to avoid a runtime import
@@ -89,6 +92,91 @@ async def hybrid_retrieve(
     return fused[:k]
 
 
+#: ``(texts_for_the_model, attributed_chunks)`` from ONE vector query (cost: the
+#: orchestrator used to embed the same question twice and run two ANN searches per turn).
+RetrieverBundle = Callable[[str], Awaitable[tuple[list[str], list[dict[str, object]]]]]
+
+
+def _relevance_floor_active() -> bool:
+    # Hashed mock vectors carry no distance meaning; the floor is a live-only rule.
+    return get_settings().integration_mode == "live"
+
+
+async def hybrid_retrieve_bundle(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    query: str,
+    k: int = DEFAULT_K,
+) -> tuple[list[str], list[dict[str, object]]]:
+    """One retrieval pass → (prompt snippets, real chunk attribution) (§3.2.1).
+
+    The vector leg runs ONCE (one embedding, one ANN); graph facts join the prompt
+    list for structured-filter intent exactly as ``hybrid_retrieve`` does. In live
+    mode a chunk beyond the relevance floor (cosine distance above
+    ``knowledge_relevance_max_distance``) is dropped before it can be injected — an
+    unrelated chunk is noise the model may answer from, and an honest "no sources"
+    beats a confident answer from the wrong page."""
+    intent = classify_intent(query)
+    graph_facts: list[str] = []
+    if intent is QueryIntent.structured_filter_intent:
+        graph_facts = await graph.graph_facts_for_terms(
+            session, admin_id=admin_id, instance_id=instance_id, terms=seed_terms(query)
+        )
+    try:
+        vector_hits = await service.retrieve(
+            session, admin_id=admin_id, instance_id=instance_id, query=query, k=k
+        )
+    except EmbeddingError as exc:
+        # The embedding provider is down (2026-09-05 audit F103): the turn goes on with
+        # NO knowledge — the grounding floor then hands the question to a person —
+        # instead of a 500 that answers the visitor with nothing at all.
+        _LOG.warning("knowledge_retrieval_degraded reason=%s", exc)
+        vector_hits = []
+    if _relevance_floor_active():
+        ceiling = get_settings().knowledge_relevance_max_distance
+        vector_hits = [(c, d) for c, d in vector_hits if d is None or float(d) <= ceiling]
+    attributed: list[dict[str, object]] = []
+    if vector_hits:
+        source_ids = {chunk.source_id for chunk, _d in vector_hits}
+        sources = await service.sources_by_id(
+            session, admin_id=admin_id, instance_id=instance_id, source_ids=source_ids
+        )
+        attributed = [
+            {
+                "source_id": str(chunk.source_id),
+                "source_name": sources.get(chunk.source_id, "Knowledge source"),
+                "text": chunk.text,
+            }
+            for chunk, _d in vector_hits
+        ]
+    fused: list[str] = []
+    seen: set[str] = set()
+    for item in [*graph_facts, *[chunk.text for chunk, _d in vector_hits]]:
+        if item and item not in seen:
+            seen.add(item)
+            fused.append(item)
+    return fused[:k], attributed
+
+
+def make_retriever_bundle(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    k: int = DEFAULT_K,
+) -> RetrieverBundle:
+    """Bind the single-pass retriever for a construction site (widget, channels)."""
+
+    async def _bundle(query: str) -> tuple[list[str], list[dict[str, object]]]:
+        return await hybrid_retrieve_bundle(
+            session, admin_id=admin_id, instance_id=instance_id, query=query, k=k
+        )
+
+    return _bundle
+
+
 def make_retriever(
     session: AsyncSession,
     *,
@@ -125,6 +213,8 @@ def make_retriever(
 # ever covers the vector leg -- deliberately: a graph-only structured-filter turn
 # still persists source_chunks=None (attribution_unavailable), never a fabricated
 # source for a fact that has no chunk this maps back to.
+_LOG = logging.getLogger(__name__)
+
 ChunkAttributor = Callable[[str], Awaitable[list[dict[str, object]]]]
 
 

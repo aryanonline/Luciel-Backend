@@ -35,6 +35,15 @@ def secret_ref_for(admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type:
     return f"vm/{admin_id}/{instance_id}/{connection_type}"
 
 
+def secret_ref_for_connection(
+    admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str, connection_id: uuid.UUID
+) -> str:
+    """A PER-ROW pointer for connection types that may hold several live rows at once
+    (knowledge sources, 2026-09-05 audit F092). Under the same ``vm/{admin}/`` prefix so
+    IAM scoping and the cascade prefix sweep cover it unchanged."""
+    return f"{secret_ref_for(admin_id, instance_id, connection_type)}/{connection_id}"
+
+
 def tenant_secret_prefix(admin_id: uuid.UUID) -> str:
     """Every secret this tenant can own lives under this prefix (§3.8.3 rule 5).
 

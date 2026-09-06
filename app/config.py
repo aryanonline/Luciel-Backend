@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     # empty — the normal state. Also readable from the platform secret's
     # PLATFORM_NOTICES so an announcement can be published without a redeploy.
     platform_notices: str = ""
+    # JSON record of the last model_currency auto-swap ({at, setting, from, to}),
+    # written by the sweep into the platform secret next to the new pin. Read by
+    # app/billing/notices.py to show and email every admin the honest 'model
+    # updated' notice (F114). Empty = no swap on record.
+    llm_model_updated: str = ""
 
     # --- Stripe integration posture (Architecture §3.4.1b) ---------------------
     # Mirrors the LLM GATE 2 cutover shape ("integration_mode") one level down: a
@@ -192,6 +197,10 @@ class Settings(BaseSettings):
     # secret / task env (SES_CONFIGURATION_SET / SES_EVENTS_TOPIC_ARN).
     ses_configuration_set: str = ""
     ses_events_topic_arn: str = ""
+    # The SNS topic the SES INBOUND receipt rule publishes to (out-of-band ops, root
+    # CLAUDE.md). When set in live mode the inbound route refuses any other topic
+    # (2026-09-05 audit F048) — the events route already pinned; inbound did not.
+    ses_inbound_topic_arn: str = ""
     # TTL for escalation-contact confirmation links (round 5B item 13).
     escalation_contact_link_ttl_seconds: int = 7 * 24 * 3600
     # Public base URL used to build customer-facing links in emails (verify link,
@@ -251,6 +260,10 @@ class Settings(BaseSettings):
     # Override via env (LUCIEL_LLM_*) without a code change.
     llm_anthropic_primary_model: str = "claude-sonnet-4-6"
     llm_anthropic_fast_model: str = "claude-haiku-4-5"
+    # Per-call provider deadline (2026-09-05 audit F101). The router fails over to
+    # the fallback IMMEDIATELY on a primary error (§3.4.3); SDK-side retries and an
+    # open-ended default timeout used to stack minutes of silence in front of that.
+    llm_timeout_seconds: float = 30.0
     llm_openai_fallback_model: str = "gpt-5.4"
 
     # Upper bound on generated tokens per LLM call (platform cost control).
@@ -328,6 +341,15 @@ class Settings(BaseSettings):
     # never hang a sync worker or pull in an unbounded page.
     website_crawl_timeout_seconds: float = 10.0
     website_crawl_max_bytes: int = 5_000_000
+    # Same-origin link discovery from each seed URL (2026-09-05 audit F117): bounded
+    # pages per crawl and link depth, robots.txt honoured (F123).
+    website_crawl_max_pages: int = 40
+    website_crawl_max_depth: int = 2
+    # Retrieval relevance floor (cosine DISTANCE ceiling) applied in live mode before
+    # a chunk is injected into the prompt: an unrelated chunk is noise the model may
+    # answer from. Mock posture uses hashed vectors whose distances carry no meaning,
+    # so the floor is live-only.
+    knowledge_relevance_max_distance: float = 0.6
 
     def model_post_init(self, __context: object) -> None:
         """Overlay platform-owned OAuth app credentials from the platform-secret
@@ -390,6 +412,7 @@ class Settings(BaseSettings):
             # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret,
             # rather than needing a task-definition change to reach every account.
             "PLATFORM_NOTICES": "platform_notices",
+            "LLM_MODEL_UPDATED": "llm_model_updated",
             "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
             "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
             "TWILIO_ACCOUNT_SID": "twilio_account_sid",
@@ -407,6 +430,7 @@ class Settings(BaseSettings):
             # also settable as plain task env (the CDK wires both ways).
             "SES_CONFIGURATION_SET": "ses_configuration_set",
             "SES_EVENTS_TOPIC_ARN": "ses_events_topic_arn",
+            "SES_INBOUND_TOPIC_ARN": "ses_inbound_topic_arn",
         }
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
         # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
@@ -425,6 +449,7 @@ class Settings(BaseSettings):
         for plain_env, ses_field in (
             ("SES_CONFIGURATION_SET", "ses_configuration_set"),
             ("SES_EVENTS_TOPIC_ARN", "ses_events_topic_arn"),
+            ("SES_INBOUND_TOPIC_ARN", "ses_inbound_topic_arn"),
         ):
             if not getattr(self, ses_field) and os.environ.get(plain_env):
                 object.__setattr__(self, ses_field, os.environ[plain_env])

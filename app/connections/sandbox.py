@@ -25,7 +25,7 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from multiprocessing import connection as mp_connection
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from app.tools import contract as c
 from app.tools.contract import ToolContext, ToolResult
@@ -52,6 +52,41 @@ class SsrfBlocked(Exception):
 def _resolve_ips(host: str) -> list[str]:
     infos = socket.getaddrinfo(host, None)
     return [str(info[4][0]) for info in infos]
+
+
+def _is_blocked_address(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip)
+    return any(addr.version == net.version and addr in net for net in _BLOCKED_NETS)
+
+
+def pin_public_target(url: str) -> tuple[str, str]:
+    """Resolve the host ONCE, refuse anything non-public, and return the URL rewritten
+    to connect to that exact address plus the original hostname (2026-09-05 audit
+    F090).
+
+    ``resolves_to_public_host`` validates a name; the connect() that follows resolves
+    it again, and a DNS answer that flips between the two (rebinding) reaches the
+    metadata endpoint with a clean bill of health. Connecting to the address that WAS
+    validated closes the gap: the caller sends ``Host`` / SNI as the original name so
+    the peer and its certificate are checked against the name, not the address.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise SsrfBlocked("scheme_not_http")
+    host = parts.hostname or ""
+    if not host:
+        raise SsrfBlocked("no_host")
+    try:
+        ips = _resolve_ips(host)
+    except OSError as exc:
+        raise SsrfBlocked("unresolvable") from exc
+    if not ips or any(_is_blocked_address(ip) for ip in ips):
+        raise SsrfBlocked("non_public_address")
+    ip = ips[0]
+    netloc = f"[{ip}]" if ":" in ip else ip
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), host
 
 
 def resolves_to_public_host(url: str) -> bool:
@@ -170,7 +205,16 @@ def _httpx_post_json(
     import httpx  # noqa: PLC0415 — lazy import: only the worker process needs this
 
     headers = {"Authorization": auth_header} if auth_header else {}
-    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    # Connect to the address that was validated, not to whatever the name resolves
+    # to a moment later (F090). The name still travels as Host + SNI, so TLS verifies
+    # the certificate against the hostname the tenant configured.
+    pinned_url, host = pin_public_target(url)
+    headers["Host"] = host
+    with httpx.Client(timeout=timeout) as client:
+        request = client.build_request(
+            "POST", pinned_url, json=payload, headers=headers, extensions={"sni_hostname": host}
+        )
+        resp = client.send(request)
     try:
         body = resp.json()
     except ValueError:

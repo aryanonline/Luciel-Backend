@@ -80,6 +80,14 @@ LIMITS: dict[str, ChannelLimits] = {
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
     # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
     "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
+    # Sign-in and password-reset throttles (2026-09-05 audit F056/F068): per email
+    # AND per source address, so neither a single-account brute force nor a
+    # many-account spray runs unbounded. A reset request is throttled whether or
+    # not the address exists, so the throttle itself enumerates nothing (§3.7.1a).
+    "auth_login_email": ChannelLimits(burst=10, refill_seconds=60.0, daily_cap=100),
+    "auth_login_ip": ChannelLimits(burst=30, refill_seconds=2.0, daily_cap=1000),
+    "auth_forgot_email": ChannelLimits(burst=3, refill_seconds=300.0, daily_cap=10),
+    "auth_forgot_ip": ChannelLimits(burst=10, refill_seconds=60.0, daily_cap=100),
     # Voice status callbacks (C11, not conversational): the finalize-at-hangup
     # route bypasses pipeline.ingest, so it gets its own per-destination-number
     # bucket. Legit volume is one callback per call plus provider retries —
@@ -197,6 +205,12 @@ class TokenBucketStore:
             self._blocked[key] = now + AUTO_BLOCK_SECONDS
             self._abuse.pop(key, None)
 
+    def record_abuse(self, channel: str, source_id: str) -> None:
+        """An abuse signal from OUTSIDE the limiter (a detected prompt injection,
+        2026-09-05 audit F086) counts toward the same per-source auto-block a
+        rate-limit refusal does."""
+        self._record_abuse(f"{channel}:{source_id}", self._now())
+
     def is_blocked(self, channel: str, source_id: str) -> bool:
         expiry = self._blocked.get(f"{channel}:{source_id}")
         return expiry is not None and expiry > self._now()
@@ -275,6 +289,14 @@ class RedisTokenBucketStore:
         if self._incr(f"rl:a:{key}", 86400) >= AUTO_BLOCK_ABUSE_THRESHOLD:
             self._client.set(f"rl:b:{key}", 1, ex=AUTO_BLOCK_SECONDS)  # type: ignore[attr-defined]
             self._client.delete(f"rl:a:{key}")  # type: ignore[attr-defined]
+
+    def record_abuse(self, channel: str, source_id: str) -> None:
+        """See ``TokenBucketStore.record_abuse`` (F086). Degrades silently on a
+        Redis error — the signal is defence in depth, never a request failure."""
+        try:
+            self._record_abuse(f"{channel}:{source_id}")
+        except Exception:  # noqa: BLE001
+            self._degraded().record_abuse(channel, source_id)
 
     def is_blocked(self, channel: str, source_id: str) -> bool:
         try:

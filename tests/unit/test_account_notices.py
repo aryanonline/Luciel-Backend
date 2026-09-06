@@ -188,3 +188,47 @@ def test_a_published_price_notice_does_not_suppress_the_derived_allowance_one(mo
 
     kinds = {n.kind for n in notices.account_notices(now=NOW)}
     assert kinds == {notices.PRICE_CHANGE, notices.ALLOWANCE_REDUCTION}
+
+
+# --- 2026-09-05 audit F114: the auto-swap 'model updated' notice ------------------- #
+
+
+def _swap(
+    monkeypatch, *, at: datetime, old: str = "claude-sonnet-4-6", new: str = "claude-sonnet-4-8"
+):
+    record = {
+        "at": at.isoformat(),
+        "setting": "llm_anthropic_primary_model",
+        "from": old,
+        "to": new,
+    }
+    monkeypatch.setattr(get_settings(), "llm_model_updated", json.dumps(record))
+
+
+def test_an_auto_swap_shows_the_model_updated_notice_for_two_weeks(monkeypatch):
+    swapped_at = NOW - timedelta(days=3)
+    _swap(monkeypatch, at=swapped_at)
+    (notice,) = notices.account_notices(now=NOW)
+    assert notice.kind == notices.MODEL_UPDATED
+    assert notice.notice_id == f"model_updated:{swapped_at.date().isoformat()}:claude-sonnet-4-8"
+    assert "claude-sonnet-4-6" in notice.body and "claude-sonnet-4-8" in notice.body
+    assert "nothing is needed" in notice.body and "test turn" in notice.body
+    assert notice.effective_at is None
+    # It is news for a fortnight, then it is simply the current model.
+    assert notices.account_notices(now=NOW + timedelta(days=20)) == []
+    # A record from the future (clock skew) is not shown early either.
+    assert notices.account_notices(now=swapped_at - timedelta(days=1)) == []
+
+
+def test_the_model_updated_notice_rides_alongside_a_pending_reduction(monkeypatch):
+    _announce(monkeypatch, to=25, effective_at=(NOW + timedelta(days=40)).isoformat())
+    _swap(monkeypatch, at=NOW - timedelta(days=1))
+    kinds = [n.kind for n in notices.account_notices(now=NOW)]
+    assert kinds == [notices.ALLOWANCE_REDUCTION, notices.MODEL_UPDATED]
+
+
+def test_a_malformed_swap_record_never_breaks_login(monkeypatch):
+    monkeypatch.setattr(get_settings(), "llm_model_updated", "{not json")
+    assert notices.account_notices(now=NOW) == []
+    monkeypatch.setattr(get_settings(), "llm_model_updated", json.dumps({"at": "yesterday"}))
+    assert notices.account_notices(now=NOW) == []

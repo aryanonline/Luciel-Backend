@@ -42,10 +42,12 @@ is the honest cadence, not noise.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from app.config import Settings, get_settings, parse_platform_secret
@@ -56,6 +58,19 @@ logger = logging.getLogger(__name__)
 MODEL_CURRENCY_ALERT = "MODEL_CURRENCY_ALERT"
 MODEL_CURRENCY_SWAP = "MODEL_CURRENCY_SWAP"
 MODEL_CURRENCY_NUDGE = "MODEL_CURRENCY_NUDGE"
+# The provider answered a model call with 401/403: the platform's key is revoked or
+# rotated, which is a human-needed condition, never a retirement (F133).
+MODEL_CURRENCY_KEY_REJECTED = "MODEL_CURRENCY_KEY_REJECTED"
+# Platform-secret key holding the last auto-swap, read by app/billing/notices.py to
+# show every admin the in-dashboard 'model updated' notice (F114) and by the
+# billing_notices sweep to email it once per tenant. Written by the same secret
+# rotation that moves the pin, so the record and the change cannot drift apart.
+LAST_SWAP_BLOB_KEY = "LLM_MODEL_UPDATED"
+_ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+# The one-turn smoke a successor must pass before it is written anywhere (F113):
+# a listed model that cannot complete a trivial turn is not a successor.
+SMOKE_PROMPT = "Reply with the single word OK."
 
 # The newer-same-family nudge (audit round 3, Phase 7 — owner concern #6) goes
 # out at most on this weekday (Monday), keeping the module stateless (its
@@ -123,6 +138,14 @@ class _Transport(Protocol):  # pragma: no cover - structural typing only
         url: str,
         *,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any: ...
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: Any = None,
         headers: dict[str, str] | None = None,
     ) -> Any: ...
 
@@ -239,6 +262,45 @@ def pick_successor(retired_id: str, available: list[dict[str, Any]]) -> str | No
     return str(best["id"])
 
 
+def _version_tuple(model_id: str) -> tuple[int, ...]:
+    """The numeric version behind the family: ``claude-sonnet-4-6`` → (4, 6);
+    ``gpt-5.4`` → (4,) (the family already kept the 5); ``claude-haiku-4-5-20251001``
+    → (4, 5, 20251001). Empty when the id carries no version at all."""
+    family = model_family(model_id)
+    rest = model_id[len(family) :] if model_id.startswith(family) else model_id
+    return tuple(int(piece) for piece in rest.replace(".", "-").split("-") if piece.isdigit())
+
+
+def pick_newer_successor(retired_id: str, available: list[dict[str, Any]]) -> str | None:
+    """The newest same-family model that is AT LEAST as new as the retired pin, or None.
+
+    ``pick_successor`` answers 'newest in the family', which for a pin that was
+    itself the family's newest returns an OLDER sibling — a silent downgrade the
+    2026-09-05 audit refused (F113). Two guards, both required when applicable:
+    the candidate's version tuple must not be below the pin's, and when the pin
+    still has a listing footprint (its dated snapshots) the candidate must have
+    been released after it."""
+    family = model_family(retired_id)
+    pin_version = _version_tuple(retired_id)
+    pin_epoch = _pin_epoch(retired_id, available)
+    candidates = []
+    for item in available:
+        candidate = item.get("id")
+        if not isinstance(candidate, str) or candidate == retired_id:
+            continue
+        if model_family(candidate) != family:
+            continue
+        if pin_version and _version_tuple(candidate)[: len(pin_version)] < pin_version:
+            continue  # an older sibling is never a swap target
+        if pin_epoch and _created_epoch(item) and _created_epoch(item) < pin_epoch:
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda item: (_created_epoch(item), item["id"]))
+    return str(best["id"])
+
+
 def _pin_epoch(model_id: str, available: list[dict[str, Any]]) -> int:
     """When the PINNED model was released, per the listing.
 
@@ -272,6 +334,63 @@ def newer_same_family(model_id: str, available: list[dict[str, Any]]) -> str | N
         (_created_epoch(item) for item in available if item.get("id") == candidate), default=0
     )
     return candidate if candidate_epoch > pin_epoch else None
+
+
+# --- smoke turn (a successor must answer before it is pinned) ------------------ #
+
+SmokeTurn = Callable[..., Awaitable[str | None]]
+"""``await smoke(provider=..., api_key=..., model_id=...)`` → None when the model
+completed a trivial turn, else a short reason it did not."""
+
+
+def _http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _completion_text(provider: str, body: Any) -> str:
+    try:
+        if provider == "anthropic":
+            return "".join(
+                str(block.get("text", ""))
+                for block in body.get("content", [])
+                if isinstance(block, dict)
+            ).strip()
+        return str(body["choices"][0]["message"]["content"] or "").strip()
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return ""
+
+
+async def _default_smoke(
+    client: _Transport, *, provider: str, api_key: str, model_id: str
+) -> str | None:
+    """One real completion against the candidate through the same transport the
+    presence checks use. Any non-2xx, transport error or empty answer fails it."""
+    if provider == "anthropic":
+        url = _ANTHROPIC_MESSAGES_URL
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+    else:
+        url = _OPENAI_CHAT_URL
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+    payload = {
+        "model": model_id,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": SMOKE_PROMPT}],
+    }
+    try:
+        resp = await client.post(url, json=payload, headers=headers)
+        status = getattr(resp, "status_code", 0)
+        if not isinstance(status, int) or status >= 400:
+            return f"http {status}"
+        body = resp.json()
+    except Exception as exc:  # noqa: BLE001 — any failure is a failed smoke, never a crash
+        return type(exc).__name__
+    return None if _completion_text(provider, body) else "empty completion"
 
 
 # --- remediation seams (secret write + service restart) ------------------------ #
@@ -371,7 +490,8 @@ async def run_model_currency_check(
     email_sender: EmailSender | None = None,
     secret_writer: PlatformSecretWriter | None = None,
     restarter: EcsServiceRestarter | None = None,
-    now: object | None = None,  # accepted for sweep-runner symmetry; unused
+    smoke: SmokeTurn | None = None,
+    now: object | None = None,  # the sweep runner stamps it; gates the weekly nudge
 ) -> dict[str, object]:
     """Verify every pinned model; auto-swap retired chat pins; alert what remains.
 
@@ -425,6 +545,11 @@ async def run_model_currency_check(
                 listings[provider] = None
         return listings[provider]
 
+    async def _smoke_default(*, provider: str, api_key: str, model_id: str) -> str | None:
+        return await _default_smoke(client, provider=provider, api_key=api_key, model_id=model_id)
+
+    smoke_fn: SmokeTurn = smoke if smoke is not None else _smoke_default
+
     async with factory() as client:
         for pin in PINS:
             if pin.provider in unreachable:
@@ -435,6 +560,20 @@ async def run_model_currency_check(
                     client, provider=pin.provider, api_key=keys[pin.provider], model_id=model_id
                 )
             except Exception as exc:  # noqa: BLE001 — unreachable ≠ retired; never false-alarm
+                status = _http_status(exc)
+                if status in (401, 403):
+                    # Not unreachable: the provider answered and refused the key.
+                    # Every runtime call against it is failing the same way (F133).
+                    logger.error(
+                        "%s provider=%s http=%s", MODEL_CURRENCY_KEY_REJECTED, pin.provider, status
+                    )
+                    alerts.append(
+                        f"{pin.provider} rejected the platform's API key (HTTP {status}) — "
+                        f"revoked or rotated? Every {pin.provider} call fails until the "
+                        "key in the platform secret is replaced"
+                    )
+                    unreachable.add(pin.provider)
+                    continue
                 logger.warning(
                     "model_currency_provider_unreachable provider=%s error=%s",
                     pin.provider,
@@ -452,14 +591,40 @@ async def run_model_currency_check(
             # Remediate if this pin allows it.
             env_pinned = bool(os.environ.get(pin.env_var))
             listing = await _listing_for(client, pin.provider) if pin.swappable else None
-            successor = pick_successor(model_id, listing) if listing else None
+            successor = pick_newer_successor(model_id, listing) if listing else None
             writer = (
                 secret_writer if secret_writer is not None else _default_secret_writer(settings)
             )
 
             if pin.swappable and successor and not env_pinned and writer is not None:
+                # Validate BEFORE writing: the pin only moves to a model that has
+                # just answered a turn with the same key the runtime will use.
+                failure = await smoke_fn(
+                    provider=pin.provider, api_key=keys[pin.provider], model_id=successor
+                )
+                if failure is not None:
+                    logger.warning(
+                        "model_currency_smoke_failed setting=%s candidate=%s reason=%s",
+                        pin.setting,
+                        successor,
+                        failure,
+                    )
+                    alerts.append(
+                        f"{pin.setting} = '{model_id}' retired; successor '{successor}' found "
+                        f"but failed a smoke turn ({failure}) — not swapped"
+                    )
+                    continue
+                swapped_at = now if isinstance(now, datetime) else datetime.now(UTC)
+                swap_record = {
+                    "at": swapped_at.isoformat(),
+                    "setting": pin.setting,
+                    "from": model_id,
+                    "to": successor,
+                }
                 try:
-                    await writer.apply({pin.blob_key: successor})
+                    await writer.apply(
+                        {pin.blob_key: successor, LAST_SWAP_BLOB_KEY: json.dumps(swap_record)}
+                    )
                 except Exception as exc:  # noqa: BLE001 — a failed write alerts, not crashes
                     logger.warning(
                         "model_currency_secret_write_failed error=%s", type(exc).__name__
@@ -498,8 +663,8 @@ async def run_model_currency_check(
                         body=(
                             f"The pinned model for {pin.setting} — '{model_id}' — is no "
                             f"longer offered by {pin.provider}. The platform swapped it to "
-                            f"the newest same-family model, '{successor}', wrote it to the "
-                            "platform secret, "
+                            f"the newest same-family model, '{successor}', after it answered "
+                            "a smoke turn, wrote it to the platform secret, "
                             + (
                                 "and restarted the app services."
                                 if restart_note == "restarted"
@@ -508,7 +673,9 @@ async def run_model_currency_check(
                             )
                             + "\n\nNo action is required; review the choice at your leisure. "
                             "The pin is never changed while it still exists — this happens "
-                            "only on a provider retirement (§3.4.3)."
+                            "only on a provider retirement (§3.4.3). Every account sees a "
+                            "'model updated' notice on its next login and receives it by "
+                            "email once, from the billing_notices sweep."
                         ),
                     )
                 swapped.append({"setting": pin.setting, "old": model_id, "new": successor})
@@ -516,13 +683,16 @@ async def run_model_currency_check(
 
             reason = (
                 "the embedding model is never auto-swapped (stored vectors are "
-                "model-specific — re-embedding is a migration)"
+                "model-specific). To move: set LUCIEL_KNOWLEDGE_EMBEDDING_MODEL, redeploy, "
+                "and the knowledge_sync sweep handles the re-embedding of every tenant's "
+                "chunks whose recorded embedding_model differs, in bounded batches (F121)"
                 if not pin.swappable
                 else "pinned by env var, which outranks the platform secret"
                 if env_pinned
                 else "the provider's model list is unavailable to resolve a successor"
                 if pin.swappable and listing is None
-                else "no same-family successor exists at the provider"
+                else "no same-family successor at least as new as the retired pin exists "
+                "at the provider (an older sibling is never a swap target)"
                 if successor is None
                 else "no platform-secret writer is configured in this environment"
             )

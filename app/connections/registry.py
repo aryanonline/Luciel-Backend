@@ -645,6 +645,10 @@ def secret_material_expected(provider: str, auth_class: str) -> bool:
       the Twilio credential fallback always stores material too.
     - Unregistered provider: fall back on auth_class alone.
     """
+    if canonical_provider(provider) == "website_crawl":
+        # An httpx fetch target, not an account: there is no credential to lose
+        # (2026-09-05 audit F104 — the probe false-errored every crawl connection).
+        return False
     spec = get_provider(provider)
     if spec is not None:
         if spec.auth_kind == AUTH_PROVISIONED:

@@ -24,7 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.billing import metering
 from app.channels.base import InboundMessage
 from app.models.instance import Instance, channel_enabled, is_paused
-from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
+from app.runtime.knowledge_retrieval import (
+    make_chunk_attributor,
+    make_retriever,
+    make_retriever_bundle,
+)
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import (
@@ -177,9 +181,14 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         router=build_llm_router(admin_id=msg.admin_id),
         retriever=retriever,
         chunk_attributor=chunk_attributor,
+        retriever_bundle=make_retriever_bundle(
+            session, admin_id=msg.admin_id, instance_id=msg.instance_id
+        ),
         admin_id=msg.admin_id,
         instance_id=msg.instance_id,
         enabled_channels=effective.enabled_channels,
+        # The source the inbound edge rate-limits this sender under (F086).
+        abuse_source=(msg.channel, msg.customer_identifier or ""),
         # `business` above is inst.name (the Luciel's own name) -- never pass it as
         # business_name for the disclosure backstop; use _disclosure_business_name.
         business_name=disclosure_business_name(inst),

@@ -22,6 +22,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # Widening the scope is as consequential as narrowing it, so both are audited.
         "knowledge_source_scope_changed",
         "escalation_fired",
+        # The fallback model answered a turn (2026-09-05 audit F132): recorded so an
+        # outage on the primary is visible to the owner, never a silent quality drop.
+        "llm_fallback_used",
         "escalation_notification_sent",
         "escalation_delivery_failed",
         "escalation_acked",

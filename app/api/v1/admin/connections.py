@@ -858,6 +858,13 @@ async def complete_oauth_connect(
     if state_rejected is not None:
         raise OAuthStateRejected(state_rejected)
 
+    # The row's own secret pointer (F092): knowledge connections each hold one; every
+    # other type still resolves to the per-type convention through the fallback.
+    async with tenant_session(admin_id) as s_ref:
+        row_secret_ref = (
+            await _tenant_connection(s_ref, admin_id, connection_id)
+        ).secret_ref or None
+
     authorize = spec.authorize
     verifier = (
         oauth_flow.verifier_for_jti(expected_jti)
@@ -893,6 +900,7 @@ async def complete_oauth_connect(
             material=material,
             connection_type=connection_type,
             staged=True,
+            secret_ref=row_secret_ref,
         )
 
         # §3.1.6a "connect, VERIFY, bind, then live": providers with a registered
@@ -909,6 +917,7 @@ async def complete_oauth_connect(
                     admin_id=admin_id,
                     instance_id=instance_id,
                     connection_type=connection_type,
+                    secret_ref=row_secret_ref,
                 )
                 await _fail_exchange(
                     admin_id, connection_id, actor_user_id, pending_provider, str(exc)
@@ -956,6 +965,7 @@ async def complete_oauth_connect(
                 admin_id=admin_id,
                 instance_id=instance_id,
                 connection_type=connection_type,
+                secret_ref=row_secret_ref,
             )
             if pending_provider is not None:
                 # A swap completes through confirm_reconnect — the ONLY place a staged

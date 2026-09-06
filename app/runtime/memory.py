@@ -29,6 +29,7 @@ unsupported facts by construction.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -136,7 +137,53 @@ def summarize(history: list[Transcript]) -> str:
     # Truncate to keep the persisted summary bounded (one-line cognition summary).
     intent = (intent[:160] + "…") if len(intent) > 160 else intent
     last_action = (last_action[:160] + "…") if len(last_action) > 160 else last_action
-    return f"Intent: {intent} | Last response: {last_action} | Turns: {len(history)}"
+    summary = f"Intent: {intent} | Last response: {last_action} | Turns: {len(history)}"
+    # Key facts the lead volunteered (§3.4.7 "key facts"), lifted from THEIR turns only
+    # — a number Luciel quoted is not a fact about the lead. Deterministic and
+    # transcript-bound, so the cross-session memory can say "you mentioned a $5k
+    # budget last time" without inventing it (2026-09-05 audit).
+    facts = _key_facts(" ".join(lead_msgs))
+    if facts:
+        summary += " | Facts: " + "; ".join(facts)
+    handled_by_person = any(t.role == "human_agent" for t in history)
+    if handled_by_person:
+        summary += " | A person joined this conversation"
+    return summary[:600]
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"(?<![\w.])(\+?\d[\d\s().-]{7,}\d)(?![\w.])")
+_MONEY_RE = re.compile(
+    r"(?:\$|£|€)\s?\d[\d,]*(?:\.\d+)?(?:\s?[kK])?"
+    r"|\b\d[\d,]*\s?(?:k|K)\b(?=\s*(?:budget|dollars|usd|cad))"
+)
+_WHEN_RE = re.compile(
+    r"\b(today|tomorrow|tonight|this (?:week|weekend|month)"
+    r"|next (?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|(?:mon|tues|wednes|thurs|fri|satur|sun)day|\d{1,2}(?::\d{2})?\s?(?:am|pm))\b",
+    re.IGNORECASE,
+)
+
+
+def _key_facts(text: str) -> list[str]:
+    facts: list[str] = []
+    seen: set[str] = set()
+
+    def add(label: str, values: list[str], cap: int = 2) -> None:
+        for v in values:
+            key = f"{label}:{v.strip().lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append(f"{label} {v.strip()}")
+            if sum(1 for f in facts if f.startswith(label)) >= cap:
+                break
+
+    add("email", _EMAIL_RE.findall(text), cap=1)
+    add("phone", [m for m in _PHONE_RE.findall(text) if sum(ch.isdigit() for ch in m) >= 8], cap=1)
+    add("budget", _MONEY_RE.findall(text))
+    add("timing", _WHEN_RE.findall(text))
+    return facts[:5]
 
 
 async def persist_summary(

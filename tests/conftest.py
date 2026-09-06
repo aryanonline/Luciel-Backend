@@ -210,6 +210,10 @@ async def assert_no_bypass() -> None:
         ).one()
         assert row.rolsuper is False, "app role must NOT be superuser (RLS would be bypassed)"
         assert row.rolbypassrls is False, "app role must NOT have BYPASSRLS"
+        member = (
+            await conn.execute(text("SELECT pg_has_role(current_user, 'luciel_auth', 'MEMBER')"))
+        ).scalar_one()
+        assert member is False, "app role must NOT be able to SET ROLE to the BYPASSRLS role (F085)"
 
 
 @pytest_asyncio.fixture

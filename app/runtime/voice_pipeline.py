@@ -284,6 +284,7 @@ async def handle_turn(
         admin_id=admin_id,
         instance_id=instance_id,
         enabled_channels=effective.enabled_channels,
+        abuse_source=("voice", from_number),
         business_name=disclosure_business_name(instance),
         assistant_name=assistant,
         business_context=effective.business_context,

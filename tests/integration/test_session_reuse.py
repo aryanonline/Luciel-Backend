@@ -35,7 +35,20 @@ async def _seed(admin_id: uuid.UUID, instance_id: uuid.UUID) -> None:
                 admin_id=admin_id,
                 name="Acme Patios",
                 state=LucielState.active,
-                channels=[{"id": "widget", "enabled": True}, {"id": "sms", "enabled": True}],
+                # Every channel this file drives is switched ON: a switched-off channel
+                # admits no new conversation (tests/unit/test_channel_enabled_gate.py).
+                channels=[
+                    {"id": c, "enabled": True}
+                    for c in (
+                        "widget",
+                        "sms",
+                        "email",
+                        "whatsapp",
+                        "messenger",
+                        "instagram",
+                        "voice",
+                    )
+                ],
             )
         )
         await s.flush()

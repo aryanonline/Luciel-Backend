@@ -46,9 +46,35 @@ class RemoteItem:
 
 @dataclass
 class RemoteSnapshot:
-    """What a provider reports for the connected scope at a point in time."""
+    """What a provider reports for the connected scope at a point in time.
+
+    ``failed_ids`` — items the provider KNOWS exist but could not read this pass (a
+    page that timed out, a file whose download failed). The sync keeps their sources
+    and flags them, instead of reading "absent" and retiring them (2026-09-05 audit
+    F117: a partial crawl used to delete every page it did not reach).
+    """
 
     items: list[RemoteItem] = field(default_factory=list)
+    failed_ids: list[str] = field(default_factory=list)
+
+
+class SnapshotShrunk(Exception):
+    """The provider reported far fewer items than are synced (2026-09-05 audit F107).
+
+    An empty listing from a revoked scope, a provider outage answering 200 with
+    nothing, or an owner who moved a folder used to be read as "everything was
+    deleted at the source" — and the sync retired every source. Nothing is deleted
+    on a shrink; the sources are flagged and the owner confirms an intentional one
+    (``allow_shrink``)."""
+
+    def __init__(self, *, existing: int, remote: int) -> None:
+        super().__init__(f"source reports {remote} items where {existing} are synced")
+        self.existing = existing
+        self.remote = remote
+
+
+#: Below this fraction of the synced count, a snapshot is a shrink, not a diff.
+SHRINK_FLOOR = 0.5
 
 
 class SyncProvider(Protocol):
@@ -78,16 +104,23 @@ async def sync_connection(
     connection_id: uuid.UUID,
     origin: str,
     provider: SyncProvider,
+    allow_shrink: bool = False,
 ) -> SyncResult:
     """Reconcile knowledge_sources for one synced connection against the provider.
 
     Incremental by external_id + revision: new items are ingested, changed items
     re-ingested (chunks replaced), and items no longer present at the source are
     removed — so Luciel stops answering from deleted/out-of-scope content (§3.2.3).
+
+    A snapshot that would retire more than half of what is synced is refused
+    (``SnapshotShrunk``) unless ``allow_shrink`` says the owner confirmed it (F107);
+    items the provider could not read this pass (``failed_ids``) are kept and
+    flagged, never retired (F117).
     """
     result = SyncResult()
     snapshot = await provider.snapshot(connection_id)
     remote_by_id = {item.external_id: item for item in snapshot.items}
+    failed_ids = set(snapshot.failed_ids)
 
     # Existing synced sources for this connection.
     existing = (
@@ -104,6 +137,35 @@ async def sync_connection(
         .all()
     )
     existing_by_ext = {s.external_id: s for s in existing if s.external_id}
+
+    # Floor guard (F107): a listing that lost more than half of what is synced — or
+    # everything — is treated as a broken read, not a mass deletion. Nothing is
+    # touched; the sources read "error" until the owner re-syncs with confirmation.
+    survivors = len([e for e in existing_by_ext if e in remote_by_id or e in failed_ids])
+    if existing_by_ext and not allow_shrink and survivors < SHRINK_FLOOR * len(existing_by_ext):
+        # The refusal is durable evidence for the owner (the rows read 'error', the
+        # audit row says why), so it is written in its OWN transaction: the caller's
+        # session unwinds with the exception and must not take the evidence with it.
+        from app.db.session import tenant_session  # noqa: PLC0415 — avoids a db↔knowledge cycle
+
+        async with tenant_session(admin_id) as evidence:
+            await mark_sync_error(evidence, admin_id=admin_id, connection_id=connection_id)
+            await audit.emit(
+                evidence,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                actor_type=ActorType.platform,
+                event_type="knowledge_source_edited",
+                payload={
+                    "action": "sync_refused_shrink",
+                    "connection_id": str(connection_id),
+                    "origin": origin,
+                    "synced": len(existing_by_ext),
+                    "reported": len(remote_by_id),
+                    "unreadable": len(failed_ids),
+                },
+            )
+        raise SnapshotShrunk(existing=len(existing_by_ext), remote=len(remote_by_id))
 
     # Additions + updates.
     for ext_id, item in remote_by_id.items():
@@ -147,6 +209,7 @@ async def sync_connection(
                         ordinal=ordinal,
                         text=c,
                         embedding=vec,
+                        embedding_model=get_embedder().model_name,
                     )
                 )
             prior.name = item.name
@@ -157,9 +220,16 @@ async def sync_connection(
             result.updated.append(ext_id)
         else:
             prior.last_synced_at = datetime.now(UTC)
+            # A source that read "error" / "paused" and now syncs cleanly is synced
+            # again (2026-09-05 audit F108): the flag used to outlive the failure.
+            prior.sync_status = "synced"
 
     # Deletions: items present locally but gone from the source (§3.2.3 safety).
+    # Unreadable-this-pass items (F117) are kept and flagged, never retired.
     for ext_id, src in existing_by_ext.items():
+        if ext_id in failed_ids:
+            src.sync_status = "error"
+            continue
         if ext_id not in remote_by_id:
             await service.delete_source(session, admin_id, src.id)
             result.removed.append(ext_id)

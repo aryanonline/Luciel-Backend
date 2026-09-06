@@ -84,7 +84,13 @@ def _body(err: ApiError) -> dict[str, object]:
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=_body(exc))
+        headers = (
+            # A 429 carries its wait on the wire too (RFC 9110), not only in the body.
+            {"Retry-After": str(exc.retry_after_seconds)}
+            if exc.retry_after_seconds is not None
+            else None
+        )
+        return JSONResponse(status_code=exc.status_code, content=_body(exc), headers=headers)
 
     # Axis10-F02: FastAPI's native RequestValidationError emits a 422 with a
     # ``{"detail": [...]}`` body, which does NOT match the wire error contract

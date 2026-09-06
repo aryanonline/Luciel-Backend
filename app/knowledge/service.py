@@ -110,6 +110,7 @@ async def ingest_text(
                     ordinal=ordinal,
                     text=chunk,
                     embedding=vec,
+                    embedding_model=embedder.model_name,
                 )
             )
     # --- Graph extraction at ingest (§3.2.1) ----------------------------------- #
@@ -607,6 +608,7 @@ async def replace_source(
                     ordinal=ordinal,
                     text=chunk,
                     embedding=vec,
+                    embedding_model=embedder.model_name,
                 )
             )
     await _store_graph(
@@ -721,3 +723,37 @@ def _rerank(
         return (band, -recency, chunk.ordinal, dist)
 
     return sorted(candidates, key=sort_key)
+
+
+async def reembed_outdated_chunks(
+    session: AsyncSession, *, admin_id: uuid.UUID, limit: int = 200
+) -> int:
+    """Re-embed chunks whose vectors came from a model other than the current pin
+    (2026-09-05 audit F121). Bounded per pass so a model change re-embeds a tenant's
+    knowledge over a few sweeps instead of one unbounded transaction. Returns the
+    number of chunks rewritten."""
+    embedder = get_embedder()
+    current = embedder.model_name
+    rows = (
+        (
+            await session.execute(
+                select(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.admin_id == admin_id,
+                    KnowledgeChunk.embedding_model.is_distinct_from(current),
+                )
+                .order_by(KnowledgeChunk.source_id, KnowledgeChunk.ordinal)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+    vectors = await embedder.embed([r.text for r in rows])
+    for row, vec in zip(rows, vectors, strict=True):
+        row.embedding = vec
+        row.embedding_model = current
+    await session.flush()
+    return len(rows)

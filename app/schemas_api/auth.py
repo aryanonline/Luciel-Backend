@@ -25,7 +25,7 @@ class AccountOut(WireModel):
     has_luciel: bool
 
 
-AccountNoticeKind = Literal["allowance_reduction", "price_change", "terms_change"]
+AccountNoticeKind = Literal["allowance_reduction", "price_change", "terms_change", "model_updated"]
 
 
 class AccountNoticeOut(WireModel):

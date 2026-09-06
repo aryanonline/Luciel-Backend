@@ -18,10 +18,19 @@ EMBED_DIM = 1536
 
 
 class Embedder(Protocol):
+    @property
+    def model_name(self) -> str:
+        """Which model produced the vectors (2026-09-05 audit F121); recorded per chunk
+        so a pin change knows what to re-embed."""
+        ...
+
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class HashingEmbedder:
+    #: Hashed vectors belong to no real model; the name says so, and a pin change
+    #: therefore never triggers a re-embed of mock-posture rows.
+    model_name: str = "hashing-mock"
     """Deterministic, dependency-free embedder for dev/test.
 
     Maps token hashes into a fixed-dim vector (a bag-of-hashed-tokens), then

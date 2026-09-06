@@ -90,9 +90,32 @@ _NEGATIVE_WORDS = {
 }
 
 
+# "Are you a human?" asks WHAT Luciel is; it does not ask FOR a human (2026-09-05
+# audit F118). The disclosure answers it — handing the whole conversation to the
+# owner because a visitor was curious made Luciel look evasive and cost a takeover.
+_ASKS_WHAT_LUCIEL_IS = re.compile(
+    r"\b(are|is|r) (you|u|this|that) (a |an )?"
+    r"(human|real person|person|bot|robot|ai|machine|computer)\b"
+    r"|\bam i (talking|speaking|chatting|texting) (to|with) a "
+    r"(human|real person|person|bot|robot|machine)\b"
+    r"|\b(is this|are you) (an? )?(ai|automated|real)\b",
+    re.IGNORECASE,
+)
+_ASKS_FOR_HUMAN = re.compile(
+    r"\b(speak|talk|connect|transfer|put me|get me)\b.{0,20}"
+    r"\b(human|person|someone|representative|agent|real)\b"
+    r"|\bi (want|need|would like) (a|an|to speak to a|to talk to a) "
+    r"(human|person|real person|agent)\b",
+    re.IGNORECASE,
+)
+
+
 def classify_request_human(text: str) -> float:
     """Return confidence in [0,1] that the message requests a human."""
-    return 0.9 if _HUMAN_PATTERNS.search(text or "") else 0.0
+    body = text or ""
+    if _ASKS_WHAT_LUCIEL_IS.search(body) and not _ASKS_FOR_HUMAN.search(body):
+        return 0.0
+    return 0.9 if _HUMAN_PATTERNS.search(body) else 0.0
 
 
 # Conversational (social) turns: greetings, thanks, declines, acknowledgments,
@@ -200,9 +223,15 @@ def sentiment_score(text: str) -> float:
     return max(-1.0, -0.4 - 0.3 * neg)
 
 
-def high_value_lead_score(text: str, custom_rules_hit: bool = False) -> float:
-    """Domain-agnostic heuristic (Architecture §3.4.5 weights), capped at 1.0."""
-    t = (text or "").lower()
+def high_value_lead_score(text: str, custom_rules_hit: bool = False, context: str = "") -> float:
+    """Domain-agnostic heuristic (Architecture §3.4.5 weights), capped at 1.0.
+
+    Scored over the message AND the conversation so far (``context``, the lead's
+    recent turns — 2026-09-05 audit F106): the flagship scene is a budget stated in
+    one turn and "can we start this week?" in the next, which no single message ever
+    scored above the line.
+    """
+    t = f"{context or ''} {text or ''}".lower()
     score = 0.0
     # explicit budget figure
     if re.search(
@@ -244,6 +273,7 @@ def evaluate_outcome(
     grounding_score: float,
     custom_rules_hit: bool = False,
     resolving_tool_succeeded: bool = False,
+    context: str = "",
 ) -> EscalationDecision:
     """Gate 2 — signals that need the loop's output (post-REFLECT).
 
@@ -270,7 +300,7 @@ def evaluate_outcome(
     # message ("$5000 budget, want to book today") deserves urgent human follow-up
     # regardless of how well-grounded the reply happened to be — masking that behind
     # a grounding failure would bury the more business-critical signal.
-    lead_score = high_value_lead_score(message, custom_rules_hit)
+    lead_score = high_value_lead_score(message, custom_rules_hit, context=context)
     if lead_score >= 0.5:
         return EscalationDecision(True, Signal.high_value_lead, Gate.outcome, lead_score)
 

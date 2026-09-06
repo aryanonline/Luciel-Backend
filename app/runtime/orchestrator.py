@@ -46,6 +46,7 @@ and the production retriever binds behind the same signature.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -72,10 +73,12 @@ from app.runtime.escalation import (
     Signal,
     evaluate_intake,
     evaluate_outcome,
+    is_conversational_turn,
     is_repeated_question,
 )
 from app.runtime.grounding import faithful_readback_ok, score_grounding
 from app.runtime.input_safety import (
+    ModerationCategory,
     build_system_prompt,
     detect_injection,
     ensure_ai_identity_disclosure,
@@ -83,6 +86,7 @@ from app.runtime.input_safety import (
     pre_send_check,
     wrap_untrusted,
 )
+from app.runtime.knowledge_retrieval import RetrieverBundle
 from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
 from app.tools import contract as tool_contract
@@ -103,6 +107,8 @@ ASK_ATTEMPT_BOUND = 2
 TOOL_RESULT_CONTENT_CAP = 2000
 AMBIGUOUS_CANDIDATE_CAP = 5
 
+_LOG = logging.getLogger(__name__)
+
 # Conservative success-claim detector (§3.3.4 rule 1 backstop): verbs a reply may not
 # use about an ACTION tool when no action returned `ok` this turn.
 _SUCCESS_CLAIM = re.compile(
@@ -110,6 +116,57 @@ _SUCCESS_CLAIM = re.compile(
     r"added to (?:the|your) calendar|updated your)\b",
     re.IGNORECASE,
 )
+
+# The same guard for a turn in which NO action tool ran at all (2026-09-05 audit
+# F110): first-person claims only, so a knowledge answer that merely contains the
+# word "confirmed" ("orders are confirmed by email") is left alone.
+_FIRST_PERSON_SUCCESS_CLAIM = re.compile(
+    r"\b(i'?ve|i have|we'?ve|we have|i|we|it'?s been|it has been|has been|have been"
+    r"|is now|are now)\b"
+    r"[^.!?]{0,30}?"
+    r"\b(booked|scheduled|rescheduled|cancelled|canceled|sent|delivered"
+    r"|added to (?:the|your) calendar|updated your)\b",
+    re.IGNORECASE,
+)
+
+
+def is_clarifying_question(text: str) -> bool:
+    """A single short question with no assertion in it — the one ungrounded draft that
+    is honest to send, because it claims nothing (F100)."""
+    body = (text or "").strip()
+    if not body.endswith("?") or len(body) > 160:
+        return False
+    return sum(body.count(ch) for ch in ".!?") == 1
+
+
+#: Tools whose ``ok`` result the reply READS BACK — a booking, a free/busy answer, a
+#: record lookup — and that therefore ground it (2026-09-05 audit F119). A CRM push or
+#: a queued callback succeeding says nothing about whether the words are true.
+ANSWER_BEARING_TOOLS = frozenset(
+    {
+        "check_availability",
+        "book_appointment",
+        "reschedule_appointment",
+        "cancel_appointment",
+        "lookup_record",
+    }
+)
+
+#: Compassion first, honesty second, a person third (2026-09-05 audit F116). No
+#: contact ask is appended: the person in distress is not asked for a phone number.
+SELF_HARM_REPLY = (
+    "I'm really sorry you're going through this. If you're in immediate danger, please "
+    "contact your local emergency number right now — in Canada and the US you can call "
+    "or text 988 to reach a crisis line, any time. I've also let the team here know so a "
+    "person can follow up with you."
+)
+
+#: Honest offers when the arbiter (§3.4.2) would rather answer on another channel
+#: (2026-09-05 audit F060): nothing is sent on that channel without the lead's say-so.
+_CHANNEL_OFFER = {
+    "email": " If you'd like the full details by email, just share your email address.",
+    "sms": " I can also text you a short version if you share your mobile number.",
+}
 
 # Honest replacement when the model claimed an action that did not happen (C4). The
 # copy follows the escalation-honesty doctrine: passed to the team, never "connecting".
@@ -381,6 +438,10 @@ class Orchestrator:
     # (e.g. voice, or a test's bare fake retriever) -- source_chunks is then
     # persisted as None (attribution_unavailable), never fabricated.
     chunk_attributor: ChunkAttributor | None = None
+    # Single-pass retrieval (cost, 2026-09-05 audit): when bound, ONE vector query
+    # yields both the prompt snippets and the attribution; ``retriever`` and
+    # ``chunk_attributor`` are then not called. Unbound → the two-seam path above.
+    retriever_bundle: RetrieverBundle | None = None
     # Admin-provided 280-char business-context (Vision §3.5). Composed into the system
     # prompt UNDER the platform-invariant stanzas via Defense 6 (§3.4.14) so it can
     # tune tone/facts but cannot override AI-identity disclosure, grounding, the
@@ -409,6 +470,10 @@ class Orchestrator:
     # tools are not wired (the default in Arc 14). A None resolution yields a `failed`
     # outcome so the loop reasons about it uniformly (§3.4.1).
     tool_resolver: ToolResolver | None = None
+    # (channel, source id) the inbound edge rate-limits this turn under, so a detected
+    # prompt injection counts toward that source's auto-block (2026-09-05 audit F086).
+    # None where no source is known (tests, internal callers) — then it only audits.
+    abuse_source: tuple[str, str] | None = None
     # §3.8.7 rule E (Decision #39): the CAPABILITY set of tools enabled when THIS
     # conversation began, taken from the session's config_snapshot. A tool enabled
     # AFTER open is an additive change that must apply to the NEXT conversation, not
@@ -583,6 +648,16 @@ class Orchestrator:
         mod = moderate(inbound_text)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
+            if mod.category is ModerationCategory.self_harm:
+                # Immediate escalation with crisis copy; no contact ask (F116).
+                ack = SELF_HARM_REPLY
+            else:
+                ack = self._with_contact_ask(
+                    await self._handoff_ack(),
+                    channel=channel,
+                    resolved_lead_id=resolved_lead_id,
+                    transport_identifier=transport_identifier,
+                )
             return await self._hand_off_with_ack(
                 session_id=session_id,
                 resolved_lead_id=resolved_lead_id,
@@ -590,12 +665,7 @@ class Orchestrator:
                 signal=Signal.explicit_human_request,
                 gate="intake",
                 score=None,
-                ack=self._with_contact_ask(
-                    await self._handoff_ack(),
-                    channel=channel,
-                    resolved_lead_id=resolved_lead_id,
-                    transport_identifier=transport_identifier,
-                ),
+                ack=ack,
             )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -625,8 +695,6 @@ class Orchestrator:
             )
 
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
-        raw_chunks = await self.retriever(inbound_text)
-        wrapped_chunks = [wrap_untrusted(c) for c in raw_chunks]
         # Harmony wave 2, item 2a: real chunk attribution for persistence, kept
         # separate from `raw_chunks` (which only ever feeds the model/scorer).
         # None when this construction site has no attribution source bound (voice,
@@ -634,8 +702,13 @@ class Orchestrator:
         # fabricated. When bound, an empty list here is a REAL "retrieval found
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
-        if self.chunk_attributor is not None:
-            attributed_chunks = await self.chunk_attributor(inbound_text)
+        if self.retriever_bundle is not None:
+            raw_chunks, attributed_chunks = await self.retriever_bundle(inbound_text)
+        else:
+            raw_chunks = await self.retriever(inbound_text)
+            if self.chunk_attributor is not None:
+                attributed_chunks = await self.chunk_attributor(inbound_text)
+        wrapped_chunks = [wrap_untrusted(c) for c in raw_chunks]
 
         # --- CROSS-SESSION MEMORY (§3.4.6) ----------------------------------- #
         # Prior-session SUMMARIES for this lead (never full transcripts, §3.4.8) —
@@ -682,6 +755,19 @@ class Orchestrator:
             session_id=session_id,
         )
 
+        if used_fallback:
+            # The fallback model answered (F132): visible in the owner's audit trail and
+            # the data-plane log, never a silent quality drop. Once per turn is the honest
+            # grain — an outage that lasts a conversation shows as that many rows.
+            _LOG.warning("llm_fallback_used session=%s", session_id)
+            await audit.emit(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="llm_fallback_used",
+                actor_type=ActorType.luciel_runtime,
+                payload={"session_id": str(session_id), "channel": channel},
+            )
         if llm_failed:
             # Both providers down → llm_unavailable escalation (§3.4.5 server signal).
             await self._emit_llm_unavailable(session_id, resolved_lead_id)
@@ -777,7 +863,13 @@ class Orchestrator:
                 sess_obj.input_ask_attempts = 0
 
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
-        tool_succeeded = any(o == "ok" for o in resp.tool_outcomes)
+        # Only an ANSWER-BEARING tool grounds the words (F119): a CRM push or a queued
+        # callback succeeding is not evidence the reply's facts are true.
+        tool_succeeded = any(
+            str(call.get("tool_id", "")) in ANSWER_BEARING_TOOLS
+            and r.outcome is tool_contract.Outcome.ok
+            for call, r in resp.dispatched
+        )
         grounding = score_grounding(resp.text, raw_chunks, tool_succeeded)
 
         # --- ESCALATION GATE 2 — OUTCOME (§3.4.5) ---------------------------- #
@@ -786,6 +878,9 @@ class Orchestrator:
             plan_confidence=resp.confidence,
             grounding_score=grounding.score,
             resolving_tool_succeeded=tool_succeeded,
+            # The lead's recent turns (F106): a budget in one message and "this week"
+            # in the next is one hot lead, not two lukewarm messages.
+            context=" ".join(trailing[-5:]),
         )
         escalation: EscalationDecision | None = None
         if outcome.fired:
@@ -819,16 +914,32 @@ class Orchestrator:
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
         reply_text = pre_send_check(resp.text)
+        if (
+            escalation is not None
+            and escalation.signal is Signal.cannot_answer
+            and not is_clarifying_question(reply_text)
+        ):
+            # Below the grounding floor the draft is a guess (2026-09-05 audit F100):
+            # it used to ship anyway with "I've flagged this" appended, so the
+            # visitor got a confident wrong answer AND a hand-off. An employee who
+            # does not know says so and gets a person — the draft never leaves. A
+            # bare clarifying question ("what's your email?") asserts nothing and
+            # still goes out.
+            reply_text = await self._handoff_ack()
 
         # --- FAITHFUL READBACK ENFORCEMENT (§3.3.4 rule 1 / §3.4.13, C4) ------ #
         action_results = [
             (call, r) for call, r in resp.dispatched if str(call.get("tool_id", "")) in ACTION_TOOLS
         ]
         ok_actions = [(c_, r) for c_, r in action_results if r.outcome is tool_contract.Outcome.ok]
-        if action_results and not ok_actions and _SUCCESS_CLAIM.search(reply_text):
-            # The model claimed an action no tool confirmed — replace with the honest
-            # failure ack and make sure a human is flagged (dedupe-suppressed like any
-            # other cannot_answer repeat).
+        claimed_without_action = (
+            action_results and not ok_actions and _SUCCESS_CLAIM.search(reply_text)
+        ) or (not action_results and _FIRST_PERSON_SUCCESS_CLAIM.search(reply_text))
+        if claimed_without_action:
+            # The model claimed an action no tool confirmed — attempted-and-failed, or
+            # never attempted at all (F110) — replace with the honest failure ack and
+            # make sure a human is flagged (dedupe-suppressed like any other
+            # cannot_answer repeat).
             reply_text = _UNFOUNDED_CLAIM_REPLACEMENT
             if escalation is None:
                 escalation = EscalationDecision(True, Signal.cannot_answer, None, None)
@@ -886,6 +997,11 @@ class Orchestrator:
             response_length=len(reply_text),
             is_urgent_escalation=outcome.fired,
         )
+        if outbound != channel and escalation is None and outbound in _CHANNEL_OFFER:
+            # The arbiter would rather answer elsewhere (a long answer on SMS, §3.4.2).
+            # Nothing is sent on that channel uninvited (F060): the reply stays on the
+            # channel the lead wrote on and OFFERS the switch.
+            reply_text = reply_text.rstrip() + _CHANNEL_OFFER[outbound]
         reply_row = await persist_turn(
             self.session,
             admin_id=admin_id,
@@ -960,7 +1076,30 @@ class Orchestrator:
         if self.snapshot_tool_ids is not None:
             enabled &= self.snapshot_tool_ids
         enabled = {tid for tid in enabled if self.tool_resolver(tid) is not None}
+        # A tool whose provider is not CONNECTED (or whose channel is off) is not
+        # described to the model at all (2026-09-05 audit): the broker would refuse the
+        # call anyway, but a model that was told it could book will promise to book.
+        enabled = {tid for tid in enabled if await self._tool_operable(tid)}
         return build_tool_defs(enabled) if enabled else None
+
+    async def _tool_operable(self, tool_id: str) -> bool:
+        from app.connections import gate  # noqa: PLC0415
+        from app.tools import catalog  # noqa: PLC0415
+
+        connection_type = catalog.TOOL_CONNECTION_TYPE.get(tool_id)
+        if connection_type is not None:
+            status = await gate.connection_status(
+                self.session,
+                admin_id=self.admin_id,
+                instance_id=self.instance_id,
+                connection_type=connection_type,
+            )
+            if status != "connected":
+                return False
+        needs_channel = {"send_email": "email", "send_sms": "sms"}.get(tool_id)
+        if needs_channel is not None and self.enabled_channels:
+            return needs_channel in self.enabled_channels
+        return True
 
     @staticmethod
     def _tool_result_feedback(call: dict[str, Any], result: ToolResult) -> str:
@@ -1049,7 +1188,12 @@ class Orchestrator:
         for _ in range(MAX_ITERATIONS):
             iterations += 1
             try:
-                resp = await self.router.complete(prompt, messages, tools=tool_defs)
+                resp = await self.router.complete(
+                    prompt,
+                    messages,
+                    tools=tool_defs,
+                    **routing_hints(inbound_text, prompt, messages, tool_defs),
+                )
             except ProviderError:
                 # Router already failed primary→fallback; a ProviderError here means
                 # BOTH providers are down (§3.4.3 immediate failover, no retry).
@@ -1316,6 +1460,37 @@ class Orchestrator:
             actor_type=ActorType.luciel_runtime,
             payload={"session_id": str(session_id)},
         )
+        # The detection is monitoring-only for THIS turn (§3.4.14), but a source that
+        # keeps probing is abuse: it feeds the same per-source auto-block a flood does
+        # (F086), so the fiftieth attempt is refused at the edge, before any LLM call.
+        if self.abuse_source is not None:
+            from app.channels import rate_limit  # noqa: PLC0415
+
+            channel, source_id = self.abuse_source
+            rate_limit.get_store().record_abuse(channel, source_id)
+
+
+def routing_hints(
+    inbound_text: str,
+    prompt: str,
+    messages: list[dict[str, Any]],
+    tool_defs: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """The fast/cheap routing hints for one model call (§3.4.3 / §7 #9).
+
+    The router's gate needs all three — no tools, a small context, low complexity —
+    and the orchestrator never passed any, so the bound fast provider was dead weight
+    (cost, 2026-09-05 audit). A social turn (thanks / goodbye / a bare greeting) has
+    no factual claim to ground and nothing for a tool to do: that is the honest fast
+    lane. Everything else keeps the primary model.
+    """
+    social = is_conversational_turn(inbound_text)
+    chars = len(prompt) + sum(len(str(m.get("content", ""))) for m in messages)
+    return {
+        "requires_tools": bool(tool_defs) and not social,
+        "context_tokens": chars // 4,
+        "complexity": 0.2 if social else 1.0,
+    }
 
 
 @dataclass

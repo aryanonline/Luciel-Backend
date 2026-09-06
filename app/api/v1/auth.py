@@ -10,11 +10,11 @@ from __future__ import annotations
 import uuid
 
 import jwt
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import select
 
 from app.api.deps import Subject, current_session_subject
-from app.api.errors import unauthorized, validation_error
+from app.api.errors import rate_limited, unauthorized, validation_error
 from app.audit import log as audit
 from app.auth import access
 from app.auth.captcha import verify_captcha
@@ -121,8 +121,25 @@ async def signup(req: SignupRequest) -> SignupResult:
     )
 
 
+def _throttle(bucket: str, key: str, message: str) -> None:
+    """Sign-in / reset throttle (2026-09-05 audit F056/F068): the same per-source
+    token buckets the channels use, keyed per email and per client address. A
+    refusal is a 429 with a wait — never a hint about whether the account exists."""
+    from app.channels import rate_limit  # noqa: PLC0415
+
+    if not rate_limit.get_store().check_source(bucket, key).allowed:
+        raise rate_limited(message, retry_after_seconds=60)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
 @router.post("/login", response_model=SessionOut)
-async def login(req: LoginRequest, response: Response) -> SessionOut:
+async def login(req: LoginRequest, response: Response, request: Request) -> SessionOut:
+    wait = "Too many sign-in attempts. Please wait a minute and try again."
+    _throttle("auth_login_ip", _client_ip(request), wait)
+    _throttle("auth_login_email", req.email.strip().lower(), wait)
     result = await access.login(req.email, req.password)
     if result is None:
         raise unauthorized("Invalid email or password.")
@@ -212,7 +229,10 @@ async def resend_verification(
 
 
 @router.post("/forgot-password", response_model=OkResult)
-async def forgot_password(req: ForgotPasswordRequest) -> OkResult:
+async def forgot_password(req: ForgotPasswordRequest, request: Request) -> OkResult:
+    wait = "Too many reset requests. Please wait a few minutes and try again."
+    _throttle("auth_forgot_ip", _client_ip(request), wait)
+    _throttle("auth_forgot_email", req.email.strip().lower(), wait)
     token = await access.request_reset(req.email)  # non-enumerating
     if token is not None:
         settings = get_settings()

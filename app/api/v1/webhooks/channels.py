@@ -442,6 +442,14 @@ async def ses_inbound(request: Request) -> dict[str, str]:
         sns_message = json.loads(raw or b"{}")
     except ValueError:
         return {"status": "ignored", "reason": "bad_sns_envelope"}
+    settings = get_settings()
+    live = settings.integration_mode == "live"
+    # A signed message from SOMEONE ELSE'S topic is still a valid SNS signature
+    # (2026-09-05 audit F048): pin the receipt-rule topic the way the events route
+    # does, so a stranger cannot feed this tenant inbound mail through their own topic.
+    pinned_topic = settings.ses_inbound_topic_arn
+    if live and pinned_topic and sns_message.get("TopicArn") != pinned_topic:
+        return {"status": "rejected", "reason": "topic_mismatch"}
     # SNS subscription confirmation handshake (one-time, on subscribe). Verified with
     # the SAME verifier as a notification before we act on it: confirming an unverified
     # subscription would let anyone bind this endpoint to a topic they control, which is
@@ -450,7 +458,7 @@ async def ses_inbound(request: Request) -> dict[str, str]:
         verifier = ConfigGatedSnsVerifier()
         if not verifier.verify(sns_message):
             return {"status": "rejected", "reason": "sns_signature_invalid"}
-        confirmed = get_settings().integration_mode == "live" and confirm_subscription(sns_message)
+        confirmed = live and confirm_subscription(sns_message)
         return {"status": "subscription_confirmed" if confirmed else "subscription_acknowledged"}
     req: dict[str, Any] = {
         "sns_message": sns_message,

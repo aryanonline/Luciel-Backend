@@ -41,7 +41,11 @@ from app.models.conversation import Transcript
 from app.models.instance import Instance, is_paused
 from app.runtime import budget, session_close
 from app.runtime.input_safety import _compose_greeting
-from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
+from app.runtime.knowledge_retrieval import (
+    make_chunk_attributor,
+    make_retriever,
+    make_retriever_bundle,
+)
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator, persist_turn
 from app.runtime.provider_factory import build_llm_router
 from app.runtime.sessions import effective_config, find_open_session, resolve_or_open_session
@@ -359,9 +363,15 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             router=build_llm_router(admin_id=ctx.admin_id),
             retriever=retriever,
             chunk_attributor=chunk_attributor,
+            retriever_bundle=make_retriever_bundle(
+                s, admin_id=ctx.admin_id, instance_id=ctx.instance_id
+            ),
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             enabled_channels=effective.enabled_channels,
+            # The bucket this turn was admitted under (F086): injection attempts from
+            # this visitor count toward the same auto-block a flood would.
+            abuse_source=("widget", f"{sess.id}:{_client_ip(request)}"),
             # Names for the first-message AI-identity disclosure backstop (§3.4.16).
             # `business` here is inst.name (the Luciel's own name) -- never pass it as
             # business_name for the disclosure; use _disclosure_business_name (never

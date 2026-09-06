@@ -133,73 +133,133 @@ export class ComputeStack extends Stack {
     // mutate the Security/Data stacks and create a cross-stack dependency CYCLE
     // (Security<->Compute). Role-side policies keep the edges one-directional:
     // Compute depends on Security/Data, never the reverse. (Caught by CDK tests.)
-    // Transcript cold storage (Commitment #38): the archive sweep writes/deletes
-    // JSONL objects and the dashboard/export read them back. grantReadWrite includes
-    // s3:DeleteObject*, which the retention sweep + cascade prefix-delete need.
-    transcriptArchiveBucket.grantReadWrite(taskRole);
-    // Account-export ZIPs (§3.6.6). Without this the live put_object is AccessDenied
-    // and the export the tenant was promised never appears (P1-14).
-    exportBucket.grantReadWrite(taskRole);
-    // Voice reply audio (§3.1.2 <Play>): the data plane uploads each turn's mp3 and
-    // presigns the GET Twilio fetches. The presigned URL is authorized AS this role,
-    // so this grant plus UseCmk (the objects are CMK-encrypted) are what make the
-    // fetch succeed — Twilio itself needs nothing.
-    voiceAudioBucket.grantReadWrite(taskRole);
-    // Original uploaded knowledge files (F016): the app planes write them at upload
-    // and read them into the export; the sweep plane deletes them at source purge /
-    // tenant cascade. grantReadWrite covers all three.
-    knowledgeOriginalsBucket.grantReadWrite(taskRole);
-    taskRole.addToPolicy(
+    // Everything an APP PLANE needs, granted role-side (see the note above) to
+    // whichever role is handed in: the control plane's `taskRole` and the sweeps'
+    // `sweepRole` hold this same set, so RLS and every seam behave identically for
+    // a request and a sweep. The data plane (below) holds a narrower one.
+    const grantAppPlaneAccess = (role: iam.Role) => {
+      // Transcript cold storage (Commitment #38): the archive sweep writes/deletes
+      // JSONL objects and the dashboard/export read them back. grantReadWrite includes
+      // s3:DeleteObject*, which the retention sweep + cascade prefix-delete need.
+      transcriptArchiveBucket.grantReadWrite(role);
+      // Account-export ZIPs (§3.6.6). Without this the live put_object is AccessDenied
+      // and the export the tenant was promised never appears (P1-14).
+      exportBucket.grantReadWrite(role);
+      // Voice reply audio (§3.1.2 <Play>): the data plane uploads each turn's mp3 and
+      // presigns the GET Twilio fetches. The presigned URL is authorized AS this role,
+      // so this grant plus UseCmk (the objects are CMK-encrypted) are what make the
+      // fetch succeed — Twilio itself needs nothing.
+      voiceAudioBucket.grantReadWrite(role);
+      // Original uploaded knowledge files (F016): the app planes write them at upload
+      // and read them into the export; the sweep plane deletes them at source purge /
+      // tenant cascade. grantReadWrite covers all three.
+      knowledgeOriginalsBucket.grantReadWrite(role);
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'ReadSecrets',
+          actions: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
+          resources: [platformSecret.secretArn, dbSecret.secretArn],
+        }),
+      );
+      // Per-tenant connection credentials (Arch §3.8.3). app/connections/secrets.py
+      // SecretsManagerStore creates/reads/rotates/deletes one secret per connection at
+      // `vm/{admin_id}/{instance_id}/{connection_type}`. The ReadSecrets grant above
+      // covers only the platform + DB secrets, so without this every credential submit
+      // fails AccessDenied -> 500. Scoped to the `vm/` tenant prefix, never `*`, so the
+      // task can reach connection secrets and nothing else in the account (§3.8.3 rule 5).
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'ManageTenantConnectionSecrets',
+          actions: [
+            'secretsmanager:CreateSecret',
+            'secretsmanager:PutSecretValue',
+            'secretsmanager:GetSecretValue',
+            'secretsmanager:DescribeSecret',
+            'secretsmanager:DeleteSecret',
+            // CreateSecret with tags is authorized against TagResource; harmless today
+            // (no Tags are passed) and required the moment tenant tagging is added.
+            'secretsmanager:TagResource',
+          ],
+          // Secrets Manager appends a 6-char suffix to the name in the ARN, so the
+          // prefix match is `secret:vm/*`.
+          resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:vm/*`],
+        }),
+      );
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'UseCmk',
+          actions: ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKey', 'kms:DescribeKey'],
+          resources: [cmk.keyArn],
+        }),
+      );
+      // Transactional email (Arch §3.1.2 / §3.6.7): verification, password reset, export
+      // links and dunning notices all go out through SESv2 (app/notifications/
+      // email_sender.py). Without this grant a live-mode send returns AccessDenied and
+      // no customer can complete signup, since unverified accounts are hard-gated.
+      // Scoped to the offering region + this account's identities for the founder domain
+      // — never a wildcard identity, so the task can only send AS VantageMind.
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'SendPlatformEmail',
+          actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+          resources: [
+            // Domain identity (covers every address under it), subdomain identities
+            // (e.g. inbound.vantagemind.ai), and individually-verified addresses.
+            `arn:aws:ses:${this.region}:${this.account}:identity/${DOMAINS.apex}`,
+            `arn:aws:ses:${this.region}:${this.account}:identity/*.${DOMAINS.apex}`,
+            `arn:aws:ses:${this.region}:${this.account}:identity/*@${DOMAINS.apex}`,
+            `arn:aws:ses:${this.region}:${this.account}:configuration-set/*`,
+          ],
+        }),
+      );
+    };
+    grantAppPlaneAccess(taskRole);
+
+    // 2026-09-05 audit F067: the PUBLIC-INGRESS data plane (widget, channel webhooks)
+    // holds a narrower role than the control plane and the sweeps. It reads a tenant's
+    // credentials to send AS the tenant and rotates a refreshed OAuth token in place;
+    // it never creates or deletes a tenant secret, never touches account exports or
+    // uploaded knowledge originals, and can neither restart services nor rotate the
+    // platform secret. A request-smuggling or deserialization hole on the plane that
+    // faces the internet must not hand out the control plane's blast radius.
+    const dataPlaneRole = new iam.Role(this, 'DataPlaneTaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: 'Luciel data-plane task role - narrower than the control plane (F067)',
+    });
+    voiceAudioBucket.grantReadWrite(dataPlaneRole);
+    transcriptArchiveBucket.grantRead(dataPlaneRole);
+    dataPlaneRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ReadSecrets',
         actions: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
         resources: [platformSecret.secretArn, dbSecret.secretArn],
       }),
     );
-    // Per-tenant connection credentials (Arch §3.8.3). app/connections/secrets.py
-    // SecretsManagerStore creates/reads/rotates/deletes one secret per connection at
-    // `vm/{admin_id}/{instance_id}/{connection_type}`. The ReadSecrets grant above
-    // covers only the platform + DB secrets, so without this every credential submit
-    // fails AccessDenied -> 500. Scoped to the `vm/` tenant prefix, never `*`, so the
-    // task can reach connection secrets and nothing else in the account (§3.8.3 rule 5).
-    taskRole.addToPolicy(
+    dataPlaneRole.addToPolicy(
       new iam.PolicyStatement({
-        sid: 'ManageTenantConnectionSecrets',
+        sid: 'UseTenantConnectionSecrets',
+        // Read to send as the tenant; PutSecretValue only for the in-place refresh of
+        // an expiring OAuth token (app/connections/refresh.py) — no Create, no Delete.
         actions: [
-          'secretsmanager:CreateSecret',
-          'secretsmanager:PutSecretValue',
           'secretsmanager:GetSecretValue',
           'secretsmanager:DescribeSecret',
-          'secretsmanager:DeleteSecret',
-          // CreateSecret with tags is authorized against TagResource; harmless today
-          // (no Tags are passed) and required the moment tenant tagging is added.
-          'secretsmanager:TagResource',
+          'secretsmanager:PutSecretValue',
         ],
-        // Secrets Manager appends a 6-char suffix to the name in the ARN, so the
-        // prefix match is `secret:vm/*`.
         resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:vm/*`],
       }),
     );
-    taskRole.addToPolicy(
+    dataPlaneRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'UseCmk',
         actions: ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKey', 'kms:DescribeKey'],
         resources: [cmk.keyArn],
       }),
     );
-    // Transactional email (Arch §3.1.2 / §3.6.7): verification, password reset, export
-    // links and dunning notices all go out through SESv2 (app/notifications/
-    // email_sender.py). Without this grant a live-mode send returns AccessDenied and
-    // no customer can complete signup, since unverified accounts are hard-gated.
-    // Scoped to the offering region + this account's identities for the founder domain
-    // — never a wildcard identity, so the task can only send AS VantageMind.
-    taskRole.addToPolicy(
+    dataPlaneRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'SendPlatformEmail',
         actions: ['ses:SendEmail', 'ses:SendRawEmail'],
         resources: [
-          // Domain identity (covers every address under it), subdomain identities
-          // (e.g. inbound.vantagemind.ai), and individually-verified addresses.
           `arn:aws:ses:${this.region}:${this.account}:identity/${DOMAINS.apex}`,
           `arn:aws:ses:${this.region}:${this.account}:identity/*.${DOMAINS.apex}`,
           `arn:aws:ses:${this.region}:${this.account}:identity/*@${DOMAINS.apex}`,
@@ -207,6 +267,17 @@ export class ComputeStack extends Stack {
         ],
       }),
     );
+
+    // 2026-09-05 audit F115: the sweeps run as their OWN role. It carries the app
+    // planes' grants PLUS the two auto-swap grants no request-serving plane may
+    // hold: rotating the platform secret and force-redeploying the app services
+    // belong to the model_currency watchdog alone, so a compromised control plane
+    // cannot rewrite the platform secret or restart the fleet.
+    const sweepRole = new iam.Role(this, 'SweepTaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: 'Luciel sweep task role - app-plane grants plus the auto-swap grants (F115)',
+    });
+    grantAppPlaneAccess(sweepRole);
 
     // The public API origin, composed exactly the way WebStack composes
     // NEXT_PUBLIC_API_BASE_URL: `https://${DOMAINS.api}`. Both SNS webhook
@@ -400,11 +471,11 @@ export class ComputeStack extends Stack {
           envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
       });
 
-    const makeTaskDef = (name: string) => {
+    const makeTaskDef = (name: string, role: iam.IRole = taskRole) => {
       const td = new ecs.FargateTaskDefinition(this, `${name}Task`, {
         cpu: envConfig.envName === 'prod' ? 1024 : 256,
         memoryLimitMiB: envConfig.envName === 'prod' ? 2048 : 512,
-        taskRole,
+        taskRole: role,
       });
       // The EXECUTION role resolves `secrets:` at task startup. It needs both
       // secret-read AND kms:Decrypt on the CMK (the secrets are CMK-encrypted).
@@ -486,7 +557,7 @@ export class ComputeStack extends Stack {
     // Data plane behind the ALB (public ingress: widget, channels).
     const dataService = new ecs.FargateService(this, 'DataPlane', {
       cluster: this.cluster,
-      taskDefinition: makeTaskDef('data-plane'),
+      taskDefinition: makeTaskDef('data-plane', dataPlaneRole),
       desiredCount: dataCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -645,17 +716,16 @@ export class ComputeStack extends Stack {
     const sweepTask = new ecs.FargateTaskDefinition(this, 'SweepTask', {
       cpu: 256,
       memoryLimitMiB: 512,
-      taskRole,
+      taskRole: sweepRole,
     });
     // The model_currency watchdog's RETIREMENT AUTO-SWAP (owner decision, §3.4.3):
     // when a pinned chat model disappears at the provider, the sweep writes the
     // same-family successor into the platform secret and force-redeploys the app
-    // services so fresh tasks read it. Both grants are an EXPLICIT, scoped widening
-    // of the shared task role (the sweep deliberately runs as the same role as the
-    // app planes, so RLS and every seam behave identically): PutSecretValue is
-    // limited to the ONE platform secret the planes can already read, and
-    // UpdateService to the two app services — nothing else in the account.
-    taskRole.addToPolicy(
+    // services so fresh tasks read it. Both grants sit on the SWEEP role only
+    // (F115): PutSecretValue is limited to the ONE platform secret the planes can
+    // already read, and UpdateService to the app services — nothing else in the
+    // account, and nothing a request-serving plane can reach.
+    sweepRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'RotatePlatformSecret',
         actions: ['secretsmanager:PutSecretValue'],
@@ -667,7 +737,7 @@ export class ComputeStack extends Stack {
     // CloudFormation cycle (service → role default policy → service). The cluster
     // is created before the role, so its name is cycle-free, and nothing but the
     // two app planes lives in it — same effective blast radius, deployable graph.
-    taskRole.addToPolicy(
+    sweepRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'RestartAppServices',
         actions: ['ecs:UpdateService'],
@@ -776,7 +846,7 @@ export class ComputeStack extends Stack {
     schedulerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['iam:PassRole'],
-        resources: [taskRole.roleArn, sweepTask.executionRole!.roleArn],
+        resources: [sweepRole.roleArn, sweepTask.executionRole!.roleArn],
         conditions: { StringLike: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' } },
       }),
     );

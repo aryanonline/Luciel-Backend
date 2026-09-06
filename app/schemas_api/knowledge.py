@@ -38,6 +38,9 @@ class KnowledgeSourceOut(WireModel):
     # live-caught on the 2026-08-23 dev walkthrough (the modal claimed "no
     # questions used this source" about a source analytics counted 6 for).
     used_by_questions_7d: int = Field(0, alias="usedByQuestions7d")
+    # The sync connection a live source belongs to (2026-09-05 audit: the pillar
+    # confirms a refused shrink against the CONNECTION, not the source).
+    connection_id: uuid.UUID | None = None
 
 
 class KnowledgeChunkOut(WireModel):

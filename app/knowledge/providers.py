@@ -37,9 +37,11 @@ Manager/SSM in production). NEVER hardcoded here.
 from __future__ import annotations
 
 import base64
+import re
 import uuid
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.robotparser import RobotFileParser
 
 import httpx
 
@@ -47,7 +49,7 @@ from app.config import get_settings
 from app.connections import registry, sandbox
 from app.connections.registry import oauth_client_config
 from app.connections.secrets import SecretStore, secret_ref_for
-from app.knowledge import scope
+from app.knowledge import parsers, scope
 from app.knowledge.sync import RemoteItem, RemoteSnapshot, SyncProvider
 
 
@@ -146,16 +148,27 @@ def live_http_transport() -> HttpTransport | None:
 
 
 async def _token_material(
-    store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID
+    store: SecretStore,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    secret_ref: str | None = None,
 ) -> dict[str, str]:
-    material = await store.get(secret_ref_for(admin_id, instance_id, "knowledge_source"))
+    # Each knowledge connection reads ITS OWN ref (F092); the legacy shared ref is the
+    # fallback for rows that predate per-connection refs and for direct constructions.
+    ref = secret_ref or secret_ref_for(admin_id, instance_id, "knowledge_source")
+    material = await store.get(ref)
     if not material or not material.get("access_token"):
         raise ProviderUnavailable("No access token on file for this knowledge-sync connection.")
     return material
 
 
-async def _bearer_token(store: SecretStore, admin_id: uuid.UUID, instance_id: uuid.UUID) -> str:
-    return (await _token_material(store, admin_id, instance_id))["access_token"]
+async def _bearer_token(
+    store: SecretStore,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    secret_ref: str | None = None,
+) -> str:
+    return (await _token_material(store, admin_id, instance_id, secret_ref))["access_token"]
 
 
 # --------------------------------------------------------------------------- #
@@ -350,8 +363,12 @@ async def store_oauth_token(
     material: dict[str, str],
     connection_type: str = "knowledge_source",
     staged: bool = False,
+    secret_ref: str | None = None,
 ) -> str:
     """Write exchanged token material to the tenant-scoped secret_ref (§3.8.3).
+
+    ``secret_ref`` names the row's own pointer for per-connection types (F092); the
+    ``connection_type`` convention is the fallback for every single-active type.
 
     Uses the SAME ``secret_ref_for(admin_id, instance_id, connection_type)``
     convention the readers consume, so a token written here is immediately usable
@@ -359,7 +376,7 @@ async def store_oauth_token(
     ``connection_type`` defaults to knowledge sync, and is ``channel_auth`` for the
     Meta channel callback (Decision #7).
     """
-    ref = secret_ref_for(admin_id, instance_id, connection_type)
+    ref = secret_ref or secret_ref_for(admin_id, instance_id, connection_type)
     if staged:
         # A STAGED write (2026-09-05 audit F050): the live credential at ``ref`` keeps
         # serving until the callback has verified the new one and cleared the
@@ -384,9 +401,10 @@ async def promote_staged_token(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     connection_type: str,
+    secret_ref: str | None = None,
 ) -> bool:
     """Make the staged credential the live one. False if nothing was staged."""
-    ref = secret_ref_for(admin_id, instance_id, connection_type)
+    ref = secret_ref or secret_ref_for(admin_id, instance_id, connection_type)
     staged = staged_secret_ref(ref)
     material = await store.get(staged)
     if material is None:
@@ -402,15 +420,28 @@ async def discard_staged_token(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     connection_type: str,
+    secret_ref: str | None = None,
 ) -> bool:
     """Drop a staged credential that failed verification; the live one is untouched."""
-    ref = staged_secret_ref(secret_ref_for(admin_id, instance_id, connection_type))
+    ref = staged_secret_ref(secret_ref or secret_ref_for(admin_id, instance_id, connection_type))
     return await store.delete(ref)
 
 
 # --------------------------------------------------------------------------- #
 # Google Drive — `changes` API delta feed (page-token), §3.2.3.
 # --------------------------------------------------------------------------- #
+#: Google-native document kinds and the plain export each one is read as (F097).
+DRIVE_EXPORT_MIME: dict[str, str] = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.presentation": "text/plain",
+}
+#: Listing pages read per sync (100 files each) — a bound, not a target.
+DRIVE_MAX_PAGES = 50
+#: Binary files above this are skipped rather than pulled through the parser.
+DRIVE_MAX_FILE_BYTES = 25_000_000
+
+
 class GoogleDriveProvider:
     """Enumerates files in the connected Drive scope; delta via the `changes` API
     page-token when available, full listing on first sync (no prior token)."""
@@ -425,44 +456,113 @@ class GoogleDriveProvider:
         store: SecretStore,
         transport: HttpTransport | None = None,
         scope_ids: list[str] | None = None,
+        secret_ref: str | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._transport = transport
+        self._secret_ref = secret_ref
         # Selected folder ids (Decision #9); empty = the whole connected account.
         self._scope_ids = list(scope_ids or [])
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        token = await _bearer_token(self._store, self._admin_id, self._instance_id)
+        token = await _bearer_token(
+            self._store, self._admin_id, self._instance_id, self._secret_ref
+        )
         transport = self._transport
         if transport is None:
             raise ProviderUnavailable(
                 "Google Drive live HTTP call is a provider-deferred seam in this arc; "
                 "inject an HttpTransport (real or fake) to exercise it."
             )
-        resp = await transport.get(
-            "https://www.googleapis.com/drive/v3/files",
-            headers={"Authorization": f"Bearer {token}"},
-            params={
+        headers = {"Authorization": f"Bearer {token}"}
+        # Every page of the listing (2026-09-05 audit F094): the first 100 files were
+        # the whole Drive before.
+        files: list[dict[str, object]] = []
+        page_token: str | None = None
+        for _ in range(DRIVE_MAX_PAGES):
+            params: dict[str, object] = {
                 "q": scope.drive_query(self._scope_ids),
                 # `parents` is requested so the scope can be re-checked locally: a shared or
                 # shortcut file can satisfy the query without living under a chosen folder.
-                "fields": "files(id,name,modifiedTime,trashed,parents)",
-            },
-        )
-        data = resp.json()
-        items = [
-            RemoteItem(
-                external_id=f["id"],
-                name=f["name"],
-                text=f.get("text", ""),
-                revision=f.get("modifiedTime", ""),
+                "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,trashed,parents,size)",
+                "pageSize": 100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            data = (
+                await transport.get(
+                    "https://www.googleapis.com/drive/v3/files", headers=headers, params=params
+                )
+            ).json()
+            files.extend(data.get("files", []))
+            page_token = data.get("nextPageToken") or None
+            if not page_token:
+                break
+        items: list[RemoteItem] = []
+        failed: list[str] = []
+        for f in files:
+            if f.get("trashed") or not scope.in_scope(f, self._scope_ids, parent_keys=("parents",)):
+                continue
+            file_id, name = str(f["id"]), str(f.get("name", f["id"]))
+            try:
+                text = await self._content_of(transport, headers, f)
+            except (ProviderUnavailable, ValueError):
+                failed.append(file_id)
+                continue
+            if text is None:
+                continue  # a kind of file that carries no ingestible text
+            items.append(
+                RemoteItem(
+                    external_id=file_id,
+                    name=name,
+                    text=text,
+                    revision=str(f.get("modifiedTime", "")),
+                )
             )
-            for f in data.get("files", [])
-            if not f.get("trashed") and scope.in_scope(f, self._scope_ids, parent_keys=("parents",))
-        ]
-        return RemoteSnapshot(items=items)
+        return RemoteSnapshot(items=items, failed_ids=failed)
+
+    async def _content_of(
+        self, transport: HttpTransport, headers: dict[str, str], f: dict[str, object]
+    ) -> str | None:
+        """The ingestible text of one Drive file (2026-09-05 audit F097).
+
+        A listing entry carries no body. Google-native documents are EXPORTED as text
+        (Docs → text/plain, Sheets → text/csv, Slides → text/plain); binary files are
+        downloaded and run through the same parsers an upload uses. A test fake may
+        put ``text`` on the listing entry directly; that is honoured so provider
+        fakes stay small. ``None`` — nothing to ingest (a folder, a form, a drawing,
+        an unsupported binary, a file over the per-file cap)."""
+        if isinstance(f.get("text"), str):
+            return str(f["text"])
+        mime = str(f.get("mimeType") or "")
+        file_id = str(f["id"])
+        if mime.startswith("application/vnd.google-apps."):
+            export_as = DRIVE_EXPORT_MIME.get(mime)
+            if export_as is None:
+                return None
+            resp = await transport.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
+                headers=headers,
+                params={"mimeType": export_as},
+            )
+            return resp.text
+        size = f.get("size")
+        try:
+            if size is not None and int(str(size)) > DRIVE_MAX_FILE_BYTES:
+                return None
+        except ValueError:
+            pass
+        name = str(f.get("name") or file_id)
+        if parsers.format_for(name, mime) is None:
+            return None
+        resp = await transport.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            headers=headers,
+            params={"alt": "media"},
+        )
+        return parsers.parse_file(resp.content, filename=name, content_type=mime).text
 
 
 # --------------------------------------------------------------------------- #
@@ -544,11 +644,13 @@ class NotionProvider:
         store: SecretStore,
         transport: HttpTransport | None = None,
         scope_ids: list[str] | None = None,
+        secret_ref: str | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._transport = transport
+        self._secret_ref = secret_ref
         # Selected page/database ids (Decision #9); empty = every page the grant reaches.
         self._scope_ids = list(scope_ids or [])
 
@@ -556,7 +658,9 @@ class NotionProvider:
         return {"Authorization": f"Bearer {token}", "Notion-Version": _NOTION_VERSION}
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        token = await _bearer_token(self._store, self._admin_id, self._instance_id)
+        token = await _bearer_token(
+            self._store, self._admin_id, self._instance_id, self._secret_ref
+        )
         transport = self._transport
         if transport is None:
             raise ProviderUnavailable(
@@ -628,6 +732,10 @@ class NotionProvider:
 # --------------------------------------------------------------------------- #
 # CRM knowledge base — HubSpot / Salesforce, `updatedAt`/`LastModifiedDate` delta.
 # --------------------------------------------------------------------------- #
+#: CRM knowledge-base listing pages read per sync — a bound, not a target (F094).
+CRM_KB_MAX_PAGES = 50
+
+
 class HubSpotProvider:
     """HubSpot Knowledge Base articles (`crm_kb` origin); delta via `updatedAt`."""
 
@@ -640,35 +748,49 @@ class HubSpotProvider:
         instance_id: uuid.UUID,
         store: SecretStore,
         transport: HttpTransport | None = None,
+        secret_ref: str | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._transport = transport
+        self._secret_ref = secret_ref
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        token = await _bearer_token(self._store, self._admin_id, self._instance_id)
+        token = await _bearer_token(
+            self._store, self._admin_id, self._instance_id, self._secret_ref
+        )
         transport = self._transport
         if transport is None:
             raise ProviderUnavailable(
                 "HubSpot live HTTP call is a provider-deferred seam in this arc; inject "
                 "an HttpTransport (real or fake) to exercise it."
             )
-        resp = await transport.get(
-            "https://api.hubapi.com/cms/v3/knowledge-base/articles",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"archived": "false"},
-        )
-        data = resp.json()
-        items = [
-            RemoteItem(
-                external_id=str(a["id"]),
-                name=a.get("title", str(a["id"])),
-                text=a.get("postBody", a.get("text", "")),
-                revision=a.get("updatedAt", ""),
+        items: list[RemoteItem] = []
+        after: str | None = None
+        for _ in range(CRM_KB_MAX_PAGES):  # every page (F094), bounded
+            params: dict[str, object] = {"archived": "false", "limit": 100}
+            if after:
+                params["after"] = after
+            data = (
+                await transport.get(
+                    "https://api.hubapi.com/cms/v3/knowledge-base/articles",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                )
+            ).json()
+            items.extend(
+                RemoteItem(
+                    external_id=str(a["id"]),
+                    name=a.get("title", str(a["id"])),
+                    text=a.get("postBody", a.get("text", "")),
+                    revision=a.get("updatedAt", ""),
+                )
+                for a in data.get("results", [])
             )
-            for a in data.get("results", [])
-        ]
+            after = ((data.get("paging") or {}).get("next") or {}).get("after") or None
+            if not after:
+                break
         return RemoteSnapshot(items=items)
 
 
@@ -685,15 +807,19 @@ class SalesforceProvider:
         store: SecretStore,
         instance_url: str | None = None,
         transport: HttpTransport | None = None,
+        secret_ref: str | None = None,
     ) -> None:
         self._admin_id = admin_id
         self._instance_id = instance_id
         self._store = store
         self._instance_url = instance_url
         self._transport = transport
+        self._secret_ref = secret_ref
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        material = await _token_material(self._store, self._admin_id, self._instance_id)
+        material = await _token_material(
+            self._store, self._admin_id, self._instance_id, self._secret_ref
+        )
         token = material["access_token"]
         # Salesforce is the one provider with no fixed API host: the token exchange
         # returns the org's own ``instance_url``, and login.salesforce.com serves the
@@ -711,21 +837,27 @@ class SalesforceProvider:
             "SELECT Id, Title, Summary, LastModifiedDate FROM Knowledge__kav "
             "WHERE PublishStatus = 'Online'"
         )
-        resp = await transport.get(
-            f"{base}/services/data/v58.0/query",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"q": query},
-        )
-        data = resp.json()
-        items = [
-            RemoteItem(
-                external_id=str(r["Id"]),
-                name=r.get("Title", str(r["Id"])),
-                text=r.get("Summary", r.get("text", "")),
-                revision=r.get("LastModifiedDate", ""),
+        headers = {"Authorization": f"Bearer {token}"}
+        data = (
+            await transport.get(
+                f"{base}/services/data/v58.0/query", headers=headers, params={"q": query}
             )
-            for r in data.get("records", [])
-        ]
+        ).json()
+        items: list[RemoteItem] = []
+        for _ in range(CRM_KB_MAX_PAGES):  # every page (F094): SOQL answers 2000 at a time
+            items.extend(
+                RemoteItem(
+                    external_id=str(r["Id"]),
+                    name=r.get("Title", str(r["Id"])),
+                    text=r.get("Summary", r.get("text", "")),
+                    revision=r.get("LastModifiedDate", ""),
+                )
+                for r in data.get("records", [])
+            )
+            next_url = data.get("nextRecordsUrl")
+            if data.get("done", True) or not next_url:
+                break
+            data = (await transport.get(f"{base}{next_url}", headers=headers)).json()
         return RemoteSnapshot(items=items)
 
 
@@ -771,6 +903,61 @@ def _extract_visible_text(html: str) -> str:
         i += 1
     # Collapse whitespace so retrieval chunks aren't full of raw HTML formatting.
     return " ".join(buf.split())
+
+
+CRAWL_USER_AGENT = "LucielBot"
+_HREF_RE = re.compile(r"""<a\s[^>]*?href\s*=\s*["']([^"'#]+)""", re.IGNORECASE)
+_SKIP_EXTENSIONS = (
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".zip",
+    ".mp4",
+    ".mp3",
+    ".css",
+    ".js",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".xml",
+    ".json",
+)
+
+
+def _normalize_url(url: str) -> str:
+    parts = urlparse(url.strip())
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return ""
+    path = parts.path or "/"
+    return urlunparse((parts.scheme, parts.netloc.lower(), path, "", parts.query, ""))
+
+
+def _same_origin_links(page_url: str, html: str) -> list[str]:
+    """Links on the page that stay on the page's scheme+host, deduped, in order.
+    Assets and downloads are skipped — this is a text crawl."""
+    base = urlparse(page_url)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _HREF_RE.findall(html):
+        candidate = raw.strip()
+        if candidate.lower().startswith(("mailto:", "tel:", "javascript:")):
+            continue
+        absolute = _normalize_url(urljoin(page_url, candidate))
+        if not absolute:
+            continue
+        parsed = urlparse(absolute)
+        if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc.lower()):
+            continue
+        if parsed.path.lower().endswith(_SKIP_EXTENSIONS):
+            continue
+        if absolute not in seen:
+            seen.add(absolute)
+            out.append(absolute)
+    return out
 
 
 class WebsiteCrawlProvider:
@@ -826,15 +1013,57 @@ class WebsiteCrawlProvider:
         return body
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+        """Fetch every seed URL and the same-origin pages it links to, breadth-first,
+        bounded by ``website_crawl_max_pages`` / ``website_crawl_max_depth`` and
+        ``robots.txt`` (2026-09-05 audit F117/F123). A page that fails to fetch is
+        reported in ``failed_ids`` so the sync keeps what it knew, never retires it."""
         import hashlib
 
+        settings = get_settings()
+        max_pages = max(1, settings.website_crawl_max_pages)
+        max_depth = max(0, settings.website_crawl_max_depth)
         items: list[RemoteItem] = []
-        for url in self._urls:
-            html = await self._fetch_one(url)
+        failed: list[str] = []
+        robots: dict[str, RobotFileParser | None] = {}
+        queue: list[tuple[str, int]] = [(u, 0) for u in self._urls]
+        seen: set[str] = set()
+        while queue and len(items) + len(failed) < max_pages:
+            url, depth = queue.pop(0)
+            url = _normalize_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            if not await self._robots_allow(url, robots):
+                continue
+            try:
+                html = await self._fetch_one(url)
+            except (ProviderUnavailable, httpx.HTTPError, ValueError):
+                failed.append(url)
+                continue
             text = _extract_visible_text(html)
             revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
             items.append(RemoteItem(external_id=url, name=url, text=text, revision=revision))
-        return RemoteSnapshot(items=items)
+            if depth < max_depth:
+                for link in _same_origin_links(url, html):
+                    if link not in seen:
+                        queue.append((link, depth + 1))
+        return RemoteSnapshot(items=items, failed_ids=failed)
+
+    async def _robots_allow(self, url: str, cache: dict[str, RobotFileParser | None]) -> bool:
+        """robots.txt per origin, fetched once per snapshot; unreachable robots = allowed
+        (the site made no rule), a fetched one is honoured for our user agent."""
+        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        if origin not in cache:
+            parser: RobotFileParser | None = None
+            try:
+                body = await self._fetch_one(f"{origin}/robots.txt")
+                parser = RobotFileParser()
+                parser.parse(body.splitlines())
+            except (ProviderUnavailable, httpx.HTTPError, ValueError):
+                parser = None
+            cache[origin] = parser
+        parser = cache[origin]
+        return True if parser is None else parser.can_fetch(CRAWL_USER_AGENT, url)
 
 
 # --------------------------------------------------------------------------- #
@@ -852,7 +1081,9 @@ async def list_scope_candidates(
     provider_name = connection.provider  # type: ignore[attr-defined]
     admin_id = connection.admin_id  # type: ignore[attr-defined]
     instance_id = connection.instance_id  # type: ignore[attr-defined]
-    token = await _bearer_token(store, admin_id, instance_id)
+    token = await _bearer_token(
+        store, admin_id, instance_id, getattr(connection, "secret_ref", None) or None
+    )
     if provider_name == "google_drive":
         resp = await transport.get(
             "https://www.googleapis.com/drive/v3/files",
@@ -924,6 +1155,9 @@ def provider_for_connection(connection: object, store: SecretStore) -> SyncProvi
     # win. In live mode this is the binding whose absence made every OAuth-class sync
     # report itself as a deferred seam (P1-2).
     transport = live_http_transport()
+    # The row's OWN secret ref (F092): several knowledge connections coexist, each
+    # with its own token. None for legacy rows → the shared-ref fallback.
+    secret_ref = getattr(connection, "secret_ref", None) or None
     if provider_name == "google_drive":
         return GoogleDriveProvider(
             admin_id=admin_id,
@@ -931,6 +1165,7 @@ def provider_for_connection(connection: object, store: SecretStore) -> SyncProvi
             store=store,
             scope_ids=selected,
             transport=transport,
+            secret_ref=secret_ref,
         )
     if provider_name == "notion":
         return NotionProvider(
@@ -939,14 +1174,23 @@ def provider_for_connection(connection: object, store: SecretStore) -> SyncProvi
             store=store,
             scope_ids=selected,
             transport=transport,
+            secret_ref=secret_ref,
         )
     if provider_name == "hubspot":
         return HubSpotProvider(
-            admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+            admin_id=admin_id,
+            instance_id=instance_id,
+            store=store,
+            transport=transport,
+            secret_ref=secret_ref,
         )
     if provider_name == "salesforce":
         return SalesforceProvider(
-            admin_id=admin_id, instance_id=instance_id, store=store, transport=transport
+            admin_id=admin_id,
+            instance_id=instance_id,
+            store=store,
+            transport=transport,
+            secret_ref=secret_ref,
         )
     if provider_name == "website_crawl":
         cfg = connection.non_secret_config or {}  # type: ignore[attr-defined]

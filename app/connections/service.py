@@ -27,7 +27,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.channels.email_routing import MxDelegationProbe, MxDelegationResult
 from app.connections import registry
-from app.connections.secrets import SecretStore, get_secret_store, secret_ref_for
+from app.connections.secrets import (
+    SecretStore,
+    get_secret_store,
+    secret_ref_for,
+    secret_ref_for_connection,
+)
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 
@@ -262,6 +267,36 @@ async def start_connection(
         )
         return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
+    if connection_type == "knowledge_source":
+        # Knowledge is MANY-per-tenant (2026-09-05 audit F092/F093): a Drive folder, a
+        # Notion workspace and the website coexist. Reuse only an abandoned connect
+        # (an unconfigured row of the same provider); otherwise mint a fresh row with
+        # its own secret ref, so connecting Notion never resets — or steals the token
+        # of — the Drive connection beside it.
+        connection = await _start_knowledge_connection(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            provider=provider,
+            auth_class=auth_class,
+            user_id=user_id,
+        )
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="instance_configured",
+            payload={
+                "connection_id": str(connection.connection_id),
+                "connection_type": connection_type,
+                "provider": provider,
+                "action": "start_connection",
+            },
+        )
+        return connection, _start_result(auth_class, connection, admin_id=admin_id)
+
     existing = await _single_active(session, admin_id, instance_id, connection_type)
     if existing is not None and existing.status == "dormant":
         # Round 5B item 16: dormant is BILLING-suspended (Legal §A3) — only the
@@ -311,6 +346,54 @@ async def start_connection(
         },
     )
     return connection, _start_result(auth_class, connection, admin_id=admin_id)
+
+
+async def _start_knowledge_connection(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    provider: str,
+    auth_class: str,
+    user_id: uuid.UUID | None,
+) -> InstanceConnection:
+    abandoned = (
+        (
+            await session.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.instance_id == instance_id,
+                    InstanceConnection.connection_type == "knowledge_source",
+                    InstanceConnection.provider == provider,
+                    InstanceConnection.status == "unconfigured",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if abandoned is not None:
+        abandoned.auth_class = auth_class
+        abandoned.status_detail = None
+        await session.flush()
+        return abandoned
+    connection_id = uuid.uuid4()
+    connection = InstanceConnection(
+        connection_id=connection_id,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        connection_type="knowledge_source",
+        auth_class=auth_class,
+        provider=provider,
+        status="unconfigured",
+        secret_ref=secret_ref_for_connection(
+            admin_id, instance_id, "knowledge_source", connection_id
+        ),
+        created_by_user_id=user_id,
+    )
+    session.add(connection)
+    await session.flush()
+    return connection
 
 
 class DormantConnection(ValueError):

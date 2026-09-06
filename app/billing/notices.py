@@ -40,8 +40,14 @@ logger = logging.getLogger(__name__)
 ALLOWANCE_REDUCTION = "allowance_reduction"
 PRICE_CHANGE = "price_change"
 TERMS_CHANGE = "terms_change"
+# 2026-09-05 audit F114: the model_currency sweep swapped a retired model. Admins
+# are told, in the dashboard and by email, that the model behind their Luciel
+# changed and that nothing is needed from them.
+MODEL_UPDATED = "model_updated"
 # The closed set AccountNoticeOut.kind accepts; anything else cannot be serialised.
-KINDS: frozenset[str] = frozenset({ALLOWANCE_REDUCTION, PRICE_CHANGE, TERMS_CHANGE})
+KINDS: frozenset[str] = frozenset({ALLOWANCE_REDUCTION, PRICE_CHANGE, TERMS_CHANGE, MODEL_UPDATED})
+# How long after an auto-swap the 'model updated' notice stays on the dashboard.
+MODEL_UPDATED_NOTICE_DAYS = 14
 
 # Legal §A5 / §A10 minimum lead time between announcing a reduction and it taking effect.
 NOTICE_LEAD_DAYS = 30
@@ -93,6 +99,45 @@ def _allowance_reduction_notice(now: datetime) -> AccountNotice | None:
         ),
         effective_at=effective_at,
         learn_more_href=BILLING_HREF,
+    )
+
+
+def _model_updated_notice(now: datetime) -> AccountNotice | None:
+    """The derived F114 notice, from the swap record the sweep wrote (LLM_MODEL_UPDATED).
+
+    Fail-open: a malformed record is dropped with a warning, because this is read on
+    the login path. The notice expires quietly after MODEL_UPDATED_NOTICE_DAYS."""
+    raw = get_settings().llm_model_updated
+    if not raw or not raw.strip():
+        return None
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("llm_model_updated is not valid JSON; publishing no notice")
+        return None
+    if not isinstance(record, dict):
+        return None
+    swapped_at = _parse_effective_at(str(record.get("at") or ""))
+    new_model = str(record.get("to") or "")
+    old_model = str(record.get("from") or "")
+    if swapped_at is None or not new_model:
+        logger.warning("llm_model_updated record is incomplete; publishing no notice")
+        return None
+    if now < swapped_at or (now - swapped_at).days >= MODEL_UPDATED_NOTICE_DAYS:
+        return None
+    return AccountNotice(
+        notice_id=f"{MODEL_UPDATED}:{swapped_at.date().isoformat()}:{new_model}",
+        kind=MODEL_UPDATED,
+        title="Luciel's AI model was updated",
+        body=(
+            f"On {swapped_at.date().isoformat()} the AI provider retired the model Luciel "
+            f"was running on ({old_model}), and the platform moved to its newest "
+            f"same-family successor ({new_model}) after it passed a test turn. Your "
+            "setup, knowledge and conversations are unchanged, and nothing is needed "
+            "from you. If you notice a change in how Luciel answers, tell us."
+        ),
+        effective_at=None,
+        learn_more_href=None,
     )
 
 
@@ -159,4 +204,7 @@ def account_notices(*, now: datetime | None = None) -> list[AccountNotice]:
     derived = _allowance_reduction_notice(now)
     if derived is not None and not any(n.kind == ALLOWANCE_REDUCTION for n in published):
         published.append(derived)
+    model_updated = _model_updated_notice(now)
+    if model_updated is not None:
+        published.append(model_updated)
     return published

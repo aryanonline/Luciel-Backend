@@ -327,11 +327,15 @@ async def ensure_fresh_access_token(
     instance_id: uuid.UUID,
     *,
     connection_type: str,
+    connection_id: uuid.UUID | None = None,
     store: SecretStore | None = None,
     transport: _Transport | None = None,
     now: datetime | None = None,
 ) -> str | None:
     """An access token usable RIGHT NOW for the tenant's ``connection_type`` row.
+
+    ``connection_id`` names the row when the type may hold several (knowledge sources,
+    F092); without it the newest live row of the type is used.
 
     The generic twin of ``tenant_outlook.ensure_fresh_token``, for the tool
     call-time path (calendar booking, CRM push): refreshes when the stored
@@ -345,16 +349,19 @@ async def ensure_fresh_access_token(
     interrupted.
     """
     now = now or datetime.now(UTC)
+    stmt = select(InstanceConnection).where(
+        InstanceConnection.admin_id == admin_id,
+        InstanceConnection.instance_id == instance_id,
+        InstanceConnection.connection_type == connection_type,
+        InstanceConnection.status != "revoked",
+    )
+    if connection_id is not None:
+        stmt = stmt.where(InstanceConnection.connection_id == connection_id)
     conn = (
-        await session.execute(
-            select(InstanceConnection).where(
-                InstanceConnection.admin_id == admin_id,
-                InstanceConnection.instance_id == instance_id,
-                InstanceConnection.connection_type == connection_type,
-                InstanceConnection.status != "revoked",
-            )
-        )
-    ).scalar_one_or_none()
+        (await session.execute(stmt.order_by(InstanceConnection.created_at.desc())))
+        .scalars()
+        .first()
+    )
     if conn is None:
         return None
     # The connect flow stamps secret_ref; rows that predate it (and fixtures)

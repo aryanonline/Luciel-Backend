@@ -39,6 +39,11 @@ class EmbeddingError(RuntimeError):
 class OpenAIEmbedder:
     """Real embedding provider — OpenAI embeddings behind the ``Embedder`` Protocol."""
 
+    @property
+    def model_name(self) -> str:
+        """The pin behind every vector this embedder writes (F121)."""
+        return self._model
+
     def __init__(self, *, api_key: str, model: str, dim: int = EMBED_DIM) -> None:
         self.dim = dim
         self._api_key = api_key

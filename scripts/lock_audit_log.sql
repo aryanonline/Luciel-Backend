@@ -205,3 +205,13 @@ END $$;
 --    when luciel_app inserts (RLS is FORCE'd). The existing tenant policy uses
 --    current_setting('app.admin_id'); ownership does not change that. No extra grant
 --    to luciel_audit_owner is needed beyond owning the relation.
+
+-- 5) The app role must not be able to BECOME the BYPASSRLS role (2026-09-05 audit
+--    F085). bootstrap_roles.sql grants luciel_app membership in luciel_auth because
+--    alembic (running as luciel_app) reassigns SECURITY DEFINER functions to it, and
+--    Postgres 16 requires SET on the target role for ALTER ... OWNER TO. That is a
+--    migration-time need only: at runtime a `SET ROLE luciel_auth` from any code path
+--    or injected SQL would switch off row-level security for every tenant. Revoke the
+--    membership here, after the migration step, so it exists only for the minutes
+--    alembic runs (bootstrap re-grants it before the next migration).
+REVOKE luciel_auth FROM luciel_app;

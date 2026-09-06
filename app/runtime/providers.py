@@ -127,6 +127,12 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _llm_timeout_seconds() -> float:
+    from app.config import get_settings  # noqa: PLC0415 — keep the provider import light
+
+    return float(get_settings().llm_timeout_seconds)
+
+
 class AnthropicProvider:
     """Primary provider — Anthropic Messages API behind the LLMProvider Protocol.
 
@@ -152,7 +158,12 @@ class AnthropicProvider:
         if self._client is None:
             from anthropic import AsyncAnthropic  # noqa: PLC0415 — lazy/guarded import
 
-            self._client = AsyncAnthropic(api_key=self._api_key)
+            # No SDK retries and a hard deadline (F101): the router's immediate
+            # primary→fallback failover is the retry policy, and a hung primary must
+            # not hold a customer's turn for minutes before it kicks in.
+            self._client = AsyncAnthropic(
+                api_key=self._api_key, max_retries=0, timeout=_llm_timeout_seconds()
+            )
         return self._client
 
     async def complete(
@@ -248,7 +259,9 @@ class OpenAIProvider:
         if self._client is None:
             from openai import AsyncOpenAI  # noqa: PLC0415 — lazy/guarded import
 
-            self._client = AsyncOpenAI(api_key=self._api_key)
+            self._client = AsyncOpenAI(
+                api_key=self._api_key, max_retries=0, timeout=_llm_timeout_seconds()
+            )
         return self._client
 
     async def complete(

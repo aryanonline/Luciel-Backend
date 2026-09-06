@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connections.secrets import get_secret_store
-from app.knowledge import sync
+from app.knowledge import service, sync
 from app.knowledge.providers import ProviderUnavailable, provider_for_connection
 from app.models.connection import InstanceConnection
 from app.models.knowledge import KnowledgeSource
@@ -105,7 +105,11 @@ async def sync_due_connections(
             from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
 
             await ensure_fresh_access_token(
-                session, admin_id, conn.instance_id, connection_type="knowledge_source"
+                session,
+                admin_id,
+                conn.instance_id,
+                connection_type="knowledge_source",
+                connection_id=conn.connection_id,
             )
             await sync.sync_connection(
                 session,
@@ -145,4 +149,13 @@ async def sync_due_connections(
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )
+    # A changed embedding pin (F121): bring this tenant's older vectors forward in a
+    # bounded batch per pass, so retrieval never scores a new-model query against
+    # old-model chunks for longer than a few sweeps.
+    try:
+        reembedded = await service.reembed_outdated_chunks(session, admin_id=admin_id)
+        if reembedded:
+            logger.info("knowledge_reembed chunks=%d", reembedded)
+    except Exception:  # noqa: BLE001 — never fail the sweep on the re-embed pass
+        logger.exception("knowledge_reembed_failed")
     return synced

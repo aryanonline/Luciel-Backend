@@ -60,6 +60,9 @@ class KnowledgeChunk(Base, TenantMixin, TimestampMixin):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBED_DIM), nullable=True)
+    # Which embedding model produced ``embedding`` (2026-09-05 audit F121): the
+    # knowledge_sync sweep re-embeds rows whose model is not the current pin.
+    embedding_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 # --- Graph store (Architecture §3.2.1 — Path Locked: PostgreSQL ONLY) ------------- #

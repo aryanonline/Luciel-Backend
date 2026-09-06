@@ -21,15 +21,18 @@ detection half and (owner decision 2026-08-17) the remediation half. Pinned here
 
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
 from app.runtime import model_currency
 from app.runtime.model_currency import (
     MODEL_CURRENCY_ALERT,
+    MODEL_CURRENCY_KEY_REJECTED,
     MODEL_CURRENCY_SWAP,
     anthropic_models,
     model_family,
+    pick_newer_successor,
     pick_successor,
     run_model_currency_check,
 )
@@ -42,6 +45,15 @@ pytestmark = [pytest.mark.asyncio]
 # --- fakes --------------------------------------------------------------------- #
 
 
+class _HttpError(RuntimeError):
+    """httpx.HTTPStatusError-shaped: carries the response the checker reads the
+    status off (401/403 = key rejected, F133)."""
+
+    def __init__(self, resp: _Resp) -> None:
+        super().__init__(f"http {resp.status_code}")
+        self.response = resp
+
+
 class _Resp:
     def __init__(self, payload: dict, status: int = 200) -> None:
         self._payload = payload
@@ -49,7 +61,7 @@ class _Resp:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise RuntimeError(f"http {self.status_code}")
+            raise _HttpError(self)
 
     def json(self) -> dict:
         return self._payload
@@ -70,18 +82,34 @@ class FakeTransport:
         existing: set[str],
         anthropic_pages: list[dict] | Exception | None = None,
         openai_listing: dict | Exception | None = None,
+        smoke_fail: bool = False,
+        key_rejected: frozenset[str] = frozenset(),
     ) -> None:
         self._existing = existing
         self._anthropic_pages = anthropic_pages
         self._openai_listing = openai_listing
         self._anthropic_page_calls = 0
+        self._smoke_fail = smoke_fail
+        self._key_rejected = key_rejected
         self.calls: list[tuple[str, dict | None]] = []
+        self.posts: list[tuple[str, dict | None]] = []
 
     def listing_calls(self, provider: str) -> list[tuple[str, dict | None]]:
         return [(u, p) for u, p in self.calls if provider in u and u.endswith("/v1/models")]
 
+    async def post(self, url: str, *, json=None, headers=None):
+        """The smoke turn: one real completion against the candidate."""
+        self.posts.append((url, json))
+        if self._smoke_fail:
+            return _Resp({"error": {"message": "model not available"}}, status=400)
+        if "anthropic" in url:
+            return _Resp({"content": [{"type": "text", "text": "OK"}]})
+        return _Resp({"choices": [{"message": {"content": "OK"}}]})
+
     async def get(self, url: str, *, params=None, headers=None):
         self.calls.append((url, params))
+        if any(provider in url for provider in self._key_rejected):
+            return _Resp({}, status=401)  # the provider answered: the key is refused
         provider_error = self._anthropic_pages if "anthropic" in url else self._openai_listing
         if isinstance(provider_error, Exception):
             raise provider_error
@@ -326,7 +354,15 @@ async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplo
             secret_writer=writer,
             restarter=restarter,
         )
-    assert writer.applied == [{"LLM_ANTHROPIC_PRIMARY_MODEL": "claude-sonnet-4-8"}]
+    (applied,) = writer.applied
+    assert applied["LLM_ANTHROPIC_PRIMARY_MODEL"] == "claude-sonnet-4-8"
+    # The same rotation records the swap for the admins' 'model updated' notice (F114).
+    record = json.loads(applied["LLM_MODEL_UPDATED"])
+    assert record["from"] == "claude-sonnet-4-6" and record["to"] == "claude-sonnet-4-8"
+    assert record["setting"] == "llm_anthropic_primary_model" and record["at"]
+    # The successor answered a smoke turn BEFORE the secret was written (F113).
+    ((smoke_url, smoke_payload),) = transport.posts
+    assert "anthropic" in smoke_url and smoke_payload["model"] == "claude-sonnet-4-8"
     assert restarter.restarts == 1
     assert len(transport.listing_calls("anthropic")) == 2  # paginated successor lookup
     ((to, subject, body),) = sender.sent
@@ -466,3 +502,139 @@ async def test_missing_provider_keys_is_a_loud_misconfiguration(caplog):
                 transport_factory=ExplodingFactory(),
             )
     assert any(MODEL_CURRENCY_ALERT in r.getMessage() for r in caplog.records)
+
+
+# --- 2026-09-05 audit WP5-B: never older, smoke-validated, key-rejection is loud -- #
+
+
+def test_pick_newer_successor_never_offers_an_older_sibling():
+    # The retired pin WAS the family's newest: the only sibling is older. The old
+    # rule would downgrade; the new one refuses (alert-only, a human decides).
+    listing = [
+        {"id": "claude-sonnet-4-7", "created": 400},
+        {"id": "claude-haiku-4-9", "created": 900},
+    ]
+    assert pick_successor("claude-sonnet-4-8", listing) == "claude-sonnet-4-7"
+    assert pick_newer_successor("claude-sonnet-4-8", listing) is None
+    # A newer sibling wins; an older one in the same listing is ignored.
+    assert (
+        pick_newer_successor(
+            "claude-sonnet-4-6",
+            [
+                {"id": "claude-sonnet-4-8", "created": 500},
+                {"id": "claude-sonnet-4-5", "created": 100},
+            ],
+        )
+        == "claude-sonnet-4-8"
+    )
+    # A dated snapshot of the SAME version is a legitimate successor for a retired alias.
+    assert (
+        pick_newer_successor(
+            "claude-sonnet-4-6", [{"id": "claude-sonnet-4-6-20251101", "created": 500}]
+        )
+        == "claude-sonnet-4-6-20251101"
+    )
+    assert pick_newer_successor("gpt-5.4", [{"id": "gpt-5.2", "created": 999}]) is None
+    assert pick_newer_successor("gpt-5.4", [{"id": "gpt-5.6", "created": 999}]) == "gpt-5.6"
+
+
+async def test_a_retired_pin_with_only_older_siblings_alerts_instead_of_downgrading():
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-5", 100), ("claude-haiku-4-5", 200)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+    sender, writer, restarter = RecordingSender(), FakeWriter(), FakeRestarter()
+    with pytest.raises(RuntimeError):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=restarter,
+        )
+    assert writer.applied == [] and restarter.restarts == 0 and transport.posts == []
+    ((_, subject, body),) = sender.sent
+    assert "need attention" in subject
+    assert "older sibling is never a swap target" in body
+
+
+async def test_a_successor_that_fails_the_smoke_turn_is_never_written(caplog):
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+        smoke_fail=True,
+    )
+    sender, writer, restarter = RecordingSender(), FakeWriter(), FakeRestarter()
+    with (
+        caplog.at_level(logging.WARNING, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=restarter,
+        )
+    assert writer.applied == [] and restarter.restarts == 0
+    assert len(transport.posts) == 1  # the smoke turn ran, once
+    ((_, subject, body),) = sender.sent
+    assert "need attention" in subject
+    assert "failed a smoke turn" in body and "claude-sonnet-4-8" in body and "not swapped" in body
+    assert any("model_currency_smoke_failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_injected_smoke_seam_replaces_the_transport_call():
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+        smoke_fail=True,  # would fail if the transport smoke ran
+    )
+    seen: list[tuple[str, str]] = []
+
+    async def smoke(*, provider: str, api_key: str, model_id: str) -> str | None:
+        seen.append((provider, model_id))
+        return None
+
+    writer = FakeWriter()
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW),
+        transport_factory=lambda: transport,
+        email_sender=RecordingSender(),
+        secret_writer=writer,
+        restarter=FakeRestarter(),
+        smoke=smoke,
+    )
+    assert seen == [("anthropic", "claude-sonnet-4-8")]
+    assert transport.posts == []
+    assert result["swapped"] and writer.applied
+
+
+async def test_a_rejected_api_key_is_a_loud_alert_not_an_unreachable_shrug(caplog):
+    transport = FakeTransport(
+        existing=set(ALL_PINS),
+        key_rejected=frozenset({"anthropic"}),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+    sender, writer = RecordingSender(), FakeWriter()
+    with (
+        caplog.at_level(logging.WARNING, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=FakeRestarter(),
+        )
+    assert writer.applied == []
+    ((_, subject, body),) = sender.sent
+    assert "need attention" in subject
+    assert "rejected the platform's API key" in body and "HTTP 401" in body
+    assert any(MODEL_CURRENCY_KEY_REJECTED in r.getMessage() for r in caplog.records)
+    # The OTHER provider's pins were still verified; nothing about them alarmed.
+    assert "gpt-5.4" not in body

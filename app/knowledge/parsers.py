@@ -85,6 +85,34 @@ def _format_for(name: str, content_type: str | None) -> str:
     return "txt"
 
 
+def format_for(filename: str, content_type: str | None) -> str | None:
+    """The parser format a file would be read with, or None when unsupported —
+    so a caller (the Drive sync, F097) can skip a download it could not parse.
+
+    Unlike ``_format_for`` (whose 'txt' fallback keeps raw uploads readable), an
+    unrecognised type here is None: a provider listing names images, archives and
+    videos, and none of those should be downloaded to find out they are binary."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    ext = _ext(filename)
+    recognised = (
+        ct in _PDF_TYPES
+        or ct in _DOCX_TYPES
+        or ct in _CSV_TYPES
+        or ct in _TXT_TYPES
+        or ct.startswith("text/")
+        or ext in _PDF_EXTS
+        or ext in _DOCX_EXTS
+        or ext in _CSV_EXTS
+        or ext in _TXT_EXTS
+    )
+    if not recognised:
+        return None
+    try:
+        return _format_for(filename, content_type)
+    except ValueError:
+        return None
+
+
 def parse_file(raw: bytes, *, filename: str, content_type: str | None) -> ParsedFile:
     """Dispatch to the right extractor and return the extracted text.
 
