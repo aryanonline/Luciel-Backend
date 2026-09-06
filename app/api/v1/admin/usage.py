@@ -186,12 +186,17 @@ async def usage_overview(subject: Subject = Depends(current_admin)) -> Analytics
 
 
 @router.get("/audit-log", response_model=list[AuditEventOut])
-async def usage_audit_log(subject: Subject = Depends(current_admin)) -> list[AuditEventOut]:
-    """Read-only view of the tenant's hash-chained audit log (§5.2). Non-secret:
-    only event metadata is surfaced; no secret material is ever in event_payload
-    (the writers enforce that). The chain integrity is verifiable via verify_chain."""
+async def usage_audit_log(
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    subject: Subject = Depends(current_admin),
+) -> list[AuditEventOut]:
+    """Read-only view of the tenant's hash-chained audit log (§5.2), newest first,
+    paged (2026-09-05 audit F170). Non-secret: only event metadata is surfaced; no
+    secret material is ever in event_payload (the writers enforce that). The chain
+    integrity is verifiable via verify_chain."""
     async with tenant_session(subject.admin_id) as s:
-        rows = await _audit_rows(s, subject.admin_id, limit=200)
+        rows = await _audit_rows(s, subject.admin_id, limit=limit, offset=offset)
         return [
             AuditEventOut.model_validate(
                 {
@@ -205,13 +210,16 @@ async def usage_audit_log(subject: Subject = Depends(current_admin)) -> list[Aud
         ]
 
 
-async def _audit_rows(s: AsyncSession, admin_id: uuid.UUID, *, limit: int) -> list[AdminAuditLog]:
+async def _audit_rows(
+    s: AsyncSession, admin_id: uuid.UUID, *, limit: int, offset: int = 0
+) -> list[AdminAuditLog]:
     return list(
         (
             await s.execute(
                 select(AdminAuditLog)
                 .where(AdminAuditLog.admin_id == admin_id)
                 .order_by(AdminAuditLog.seq.desc())
+                .offset(max(0, offset))
                 .limit(limit)
             )
         )

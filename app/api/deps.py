@@ -19,6 +19,7 @@ from app.auth.tokens import decode_token
 from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.instance import Account, AccountState
+from app.observability.context import bind_admin
 
 #: Account states that must not reach the admin surface at all (P1-5). ``closed`` is the
 #: one that bites: the row survives its 30-day recovery window (§3.6.6), so without this
@@ -95,4 +96,5 @@ async def current_admin(request: Request) -> Subject:
         raise forbidden("Account closed.")
     if acct.state == AccountState.unverified or not acct.email_verified:
         raise forbidden("Email verification required.")
+    bind_admin(subject.admin_id)  # every later log line names the tenant (F035)
     return subject

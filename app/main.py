@@ -8,16 +8,22 @@ today).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.errors import register_error_handlers
 from app.config import get_settings
+from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
+from app.observability.context import admin_id_var, bind_trace, new_trace_id, trace_id_var
+from app.observability.logging import install_structured_logging
+from app.observability.metrics import install_metrics_logger
 from app.runtime.integration_status import (
     database_unreachable_reason,
     degraded_bindings,
@@ -101,6 +107,40 @@ class PlaneAwareCORS:
         await self._control_plane(scope, receive, send)
 
 
+class TraceContext:
+    """Pure-ASGI: one trace id per request, echoed back as X-Request-Id (F035).
+
+    The ALB's X-Amzn-Trace-Id (or a caller's X-Request-Id) is honoured so a
+    CloudWatch search on one id spans the edge and the app; otherwise a fresh id
+    is minted. The tenant is bound later, by the auth dependency."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        incoming = headers.get(b"x-request-id") or headers.get(b"x-amzn-trace-id")
+        trace_id = incoming.decode("latin-1")[:128] if incoming else new_trace_id()
+        trace_token = bind_trace(trace_id)
+        admin_token = admin_id_var.set("")
+
+        async def send_with_trace(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                raw = list(message.get("headers") or [])
+                raw.append((b"x-request-id", trace_id.encode("latin-1", "ignore")))
+                message["headers"] = raw
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_trace)
+        finally:
+            trace_id_var.reset(trace_token)
+            admin_id_var.reset(admin_token)
+
+
 _CAP_TOKEN_RE = re.compile(r"(\bcap=)[^&\s\"']+")
 
 
@@ -132,11 +172,40 @@ def install_log_redaction() -> None:
             logger.addFilter(_RedactCapabilityTokens())
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Background work that belongs to the running process, not a scheduler:
+    the data plane's in-process mailbox poll (cost) — started only where the
+    environment asks for it, stopped cleanly on shutdown."""
+    settings = get_settings()
+    stop = asyncio.Event()
+    poller: asyncio.Task[int] | None = None
+    if should_run_inprocess_mailbox_poll(settings):
+        poller = asyncio.create_task(
+            mailbox_poll_loop(stop, interval_seconds=settings.inprocess_mailbox_poll_seconds)
+        )
+        logging.getLogger(__name__).info(
+            "inprocess_mailbox_poll_started interval=%ss",
+            settings.inprocess_mailbox_poll_seconds,
+        )
+    try:
+        yield
+    finally:
+        stop.set()
+        if poller is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(poller, timeout=10)
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     install_log_redaction()
-    app = FastAPI(title="Luciel Backend", version="0.1.0")
+    install_structured_logging(settings.log_format)
+    install_metrics_logger()
+    app = FastAPI(title="Luciel Backend", version="0.1.0", lifespan=_lifespan)
 
+    # Outermost: every line logged while serving the request carries its trace id.
+    app.add_middleware(TraceContext)
     app.add_middleware(
         PlaneAwareCORS,
         dashboard_origins=settings.dashboard_origins,

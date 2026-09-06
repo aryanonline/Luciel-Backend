@@ -35,6 +35,21 @@ class Settings(BaseSettings):
         "postgresql+psycopg://luciel_app:luciel_dev_pw@127.0.0.1:5432/luciel_dev"
     )
 
+    # 2026-09-05 audit WP7: a bounded pool and a hard per-statement deadline. A
+    # runaway query used to hold a connection forever; asyncpg gets
+    # statement_timeout as a server setting on every pooled connection.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    db_pool_recycle_seconds: int = 1800
+    db_statement_timeout_ms: int = 60_000
+    # 'json' puts trace_id/admin_id on every log line (the ECS task definitions set
+    # it); 'text' keeps a developer terminal readable.
+    log_format: str = "text"
+    # >0 makes the DATA plane poll BYO mailboxes in-process at this cadence instead
+    # of a Fargate launch every five minutes (the EventBridge sweep stays as an
+    # hourly backstop). 0 = off (local, CI, control plane, sweeps).
+    inprocess_mailbox_poll_seconds: float = 0.0
+
     # --- Redis ------------------------------------------------------------
     redis_url: str = "redis://127.0.0.1:6379/0"
 

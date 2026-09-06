@@ -17,6 +17,7 @@ module is the verifiable application artifact (audit finding Axis3-F06).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -106,14 +107,20 @@ async def run_grace_expiry_sweep(
     now = now or datetime.now(UTC)
     deleted: dict[str, dict[str, int]] = {}
     for admin_id in candidate_admin_ids:
-        async with tenant_session(admin_id) as s:
-            # The cascade emits audit rows and deletes Secrets Manager entries, neither
-            # of which is guarded by a uniqueness constraint, so two overlapping runs
-            # would each do it (P2-7). A tenant another run holds is skipped, not waited
-            # for: by the time the lock frees the winner has already expired it.
-            if not await claim_sweep_lock(s, "grace_expiry", admin_id):
-                continue
-            counts = await expire_grace_window_if_due(s, admin_id=admin_id, now=now)
+        try:
+            async with tenant_session(admin_id) as s:
+                # The cascade emits audit rows and deletes Secrets Manager entries,
+                # neither of which is guarded by a uniqueness constraint, so two
+                # overlapping runs would each do it (P2-7). A tenant another run holds
+                # is skipped, not waited for.
+                if not await claim_sweep_lock(s, "grace_expiry", admin_id):
+                    continue
+                counts = await expire_grace_window_if_due(s, admin_id=admin_id, now=now)
+        except Exception:  # noqa: BLE001 — one tenant never ends the sweep (F036)
+            logging.getLogger(__name__).error(
+                "sweep_tenant_failed kind=grace_expiry admin_id=%s", admin_id, exc_info=True
+            )
+            continue
         if counts is not None:
             deleted[str(admin_id)] = counts
     return deleted

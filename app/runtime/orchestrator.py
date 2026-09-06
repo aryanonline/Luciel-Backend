@@ -66,6 +66,7 @@ from app.notifications.escalation_dispatch import (
     has_configured_escalation_contact,
     notify_escalation_safely,
 )
+from app.observability.metrics import emit_metric
 from app.runtime import budget, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import (
@@ -397,6 +398,7 @@ async def _record_escalation(
     )
     if inserted.rowcount == 0:  # type: ignore[attr-defined]  # a racing turn already wrote it
         return False
+    emit_metric("EscalationFired", dimensions={"Signal": signal})
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -616,6 +618,7 @@ class Orchestrator:
         if budget_state.at_cap:
             # Graceful single-turn reply WITHOUT an LLM call; escalation row signal
             # budget_exhausted; counter does NOT increment (§3.4.1b).
+            emit_metric("BudgetGateHit", dimensions={"Channel": channel})
             await self._emit_budget_exhausted(session_id, resolved_lead_id)
             at_cap_reply = self._with_contact_ask(
                 AT_CAP_REPLY,
@@ -760,6 +763,7 @@ class Orchestrator:
             # the data-plane log, never a silent quality drop. Once per turn is the honest
             # grain — an outage that lasts a conversation shows as that many rows.
             _LOG.warning("llm_fallback_used session=%s", session_id)
+            emit_metric("LLMFallbackUsed", dimensions={"Channel": channel})
             await audit.emit(
                 self.session,
                 admin_id=admin_id,

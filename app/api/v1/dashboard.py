@@ -56,18 +56,34 @@ router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
 
 # --- conversations ------------------------------------------------------------ #
+# 2026-09-05 audit WP7: every list endpoint is bounded. The defaults keep the
+# existing clients whole (they never asked for more than a page fits); the cap
+# stops one tenant's history from being one unbounded query.
+PAGE_DEFAULT = 200
+PAGE_MAX = 500
+
+
+def _page(limit: int, offset: int) -> tuple[int, int]:
+    return max(1, min(limit, PAGE_MAX)), max(0, offset)
+
+
 @router.get("/conversations", response_model=list[ConversationSummaryOut])
 async def list_conversations(
+    limit: int = Query(PAGE_DEFAULT, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[ConversationSummaryOut]:
-    """The dashboard conversation list (§3.4.7) — newest activity first."""
+    """The dashboard conversation list (§3.4.7) — newest activity first, paged."""
+    limit, offset = _page(limit, offset)
     async with tenant_session(subject.admin_id) as s:
         rows = (
             (
                 await s.execute(
                     select(SessionModel)
                     .where(SessionModel.admin_id == subject.admin_id)
-                    .order_by(SessionModel.last_message_at.desc())
+                    .order_by(SessionModel.last_message_at.desc(), SessionModel.id.desc())
+                    .offset(offset)
+                    .limit(limit)
                 )
             )
             .scalars()
@@ -467,16 +483,21 @@ async def flag_answer(
 
 @router.get("/escalations", response_model=list[EscalationEventOut])
 async def list_escalations(
+    limit: int = Query(PAGE_DEFAULT, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[EscalationEventOut]:
-    """All escalation events for the tenant, newest first (§3.5.2)."""
+    """Escalation events for the tenant, newest first, paged (§3.5.2)."""
+    limit, offset = _page(limit, offset)
     async with tenant_session(subject.admin_id) as s:
         rows = (
             (
                 await s.execute(
                     select(EscalationEvent)
                     .where(EscalationEvent.admin_id == subject.admin_id)
-                    .order_by(EscalationEvent.fired_at.desc())
+                    .order_by(EscalationEvent.fired_at.desc(), EscalationEvent.escalation_id.desc())
+                    .offset(offset)
+                    .limit(limit)
                 )
             )
             .scalars()
@@ -517,16 +538,23 @@ def _lead_out(r: Lead) -> LeadOut:
 
 
 @router.get("/leads", response_model=list[LeadOut])
-async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]:
-    """Lead list (§3.4.9). Newest activity first. Archived rows are served too —
-    the dashboard keeps them out of the active view, not out of existence."""
+async def list_leads(
+    limit: int = Query(PAGE_DEFAULT, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
+    subject: Subject = Depends(current_admin),
+) -> list[LeadOut]:
+    """Lead list (§3.4.9). Newest activity first, paged. Archived rows are served
+    too — the dashboard keeps them out of the active view, not out of existence."""
+    limit, offset = _page(limit, offset)
     async with tenant_session(subject.admin_id) as s:
         rows = (
             (
                 await s.execute(
                     select(Lead)
                     .where(Lead.admin_id == subject.admin_id)
-                    .order_by(Lead.last_activity_at.desc())
+                    .order_by(Lead.last_activity_at.desc(), Lead.id.desc())
+                    .offset(offset)
+                    .limit(limit)
                 )
             )
             .scalars()

@@ -28,6 +28,7 @@ takes the candidate list as input and keeps this module pure.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -355,15 +356,21 @@ async def run_retention_sweep(
     now = now or datetime.now(UTC)
     swept: dict[str, dict[str, int]] = {}
     for admin_id in candidate_admin_ids:
-        async with tenant_session(admin_id) as s:
-            if not await claim_sweep_lock(s, "retention", admin_id):
-                continue
-            counts = await expire_aged_data(
-                s, admin_id=admin_id, now=now, retention_days=retention_days
+        try:
+            async with tenant_session(admin_id) as s:
+                if not await claim_sweep_lock(s, "retention", admin_id):
+                    continue
+                counts = await expire_aged_data(
+                    s, admin_id=admin_id, now=now, retention_days=retention_days
+                )
+                # Same transaction as the platform sweep, but a different policy:
+                # this one only acts for tenants that opted in (§3.4.10a).
+                counts["lead"] = await prune_stale_leads(s, admin_id=admin_id, now=now)
+        except Exception:  # noqa: BLE001 — one tenant never ends the sweep (F036)
+            logging.getLogger(__name__).error(
+                "sweep_tenant_failed kind=retention admin_id=%s", admin_id, exc_info=True
             )
-            # Same transaction as the platform sweep, but a different policy: this one
-            # only acts for tenants that opted in (§3.4.10a).
-            counts["lead"] = await prune_stale_leads(s, admin_id=admin_id, now=now)
+            continue
         if any(counts.values()):
             swept[str(admin_id)] = counts
     return swept

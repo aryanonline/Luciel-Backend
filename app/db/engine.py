@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -23,6 +25,17 @@ def get_engine() -> AsyncEngine:
             settings.database_url,
             pool_pre_ping=True,
             echo=False,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_recycle=settings.db_pool_recycle_seconds,
+            # asyncpg applies these on every new connection: a hard statement
+            # deadline (WP7) and a name the DBA can see in pg_stat_activity.
+            connect_args={
+                "server_settings": {
+                    "statement_timeout": str(settings.db_statement_timeout_ms),
+                    "application_name": f"luciel-{os.environ.get('LUCIEL_PLANE', 'local')}",
+                }
+            },
         )
     return _engine
 

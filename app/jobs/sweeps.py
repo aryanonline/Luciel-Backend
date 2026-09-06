@@ -54,11 +54,12 @@ Two invariants every sweep holds:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import reaper
@@ -68,7 +69,10 @@ from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
 from app.lifecycle import audit_retention, grace_expiry, retention, transcript_archive
 from app.lifecycle.close_purge import purge_closed_account_if_due
 from app.models.connection import InstanceConnection
+from app.observability.metrics import emit_metric
 from app.runtime import session_close
+
+logger = logging.getLogger(__name__)
 
 RETENTION = "retention"
 GRACE_EXPIRY = "grace_expiry"
@@ -152,10 +156,17 @@ async def _per_tenant(
     now = now or datetime.now(UTC)
     acted: list[str] = []
     for admin_id in await sweep_candidates(kind):
-        async with tenant_session(admin_id) as s:
-            if not await claim_sweep_lock(s, kind, admin_id):
-                continue
-            result = await work(s, admin_id=admin_id, now=now)
+        try:
+            async with tenant_session(admin_id) as s:
+                if not await claim_sweep_lock(s, kind, admin_id):
+                    continue
+                result = await work(s, admin_id=admin_id, now=now)
+        except Exception:  # noqa: BLE001 — one tenant's failure never ends the run (F036)
+            # ERROR-level so the SweepErrors metric filter pages an operator; the
+            # remaining tenants still get their sweep this run.
+            logger.error("sweep_tenant_failed kind=%s admin_id=%s", kind, admin_id, exc_info=True)
+            emit_metric("SweepTenantFailure", dimensions={"Sweep": kind})
+            continue
         if result:
             acted.append(str(admin_id))
     return acted
@@ -236,7 +247,21 @@ async def _check_connections(
         now=now,
     )
     await _reapply_sms_webhooks(session, admin_id=admin_id)
-    return result
+    transitions = result
+    unhealthy = (
+        await session.execute(
+            select(func.count())
+            .select_from(InstanceConnection)
+            .where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.status.in_(("error", "expired")),
+            )
+        )
+    ).scalar_one()
+    # ConnectionUnhealthy (F032): rows an owner must act on, after this tenant's
+    # sweep; CloudWatch sums the per-tenant emissions.
+    emit_metric("ConnectionUnhealthy", float(unhealthy))
+    return transitions
 
 
 async def _reapply_sms_webhooks(session: AsyncSession, *, admin_id: uuid.UUID) -> None:
@@ -285,7 +310,21 @@ async def run_audit_retention(*, now: datetime | None = None) -> list[str]:
 
 
 async def _finalize_sessions(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
-    return await session_close.finalize_due_sessions(session, admin_id=admin_id, now=now)
+    closed = await session_close.finalize_due_sessions(session, admin_id=admin_id, now=now)
+    # ActiveSessions (F032): what is still open after the finalize pass, summed
+    # across tenants by CloudWatch — the load signal autoscaling and the owner's
+    # cost questions both want.
+    from app.models.conversation import Session as SessionModel  # noqa: PLC0415
+
+    open_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(SessionModel)
+            .where(SessionModel.admin_id == admin_id, SessionModel.ended_at.is_(None))
+        )
+    ).scalar_one()
+    emit_metric("ActiveSessions", float(open_count))
+    return closed
 
 
 async def run_session_finalize(*, now: datetime | None = None) -> list[str]:
