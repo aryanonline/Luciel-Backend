@@ -83,7 +83,7 @@ def test_a_metric_is_one_emf_line(monkeypatch):
     envelope = doc["_aws"]["CloudWatchMetrics"][0]
     assert envelope["Namespace"] == "Luciel"
     assert envelope["Metrics"] == [{"Name": "SweepTenantFailure", "Unit": "Count"}]
-    assert envelope["Dimensions"] == [["Environment", "Plane", "Sweep"]]
+    assert envelope["Dimensions"] == [["Environment"], ["Environment", "Plane", "Sweep"]]
     assert doc["Environment"] == "dev" and doc["Plane"] == "sweep" and doc["Sweep"] == "retention"
     assert doc["SweepTenantFailure"] == 1.0
     json.dumps(doc)  # serialisable as-is

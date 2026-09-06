@@ -116,6 +116,8 @@ new ObservabilityStack(app, `${prefix}-Observability`, {
   // Same no-address-in-the-repo rule as BudgetStack.
   alertEmail: (app.node.tryGetContext('alarmEmail') ??
     app.node.tryGetContext('budgetAlertEmail')) as string | undefined,
+  clusterArn: compute.cluster.clusterArn,
+  sweepTaskFamily: compute.sweepTaskFamily,
 });
 
 new PipelineStack(app, `${prefix}-Pipeline`, {

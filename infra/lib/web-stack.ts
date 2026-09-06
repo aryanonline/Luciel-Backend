@@ -74,7 +74,7 @@ export class WebStack extends Stack {
 
     this.cluster = new ecs.Cluster(this, 'WebCluster', {
       vpc,
-      containerInsights: envConfig.alarmsArmed,
+      containerInsights: envConfig.productionPosture,
     });
 
     const appSg = new ec2.SecurityGroup(this, 'WebSg', {

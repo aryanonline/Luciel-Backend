@@ -47,7 +47,7 @@ export class EdgeStack extends Stack {
     // wakes — an UNPAUSED dev (live demos, real keys) is always protected.
     // Environments with armed alarms (preprod/prod) keep the WAF unconditionally:
     // production posture is never cost-gated.
-    if (!envConfig.alarmsArmed && envConfig.paused) {
+    if (!envConfig.productionPosture && envConfig.paused) {
       return;
     }
 

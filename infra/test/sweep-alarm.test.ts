@@ -22,7 +22,9 @@ import { EnvName, getEnvConfig, OFFERING_REGION, SWEEP_ERROR_METRIC } from '../l
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
 
-function build(envName: EnvName, alertEmail?: string) {
+// Every environment is armed (F045), so the stack refuses to synth without an inbox;
+// the helper supplies one unless a test passes `undefined` on purpose.
+function build(envName: EnvName, alertEmail: string | undefined = 'ops@example.com') {
   const app = new App();
   const envConfig = getEnvConfig(envName);
   const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig });
@@ -81,15 +83,19 @@ describe('The armed alarm + a subscribed operator (ObservabilityStack)', () => {
     });
   });
 
-  test('dev stays unarmed (no alarms) but still subscribes the operator', () => {
+  test('dev is armed too (F045): the sweep-error alarm exists and the operator is subscribed', () => {
     const { obs } = build('dev', 'owner@example.com');
-    obs.resourceCountIs('AWS::CloudWatch::Alarm', 0);
+    obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      Namespace: SWEEP_ERROR_METRIC.metricNamespace,
+      MetricName: SWEEP_ERROR_METRIC.metricName,
+    });
     obs.resourceCountIs('AWS::SNS::Subscription', 1);
   });
 
-  test('no alertEmail context → no subscription (the documented empty state)', () => {
-    const { obs } = build('dev');
-    obs.resourceCountIs('AWS::SNS::Subscription', 0);
+  test('an armed environment refuses to synth without an operator inbox (F045)', () => {
+    // Every environment is armed now (dev serves the public product), so the
+    // documented empty state — a topic nobody subscribes to — is a synth error.
+    expect(() => build('dev', '')).toThrow(/no operator inbox/);
   });
 });
 

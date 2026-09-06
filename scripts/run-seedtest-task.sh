@@ -33,14 +33,19 @@ code=$(aws ecs describe-tasks --region "$REGION" --cluster "$cluster" --tasks "$
   --query 'tasks[0].containers[0].exitCode' --output text)
 echo "[seedtest] exit code: $code"
 
-# Print the harness output from CloudWatch (luciel-seedtest stream).
+# Print the harness output from CloudWatch. The group is the one ComputeStack
+# declares — /luciel/<env>/seedtest (2026-09-05 audit F174: the old lookup searched
+# for 'SeedTest' case-sensitively, matched nothing, and always printed
+# "(logs not yet available)" — the harness output never reached the workflow log).
 taskid="${arn##*/}"
+log_group="/luciel/${ENVIRONMENT}/seedtest"
+echo "[seedtest] task definition: $taskdef"
+echo "[seedtest] log group: $log_group  stream: luciel-seedtest/SeedTestContainer/${taskid}"
 sleep 5
 aws logs get-log-events --region "$REGION" \
-  --log-group-name "$(aws logs describe-log-groups --region "$REGION" \
-     --query "logGroups[?contains(logGroupName,'SeedTest')].logGroupName | [0]" --output text)" \
+  --log-group-name "$log_group" \
   --log-stream-name "luciel-seedtest/SeedTestContainer/${taskid}" \
-  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available)"
+  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available for $log_group)"
 
 [ "$code" = "0" ] || { echo "::error::seedtest task FAILED (exit $code)"; exit 1; }
 echo "[seedtest] §10 live-behavior probe PASSED."

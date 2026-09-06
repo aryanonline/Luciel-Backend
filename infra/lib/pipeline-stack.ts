@@ -114,6 +114,15 @@ export class PipelineStack extends Stack {
     );
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
+        // 2026-09-05 audit F008: a failed post-deploy smoke probe rolls the app
+        // services back to the task definitions that were serving.
+        sid: 'RollbackAppServices',
+        actions: ['ecs:UpdateService'],
+        resources: [`arn:aws:ecs:${this.region}:${this.account}:service/*`],
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
         sid: 'RunMigrationTask',
         // run-migration-task.sh discovers the cluster/taskdef via CFN exports, then
         // looks up the service (ListServices + DescribeServices) to copy its network

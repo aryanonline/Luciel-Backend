@@ -77,7 +77,10 @@ def emf_document(
             "CloudWatchMetrics": [
                 {
                     "Namespace": NAMESPACE,
-                    "Dimensions": [list(dims.keys())],
+                    # Two dimension sets: the full one for drill-down and
+                    # [Environment] alone so an alarm can sum the environment's
+                    # total without enumerating channels, planes or signals.
+                    "Dimensions": [["Environment"], list(dims.keys())],
                     "Metrics": [{"Name": name, "Unit": unit}],
                 }
             ],

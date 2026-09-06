@@ -80,15 +80,18 @@ export class DataStack extends Stack {
       storageEncryptionKey: cmk,
       backupRetention: Duration.days(7), // Commitment 3 (PITR window)
       deleteAutomatedBackups: envConfig.envName !== 'prod',
-      deletionProtection: envConfig.envName === 'prod',
+      // 2026-09-05 audit F003 (owner decision 6): dev serves the public product, so
+      // its data stores are as hard to destroy as prod's — cost-neutral hardening.
+      // Only the EPHEMERAL preprod stays destroyable (its teardown is the point).
+      deletionProtection: envConfig.envName !== 'preprod',
       removalPolicy:
-        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
       databaseName: 'luciel',
       // Master creds in Secrets Manager, KMS-encrypted. App uses luciel_app, NOT master.
       credentials: rds.Credentials.fromGeneratedSecret('luciel_master', {
         encryptionKey: cmk,
       }),
-      enablePerformanceInsights: envConfig.alarmsArmed,
+      enablePerformanceInsights: envConfig.productionPosture,
       cloudwatchLogsExports: ['postgresql'],
       // RDS creates /aws/rds/instance/<id>/postgresql itself, and a group RDS creates
       // never expires. This is the one log group in the app that is NOT ours to declare
@@ -120,7 +123,7 @@ export class DataStack extends Stack {
       bucketName: `luciel-${envConfig.envName}-transcript-archive-${this.account}`,
       versioned: true,
       removalPolicy:
-        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY, // F003
       lifecycleRules: [
         {
           id: 'transcript-archive-backstop',
@@ -157,7 +160,7 @@ export class DataStack extends Stack {
       key: cmk,
       bucketName: `luciel-${envConfig.envName}-knowledge-originals-${this.account}`,
       removalPolicy:
-        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY, // F003
       lifecycleRules: [
         {
           id: 'knowledge-originals-hygiene',
@@ -182,7 +185,7 @@ export class DataStack extends Stack {
       // name cannot exist twice — that is how a dev export lands in the prod bucket.
       bucketName: `luciel-${envConfig.envName}-export-bundles-${this.account}`,
       removalPolicy:
-        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY, // F003
       lifecycleRules: [
         {
           id: 'export-bundle-expiry',
@@ -209,7 +212,7 @@ export class DataStack extends Stack {
       // per-env + per-account for global uniqueness (same rationale as exports).
       bucketName: `luciel-${envConfig.envName}-voice-audio-${this.account}`,
       removalPolicy:
-        envConfig.envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+        envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY, // F003
       lifecycleRules: [
         {
           id: 'voice-audio-expiry',

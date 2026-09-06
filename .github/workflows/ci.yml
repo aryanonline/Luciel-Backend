@@ -9,6 +9,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # 2026-09-05 audit F039: pip-audit, bandit and the secret scan run daily, not
+  # only when someone pushes — a CVE published on a quiet week still blocks.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch: {}
 
 jobs:
   quality-gate:

@@ -71,6 +71,13 @@ export interface EnvConfig {
   /** Whether alarms/smoke-probe gating are armed (prod only fully armed). */
   readonly alarmsArmed: boolean;
   /**
+   * 2026-09-05 audit F045: alarms are armed EVERYWHERE now (dev serves the public
+   * product), so the cost-bearing telemetry — Container Insights, RDS Performance
+   * Insights, keeping the WAF while paused — needs its own switch. True only where
+   * production posture is never cost-gated (preprod/prod).
+   */
+  readonly productionPosture: boolean;
+  /**
    * Retention for every log group this app owns. A CloudWatch log group created
    * without one keeps its logs FOREVER and bills for the privilege, which is a cost
    * that only ever grows and that nobody notices until the bill does. It lives here
@@ -142,7 +149,10 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     maxAzs: 2, // 2 AZs for valid subnet layout, but single-AZ data plane (§4)
     natGateways: 1,
     rdsInstanceClass: 'db.t4g.micro',
-    alarmsArmed: false,
+    // Armed (F045): dev serves the public product; an alarm that reaches nobody is
+    // refused at synth (ObservabilityStack requires the subscriber).
+    alarmsArmed: true,
+    productionPosture: false,
     logRetention: logs.RetentionDays.ONE_MONTH,
     redisSnapshotRetentionDays: 0,
     paused: false,
@@ -164,6 +174,7 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     natGateways: 2,
     rdsInstanceClass: 'db.r6g.large',
     alarmsArmed: true,
+    productionPosture: true,
     // The environment itself does not outlive the release that created it, so a week
     // is already longer than any preprod log can be worth reading.
     logRetention: logs.RetentionDays.ONE_WEEK,
@@ -186,6 +197,7 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     natGateways: 2,
     rdsInstanceClass: 'db.r6g.large',
     alarmsArmed: true,
+    productionPosture: true,
     logRetention: logs.RetentionDays.THREE_MONTHS, // doctrine §5.1: 90d app logs
     redisSnapshotRetentionDays: 0,
     paused: false,

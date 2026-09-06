@@ -198,7 +198,12 @@ describe('No log group retains forever', () => {
     // `/luciel/<env>/app` group had no producer and was removed — cost hygiene);
     // every real log group is declared by the container that writes to it.
     const obs = Template.fromStack(
-      new ObservabilityStack(app, 'Obs', { env: ENV, envConfig, alb: compute.alb }),
+      new ObservabilityStack(app, 'Obs', {
+        env: ENV,
+        envConfig,
+        alb: compute.alb,
+        alertEmail: 'ops@example.com',
+      }),
     );
     obs.resourceCountIs('AWS::Logs::LogGroup', 0);
     for (const [, props] of logGroups(Template.fromStack(compute))) {

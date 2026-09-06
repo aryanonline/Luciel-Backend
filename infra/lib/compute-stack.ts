@@ -76,6 +76,9 @@ export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> =
 export class ComputeStack extends Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly cluster: ecs.Cluster;
+  /** The sweep task definition family — the ObservabilityStack's task-failure rule
+   *  matches on it (2026-09-05 audit F034). */
+  public readonly sweepTaskFamily: string;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
@@ -91,7 +94,10 @@ export class ComputeStack extends Stack {
       platformSecretArn,
     );
 
-    this.cluster = new ecs.Cluster(this, 'Cluster', { vpc, containerInsights: envConfig.alarmsArmed });
+    this.cluster = new ecs.Cluster(this, 'Cluster', {
+      vpc,
+      containerInsights: envConfig.productionPosture,
+    });
 
     // App tier SG. Egress open (needs outbound for LLM/Twilio/etc. via NAT).
     // Ingress to Postgres is granted by the DB SG (VPC-CIDR rule in DataStack),
@@ -517,6 +523,13 @@ export class ComputeStack extends Stack {
         environment: {
           LUCIEL_ENV: envConfig.envName,
           LUCIEL_PLANE: name,
+          // JSON lines with trace_id/admin_id (F035); CloudWatch extracts the EMF
+          // metric lines from the same stream (F032).
+          LUCIEL_LOG_FORMAT: 'json',
+          // The data plane polls BYO mailboxes in-process every 5 minutes (cost:
+          // 288 Fargate launches a day became a background task); the hourly
+          // mailbox_poll schedule below is the backstop, same advisory lock.
+          ...(name === 'data-plane' ? { LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS: '300' } : {}),
           // Integrations remain MOCK until a gated cutover flips them (GATE 2).
           LUCIEL_INTEGRATION_MODE: integrationMode,
           // The Stripe seam has its OWN posture, one level down from the LLM cutover,
@@ -588,6 +601,27 @@ export class ComputeStack extends Stack {
       circuitBreaker: { rollback: true },
       minHealthyPercent: 100,
     });
+
+    // 2026-09-05 audit F009: production posture scales on load instead of pinning a
+    // task count. Target-tracking on CPU; the floor is the multi-AZ count, the
+    // ceiling bounds cost. Dev keeps one task (it is single-AZ by design), and a
+    // paused environment has nothing to scale.
+    if (envConfig.productionPosture && !envConfig.paused) {
+      dataService
+        .autoScaleTaskCount({ minCapacity: dataCount, maxCapacity: 6 })
+        .scaleOnCpuUtilization('DataPlaneCpu', {
+          targetUtilizationPercent: 60,
+          scaleInCooldown: Duration.minutes(5),
+          scaleOutCooldown: Duration.minutes(2),
+        });
+      controlService
+        .autoScaleTaskCount({ minCapacity: controlCount, maxCapacity: 3 })
+        .scaleOnCpuUtilization('ControlPlaneCpu', {
+          targetUtilizationPercent: 60,
+          scaleInCooldown: Duration.minutes(5),
+          scaleOutCooldown: Duration.minutes(2),
+        });
+    }
 
     // One-off MIGRATION task definition (run by the pipeline before app deploy).
     // Same image; entrypoint overridden to scripts/migrate.sh. Gets master creds +
@@ -729,6 +763,7 @@ export class ComputeStack extends Stack {
       memoryLimitMiB: 512,
       taskRole: sweepRole,
     });
+    this.sweepTaskFamily = sweepTask.family;
     // The model_currency watchdog's RETIREMENT AUTO-SWAP (owner decision, §3.4.3):
     // when a pinned chat model disappears at the provider, the sweep writes the
     // same-family successor into the platform secret and force-redeploys the app
@@ -787,6 +822,7 @@ export class ComputeStack extends Stack {
       environment: {
         LUCIEL_ENV: envConfig.envName,
         LUCIEL_PLANE: 'sweep',
+        LUCIEL_LOG_FORMAT: 'json',
         LUCIEL_INTEGRATION_MODE: integrationMode,
         // MUST match the app planes. The usage_reconcile sweep posts meter events and
         // advances the billing watermark; if it resolved a different gateway than the
@@ -944,7 +980,10 @@ export class ComputeStack extends Stack {
         // with no connected mailboxes (candidates limited to CONNECTED outlook rows,
         // migration 0038). Pauses with the environment like every other schedule.
         name: 'mailbox_poll',
-        cron: 'cron(0/5 * * * ? *)',
+        // Hourly BACKSTOP since 2026-09-05: the data plane polls in-process every
+        // five minutes (LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS above). The same
+        // per-tenant advisory lock makes the two paths mutually exclusive.
+        cron: 'cron(7 * * * ? *)',
         description: 'Pull new mail from connected BYO Outlook mailboxes (§3.1.6a)',
       },
       {

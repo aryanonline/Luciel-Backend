@@ -137,6 +137,25 @@ jobs:
           echo "[pause] reusing gated image tag $TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
+      # 2026-09-05 audit F008: remember what is serving BEFORE the deploy so a failed
+      # smoke probe below can put it back. First deploy of an environment has nothing
+      # to remember (had_previous=false) and simply skips the rollback.
+      - name: Record the running task definitions (rollback target)
+        id: previous
+        if: inputs.paused != 'true'
+        run: |
+          cluster=$(aws cloudformation list-exports --query "Exports[?Name=='Luciel-dev-ClusterName'].Value" --output text)
+          if [ -z "$cluster" ] || [ "$cluster" = "None" ]; then
+            echo "[rollback] no cluster yet - first deploy, nothing to record"
+            echo "had_previous=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          services=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns' --output text)
+          aws ecs describe-services --cluster "$cluster" --services $services \
+            --query 'services[].{name:serviceName,td:taskDefinition}' --output json > previous-services.json
+          cat previous-services.json
+          echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
+          echo "had_previous=true" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
@@ -169,6 +188,35 @@ jobs:
       - name: Run DB migrations as a one-off ECS task (inside the VPC)
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh dev
+
+      # 2026-09-05 audit F008: the deploy is not done until the live API answers the
+      # way it was deployed to — healthz live with no degraded binding, both planes
+      # reachable through the ALB (F067) — and the §10 probe passes as luciel_app.
+      - name: Post-deploy smoke probe (healthz + both planes answer)
+        id: smoke
+        if: inputs.paused != 'true'
+        run: bash scripts/smoke_probe.sh https://api.vantagemind.ai ${{ inputs.integration_mode || 'mock' }}
+
+      - name: §10 live probe as luciel_app (one-off ECS task inside the VPC)
+        id: verify
+        if: inputs.paused != 'true'
+        run: bash scripts/run-verify-task.sh dev
+
+      - name: Roll the app services back to the previous task definitions
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
+        run: |
+          cluster='${{ steps.previous.outputs.cluster }}'
+          python3 - "$cluster" <<'PY'
+          import json, subprocess, sys
+          cluster = sys.argv[1]
+          for svc in json.load(open('previous-services.json')):
+              print(f"[rollback] {svc['name']} -> {svc['td']}", flush=True)
+              subprocess.run(['aws', 'ecs', 'update-service', '--cluster', cluster, '--service', svc['name'],
+                              '--task-definition', svc['td'], '--force-new-deployment',
+                              '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
+          PY
+          echo "::error::post-deploy probe failed; app services rolled back to the previous task definitions"
+          exit 1
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----
   # ---- -> prod -> always teardown. Manual dispatch + environment=prod only. ------

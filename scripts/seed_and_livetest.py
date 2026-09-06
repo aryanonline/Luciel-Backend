@@ -22,6 +22,7 @@ Runs as a one-off in-VPC ECS task (SeedTestTask) so it can both reach the privat
 API/RDS and read the verify JTI from the DB. Synthetic data only; no secrets are
 hardcoded (LLM keys come from the platform secret already in the live dev env).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -408,31 +409,35 @@ async def _run_inprocess_turn(
     # This coroutine is invoked from several separate asyncio.run() blocks; dispose
     # the global engine on exit so it is never reused across a dead event loop.
     try:
-      async with tenant_session(admin_id) as s:
-        instance_id = (
-            await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
-        ).scalar_one()
-        sess, _ = await resolve_or_open_session(
-            s, admin_id=admin_id, instance_id=instance_id, channel=channel, resolved_lead_id=None
-        )
-        orch = Orchestrator(
-            session=s,
-            router=router,
-            retriever=retriever,
-            admin_id=admin_id,
-            instance_id=instance_id,
-            enabled_channels=enabled_channels,
-            business_context="We sell refurbished gadgets.",
-            has_payment_method=False,
-            tool_resolver=tool_resolver,
-        )
-        return await orch.run_turn(
-            session_id=sess.id,
-            resolved_lead_id=None,
-            channel=channel,
-            mode=sess.mode,
-            inbound_text=inbound,
-        )
+        async with tenant_session(admin_id) as s:
+            instance_id = (
+                await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
+            ).scalar_one()
+            sess, _ = await resolve_or_open_session(
+                s,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                channel=channel,
+                resolved_lead_id=None,
+            )
+            orch = Orchestrator(
+                session=s,
+                router=router,
+                retriever=retriever,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                enabled_channels=enabled_channels,
+                business_context="We sell refurbished gadgets.",
+                has_payment_method=False,
+                tool_resolver=tool_resolver,
+            )
+            return await orch.run_turn(
+                session_id=sess.id,
+                resolved_lead_id=None,
+                channel=channel,
+                mode=sess.mode,
+                inbound_text=inbound,
+            )
     finally:
         await dispose_engine()
 
@@ -571,15 +576,13 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
         )
         replies[channel] = res.reply_text
 
-    parity_ok = all(
-        GROUNDED_TOKEN in v and not v.startswith("Echo:") for v in replies.values()
-    )
+    parity_ok = all(GROUNDED_TOKEN in v and not v.startswith("Echo:") for v in replies.values())
     ok = disclosure_ok and parity_ok
     r.record(
         "T6 row11-channel-parity-and-disclosure",
         ok,
         f"disclosure={disclosure_ok} parity={parity_ok} "
-        f"widget={replies.get('widget','')[:60]!r} email={replies.get('email','')[:60]!r}",
+        f"widget={replies.get('widget', '')[:60]!r} email={replies.get('email', '')[:60]!r}",
     )
 
 
@@ -593,20 +596,26 @@ def main() -> int:
     # Seed two synthetic tenants: a primary (happy-path / parity / fail-safe) and a
     # dedicated free-cap tenant (driven to its conversation cap in T2).
     main_tenant = Tenant("main")
-    main_tenant.seed()
-    main_admin_id = asyncio.run(_admin_id_for(main_tenant.email))
-
     cap_tenant = Tenant("cap")
-    cap_tenant.seed()
+    try:
+        main_tenant.seed()
+        main_admin_id = asyncio.run(_admin_id_for(main_tenant.email))
+        cap_tenant.seed()
 
-    # T1, T3, T4, T5, T6 do not consume the free cap; run them on the main tenant.
-    test_happy_path(r, main_tenant)
-    test_llm_cap_per_minute(r)
-    test_failsafe_escalation(r, main_admin_id)
-    test_fallback_failover(r)
-    test_channel_parity_and_disclosure(r, main_tenant, main_admin_id)
-    # T2 last: it exhausts the cap tenant's free allowance.
-    test_free_cap_zero_llm(r, cap_tenant)
+        # T1, T3, T4, T5, T6 do not consume the free cap; run them on the main tenant.
+        test_happy_path(r, main_tenant)
+        test_llm_cap_per_minute(r)
+        test_failsafe_escalation(r, main_admin_id)
+        test_fallback_failover(r)
+        test_channel_parity_and_disclosure(r, main_tenant, main_admin_id)
+        # T2 last: it exhausts the cap tenant's free allowance.
+        test_free_cap_zero_llm(r, cap_tenant)
+    finally:
+        # 2026-09-05 audit F179: the synthetic tenants never outlive the run. Every
+        # earlier run left two accounts (and their Luciels, sessions and secrets)
+        # behind in the environment. LUCIEL_SEEDTEST_KEEP=1 keeps them for debugging.
+        if os.environ.get("LUCIEL_SEEDTEST_KEEP") != "1":
+            asyncio.run(_teardown([main_tenant, cap_tenant]))
 
     print(f"[seedtest] {r.summary()}", flush=True)
     if r.any_failed():
@@ -614,6 +623,43 @@ def main() -> int:
         return 1
     print("[seedtest] §10 live-behavior harness: all checks PASS.", flush=True)
     return 0
+
+
+async def _teardown(tenants: list[Tenant]) -> None:
+    """Hard-purge the synthetic tenants this run created (F179): the Luciel-scope
+    cascade plus the billing identity and the account shell — the same destruction the
+    account purge paths run, on rows only this run ever knew about."""
+    from app.db.session import tenant_session
+    from app.lifecycle.cascade import hard_delete_cascade
+    from app.models.instance import Account
+    from sqlalchemy import delete as sa_delete
+
+    for tenant in tenants:
+        if not tenant.embed_key and not tenant.email:
+            continue
+        try:
+            admin_id = await _admin_id_for(tenant.email)
+        except Exception as exc:  # noqa: BLE001 — never seeded; nothing to purge
+            print(
+                f"[seedtest] teardown: {tenant.role} was never seeded ({type(exc).__name__})",
+                flush=True,
+            )
+            continue
+        try:
+            async with tenant_session(admin_id) as s:
+                counts = await hard_delete_cascade(s, admin_id, include_account_scope=True)
+                await s.execute(sa_delete(Account).where(Account.id == admin_id))
+            rows = sum(counts.values())
+            print(
+                f"[seedtest] teardown: purged synthetic tenant '{tenant.role}' ({rows} rows)",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — report, never mask the test result
+            print(
+                f"::warning::seedtest teardown could not purge '{tenant.role}': "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
 
 async def _admin_id_for(email: str) -> uuid.UUID:
