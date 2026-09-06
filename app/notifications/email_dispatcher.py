@@ -412,7 +412,10 @@ async def send_deferred_abandon_notice(
     The abandon used to be audit-only (flagged in the queue's own docstring):
     "abandoned WITH an owner notification" was a promise the audit page kept and
     the inbox did not. Escalation retries get the hot-lead wording."""
-    if action_type == "escalation_retry":
+    # The queue files escalation retries under ``escalation_notification`` (the
+    # dispatch module's constant); the legacy ``escalation_retry`` spelling is kept so
+    # an item queued under it still gets the hot-lead wording (2026-09-05 audit).
+    if action_type in ("escalation_retry", "escalation_notification"):
         ref = f" (conversation #{conversation_ref})" if conversation_ref else ""
         body = (
             "VantageMind could not deliver an escalation alert after retrying for 24 "

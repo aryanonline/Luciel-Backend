@@ -231,6 +231,15 @@ async def two_tenants() -> tuple[uuid.UUID, uuid.UUID]:
 
 
 @pytest.fixture(autouse=True)
+def _no_background_escalation_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-process escalation retry ladder (F065) sleeps 30s/2m on the event loop;
+    tests that want it set ``ESCALATION_RETRY_DELAYS`` themselves and drain it."""
+    from app.notifications import escalation_dispatch
+
+    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", ())
+
+
+@pytest.fixture(autouse=True)
 def _reset_rate_limiter() -> None:
     """Reset the module-global rate-limit store so token buckets / auto-blocks do
     not leak across tests (the limiter is a process singleton in app code)."""

@@ -134,3 +134,11 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
     fired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # What happened to the owner notification for this row (2026-09-05 audit F079):
+    # pending → delivered | owner_fallback | queued | failed. Rows from before the
+    # column existed read ``unknown`` — never a fabricated ``delivered``.
+    delivery_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="unknown"
+    )
+    delivery_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

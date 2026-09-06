@@ -31,12 +31,14 @@ in it will look exactly the same tomorrow, so that one is reported once and not 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -58,6 +60,19 @@ DEFAULT_CHANNEL = "email"
 
 #: The deferred-queue ``action_type`` a retried escalation notification travels under.
 ESCALATION_RETRY_ACTION = "escalation_notification"
+
+#: In-process retry ladder (2026-09-05 audit F065): seconds after a refusal at which
+#: THIS process tries again before the hourly deferred sweep takes over. A hot lead
+#: cannot wait an hour on a provider blip. Tests set it to () or (0,).
+ESCALATION_RETRY_DELAYS: tuple[float, ...] = (30.0, 120.0)
+_BACKGROUND_RETRIES: set[asyncio.Task[None]] = set()
+
+#: ``escalation_events.delivery_status`` vocabulary (migration 0057).
+DELIVERY_PENDING = "pending"
+DELIVERY_DELIVERED = "delivered"  # a CONFIGURED contact heard
+DELIVERY_OWNER_FALLBACK = "owner_fallback"  # only the account owner heard so far
+DELIVERY_QUEUED = "queued"  # nobody yet; the deferred queue / ladder own it
+DELIVERY_FAILED = "failed"  # terminal
 
 
 @dataclass(frozen=True)
@@ -116,8 +131,9 @@ async def _deliver(
     channel: str,
     to: str,
     role: str,
-) -> bool:
-    """One attempt to one contact, fully audited (§3.5.5). Returns whether it landed."""
+) -> DeliveryReceipt:
+    """One attempt to one contact, fully audited (§3.5.5). Returns the receipt: whether
+    it landed and, when it did not, the reason (the retry decision hangs on it)."""
     adapter = _ADAPTERS[channel]
     if not adapter.verify_config(to):
         receipt = DeliveryReceipt(accepted=False, detail="malformed_contact")
@@ -144,7 +160,163 @@ async def _deliver(
             "failure_reason": receipt.detail if not receipt.accepted else None,
         },
     )
-    return receipt.accepted
+    return receipt
+
+
+async def _stamp_delivery(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    status: str,
+    detail: str | None = None,
+) -> None:
+    """Record what happened to the notification on its escalation row (F079/F083)."""
+    values: dict[str, object] = {
+        "delivery_status": status,
+        "delivery_detail": (detail or None) and str(detail)[:64],
+    }
+    if status == DELIVERY_DELIVERED:
+        values["delivered_at"] = datetime.now(UTC)
+    await session.execute(
+        update(EscalationEvent)
+        .where(
+            EscalationEvent.admin_id == admin_id,
+            EscalationEvent.session_id == session_id,
+            EscalationEvent.signal == signal,
+            EscalationEvent.gate == gate,
+        )
+        .values(**values)
+    )
+
+
+async def delivery_status_of(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID, signal: str, gate: str
+) -> str | None:
+    return (
+        await session.execute(
+            select(EscalationEvent.delivery_status).where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _enqueue_retry(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    contacts_only: bool,
+) -> None:
+    from app.connections import deferred_queue  # noqa: PLC0415
+
+    await deferred_queue.enqueue(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        action_type=ESCALATION_RETRY_ACTION,
+        connection_type=deferred_queue.PLATFORM_NOTIFICATION,
+        resolved_lead_id=resolved_lead_id,
+        payload={
+            "session_id": str(session_id),
+            "signal": signal,
+            "gate": gate,
+            "score": score,
+            "contacts_only": contacts_only,
+        },
+    )
+
+
+def _schedule_background_retries(
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    contacts_only: bool,
+) -> None:
+    """Start the in-process ladder (F065) — never awaited by the lead's turn."""
+    if not ESCALATION_RETRY_DELAYS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(
+        _background_retry(
+            admin_id=admin_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=gate,
+            score=score,
+            contacts_only=contacts_only,
+        )
+    )
+    _BACKGROUND_RETRIES.add(task)
+    task.add_done_callback(_BACKGROUND_RETRIES.discard)
+
+
+async def _background_retry(
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    contacts_only: bool,
+) -> None:
+    from app.db.session import tenant_session  # noqa: PLC0415
+
+    for delay in ESCALATION_RETRY_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            async with tenant_session(admin_id) as s:
+                status = await delivery_status_of(
+                    s, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+                )
+                if status == DELIVERY_DELIVERED:
+                    return
+                if await notify_escalation(
+                    s,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=signal,
+                    gate=gate,
+                    score=score,
+                    queue_retry=False,
+                    contacts_only=contacts_only,
+                ):
+                    return
+        except Exception:  # noqa: BLE001 — the ladder is best-effort; the queue remains
+            _LOG.exception(
+                "escalation retry ladder attempt failed: signal=%s session=%s", signal, session_id
+            )
+
+
+async def drain_background_retries() -> None:
+    """Await every in-process retry ladder currently running (tests / shutdown)."""
+    while _BACKGROUND_RETRIES:
+        await asyncio.gather(*list(_BACKGROUND_RETRIES), return_exceptions=True)
 
 
 async def _build_notification(
@@ -248,13 +420,16 @@ async def notify_escalation(
     gate: str,
     score: float | None = None,
     queue_retry: bool = True,
+    contacts_only: bool = False,
 ) -> bool:
     """Notify the configured contact(s) that an escalation fired (§3.5.3).
 
     Returns whether anything reached anyone. ``queue_retry=False`` is what the deferred
-    sweep passes when it is REPLAYING a queued notification: the queue already owns the
-    backoff, and a retry that re-enqueues on failure would fork a new 24h TTL on every
-    pass and never abandon.
+    sweep and the in-process ladder pass when they are REPLAYING a notification: the
+    queue already owns the backoff, and a retry that re-enqueues on failure would fork a
+    new 24h TTL on every pass and never abandon. ``contacts_only`` is the replay of a
+    notification the OWNER already received as a fallback (F083): the configured
+    contact is tried again, the owner is never paged a second time for it.
     """
     notification, inst, owner_email = await _build_notification(
         session,
@@ -291,6 +466,7 @@ async def notify_escalation(
     delivered = False
     delivered_unverified = False
     attempted: set[tuple[str, str]] = set()
+    last_refusal: str | None = None  # a provider refusal that could clear on its own
     for role, contact in (("primary", routing.primary), ("secondary", routing.secondary)):
         if not contact:
             continue
@@ -322,14 +498,30 @@ async def notify_escalation(
             )
             continue
         attempted.add((routing.channel, contact))
-        delivered = await _deliver(
+        receipt = await _deliver(
             session, notification, channel=routing.channel, to=contact, role=role
         )
+        delivered = receipt.accepted
         if delivered:
             delivered_unverified = routing.channel == "email" and not is_verified(
                 _state_of(contact)
             )
+            await _stamp_delivery(
+                session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=signal,
+                gate=gate,
+                status=DELIVERY_DELIVERED,
+                detail=f"{routing.channel}:{role}",
+            )
             break
+        last_refusal = receipt.detail or "refused"
+
+    if contacts_only:
+        # The owner already heard (fallback); this replay is for the configured
+        # contact alone. Nothing below may page the owner again.
+        return delivered
 
     # cc-owner-email is fan-out, not fallback: it goes out even on a successful primary.
     if routing.cc_owner_email and owner_email and ("email", owner_email) not in attempted:
@@ -369,9 +561,31 @@ async def notify_escalation(
         # dedupe: an empty set below means "there was nowhere to send this", and a
         # fallback that was tried and refused is a refusal, not an absence.
         attempted.add(("email", owner_email))
-        if await _deliver(
-            session, notification, channel="email", to=owner_email, role="owner_fallback"
-        ):
+        if is_suppressed(_state_of(owner_email)):
+            # The owner's own address is bouncing / complained (audit F089): the
+            # fallback would die exactly like the contact did. Say so, and let the
+            # queue keep trying the contact rather than pretending the owner heard.
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="escalation_delivery_failed",
+                actor_type=ActorType.platform,
+                payload={
+                    "signal": signal,
+                    "gate": gate,
+                    "conversation_ref": notification.conversation_ref,
+                    "delivery_method": "email",
+                    "recipient": owner_email,
+                    "recipient_role": "owner_fallback",
+                    "failure_reason": "owner_email_suppressed",
+                },
+            )
+        elif (
+            await _deliver(
+                session, notification, channel="email", to=owner_email, role="owner_fallback"
+            )
+        ).accepted:
             await audit.emit(
                 session,
                 admin_id=admin_id,
@@ -390,6 +604,40 @@ async def notify_escalation(
                     "configured_channel": routing.channel,
                 },
             )
+            await _stamp_delivery(
+                session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=signal,
+                gate=gate,
+                status=DELIVERY_OWNER_FALLBACK,
+                detail=last_refusal or "no_contact_configured",
+            )
+            if queue_retry and last_refusal is not None:
+                # The owner heard, but the person the owner CONFIGURED did not (audit
+                # F083): keep trying that contact — contacts only, the owner is never
+                # paged twice for one escalation.
+                await _enqueue_retry(
+                    session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=signal,
+                    gate=gate,
+                    score=score,
+                    contacts_only=True,
+                )
+                _schedule_background_retries(
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=signal,
+                    gate=gate,
+                    score=score,
+                    contacts_only=True,
+                )
             return True
     if not attempted:
         # No contact anywhere, not even an owner email: record it as a failure so the
@@ -410,25 +658,50 @@ async def notify_escalation(
                 "failure_reason": "no_contact_configured",
             },
         )
+        await _stamp_delivery(
+            session,
+            admin_id=admin_id,
+            session_id=session_id,
+            signal=signal,
+            gate=gate,
+            status=DELIVERY_FAILED,
+            detail="no_contact_configured",
+        )
         return False
 
     if queue_retry:
         # Contacts existed and every send was refused — the provider blip case (P1-6).
-        from app.connections import deferred_queue
-
-        await deferred_queue.enqueue(
+        # The deferred queue owns the long tail; the in-process ladder (F065) owns the
+        # next few minutes.
+        await _enqueue_retry(
             session,
             admin_id=admin_id,
             instance_id=instance_id,
-            action_type=ESCALATION_RETRY_ACTION,
-            connection_type=deferred_queue.PLATFORM_NOTIFICATION,
+            session_id=session_id,
             resolved_lead_id=resolved_lead_id,
-            payload={
-                "session_id": str(session_id),
-                "signal": signal,
-                "gate": gate,
-                "score": score,
-            },
+            signal=signal,
+            gate=gate,
+            score=score,
+            contacts_only=False,
+        )
+        await _stamp_delivery(
+            session,
+            admin_id=admin_id,
+            session_id=session_id,
+            signal=signal,
+            gate=gate,
+            status=DELIVERY_QUEUED,
+            detail=last_refusal or "refused",
+        )
+        _schedule_background_retries(
+            admin_id=admin_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=gate,
+            score=score,
+            contacts_only=False,
         )
     return False
 
@@ -448,17 +721,58 @@ async def replay_queued_notification(
     if not isinstance(session_id, str) or not isinstance(signal, str) or not isinstance(gate, str):
         return False
     score = action_payload.get("score")
+    sid = uuid.UUID(session_id)
+    # The in-process ladder (F065) may already have reached the contact while this item
+    # waited its backoff: a second page for the same escalation is noise, not delivery.
+    if (
+        await delivery_status_of(
+            session, admin_id=admin_id, session_id=sid, signal=signal, gate=gate
+        )
+        == DELIVERY_DELIVERED
+    ):
+        return True
     return await notify_escalation(
         session,
         admin_id=admin_id,
         instance_id=instance_id,
-        session_id=uuid.UUID(session_id),
+        session_id=sid,
         resolved_lead_id=resolved_lead_id,
         signal=signal,
         gate=gate,
         score=score if isinstance(score, (int, float)) else None,
         queue_retry=False,
+        contacts_only=bool(action_payload.get("contacts_only")),
     )
+
+
+async def mark_abandoned(session: AsyncSession, action_payload: Mapping[str, object]) -> None:
+    """The deferred queue gave up on this notification (24h TTL): the row's delivery
+    truth becomes terminal — unless the owner already heard through the fallback, in
+    which case ``owner_fallback`` stays the honest answer."""
+    session_id = action_payload.get("session_id")
+    signal = action_payload.get("signal")
+    gate = action_payload.get("gate")
+    if not isinstance(session_id, str) or not isinstance(signal, str) or not isinstance(gate, str):
+        return
+    admin_id = action_payload.get("admin_id")
+    row = (
+        await session.execute(
+            select(EscalationEvent).where(
+                EscalationEvent.session_id == uuid.UUID(session_id),
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+                *(
+                    [EscalationEvent.admin_id == uuid.UUID(admin_id)]
+                    if isinstance(admin_id, str)
+                    else []
+                ),
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or row.delivery_status not in (DELIVERY_PENDING, DELIVERY_QUEUED, "unknown"):
+        return
+    row.delivery_status = DELIVERY_FAILED
+    row.delivery_detail = "abandoned_after_24h"
 
 
 async def notify_escalation_safely(
@@ -489,7 +803,47 @@ async def notify_escalation_safely(
             gate=gate,
             score=score,
         )
-    except Exception:  # noqa: BLE001 — never propagate into the lead's turn
+    except Exception as exc:  # noqa: BLE001 — never propagate into the lead's turn
         _LOG.exception(
             "escalation notification failed: signal=%s gate=%s session=%s", signal, gate, session_id
         )
+        # A crash in the notifier is still a hot lead nobody was told about (audit F088):
+        # leave the same trail a refused send leaves, and hand it to the queue.
+        try:
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="escalation_delivery_failed",
+                actor_type=ActorType.platform,
+                payload={
+                    "signal": signal,
+                    "gate": gate,
+                    "session_id": str(session_id),
+                    "failure_reason": f"notifier_exception:{type(exc).__name__}",
+                },
+            )
+            await _enqueue_retry(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=signal,
+                gate=gate,
+                score=score,
+                contacts_only=False,
+            )
+            await _stamp_delivery(
+                session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=signal,
+                gate=gate,
+                status=DELIVERY_QUEUED,
+                detail=f"notifier_exception:{type(exc).__name__}"[:64],
+            )
+        except Exception:  # noqa: BLE001
+            _LOG.exception(
+                "escalation notification failure could not be recorded: session=%s", session_id
+            )

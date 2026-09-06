@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -308,14 +309,20 @@ async def _record_escalation(
     signal: str,
     gate: str,
     score: float | None,
-) -> None:
+) -> bool:
     """Write the escalation_events row + the audit event, then notify (§3.5.2 / §5.2).
 
     The row is written and flushed FIRST: it is the authoritative record and delivery is
     best-effort against it (§3.5.2). Notification never blocks or breaks the lead's turn
-    (§3.5.4)."""
-    session.add(
-        EscalationEvent(
+    (§3.5.4).
+
+    ONCE per (session, signal, gate): the insert itself is the arbiter (unique index
+    ``uq_escalation_once``, 2026-09-05 audit F053/F061) — a pre-check-then-insert let
+    two turns racing on the same session page the owner twice. Returns whether this
+    call wrote the row; a loser writes nothing and notifies nobody."""
+    inserted = await session.execute(
+        pg_insert(EscalationEvent)
+        .values(
             escalation_id=uuid.uuid4(),
             admin_id=admin_id,
             instance_id=instance_id,
@@ -324,8 +331,15 @@ async def _record_escalation(
             signal=signal,
             gate=gate,
             score_or_confidence=score,
+            delivery_status="pending",
+        )
+        .on_conflict_do_nothing(
+            index_elements=["admin_id", "session_id", "signal", "gate"],
+            index_where=EscalationEvent.session_id.isnot(None),
         )
     )
+    if inserted.rowcount == 0:  # type: ignore[attr-defined]  # a racing turn already wrote it
+        return False
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -346,6 +360,7 @@ async def _record_escalation(
         gate=gate,
         score=score,
     )
+    return True
 
 
 @dataclass

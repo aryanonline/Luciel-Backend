@@ -166,3 +166,28 @@ def log_resolved_bindings() -> None:
         )
         return
     logger.info("integration_mode=%s degraded_bindings=%s", mode, ", ".join(degraded) or "none")
+
+
+async def escalation_backlog() -> dict[str, int] | None:
+    """Escalation notifications nobody has heard yet, platform-wide (audit F079).
+
+    ``queued`` — retries the deferred queue still owns; ``failed24h`` — terminal misses
+    in the last day. Read through the SECURITY DEFINER ``platform_escalation_backlog()``
+    (migration 0057) so the app role never gains cross-tenant SELECT. ``None`` when the
+    count could not be taken — an unknown backlog is reported as unknown, never as 0.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.db.session import untenanted_session  # noqa: PLC0415
+
+    try:
+        async with untenanted_session() as s:
+            row = (
+                await s.execute(
+                    text("SELECT queued, failed_24h FROM platform_escalation_backlog()")
+                )
+            ).one()
+    except Exception:  # noqa: BLE001 — health must not raise
+        logger.warning("escalation backlog could not be read", exc_info=True)
+        return None
+    return {"queued": int(row[0] or 0), "failed24h": int(row[1] or 0)}

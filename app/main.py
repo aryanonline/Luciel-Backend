@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.runtime.integration_status import (
     database_unreachable_reason,
     degraded_bindings,
+    escalation_backlog,
     log_resolved_bindings,
 )
 
@@ -108,10 +109,15 @@ def create_app() -> FastAPI:
         # deployment circuit breaker roll back a perfectly good release because a
         # dependency blipped. Restarting a task has never fixed an unreachable
         # database. So liveness keeps its 200 and the BODY carries the truth.
+        # Escalation notifications nobody has heard yet (audit F079): a number, not a
+        # ``degraded`` entry — that list gates deploys on binding truth, this is an
+        # operations signal. ``None`` when the database is unreachable.
+        backlog = await escalation_backlog() if database_reason is None else None
         return {
             "status": "ok" if database_reason is None else "degraded",
             "integrationMode": settings.integration_mode,
             "degraded": degraded,
+            "escalationBacklog": backlog,
         }
 
     # v1 routers (mounted as arcs land).

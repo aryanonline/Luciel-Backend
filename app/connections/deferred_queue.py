@@ -347,6 +347,11 @@ async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction)
     was never told", and burying the terminal miss inside a generic connection event
     would leave it findable only by someone who already knew to look."""
     escalation = action.action_type == escalation_dispatch.ESCALATION_RETRY_ACTION
+    if escalation:
+        # The row's delivery truth turns terminal with the abandon (F079).
+        await escalation_dispatch.mark_abandoned(
+            session, {**(action.payload or {}), "admin_id": str(action.admin_id)}
+        )
     await audit.emit(
         session,
         admin_id=action.admin_id,
