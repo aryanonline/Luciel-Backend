@@ -149,7 +149,9 @@ async def test_email_reply_sends_from_the_tenants_own_address(email_sender):
     assert result.provider_message_id == "ses-1"
     assert email_sender.sent[0]["to"] == LEAD_EMAIL
     assert email_sender.sent[0]["from_address"] == TENANT_EMAIL
-    assert email_sender.sent[0]["body"] == "We open at 9."
+    # The answer leads; the AI-identity / opt-out / privacy footer follows (F073 —
+    # pinned in tests/unit/test_outbound_health_gates.py).
+    assert email_sender.sent[0]["body"].startswith("We open at 9.")
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

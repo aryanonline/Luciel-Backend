@@ -13,13 +13,18 @@ Two families live here:
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import ConfigDict, EmailStr, Field
+from pydantic import ConfigDict, EmailStr, Field, field_validator
 
 from app.schemas_api.common import WireModel
+
+# International format (country code first, 8–15 digits) — the only shape Twilio can
+# deliver an escalation text to (2026-09-05 audit F084).
+_E164 = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
 class StrictWireModel(WireModel):
@@ -273,6 +278,19 @@ class UpdateToolsRequest(StrictWireModel):
     tools: list[AddonToolIn]
 
 
+class TestSmsRequest(StrictWireModel):
+    """POST /admin/luciel/escalation/test-sms — which saved SMS contact to text."""
+
+    which: Literal["primary", "secondary"]
+
+
+class TestSmsResult(WireModel):
+    """Outcome of a test text: whether the tenant's own number could deliver it."""
+
+    delivered: bool
+    detail: str | None = None
+
+
 class UpdateEscalationRequest(StrictWireModel):
     # Only who/how is editable — contacts + per-signal routing channel + ccOwner. The set
     # of signals themselves is NOT a field here (it is fixed in code), so an admin cannot
@@ -288,6 +306,25 @@ class UpdateEscalationRequest(StrictWireModel):
     secondary_sms: str | None = None
     preferred_channel: NotificationChannelWire | None = None
     routing: list[EscalationRoutingRuleIn] | None = None
+
+    # E.164 at save time (2026-09-05 audit F084): a contact number that could never
+    # receive a text was accepted as-is and the first real escalation was the detector.
+    # Spaces, dashes, dots and brackets are stripped; the stored form is +digits.
+    @field_validator("primary_sms", "secondary_sms", mode="before")
+    @classmethod
+    def _e164(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        raw = str(value)
+        # Formatting is forgiven; anything else (letters, an "x123" extension) is
+        # refused — an extension cannot receive a text.
+        cleaned = "".join(ch for ch in raw if ch not in " -.()\t")
+        if not _E164.match(cleaned):
+            raise ValueError(
+                "Enter the number in international format, e.g. +16045551234 "
+                "(country code first, digits only)."
+            )
+        return cleaned
 
 
 class UpdatePersonalityRequest(StrictWireModel):

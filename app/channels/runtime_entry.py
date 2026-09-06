@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import metering
 from app.channels.base import InboundMessage
-from app.models.instance import Instance, is_paused
+from app.models.instance import Instance, channel_enabled, is_paused
 from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.provider_factory import build_llm_router
@@ -55,6 +55,12 @@ class RuntimeReply:
     reply_text: str
     render_state: str  # active | paused | at_cap
     session_id: str
+    #: The turn opened this session (first message of a new conversation, §3.4.8) —
+    #: what the SMS edge keys the one-time AI-identity + STOP notice on (F064).
+    is_new_session: bool = False
+    #: A person holds the conversation (§3.4.12): no auto-reply went out, and none
+    #: must be fabricated by the caller (F057).
+    handed_off: bool = False
 
 
 def names(inst: Instance) -> tuple[str, str]:
@@ -126,12 +132,28 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         if draining is None:
             return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
+    # A channel the owner switched OFF admits no NEW conversation (audit F058); a
+    # conversation already in flight when it was switched off finishes on its channel
+    # (§3.8.7 rule E.1 — the safety half of a config change never cuts a lead off
+    # mid-sentence). Same drain gate as pause: an existing live session only.
+    if not channel_enabled(inst, msg.channel):
+        draining = await find_open_session(
+            session,
+            admin_id=msg.admin_id,
+            instance_id=msg.instance_id,
+            channel=msg.channel,
+            session_id=msg.session_id,
+            participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
+        )
+        if draining is None:
+            return RuntimeReply(reply_text="", render_state="paused", session_id="")
+
     # Conversation = ONE billed session (§3.4.8). The transport identifier the adapter
     # already resolved (From number / from_address / Meta-scoped id) is the session key,
     # so a thread's later messages land in the SAME session inside the channel's
     # inactivity window instead of opening — and billing — a new conversation per
     # message (the owner-reported 10-texts-=-10-conversations defect).
-    sess, _is_new = await resolve_or_open_session(
+    sess, is_new = await resolve_or_open_session(
         session,
         admin_id=msg.admin_id,
         instance_id=msg.instance_id,
@@ -186,8 +208,14 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         received_at=msg.received_at,
     )
 
+    # The graceful at-cap line is the AT-CAP reply, nothing else's: a human-controlled
+    # session returns an empty reply on purpose (§3.4.12 — the person answers, not
+    # Luciel), and coalescing it into the at-cap text fabricated a bot line on every
+    # channel during every takeover (audit F057/F145).
     return RuntimeReply(
-        reply_text=result.reply_text or AT_CAP_REPLY,
+        reply_text=result.reply_text or (AT_CAP_REPLY if result.at_cap else ""),
         render_state="at_cap" if result.at_cap else "active",
         session_id=str(sess.id),
+        is_new_session=is_new,
+        handed_off=result.handed_off,
     )

@@ -50,7 +50,15 @@ async def _seed_active_instance() -> tuple[uuid.UUID, uuid.UUID]:
                 name="Sarah Chen",
                 state=LucielState.active,
                 embed_key_public_id=f"vm_live_{admin.hex[:8]}",
-                channels=[],
+                # The channels these webhooks exercise are ON (a switched-off channel
+                # admits no new conversation — tests/unit/test_channel_enabled_gate.py).
+                channels=[
+                    {"id": "sms", "enabled": True},
+                    {"id": "voice", "enabled": True},
+                    {"id": "whatsapp", "enabled": True},
+                    {"id": "messenger", "enabled": True},
+                    {"id": "instagram", "enabled": True},
+                ],
                 tools=[],
                 escalation={},
                 personality={},

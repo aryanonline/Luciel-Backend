@@ -24,6 +24,7 @@ from app.channels.base import (
     OutboundMessage,
 )
 from app.channels.signatures import verify_hmac_shared_secret
+from app.channels.sms_adapter import classify_keyword
 from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
 
 
@@ -86,6 +87,14 @@ class MetaMessagingAdapter:
             raise InboundRejected("meta_no_message")
         event = parsed["event"]
         body = (event.get("message") or {}).get("text", "")
+        metadata: dict[str, Any] = {
+            "mid": (event.get("message") or {}).get("mid"),
+            "destination_id": parsed["entry"].get("id"),
+        }
+        # STOP/START/HELP on Messenger / Instagram too (audit F074).
+        keyword = classify_keyword(body)
+        if keyword is not None:
+            metadata["opt_keyword"] = keyword
         return InboundMessage(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
@@ -93,10 +102,7 @@ class MetaMessagingAdapter:
             session_id=None,
             customer_identifier=(event.get("sender") or {}).get("id", ""),
             body=body,
-            channel_metadata={
-                "mid": (event.get("message") or {}).get("mid"),
-                "destination_id": parsed["entry"].get("id"),
-            },
+            channel_metadata=metadata,
             received_at=datetime.now(UTC),
         )
 

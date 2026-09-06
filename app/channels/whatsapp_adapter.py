@@ -25,6 +25,7 @@ from app.channels.base import (
     OutboundMessage,
 )
 from app.channels.signatures import verify_hmac_shared_secret
+from app.channels.sms_adapter import classify_keyword
 
 
 class MetaSender(Protocol):
@@ -105,6 +106,15 @@ class WhatsAppAdapter:
         msg = parsed["message"]
         # WhatsApp text lives at message.text.body; the sender is message.from (E.164).
         body = (msg.get("text") or {}).get("body", "")
+        metadata: dict[str, Any] = {
+            "wa_message_id": msg.get("id"),
+            "phone_number_id": parsed["value"].get("metadata", {}).get("phone_number_id"),
+        }
+        # STOP/START/HELP on WhatsApp too (audit F074): no carrier answers these here,
+        # so the platform records consent and confirms (inbound_dispatch).
+        keyword = classify_keyword(body)
+        if keyword is not None:
+            metadata["opt_keyword"] = keyword
         return InboundMessage(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
@@ -112,10 +122,7 @@ class WhatsAppAdapter:
             session_id=None,
             customer_identifier=msg.get("from", ""),
             body=body,
-            channel_metadata={
-                "wa_message_id": msg.get("id"),
-                "phone_number_id": parsed["value"].get("metadata", {}).get("phone_number_id"),
-            },
+            channel_metadata=metadata,
             received_at=datetime.now(UTC),
         )
 

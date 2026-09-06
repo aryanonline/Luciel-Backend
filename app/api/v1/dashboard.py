@@ -202,14 +202,24 @@ async def send_human_message(
             ).scalar_one_or_none()
             recipient = lead.contact_identifier if lead is not None else None
 
-        result = await outbound.send_outbound_reply(
-            s,
-            admin_id=subject.admin_id,
-            instance_id=sess.instance_id,
-            channel=sess.channel,
-            to=recipient,
-            body=body.text,
-        )
+        if sess.channel == "voice":
+            # A voice conversation has no text transport of its own: the reply reaches
+            # the caller as an SMS on the tenant's number (owner decision 2026-09-05).
+            # Honest on both sides — gated on the SMS channel being switched on and the
+            # number being connected/attested, and LABELLED as a text so the owner never
+            # believes the caller heard it on the call (audit F150).
+            result = await _bridge_voice_reply_to_sms(
+                s, admin_id=subject.admin_id, sess=sess, to=recipient, body=body.text
+            )
+        else:
+            result = await outbound.send_outbound_reply(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=sess.instance_id,
+                channel=sess.channel,
+                to=recipient,
+                body=body.text,
+            )
         await audit.emit(
             s,
             admin_id=subject.admin_id,
@@ -226,7 +236,9 @@ async def send_human_message(
                 "delivery_detail": result.detail,
             },
         )
-        detail = result.detail if not result.delivered else None
+        # A delivered reply may still carry a detail the owner must see (the voice→SMS
+        # bridge); an undelivered one always does.
+        detail = result.detail if (not result.delivered or result.detail) else None
         return HumanReplyResult(
             message=MessageOut(message_id=row.id, role="human_agent", text=row.text, at=row.at),
             delivered=result.delivered,
@@ -234,11 +246,58 @@ async def send_human_message(
         )
 
 
+async def _bridge_voice_reply_to_sms(
+    s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel, to: str | None, body: str
+) -> outbound.OutboundResult:
+    from app.channels.phone_lifecycle import sms_number_status  # noqa: PLC0415
+    from app.models.instance import Instance, channel_enabled  # noqa: PLC0415
+
+    inst = (await s.execute(select(Instance).where(Instance.id == sess.instance_id))).scalar_one()
+    # A text that starts from the business (no inbound text first) is the case A2P
+    # registration governs: the bridge needs the channel ON and the number ATTESTED
+    # (`connected`), not merely operable-and-pending.
+    attested = (
+        await sms_number_status(s, admin_id=admin_id, instance_id=sess.instance_id)
+    ) == "connected"
+    if not channel_enabled(inst, "sms") or not attested:
+        return outbound.OutboundResult(
+            channel="voice", delivered=False, detail="voice_reply_requires_sms"
+        )
+    result = await outbound.send_outbound_reply(
+        s, admin_id=admin_id, instance_id=sess.instance_id, channel="sms", to=to, body=body
+    )
+    if result.delivered:
+        return outbound.OutboundResult(
+            channel="voice",
+            delivered=True,
+            provider_message_id=result.provider_message_id,
+            detail="voice_bridged_to_sms",
+        )
+    if result.detail == "sms_sender_not_operable":
+        return outbound.OutboundResult(
+            channel="voice", delivered=False, detail="voice_reply_requires_sms"
+        )
+    return outbound.OutboundResult(channel="voice", delivered=False, detail=result.detail)
+
+
 # The adapter can return a provider-specific failure string (e.g. "twilio_error:...").
 # The wire vocabulary is a closed set, so anything unrecognized collapses to send_failed
 # — the admin learns it did not go out; the provider detail stays in the audit log.
 _WIRE_DELIVERY_DETAILS = frozenset(
-    {"widget_poll_only", "no_recipient", "channel_not_provisioned", "unsupported_channel"}
+    {
+        "widget_poll_only",
+        "no_recipient",
+        "channel_not_provisioned",
+        "unsupported_channel",
+        # Voice takeover replies (audit F150): went out as a TEXT to the caller, or
+        # could not because SMS is off / the number is not connected+attested.
+        "voice_bridged_to_sms",
+        "voice_reply_requires_sms",
+        # Health-gated senders (F070).
+        "sms_sender_not_operable",
+        "email_sender_not_connected",
+        "mailbox_reconnect_needed",
+    }
 )
 
 

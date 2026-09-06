@@ -51,6 +51,11 @@ def classify_keyword(body: str) -> str | None:
     return None
 
 
+#: Prepended to the FIRST outbound text of a conversation (§3.4.16 AI identity +
+#: carrier opt-out rules): the SMS edge stamps it on a new session's first reply.
+SMS_FIRST_MESSAGE_NOTICE = "AI assistant. Reply STOP to opt out."
+
+
 class SmsSender(Protocol):
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None: ...
 
@@ -115,9 +120,7 @@ class SmsAdapter:
         body = message.body
         # First message of a new conversation prepends AI-identity + STOP notice (§3.4.16).
         if message.metadata.get("is_first_of_conversation"):
-            notice = message.metadata.get(
-                "ai_identity_notice", "AI assistant. Reply STOP to opt out."
-            )
+            notice = message.metadata.get("ai_identity_notice", SMS_FIRST_MESSAGE_NOTICE)
             body = f"{notice}\n{body}"
         try:
             sid = await self._sender.send_sms(from_number, message.to, body)

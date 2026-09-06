@@ -58,6 +58,12 @@ from app.runtime.sessions import (
 )
 from app.runtime.speech import SpeechError, SpeechToText, TextToSpeech
 
+# Spoken when a person holds the call and Luciel has nothing to relay (§3.4.12): an
+# honest hand-off, never a fabricated "I've passed that along" (2026-09-05 audit F057).
+VOICE_HANDOFF_LINE = (
+    "Thanks for calling. A member of the team has your details and will follow up with you shortly."
+)
+
 # Voice replies stay short — long answers switch channel or get truncated for speech
 # (§3.4.2 voice shaping). A hard spoken-length ceiling keeps calls within cost bounds.
 VOICE_REPLY_MAX_CHARS = 600
@@ -300,7 +306,12 @@ async def handle_turn(
 
     # at_cap → the orchestrator already produced the graceful no-LLM reply (§3.4.1b);
     # speak it. handed_off / normal → speak the loop's reply, shaped for voice.
-    spoken = shape_for_voice(result.reply_text or AT_CAP_REPLY)
+    # at_cap → the canned line; nothing to say (a person holds the call, §3.4.12) →
+    # an honest hand-off line: a person follows up, Luciel never pretends it relayed
+    # anything (audit F057); otherwise the loop's own reply.
+    spoken = shape_for_voice(
+        result.reply_text or (AT_CAP_REPLY if result.at_cap else VOICE_HANDOFF_LINE)
+    )
     # A playable result (the hosting layer minted a <Play> URL) upgrades the reply
     # to the synthesized voice; anything else — including every failure inside the
     # hosting wrapper, which never raises — keeps the honest <Say> of the same text.

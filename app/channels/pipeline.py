@@ -12,6 +12,7 @@ the normalized InboundMessage and the admission decision.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.channels import rate_limit
-from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected
+from app.channels.base import ChannelAdapter, InboundMessage, InboundRejected, InstanceContext
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 
@@ -47,13 +48,64 @@ class OptOutHandled:
     keyword: str  # stop|help|start
     channel: str
     customer_identifier: str
+    # Enough for the edge to send the platform's own confirmation on channels with no
+    # carrier keyword handling (F074) — tenant, instance, and the identity to reply as.
+    admin_id: uuid.UUID | None = None
+    instance_id: uuid.UUID | None = None
+    sender_id: str | None = None
+    subject: str | None = None
+
+
+@dataclass(frozen=True)
+class ContactReply:
+    """An inbound from one of the tenant's OWN escalation contacts (audit F051).
+
+    An owner or manager replying to the escalation text on the tenant's number is not
+    a lead: no session opens, nothing is billed, the runtime never runs. Surfaced so
+    the edge can record the acknowledgement.
+    """
+
+    admin_id: uuid.UUID
+    instance_id: uuid.UUID
+    channel: str
+    contact_role: str
+    body: str
+
+
+def _normalize_number(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit() or ch == "+")
+
+
+async def _escalation_contact_role(
+    ctx: InstanceContext, channel: str, customer_identifier: str
+) -> str | None:
+    """'primary' / 'secondary' when the sender is a configured SMS escalation contact."""
+    # Texts only: a contact CALLING the tenant's line is a caller like any other (the
+    # voice route answers or declines on its own gates); a TEXT from the contact's
+    # number is the reply to the escalation page.
+    if channel != "sms" or not customer_identifier:
+        return None
+    from app.models.instance import Instance  # noqa: PLC0415
+
+    async with tenant_session(ctx.admin_id) as s:
+        cfg = (
+            await s.execute(select(Instance.escalation).where(Instance.id == ctx.instance_id))
+        ).scalar_one_or_none()
+    if not isinstance(cfg, dict):
+        return None
+    sender = _normalize_number(customer_identifier)
+    for role, key in (("primary", "primarySms"), ("secondary", "secondarySms")):
+        number = cfg.get(key)
+        if isinstance(number, str) and number and _normalize_number(number) == sender:
+            return role
+    return None
 
 
 async def ingest(
     adapter: ChannelAdapter,
     request: dict[str, Any],
     session: AsyncSession,
-) -> InboundMessage | AdmissionDenied | OptOutHandled | InboundRejected:
+) -> InboundMessage | AdmissionDenied | OptOutHandled | ContactReply | InboundRejected:
     """Run the inbound edge. Returns:
     - InboundMessage on admission (ready for the runtime budget gate, Arc 14),
     - OptOutHandled when the inbound is a STOP/HELP/START keyword (suppressed pre-budget),
@@ -66,6 +118,18 @@ async def ingest(
     # 2. Normalize enough to know the source identifier for rate-limiting.
     msg = await adapter.receive(request, ctx)
     source_id = msg.customer_identifier or request.get("source_ip", "unknown")
+
+    # 2a. The tenant's own escalation contact writing back on the tenant's number
+    # (audit F051): the owner's side of an escalation, never a lead.
+    contact_role = await _escalation_contact_role(ctx, adapter.channel_id, msg.customer_identifier)
+    if contact_role is not None:
+        return ContactReply(
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            channel=adapter.channel_id,
+            contact_role=contact_role,
+            body=msg.body,
+        )
 
     # 2b. Opt-out / help keyword handling (§3.1.6) BEFORE the orchestrator/LLM. The
     # carrier sends the canonical reply; we never route the keyword to the runtime.
@@ -110,6 +174,13 @@ async def ingest(
             keyword=str(opt_keyword),
             channel=adapter.channel_id,
             customer_identifier=msg.customer_identifier,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            sender_id=(
+                msg.channel_metadata.get("destination_id")
+                or msg.channel_metadata.get("phone_number_id")
+            ),
+            subject=msg.channel_metadata.get("subject"),
         )
 
     # 3. Pre-budget admission (per-source token bucket + per-tenant ceiling).

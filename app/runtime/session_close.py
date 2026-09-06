@@ -30,6 +30,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
+from app.models.audit import ActorType
 from app.models.conversation import Session
 from app.runtime import memory
 from app.runtime.sessions import INACTIVITY_TIMEOUT
@@ -54,6 +56,27 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
     be pure noise in the cross-session store.
     """
     sess.ended_at = ended_at
+    if sess.mode == "human_controlled":
+        # The takeover ended with the session, not with a hand-back (§3.4.12 — "if
+        # the admin never hands back, the session ends via the inactivity timeout").
+        # Audit F078: this end was never recorded, so the takeover audit trail had a
+        # start for every timeout and no end.
+        await audit.emit(
+            session,
+            admin_id=sess.admin_id,
+            instance_id=sess.instance_id,
+            event_type="human_takeover_ended",
+            actor_type=ActorType.platform,
+            payload={
+                "session_id": str(sess.id),
+                "channel": sess.channel,
+                "trigger": "session_timeout",
+                "resolved_lead_id_hash": (
+                    audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
+                ),
+                "ended_at": ended_at.isoformat(),
+            },
+        )
     history = await memory.load_session_history(session, admin_id=sess.admin_id, session_id=sess.id)
     if not history:
         await session.flush()

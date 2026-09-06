@@ -26,6 +26,7 @@ from app.channels.base import (
     OutboundMessage,
 )
 from app.channels.signatures import sns_canonical_string
+from app.channels.sms_adapter import classify_keyword
 
 
 class EmailSender(Protocol):
@@ -62,19 +63,30 @@ class EmailAdapter:
         return ctx
 
     async def receive(self, request: dict[str, Any], ctx: InstanceContext) -> InboundMessage:
+        text = request.get("text", "")
+        metadata: dict[str, Any] = {
+            "spf": request.get("spf"),
+            "dkim": request.get("dkim"),
+            "dmarc": request.get("dmarc"),
+            "subject": request.get("subject"),
+        }
+        # A bare STOP/START/HELP as the whole message (or subject) is a consent
+        # keyword on email as well (audit F074); a sentence that merely contains the
+        # word is not.
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        keyword = classify_keyword(first_line) or classify_keyword(
+            str(request.get("subject") or "")
+        )
+        if keyword is not None:
+            metadata["opt_keyword"] = keyword
         return InboundMessage(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             channel="email",
             session_id=None,
             customer_identifier=request["from_address"],
-            body=request.get("text", ""),
-            channel_metadata={
-                "spf": request.get("spf"),
-                "dkim": request.get("dkim"),
-                "dmarc": request.get("dmarc"),
-                "subject": request.get("subject"),
-            },
+            body=text,
+            channel_metadata=metadata,
             received_at=datetime.now(UTC),
         )
 

@@ -448,3 +448,54 @@ async def test_voice_caller_number_alone_writes_the_lead():
         lead = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalar_one()
         assert lead.contact_identifier == "+15557654321"
         assert lead.intent is None  # a pleasantry is not an "intent"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_call_a_person_holds_hears_an_honest_handoff_line_not_a_fabricated_relay():
+    """§3.4.12 during a voice takeover: the loop has nothing to say, so the caller used
+    to hear the AT-CAP line (a lie about capacity). Now they hear that a person has
+    their details and will follow up — which is exactly what happens (the admin's reply
+    reaches them as a text). Never "I've passed that along" (audit F057)."""
+    from app.models.conversation import Session
+    from app.runtime import handoff
+    from app.runtime.orchestrator import AT_CAP_REPLY
+    from app.runtime.voice_pipeline import VOICE_HANDOFF_LINE
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+
+    async def turn(text: str):
+        async with tenant_session(admin) as s:
+            inst = (
+                await s.execute(select(Instance).where(Instance.id == iid))
+            ).scalar_one_or_none()
+            if inst is None:
+                inst = _instance(admin, iid, state=LucielState.active)
+                s.add(inst)
+                await s.flush()
+            return await handle_turn(
+                s,
+                instance=inst,
+                admin_id=admin,
+                instance_id=iid,
+                from_number="+15557654321",
+                speech_audio_ref=text,
+                action_url=_ACTION_URL,
+                stt=EchoSpeechToText(),
+                tts=EchoTextToSpeech(),
+                router=_router(),
+                has_payment_method=False,
+                provider_call_id="CA_held",
+            )
+
+    await turn("can I speak to someone?")
+    async with tenant_session(admin) as s:
+        sid = (await s.execute(select(Session.id).where(Session.admin_id == admin))).scalar_one()
+        await handoff.take_over(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+
+    result = await turn("hello?")
+    assert result.at_cap is False
+    assert VOICE_HANDOFF_LINE in result.twiml
+    assert AT_CAP_REPLY not in result.twiml
+    assert "passed that along" not in result.twiml.lower()

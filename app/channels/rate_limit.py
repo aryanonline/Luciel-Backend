@@ -78,6 +78,8 @@ LIMITS: dict[str, ChannelLimits] = {
     # claimed. Keyed per admin; contact-form-tight because a legitimate owner
     # hits this at most once or twice by accident.
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
+    # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
+    "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
     # Voice status callbacks (C11, not conversational): the finalize-at-hangup
     # route bypasses pipeline.ingest, so it gets its own per-destination-number
     # bucket. Legit volume is one callback per call plus provider retries —

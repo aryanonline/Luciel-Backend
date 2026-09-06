@@ -241,6 +241,63 @@ async def _session_already_escalated(
     return row is not None
 
 
+async def record_platform_escalation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    detail: str | None = None,
+    resolved_lead_id: uuid.UUID | None = None,
+) -> bool:
+    """Record + notify a PLATFORM-originated escalation for a session, once per signal.
+
+    The public door for edges outside the loop (an undeliverable reply, 2026-09-05
+    audit F077): same row, same audit event, same notification path as the judgment
+    gates, and the same once-per-session rule. ``detail`` (the delivery failure
+    reason) rides the audit trail, never the customer-facing reply. Returns whether a
+    new row was written."""
+    if await _session_already_escalated(
+        session, admin_id=admin_id, session_id=session_id, signal=signal
+    ):
+        return False
+    if resolved_lead_id is None:
+        resolved_lead_id = (
+            await session.execute(
+                select(Session.resolved_lead_id).where(
+                    Session.admin_id == admin_id, Session.id == session_id
+                )
+            )
+        ).scalar_one_or_none()
+    if detail:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            event_type="escalation_delivery_failed",
+            actor_type=ActorType.platform,
+            payload={
+                "signal": signal,
+                "gate": "outcome",
+                "session_id": str(session_id),
+                "failure_reason": detail,
+                "context": "customer_reply_undeliverable",
+            },
+        )
+    await _record_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate="outcome",
+        score=None,
+    )
+    return True
+
+
 async def _record_escalation(
     session: AsyncSession,
     *,

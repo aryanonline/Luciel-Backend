@@ -38,7 +38,7 @@ from fastapi import APIRouter, Request, Response
 from app.channels import inbound_dispatch, routing
 from app.channels.base import ChannelAdapter, InboundRejected, InstanceContext
 from app.channels.meta_messaging_adapter import MetaMessagingAdapter
-from app.channels.sms_adapter import SmsAdapter
+from app.channels.sms_adapter import SMS_FIRST_MESSAGE_NOTICE, SmsAdapter
 from app.channels.sns_verification import ConfigGatedSnsVerifier, confirm_subscription
 from app.channels.whatsapp_adapter import WhatsAppAdapter
 from app.config import get_settings
@@ -134,12 +134,18 @@ async def twilio_sms_inbound(request: Request) -> Response:
         "resolve": _resolve,
         "source_ip": request.client.host if request.client else "unknown",
     }
-    result = await _dispatch(SmsAdapter(), req)
+    reply = await inbound_dispatch.dispatch_inbound_reply(SmsAdapter(), req)
     # Reply on-channel via TwiML. Empty <Response/> = accepted, no auto-reply.
-    if isinstance(result, str) and result:
+    text = reply.reply_text if reply is not None else ""
+    if text and reply is not None and reply.is_new_session:
+        # The FIRST text of a conversation carries the AI identity + STOP notice
+        # (§3.4.16 / carrier rules). Audit F064: the adapter waited for a metadata
+        # flag nothing ever set, so no conversation ever got it.
+        text = f"{SMS_FIRST_MESSAGE_NOTICE}\n{text}"
+    if text:
         body = (
             f'<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response><Message>{_xml_escape(result)}</Message></Response>"
+            f"<Response><Message>{_xml_escape(text)}</Message></Response>"
         )
     else:
         body = '<?xml version="1.0" encoding="UTF-8"?><Response/>'

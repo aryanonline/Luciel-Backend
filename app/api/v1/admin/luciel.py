@@ -34,6 +34,8 @@ from app.schemas_api.luciel import (
     CreateLucielRequest,
     LucielOut,
     ResendContactConfirmationRequest,
+    TestSmsRequest,
+    TestSmsResult,
     UpdateChannelsRequest,
     UpdateEscalationRequest,
     UpdateLeadRetentionRequest,
@@ -442,6 +444,63 @@ async def update_escalation(
     return await _update_config(
         subject.admin_id, subject.user_id, "escalation", _build, after=_after
     )
+
+
+@router.post("/escalation/test-sms", response_model=TestSmsResult)
+async def send_test_escalation_sms(
+    req: TestSmsRequest, subject: Subject = Depends(current_admin)
+) -> TestSmsResult:
+    """Send a test text to a configured SMS escalation contact (2026-09-05 audit F084).
+
+    Email contacts confirm themselves through a link; a phone number had no loop at
+    all — the first real hot lead was the test. The text goes out through the tenant's
+    own number (BYO), so it also proves the number can send. Rate-limited per tenant
+    so it cannot be turned into a texting tool."""
+    from app.channels import rate_limit  # noqa: PLC0415
+    from app.channels.outbound import send_outbound_reply  # noqa: PLC0415
+
+    decision = rate_limit.get_store().check_source("escalation_test_sms", str(subject.admin_id))
+    if not decision.allowed:
+        from app.api.errors import rate_limited  # noqa: PLC0415
+
+        raise rate_limited("Too many test texts. Please wait a minute.", retry_after_seconds=60)
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        cfg = inst.escalation if isinstance(inst.escalation, dict) else {}
+        number = cfg.get("primarySms" if req.which == "primary" else "secondarySms")
+        if not isinstance(number, str) or not number:
+            raise validation_error("No SMS contact is saved in that slot yet.")
+        result = await send_outbound_reply(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            channel="sms",
+            to=number,
+            body=(
+                "VantageMind test: escalation texts from your Luciel will arrive at this "
+                "number. No action needed."
+            ),
+        )
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="escalation_contact_verification_sent",
+            payload={
+                "channel": "sms",
+                "slot": req.which,
+                "number_suffix": number[-4:],
+                "delivered": result.delivered,
+                "detail": result.detail,
+            },
+        )
+        return TestSmsResult(delivered=result.delivered, detail=result.detail)
 
 
 @router.post("/escalation/resend-confirmation", response_model=LucielOut)

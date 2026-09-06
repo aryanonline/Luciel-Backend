@@ -389,7 +389,12 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             received_at=received_at,
         )
 
-        reply_text = result.reply_text or AT_CAP_REPLY
+        # Only the at-cap turn gets the canned at-cap line (§3.4.1b). A session a
+        # person has taken over answers with an EMPTY reply: the widget shows its own
+        # "a member of the team has this conversation" note and polls for the human
+        # reply — the fabricated "passed along" line it used to get was never
+        # persisted and never true (audit F145).
+        reply_text = result.reply_text or (AT_CAP_REPLY if result.at_cap else "")
         render_state = "at_cap" if result.at_cap else "active"
         return WidgetSendResult(
             session_id=sess.id,

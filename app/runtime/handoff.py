@@ -97,8 +97,16 @@ async def take_over(
             event_type="human_takeover_started",
             actor_type=ActorType.luciel_runtime if luciel_initiated else ActorType.admin_user,
             actor_user_id=actor_user_id,
-            # No raw lead PII in the payload (§3.4.11) — session id + trigger only.
-            payload={"session_id": str(session_id), "luciel_initiated": luciel_initiated},
+            # No raw lead PII in the payload (§3.4.11) — ids + trigger + channel only.
+            payload={
+                "session_id": str(session_id),
+                "luciel_initiated": luciel_initiated,
+                "trigger": "luciel" if luciel_initiated else "admin",
+                "channel": sess.channel,
+                "resolved_lead_id_hash": (
+                    audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
+                ),
+            },
         )
     await session.flush()
     return sess
@@ -136,7 +144,14 @@ async def hand_back(
             event_type="human_takeover_ended",
             actor_type=ActorType.admin_user,
             actor_user_id=actor_user_id,
-            payload={"session_id": str(session_id)},
+            payload={
+                "session_id": str(session_id),
+                "trigger": "hand_back",
+                "channel": sess.channel,
+                "resolved_lead_id_hash": (
+                    audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
+                ),
+            },
         )
     await session.flush()
     return sess

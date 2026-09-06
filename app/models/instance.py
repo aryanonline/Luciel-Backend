@@ -51,6 +51,29 @@ def is_paused(inst: Instance) -> bool:
     return inst.state in NON_SERVING_STATES
 
 
+#: Channel ids that are never switchable off through the pillar: the widget is the
+#: Luciel's own front door and has no enabled flag on the wire.
+ALWAYS_ENABLED_CHANNELS = frozenset({"widget"})
+
+
+def channel_enabled(inst: Instance, channel: str) -> bool:
+    """Whether the owner has this channel switched ON in the channels pillar (§3.1).
+
+    Disabling a channel never disconnects its provider (root CLAUDE.md) — but it must
+    stop NEW conversations on it (2026-09-05 audit F058: only Voice checked the flag;
+    SMS, email, WhatsApp, Messenger and Instagram kept answering and billing while the
+    pillar said "off"). The legacy combined ``instagram_messenger`` session id (§3.1.2
+    split) reads as on when either of its halves is on.
+    """
+    if channel in ALWAYS_ENABLED_CHANNELS:
+        return True
+    wanted = {"instagram", "messenger"} if channel == "instagram_messenger" else {channel}
+    for entry in inst.channels or []:
+        if isinstance(entry, dict) and entry.get("id") in wanted and bool(entry.get("enabled")):
+            return True
+    return False
+
+
 class Account(Base, TenantMixin, TimestampMixin):
     """The single account owner. ``admin_id`` mirrors the primary key (self-tenant)."""
 

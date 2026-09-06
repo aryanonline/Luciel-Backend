@@ -142,6 +142,14 @@ async def _send_sms(
     from_number = await resolve_sms_number(session, admin_id, instance_id)
     if not from_number:
         return _NOT_PROVISIONED
+    # The number's CONNECTION must be operable before anything goes out on it (audit
+    # F070): resolve_sms_number reads any non-revoked row, so a number the probe had
+    # flagged (hosting required / action needed / expired / dormant) still "sent" and
+    # Twilio dropped it. Pending carrier registration IS operable — 10DLC is the
+    # tenant's business (§3.1.4) and the number can send meanwhile.
+    row = await _connection_row(session, admin_id, instance_id, "sms_sender")
+    if row is None or row.status not in SMS_OPERABLE_STATUSES:
+        return DeliveryReceipt(accepted=False, detail="sms_sender_not_operable")
     # BYO (§3.1.4): send through the tenant's OWN Twilio, never the platform's.
     sender = await build_tenant_sms_sender(session, admin_id, instance_id)
     if null_in_live(sender):
@@ -166,6 +174,8 @@ async def _send_email(
     from app.notifications.email_sender import build_email_sender
     from app.runtime.integration_status import null_in_live
 
+    # Every reply carries the AI-identity / opt-out / privacy footer (F073).
+    body = await _with_email_footer(session, admin_id, instance_id, body)
     # BYO mailbox (§3.1.6a): when the tenant's email sender IS their Outlook mailbox,
     # the reply goes out through THEIR Graph credential — and only through it. There
     # is deliberately no SES fallback on this branch: falling back would swap the
@@ -196,6 +206,9 @@ async def _send_email(
     address = await resolve_email_address(session, admin_id, instance_id)
     if not address:
         return _NOT_PROVISIONED
+    if conn is not None and conn.status != "connected":
+        # The legacy SES row honours the same health gate the mailbox branch does (F070).
+        return DeliveryReceipt(accepted=False, detail="email_sender_not_connected")
     email_sender = build_email_sender()
     if null_in_live(email_sender):
         return _sender_not_provisioned("email")
@@ -214,6 +227,12 @@ async def _send_email(
 async def _email_sender_row(
     session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
 ) -> Any:  # InstanceConnection | None (lazy import keeps module import light)
+    return await _connection_row(session, admin_id, instance_id, "email_sender")
+
+
+async def _connection_row(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str
+) -> Any:
     from sqlalchemy import select
 
     from app.models.connection import InstanceConnection
@@ -223,11 +242,45 @@ async def _email_sender_row(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.instance_id == instance_id,
-                InstanceConnection.connection_type == "email_sender",
+                InstanceConnection.connection_type == connection_type,
                 InstanceConnection.status != "revoked",
             )
         )
     ).scalar_one_or_none()
+
+
+#: sms_sender statuses on which a text may leave (phone_lifecycle): attested-live, or
+#: operable-and-pending the tenant's own carrier registration.
+SMS_OPERABLE_STATUSES = frozenset({"connected", "pending_carrier_registration"})
+
+EMAIL_FOOTER_MARKER = "This message was written by an AI assistant"
+
+
+async def _with_email_footer(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, body: str
+) -> str:
+    """Every email that leaves the platform carries the AI-identity + opt-out + privacy
+    footer (§3.4.16, Legal §A2; audit F073: replies went out bare). Idempotent."""
+    if EMAIL_FOOTER_MARKER in body:
+        return body
+    from sqlalchemy import select
+
+    from app.channels.runtime_entry import disclosure_business_name
+    from app.config import get_settings
+    from app.models.instance import Instance
+
+    inst = (
+        await session.execute(select(Instance).where(Instance.id == instance_id))
+    ).scalar_one_or_none()
+    business = disclosure_business_name(inst) if inst is not None else "this business"
+    privacy = f"{get_settings().app_base_url.rstrip('/')}/legal/privacy"
+    footer = (
+        "\n\n--\n"
+        f"{EMAIL_FOOTER_MARKER} on behalf of {business}. "
+        "Reply STOP to opt out of further messages. "
+        f"Privacy: {privacy}"
+    )
+    return f"{body.rstrip()}{footer}"
 
 
 async def _send_meta(

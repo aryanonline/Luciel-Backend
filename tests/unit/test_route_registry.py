@@ -104,6 +104,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/webhooks/ses/events"),
         ("POST", "/api/v1/escalation-contact/confirm"),
         ("POST", "/api/v1/admin/luciel/escalation/resend-confirmation"),
+        # 2026-09-05 audit F084: prove an SMS escalation contact can receive a text.
+        ("POST", "/api/v1/admin/luciel/escalation/test-sms"),
         ("POST", "/api/v1/admin/connections/email/reverify"),
         # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every
         # connection type is connect / disconnect / switch-able through these three.

@@ -74,6 +74,14 @@ DeliveryDetailWire = Literal[
     "channel_not_provisioned",
     "unsupported_channel",
     "send_failed",
+    # 2026-09-05 audit: a voice takeover reply reaches the caller as a text (F150) —
+    # labelled, never silent — or cannot because SMS is off / not attested; and the
+    # senders' health gates (F070) name why nothing left.
+    "voice_bridged_to_sms",
+    "voice_reply_requires_sms",
+    "sms_sender_not_operable",
+    "email_sender_not_connected",
+    "mailbox_reconnect_needed",
 ]
 
 
