@@ -394,7 +394,13 @@ async def test_no_kb_confidently_fabricated_answer_escalates_instead_of_confiden
                 select(Transcript).where(Transcript.session_id == sid, Transcript.role == "luciel")
             )
         ).scalar_one()
-        assert luciel_row.grounding_score == 0.0
+        # The row that reaches the visitor is the FIXED hand-off, not the fabricated
+        # draft (F100) - persisted deterministic and unscored (2026-09-06 E2E walk,
+        # E2E-6) so the dashboard never asks the owner to review a canned line. The
+        # measured 0.0 lives on the loop result and drove the escalation above.
+        assert luciel_row.deterministic is True
+        assert luciel_row.grounding_score is None
+        assert "lifetime warranty" not in luciel_row.text
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
