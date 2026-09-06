@@ -11,6 +11,9 @@ ObservabilityStack alarms reference:
     ConnectionUnhealthy  rows in error/expired after a tenant's health sweep
     ActiveSessions       open sessions after a tenant's finalize sweep
     SweepTenantFailure   a sweep's per-tenant work raised (dim: Sweep)
+    KnowledgeRetrievalDegraded
+                         a turn ran with NO knowledge because the embedding
+                         provider failed (dim: Reason)
 """
 
 from __future__ import annotations

@@ -184,6 +184,25 @@ async def test_history_maps_roles_to_visitor_assistant(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_send_reply_id_is_the_persisted_row_id_the_history_serves(client):
+    """2026-09-06 E2E walk (E2E-4): the send response carried a random id while the
+    history served the row id, so the widget's poll appended every reply a second
+    time after a page restore. One reply, one id, on both wires."""
+    _admin, embed_key = await _seed_active_instance()
+    send = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "text": "hi there"},
+    )
+    assert send.status_code == 200
+    sid = send.json()["sessionId"]
+    reply_id = send.json()["reply"]["messageId"]
+    history = await client.get(f"/api/v1/chat-widget/sessions/{sid}?embedKey={embed_key}")
+    assistant_ids = [m["messageId"] for m in history.json() if m["role"] == "assistant"]
+    assert reply_id in assistant_ids
+    assert assistant_ids[-1] == reply_id
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_close_beacon_ends_the_session_and_a_followup_opens_a_new_one(client):
     """§3.4.8 trigger (b): the widget close beacon ends THIS session (summarized,
     §3.4.7); a later message — even inside the 30-minute window — starts a NEW

@@ -68,7 +68,12 @@ describe('alarms are armed everywhere and always reach someone (F045)', () => {
 describe("alarms on the app's own metrics and on sweep task failures (F032/F034)", () => {
   test('the EMF metrics have alarms in the Luciel namespace on the [Environment] set', () => {
     const { obs } = build('dev');
-    for (const metricName of ['LLMFallbackUsed', 'SweepTenantFailure', 'BudgetGateHit']) {
+    for (const metricName of [
+      'LLMFallbackUsed',
+      'SweepTenantFailure',
+      'BudgetGateHit',
+      'KnowledgeRetrievalDegraded',
+    ]) {
       obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
         Namespace: 'Luciel',
         MetricName: metricName,

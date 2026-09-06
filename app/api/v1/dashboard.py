@@ -34,6 +34,7 @@ from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
+from app.runtime.knowledge_retrieval import is_retrieval_unavailable
 from app.runtime.orchestrator import persist_turn
 from app.schemas_api.conversations import (
     AnswerEvidenceOut,
@@ -415,6 +416,11 @@ async def get_answer_evidence(
             source_chunks: list[SourceChunkOut] = []
         elif len(source_chunks_raw) == 0:
             attribution_status = "no_sources_retrieved"
+            source_chunks = []
+        elif is_retrieval_unavailable(source_chunks_raw):
+            # 2026-09-06 E2E walk: the embedding provider failed, so retrieval never
+            # ran — the marker is NOT an empty result and must not read as one.
+            attribution_status = "retrieval_unavailable"
             source_chunks = []
         else:
             attribution_status = "has_sources"

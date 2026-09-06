@@ -214,6 +214,10 @@ class LoopResult:
     handed_off: bool = False
     iterations: int = 0
     tool_outcomes: list[str] = field(default_factory=list)
+    # The persisted transcript row of the reply, when one was written (2026-09-06
+    # E2E walk): the widget hands this id back as the reply's id so its history
+    # poll recognises the same row and never renders the reply twice.
+    reply_message_id: uuid.UUID | None = None
 
 
 TRANSCRIPT_ROLES = frozenset({"lead", "luciel", "human_agent", "system"})
@@ -626,7 +630,7 @@ class Orchestrator:
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
             )
-            await persist_turn(
+            at_cap_row = await persist_turn(
                 self.session,
                 admin_id=admin_id,
                 instance_id=instance_id,
@@ -637,6 +641,7 @@ class Orchestrator:
                 deterministic=True,
             )
             return LoopResult(
+                reply_message_id=at_cap_row.id,
                 reply_text=at_cap_reply,
                 outbound_channel=channel,
                 counted=False,
@@ -782,7 +787,7 @@ class Orchestrator:
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
             )
-            await persist_turn(
+            outage_row = await persist_turn(
                 self.session,
                 admin_id=admin_id,
                 instance_id=instance_id,
@@ -797,6 +802,7 @@ class Orchestrator:
             # provider outage with no served turn does not count. Flagged: revisit
             # with metering in Arc 18.
             return LoopResult(
+                reply_message_id=outage_row.id,
                 reply_text=ack,
                 outbound_channel=channel,
                 counted=False,
@@ -927,12 +933,18 @@ class Orchestrator:
         claimed_without_action = (
             action_results and not ok_actions and _SUCCESS_CLAIM.search(reply_text)
         ) or (not action_results and _FIRST_PERSON_SUCCESS_CLAIM.search(reply_text))
+        # A reply composed in CODE below (the unfounded-claim or below-floor
+        # replacement) is a fixed message, not a knowledge answer: persisted as such,
+        # so the dashboard never asks the owner to review a canned line as "weakly
+        # backed" (2026-09-06 E2E walk, E2E-6).
+        deterministic_reply = False
         if claimed_without_action:
             # The model claimed an action no tool confirmed — attempted-and-failed, or
             # never attempted at all (F110) — replace with the honest failure ack and
             # make sure a human is flagged (dedupe-suppressed like any other
             # cannot_answer repeat).
             reply_text = _UNFOUNDED_CLAIM_REPLACEMENT
+            deterministic_reply = True
             if escalation is None:
                 escalation = EscalationDecision(True, Signal.cannot_answer, None, None)
                 if not await _session_already_escalated(
@@ -978,6 +990,7 @@ class Orchestrator:
             # still goes out; an unfounded action claim keeps its own, more
             # specific replacement above.
             reply_text = await self._handoff_ack()
+            deterministic_reply = True
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
         if escalation is not None:
             reply_text = self._with_contact_ask(
@@ -1015,9 +1028,12 @@ class Orchestrator:
             session_id=session_id,
             role="luciel",
             text=reply_text,
-            grounding_score=grounding.score,
+            # A fixed replacement is not scored: the score measured the DRAFT that
+            # never left, and the evidence view would read it against a canned line.
+            grounding_score=None if deterministic_reply else grounding.score,
             source_chunks=attributed_chunks,
             at=datetime.now(UTC),
+            deterministic=deterministic_reply,
         )
         # Durable retrieval trace (§5.4 / C6): one row per knowledge SOURCE this
         # answer retrieved from (deduped — several chunks of one document are one
@@ -1046,6 +1062,7 @@ class Orchestrator:
                     )
                 )
         return LoopResult(
+            reply_message_id=reply_row.id,
             reply_text=reply_text,
             outbound_channel=outbound,
             counted=counted,
@@ -1379,7 +1396,7 @@ class Orchestrator:
             gate=gate,
             score=score,
         )
-        await persist_turn(
+        ack_row = await persist_turn(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
@@ -1398,6 +1415,7 @@ class Orchestrator:
             luciel_initiated=True,
         )
         return LoopResult(
+            reply_message_id=ack_row.id,
             reply_text=ack,
             outbound_channel=channel,
             counted=True,

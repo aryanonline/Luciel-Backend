@@ -137,6 +137,17 @@ export class ObservabilityStack extends Stack {
         60,
         'A conversation cap was hit 100+ times in an hour: a hammered widget or a real tenant at cap.',
       );
+      // 2026-09-06 E2E walk: the embedding provider answered 429 at quota and every
+      // knowledge answer silently became a hand-off — the owner saw "no source
+      // backed this answer" over a question their sources answer. One degraded
+      // retrieval is worth a page: nothing else in the product can notice it.
+      emfAlarm(
+        'KnowledgeRetrievalDegradedAlarm',
+        'KnowledgeRetrievalDegraded',
+        1,
+        5,
+        'A turn ran with no knowledge because the embedding provider failed (quota, outage, key): every answer is a hand-off until it is fixed.',
+      );
 
       // 2026-09-05 audit F034: a sweep task that exits non-zero or never starts
       // is an EventBridge task-state event straight to the operator topic —

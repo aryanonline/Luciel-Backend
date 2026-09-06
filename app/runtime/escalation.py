@@ -172,6 +172,40 @@ def is_conversational_turn(text: str) -> bool:
     return bool(_CONVERSATIONAL_PATTERNS.search(stripped))
 
 
+# A contact hand-over: the visitor is giving an email address or a phone number
+# and asking nothing — usually the answer to Luciel's OWN contact ask. The reply
+# is an acknowledgement with no factual claim to ground. 2026-09-06 E2E walk:
+# "I'm Walk Lead, you can reach me at walk.lead@example.com" retrieved nothing,
+# scored 0.0, and the floor swapped the model's thank-you for the hand-off line a
+# second time. Digits are substantive for is_conversational_turn (a budget, a
+# date); here they are the phone number itself, so this classifier stands alone.
+_CONTACT_MAX_LEN = 200
+_EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<![a-z0-9])\+?\(?\d[\d\s().-]{6,}\d(?![a-z0-9])", re.IGNORECASE)
+_CONTACT_SEEKING_PATTERNS = re.compile(
+    r"\?"
+    r"|\b(what|how|when|where|why|which|who)\b"
+    r"|^(can|could|would|will|do|does|did|is|are|should|may|might)\b"
+    r"|\b(need|want|looking for|book|schedule|quote|price|cost|help me|tell me|explain)\b"
+    r"|[$£€]",
+    re.IGNORECASE,
+)
+
+
+def is_contact_details_turn(text: str) -> bool:
+    """True when the visitor is handing over contact details and asking nothing.
+
+    Skips ONLY the gate-2 ``cannot_answer`` floor, exactly like a social turn:
+    lead capture still stores the details, gate 1 and ``high_value_lead`` still see
+    the message. A question in the same breath keeps the floor."""
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > _CONTACT_MAX_LEN:
+        return False
+    if _CONTACT_SEEKING_PATTERNS.search(stripped):
+        return False
+    return bool(_EMAIL_RE.search(stripped) or _PHONE_RE.search(stripped))
+
+
 _WORD_RE = re.compile(r"[a-z0-9']+")
 # Below this Jaccard overlap two questions count as different asks; at or above
 # it, the model is re-asking the same thing in fresh clothes. Conservative on
@@ -312,6 +346,7 @@ def evaluate_outcome(
     if (
         not resolving_tool_succeeded
         and not is_conversational_turn(message)
+        and not is_contact_details_turn(message)
         and (grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE)
     ):
         score = min(plan_confidence, grounding_score)

@@ -54,7 +54,15 @@ class OpenAIEmbedder:
         if self._client is None:
             from openai import AsyncOpenAI  # noqa: PLC0415 — lazy/guarded import
 
-            self._client = AsyncOpenAI(api_key=self._api_key)
+            # Same budget as the chat providers (2026-09-05 audit F101): a visitor
+            # is waiting on this call, and the SDK's own retries only multiply an
+            # outage's latency — the 2026-09-06 E2E walk watched a 429 at quota get
+            # retried twice for nothing behind the typing bubble.
+            self._client = AsyncOpenAI(
+                api_key=self._api_key,
+                max_retries=0,
+                timeout=float(get_settings().llm_timeout_seconds),
+            )
         return self._client
 
     async def embed(self, texts: list[str]) -> list[list[float]]:

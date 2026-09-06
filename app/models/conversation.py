@@ -94,7 +94,10 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # retrieval genuinely ran and found nothing. The dashboard evidence endpoint
     # (app/api/v1/dashboard.py::get_answer_evidence) maps NULL vs [] vs non-empty to
     # three distinct attributionStatus values -- never collapses NULL and [] into
-    # the same "no source backed this answer" claim.
+    # the same "no source backed this answer" claim. A one-entry list carrying only
+    # {"unavailable": reason} (app.runtime.knowledge_retrieval) means retrieval
+    # never ran for the turn (embedding provider failed, 2026-09-06 E2E walk) and
+    # maps to a fourth status, retrieval_unavailable.
     source_chunks: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
     # #5c (live-caught 2026-08-23, migration 0051): True for luciel rows composed in
     # CODE, not by the model — the persisted greeting, the at-cap graceful reply,

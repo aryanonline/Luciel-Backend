@@ -409,7 +409,10 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         return WidgetSendResult(
             session_id=sess.id,
             reply=WidgetMessageOut(
-                message_id=uuid.uuid4(),
+                # The persisted row's id (2026-09-06 E2E walk): the widget's history
+                # poll must recognise this reply as already shown, or it renders it
+                # twice on the next page. A random id only for a reply no row backs.
+                message_id=result.reply_message_id or uuid.uuid4(),
                 role="assistant",
                 text=reply_text,
                 at=sess.last_message_at,

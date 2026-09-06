@@ -271,6 +271,38 @@ async def test_evidence_reports_no_sources_retrieved_when_retrieval_found_nothin
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_evidence_reports_retrieval_unavailable_when_the_embedder_failed(client):
+    """A turn whose retrieval never RAN (the embedding provider failed) persists
+    the one-entry marker, not an empty list — and the wire says so
+    (retrieval_unavailable), never "no source backed this answer" over a
+    question the tenant's sources do answer (2026-09-06 E2E walk: OpenAI 429 at
+    quota turned a plain hours question into a hand-off)."""
+    admin = await _signup_verify_login(client)
+    iid, sid, _mid = await _seed_conversation(admin)
+    msg_id = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=msg_id,
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                role="luciel",
+                text="I've flagged this for the team, and they'll follow up with you shortly.",
+                grounding_score=0.0,
+                source_chunks=[{"unavailable": "openai_error:RateLimitError"}],
+            )
+        )
+        await s.flush()
+
+    r = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{msg_id}/evidence")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["attributionStatus"] == "retrieval_unavailable"
+    assert body["sourceChunks"] == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_flag_answer_returns_204(client):
     admin = await _signup_verify_login(client)
     _iid, sid, mid = await _seed_conversation(admin)

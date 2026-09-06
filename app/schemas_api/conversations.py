@@ -135,7 +135,14 @@ class SourceChunkOut(WireModel):
 # panel must branch on attributionStatus, not on `sourceChunks.length === 0` alone,
 # to decide which copy to render (see register note for the sibling FE task).
 ScoringStatusWire = Literal["scored", "not_scored_legacy", "not_applicable"]
-AttributionStatusWire = Literal["has_sources", "no_sources_retrieved", "attribution_unavailable"]
+AttributionStatusWire = Literal[
+    "has_sources",
+    "no_sources_retrieved",
+    "attribution_unavailable",
+    # 2026-09-06 E2E walk: retrieval never ran for this turn (embedding provider
+    # failed) — a fourth truth, not an empty result.
+    "retrieval_unavailable",
+]
 
 
 class AnswerEvidenceOut(WireModel):

@@ -94,6 +94,25 @@ async def test_large_inputs_are_batched():
     assert [len(c) for c in fake.calls] == [128, 128, 44]
 
 
+def test_the_live_client_never_retries_and_carries_the_provider_timeout(monkeypatch):
+    """2026-09-06 E2E walk: a 429 at quota was retried twice by the SDK while the
+    visitor watched the typing bubble. The embedder shares the chat providers'
+    posture (F101): no SDK retries, the configured provider timeout."""
+    import openai
+
+    captured: dict[str, object] = {}
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _FakeAsyncOpenAI)
+    embedder = OpenAIEmbedder(api_key="sk-test", model="text-embedding-3-small")
+    embedder._get_client()
+    assert captured["max_retries"] == 0
+    assert float(captured["timeout"]) > 0
+
+
 @pytest.mark.asyncio
 async def test_no_call_is_made_for_an_empty_input():
     embedder = OpenAIEmbedder(api_key="sk-test", model="text-embedding-3-small")

@@ -40,6 +40,7 @@ from app.config import get_settings
 from app.knowledge import graph, service
 from app.knowledge.embeddings import EmbeddingError
 from app.knowledge.intent import QueryIntent, classify_intent, seed_terms
+from app.observability.metrics import emit_metric
 
 # Matches app/runtime/orchestrator.py Retriever; re-declared here to avoid a runtime import
 # cycle (orchestrator imports nothing from this module — binding happens at the call sites).
@@ -96,6 +97,25 @@ async def hybrid_retrieve(
 #: orchestrator used to embed the same question twice and run two ANN searches per turn).
 RetrieverBundle = Callable[[str], Awaitable[tuple[list[str], list[dict[str, object]]]]]
 
+#: The one-entry ``source_chunks`` value persisted when retrieval could not run AT
+#: ALL (the embedding provider failed — 2026-09-06 E2E walk: OpenAI answered 429 at
+#: quota and every answer became a hand-off). It is a third truth next to ``[]``
+#: (retrieval ran, nothing matched) and ``None`` (attribution never captured): the
+#: evidence endpoint maps it to ``retrieval_unavailable`` so the owner reads
+#: "your knowledge couldn't be searched", never "no source backed this answer"
+#: over a question their sources do answer.
+RETRIEVAL_UNAVAILABLE_KEY = "unavailable"
+
+
+def retrieval_unavailable_marker(reason: str) -> dict[str, object]:
+    """The ``source_chunks`` entry for a turn whose retrieval never ran."""
+    return {RETRIEVAL_UNAVAILABLE_KEY: reason[:120]}
+
+
+def is_retrieval_unavailable(chunks: list[dict[str, object]] | None) -> bool:
+    """True when a persisted ``source_chunks`` value is the marker, not real chunks."""
+    return bool(chunks) and all(RETRIEVAL_UNAVAILABLE_KEY in c for c in chunks or [])
+
 
 def _relevance_floor_active() -> bool:
     # Hashed mock vectors carry no distance meaning; the floor is a live-only rule.
@@ -124,6 +144,7 @@ async def hybrid_retrieve_bundle(
         graph_facts = await graph.graph_facts_for_terms(
             session, admin_id=admin_id, instance_id=instance_id, terms=seed_terms(query)
         )
+    unavailable_reason: str | None = None
     try:
         vector_hits = await service.retrieve(
             session, admin_id=admin_id, instance_id=instance_id, query=query, k=k
@@ -131,8 +152,12 @@ async def hybrid_retrieve_bundle(
     except EmbeddingError as exc:
         # The embedding provider is down (2026-09-05 audit F103): the turn goes on with
         # NO knowledge — the grounding floor then hands the question to a person —
-        # instead of a 500 that answers the visitor with nothing at all.
+        # instead of a 500 that answers the visitor with nothing at all. It is also
+        # a metric with an alarm behind it (2026-09-06 E2E walk): a provider at
+        # quota turns EVERY answer into a hand-off, and only a warning line said so.
         _LOG.warning("knowledge_retrieval_degraded reason=%s", exc)
+        unavailable_reason = str(exc)
+        emit_metric("KnowledgeRetrievalDegraded", dimensions={"Reason": unavailable_reason})
         vector_hits = []
     if _relevance_floor_active():
         ceiling = get_settings().knowledge_relevance_max_distance
@@ -151,6 +176,10 @@ async def hybrid_retrieve_bundle(
             }
             for chunk, _d in vector_hits
         ]
+    if unavailable_reason is not None:
+        # Persisted in place of chunks: the dashboard must not read this turn as
+        # "retrieval ran and found nothing".
+        attributed = [retrieval_unavailable_marker(unavailable_reason)]
     fused: list[str] = []
     seen: set[str] = set()
     for item in [*graph_facts, *[chunk.text for chunk, _d in vector_hits]]:

@@ -89,6 +89,39 @@ async def test_an_ungrounded_assertion_becomes_the_honest_hand_off():
     assert result.escalation is not None and result.escalation.signal is Signal.cannot_answer
     assert "Rheem" not in result.reply_text  # the guess never left
     assert "team" in result.reply_text.lower()  # the honest hand-off did
+    # The hand-off is a FIXED message (2026-09-06 E2E walk, E2E-6): persisted as
+    # deterministic and unscored, so the owner is never asked to review a canned
+    # line as "weakly backed" — and the widget gets the row's own id (E2E-4).
+    from app.models.conversation import Transcript
+
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(select(Transcript).where(Transcript.id == result.reply_message_id))
+        ).scalar_one()
+    assert row.role == "luciel" and row.text == result.reply_text
+    assert row.deterministic is True
+    assert row.grounding_score is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_contact_hand_over_gets_the_model_reply_not_the_hand_off_again():
+    """2026-09-06 E2E walk (E2E-5): the visitor answered Luciel's own contact ask and
+    got the hand-off line a second time — the thank-you retrieves nothing, scores
+    0.0, and the floor swapped it out. Handing over contact details is not a
+    question; the model's acknowledgement ships and nothing escalates."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=StatementModel(confidence=0.9))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I'm Walk Lead, you can reach me at walk.lead@example.com",
+        )
+    assert result.escalation is None
+    assert "Rheem" in result.reply_text  # the model's own reply, untouched
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -174,7 +207,7 @@ async def test_a_tool_without_a_connected_provider_is_not_described():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_an_embedding_outage_degrades_to_no_knowledge_not_a_crash(monkeypatch):
+async def test_an_embedding_outage_degrades_to_no_knowledge_not_a_crash(monkeypatch, capsys):
     from app.knowledge import service
 
     async def boom(*a, **kw):
@@ -185,4 +218,17 @@ async def test_an_embedding_outage_degrades_to_no_knowledge_not_a_crash(monkeypa
         texts, attributed = await knowledge_retrieval.hybrid_retrieve_bundle(
             s, admin_id=uuid.uuid4(), instance_id=uuid.uuid4(), query="opening hours?"
         )
-    assert texts == [] and attributed == []
+    # The model sees NO knowledge (never a guess) — and what is persisted says WHY:
+    # the marker, not an empty list that reads as "retrieval found nothing"
+    # (2026-09-06 E2E walk: OpenAI at quota made every answer a silent hand-off).
+    assert texts == []
+    assert attributed == [{"unavailable": "openai_error:APIConnectionError"}]
+    assert knowledge_retrieval.is_retrieval_unavailable(attributed)
+    assert not knowledge_retrieval.is_retrieval_unavailable([])
+    assert not knowledge_retrieval.is_retrieval_unavailable(None)
+    # ...and the operator is paged through the metric the alarm watches.
+    metric_lines = [
+        ln for ln in capsys.readouterr().out.splitlines() if '"KnowledgeRetrievalDegraded"' in ln
+    ]
+    assert len(metric_lines) == 1
+    assert "openai_error:APIConnectionError" in metric_lines[0]
