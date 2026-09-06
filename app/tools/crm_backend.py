@@ -67,10 +67,21 @@ class CrmApi(Protocol):
 
     async def get(self, token: str, record_id: str) -> CrmRecord | None: ...
 
-    async def create(self, token: str, lead_key: str, fields: dict[str, Any]) -> CrmRecord: ...
+    async def create(
+        self,
+        token: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
+    ) -> CrmRecord: ...
 
     async def update(
-        self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
+        self,
+        token: str,
+        record_id: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
     ) -> CrmRecord | None: ...
 
 
@@ -90,19 +101,36 @@ class InMemoryCrmApi:
     async def get(self, token: str, record_id: str) -> CrmRecord | None:
         return CrmRecord(record_id=record_id) if record_id in self.records else None
 
-    async def create(self, token: str, lead_key: str, fields: dict[str, Any]) -> CrmRecord:
+    async def create(
+        self,
+        token: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
+    ) -> CrmRecord:
         record_id = f"mock-{uuid.uuid4().hex[:10]}"
-        self.records[record_id] = {"lead_key": lead_key, "fields": dict(fields)}
+        self.records[record_id] = {
+            "lead_key": lead_key,
+            "fields": dict(fields),
+            "notes": dict(notes or {}),
+        }
         return CrmRecord(record_id=record_id)
 
     async def update(
-        self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
+        self,
+        token: str,
+        record_id: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
     ) -> CrmRecord | None:
         rec = self.records.get(record_id)
         if rec is None:
             return None
         del lead_key  # updates never rewrite the key (item 1) — mirror the live APIs
         rec["fields"].update(fields)
+        if notes:
+            rec["notes"] = dict(notes)
         return CrmRecord(record_id=record_id)
 
 
@@ -119,10 +147,45 @@ class HubSpotCrmApi:
         return httpx.AsyncClient(timeout=15.0, base_url=HUBSPOT_BASE)
 
     @staticmethod
-    def _properties(lead_key: str, fields: dict[str, Any]) -> dict[str, str]:
+    def _mapped(fields: dict[str, Any], notes: dict[str, str] | None = None) -> dict[str, str]:
+        """Captured facts → HubSpot's STANDARD contact properties (2026-09-05 audit F128).
+
+        The old push sent our field names verbatim (``name``, ``intent``, …); HubSpot
+        rejects unknown properties with a 400, so every push carrying a fact other
+        than the email failed. ``name`` splits into firstname/lastname, ``phone`` and
+        ``company`` map 1:1, and everything else — intent, lead score, outcome —
+        is Luciel-maintained free text on the standard ``message`` property: the
+        record's CURRENT facts (``notes``) with this push's changes on top, never
+        only the delta, so an outcome push cannot wipe the intent (F130)."""
+        working = {str(k): str(v) for k, v in fields.items() if v is not None and str(v) != ""}
+        props: dict[str, str] = {}
+        name = working.pop("name", "").strip()
+        if name:
+            first, _, last = name.partition(" ")
+            props["firstname"] = first
+            if last.strip():
+                props["lastname"] = last.strip()
+        phone = working.pop("phone", "")
+        if phone:
+            props["phone"] = phone
+        company = working.pop("business", "") or working.pop("company", "")
+        if company:
+            props["company"] = company
+        moved_email = working.pop("email", "")
+        if moved_email:
+            props["email"] = moved_email
+        if working or notes:
+            merged = {**(notes or {}), **working}
+            props["message"] = "\n".join(f"{k}: {v}" for k, v in sorted(merged.items()))
+        return props
+
+    @staticmethod
+    def _properties(
+        lead_key: str, fields: dict[str, Any], notes: dict[str, str] | None = None
+    ) -> dict[str, str]:
         # The stable key IS the email property; captured facts ride alongside.
         # Values are stringified — HubSpot property values are strings on write.
-        return {"email": lead_key, **{str(k): str(v) for k, v in fields.items()}}
+        return {"email": lead_key, **HubSpotCrmApi._mapped(fields, notes)}
 
     async def find_by_key(self, token: str, lead_key: str) -> CrmRecord | None:
         async with self._transport_factory() as client:
@@ -159,31 +222,43 @@ class HubSpotCrmApi:
             raise CrmUnavailable(f"hubspot_get_http_{resp.status_code}")
         return CrmRecord(record_id=record_id)
 
-    async def create(self, token: str, lead_key: str, fields: dict[str, Any]) -> CrmRecord:
+    async def create(
+        self,
+        token: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
+    ) -> CrmRecord:
         async with self._transport_factory() as client:
             resp = await client.post(
                 "/crm/v3/objects/contacts",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"properties": self._properties(lead_key, fields)},
+                json={"properties": self._properties(lead_key, fields, notes)},
             )
         if resp.status_code not in (200, 201):
             raise CrmUnavailable(f"hubspot_create_http_{resp.status_code}")
         return CrmRecord(record_id=str(resp.json()["id"]))
 
     async def update(
-        self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
+        self,
+        token: str,
+        record_id: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
     ) -> CrmRecord | None:
         # lead_key deliberately unused on update (item 1): re-sending the email
         # property on every PATCH reverted a tenant's in-CRM correction; the
         # record id already addresses the contact, so only changed facts ride.
         del lead_key
-        if not fields:
+        props = self._mapped(fields, notes)
+        if not props:
             return CrmRecord(record_id=record_id)
         async with self._transport_factory() as client:
             resp = await client.patch(
                 f"/crm/v3/objects/contacts/{record_id}",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"properties": {str(k): str(v) for k, v in fields.items()}},
+                json={"properties": props},
             )
         if resp.status_code == 404:
             return None  # deleted inside the CRM — caller heals the link
@@ -222,7 +297,19 @@ class SalesforceCrmApi:
         return httpx.AsyncClient(timeout=15.0, base_url=self._base)
 
     @staticmethod
-    def _create_payload(lead_key: str, fields: dict[str, Any]) -> dict[str, str]:
+    def _description(working: dict[str, str], notes: dict[str, str] | None) -> str | None:
+        # F130: Description is Luciel-maintained, and it holds the record's CURRENT
+        # facts with this push's changes on top — an outcome-only push used to
+        # overwrite it with the single line "outcome: converted", erasing the intent.
+        merged = {**(notes or {}), **working}
+        if not merged:
+            return None
+        return "\n".join(f"{k}: {v}" for k, v in sorted(merged.items()))
+
+    @staticmethod
+    def _create_payload(
+        lead_key: str, fields: dict[str, Any], notes: dict[str, str] | None = None
+    ) -> dict[str, str]:
         """Captured-lead facts → a NEW Salesforce Lead (the disclosed mapping).
 
         Salesforce requires LastName and Company on create, so the honest
@@ -236,12 +323,15 @@ class SalesforceCrmApi:
         phone = working.pop("phone", "")
         if phone:
             payload["Phone"] = phone
-        if working:
-            payload["Description"] = "\n".join(f"{k}: {v}" for k, v in sorted(working.items()))
+        description = SalesforceCrmApi._description(working, notes)
+        if description:
+            payload["Description"] = description
         return payload
 
     @staticmethod
-    def _update_payload(fields: dict[str, Any]) -> dict[str, str]:
+    def _update_payload(
+        fields: dict[str, Any], notes: dict[str, str] | None = None
+    ) -> dict[str, str]:
         """ONLY the facts this push changed → PATCH fields (round 5A, item 1).
 
         The old shared payload builder re-sent Email/LastName/Company on every
@@ -269,8 +359,9 @@ class SalesforceCrmApi:
         phone = working.pop("phone", "")
         if phone:
             payload["Phone"] = phone
-        if working:
-            payload["Description"] = "\n".join(f"{k}: {v}" for k, v in sorted(working.items()))
+        description = SalesforceCrmApi._description(working, notes)
+        if description:
+            payload["Description"] = description
         return payload
 
     async def find_by_key(self, token: str, lead_key: str) -> CrmRecord | None:
@@ -303,24 +394,35 @@ class SalesforceCrmApi:
             raise CrmUnavailable(f"salesforce_get_http_{resp.status_code}")
         return CrmRecord(record_id=record_id)
 
-    async def create(self, token: str, lead_key: str, fields: dict[str, Any]) -> CrmRecord:
+    async def create(
+        self,
+        token: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
+    ) -> CrmRecord:
         async with self._transport_factory() as client:
             resp = await client.post(
                 f"/services/data/{SALESFORCE_API_VERSION}/sobjects/Lead",
                 headers={"Authorization": f"Bearer {token}"},
-                json=self._create_payload(lead_key, fields),
+                json=self._create_payload(lead_key, fields, notes),
             )
         if resp.status_code not in (200, 201):
             raise CrmUnavailable(f"salesforce_create_http_{resp.status_code}")
         return CrmRecord(record_id=str(resp.json()["id"]))
 
     async def update(
-        self, token: str, record_id: str, lead_key: str, fields: dict[str, Any]
+        self,
+        token: str,
+        record_id: str,
+        lead_key: str,
+        fields: dict[str, Any],
+        notes: dict[str, str] | None = None,
     ) -> CrmRecord | None:
         # lead_key deliberately unused on update (item 1): the link row already
         # pins the record id, and re-sending Email reverted tenant corrections.
         del lead_key
-        payload = self._update_payload(fields)
+        payload = self._update_payload(fields, notes)
         if not payload:
             return CrmRecord(record_id=record_id)
         async with self._transport_factory() as client:
@@ -373,6 +475,10 @@ class _NativeCrmBackend:
             raise CrmUnavailable("crm_session_unavailable")
         from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
 
+        if "@" not in lead_key:
+            # The native CRMs dedupe on the email property; a phone number there
+            # would create a garbage record the tenant then cleans up.
+            raise CrmUnavailable("crm_key_not_email")
         token = await ensure_fresh_access_token(
             ctx.session, ctx.admin_id, ctx.instance_id, connection_type="crm"
         )
@@ -385,6 +491,7 @@ class _NativeCrmBackend:
         # push can carry any email, and without the guard a stranger's key would
         # PATCH the current lead's record with someone else's identity.
         verified_lead_id: uuid.UUID | None = None
+        notes: dict[str, str] | None = None
         if ctx.resolved_lead_id is not None:
             from app.models.lead import Lead  # noqa: PLC0415
 
@@ -401,8 +508,26 @@ class _NativeCrmBackend:
                     for k in (lead_row.email, lead_row.contact_identifier)
                     if k and "@" in k
                 }
-                if lead_key.strip().lower() in owned_keys:
-                    verified_lead_id = lead_row.id
+                if lead_key.strip().lower() not in owned_keys:
+                    # 2026-09-05 audit F095: a key the conversation's lead does not
+                    # own is a stranger's record — the push is refused outright
+                    # instead of creating or patching someone else's contact.
+                    raise CrmUnavailable("crm_lead_key_not_owned")
+                verified_lead_id = lead_row.id
+                # The record's current Luciel-maintained facts ride every push so
+                # the CRM's free-text field is merged, never overwritten (F130).
+                notes = {
+                    k: v
+                    for k, v in (
+                        ("intent", lead_row.intent or ""),
+                        (
+                            "lead_score",
+                            f"{lead_row.lead_score:g}" if lead_row.lead_score is not None else "",
+                        ),
+                        ("outcome", lead_row.outcome or ""),
+                    )
+                    if v
+                }
 
         link: CrmLeadLink | None = None
         if verified_lead_id is not None:
@@ -442,7 +567,7 @@ class _NativeCrmBackend:
 
         # 1. Linked record → update IN PLACE (the maintenance semantics).
         if link is not None:
-            updated = await api.update(token, link.crm_record_id, lead_key, fields)
+            updated = await api.update(token, link.crm_record_id, lead_key, fields, notes)
             if updated is not None:
                 await self._write_link(ctx, link, lead_key, updated.record_id, verified_lead_id)
                 await self._audit(ctx, "updated", updated.record_id)
@@ -453,14 +578,14 @@ class _NativeCrmBackend:
         # 2. Search by the stable key → update + (re)link.
         found = await api.find_by_key(token, lead_key)
         if found is not None:
-            updated = await api.update(token, found.record_id, lead_key, fields)
+            updated = await api.update(token, found.record_id, lead_key, fields, notes)
             record_id = (updated or found).record_id
             await self._write_link(ctx, link, lead_key, record_id, verified_lead_id)
             await self._audit(ctx, "updated", record_id)
             return {"crm_record_id": record_id, "action": "updated"}
 
         # 3. Create + link.
-        created = await api.create(token, lead_key, fields)
+        created = await api.create(token, lead_key, fields, notes)
         await self._write_link(ctx, link, lead_key, created.record_id, verified_lead_id)
         await self._audit(ctx, "created", created.record_id)
         return {"crm_record_id": created.record_id, "action": "created"}

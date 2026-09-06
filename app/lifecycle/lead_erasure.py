@@ -56,6 +56,7 @@ class ErasureCounts:
     voice_records_scrubbed: int = 0
     deferred_actions_deleted: int = 0
     crm_links_deleted: int = 0
+    identifiers_deleted: int = 0
 
     def payload(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -150,6 +151,14 @@ async def erase_lead_data(
     counts.deferred_actions_deleted = int(deferred.rowcount or 0)  # type: ignore[attr-defined]
 
     counts.crm_links_deleted = await delete_links_for_lead(session, admin_id=admin_id, lead=lead)
+    from app.models.lead import LeadIdentifier  # noqa: PLC0415
+
+    identifiers = await session.execute(
+        delete(LeadIdentifier).where(
+            LeadIdentifier.admin_id == admin_id, LeadIdentifier.lead_id == lead_id
+        )
+    )
+    counts.identifiers_deleted = int(identifiers.rowcount or 0)  # type: ignore[attr-defined]
     await session.delete(lead)
     await session.flush()
 

@@ -274,6 +274,43 @@ async def send_connection_attention(
     )
 
 
+async def send_crm_push_failed(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    lead_label: str,
+    detail: str,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """2026-09-05 audit F134: a lead did not reach the tenant's CRM — say so, once.
+
+    Sent the first time a push for a given lead FAILS at the CRM (refused, HTTP
+    error, unreachable) — never for a broker refusal the owner chose (tool off).
+    The lead is safe in the dashboard; the Leads page shows the same state and
+    offers the retry."""
+    subject = "A lead did not reach your CRM"
+    body = (
+        f"Luciel captured {lead_label}, but could not push the record to your CRM "
+        f"({detail}). The lead is safe in your VantageMind dashboard.\n\n"
+        "Open the Leads page to see the details and use “Retry CRM push” once your "
+        "CRM connection is healthy. Luciel also retries on its own the next time it "
+        "learns something new about this person.\n\n"
+        "You will not be emailed again about this lead."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="crm_push_failed",
+        audit_event="crm_push_failure_emailed",
+        extra_payload={"detail": detail[:160]},
+        sender=sender,
+    )
+
+
 async def send_payg_usage_nudge(
     session: AsyncSession,
     *,

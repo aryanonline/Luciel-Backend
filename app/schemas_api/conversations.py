@@ -168,6 +168,8 @@ class LeadOut(WireModel):
     # CRM dedupe key once known. Null when unknown or when contactIdentifier
     # already is the email.
     email: str | None = None
+    # 2026-09-05 audit F111: the volunteered phone (E.164) beside a non-phone key.
+    phone: str | None = None
     intent: str | None = None
     state: LeadStateWire
     # Admin-marked business outcome (Vision §7; C14). Distinct from `state`
@@ -175,6 +177,12 @@ class LeadOut(WireModel):
     outcome: Literal["in_progress", "converted", "lost"] = "in_progress"
     last_activity_at: datetime
     created_at: datetime
+    # 2026-09-05 audit F134: the honest CRM state. null = never attempted (no CRM,
+    # tool off, or no key the CRM accepts); synced / failed otherwise, with the
+    # non-secret reason and the time of the last successful push.
+    crm_status: Literal["synced", "failed"] | None = None
+    crm_detail: str | None = None
+    crm_pushed_at: datetime | None = None
 
 
 class LeadOutcomeRequest(WireModel):

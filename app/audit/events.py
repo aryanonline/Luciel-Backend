@@ -133,6 +133,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # 404-heal into duplicates on reconnect). Payload: connection, provider,
         # count — never lead PII.
         "crm_links_cleared",
+        # 2026-09-05 audit F134: a captured lead could not be pushed to the CRM and
+        # the owner was told (once per lead). Payload: delivery metadata only.
+        "crm_push_failure_emailed",
         # Round 5A item 7: two lead rows proved to be the same person (exact
         # identifier match) and were unified. Hashed ids only (§3.4.11).
         "lead_merged",

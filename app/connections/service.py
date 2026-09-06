@@ -832,6 +832,17 @@ async def confirm_reconnect(
             connection.auth_class = _auth_class_for(
                 connection.connection_type, str(pending_provider)
             )
+            # 2026-09-05 audit F120: a swapped CRM is a different account (or at
+            # least may be) — the old record ids are forgotten exactly as on
+            # disconnect, so nothing 404-heals into a duplicate over there.
+            if connection.connection_type == "crm":
+                await clear_crm_links(
+                    session,
+                    admin_id=admin_id,
+                    connection=connection,
+                    user_id=user_id,
+                    reason="swap",
+                )
         connection.non_secret_config = config
         if connection.connection_type == "sms_sender":
             # Round 5B item 10: an sms row never blanket-promotes past the
@@ -1081,6 +1092,48 @@ async def _cascade_dependents(
     return {"tools": disabled_tools, "channels": disabled_channels}
 
 
+async def clear_crm_links(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection: InstanceConnection,
+    user_id: uuid.UUID | None,
+    reason: str,
+) -> int:
+    """Forget where this instance's leads live in the CRM (round 5A item 9; F120).
+
+    Record ids belong to ONE CRM account. After a disconnect — or a swap, which
+    is a reconnect against a possibly different account — a stale id would
+    silently 404-heal into a duplicate record there. The next push relinks by
+    the documented search-by-key step. Audited with the count, never lead PII."""
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
+
+    cleared_result = await session.execute(
+        sa_delete(CrmLeadLink).where(
+            CrmLeadLink.admin_id == admin_id,
+            CrmLeadLink.instance_id == connection.instance_id,
+        )
+    )
+    cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="crm_links_cleared",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "provider": connection.provider,
+            "count": cleared_count,
+            "reason": reason,
+        },
+    )
+    return cleared_count
+
+
 async def disconnect(
     session: AsyncSession,
     *,
@@ -1182,29 +1235,8 @@ async def disconnect(
     # documented search-by-email step. Clearing ALL providers' rows also removes
     # leftovers from earlier provider switches.
     if connection.connection_type == "crm":
-        from sqlalchemy import delete as sa_delete  # noqa: PLC0415
-
-        from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
-
-        cleared_result = await session.execute(
-            sa_delete(CrmLeadLink).where(
-                CrmLeadLink.admin_id == admin_id,
-                CrmLeadLink.instance_id == connection.instance_id,
-            )
-        )
-        cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
-        await audit.emit(
-            session,
-            admin_id=admin_id,
-            instance_id=connection.instance_id,
-            actor_type=ActorType.admin_user,
-            actor_user_id=user_id,
-            event_type="crm_links_cleared",
-            payload={
-                "connection_id": str(connection.connection_id),
-                "provider": connection.provider,
-                "count": cleared_count,
-            },
+        await clear_crm_links(
+            session, admin_id=admin_id, connection=connection, user_id=user_id, reason="disconnect"
         )
     return {
         "connection": connection,

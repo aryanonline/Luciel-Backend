@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import not_found, service_unavailable, validation_error
+from app.api.errors import conflict, not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
@@ -497,9 +497,29 @@ async def list_escalations(
 
 
 # --- leads -------------------------------------------------------------------- #
+def _lead_out(r: Lead) -> LeadOut:
+    crm_status = r.crm_push_status if r.crm_push_status in ("synced", "failed") else None
+    return LeadOut(
+        lead_id=r.id,
+        name=r.name,
+        contact_identifier=r.contact_identifier,
+        email=r.email,
+        phone=r.phone,
+        intent=r.intent,
+        state=r.state.value,
+        outcome=r.outcome,
+        last_activity_at=r.last_activity_at,
+        created_at=r.created_at,
+        crm_status=crm_status,
+        crm_detail=r.crm_push_detail,
+        crm_pushed_at=r.crm_pushed_at,
+    )
+
+
 @router.get("/leads", response_model=list[LeadOut])
 async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]:
-    """Lead list (§3.4.9). Newest activity first."""
+    """Lead list (§3.4.9). Newest activity first. Archived rows are served too —
+    the dashboard keeps them out of the active view, not out of existence."""
     async with tenant_session(subject.admin_id) as s:
         rows = (
             (
@@ -512,20 +532,62 @@ async def list_leads(subject: Subject = Depends(current_admin)) -> list[LeadOut]
             .scalars()
             .all()
         )
-        return [
-            LeadOut(
-                lead_id=r.id,
-                name=r.name,
-                contact_identifier=r.contact_identifier,
-                email=r.email,
-                intent=r.intent,
-                state=r.state.value,
-                outcome=r.outcome,
-                last_activity_at=r.last_activity_at,
-                created_at=r.created_at,
+        return [_lead_out(r) for r in rows]
+
+
+def _current_lead_facts(lead: Lead) -> dict[str, str]:
+    """The record's Luciel-maintained facts, as a push payload (the retry path)."""
+    facts: dict[str, str] = {}
+    if lead.name:
+        facts["name"] = lead.name
+    if lead.phone:
+        facts["phone"] = lead.phone
+    elif lead.contact_identifier and "@" not in lead.contact_identifier:
+        facts["phone"] = lead.contact_identifier
+    if lead.intent:
+        facts["intent"] = lead.intent
+    if lead.lead_score is not None:
+        facts["lead_score"] = f"{lead.lead_score:g}"
+    facts["outcome"] = lead.outcome
+    return facts
+
+
+@router.post("/leads/{lead_id}/crm-retry", response_model=LeadOut)
+async def retry_crm_push(lead_id: uuid.UUID, subject: Subject = Depends(current_admin)) -> LeadOut:
+    """Push the lead's current facts to the CRM again (2026-09-05 audit F134).
+
+    Same broker gates as a capture push (tool off / not connected / dormant → a
+    refused, traced no-op). 409 when the push could not even be attempted, so
+    the owner is told why instead of watching a button do nothing."""
+    from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+    from app.runtime.lead_capture import CaptureResult, crm_lead_key  # noqa: PLC0415
+    from app.tools.registry import make_tool_resolver  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
+        outcome = await push_captured_lead(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=lead.instance_id,
+            captured=CaptureResult(
+                lead_id=lead.id, changed=_current_lead_facts(lead), lead_key=crm_lead_key(lead)
+            ),
+            lead_key=crm_lead_key(lead),
+            snapshot_tool_ids=None,
+            tool_resolver=make_tool_resolver(),
+            session_id=None,
+        )
+        if outcome is None:
+            raise conflict(
+                "This lead has no identifier your CRM accepts (an email, or a phone "
+                "number for a custom webhook), or no CRM is connected."
             )
-            for r in rows
-        ]
+        if outcome.refusal_reason is not None:
+            # Refused before reaching the CRM (tool off, connection not ready):
+            # nothing was attempted, so say what to fix instead of a silent 200.
+            raise conflict(f"The push was not attempted: {outcome.refusal_reason}.")
+        await s.flush()
+        return _lead_out(lead)
 
 
 @router.get("/leads/export")
@@ -727,17 +789,7 @@ async def mark_lead_outcome(
             )
         except Exception:  # noqa: BLE001 — the outcome save must never fail on a push
             logger.exception("lead_outcome_crm_push_failed")
-        return LeadOut(
-            lead_id=lead.id,
-            name=lead.name,
-            contact_identifier=lead.contact_identifier,
-            email=lead.email,
-            intent=lead.intent,
-            state=lead.state.value,
-            outcome=lead.outcome,
-            last_activity_at=lead.last_activity_at,
-            created_at=lead.created_at,
-        )
+        return _lead_out(lead)
 
 
 def _summary(sess: SessionModel) -> ConversationSummaryOut:

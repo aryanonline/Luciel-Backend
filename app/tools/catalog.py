@@ -442,7 +442,15 @@ class PushToCrmTool:
         try:
             result = await self.backend.upsert_lead(context, inputs["lead_key"], inputs["fields"])
         except Exception as exc:  # noqa: BLE001
-            return c.failed(f"crm_error: {type(exc).__name__}")
+            # A CrmUnavailable carries a non-secret, stable reason (crm_key_not_email,
+            # crm_lead_key_not_owned, hubspot_create_http_400 …) — the Leads page
+            # shows it (F134); any other exception is named by class only.
+            reason = (
+                str(exc)
+                if type(exc).__name__ == "CrmUnavailable" and str(exc)
+                else type(exc).__name__
+            )
+            return c.failed(f"crm_error: {reason}")
         if result is None:
             # Field-mapping failure → failed; lead remains safe in our dashboard (§3.3.6).
             return c.failed("crm_field_mapping")

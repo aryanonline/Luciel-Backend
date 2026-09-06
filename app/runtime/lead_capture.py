@@ -32,7 +32,54 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import Session
-from app.models.lead import Lead, LeadState
+from app.models.lead import Lead, LeadIdentifier, LeadState
+
+_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+def normalize_phone(raw: str | None) -> str | None:
+    """A volunteered or transport phone → E.164, or None when it cannot honestly be one
+    (2026-09-05 audit F111/F127). Ten North-American digits gain +1 (the offering
+    region); an explicit ``+`` keeps its own country code; anything else is left
+    unresolved rather than guessed — a wrong number in the CRM is worse than none."""
+    if not raw:
+        return None
+    text = raw.strip()
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    if text.startswith("+"):
+        candidate = "+" + digits
+    elif len(digits) == 10:
+        candidate = "+1" + digits
+    elif len(digits) == 11 and digits[0] == "1":
+        candidate = "+" + digits
+    else:
+        return None
+    return candidate if _E164_RE.match(candidate) else None
+
+
+def identifier_kind(value: str) -> str:
+    """``email`` / ``phone`` (E.164) / ``transport`` (a platform-scoped id)."""
+    if "@" in value:
+        return "email"
+    if _E164_RE.match(value.strip()):
+        return "phone"
+    return "transport"
+
+
+def normalize_identifier(value: str) -> str:
+    """Emails case-fold; phones and transport ids are compared verbatim."""
+    text = value.strip()
+    return text.lower() if "@" in text else text
+
+
+def crm_phone_key(lead: Lead) -> str | None:
+    """The E.164 key a custom webhook may dedupe on when no email exists (F126)."""
+    for candidate in (lead.phone, lead.contact_identifier):
+        if candidate and _E164_RE.match(candidate.strip()):
+            return candidate.strip()
+    return None
 
 
 def crm_lead_key(lead: Lead) -> str | None:
@@ -163,7 +210,10 @@ def extract_lead_signals(text: str) -> LeadSignals:
     phone_m = _PHONE_RE.search(t)
     return LeadSignals(
         email=email_m.group(0) if email_m else None,
-        phone=phone_m.group(0) if phone_m else None,
+        # E.164 from the first turn (F111/F127): the widget visitor who types
+        # 416-555-0143 and the SMS sender +14165550143 are one person, and only a
+        # normalised key lets the lookup see that.
+        phone=normalize_phone(phone_m.group(0)) if phone_m else None,
         has_intent=bool(_INTENT_RE.search(t)),
         has_budget=bool(_BUDGET_RE.search(t)),
         name=_extract_name(t),
@@ -173,6 +223,72 @@ def extract_lead_signals(text: str) -> LeadSignals:
 def _summarize_intent(text: str) -> str:
     t = (text or "").strip().replace("\n", " ")
     return (t[:2040] + "…") if len(t) > 2040 else t
+
+
+# --- identifiers (F125/F127) -------------------------------------------------- #
+
+
+def _lead_identifier_values(lead: Lead) -> set[str]:
+    return {normalize_identifier(v) for v in (lead.contact_identifier, lead.email, lead.phone) if v}
+
+
+async def record_identifiers(session: AsyncSession, lead: Lead) -> None:
+    """Make sure every identifier the row carries has its ``lead_identifiers`` row.
+
+    Idempotent (unique on tenant+kind+value, conflicts ignored). A value already
+    owned by ANOTHER lead is left alone — that is the unification signal, not ours."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    for value in _lead_identifier_values(lead):
+        await session.execute(
+            pg_insert(LeadIdentifier)
+            .values(
+                id=uuid.uuid4(),
+                admin_id=lead.admin_id,
+                instance_id=lead.instance_id,
+                lead_id=lead.id,
+                kind=identifier_kind(value),
+                value=value,
+            )
+            .on_conflict_do_nothing(constraint="uq_lead_identifier")
+        )
+
+
+async def find_lead_by_identifier(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    value: str,
+    exclude_id: uuid.UUID | None = None,
+) -> Lead | None:
+    """The oldest lead known by ``value`` — on its own columns OR in the identifier
+    table (an identity absorbed by a merge). Emails case-fold; phones must already
+    be E.164 (callers normalise). Deterministic: oldest row wins."""
+    key = normalize_identifier(value)
+    kind = identifier_kind(key)
+    if kind == "email":
+        own = [func.lower(Lead.contact_identifier) == key, Lead.email == key]
+    else:
+        own = [Lead.contact_identifier == key, Lead.phone == key]
+    known = select(LeadIdentifier.lead_id).where(
+        LeadIdentifier.admin_id == admin_id,
+        LeadIdentifier.instance_id == instance_id,
+        LeadIdentifier.kind == kind,
+        LeadIdentifier.value == key,
+    )
+    stmt = select(Lead).where(
+        Lead.admin_id == admin_id,
+        Lead.instance_id == instance_id,
+        or_(*own, Lead.id.in_(known)),
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(Lead.id != exclude_id)
+    return (
+        (await session.execute(stmt.order_by(Lead.created_at.asc(), Lead.id.asc()).limit(1)))
+        .scalars()
+        .first()
+    )
 
 
 # --- capture / upsert -------------------------------------------------------- #
@@ -253,34 +369,15 @@ async def capture_or_update_lead(
             # the survivor.
             volunteered = signals.strong_identifier
             if volunteered:
-                folded = volunteered.strip().lower()
-                own = {
-                    (lead.contact_identifier or "").strip().lower(),
-                    (lead.email or "").strip().lower(),
-                }
-                if folded not in own:
-                    match_conditions = [Lead.contact_identifier == volunteered]
-                    if "@" in volunteered:
-                        match_conditions = [
-                            func.lower(Lead.contact_identifier) == folded,
-                            Lead.email == folded,
-                        ]
-                    other = (
-                        (
-                            await session.execute(
-                                select(Lead)
-                                .where(
-                                    Lead.admin_id == admin_id,
-                                    Lead.instance_id == instance_id,
-                                    Lead.id != lead.id,
-                                    or_(*match_conditions),
-                                )
-                                .order_by(Lead.created_at.asc(), Lead.id.asc())
-                                .limit(1)
-                            )
-                        )
-                        .scalars()
-                        .first()
+                if normalize_identifier(volunteered) not in _lead_identifier_values(lead):
+                    # Identifier-aware (F125): an identity absorbed by an earlier
+                    # merge still proves the match.
+                    other = await find_lead_by_identifier(
+                        session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        value=volunteered,
+                        exclude_id=lead.id,
                     )
                     if other is not None:
                         keep, absorb = (
@@ -296,6 +393,7 @@ async def capture_or_update_lead(
                         lead.last_activity_at = datetime.now(UTC)
                         await _reactivate_if_archived(session, lead)
                         await session.flush()
+                        await record_identifiers(session, lead)
                         return CaptureResult(
                             lead_id=lead.id,
                             changed=changed,
@@ -310,6 +408,7 @@ async def capture_or_update_lead(
             lead.last_activity_at = datetime.now(UTC)
             await _reactivate_if_archived(session, lead)
             await session.flush()
+            await record_identifiers(session, lead)
             return CaptureResult(
                 lead_id=lead.id,
                 changed=changed,
@@ -340,25 +439,8 @@ async def capture_or_update_lead(
     # order_by replaces scalar_one_or_none's implicit uniqueness assumption:
     # the oldest row wins, deterministically (pre-existing duplicates absorb
     # lazily via the bound-branch unification).
-    conditions = [Lead.contact_identifier == contact_key]
-    if "@" in contact_key:
-        folded = contact_key.strip().lower()
-        conditions = [func.lower(Lead.contact_identifier) == folded, Lead.email == folded]
-    existing = (
-        (
-            await session.execute(
-                select(Lead)
-                .where(
-                    Lead.admin_id == admin_id,
-                    Lead.instance_id == instance_id,
-                    or_(*conditions),
-                )
-                .order_by(Lead.created_at.asc(), Lead.id.asc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
+    existing = await find_lead_by_identifier(
+        session, admin_id=admin_id, instance_id=instance_id, value=contact_key
     )
 
     if existing is not None:
@@ -378,6 +460,11 @@ async def capture_or_update_lead(
             if signals.email and signals.email.strip().lower() != contact_key.strip().lower()
             else None
         )
+        # F111: a phone volunteered on the capturing turn is stored E.164 beside a
+        # non-phone key (an email-keyed visitor, a Meta id) instead of being lost.
+        volunteered_phone = (
+            signals.phone if signals.phone and signals.phone != contact_key.strip() else None
+        )
         lead = Lead(
             id=uuid.uuid4(),
             admin_id=admin_id,
@@ -388,6 +475,7 @@ async def capture_or_update_lead(
             name=signals.name,
             contact_identifier=contact_key,
             email=volunteered_email,
+            phone=volunteered_phone,
             # Intent only when the turn actually SIGNALED one: an identity-only
             # capture ("No its alright thankyou" from a known number) must not
             # store a pleasantry as the lead's recorded want.
@@ -413,6 +501,9 @@ async def capture_or_update_lead(
     # (strong identities only) resolve against it going forward (§3.4.9).
     sess.resolved_lead_id = lead_id
     await session.flush()
+    captured_row = existing if existing is not None else lead
+    if captured_row is not None:
+        await record_identifiers(session, captured_row)
     return CaptureResult(
         lead_id=lead_id,
         changed=changed,
@@ -453,6 +544,9 @@ async def _unify_leads(
     if keep.contact_identifier is None and absorb.contact_identifier:
         keep.contact_identifier = absorb.contact_identifier
         gained["contact"] = absorb.contact_identifier
+    if keep.phone is None and absorb.phone:
+        keep.phone = absorb.phone
+        gained["phone"] = absorb.phone
     if absorb.intent and (keep.intent is None or absorb.last_activity_at > keep.last_activity_at):
         if absorb.intent != keep.intent:
             keep.intent = absorb.intent
@@ -476,6 +570,13 @@ async def _unify_leads(
             .where(model.admin_id == admin_id, model.resolved_lead_id == absorb.id)
             .values(resolved_lead_id=keep.id)
         )
+    # F125: the absorbed identity keeps resolving — its identifiers now name the
+    # survivor (the survivor's own rows are (re)recorded by the caller).
+    await session.execute(
+        update(LeadIdentifier)
+        .where(LeadIdentifier.admin_id == admin_id, LeadIdentifier.lead_id == absorb.id)
+        .values(lead_id=keep.id)
+    )
     # CRM links: re-point the loser's rows unless the survivor already holds a
     # link for that provider — then the loser's is the duplicate, delete it.
     absorb_links = (
@@ -587,10 +688,15 @@ def _apply_signals(
         if intent != lead.intent:
             lead.intent = intent
             changed["intent"] = intent
-    # A phone volunteered mid-conversation is a new reachable fact even when the
-    # lead is already email-keyed.
-    if signals.phone and signals.phone != lead.contact_identifier:
-        changed.setdefault("phone", signals.phone)
+    # F111: a phone volunteered mid-conversation is STORED (E.164, fill-when-absent)
+    # and forwarded; a later different number is still a reachable fact for the CRM
+    # but never silently replaces the one on file.
+    if signals.phone and signals.phone != (lead.contact_identifier or "").strip():
+        if lead.phone is None:
+            lead.phone = signals.phone
+            changed["phone"] = signals.phone
+        elif signals.phone != lead.phone:
+            changed.setdefault("phone", signals.phone)
     # Keep the highest score seen across the lead's lifetime.
     if score > 0 and (lead.lead_score is None or score > lead.lead_score):
         lead.lead_score = score

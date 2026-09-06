@@ -42,7 +42,7 @@ from app.models.deferred import DeferredAction
 from app.models.email_incident import EmailDeliveryIncident
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
-from app.models.lead import Lead
+from app.models.lead import Lead, LeadIdentifier
 from app.models.notice_delivery import NoticeDelivery
 from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
@@ -72,6 +72,7 @@ LUCIEL_SCOPE_MODELS: tuple[tuple[type[TenantMixin], str], ...] = (
     (KnowledgeSource, "knowledge_source"),
     (Transcript, "transcript"),
     (SessionSummary, "session_summary"),
+    (LeadIdentifier, "lead_identifier"),
     (Lead, "lead_record"),
     (EscalationEvent, "escalation_event"),
     (ToolTraceEvent, "tool_trace_event"),

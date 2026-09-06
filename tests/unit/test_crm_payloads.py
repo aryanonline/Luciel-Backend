@@ -100,7 +100,9 @@ async def test_hubspot_update_never_rewrites_the_email_property():
     transport = _CapturingTransport()
     await _hs(transport).update("tok", "rec-9", "jane@acme.com", {"intent": "site visit"})
     _, _, payload = transport.requests[0]
-    assert payload == {"properties": {"intent": "site visit"}}
+    # F128: our field names never reach HubSpot; a non-standard fact rides the
+    # standard `message` property, and the email property is never re-sent.
+    assert payload == {"properties": {"message": "intent: site visit"}}
 
 
 async def test_hubspot_create_still_keys_on_the_email_property():

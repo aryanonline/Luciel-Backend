@@ -27,7 +27,7 @@ from app.models.knowledge import (
     KnowledgeEntity,
     KnowledgeSource,
 )
-from app.models.lead import Lead
+from app.models.lead import Lead, LeadIdentifier
 from app.models.notice_delivery import NoticeDelivery
 from app.models.record_source import RecordSourceRecord
 from app.models.tool_auth import InstanceToolAuthorization
@@ -41,6 +41,7 @@ __all__ = [
     "Account",
     "Instance",
     "Lead",
+    "LeadIdentifier",
     "AdminAuditLog",
     "BillingAccount",
     "BookingEvent",
