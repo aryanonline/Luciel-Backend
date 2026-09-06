@@ -172,11 +172,13 @@ jobs:
           # stale Data stack fails on a cross-stack export that does not exist yet.
           # Budget is the per-environment AWS Budgets ceiling: no runtime cost, and
           # it is the control that catches an environment left running by accident.
+          # Pipeline holds the GitHub deploy role: deploying it here is what lets a
+          # grant change (2026-09-05: RollbackAppServices) reach the role that uses it.
           # imageTag points Compute at the SCANNED artifact in ECR — the gate above
           # gated the exact bytes ECS will run, not a parallel rebuild.
           npx cdk deploy "Luciel-dev-Networking" "Luciel-dev-Data" "Luciel-dev-Compute" \
             "Luciel-dev-Edge" "Luciel-dev-Observability" "Luciel-dev-Budget" \
-            "Luciel-dev-WidgetCert" "Luciel-dev-Widget" "Luciel-dev-Web" \
+            "Luciel-dev-WidgetCert" "Luciel-dev-Widget" "Luciel-dev-Web" "Luciel-dev-Pipeline" \
             -c env=dev -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \

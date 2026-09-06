@@ -16,11 +16,20 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - The CVE gate is `scripts/check_image_scan.py` + `.security/cve-allowlist.json`
   (governed, expiring exceptions; fails CLOSED on scan unavailability). Pause runs
   skip the build and reuse the deployed tag — taking an env down never needs a build.
-- Fifteen sweep schedules (incl. the 5-min `mailbox_poll` and the daily
-  `model_currency` watchdog); ERROR-level sweep log lines feed the `SweepErrors`
-  metric filter (ComputeStack) alarmed in armed envs (ObservabilityStack, which
-  subscribes `-c alarmEmail`/`-c budgetAlertEmail` to the Alarms topic); dev has NO VPC interface
-  endpoints (env-gated, ~$73/mo — NAT carries the traffic; prod/preprod keep them).
+- Fifteen sweep schedules (incl. the daily `model_currency` watchdog; `mailbox_poll`
+  is an HOURLY backstop since 2026-09-05 — the data plane polls in-process every
+  5 min via `LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS`); ERROR-level sweep log lines
+  feed the `SweepErrors` metric filter (ComputeStack); alarms are armed in EVERY
+  environment and ObservabilityStack refuses to synth without `-c alarmEmail`/
+  `-c budgetAlertEmail`; the app's EMF metrics (namespace `Luciel`) and ECS
+  task-state rules for failed sweep tasks alarm too; `productionPosture`
+  (preprod/prod) gates cost-bearing telemetry, the paused-WAF exception and
+  autoscaling; dev data stores are RETAIN + deletion-protected (only preprod is
+  disposable); dev has NO VPC interface endpoints (env-gated, ~$73/mo).
+- Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
+  authority to the control-plane service; the data plane is the default action.
+- Dev deploys run `scripts/smoke_probe.sh` + the §10 verify task after migrating and
+  roll the app services back to the recorded task definitions on failure.
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.
