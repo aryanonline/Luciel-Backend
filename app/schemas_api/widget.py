@@ -22,7 +22,9 @@ from app.schemas_api.common import WireModel
 WIDGET_TEXT_MAX_CHARS = 4000
 
 WidgetRenderStateWire = Literal["active", "paused", "at_cap"]
-WidgetRoleWire = Literal["visitor", "assistant"]
+# "human": a person's reply from the dashboard (2026-09-06 E2E walk, E2E-11) — the
+# widget must never present it under the AI assistant's name.
+WidgetRoleWire = Literal["visitor", "assistant", "human"]
 
 # Persistent header label + powered-by chrome are platform literals — admin cannot
 # remove the FACT of AI (§3.4.16) nor the platform attribution (§3.4.17).

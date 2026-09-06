@@ -503,6 +503,13 @@ async def get_history(
         )
         out: list[WidgetMessageOut] = []
         for r in rows:
-            role = "visitor" if r.role == "lead" else "assistant"
+            # A person's reply keeps its own role on the wire (E2E-11): the widget
+            # labels it as the team, never as the AI assistant.
+            if r.role == "lead":
+                role = "visitor"
+            elif r.role == "human_agent":
+                role = "human"
+            else:
+                role = "assistant"
             out.append(WidgetMessageOut(message_id=r.id, role=role, text=r.text, at=r.at))
         return out

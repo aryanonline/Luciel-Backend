@@ -182,6 +182,30 @@ async def test_history_maps_roles_to_visitor_assistant(client):
     # The widget never sees lead/luciel — only visitor/assistant.
     assert roles <= {"visitor", "assistant"}
 
+    # A person's reply from the dashboard keeps its own role on the wire (2026-09-06
+    # E2E walk, E2E-11): the widget labelled Sam's words with the AI's name.
+    from datetime import UTC, datetime
+
+    from app.models.conversation import Transcript
+
+    async with tenant_session(_admin) as s:
+        s.add(
+            Transcript(
+                admin_id=_admin,
+                instance_id=_admin,
+                session_id=uuid.UUID(sid),
+                role="human_agent",
+                text="Hi, this is Sam from the front desk.",
+                at=datetime.now(UTC),
+                deterministic=True,
+            )
+        )
+        await s.flush()
+    r2 = await client.get(f"/api/v1/chat-widget/sessions/{sid}?embedKey={embed_key}")
+    human = [m for m in r2.json() if m["role"] == "human"]
+    assert len(human) == 1
+    assert human[0]["text"].startswith("Hi, this is Sam")
+
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_send_reply_id_is_the_persisted_row_id_the_history_serves(client):
