@@ -122,15 +122,50 @@ async def _contact_health(
     return out
 
 
+# 2026-09-05 audit F151: every tool that needs a connection reports that connection's
+# LIVE status on the wire, so the Tools pillar can say "connected" for a send_sms
+# whose number really sends, instead of "finish setting that up" forever.
+_TOOL_CONNECTION_TYPES: dict[str, str] = {
+    tool_id: connection_type
+    for tool_id, connection_type in catalog.TOOL_CONNECTION_TYPE.items()
+    if connection_type
+}
+
+
+async def _tool_statuses(
+    s: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> dict[str, str]:
+    by_type: dict[str, str] = {}
+    for connection_type in sorted(set(_TOOL_CONNECTION_TYPES.values())):
+        status = await gate.connection_status(
+            s, admin_id=admin_id, instance_id=instance_id, connection_type=connection_type
+        )
+        by_type[connection_type] = status or "unconfigured"
+    return {tool_id: by_type[ct] for tool_id, ct in _TOOL_CONNECTION_TYPES.items()}
+
+
+def _merge_tool_status(
+    tools: list[dict[str, object]], statuses: dict[str, str]
+) -> list[dict[str, object]]:
+    return [
+        {**t, "connectionStatus": statuses.get(str(t.get("id")), t.get("connectionStatus"))}
+        for t in tools
+    ]
+
+
 def _to_out(
     inst: Instance,
     *,
     live_channel_status: dict[str, str] | None = None,
     contact_health: list[dict[str, object]] | None = None,
+    tool_status: dict[str, str] | None = None,
 ) -> LucielOut:
     channels = inst.channels or []
     if live_channel_status:
         channels = _merge_live_channel_status(channels, live_channel_status)
+    tools = list(inst.tools or [])
+    if tool_status:
+        tools = _merge_tool_status(tools, tool_status)
     return LucielOut.model_validate(
         {
             "instanceId": inst.id,
@@ -139,7 +174,7 @@ def _to_out(
             "state": inst.state.value,
             "embedKeyPublicId": inst.embed_key_public_id,
             "channels": channels,
-            "tools": inst.tools or [],
+            "tools": tools,
             "escalation": inst.escalation or {},
             "escalationContactHealth": contact_health or [],
             "personality": inst.personality or {"preset": "warm_concierge"},
@@ -168,8 +203,11 @@ async def get_luciel(subject: Subject = Depends(current_admin)) -> LucielOut | N
         live_status = await gate.channel_connection_statuses(
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
+        tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
         health = await _contact_health(s, subject.admin_id, inst.escalation)
-    return _to_out(inst, live_channel_status=live_status, contact_health=health)
+    return _to_out(
+        inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
+    )
 
 
 @router.get("/capabilities", response_model=list[CapabilityGroupOut])
@@ -287,8 +325,11 @@ async def _update_config(
             if field == "channels"
             else None
         )
+        tool_status = await _tool_statuses(s, admin_id, inst.id)
         health = await _contact_health(s, admin_id, inst.escalation)
-        return _to_out(inst, live_channel_status=live_status, contact_health=health)
+        return _to_out(
+            inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
+        )
 
 
 @router.put("/channels", response_model=LucielOut)
@@ -560,8 +601,11 @@ async def resend_contact_confirmation(
         live_status = await gate.channel_connection_statuses(
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
+        tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
         health = await _contact_health(s, subject.admin_id, inst.escalation)
-        return _to_out(inst, live_channel_status=live_status, contact_health=health)
+        return _to_out(
+            inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
+        )
 
 
 @router.put("/lead-retention", response_model=LucielOut)

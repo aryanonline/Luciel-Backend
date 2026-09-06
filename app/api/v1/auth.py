@@ -93,7 +93,7 @@ async def _has_luciel(admin_id: uuid.UUID) -> bool:
 
 
 @router.post("/signup", response_model=SignupResult)
-async def signup(req: SignupRequest) -> SignupResult:
+async def signup(req: SignupRequest, response: Response) -> SignupResult:
     # Verify the captcha with the provider (hCaptcha) BEFORE creating the account
     # (§3.7.1a bot-protection). In mock/unconfigured mode this is a no-op pass.
     await verify_captcha(req.captcha_token)
@@ -116,6 +116,17 @@ async def signup(req: SignupRequest) -> SignupResult:
         # the client the mail did not leave the system so it can offer a resend —
         # the provider error itself stays in the log/audit trail, never on the wire.
         degraded = outcome.degraded
+        # 2026-09-05 audit F148: the verify wall's "resend" is a session-authed call,
+        # and until now signup issued no session — so the wall's copy promised a
+        # resend that could only 401. A PENDING account (a verify token was minted)
+        # gets its session now; it stays hard-gated everywhere else until verified.
+        # A re-signup on an already-verified email mints no token and gets no
+        # session: that path must never be a password-less login.
+        from app.auth.tokens import (
+            mint_session_token,  # noqa: PLC0415 — same lazy import verify_email uses
+        )
+
+        _set_session_cookie(response, mint_session_token(acct.id, acct.user_id, acct.session_epoch))
     return SignupResult(
         account=_account_out(acct, has_luciel=False), email_delivery_degraded=degraded
     )

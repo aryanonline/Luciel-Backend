@@ -275,12 +275,15 @@ class ScheduleCallbackTool:
 
     # Map from the free-form channel string to the connection_type checked at fire time
     # (§3.3.5: delivery channel bound at FIRE time, not scheduling time).
+    # 2026-09-05 audit F144/F175: a callback is a MESSAGE delivered later over a
+    # channel the lead left an address on. `widget` has no address to deliver to
+    # (the visitor's tab is gone) and `voice` would be an outbound call the
+    # platform does not make — both used to be accepted, queued, and then fail
+    # every retry while Luciel had already promised the follow-up.
     _CHANNEL_TO_CONNECTION: dict[str, str] = {
         "email": "email_sender",
         "sms": "sms_sender",
         "whatsapp": "channel_auth",
-        "voice": "channel_auth",
-        "widget": "channel_auth",
     }
 
     async def _count_pending(
@@ -383,7 +386,11 @@ class ScheduleCallbackTool:
             return c.failed("enqueue_failed:no_session")
 
         channel: str = inputs["channel"]
-        connection_type = self._CHANNEL_TO_CONNECTION.get(channel, "channel_auth")
+        connection_type = self._CHANNEL_TO_CONNECTION.get(channel)
+        if connection_type is None:
+            # Refused before any write: the loop reads the structured reason and
+            # offers a channel that can actually deliver (F144/F175).
+            return c.failed(f"unsupported_channel:{channel}")
 
         # §3.3.5: an opted-out lead is NEVER sent a scheduled callback, regardless of
         # caps — checked first so opt-out always wins over an under-cap lead/tenant.

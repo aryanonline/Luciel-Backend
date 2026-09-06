@@ -169,8 +169,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "channel": {
                     "type": "string",
-                    "enum": ["email", "sms", "whatsapp", "voice", "widget"],
-                    "description": "The delivery channel; it must already be connected.",
+                    "enum": ["email", "sms", "whatsapp"],
+                    "description": (
+                        "The delivery channel; it must already be connected and the "
+                        "customer must have given an address on it. Text channels only "
+                        "— a callback is a message, never an outbound call, and a web "
+                        "chat visitor cannot be reached once they leave."
+                    ),
                 },
                 "message": {"type": "string", "description": "The follow-up message text."},
             },
