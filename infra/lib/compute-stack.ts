@@ -62,6 +62,17 @@ export interface ComputeStackProps extends StackProps {
   readonly hostedZone?: route53.IHostedZone;
 }
 
+/**
+ * Paths the CONTROL plane answers (2026-09-05 audit F067). An ALB rule takes at
+ * most five patterns, hence the grouping; every group becomes one rule on every
+ * listener. Kept in sync with app/main.py CONTROL_PLANE_PREFIXES by the CDK test
+ * (plane-routing.test.ts) and the Python test (tests/unit/test_plane_routing.py).
+ */
+export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> = [
+  ['/api/v1/admin/*', '/api/v1/auth/*', '/api/v1/dashboard/*', '/api/v1/connections/*', '/api/v1/exports/*'],
+  ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
+];
+
 export class ComputeStack extends Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly cluster: ecs.Cluster;
@@ -1030,6 +1041,36 @@ export class ComputeStack extends Stack {
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
     });
 
+    // §0 two-plane split, made real at the edge (2026-09-05 audit F067). Before
+    // this, BOTH listeners forwarded every path to the data plane and the
+    // control-plane service received no traffic at all — which only mattered once
+    // the data-plane role was narrowed: admin flows that create tenant secrets,
+    // write export bundles or store knowledge originals must run on the plane whose
+    // role can. Admin authority (auth, admin, dashboard, billing, connections,
+    // exports, contact, escalation-contact) is answered by the CONTROL plane;
+    // everything else — the widget, channel + provider webhooks, /healthz — stays
+    // on the data plane, which remains the DEFAULT action so an unlisted path can
+    // never be dropped. app/main.py declares the same split (CONTROL_PLANE_PREFIXES)
+    // and its unit test refuses a router that is on neither list. One target group
+    // per service (the single-service-in-two-TGs deploy hang above does not apply).
+    const controlPlaneTg = new elbv2.ApplicationTargetGroup(this, 'ControlPlaneTargets', {
+      vpc,
+      port: 8000,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [controlService],
+      healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
+    });
+    const routeControlPlane = (l: elbv2.ApplicationListener, tag: string) => {
+      CONTROL_PLANE_PATH_PATTERNS.forEach((patterns, i) => {
+        l.addAction(`${tag}ControlPlane${i}`, {
+          priority: 10 + i,
+          conditions: [elbv2.ListenerCondition.pathPatterns([...patterns])],
+          action: elbv2.ListenerAction.forward([controlPlaneTg]),
+        });
+      });
+    };
+    routeControlPlane(listener, 'Http');
+
     // HTTPS:443 with the api.vantagemind.ai cert (spec §1: add the HTTPS listener to
     // the EXISTING ALB; keep the existing HTTP routing above). Only wired when DNS
     // has provided the regional cert. Forwards to the SAME data-plane target group
@@ -1041,9 +1082,7 @@ export class ComputeStack extends Stack {
         certificates: [apiCert],
         defaultTargetGroups: [dataPlaneTg],
       });
-      // Reference https to satisfy no-unused; the listener is attached to the ALB
-      // by construction above.
-      void https;
+      routeControlPlane(https, 'Https');
     }
 
     // api.vantagemind.ai -> this ALB (A + AAAA ALIAS). Zone already exists (spec §1).

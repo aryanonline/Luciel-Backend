@@ -28,6 +28,27 @@ from app.runtime.integration_status import (
 # Data plane: the embeddable widget is loaded on ARBITRARY customer websites, so its
 # origin can never be allow-listed in advance (§1.2, §9.6).
 DATA_PLANE_PREFIXES = ("/api/v1/chat-widget",)
+# The ALB routes these prefixes to the CONTROL plane service (infra/lib/compute-stack.ts
+# CONTROL_PLANE_PATH_PATTERNS — same list, 2026-09-05 audit F067); everything else,
+# including the widget and every webhook, is answered by the narrower data plane.
+# tests/unit/test_plane_routing.py refuses a mounted router that is on neither list.
+CONTROL_PLANE_PREFIXES = (
+    "/api/v1/admin",
+    "/api/v1/auth",
+    "/api/v1/dashboard",
+    "/api/v1/connections",
+    "/api/v1/exports",
+    "/api/v1/billing",
+    "/api/v1/contact",
+    "/api/v1/escalation-contact",
+)
+# Answered by the data plane (the ALB default): public ingress and the platform's
+# own health surface.
+DATA_PLANE_PUBLIC_PREFIXES = (
+    "/api/v1/chat-widget",
+    "/api/v1/webhooks",
+    "/healthz",
+)
 
 _CORS_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 
