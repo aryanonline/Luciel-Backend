@@ -231,12 +231,17 @@ async def run_deferred_retry(*, now: datetime | None = None) -> list[str]:
 async def _check_connections(
     session: AsyncSession, *, admin_id: uuid.UUID, now: datetime
 ) -> dict[str, str]:
+    from app.connections.probes import DispatchingProbe
     from app.connections.refresh import DispatchingRefresher
 
     result = await health.run_health_sweep(
         session,
         admin_id=admin_id,
-        probe=health.StoredCredentialProbe(),
+        # Round 6 WP-C: the stored-credential check for every row, then — live
+        # only — one identity call at the provider, so a grant revoked at the
+        # provider flips within one sweep instead of reading Connected until a
+        # customer's booking or lead push fails.
+        probe=DispatchingProbe(fallback=health.StoredCredentialProbe()),
         # Every provider with a REFRESH_SPECS entry refreshes for real in live
         # mode (Google/HubSpot/Salesforce/Calendly/Outlook refresh grants,
         # Instagram/Meta long-lived re-exchange); mock and unspecced providers

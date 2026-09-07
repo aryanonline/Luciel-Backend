@@ -36,6 +36,7 @@ universal gate consults was last computed the day the admin connected.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -49,6 +50,8 @@ from app.connections.secrets import SecretStore, get_secret_store
 from app.knowledge import sync as knowledge_sync
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
+
+_log = logging.getLogger(__name__)
 
 # §3.8.5 TARGET cadence per auth_class. Honesty note (round 5B): the deployed
 # scheduler runs ONE 6-hour EventBridge cron for every class — this table is the
@@ -418,3 +421,81 @@ async def run_health_sweep(
         )
         out[str(connection.connection_id)] = status
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Round 6 WP-C: a live call the provider refused flips the row at once
+# --------------------------------------------------------------------------- #
+
+#: Failure-reason suffixes the tool backends use when the provider answered 401/403.
+PROVIDER_AUTH_FAILURE_SUFFIXES = ("_http_401", "_http_403")
+
+
+def is_provider_auth_failure(reason: str) -> bool:
+    """True when a backend's failure reason says the provider refused the credential."""
+    return reason.endswith(PROVIDER_AUTH_FAILURE_SUFFIXES)
+
+
+async def flag_provider_auth_failure(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    connection_type: str,
+    reason: str,
+    connection_id: uuid.UUID | None = None,
+) -> bool:
+    """A provider refused the stored credential on a LIVE call: flip the row to
+    ``error`` through the sweep's own transition — audit row, one attention email —
+    right now, instead of letting it read Connected until the next sweep while every
+    push or booking fails in front of a customer (round 6 WP-C, F081). Health-owned
+    rows only; a row mid-swap or setup-owned is left to its owner. Returns whether a
+    row was flipped."""
+    stmt = select(InstanceConnection).where(
+        InstanceConnection.admin_id == admin_id,
+        InstanceConnection.instance_id == instance_id,
+        InstanceConnection.connection_type == connection_type,
+        InstanceConnection.status != "revoked",
+    )
+    if connection_id is not None:
+        stmt = stmt.where(InstanceConnection.connection_id == connection_id)
+    row = (
+        (await session.execute(stmt.order_by(InstanceConnection.created_at.desc())))
+        .scalars()
+        .first()
+    )
+    if row is None or not health_owned(row):
+        return False
+    from app.connections import registry  # noqa: PLC0415 — avoids an import cycle
+
+    spec = registry.get_provider(row.provider)
+    name = spec.display_name if spec is not None else row.provider
+    await mark_connection_broken(
+        session, row, detail=f"{name} rejected the stored credential ({reason}) — reconnect"
+    )
+    return True
+
+
+async def flag_if_provider_auth_failure(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    connection_type: str,
+    reason: str,
+) -> bool:
+    """``flag_provider_auth_failure`` when ``reason`` is a 401/403, else nothing. Never
+    raises: the flag rides a customer's turn and must not turn one failure into two."""
+    if not is_provider_auth_failure(reason):
+        return False
+    try:
+        return await flag_provider_auth_failure(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            connection_type=connection_type,
+            reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — the flag is best-effort; the call already failed
+        _log.exception("provider auth failure could not be flagged type=%s", connection_type)
+        return False

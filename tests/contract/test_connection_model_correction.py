@@ -447,6 +447,13 @@ def _fake_meta_token_exchange(expected_code: str, monkeypatch) -> None:
             return httpx.Response(200, json=body, request=httpx.Request("POST", url))
 
         async def get(self, url, *, params=None, headers=None):
+            if "/me" in url:
+                # Round 6 WP-C: both grants are verified against /me before they flip.
+                return httpx.Response(
+                    200,
+                    json={"id": "10001", "name": "Tester", "username": "acme"},
+                    request=httpx.Request("GET", url),
+                )
             if params["grant_type"] == "fb_exchange_token":
                 assert params["client_id"] == "meta-cid"
                 assert params["fb_exchange_token"] == "meta-tok"

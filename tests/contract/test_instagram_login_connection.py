@@ -115,6 +115,15 @@ def _fake_instagram_token_server(monkeypatch, *, long_lived_status: int = 200):
 
         async def get(self, url, *, params=None, headers=None):
             self.gets.append((url, dict(params or {})))
+            if url.startswith("https://graph.instagram.com/v23.0/me"):
+                # Round 6 WP-C: the verifier proves the LONG-lived token against
+                # graph.instagram.com/me and records the @username.
+                assert (headers or {}).get("Authorization") == f"Bearer {LONG_LIVED}"
+                return httpx.Response(
+                    200,
+                    json={"id": IG_USER_ID, "username": "acme"},
+                    request=httpx.Request("GET", url),
+                )
             assert url == "https://graph.instagram.com/access_token"
             if long_lived_status >= 400:
                 return httpx.Response(
@@ -243,7 +252,8 @@ async def test_the_callback_upgrades_to_a_long_lived_token_before_storing_it(cli
     assert await _status_of(client, cid) == "connected"
 
     assert len(server.posts) == 1
-    assert len(server.gets) == 1, "the long-lived upgrade is not optional"
+    upgrades = [url for url, _ in server.gets if url.endswith("/access_token")]
+    assert len(upgrades) == 1, "the long-lived upgrade is not optional"
     assert server.gets[0][1] == {
         "grant_type": "ig_exchange_token",
         "client_secret": "ig-csecret",
@@ -307,6 +317,14 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
             )
 
         async def get(self, url, *, params=None, headers=None):
+            if url.startswith("https://graph.facebook.com/v19.0/me"):
+                # Round 6 WP-C: Graph /me with the long-lived token names who authorized.
+                assert (headers or {}).get("Authorization") == "Bearer fb-tok-long"
+                return httpx.Response(
+                    200,
+                    json={"id": "10001", "name": "FB Tester"},
+                    request=httpx.Request("GET", url),
+                )
             # Facebook's own long-lived upgrade (round 5B item 14) — same endpoint, GET.
             assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
             assert params["grant_type"] == "fb_exchange_token"

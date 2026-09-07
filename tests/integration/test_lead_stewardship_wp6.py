@@ -453,3 +453,59 @@ async def test_a_crm_swap_forgets_the_old_record_ids_like_a_disconnect():
         ).scalars()
         payloads = [row.event_payload for row in cleared]
         assert payloads and payloads[-1]["reason"] == "swap" and payloads[-1]["count"] == 1
+
+
+# --- Round 6 WP-C: a dead grant flips the row the moment a push hits it ------- #
+class _RejectingApi:
+    """A CRM whose grant is dead: the provider answers 401 to everything."""
+
+    async def find_by_key(self, token, lead_key):
+        raise crm_backend.CrmUnavailable("hubspot_search_http_401")
+
+    async def get(self, token, record_id):
+        raise crm_backend.CrmUnavailable("hubspot_get_http_401")
+
+    async def create(self, token, lead_key, fields, notes=None):
+        raise crm_backend.CrmUnavailable("hubspot_create_http_401")
+
+    async def update(self, token, record_id, lead_key, fields, notes=None):
+        raise crm_backard_never()  # pragma: no cover — find_by_key fails first
+
+
+def crm_backard_never():  # pragma: no cover
+    return crm_backend.CrmUnavailable("hubspot_update_http_401")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rejected_credential_flips_the_crm_row_and_marks_the_lead(
+    monkeypatch, fresh_mock_crm
+):
+    """Round 6 WP-C (F081): the row used to read Connected until the next sweep while
+    every push returned 401. Now the push that hits the dead grant flips it — audit
+    row, one attention email — and the lead still records the honest failure."""
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, provider="hubspot")
+    sid = await _session(admin, iid)
+    monkeypatch.setattr(crm_backend, "build_crm_api", lambda: _RejectingApi())
+
+    assert await _capture(admin, iid, sid, "I'm jane@acme.com — I need a quote") == "failed"
+    (lead,) = await _leads(admin)
+    assert lead.crm_push_status == "failed"
+    assert (lead.crm_push_detail or "").endswith("hubspot_search_http_401")
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin,
+                    InstanceConnection.connection_type == "crm",
+                )
+            )
+        ).scalar_one()
+        assert row.status == "error"
+        assert "rejected the stored credential" in (row.status_detail or "")
+        assert "reconnect" in (row.status_detail or "")
+    assert await _audit_count(admin, "connection_status_changed") == 1
+
+    # A second failing push on a row that is already error transitions nothing more.
+    assert await _capture(admin, iid, sid, "budget is about $9k") == "failed"
+    assert await _audit_count(admin, "connection_status_changed") == 1

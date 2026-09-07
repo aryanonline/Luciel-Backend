@@ -101,6 +101,18 @@ def _fake_notion_transport(monkeypatch, *, patch_knowledge: bool = False):
                 request=httpx.Request("POST", url),
             )
 
+        async def get(self, url, *, headers=None, params=None):
+            # Round 6 WP-C: the verifier answers as the integration bot (/v1/users/me)
+            # and names the workspace before the row flips.
+            assert url == "https://api.notion.com/v1/users/me"
+            assert (headers or {}).get("Authorization") == "Bearer n-tok-1"
+            assert (headers or {}).get("Notion-Version")
+            return httpx.Response(
+                200,
+                json={"type": "bot", "name": "Luciel", "bot": {"workspace_name": "Acme Co"}},
+                request=httpx.Request("GET", url),
+            )
+
         async def __aenter__(self):
             return self
 

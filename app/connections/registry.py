@@ -82,6 +82,10 @@ class ProviderAuthorize:
     # The exchange request body encoding: "form" (x-www-form-urlencoded, the OAuth
     # default) or "json" (Notion's token endpoint takes a JSON body).
     exchange_body: str = "form"
+    # Scopes the grant MUST carry for the effect layer to work (round 6 WP-C). The
+    # post-exchange verifier refuses a narrower grant with the fix in the reason; a
+    # provider whose token report carries no scope list leaves this empty.
+    required_scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,7 +213,12 @@ PROVIDERS: dict[str, ProviderSpec] = {
         authorize=ProviderAuthorize(
             endpoint="https://app.hubspot.com/oauth/authorize",
             exchange_endpoint="https://api.hubapi.com/oauth/v1/token",
-            scopes="crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read",
+            # The push WRITES contacts (crm_backend.HubSpotCrmApi.create/update); a
+            # read-only grant connected cleanly and failed on the first lead (round 6
+            # WP-C). The HubSpot app registration must carry the same scope list.
+            scopes="crm.objects.contacts.read crm.objects.contacts.write "
+            "crm.objects.companies.read crm.objects.deals.read",
+            required_scopes=("crm.objects.contacts.read", "crm.objects.contacts.write"),
             # HubSpot's authorize endpoint rejects unknown query params, and it does not
             # implement PKCE — sending a code_challenge fails the request outright.
             supports_pkce=False,

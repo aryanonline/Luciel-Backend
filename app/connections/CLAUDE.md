@@ -7,7 +7,7 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
 `service.py` — connection lifecycle operations.
 `registry.py` — supported provider definitions.
 `oauth_flow.py` — signed OAuth state and callback exchange.
-`verify.py` — post-exchange provider verification (Graph /me for the Outlook mailbox).
+`verify.py` — post-exchange provider verification for EVERY OAuth provider (identity call, scope check, expiry stamp, `connectedAs`); `probes.py` — live liveness probes the health sweep binds (round 6 WP-C).
 `secrets.py` — tenant secret storage.
 `health.py`, `gate.py`, and `deferred_queue.py` — readiness and follow-up.
 

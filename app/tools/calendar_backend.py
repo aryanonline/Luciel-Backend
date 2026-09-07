@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from app.config import get_settings
 from app.connections.secrets import get_secret_store, secret_ref_for
@@ -173,6 +174,9 @@ def _booking(event: CalendarEvent) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # the backend
 # --------------------------------------------------------------------------- #
+_T = TypeVar("_T")
+
+
 class GoogleCalendarBackend:
     """``CalendarBackend`` over Google Calendar for the tenant's connected account.
 
@@ -211,6 +215,25 @@ class GoogleCalendarBackend:
             raise CalendarUnavailable("calendar_token_unavailable")
         return CalendarCredentials(access_token=token, calendar_id=self._calendar_id)
 
+    async def _guarded(self, ctx: ToolContext, call: Awaitable[_T]) -> _T:
+        """Round 6 WP-C: a 401/403 from Google is a dead grant. The calendar row
+        flips to error through the sweep's own transition the moment it happens
+        (audit + one attention email); the tool call still fails honestly."""
+        try:
+            return await call
+        except CalendarUnavailable as exc:
+            if ctx.session is not None:
+                from app.connections import health  # noqa: PLC0415 — import cycle
+
+                await health.flag_if_provider_auth_failure(
+                    ctx.session,
+                    admin_id=ctx.admin_id,
+                    instance_id=ctx.instance_id,
+                    connection_type="calendar",
+                    reason=str(exc),
+                )
+            raise
+
     async def _is_free(
         self,
         cred: CalendarCredentials,
@@ -228,12 +251,18 @@ class GoogleCalendarBackend:
         )
 
     async def free_busy(self, ctx: ToolContext, window: str) -> list[str]:
+        return await self._guarded(ctx, self._free_busy(ctx, window))
+
+    async def _free_busy(self, ctx: ToolContext, window: str) -> list[str]:
         cred = await self._credentials(ctx)
         window_start, window_end = parse_interval(window, default_minutes=SLOT_MINUTES)
         busy = await self._api.busy(cred, window_start, window_end)
         return open_slots(busy, window_start=window_start, window_end=window_end)
 
     async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
+        return await self._guarded(ctx, self._book(ctx, slot, email))
+
+    async def _book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
         start, end = parse_interval(slot)
         if not await self._is_free(cred, start, end):
@@ -241,6 +270,13 @@ class GoogleCalendarBackend:
         return _booking(await self._api.insert_event(cred, start=start, end=end, email=email))
 
     async def find_bookings(
+        self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
+    ) -> list[dict[str, Any]]:
+        return await self._guarded(
+            ctx, self._find_bookings(ctx, email=email, booking_ref=booking_ref)
+        )
+
+    async def _find_bookings(
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
     ) -> list[dict[str, Any]]:
         cred = await self._credentials(ctx)
@@ -255,6 +291,11 @@ class GoogleCalendarBackend:
     async def reschedule(
         self, ctx: ToolContext, booking_ref: str, slot: str
     ) -> dict[str, Any] | None:
+        return await self._guarded(ctx, self._reschedule(ctx, booking_ref, slot))
+
+    async def _reschedule(
+        self, ctx: ToolContext, booking_ref: str, slot: str
+    ) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
         start, end = parse_interval(slot)
         existing = await self._api.get_event(cred, booking_ref)
@@ -266,6 +307,9 @@ class GoogleCalendarBackend:
         return _booking(moved) if moved is not None else None
 
     async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
+        return await self._guarded(ctx, self._cancel(ctx, booking_ref))
+
+    async def _cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
         event = await self._api.get_event(cred, booking_ref)
         if event is None or not await self._api.delete_event(cred, booking_ref):

@@ -103,6 +103,18 @@ def _fake_google_transport(monkeypatch, *, fail: bool = False):
                 request=httpx.Request("POST", url),
             )
 
+        async def get(self, url, *, headers=None, params=None):
+            # Round 6 WP-C: Google tokeninfo proves the grant carries the calendar scope.
+            assert url.startswith("https://oauth2.googleapis.com/tokeninfo")
+            return httpx.Response(
+                200,
+                json={
+                    "scope": "https://www.googleapis.com/auth/calendar.events",
+                    "expires_in": "3599",
+                },
+                request=httpx.Request("GET", url),
+            )
+
         async def __aenter__(self):
             return self
 

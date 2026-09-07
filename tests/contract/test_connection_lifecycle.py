@@ -611,9 +611,18 @@ def _fake_meta_transport(expected_code: str, monkeypatch):
             )
 
         async def get(self, url, *, params=None, headers=None):
+            self.calls.append((url, dict(params or {})))
+            if url.startswith("https://graph.facebook.com/v19.0/me"):
+                # Round 6 WP-C: the post-exchange verifier proves the LONG-lived
+                # token against Graph /me and records who authorized.
+                assert (headers or {}).get("Authorization") == "Bearer meta-tok-1"
+                return httpx.Response(
+                    200,
+                    json={"id": "10001", "name": "Meta Tester"},
+                    request=httpx.Request("GET", url),
+                )
             # The mandatory fb_exchange_token upgrade (round 5B item 14): Meta's
             # own grant shape — client_id + the short token under fb_exchange_token.
-            self.calls.append((url, dict(params or {})))
             assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
             assert params["grant_type"] == "fb_exchange_token"
             assert params["fb_exchange_token"] == "meta-short-1"
@@ -686,7 +695,8 @@ async def test_meta_oauth_callback_stores_the_token_and_connects(client, monkeyp
     # the code redeem plus the mandatory fb_exchange_token upgrade.
     assert stored["access_token"] == "meta-tok-1"
     assert stored["expires_in"] == "5184000"
-    assert len(transport.calls) == 2
+    # Exchange, long-lived upgrade, and (round 6 WP-C) the verifier's Graph /me.
+    assert len(transport.calls) == 3
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

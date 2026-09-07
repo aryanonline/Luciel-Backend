@@ -287,7 +287,9 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
     from app.connections.secrets import secret_ref_for
 
     class FakeTokenTransport:
-        """Stands in for the real oauth2.googleapis.com/token endpoint."""
+        """Stands in for the real oauth2.googleapis.com/token endpoint — and, since
+        round 6 WP-C, for the tokeninfo call the verifier makes with the new token
+        to prove the grant carries the Drive read scope."""
 
         async def post(self, url, *, data=None, headers=None):
             assert url == "https://oauth2.googleapis.com/token"
@@ -296,6 +298,18 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
                 200,
                 json={"access_token": "gd-tok-from-callback", "refresh_token": "gd-r"},
                 request=httpx.Request("POST", url),
+            )
+
+        async def get(self, url, *, headers=None, params=None):
+            assert url.startswith("https://oauth2.googleapis.com/tokeninfo")
+            assert "access_token=gd-tok-from-callback" in url
+            return httpx.Response(
+                200,
+                json={
+                    "scope": "https://www.googleapis.com/auth/drive.readonly",
+                    "expires_in": "3599",
+                },
+                request=httpx.Request("GET", url),
             )
 
         async def __aenter__(self):

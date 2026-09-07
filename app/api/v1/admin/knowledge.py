@@ -27,6 +27,7 @@ from app.audit import log as audit
 from app.connections import oauth_flow, registry
 from app.connections import service as connections_service
 from app.connections.secrets import get_secret_store
+from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
 from app.knowledge import scope as knowledge_scope
 from app.knowledge import service, sync
@@ -784,6 +785,21 @@ async def oauth_callback(
                 conn.status_detail = f"oauth_exchange_failed: {exc}"
                 await s.flush()
                 raise conflict(f"OAuth token exchange failed: {exc}") from exc
+            # Round 6 WP-C: a knowledge grant is verified like every other provider —
+            # Drive must carry the read scope, Notion must answer as its bot — before
+            # the token is stored or the row flips. A refusal leaves the row where it
+            # was, with the provider's reason on it.
+            verify_updates: dict[str, object] | None = None
+            provider_verifier = POST_EXCHANGE_VERIFIERS.get(conn.provider)
+            if provider_verifier is not None:
+                try:
+                    verify_updates = await provider_verifier(
+                        material=material, transport=cast("HttpTransport", transport)
+                    )
+                except PostExchangeVerifyFailed as exc:
+                    conn.status_detail = f"verify_failed: {exc}"
+                    await s.flush()
+                    raise conflict(str(exc)) from exc
         await store_oauth_token(
             store,
             admin_id=subject.admin_id,
@@ -794,6 +810,10 @@ async def oauth_callback(
         old_status = conn.status
         conn.status = "connected"
         conn.status_detail = None
+        if verify_updates:
+            cfg = dict(conn.non_secret_config or {})
+            cfg.update(verify_updates)
+            conn.non_secret_config = cfg
         await s.flush()
         await audit.emit(
             s,

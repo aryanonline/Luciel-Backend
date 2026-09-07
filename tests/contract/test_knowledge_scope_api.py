@@ -36,6 +36,13 @@ class FakeDriveTransport:
         )
 
     async def get(self, url, *, headers=None, params=None):
+        if url.startswith("https://oauth2.googleapis.com/tokeninfo"):
+            # Round 6 WP-C: the callback verifies the Drive read scope before flipping.
+            return httpx.Response(
+                200,
+                json={"scope": "https://www.googleapis.com/auth/drive.readonly"},
+                request=httpx.Request("GET", url),
+            )
         self.get_params.append(dict(params or {}))
         return httpx.Response(200, json=self._listing, request=httpx.Request("GET", url))
 

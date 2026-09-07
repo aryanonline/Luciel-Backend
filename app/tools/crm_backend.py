@@ -471,6 +471,28 @@ class _NativeCrmBackend:
     async def upsert_lead(
         self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
     ) -> dict[str, Any] | None:
+        try:
+            return await self._upsert_lead_inner(ctx, lead_key, fields)
+        except CrmUnavailable as exc:
+            # Round 6 WP-C: a 401/403 from the CRM is a dead grant, not a bad record.
+            # The connection row flips to error through the sweep's own transition
+            # (audit + one attention email) the moment it happens, instead of reading
+            # Connected until the next sweep — and the push still fails honestly.
+            if ctx.session is not None:
+                from app.connections import health  # noqa: PLC0415 — import cycle
+
+                await health.flag_if_provider_auth_failure(
+                    ctx.session,
+                    admin_id=ctx.admin_id,
+                    instance_id=ctx.instance_id,
+                    connection_type="crm",
+                    reason=str(exc),
+                )
+            raise
+
+    async def _upsert_lead_inner(
+        self, ctx: ToolContext, lead_key: str, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
         if ctx.session is None:
             raise CrmUnavailable("crm_session_unavailable")
         from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
@@ -686,7 +708,12 @@ class SalesforceCrmBackend(_NativeCrmBackend):
         material = (
             await get_secret_store().get(secret_ref_for(ctx.admin_id, ctx.instance_id, "crm")) or {}
         )
-        instance_url = material.get("instance_url") or "https://login.salesforce.com"
+        instance_url = str(material.get("instance_url") or "").strip()
+        if not instance_url:
+            # Round 6 WP-C: login.salesforce.com is the AUTH host, not an org's API
+            # base — a push against it answered 401 forever while the row read
+            # Connected. No org URL on file is its own honest reason.
+            raise CrmUnavailable("salesforce_instance_url_missing")
         return SalesforceCrmApi(instance_url=instance_url)
 
 
