@@ -80,6 +80,11 @@ LIMITS: dict[str, ChannelLimits] = {
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
     # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
     "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
+    # Account-export downloads per signed link (adversarial review R-WP2-2): the
+    # door is unauthenticated by design (the token is the authorization), so a
+    # leaked or replayed link must not become an unbounded audit-row + presign mill.
+    # A person downloads once or twice; a browser that retries is covered by the burst.
+    "export_download": ChannelLimits(burst=5, refill_seconds=60.0, daily_cap=50),
     # Sign-in and password-reset throttles (2026-09-05 audit F056/F068): per email
     # AND per source address, so neither a single-account brute force nor a
     # many-account spray runs unbounded. A reset request is throttled whether or

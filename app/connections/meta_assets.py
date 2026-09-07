@@ -26,6 +26,10 @@ from typing import Any, Protocol
 GRAPH_BASE = "https://graph.facebook.com/v19.0"
 INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com/v23.0"
 _MAX_PAGES = 10
+# The only origins a ``paging.next`` URL may point at (adversarial review R-WP2-1):
+# the next URL carries the grant's access token in its query string, so following
+# whatever the reply named would have sent that token wherever the reply said.
+_GRAPH_ORIGINS = ("https://graph.facebook.com/", "https://graph.instagram.com/")
 
 
 class AssetLookupFailed(Exception):
@@ -72,7 +76,11 @@ async def _get_all(
         items.extend(i for i in page.get("data", []) if isinstance(i, dict))
         paging = page.get("paging") or {}
         raw_next = paging.get("next") if isinstance(paging, dict) else None
-        next_url = str(raw_next) if raw_next else None
+        next_url = (
+            str(raw_next)
+            if raw_next and str(raw_next).startswith(_GRAPH_ORIGINS)
+            else None  # an off-Graph next URL ends the walk; it is never fetched
+        )
         next_params = None  # the next URL already carries its query string
     return items
 

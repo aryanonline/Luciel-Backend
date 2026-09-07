@@ -10,12 +10,15 @@ oracle on which tokens exist — invalid and expired read the same).
 
 from __future__ import annotations
 
+import hashlib
+
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
-from app.api.errors import ApiError
+from app.api.errors import ApiError, rate_limited
 from app.audit import log as audit
+from app.channels import rate_limit
 from app.db.session import tenant_session
 from app.lifecycle.export_link import PRESIGN_TTL_SECONDS, ExportLinkRejected, parse_export_token
 from app.lifecycle.export_store import export_key_for, get_export_store
@@ -36,6 +39,14 @@ async def download_export(token: str) -> RedirectResponse:
         admin_id, export_id = parse_export_token(token)
     except ExportLinkRejected as exc:
         raise ApiError(410, _EXPIRED) from exc
+    # Per link, before any tenant work (adversarial review R-WP2-2): a valid token
+    # replayed in a loop must not write an audit row and mint a presign per hit.
+    link_key = hashlib.sha256(token.encode()).hexdigest()[:32]
+    if not rate_limit.get_store().check_source("export_download", link_key).allowed:
+        raise rate_limited(
+            "This link was opened too many times in a row — wait a minute and try again.",
+            retry_after_seconds=60,
+        )
     async with tenant_session(admin_id) as s:
         acct = (await s.execute(select(Account).where(Account.id == admin_id))).scalar_one_or_none()
         if acct is None:

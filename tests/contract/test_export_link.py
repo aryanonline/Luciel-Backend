@@ -125,6 +125,38 @@ async def test_close_account_also_uploads_export_with_context(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_export_link_is_throttled_per_link(client):
+    """Adversarial review R-WP2-2: the download door is unauthenticated by design, so
+    a leaked or replayed link must not become an unbounded audit-row and presign
+    mill. The burst covers a browser that retries; a loop gets 429s."""
+    from app.lifecycle.export_link import mint_export_token
+
+    LocalExportStore.reset()
+    admin_id = await _signup_verify_login(client)
+    token = mint_export_token(admin_id, uuid.uuid4(), ttl_days=7)
+    statuses = [
+        (await client.get(f"/api/v1/exports/{token}", follow_redirects=False)).status_code
+        for _ in range(8)
+    ]
+    assert statuses[:5] == [302] * 5, statuses
+    assert set(statuses[5:]) == {429}, statuses
+    async with tenant_session(admin_id) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin_id,
+                        AdminAuditLog.event_type == "data_export_downloaded",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 5, "a throttled visit writes no audit row"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_bad_or_expired_export_link_is_a_plain_410(client):
     from app.auth.tokens import mint_link_token
 
