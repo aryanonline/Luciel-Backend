@@ -1006,10 +1006,22 @@ class WebsiteCrawlProvider:
             # admin registered last month is not the one it gives today. The crawled
             # body is readable back through GET /sources/{id}/chunks, so an unguarded
             # fetch is an exfiltration channel, not a blind SSRF (P1-4).
-            if not sandbox.resolves_to_public_host(url):
-                raise ProviderUnavailable(f"crawl URL is not a public http(s) address: {url}")
+            # ...and CONNECT to the address that was validated (adversarial review
+            # R-WP4-1 — the F090 pin the webhook POST already had). A DNS answer that
+            # flipped between the check and the connect (rebinding) reached the task
+            # metadata endpoint with a clean bill of health, and what it returned
+            # became readable chunks. The name still travels as Host + SNI, so TLS
+            # verifies the certificate against the hostname the owner registered.
+            try:
+                pinned_url, host = sandbox.pin_public_target(url)
+            except sandbox.SsrfBlocked as exc:
+                raise ProviderUnavailable(
+                    f"crawl URL is not a public http(s) address: {url}"
+                ) from exc
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(url)
+                resp = await client.get(
+                    pinned_url, headers={"Host": host}, extensions={"sni_hostname": host}
+                )
                 resp.raise_for_status()
                 body = resp.text
         if len(body.encode("utf-8")) > self._max_bytes:
