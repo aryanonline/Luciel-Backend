@@ -77,8 +77,8 @@ dev = [
     # zero repo changes (live-caught twice: 2026-08-18 `86b83f3`, and again on the
     # 2026-08-19 run for 9ed4f2c). Bump deliberately: upgrade the pin, reformat, and
     # fix findings in the same commit.
-    "ruff==0.16.2",
-    "mypy==2.3.0",
+    "ruff==0.16.6",
+    "mypy==2.3.1",
     "bandit==1.9.4",
     "pip-audit>=2.7",
     "detect-secrets>=1.5",
