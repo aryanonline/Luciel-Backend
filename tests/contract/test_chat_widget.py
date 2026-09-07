@@ -379,6 +379,23 @@ async def test_payg_account_with_card_is_not_capped_past_the_free_allowance(clie
     assert "Echo:" in body["reply"]["text"], "the tenant must still be served, not deflected"
 
 
+async def _assistant_rows(admin: uuid.UUID) -> int:
+    """How many assistant replies the tenant holds — the widget's proof of a model turn."""
+    from app.models.conversation import Transcript
+    from sqlalchemy import func, select
+
+    async with tenant_session(admin) as s:
+        return int(
+            (
+                await s.execute(
+                    select(func.count())
+                    .select_from(Transcript)
+                    .where(Transcript.admin_id == admin, Transcript.role == "luciel")
+                )
+            ).scalar_one()
+        )
+
+
 async def test_widget_flood_is_rate_limited_before_budget(client):
     """B3 regression (Architecture §3.1.5): the widget /messages endpoint must run
     the pre-budget abuse gate BEFORE the budget gate / any LLM call, so a flood from
@@ -389,14 +406,25 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
     from sqlalchemy import select
 
     admin, embed_key = await _seed_active_instance()
-    sid = str(uuid.uuid4())  # one widget session token → one source bucket
-    statuses = []
+    # A REAL open session (round 6 WP-J, F168): the first send has no id, the server
+    # issues one, and the flood rides it — the shape the shipped widget produces. A
+    # made-up id never resolves, so each served request would open (and count) a
+    # fresh conversation and the counter could not be asserted.
+    first = await client.post(
+        "/api/v1/chat-widget/messages", json={"embedKey": embed_key, "text": "hello"}
+    )
+    assert first.status_code == 200
+    sid = first.json()["sessionId"]  # one widget session → one source bucket
+    statuses = [first.status_code]
+    replies_at_first_429: int | None = None
     for _ in range(8):  # exceed burst of 5 within the same instant (no refill)
         r = await client.post(
             "/api/v1/chat-widget/messages",
             json={"embedKey": embed_key, "sessionId": sid, "text": "hi"},
         )
         statuses.append(r.status_code)
+        if r.status_code == 429 and replies_at_first_429 is None:
+            replies_at_first_429 = await _assistant_rows(admin)
     assert 429 in statuses, f"expected a 429 once the burst is exhausted, got {statuses}"
     # The 429 carries the documented error-contract body shape.
     blocked = [s for s in statuses if s == 429]
@@ -415,6 +443,32 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
     assert rows, "widget_abuse_blocked audit event must be written on a flood"
     for row in rows:
         assert "reason" in row.event_payload and row.event_payload["channel"] == "widget"
+
+    # Round 6 WP-J (F168): a flood is refused, not served. The one session the flood
+    # opened counts once, and no turn ran after the first 429 — the assistant rows
+    # equal the served (200) requests, so nothing was billed or generated for the
+    # refused remainder.
+    from app.models.budget import ConversationBudget
+
+    served = statuses.count(200)
+    assert 0 < served < len(statuses), statuses
+    async with tenant_session(admin) as s:
+        counted = (
+            (
+                await s.execute(
+                    select(ConversationBudget.counted_conversations).where(
+                        ConversationBudget.admin_id == admin
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sum(counted) == 1, f"one session, counted once: {counted}"
+    assert replies_at_first_429 is not None
+    assert await _assistant_rows(admin) == replies_at_first_429, (
+        "an assistant reply was generated after the first 429"
+    )
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

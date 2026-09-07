@@ -336,7 +336,12 @@ def test_free_cap_zero_llm(r: Results, t: Tenant) -> None:
 
 
 def test_llm_cap_per_minute(r: Results) -> None:
-    """T3 / Row 1b — >50 LLM calls/min for one admin are rejected, gracefully (429)."""
+    """T3 / Row 1b — >50 LLM calls/min for one admin are rejected, gracefully (429).
+
+    IN-PROCESS (2026-09-05 audit F173): this drives the cap store and the error
+    handler directly, with no model call and nothing over the wire. It proves the
+    arithmetic and the edge mapping; the live router's own gate is proven by T3b,
+    which is opt-in because it spends real model calls."""
     # (a) The cap admits exactly `cap` calls in the window, then rejects — for ONE admin.
     import app.runtime.llm_cap as cap_mod
     from app.runtime.llm_cap import (
@@ -381,10 +386,69 @@ def test_llm_cap_per_minute(r: Results) -> None:
 
     ok = cap_ok and edge_ok
     r.record(
-        "T3 row1b-llm-cap-50-per-min",
+        "T3 row1b-llm-cap-50-per-min (in-process)",
         ok,
         f"admitted={admitted}/{LLM_CAP_PER_MINUTE} rejected_51st={rejected} "
-        f"edge_status={resp.status_code} (graceful 429, not dropped)",
+        f"edge_status={resp.status_code} (graceful 429, not dropped; cap store + edge "
+        "mapping only — no model call)",
+    )
+
+
+def test_llm_cap_live(r: Results, admin_id: uuid.UUID) -> None:
+    """T3b / Row 1b, LIVE — the real router refuses the 51st model call in a minute.
+
+    Opt-in (LUCIEL_SEEDTEST_LIVE_CAP=1) because it spends LLM_CAP_PER_MINUTE real,
+    tiny completions against the platform's primary provider. Nothing rides the
+    HTTP edge: the widget's own per-source buckets would refuse a 51-message burst
+    long before the LLM cap does, so the router — the layer that actually holds the
+    cap (llm_router.complete → admit_llm_call) — is driven directly."""
+    if os.environ.get("LUCIEL_SEEDTEST_LIVE_CAP") != "1":
+        r.skip(
+            "T3b row1b-llm-cap-live",
+            "set LUCIEL_SEEDTEST_LIVE_CAP=1 to spend 50 real model calls proving the "
+            "router's per-minute cap",
+        )
+        return
+    import app.runtime.llm_cap as cap_mod
+    from app.runtime.llm_cap import LLM_CAP_PER_MINUTE, InMemoryLLMCapStore, LLMCapExceeded
+    from app.runtime.provider_factory import build_llm_router
+
+    fresh = InMemoryLLMCapStore()
+    original = cap_mod._store
+    cap_mod._store = fresh
+    admitted = 0
+    rejected = False
+    failure: str | None = None
+
+    async def _go() -> None:
+        nonlocal admitted, rejected, failure
+        router = build_llm_router(admin_id=admin_id)
+        for _ in range(LLM_CAP_PER_MINUTE):
+            resp = await router.complete(
+                "Reply with the single word OK.",
+                [{"role": "user", "content": "OK?"}],
+            )
+            if not resp.text.strip():
+                failure = "empty completion"
+                return
+            admitted += 1
+        try:
+            await router.complete("Reply with OK.", [{"role": "user", "content": "OK?"}])
+        except LLMCapExceeded:
+            rejected = True
+
+    try:
+        asyncio.run(_go())
+    except Exception as exc:  # noqa: BLE001 — a live failure is a FAIL with its reason
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        cap_mod._store = original
+    ok = failure is None and admitted == LLM_CAP_PER_MINUTE and rejected
+    r.record(
+        "T3b row1b-llm-cap-live",
+        ok,
+        f"admitted={admitted}/{LLM_CAP_PER_MINUTE} rejected_51st={rejected} "
+        f"failure={failure!r} (real router, real model calls)",
     )
 
 
@@ -545,6 +609,97 @@ def test_fallback_failover(r: Results) -> None:
     )
 
 
+def test_crm_custom_webhook_live(r: Results, t: Tenant) -> None:
+    """T7 — a captured lead reaches a REAL custom-webhook CRM endpoint (owner-provided).
+
+    Opt-in: LUCIEL_SEEDTEST_WEBHOOK_URL names the endpoint (LUCIEL_SEEDTEST_WEBHOOK_AUTH
+    an optional Authorization header). Drives the product path end to end over the
+    wire: connect the CRM through the admin API, enable the Push-to-CRM tool, let the
+    widget capture a lead with an email, and read the lead's honest CRM state back
+    from the Leads API (F134) — never a claim the push happened."""
+    url = os.environ.get("LUCIEL_SEEDTEST_WEBHOOK_URL", "").strip()
+    if not url:
+        r.skip(
+            "T7 crm-custom-webhook-live",
+            "set LUCIEL_SEEDTEST_WEBHOOK_URL (and optionally LUCIEL_SEEDTEST_WEBHOOK_AUTH) "
+            "to push a captured lead to a real endpoint",
+        )
+        return
+    from urllib.parse import urlparse
+
+    started = _check(
+        t.client.post(
+            f"{API_BASE}/api/v1/admin/connections",
+            json={"connectionType": "crm", "provider": "custom_webhook"},
+        ),
+        "crm connect",
+    )
+    # The start result carries the flow shape (requiresClientForm), not the row id: the
+    # row is read back from the connections list exactly as the dashboard does.
+    rows = _check(t.client.get(f"{API_BASE}/api/v1/admin/connections"), "connections")
+    cid = next(
+        (
+            row.get("connectionId")
+            for row in rows
+            if row.get("connectionType") == "crm" and row.get("provider") == "custom_webhook"
+        ),
+        None,
+    )
+    if not started.get("requiresClientForm") or not cid:
+        r.record(
+            "T7 crm-custom-webhook-live",
+            False,
+            f"connect did not open a credential form / no crm row: {started} rows={len(rows)}",
+        )
+        return
+    fields: dict[str, str] = {"url": url}
+    auth = os.environ.get("LUCIEL_SEEDTEST_WEBHOOK_AUTH", "").strip()
+    if auth:
+        fields["auth_header"] = auth
+    conn = _check(
+        t.client.post(
+            f"{API_BASE}/api/v1/admin/connections/{cid}/credentials", json={"fields": fields}
+        ),
+        "crm credentials",
+    )
+    luciel = _check(t.client.get(f"{API_BASE}/api/v1/admin/luciel"), "luciel")
+    tools = [
+        {"id": tool["id"], "enabled": tool["id"] == "push_to_crm" or bool(tool.get("enabled"))}
+        for tool in luciel.get("tools", [])
+    ]
+    if not any(tool["id"] == "push_to_crm" for tool in tools):
+        tools.append({"id": "push_to_crm", "enabled": True})
+    _check(t.client.put(f"{API_BASE}/api/v1/admin/luciel/tools", json={"tools": tools}), "tools")
+
+    lead_email = f"seed-lead-{RUN_ID}@example.com"
+    widget_send(
+        t.client,
+        t.embed_key,
+        f"Hi, I'm Jordan. My email is {lead_email} — please send me a quote for a "
+        "refurbished laptop.",
+    )
+    status = detail = None
+    for _ in range(10):
+        leads = _check(t.client.get(f"{API_BASE}/api/v1/dashboard/leads"), "leads")
+        for lead in leads:
+            keys = {
+                str(lead.get(k) or "").lower()
+                for k in ("contactIdentifier", "email", "contact_identifier")
+            }
+            if lead_email in keys:
+                status, detail = lead.get("crmStatus"), lead.get("crmDetail")
+        if status:
+            break
+        time.sleep(1)
+    ok = status == "synced"
+    r.record(
+        "T7 crm-custom-webhook-live",
+        ok,
+        f"connection={conn.get('status')} crmStatus={status} crmDetail={detail} "
+        f"endpoint={urlparse(url).hostname}",
+    )
+
+
 def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUID) -> None:
     """T6 / Row 11 — same query across two channels → parity + AI-identity disclosure."""
     # Disclosure (always present on bootstrap, §3.4.16/§3.4.17).
@@ -605,9 +760,11 @@ def main() -> int:
         # T1, T3, T4, T5, T6 do not consume the free cap; run them on the main tenant.
         test_happy_path(r, main_tenant)
         test_llm_cap_per_minute(r)
+        test_llm_cap_live(r, main_admin_id)  # T3b: opt-in, spends real calls
         test_failsafe_escalation(r, main_admin_id)
         test_fallback_failover(r)
         test_channel_parity_and_disclosure(r, main_tenant, main_admin_id)
+        test_crm_custom_webhook_live(r, main_tenant)  # T7: opt-in, real endpoint
         # T2 last: it exhausts the cap tenant's free allowance.
         test_free_cap_zero_llm(r, cap_tenant)
     finally:
