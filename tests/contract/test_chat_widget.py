@@ -442,6 +442,28 @@ async def test_widget_flood_with_rotating_session_ids_is_still_rate_limited(clie
         n = (await s.execute(select(func.count()).select_from(Session))).scalar_one()
     assert n <= cap.burst, "a fabricated sessionId must not open (and bill) a fresh session"
 
+    # Adversarial review R-WP1-1: the flood is audited, not amplified — one row per
+    # (instance, reason) per window, each carrying the denials it stands for.
+    from app.models.audit import AdminAuditLog
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "widget_abuse_blocked",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    denied = statuses.count(429)
+    assert denied >= 10
+    assert len(rows) <= 2, f"{len(rows)} audit rows for {denied} denials"
+    assert all("denials_folded" in r.event_payload for r in rows)
+
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_resumed_session_is_not_charged_against_the_new_session_cap(client):

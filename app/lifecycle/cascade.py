@@ -392,6 +392,7 @@ async def settle_billing_at_closure(
         "subscription_id": None,
         "usage_reported_blocks": 0,
         "usage_owed": False,
+        "usage_unreported": False,
         "subscription_cancelled": None,
         "error": None,
     }
@@ -405,7 +406,12 @@ async def settle_billing_at_closure(
         outcome["usage_owed"] = account.accrued_blocks > 0
     except Exception as exc:  # noqa: BLE001 — closure must complete; the failure is audited
         outcome["error"] = type(exc).__name__
+        outcome["usage_owed"] = account.accrued_blocks > 0
         _log.exception("closure usage flush failed admin_id=%s", admin_id)
+    # Adversarial review R-WP1-3: "owed" only says usage existed. The operator who
+    # finishes a failed settlement by hand needs to know whether any of it is STILL
+    # unreported after the flush — that is the number Stripe has not seen.
+    outcome["usage_unreported"] = account.accrued_blocks > account.last_reported_blocks
     if account.stripe_subscription_id is not None:
         try:
             cancelled = await gateway.cancel_subscription(

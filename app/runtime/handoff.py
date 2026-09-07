@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import enum
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -85,9 +86,15 @@ async def take_over(
         # The takeover path is a counting path, so it is a metering path too (audit
         # F043): a conversation that crossed a block boundary here used to be counted
         # but never reported until some later model-call turn happened to run.
-        from app.billing import metering  # noqa: PLC0415 — avoids an import cycle
+        from app.billing import metering, notice_delivery  # noqa: PLC0415 — import cycle
 
         await metering.report_usage_after_count(session, admin_id=admin_id, instance_id=instance_id)
+        # Adversarial review R-WP1-2: the block a takeover opened was announced only
+        # by the daily sweep, while a model-call turn announces it the moment the
+        # count moves. Same event, same moment, whichever path counted. Never raises.
+        await notice_delivery.send_usage_notices_after_count(
+            session, admin_id=admin_id, now=datetime.now(UTC)
+        )
 
     if not already:
         await audit.emit(

@@ -22,6 +22,7 @@ for 'widget'); the loop enforces this in memory.load_cross_session_summaries.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -90,18 +91,53 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# A denial is audited, but not once per denied request. A flood is exactly the case
+# where a per-request audit row turned a cheap 429 into a tenant-scoped INSERT per
+# packet: the limiter protected the LLM and the budget while the audit trail became
+# the amplification path (adversarial review R-WP1-1). One row per instance per
+# reason per window, carrying how many denials it stands for — the payload never
+# named the source, so folding loses nothing an operator could read before.
+_DENIAL_AUDIT_WINDOW_SECONDS = 60.0
+_DENIAL_AUDIT_MAX_KEYS = 5000
+_denial_audit_slots: dict[tuple[uuid.UUID, str], tuple[float, int]] = {}
+
+
+def _denial_audit_folded(
+    instance_id: uuid.UUID, reason: str, now: float | None = None
+) -> int | None:
+    """None when a row was written for (instance, reason) inside the current window —
+    this denial is folded into the next row. Otherwise the number of denials folded
+    since the last row (0 for the first), and the window restarts."""
+    now = time.monotonic() if now is None else now
+    key = (instance_id, reason)
+    slot = _denial_audit_slots.get(key)
+    if slot is not None and now - slot[0] < _DENIAL_AUDIT_WINDOW_SECONDS:
+        _denial_audit_slots[key] = (slot[0], slot[1] + 1)
+        return None
+    if len(_denial_audit_slots) >= _DENIAL_AUDIT_MAX_KEYS:
+        # Bounded: closed windows are dropped before a new key lands.
+        cutoff = now - _DENIAL_AUDIT_WINDOW_SECONDS
+        for stale in [k for k, (ts, _n) in _denial_audit_slots.items() if ts < cutoff]:
+            del _denial_audit_slots[stale]
+    _denial_audit_slots[key] = (now, 0)
+    return 0 if slot is None else slot[1]
+
+
 async def _deny_widget(ctx: InstanceContext, reason: str | None) -> None:
     """Audit an admission denial (no raw PII) and answer the documented 429 (§3.1.5)."""
-    async with tenant_session(ctx.admin_id) as s:
-        await audit.emit(
-            s,
-            admin_id=ctx.admin_id,
-            instance_id=ctx.instance_id,
-            actor_type=ActorType.platform,
-            event_type="widget_abuse_blocked",
-            # No raw PII: channel + reason only (§3.1.5 / §3.4.11).
-            payload={"channel": "widget", "reason": reason},
-        )
+    folded = _denial_audit_folded(ctx.instance_id, reason or "rate_limited")
+    if folded is not None:
+        async with tenant_session(ctx.admin_id) as s:
+            await audit.emit(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                actor_type=ActorType.platform,
+                event_type="widget_abuse_blocked",
+                # No raw PII: channel + reason + how many denials this row stands
+                # for (§3.1.5 / §3.4.11).
+                payload={"channel": "widget", "reason": reason, "denials_folded": folded},
+            )
     raise rate_limited("Too many messages — please slow down.", retry_after_seconds=3)
 
 

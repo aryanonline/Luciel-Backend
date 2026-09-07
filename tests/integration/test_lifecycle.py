@@ -272,6 +272,8 @@ async def test_close_account_settles_outstanding_usage_while_the_card_is_on_file
         ).scalar_one()
         assert settled.event_payload["subscription_cancelled"] is True
         assert settled.event_payload["usage_owed"] is True
+        # R-WP1-3: the flush succeeded, so nothing is left unreported.
+        assert settled.event_payload["usage_unreported"] is False
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

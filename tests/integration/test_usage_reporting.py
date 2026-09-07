@@ -759,6 +759,20 @@ async def test_a_takeover_before_any_model_call_reports_the_block(
             s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
         )
     assert gateway.billed_quantity(_customer(admin)) == 1
+    # Adversarial review R-WP1-2: the block this takeover opened is announced the
+    # moment it opens, exactly as a model-call turn would — not a day later by the
+    # sweep.
+    from app.models.notice_delivery import NoticeDelivery
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (await s.execute(select(NoticeDelivery).where(NoticeDelivery.admin_id == admin)))
+            .scalars()
+            .all()
+        )
+    assert [(r.kind, r.notice_id.split(":")[0], r.notice_id.split(":")[-1]) for r in rows] == [
+        ("payg_block_started", "paygblock", "1")
+    ]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
