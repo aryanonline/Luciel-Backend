@@ -23,6 +23,14 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
 - AI disclosure must be present on every channel, and a greeting does not repeat the Luciel name.
 - No knowledge evidence must not be recast as an attributed answer; offer honest refusal/escalation.
 
+## Team availability (round 6 WP-E, 2026-09-07)
+- Luciel has NO working hours; nothing may make it stop answering. `team_availability.py`
+  describes when the HUMAN team is reachable (owner's IANA zone, weekly windows incl.
+  overnight, closure dates) and is used for two things only: `_handoff_ack` says WHEN a
+  person follows up ("tomorrow at 9:00 am (EDT)") instead of "shortly", and
+  `escalation_dispatch.resolve_routing` pages the after-hours contact. Unset/off →
+  byte-identical behaviour to before. Never promise a real-time human reply.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

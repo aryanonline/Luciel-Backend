@@ -16,7 +16,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Integer, String
+from sqlalchemy import Boolean, DateTime, Enum, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -149,5 +149,17 @@ class Instance(Base, TenantMixin, TimestampMixin):
     # embed key is public by design and this is the owner's only way to say WHERE it
     # may be used. Enforced on the widget data plane (chat_widget._enforce_origin).
     allowed_origins: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # Round 6 WP-E (audit F054; migration 0061): the owner's IANA timezone and the
+    # OPTIONAL description of when their HUMAN team is reachable. Luciel itself has
+    # no hours — this only shapes follow-up wording and after-hours escalation routing
+    # (app/runtime/team_availability.py). NULL = unset: generic wording, no rerouting.
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    team_availability: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # What Luciel calls the business in greetings (WP-F); NULL → "this business".
+    business_short_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # The owner's opt-out of the morning brief (WP-F); on by default.
+    daily_brief_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
     # Soft-delete marker mirrored onto the state machine (grace window).
     soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -52,6 +52,7 @@ from app.models.lead import Lead
 from app.notifications.base import EscalationNotification, NotificationAdapter
 from app.notifications.email_notifier import EmailNotifier
 from app.notifications.sms_notifier import SmsNotifier
+from app.runtime import team_availability as team_hours
 from app.schemas_api.luciel import EscalationContactWire
 
 _LOG = logging.getLogger(__name__)
@@ -83,13 +84,30 @@ class Routing:
     primary: str | None
     secondary: str | None
     cc_owner_email: bool
+    # Round 6 WP-E: the team was unreachable and the owner's after-hours contact took
+    # the page; ``next_reachable`` is when a regular person is back (owner's zone).
+    after_hours: bool = False
+    next_reachable: datetime | None = None
 
 
-def resolve_routing(escalation_config: Mapping[str, object] | None, signal: str) -> Routing:
+def resolve_routing(
+    escalation_config: Mapping[str, object] | None,
+    signal: str,
+    *,
+    team_availability: Mapping[str, object] | None = None,
+    timezone: str | None = None,
+    now: datetime | None = None,
+) -> Routing:
     """Resolve (signal → contacts + channel) from the admin's escalation pillar config.
 
     The config is stored as the camelCase wire object the admin PUT, so it is read back
     through the same wire model rather than by hand-indexing camelCase keys.
+
+    Round 6 WP-E (F054): when the owner described their team's hours, nobody is
+    reachable at ``now`` and an after-hours contact is named, that contact takes the
+    page on its channel; the regular contact for that channel stays as the backup so
+    a failing after-hours address still tries a person before the owner fallback.
+    With the setting off (or the team reachable) the resolution is unchanged.
     """
     cfg = EscalationContactWire.model_validate(dict(escalation_config or {}))
     rule = next((r for r in (cfg.routing or []) if r.signal == signal), None)
@@ -98,11 +116,26 @@ def resolve_routing(escalation_config: Mapping[str, object] | None, signal: str)
         primary, secondary = cfg.primary_sms, cfg.secondary_sms
     else:
         primary, secondary = cfg.primary_email, cfg.secondary_email
-    return Routing(
+    routing = Routing(
         channel=channel,
         primary=primary or None,
         secondary=secondary or None,
         cc_owner_email=bool(rule.cc_owner_email) if rule else False,
+    )
+    hours = team_hours.parse(team_availability, timezone)
+    if hours is None or hours.after_hours is None or team_hours.team_reachable_now(hours, now):
+        return routing
+    ah = hours.after_hours
+    regular = (cfg.primary_sms if ah.channel == "sms" else cfg.primary_email) or None
+    return Routing(
+        channel=ah.channel,
+        primary=ah.contact,
+        secondary=regular if regular != ah.contact else None,
+        cc_owner_email=(
+            ah.cc_owner_email if ah.cc_owner_email is not None else routing.cc_owner_email
+        ),
+        after_hours=True,
+        next_reachable=team_hours.next_reachable(hours, now),
     )
 
 
@@ -441,7 +474,31 @@ async def notify_escalation(
         gate=gate,
         score=score,
     )
-    routing = resolve_routing(inst.escalation if inst else None, signal)
+    routing = resolve_routing(
+        inst.escalation if inst else None,
+        signal,
+        team_availability=inst.team_availability if inst else None,
+        timezone=inst.timezone if inst else None,
+    )
+    if routing.after_hours:
+        # WP-E: say so in the audit trail — the dashboard's "who was paged" must not
+        # look like the regular contact was skipped for no reason.
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            event_type="escalation_after_hours_routing",
+            actor_type=ActorType.platform,
+            payload={
+                "signal": signal,
+                "gate": gate,
+                "conversation_ref": notification.conversation_ref,
+                "delivery_method": routing.channel,
+                "next_reachable": (
+                    routing.next_reachable.isoformat() if routing.next_reachable else None
+                ),
+            },
+        )
 
     # Round 5B item 13: suppression + verification state for the email contacts.
     # A hard-bounced/complained address is never attempted (SES "accepting" it

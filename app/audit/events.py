@@ -29,6 +29,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "escalation_delivery_failed",
         "escalation_acked",
         "escalation_owner_fallback",
+        # The team was unreachable and the owner's after-hours contact took the page (WP-E).
+        "escalation_after_hours_routing",
         "budget_exhausted",
         "budget_overage_threshold",
         # Billing / metering lifecycle (Architecture §3.4.1b, CJ §6, Legal §A3)

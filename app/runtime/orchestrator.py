@@ -90,6 +90,8 @@ from app.runtime.input_safety import (
 from app.runtime.knowledge_retrieval import RetrieverBundle
 from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
+from app.runtime.team_availability import follow_up_phrase
+from app.runtime.team_availability import parse as parse_team_availability
 from app.tools import contract as tool_contract
 from app.tools.contract import Tool, ToolResult
 from app.tools.schemas import ACTION_TOOLS, build_tool_defs
@@ -1365,6 +1367,21 @@ class Orchestrator:
             )
         ).scalar_one_or_none()
         configured = has_configured_escalation_contact(inst.escalation if inst else None)
+        # Round 6 WP-E (F054): when the owner described their team's hours and nobody
+        # is reachable now, say WHEN a person follows up instead of "shortly". Luciel
+        # itself keeps answering; only the promise about a human changes.
+        when = follow_up_phrase(
+            parse_team_availability(
+                inst.team_availability if inst else None, inst.timezone if inst else None
+            )
+        )
+        if when is not None:
+            opener = (
+                "Of course — I've flagged this for the team."
+                if configured
+                else "I've passed this along to the team."
+            )
+            return f"{opener} They're away right now, so someone will follow up with you {when}."
         if configured:
             return (
                 "Of course — I've flagged this for the team, and they'll follow up "

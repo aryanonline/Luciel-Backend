@@ -18,9 +18,10 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import ConfigDict, EmailStr, Field, field_validator
+from pydantic import ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.channels.origins import MAX_ALLOWED_ORIGINS, normalize_origin
+from app.runtime.team_availability import parse_hhmm, valid_timezone
 from app.schemas_api.common import WireModel
 
 # International format (country code first, 8–15 digits) — the only shape Twilio can
@@ -179,6 +180,45 @@ class EscalationContactHealthOut(WireModel):
     last_bounced_at: datetime | None = None
 
 
+class TeamWindowWire(WireModel):
+    """One weekly window the HUMAN team is reachable: day 0=Monday … 6=Sunday, 24-hour
+    HH:MM local times; end before start wraps past midnight (round 6 WP-E)."""
+
+    day: int
+    start: str
+    end: str
+
+
+class TeamClosureWire(WireModel):
+    date: str
+    label: str | None = None
+
+
+class AfterHoursEscalationWire(WireModel):
+    """Who an escalation reaches while the team is unreachable (routing only)."""
+
+    channel: NotificationChannelWire | None = None
+    contact_email: str | None = None
+    contact_sms: str | None = None
+    cc_owner_email: bool | None = None
+
+
+class AfterHoursWire(WireModel):
+    escalation: AfterHoursEscalationWire | None = None
+
+
+class TeamAvailabilityWire(WireModel):
+    """When the owner's PEOPLE are reachable — never Luciel's hours (WP-E, F054).
+
+    Luciel answers around the clock regardless; this shapes only follow-up wording and
+    after-hours escalation routing. ``enabled`` false keeps the generic behaviour."""
+
+    enabled: bool = False
+    weekly: list[TeamWindowWire] = Field(default_factory=list)
+    closures: list[TeamClosureWire] = Field(default_factory=list)
+    after_hours: AfterHoursWire | None = None
+
+
 class LucielOut(WireModel):
     instance_id: uuid.UUID
     name: str
@@ -195,6 +235,10 @@ class LucielOut(WireModel):
     lead_retention_days: int | None = None
     # The website origins the widget may load on; null means any page (round 6 WP-I).
     allowed_origins: list[str] | None = None
+    # The owner's IANA timezone and the optional team-availability description
+    # (round 6 WP-E). Both null until the owner sets them.
+    timezone: str | None = None
+    team_availability: TeamAvailabilityWire | None = None
     grace_window_started_at: datetime | None = None
 
 
@@ -364,6 +408,111 @@ class UpdateAllowedOriginsRequest(StrictWireModel):
             if origin not in out:
                 out.append(origin)
         return out
+
+
+def _clean_e164(value: object) -> object:
+    """Forgive formatting, refuse anything a text cannot be delivered to (F084)."""
+    if value is None or value == "":
+        return None
+    cleaned = "".join(ch for ch in str(value) if ch not in " -.()\t")
+    if not _E164.match(cleaned):
+        raise ValueError(
+            "Enter the number in international format, e.g. +16045551234 "
+            "(country code first, digits only)."
+        )
+    return cleaned
+
+
+class TeamWindowIn(StrictWireModel):
+    day: int = Field(ge=0, le=6)
+    start: str
+    end: str
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, value: str) -> str:
+        if parse_hhmm(value) is None:
+            raise ValueError("Use a 24-hour time like 09:00 or 17:30.")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _has_length(self) -> TeamWindowIn:
+        start, end = parse_hhmm(self.start), parse_hhmm(self.end)
+        if start == end:
+            raise ValueError("A window has to end after it starts.")
+        if start == 24 * 60:
+            raise ValueError("A window cannot start at 24:00 — use 00:00 on the next day.")
+        return self
+
+
+class TeamClosureIn(StrictWireModel):
+    date: str
+    label: str | None = Field(default=None, max_length=80)
+
+    @field_validator("date")
+    @classmethod
+    def _iso_date(cls, value: str) -> str:
+        from datetime import date as _date  # noqa: PLC0415
+
+        try:
+            return _date.fromisoformat(value.strip()).isoformat()
+        except ValueError as exc:
+            raise ValueError("Use a date like 2026-12-25.") from exc
+
+
+class AfterHoursEscalationIn(StrictWireModel):
+    channel: NotificationChannelWire | None = None
+    contact_email: EmailStr | None = None
+    contact_sms: str | None = None
+    cc_owner_email: bool | None = None
+
+    @field_validator("contact_sms", mode="before")
+    @classmethod
+    def _e164(cls, value: object) -> object:
+        return _clean_e164(value)
+
+    @model_validator(mode="after")
+    def _someone_on_the_other_end(self) -> AfterHoursEscalationIn:
+        if self.channel == "sms" and not self.contact_sms:
+            raise ValueError("Add the number the after-hours text should go to.")
+        if self.channel == "email" and not self.contact_email:
+            raise ValueError("Add the address the after-hours email should go to.")
+        return self
+
+
+class AfterHoursIn(StrictWireModel):
+    escalation: AfterHoursEscalationIn | None = None
+
+
+class UpdateTeamAvailabilityRequest(StrictWireModel):
+    """PUT /admin/luciel/team-availability — when the HUMAN team is reachable (WP-E).
+
+    Luciel keeps answering around the clock whatever is set here. ``enabled`` false
+    (with any grid) turns the wording/routing effects off; the timezone is kept
+    because the daily brief reads it on its own."""
+
+    timezone: str | None = None
+    enabled: bool = False
+    weekly: list[TeamWindowIn] = Field(default_factory=list, max_length=21)
+    closures: list[TeamClosureIn] = Field(default_factory=list, max_length=60)
+    after_hours: AfterHoursIn | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _iana(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        if not valid_timezone(value):
+            raise ValueError(
+                "Pick a timezone from the list — an IANA name such as America/Toronto."
+            )
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _timezone_when_on(self) -> UpdateTeamAvailabilityRequest:
+        if self.enabled and not self.timezone:
+            raise ValueError("Choose your timezone before turning this on.")
+        return self
 
 
 class UpdateLeadRetentionRequest(StrictWireModel):

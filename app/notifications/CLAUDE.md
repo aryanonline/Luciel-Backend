@@ -25,6 +25,13 @@ Delivers internal/customer notifications and runs the deferred escalation-dispat
   already written — the deferred-queue payload is unchanged, replays render
   identically, and no PII enters the queue. Keep it that way.
 
+## After-hours routing (round 6 WP-E, 2026-09-07)
+- `resolve_routing(..., team_availability=, timezone=, now=)`: with the owner's team
+  availability on, nobody reachable now and an after-hours contact named, that contact
+  takes the page on its channel and the regular contact for that channel becomes the
+  backup; `Routing.after_hours` is True and `escalation_after_hours_routing` is audited.
+  The owner-email last resort is untouched. Setting off/reachable → unchanged.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

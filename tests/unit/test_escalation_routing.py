@@ -9,6 +9,7 @@ keys), which is the part most likely to silently drift.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 from app.notifications.base import EscalationNotification
 from app.notifications.email_notifier import EmailNotifier
@@ -193,3 +194,93 @@ def test_sms_body_carries_the_short_ref():
     body = SmsNotifier().format(_notification(session_id=sid))
     assert f"#{str(sid)[:8]}" in body
     assert "\n" not in body  # still the condensed single-line form
+
+
+# --- Round 6 WP-E (F054): after-hours routing ----------------------------------------
+
+_CONTACTS = {
+    "primaryEmail": "office@acme.example",
+    "primarySms": "+16045550001",
+    "routing": [{"signal": "high_value_lead", "channel": "email", "ccOwnerEmail": True}],
+}
+_HOURS = {
+    "enabled": True,
+    "weekly": [{"day": d, "start": "09:00", "end": "17:00"} for d in range(5)],
+    "afterHours": {"escalation": {"channel": "sms", "contactSms": "+16045559999"}},
+}
+_OFFICE_TIME = datetime(2026, 9, 8, 14, 30, tzinfo=UTC)  # Tue 10:30 EDT
+_NIGHT_TIME = datetime(2026, 9, 9, 3, 0, tzinfo=UTC)  # Tue 23:00 EDT
+
+
+def test_after_hours_contact_takes_the_page_when_nobody_is_reachable():
+    r = resolve_routing(
+        _CONTACTS,
+        "high_value_lead",
+        team_availability=_HOURS,
+        timezone="America/Toronto",
+        now=_NIGHT_TIME,
+    )
+    assert r.after_hours is True
+    assert (r.channel, r.primary) == ("sms", "+16045559999")
+    # The regular SMS contact stays as the backup; the rule's cc-owner choice is kept.
+    assert r.secondary == "+16045550001"
+    assert r.cc_owner_email is True
+    assert r.next_reachable is not None and r.next_reachable.isoformat() == (
+        "2026-09-09T09:00:00-04:00"
+    )
+
+
+def test_office_hours_routing_is_unchanged_while_the_team_is_reachable():
+    plain = resolve_routing(_CONTACTS, "high_value_lead")
+    r = resolve_routing(
+        _CONTACTS,
+        "high_value_lead",
+        team_availability=_HOURS,
+        timezone="America/Toronto",
+        now=_OFFICE_TIME,
+    )
+    assert r == plain
+    assert r.after_hours is False and r.channel == "email"
+
+
+def test_the_setting_off_or_without_a_contact_never_reroutes():
+    plain = resolve_routing(_CONTACTS, "high_value_lead")
+    off = resolve_routing(
+        _CONTACTS,
+        "high_value_lead",
+        team_availability={**_HOURS, "enabled": False},
+        timezone="America/Toronto",
+        now=_NIGHT_TIME,
+    )
+    nobody = resolve_routing(
+        _CONTACTS,
+        "high_value_lead",
+        team_availability={**_HOURS, "afterHours": {"escalation": {"channel": "sms"}}},
+        timezone="America/Toronto",
+        now=_NIGHT_TIME,
+    )
+    assert off == plain
+    assert nobody == plain
+
+
+def test_after_hours_cc_owner_override_and_same_contact_dedupe():
+    hours = {
+        **_HOURS,
+        "afterHours": {
+            "escalation": {
+                "channel": "email",
+                "contactEmail": "office@acme.example",
+                "ccOwnerEmail": False,
+            }
+        },
+    }
+    r = resolve_routing(
+        _CONTACTS,
+        "high_value_lead",
+        team_availability=hours,
+        timezone="America/Toronto",
+        now=_NIGHT_TIME,
+    )
+    assert r.after_hours is True
+    assert (r.channel, r.primary, r.secondary) == ("email", "office@acme.example", None)
+    assert r.cc_owner_email is False

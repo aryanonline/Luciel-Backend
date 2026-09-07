@@ -41,6 +41,7 @@ from app.schemas_api.luciel import (
     UpdateEscalationRequest,
     UpdateLeadRetentionRequest,
     UpdatePersonalityRequest,
+    UpdateTeamAvailabilityRequest,
     UpdateToolsRequest,
 )
 from app.tools import catalog
@@ -181,6 +182,8 @@ def _to_out(
             "personality": inst.personality or {"preset": "warm_concierge"},
             "leadRetentionDays": inst.lead_retention_days,
             "allowedOrigins": list(inst.allowed_origins) if inst.allowed_origins else None,
+            "timezone": inst.timezone,
+            "teamAvailability": inst.team_availability or None,
             "graceWindowStartedAt": (
                 inst.grace_window_started_at.isoformat() if inst.grace_window_started_at else None
             ),
@@ -642,6 +645,28 @@ async def update_allowed_origins(
         return list(req.origins) or None
 
     return await _update_config(subject.admin_id, subject.user_id, "allowed_origins", _build)
+
+
+@router.put("/team-availability", response_model=LucielOut)
+async def update_team_availability(
+    req: UpdateTeamAvailabilityRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """Describe when the HUMAN team is reachable (round 6 WP-E, audit F054).
+
+    Luciel has no hours and keeps answering around the clock whatever is set here. The
+    description is used for two things only: honest follow-up wording in a hand-off
+    ("someone will follow up tomorrow at 9:00 am") and routing an after-hours
+    escalation to a different contact. ``enabled: false`` turns both effects off."""
+
+    def _build(inst: Instance) -> object:
+        # The timezone rides on its own column — the daily brief reads it even with
+        # the setting off — written in the same transaction and audit event.
+        inst.timezone = req.timezone
+        blob = req.model_dump(by_alias=True, exclude_none=True)
+        blob.pop("timezone", None)
+        return blob
+
+    return await _update_config(subject.admin_id, subject.user_id, "team_availability", _build)
 
 
 @router.put("/personality", response_model=LucielOut)
