@@ -47,6 +47,13 @@ updates:
       timezone: America/Toronto
     open-pull-requests-limit: 2
     labels: [dependencies, docker]
+    # The Python runtime line is a deliberate choice (pyproject requires-python, CI,
+    # native wheels): a base-image major/minor bump is not a dependency update to
+    # auto-merge (2026-09-07: 3.12 → 3.14 slipped through as "minor"). Patch-level
+    # image rebuilds still arrive.
+    ignore:
+      - dependency-name: python
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
 
   - package-ecosystem: npm
     directory: /infra
