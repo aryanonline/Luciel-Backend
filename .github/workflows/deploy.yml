@@ -10,9 +10,11 @@ name: deploy
 # role (no static keys; INFRA-SEC-01 fix) -> run migrations as a one-off ECS task
 # INSIDE the VPC (RDS is private).
 #
-# Triggers:
-#   - push to main           -> auto-deploy dev (dev is ungated).
-#   - workflow_dispatch dev  -> manual dev deploy.
+# Triggers (dispatch only — there is no push trigger: `main` is a stale revert and
+# the `guard` job refuses any ref but the release branch):
+#   - workflow_dispatch dev  -> manual dev deploy. Always pass
+#     `--ref feat/docs-conformance-build-20260713-r2`; a bare dispatch uses the
+#     default branch, which is now the release branch too.
 #   - workflow_dispatch prod -> prod RELEASE FLOW (below). Gated by the GitHub
 #     `prod` Environment protection rule AND by the preprod §10 harness: prod is
 #     NEVER reached unless a prod-shaped preprod passed the §10 verification.
@@ -25,8 +27,6 @@ name: deploy
 #   -> preprod-teardown (if: always(), cdk destroy preprod --force; can't be skipped).
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
@@ -35,10 +35,12 @@ on:
         options: [dev, prod]
         default: dev
       integration_mode:
-        description: LLM integration mode (GATE 2). 'live' enables real Anthropic/OpenAI.
+        # Empty means the DEV_INTEGRATION_MODE repo variable (live on dev): a dispatch
+        # that omits the input can no longer flip a live environment back to mock.
+        description: LLM integration mode (GATE 2). 'live' enables real Anthropic/OpenAI. Empty = repo variable DEV_INTEGRATION_MODE.
         type: choice
-        options: [mock, live]
-        default: mock
+        options: ['', mock, live]
+        default: ''
       paused:
         # The cheap-idle switch has existed in the CDK app since it was written
         # (`-c paused=true` -> every ECS service desiredCount 0, every sweep schedule
@@ -64,9 +66,29 @@ env:
   ACCOUNT: '729005488042'
 
 jobs:
-  # ---- DEV: auto on push to main, or manual dispatch with environment=dev -------
+  # ---- GUARD: deploys run ONLY from the release branch --------------------------
+  # `main` is a stale revert (CLAUDE.md "Branch discipline"), yet a bare
+  # `gh workflow run` dispatches the repository's default branch and every job
+  # below checks out whatever ref was dispatched. 2026-09-06: a dispatch without
+  # `--ref` deployed main to dev for 25 minutes. The default branch now IS the
+  # release branch, and this job refuses anything else before a single AWS call.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse any ref that is not the release branch
+        env:
+          RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH || 'feat/docs-conformance-build-20260713-r2' }}
+        run: |
+          if [ "${{ github.ref_name }}" != "$RELEASE_BRANCH" ]; then
+            echo "::error::deploys run only from $RELEASE_BRANCH (dispatched ref: ${{ github.ref_name }}). Re-run with --ref $RELEASE_BRANCH."
+            exit 1
+          fi
+          echo "ref ${{ github.ref_name }} is the release branch"
+
+  # ---- DEV: manual dispatch with environment=dev -------------------------------
   dev:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'dev')
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'dev'
+    needs: guard
     runs-on: ubuntu-latest
     environment: dev
     env:
@@ -180,7 +202,7 @@ jobs:
             "Luciel-dev-Edge" "Luciel-dev-Observability" "Luciel-dev-Budget" \
             "Luciel-dev-WidgetCert" "Luciel-dev-Widget" "Luciel-dev-Web" "Luciel-dev-Pipeline" \
             -c env=dev -c imageTag=$IMAGE_TAG \
-            -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
+            -c integrationMode=${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
             -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
             --require-approval never
@@ -197,7 +219,7 @@ jobs:
       - name: Post-deploy smoke probe (healthz + both planes answer)
         id: smoke
         if: inputs.paused != 'true'
-        run: bash scripts/smoke_probe.sh https://api.vantagemind.ai ${{ inputs.integration_mode || 'mock' }}
+        run: bash scripts/smoke_probe.sh https://api.vantagemind.ai ${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }}
 
       - name: §10 live probe as luciel_app (one-off ECS task inside the VPC)
         id: verify
@@ -228,6 +250,7 @@ jobs:
   #    the whole release flow is held until a human approves.
   preprod-standup:
     if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+    needs: guard
     runs-on: ubuntu-latest
     environment: prod
     env:
@@ -300,7 +323,7 @@ jobs:
   #    this job, which (via `needs`) prevents prod-deploy from running.
   preprod-verify:
     if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
-    needs: preprod-standup
+    needs: [guard, preprod-standup]
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -325,7 +348,7 @@ jobs:
   # 3) Deploy prod — ONLY runs if preprod-verify succeeded (default `needs` gating).
   prod-deploy:
     if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
-    needs: [preprod-standup, preprod-verify]
+    needs: [guard, preprod-standup, preprod-verify]
     runs-on: ubuntu-latest
     environment: prod
     env:
@@ -403,7 +426,7 @@ jobs:
             "Luciel-prod-Edge" "Luciel-prod-Observability" "Luciel-prod-Budget" \
             "Luciel-prod-WidgetCert" "Luciel-prod-Widget" "Luciel-prod-Web" \
             -c env=prod -c imageTag=$IMAGE_TAG \
-            -c integrationMode=${{ inputs.integration_mode || 'mock' }} \
+            -c integrationMode=${{ inputs.integration_mode || 'live' }} \
             -c paused=${{ inputs.paused || 'false' }} \
             -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
             --require-approval never
@@ -419,8 +442,8 @@ jobs:
   #    deletionProtection false for non-prod envs). preprod must never be left
   #    running for cost reasons; this job cannot be skipped.
   preprod-teardown:
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
-    needs: [preprod-standup, preprod-verify, prod-deploy]
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.environment == 'prod' && needs.guard.result == 'success'
+    needs: [guard, preprod-standup, preprod-verify, prod-deploy]
     runs-on: ubuntu-latest
     environment: prod
     env:

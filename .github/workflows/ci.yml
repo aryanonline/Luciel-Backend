@@ -8,7 +8,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # The release branch, not the stale `main` (2026-09-07: it is also the default
+    # branch now, so the daily schedule below audits the code that actually ships).
+    branches: [feat/docs-conformance-build-20260713-r2]
   # 2026-09-05 audit F039: pip-audit, bandit and the secret scan run daily, not
   # only when someone pushes — a CVE published on a quiet week still blocks.
   schedule:

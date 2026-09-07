@@ -198,8 +198,11 @@ Run focused tests while iterating, then run the full command above before commit
 
 ## Deploy
 
-- Dispatch the named workflow from the intended commit, for example:
-  `gh workflow run deploy -f environment=dev -f integration_mode=mock`.
+- Dispatch the named workflow FROM THE RELEASE BRANCH, always with `--ref`:
+  `gh workflow run deploy.yml --ref feat/docs-conformance-build-20260713-r2 -f environment=dev -f integration_mode=live`.
+  The workflow's `guard` job refuses any other ref (2026-09-06: a bare dispatch shipped
+  stale `main` to dev), there is no push trigger, and an omitted `integration_mode`
+  means the `DEV_INTEGRATION_MODE` repo variable (`live`), never `mock`.
 - `environment` is `dev` or `prod`; choose `integration_mode` explicitly (`mock` or
   `live`). Do not treat a deploy command as approval for a real integration.
 - Dev is the normal target for verification. Production is only for explicit owner
