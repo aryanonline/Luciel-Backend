@@ -605,3 +605,98 @@ async def test_bootstrap_disclosure_clause_never_names_the_luciel(client):
     # The frozen wire field business_name still mirrors inst.name (unrelated to
     # the disclosure clause fix -- widget header contract, not the greeting text).
     assert body["businessName"] == luciel_name
+
+
+# --- Round 6 WP-I (F066): the websites the widget may load on ---------------------- #
+async def _restrict(admin: uuid.UUID, origins: list[str] | None) -> None:
+    from sqlalchemy import select
+
+    async with tenant_session(admin) as s:
+        inst = (await s.execute(select(Instance).where(Instance.admin_id == admin))).scalar_one()
+        inst.allowed_origins = origins
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_origin_allowlist_unset_admits_any_page(client):
+    _admin, embed_key = await _seed_active_instance()
+    r = await client.post(
+        "/api/v1/chat-widget/bootstrap",
+        json={"embedKey": embed_key},
+        headers={"Origin": "https://anywhere.example"},
+    )
+    assert r.status_code == 200
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_origin_allowlist_refuses_other_pages_and_audits_once(client):
+    """The embed key is public by design; the owner's list is the only thing that says
+    WHERE it may be used. Bootstrap, send and history all compare the page origin;
+    the dashboard's own preview is never refused; a refusal is one audit row per
+    window, not one per hammering request."""
+    from app.config import get_settings
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select
+
+    admin, embed_key = await _seed_active_instance()
+    await _restrict(admin, ["https://acme.example"])
+    boot = {"embedKey": embed_key}
+
+    ok = await client.post(
+        "/api/v1/chat-widget/bootstrap", json=boot, headers={"Origin": "https://acme.example"}
+    )
+    assert ok.status_code == 200
+    folded_case = await client.post(
+        "/api/v1/chat-widget/bootstrap", json=boot, headers={"Origin": "https://ACME.example:443"}
+    )
+    assert folded_case.status_code == 200
+    via_referer = await client.post(
+        "/api/v1/chat-widget/bootstrap",
+        json=boot,
+        headers={"Referer": "https://acme.example/pricing?utm=1"},
+    )
+    assert via_referer.status_code == 200
+    dashboard = await client.post(
+        "/api/v1/chat-widget/bootstrap",
+        json=boot,
+        headers={"Origin": get_settings().app_base_url.rstrip("/")},
+    )
+    assert dashboard.status_code == 200, "the Embed page's live preview must keep working"
+
+    stranger = {"Origin": "https://evil.example"}
+    for _ in range(3):
+        r = await client.post("/api/v1/chat-widget/bootstrap", json=boot, headers=stranger)
+        assert r.status_code == 403
+        assert "isn't available on this website" in r.json()["message"]
+    missing = await client.post("/api/v1/chat-widget/bootstrap", json=boot)
+    assert missing.status_code == 403  # no page origin at all is not the owner's site
+    sent = await client.post(
+        "/api/v1/chat-widget/messages",
+        json={"embedKey": embed_key, "text": "hi"},
+        headers=stranger,
+    )
+    assert sent.status_code == 403
+    history = await client.get(
+        f"/api/v1/chat-widget/sessions/{uuid.uuid4()}?embedKey={embed_key}", headers=stranger
+    )
+    assert history.status_code == 403
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "widget_origin_blocked",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1, "refusals fold into one audit row per window"
+    assert rows[0].event_payload["origin"] == "https://evil.example"
+
+    # Switching the restriction off admits the stranger again — the setting is the owner's.
+    await _restrict(admin, None)
+    r = await client.post("/api/v1/chat-widget/bootstrap", json=boot, headers=stranger)
+    assert r.status_code == 200

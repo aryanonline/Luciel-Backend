@@ -1,18 +1,20 @@
 /**
- * Edge layer - CloudFront + WAF (DEVOPS §5.6, Arch §3.1.5).
+ * Edge layer - regional WAF on the ALBs (DEVOPS §5.6, Arch §3.1.5).
  *
- * Closes AUDIT FINDING M2: the widget edge security posture (Origin/Referer
- * allowlist + bot challenge + per-tenant rate limit) that the app deliberately
- * delegates to the edge. Until this existed, off-domain embedding and bot abuse
- * were not actually rejected. This is the enforcement the application layer trusts.
+ * What this WebACL actually enforces — exactly three rules, pinned by
+ * infra/test (round 6 WP-I, audit F066: the previous header claimed an
+ * Origin/Referer allowlist and a bot challenge that were never built):
+ *  - AWSCommon: the AWS managed common rule set (baseline);
+ *  - KnownBadInputs: the AWS managed known-bad-inputs set;
+ *  - RateLimitPerIp: a per-IP request ceiling (denial-of-wallet backstop, §3.1.5).
  *
- * WAF (regional, on the ALB) provides:
- *  - AWS managed common rule set + known-bad-inputs (baseline).
- *  - Rate-based rule: per-IP request ceiling (denial-of-wallet backstop, §3.1.5).
- *  - A bot-control / challenge action on the widget ingress paths.
- * Origin/Referer allowlisting per registered admin domain is enforced at the app
- * edge via the embed-key + this WAF; the registered-domain check is data-driven so
- * it cannot be a static IaC list (documented seam).
+ * What it does NOT do: there is no CloudFront distribution, no bot-control /
+ * challenge action, and no per-tenant or per-domain rule here. The owner's
+ * website allowlist is data (instances.allowed_origins) and is enforced by the
+ * widget data plane (app/api/v1/chat_widget._enforce_origin), which compares the
+ * page origin of every bootstrap / send / history call; per-source and
+ * per-tenant ceilings live in app/channels/rate_limit.py. One WebACL, two ALB
+ * associations (API + dashboard/marketing).
  */
 import { Stack, StackProps } from 'aws-cdk-lib';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';

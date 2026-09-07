@@ -174,4 +174,14 @@ describe('Edge layer / WAF (§5.6 — closes audit M2)', () => {
   test('WAF is associated to the ALB', () => {
     buildEdge().resourceCountIs('AWS::WAFv2::WebACLAssociation', 1);
   });
+
+  test('the WebACL carries exactly the three rules its header names (round 6 WP-I)', () => {
+    // The old header promised an Origin/Referer allowlist and a bot challenge that
+    // never existed. The rule list IS the posture; the header now describes it and
+    // this pins the two together.
+    const acls = Object.values(buildEdge().findResources('AWS::WAFv2::WebACL'));
+    expect(acls).toHaveLength(1);
+    const rules = (acls[0] as { Properties: { Rules: Array<{ Name: string }> } }).Properties.Rules;
+    expect(rules.map((r) => r.Name)).toEqual(['AWSCommon', 'KnownBadInputs', 'RateLimitPerIp']);
+  });
 });

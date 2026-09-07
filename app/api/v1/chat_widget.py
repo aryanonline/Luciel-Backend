@@ -29,12 +29,14 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import select
 
-from app.api.errors import not_found, rate_limited
+from app.api.errors import forbidden, not_found, rate_limited
 from app.audit import log as audit
 from app.billing import metering
 from app.channels import rate_limit
 from app.channels.base import InboundRejected, InstanceContext
+from app.channels.origins import normalize_origin, request_origin
 from app.channels.routing import resolve_widget
+from app.config import get_settings
 from app.db.session import tenant_session, untenanted_session
 from app.models.audit import ActorType
 from app.models.conversation import Session as ConversationSession
@@ -141,6 +143,52 @@ async def _deny_widget(ctx: InstanceContext, reason: str | None) -> None:
     raise rate_limited("Too many messages — please slow down.", retry_after_seconds=3)
 
 
+ORIGIN_REFUSED_MESSAGE = "This chat isn't available on this website."
+
+
+def _dashboard_origin() -> str | None:
+    """The platform's own frontend origin: the Embed page's live preview loads the
+    widget from there, so it is never refused whatever the owner listed."""
+    return normalize_origin(get_settings().app_base_url)
+
+
+async def _enforce_origin(ctx: InstanceContext, inst: Instance, request: Request) -> None:
+    """Refuse a page outside the owner's allowed origins (round 6 WP-I, audit F066).
+
+    The embed key is public by design; ``allowed_origins`` is the owner's only way to
+    say WHERE it may be used. Unset (the default) admits any page — today's behaviour.
+    A refusal is audited once per window per instance (the same folding as an
+    admission denial: a page hammering the key must not become an audit-row mill)
+    and answered with an honest 403 the widget renders as such."""
+    allowed = [o for o in (inst.allowed_origins or []) if isinstance(o, str) and o]
+    if not allowed:
+        return
+    permitted = set(allowed)
+    dashboard = _dashboard_origin()
+    if dashboard:
+        permitted.add(dashboard)
+    origin = request_origin(request.headers)
+    if origin in permitted:
+        return
+    folded = _denial_audit_folded(ctx.instance_id, "origin_not_allowed")
+    if folded is not None:
+        async with tenant_session(ctx.admin_id) as s:
+            await audit.emit(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                actor_type=ActorType.platform,
+                event_type="widget_origin_blocked",
+                # The refusing page's origin is the fact the owner needs; no visitor PII.
+                payload={
+                    "channel": "widget",
+                    "origin": origin or "",
+                    "denials_folded": folded,
+                },
+            )
+    raise forbidden(ORIGIN_REFUSED_MESSAGE)
+
+
 async def _widget_ip_gate(ctx: InstanceContext, request: Request, bucket: str) -> str:
     """Stage-one widget admission: per TRUSTED client IP per instance, before any DB work.
 
@@ -236,6 +284,7 @@ async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBoo
         ).scalar_one_or_none()
         if inst is None:
             raise not_found("Unknown widget.")
+        await _enforce_origin(ctx, inst, request)
         business, assistant = _names(inst)
         # A pause holds NEW conversations; one in progress finishes (§3.6.2). The
         # visitor's tab carries its session id across pages, and the bootstrap
@@ -303,6 +352,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
         ).scalar_one_or_none()
         if inst is None:
             raise not_found("Unknown widget.")
+        await _enforce_origin(ctx, inst, request)
 
         # Does the supplied session id belong to a conversation of THIS tenant that is
         # still in flight? Read-only. It decides three things at once: the §3.6.2 /
@@ -520,6 +570,12 @@ async def get_history(
     ctx = await _resolve_embed_key(embed_key)
     await _widget_ip_gate(ctx, request, "widget_poll")
     async with tenant_session(ctx.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.id == ctx.instance_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("Unknown widget.")
+        await _enforce_origin(ctx, inst, request)
         rows = (
             (
                 await s.execute(

@@ -376,3 +376,54 @@ async def test_lead_retention_forbids_unknown_fields_like_every_pillar(client):
         json={"leadRetentionDays": 90, "purgeArchived": True},
     )
     assert r.status_code == 422
+
+
+# --- Round 6 WP-I (F066): the websites the widget may load on ---------------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_allowed_origins_round_trip_normalise_and_clear(client):
+    await _signup_verify_login(client)
+    await _create(client)
+    assert (await client.get("/api/v1/admin/luciel")).json()["allowedOrigins"] is None
+    r = await client.put(
+        "/api/v1/admin/luciel/allowed-origins",
+        json={
+            "origins": [
+                "https://Acme.Example/",
+                "https://acme.example:443",
+                "http://localhost:3000",
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    # Case-folded, default port dropped, duplicates collapsed, order kept.
+    assert r.json()["allowedOrigins"] == ["https://acme.example", "http://localhost:3000"]
+    assert (await client.get("/api/v1/admin/luciel")).json()["allowedOrigins"] == [
+        "https://acme.example",
+        "http://localhost:3000",
+    ]
+    off = await client.put("/api/v1/admin/luciel/allowed-origins", json={"origins": []})
+    assert off.status_code == 200
+    assert off.json()["allowedOrigins"] is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_allowed_origins_refuse_paths_schemes_and_too_many(client):
+    """An origin with a path would silently never match and the owner's own site would be
+    refused: it is rejected with the fix in the reason, never stored."""
+    await _signup_verify_login(client)
+    await _create(client)
+    for bad in (
+        ["https://acme.example/pricing"],
+        ["ftp://acme.example"],
+        ["acme.example"],
+        ["https://user:pw@acme.example"],
+        ["https://acme.example?x=1"],
+        [f"https://site{i}.example" for i in range(11)],
+    ):
+        r = await client.put("/api/v1/admin/luciel/allowed-origins", json={"origins": bad})
+        assert r.status_code == 422, bad
+    r = await client.put(
+        "/api/v1/admin/luciel/allowed-origins",
+        json={"origins": ["https://acme.example"], "strict": True},
+    )
+    assert r.status_code == 422  # unknown fields refused like every pillar

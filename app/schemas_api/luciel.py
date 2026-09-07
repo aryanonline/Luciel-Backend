@@ -20,6 +20,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, EmailStr, Field, field_validator
 
+from app.channels.origins import MAX_ALLOWED_ORIGINS, normalize_origin
 from app.schemas_api.common import WireModel
 
 # International format (country code first, 8–15 digits) — the only shape Twilio can
@@ -192,6 +193,8 @@ class LucielOut(WireModel):
     personality: PersonalityConfigWire
     # Opt-in lead auto-prune window in days; null means the rule is off (§3.4.10a).
     lead_retention_days: int | None = None
+    # The website origins the widget may load on; null means any page (round 6 WP-I).
+    allowed_origins: list[str] | None = None
     grace_window_started_at: datetime | None = None
 
 
@@ -335,6 +338,32 @@ class UpdatePersonalityRequest(StrictWireModel):
     axes: PersonalityAxesIn | None = None
     business_context: str | None = Field(default=None, max_length=280)
     assistant_name: str | None = Field(default=None, max_length=80)
+
+
+class UpdateAllowedOriginsRequest(StrictWireModel):
+    """PUT /admin/luciel/allowed-origins — the websites the widget may load on.
+
+    Each entry is normalised to ``scheme://host[:port]`` (round 6 WP-I, F066); a path,
+    query, credentials or a non-http(s) scheme is refused with the fix in the reason,
+    because an origin with a path would silently never match and the owner's own site
+    would be refused. An empty list turns the restriction OFF (any page)."""
+
+    origins: list[str] = Field(default_factory=list, max_length=MAX_ALLOWED_ORIGINS)
+
+    @field_validator("origins")
+    @classmethod
+    def _normalized(cls, value: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in value:
+            origin = normalize_origin(raw)
+            if origin is None:
+                raise ValueError(
+                    f"'{raw}' is not a website address — use the form https://www.example.com "
+                    "(no path or query)."
+                )
+            if origin not in out:
+                out.append(origin)
+        return out
 
 
 class UpdateLeadRetentionRequest(StrictWireModel):

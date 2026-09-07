@@ -32,6 +32,13 @@ class BudgetOut(WireModel):
     # through its CURRENT billed 100-block, so the dashboard can warn before a new
     # block is billed. Honest nudge only — NOT a cap. Always false for free_cap.
     near_next_block: bool = False
+    # Ledger truth (round 6 WP-I, audit F025), additive: whether new usage past the
+    # free 50 is served and billed right now, and this period's block watermarks —
+    # accrued against the tenant / already reported to Stripe — so a cardless or
+    # dunned account still shows the blocks it ran while it could.
+    billable: bool = True
+    accrued_blocks: int = 0
+    reported_blocks: int = 0
 
 
 class PaymentMethodOut(WireModel):

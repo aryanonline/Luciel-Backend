@@ -71,6 +71,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "account_closure_initiated",
         "llm_unavailable_escalation",
         "widget_abuse_blocked",
+        # A page outside the owner's allowed origins tried to load the chat (WP-I).
+        "widget_origin_blocked",
         "channel_abuse_blocked",
         "prompt_injection_detected",
         "content_moderation_event",

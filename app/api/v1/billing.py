@@ -74,6 +74,9 @@ def _budget_out(b: metering.MeteredBudget) -> BudgetOut:
             "periodResetsAt": b.period_resets_at,
             "atCap": b.at_cap,
             "nearNextBlock": b.near_next_block,
+            "billable": b.billable,
+            "accruedBlocks": b.accrued_blocks,
+            "reportedBlocks": b.reported_blocks,
         }
     )
 

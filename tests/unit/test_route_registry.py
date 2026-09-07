@@ -47,6 +47,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/api/v1/admin/luciel/escalation"),
         # The Admin's opt-in lead auto-prune rule (§3.4.10a) — intentional addition.
         ("PUT", "/api/v1/admin/luciel/lead-retention"),
+        # Round 6 WP-I (F066): the websites the widget may load on.
+        ("PUT", "/api/v1/admin/luciel/allowed-origins"),
         ("POST", "/api/v1/admin/luciel/pause"),
         ("PUT", "/api/v1/admin/luciel/personality"),
         ("POST", "/api/v1/admin/luciel/restore"),

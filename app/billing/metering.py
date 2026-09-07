@@ -96,6 +96,16 @@ class MeteredBudget:
     billed_blocks: int
     billed_cents: int
 
+    # Ledger truth (round 6 WP-I, audit F025). ``billable`` is whether NEW usage past
+    # the free 50 is served and billed right now (a live card, dunning not reduced);
+    # the two block counts are this period's watermarks — blocks accrued against the
+    # tenant and blocks already reported to Stripe — so a cardless or dunned account
+    # still shows the blocks it ran while it could, instead of a zero that reads as
+    # "nothing was ever billed".
+    billable: bool = True
+    accrued_blocks: int = 0
+    reported_blocks: int = 0
+
 
 async def get_or_create_billing_account(
     session: AsyncSession, *, admin_id: uuid.UUID
@@ -182,9 +192,18 @@ async def build_budget(
         position_in_block = (counted - free) % settings.payg_block_size
         near_next_block = position_in_block >= int(settings.payg_block_size * 0.8)
 
-    # billedThisPeriod (wire COUNT) is only nonzero when billing actually applies —
-    # i.e. there is a live card. A cardless account caps at free, so nothing billed.
-    billed_count = billed_conversations(counted, free) if live_card else 0
+    # Ledger truth (round 6 WP-I, F025): the watermarks the meter actually posted
+    # against this period. With a live card the count above free is what is billed;
+    # without one (card removed, dunning reduced) the blocks that ran while the card
+    # WAS live are still owed and still shown — bounded by what the ledger accrued,
+    # so a capped tenant is never shown a charge that was never metered.
+    same_period = account.accrual_period_start == period
+    accrued_blocks = account.accrued_blocks if same_period else 0
+    reported_blocks = account.last_reported_blocks if same_period else 0
+    if live_card:
+        billed_count = billed_conversations(counted, free)
+    else:
+        billed_count = min(max(counted - free, 0), accrued_blocks * settings.payg_block_size)
     blocks = billed_blocks(counted, free, settings.payg_block_size) if live_card else 0
     cents = (
         billed_cents(counted, free, settings.payg_block_size, settings.payg_price_per_block_cents)
@@ -206,6 +225,9 @@ async def build_budget(
         near_next_block=near_next_block,
         billed_blocks=blocks,
         billed_cents=cents,
+        billable=live_card,
+        accrued_blocks=accrued_blocks,
+        reported_blocks=reported_blocks,
     )
 
 

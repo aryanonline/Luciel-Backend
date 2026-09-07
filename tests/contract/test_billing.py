@@ -365,3 +365,42 @@ async def test_webhook_verified_invoice_paid_processed(client) -> None:
     # Counter reset, no rollover.
     g = await client.get("/api/v1/billing")
     assert g.json()["budget"]["conversationsThisPeriod"] == 0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_budget_reports_the_ledger_when_the_card_is_gone(client) -> None:
+    """Round 6 WP-I (audit F025): a dunned account that ran a paid block while its card
+    was live used to read billedThisPeriod 0 — as if nothing had ever been billed. The
+    wire now carries the ledger: not billable for NEW usage, at cap, but the block it
+    ran is still shown, with how much of it Stripe has already been told about."""
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=70)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.dunning_state = "reduced"
+        acct.accrued_blocks = 1
+        acct.last_reported_blocks = 1
+        acct.accrual_period_start = current_billing_period_start()
+    r = await client.get("/api/v1/billing")
+    assert r.status_code == 200
+    b = r.json()["budget"]
+    assert b["billable"] is False and b["atCap"] is True
+    assert b["billedThisPeriod"] == 20  # 70 counted − 50 free, inside the one accrued block
+    assert b["accruedBlocks"] == 1 and b["reportedBlocks"] == 1
+
+    # A live card: the same figures read billable, with the count above free as before.
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.dunning_state = "none"
+    b = (await client.get("/api/v1/billing")).json()["budget"]
+    assert b["billable"] is True and b["atCap"] is False and b["billedThisPeriod"] == 20
+
+    # A free-cap account that never accrued anything shows zero, not a phantom charge.
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "free_cap"
+        acct.accrued_blocks = 0
+        acct.last_reported_blocks = 0
+    b = (await client.get("/api/v1/billing")).json()["budget"]
+    assert b["billedThisPeriod"] == 0 and b["accruedBlocks"] == 0 and b["billable"] is False

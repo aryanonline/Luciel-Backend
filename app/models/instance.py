@@ -144,5 +144,10 @@ class Instance(Base, TenantMixin, TimestampMixin):
     # retention choice — leads with no activity for this many days are pruned by the
     # retention sweep.
     lead_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The website origins the widget may load on (round 6 WP-I, audit F066; migration
+    # 0060). A list of ``scheme://host[:port]`` strings; NULL means any page — the
+    # embed key is public by design and this is the owner's only way to say WHERE it
+    # may be used. Enforced on the widget data plane (chat_widget._enforce_origin).
+    allowed_origins: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     # Soft-delete marker mirrored onto the state machine (grace window).
     soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -36,6 +36,7 @@ from app.schemas_api.luciel import (
     ResendContactConfirmationRequest,
     TestSmsRequest,
     TestSmsResult,
+    UpdateAllowedOriginsRequest,
     UpdateChannelsRequest,
     UpdateEscalationRequest,
     UpdateLeadRetentionRequest,
@@ -179,6 +180,7 @@ def _to_out(
             "escalationContactHealth": contact_health or [],
             "personality": inst.personality or {"preset": "warm_concierge"},
             "leadRetentionDays": inst.lead_retention_days,
+            "allowedOrigins": list(inst.allowed_origins) if inst.allowed_origins else None,
             "graceWindowStartedAt": (
                 inst.grace_window_started_at.isoformat() if inst.grace_window_started_at else None
             ),
@@ -623,6 +625,23 @@ async def update_lead_retention(
         return req.lead_retention_days
 
     return await _update_config(subject.admin_id, subject.user_id, "lead_retention_days", _build)
+
+
+@router.put("/allowed-origins", response_model=LucielOut)
+async def update_allowed_origins(
+    req: UpdateAllowedOriginsRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """Name the websites the widget may load on (round 6 WP-I, audit F066).
+
+    The embed key is public by design; this list is the owner's only way to say WHERE
+    it may be used. The widget data plane refuses every other page origin with a 403.
+    An empty list turns the restriction off. The dashboard's own preview always
+    works — the platform origin is never refused."""
+
+    def _build(_: Instance) -> object:
+        return list(req.origins) or None
+
+    return await _update_config(subject.admin_id, subject.user_id, "allowed_origins", _build)
 
 
 @router.put("/personality", response_model=LucielOut)
