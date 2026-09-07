@@ -1,0 +1,63 @@
+# Dependency upkeep without a person in the loop (round 6 WP-B, owner request
+# 2026-09-07: "automatically perform any Next migrations or CVE reviews without
+# having me and my team manage it").
+#
+# Every ecosystem this repository ships targets the RELEASE branch (the stale
+# `main` is never touched). Minor and patch updates are grouped into one weekly
+# PR per ecosystem; `.github/workflows/dependabot-auto-merge.yml` squash-merges a
+# grouped or single minor/patch PR once CI is green and labels a MAJOR bump for a
+# person. Security updates arrive as soon as the advisory does, on the same rules.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    target-branch: feat/docs-conformance-build-20260713-r2
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: feat/docs-conformance-build-20260713-r2
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    target-branch: feat/docs-conformance-build-20260713-r2
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/Toronto
+    open-pull-requests-limit: 2
+    labels: [dependencies, docker]
+
+  - package-ecosystem: npm
+    directory: /infra
+    target-branch: feat/docs-conformance-build-20260713-r2
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels: [dependencies, infra]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]

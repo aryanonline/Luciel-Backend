@@ -1,0 +1,134 @@
+name: dependency-review
+
+# Monthly dependency and CVE review (round 6 WP-B): what is outdated, what the
+# image CVE gate is waiving and for how long, what the last image scan found, and a
+# review issue a person can act on — without anyone having to remember to look.
+# Also on demand.
+#
+# Explicit `ref`: a scheduled run checks out the DEFAULT branch, which is the
+# release branch now, but the ref is named so a later default-branch change can
+# never point this at stale code.
+
+on:
+  schedule:
+    - cron: '0 7 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+env:
+  AWS_REGION: ca-central-1
+  ECR_REPOSITORY: luciel-backend-dev
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/docs-conformance-build-20260713-r2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install deps
+        run: |
+          uv venv .venv
+          . .venv/bin/activate
+          uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
+
+      - name: pip-audit (the same strict audit CI runs)
+        id: audit
+        continue-on-error: true
+        run: |
+          . .venv/bin/activate
+          uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
+          pip-audit --strict --desc -r /tmp/audit-reqs.txt 2>&1 | tee audit.txt
+
+      - name: Outdated Python packages (advisory)
+        continue-on-error: true
+        run: |
+          . .venv/bin/activate
+          uv pip list --outdated 2>&1 | tee outdated-python.txt || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Outdated infra (CDK) packages (advisory)
+        continue-on-error: true
+        working-directory: infra
+        run: |
+          npm ci --no-audit --no-fund >/dev/null 2>&1 || true
+          npm outdated 2>&1 | tee ../outdated-infra.txt || true
+
+      - name: Image CVE waivers expiring within 14 days
+        id: expiry
+        continue-on-error: true
+        run: python3 scripts/allowlist_expiry.py --within-days 14 --markdown expiry.md
+
+      - name: Configure AWS credentials (OIDC, dev deploy role)
+        id: aws
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Latest dev image scan summary (ECR, advisory)
+        if: steps.aws.outcome == 'success'
+        continue-on-error: true
+        run: |
+          tag=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                  --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text 2>/dev/null || echo "")
+          if [ -z "$tag" ] || [ "$tag" = "None" ]; then
+            echo "no image found in $ECR_REPOSITORY" | tee ecr.txt; exit 0
+          fi
+          aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$tag" --query 'imageScanFindings.findingSeverityCounts' \
+            --output table 2>&1 | tee ecr.txt || true
+          echo "image tag: $tag" | tee -a ecr.txt
+
+      - name: Open or update the month's review issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+          EXPIRY_OUTCOME: ${{ steps.expiry.outcome }}
+        run: |
+          set -euo pipefail
+          month=$(date -u +%Y-%m)
+          title="Dependency & CVE review $month"
+          {
+            echo "Automated monthly review (\`dependency-review.yml\`, run ${{ github.run_id }})."
+            echo
+            echo "## pip-audit — **$AUDIT_OUTCOME**"
+            echo '```'; tail -n 40 audit.txt 2>/dev/null || echo "(no output)"; echo '```'
+            echo
+            echo "## Image CVE waivers — **$EXPIRY_OUTCOME** (⚠️ = expires within 14 days)"
+            cat expiry.md 2>/dev/null || echo "(no waivers file)"
+            echo
+            echo "## Latest dev image scan (severity counts)"
+            echo '```'; cat ecr.txt 2>/dev/null || echo "(not read — AWS role unavailable to this run)"; echo '```'
+            echo
+            echo "## Outdated (advisory)"
+            echo '```'; tail -n 60 outdated-python.txt 2>/dev/null || echo "(none)"; echo '```'
+            echo '```'; tail -n 40 outdated-infra.txt 2>/dev/null || echo "(none)"; echo '```'
+            echo
+            echo "Minor/patch updates merge themselves once CI is green (Dependabot + auto-merge); majors carry the \`major-update\` label and need a person. Re-review waivers in \`.security/cve-allowlist.json\` before they expire — an expired one blocks the deploy."
+          } > body.md
+          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body-file body.md
+            echo "updated issue #$existing"
+          else
+            gh issue create --repo "$REPO" --title "$title" --label dependencies --body-file body.md
+          fi
+          [ "$AUDIT_OUTCOME" = "success" ] && [ "$EXPIRY_OUTCOME" = "success" ]
