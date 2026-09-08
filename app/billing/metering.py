@@ -70,7 +70,7 @@ def billed_blocks(counted: int, free_allowance: int, block_size: int) -> int:
 def billed_cents(
     counted: int, free_allowance: int, block_size: int, price_per_block_cents: int
 ) -> int:
-    """Dollar amount (in cents) for the period: blocks × $39 (the locked numbers).
+    """Amount in cents (CAD) for the period: blocks × $39 CAD (the locked numbers).
 
     50→$0, 51→$39 (3900¢), 150→$39, 151→$78 (7800¢) — exhaustively tested at the
     100-block boundaries (Vision §7, §3.4.1b, BUILD_SPEC ~193)."""

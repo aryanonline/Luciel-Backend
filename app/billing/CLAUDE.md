@@ -11,7 +11,7 @@ Owns PAYG billing accounts, metering, Stripe interaction, dunning, and billing n
 notices, and the once-only notice email sweep worker.
 
 ## Contracts this module owns
-- Price is $0/first 50 conversations then $39 per 100-conversation PAYG block; no tiers, seats, or model picker.
+- Price is $0/first 50 conversations then $39 CAD per 100-conversation PAYG block; no tiers, seats, or model picker.
 - Use Stripe Billing Meter event `luciel_payg_blocks`, idempotent delta reporting, persisted watermark, and replay-gated events.
 - Flush residual blocks on card detach and reset after `invoice.paid`.
 

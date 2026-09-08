@@ -68,8 +68,9 @@ modules rather than duplicating business rules in a new location.
 
 - One account has one Luciel and one login; there are no seats.
 - There is no model picker and no other pricing tier.
-- Pricing is $0 for the first 50 conversations, then $39 per 100-conversation
-  block, pay-as-you-go.
+- Pricing is $0 for the first 50 conversations, then $39 CAD per 100-conversation
+  block, pay-as-you-go (the Stripe price object is CAD; every customer-facing
+  mention says "$39 CAD").
 - A conversation is a billed session. It counts once per billing period despite
   multiple turns and must mean the same thing in Overview, Billing, and Analytics.
   On every channel the session key is the transport identifier (participant key,
