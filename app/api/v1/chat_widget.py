@@ -38,6 +38,7 @@ from app.channels.origins import normalize_origin, request_origin
 from app.channels.routing import resolve_widget
 from app.config import get_settings
 from app.db.session import tenant_session, untenanted_session
+from app.employee.context import build_operating_context
 from app.models.audit import ActorType
 from app.models.conversation import Session as ConversationSession
 from app.models.conversation import Transcript
@@ -268,7 +269,7 @@ def _disclosure_business_name(inst: Instance) -> str:
     names -- so neither is safe to drop into a one-line greeting. With no
     usable short name, this falls back to the generic "this business".
     """
-    return "this business"
+    return (inst.business_short_name or "").strip() or "this business"
 
 
 @router.post("/bootstrap", response_model=WidgetBootstrapOut)
@@ -488,6 +489,8 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             has_payment_method=await metering.has_live_card(s, admin_id=ctx.admin_id),
             snapshot_tool_ids=effective.snapshot_tool_ids,
             tool_resolver=make_tool_resolver(),
+            # The employee's operating context (round 6 WP-F).
+            operating_context=await build_operating_context(s, inst, admin_id=ctx.admin_id),
         )
         result = await orch.run_turn(
             session_id=sess.id,

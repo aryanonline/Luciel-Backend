@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import metering
 from app.channels.base import InboundMessage
+from app.employee.context import build_operating_context
 from app.models.instance import Instance, channel_enabled, is_paused
 from app.runtime.knowledge_retrieval import (
     make_chunk_attributor,
@@ -103,7 +104,7 @@ def disclosure_business_name(inst: Instance) -> str:
     name, this falls back to the generic "this business". The Luciel name
     (``inst.name``) must NEVER be returned here.
     """
-    return "this business"
+    return (inst.business_short_name or "").strip() or "this business"
 
 
 async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> RuntimeReply:
@@ -200,6 +201,8 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         has_payment_method=await metering.has_live_card(session, admin_id=msg.admin_id),
         snapshot_tool_ids=effective.snapshot_tool_ids,
         tool_resolver=make_tool_resolver(),
+        # The employee's operating context (round 6 WP-F).
+        operating_context=await build_operating_context(session, inst, admin_id=msg.admin_id),
     )
 
     transport_identifier = (

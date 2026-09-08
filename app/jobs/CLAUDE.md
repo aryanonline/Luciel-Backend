@@ -20,6 +20,12 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
 - Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), the 90-day transcript hot→cold archive (Commitment #38), and the 5-minute BYO-mailbox delta poll (`mailbox_poll` — a TRANSPORT, not a compliance sweep; candidates are only CONNECTED outlook rows, migration 0038).
 - “Freed” pages may be reused; files shrink only after explicit `VACUUM FULL`.
 
+## daily_brief (round 6 WP-F, 2026-09-07)
+- Hourly sweep; a tenant is due once its LOCAL clock (instances.timezone, UTC when unset)
+  passes 07:00 and no `brief:<date>` row exists in `notice_deliveries`. Body from
+  `app.employee.brief.render_daily_brief` (counts + top-3 needs, never narration).
+  `instances.daily_brief_enabled` is the opt-out; candidates via migration 0062.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

@@ -58,6 +58,7 @@ const SWEEPS = [
   'knowledge_sync',
   'billing_notices',
   'model_currency',
+  'daily_brief',
 ];
 
 describe('Background sweep schedules (Legal §B5 / §A3)', () => {

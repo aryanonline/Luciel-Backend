@@ -50,6 +50,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Round 6 WP-I (F066): the websites the widget may load on.
         ("PUT", "/api/v1/admin/luciel/allowed-origins"),
         ("PUT", "/api/v1/admin/luciel/team-availability"),
+        ("GET", "/api/v1/admin/luciel/status"),
+        ("PUT", "/api/v1/admin/luciel/daily-brief"),
+        ("PUT", "/api/v1/admin/luciel/business-name"),
         ("POST", "/api/v1/admin/luciel/pause"),
         ("PUT", "/api/v1/admin/luciel/personality"),
         ("POST", "/api/v1/admin/luciel/restore"),

@@ -1019,6 +1019,15 @@ export class ComputeStack extends Stack {
         cron: 'cron(35 6 * * ? *)',
         description: 'Verify pinned LLM model IDs; auto-swap retired chat pins (§3.4.3)',
       },
+      {
+        // Hourly, because owners sit in different zones: a tenant is due once its
+        // LOCAL clock passes 07:00 and no ledger row exists for the day (round 6 WP-F).
+        // :50 staggers off the deferred (:10), session_finalize (:25) and health
+        // (:40) hourly slots.
+        name: 'daily_brief',
+        cron: 'cron(50 * * * ? *)',
+        description: "Email each owner's morning brief once per local day (round 6 WP-F)",
+      },
     ];
     // Every name in app/jobs/sweeps.py SWEEP_KINDS must appear above: an entrypoint with
     // no schedule is a compliance promise that never runs, and nothing else in the stack

@@ -89,6 +89,7 @@ MAILBOX_POLL = "mailbox_poll"
 KNOWLEDGE_SYNC = "knowledge_sync"
 BILLING_NOTICES = "billing_notices"
 MODEL_CURRENCY = "model_currency"
+DAILY_BRIEF = "daily_brief"
 
 SWEEP_KINDS: tuple[str, ...] = (
     RETENTION,
@@ -106,6 +107,7 @@ SWEEP_KINDS: tuple[str, ...] = (
     KNOWLEDGE_SYNC,
     BILLING_NOTICES,
     MODEL_CURRENCY,
+    DAILY_BRIEF,
 )
 
 
@@ -427,6 +429,22 @@ async def run_model_currency(*, now: datetime | None = None) -> dict[str, object
     return await run_model_currency_check(now=now or datetime.now(UTC))
 
 
+async def _send_daily_brief(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+    from app.employee.brief import send_daily_brief_if_due  # noqa: PLC0415 — lazy import
+
+    return await send_daily_brief_if_due(session, admin_id=admin_id, now=now)
+
+
+async def run_daily_brief(*, now: datetime | None = None) -> list[str]:
+    """Email each owner's morning brief once per LOCAL day (round 6 WP-F).
+
+    Hourly, because owners sit in different zones: a tenant is due once its local
+    clock passes 07:00 and no ``brief:<date>`` ledger row exists. "What I did
+    yesterday, what I need today" — counts and links from rows that already exist,
+    never narration. ``daily_brief_enabled`` is the opt-out."""
+    return await _per_tenant(DAILY_BRIEF, _send_daily_brief, now)
+
+
 SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     RETENTION: run_retention_prune,
     GRACE_EXPIRY: run_grace_purge,
@@ -443,4 +461,5 @@ SWEEPS: dict[str, Callable[..., Coroutine[object, object, object]]] = {
     KNOWLEDGE_SYNC: run_knowledge_sync,
     BILLING_NOTICES: run_billing_notices,
     MODEL_CURRENCY: run_model_currency,
+    DAILY_BRIEF: run_daily_brief,
 }

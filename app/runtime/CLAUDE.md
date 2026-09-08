@@ -31,6 +31,15 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
   `escalation_dispatch.resolve_routing` pages the after-hours contact. Unset/off →
   byte-identical behaviour to before. Never promise a real-time human reply.
 
+## Operating context (round 6 WP-F, 2026-09-07)
+- `Orchestrator.operating_context` (built by `app.employee.context.build_operating_context`
+  at every entry point) composes a platform-resolved stanza under the invariants: business
+  short name, "available around the clock" (Luciel has no hours), the channels live right
+  now, how the team is notified (never a real-time human), whether a PERSON is reachable
+  (WP-E), and "an unlisted capability does not exist". None keeps the prompt byte-identical.
+- `disclosure_business_name` / `_disclosure_business_name` now serve `instances.
+  business_short_name` (PUT /admin/luciel/business-name) and still never the Luciel name.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

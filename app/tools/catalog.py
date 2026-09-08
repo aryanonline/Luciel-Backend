@@ -488,6 +488,14 @@ ALL_TOOL_IDS = (
 )
 
 # Static metadata used by the broker even before backends are bound.
+# Owner-facing labels per tool id (round 6 WP-F: the Today card and the brief name
+# capabilities the way Configure does). Derived from the classes above.
+TOOL_DISPLAY_NAMES: dict[str, str] = {
+    str(cls.tool_id): str(cls.display_name)
+    for cls in list(globals().values())
+    if isinstance(cls, type) and hasattr(cls, "tool_id") and hasattr(cls, "display_name")
+}
+
 TOOL_CONNECTION_TYPE: dict[str, str | None] = {
     "check_availability": "calendar",
     "book_appointment": "calendar",

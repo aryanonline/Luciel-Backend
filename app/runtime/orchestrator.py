@@ -59,6 +59,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.employee.context import OperatingContext
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, Session, Transcript
 from app.models.instance import Instance
@@ -490,6 +491,10 @@ class Orchestrator:
     # fall back to the broker's live gates alone. This is CAPABILITY=snapshot; the
     # broker's connection/authorization gates remain LIVE (usability=live, safety wins).
     snapshot_tool_ids: set[str] | None = None
+    # The employee's operating context (round 6 WP-F): business short name, live
+    # channels, how the team is notified, whether a person is reachable. Platform-
+    # resolved by the entry point; None keeps the prompt byte-identical.
+    operating_context: OperatingContext | None = None
 
     def __post_init__(self) -> None:
         # Defense 6 (§3.4.14): compose the system prompt with the platform-invariant
@@ -504,6 +509,7 @@ class Orchestrator:
             # not by the platform's product name (live-caught 2026-08-17: greeting
             # said "Aurora", the model then said "I'm Luciel").
             assistant_name=self.assistant_name,
+            operating_context=self.operating_context,
         )
 
     async def run_turn(
@@ -747,6 +753,7 @@ class Orchestrator:
                 self.personality,
                 assistant_name=self.assistant_name,
                 tool_catalog=tool_defs,
+                operating_context=self.operating_context,
             )
             if tool_defs
             else self.system_prompt

@@ -44,6 +44,7 @@ from app.channels.voice_adapter import (
     opening_twiml,
     reply_twiml,
 )
+from app.employee.context import build_operating_context
 from app.models.audit import ActorType
 from app.models.instance import Instance, is_paused
 from app.models.voice import VoiceCallRecord
@@ -292,6 +293,8 @@ async def handle_turn(
         has_payment_method=has_payment_method,
         snapshot_tool_ids=effective.snapshot_tool_ids,
         tool_resolver=make_tool_resolver(),
+        # The employee's operating context (round 6 WP-F).
+        operating_context=await build_operating_context(session, instance, admin_id=admin_id),
     )
     result = await orch.run_turn(
         session_id=sess.id,

@@ -26,6 +26,7 @@ import enum
 import re
 from dataclasses import dataclass
 
+from app.employee.context import CHANNEL_PHRASES, OperatingContext
 from app.runtime.personality import compose_personality_stanza
 
 UNTRUSTED_OPEN = "<<<UNTRUSTED_DATA_BEGIN>>>"
@@ -216,6 +217,45 @@ _TOOL_USE_STANZA_HEADER = (
 )
 
 
+def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
+    """The employee's operating context (round 6 WP-F) — platform-RESOLVED facts.
+
+    Composed under the invariants and above personality: the business's short name,
+    that Luciel is available around the clock (it has no hours and must never say it
+    is closed), the channels a customer can reach the business on right now, how the
+    team is notified on a hand-off (so the model never promises a real-time human),
+    whether a PERSON is reachable now (WP-E, wording only), and that an unlisted
+    capability does not exist. None keeps the prompt byte-identical."""
+    if ctx is None:
+        return ""
+    business = ctx.business_short_name or "this business"
+    channels = ", ".join(CHANNEL_PHRASES.get(c, c) for c in ctx.live_channels) or "the website chat"
+    notify = "text message" if ctx.escalation_channel == "sms" else "email"
+    if not ctx.escalation_configured:
+        notify = "email to the account owner (no dedicated contact is set)"
+    lines = [
+        "\n--- Operating context (platform-resolved facts about this deployment) ---\n",
+        f"- You work for {business}. You are available to customers around the clock — you "
+        "have no working hours and never say you are closed, offline, or unavailable.\n",
+        f"- Customers can reach the business right now on: {channels}.\n",
+        f"- When you pass something to the team they are notified by {notify}. A person "
+        "replies when they see it — never promise an immediate or real-time human reply.\n",
+    ]
+    if ctx.team_reachable_now is True:
+        lines.append("- Someone on the team is reachable right now.\n")
+    elif ctx.team_reachable_now is False:
+        when = ctx.next_reachable_phrase or "when they're next available"
+        lines.append(
+            f"- Nobody on the team is reachable right now; a person is next expected {when}. "
+            "Say so honestly when a customer asks about a human follow-up.\n"
+        )
+    lines.append(
+        "- If a capability is not among your tools, you cannot do it: say so plainly rather "
+        "than implying it was done.\n"
+    )
+    return "".join(lines)
+
+
 def compose_tool_use_stanza(tool_catalog: list[dict[str, object]] | None) -> str:
     """The tool-use stanza for ``build_system_prompt`` — empty when no tools are wired.
 
@@ -288,6 +328,7 @@ def build_system_prompt(
     personality: dict[str, object] | None = None,
     assistant_name: str = "Luciel",
     tool_catalog: list[dict[str, object]] | None = None,
+    operating_context: OperatingContext | None = None,
 ) -> str:
     """Compose the system prompt with platform invariants at higher precedence than
     the admin's business-context field (Defense 6, §3.4.14).
@@ -329,6 +370,8 @@ def build_system_prompt(
     # personality/style, and far above the untrusted admin field. Empty when the
     # caller wired no tools, keeping the no-tool prompt byte-identical.
     prompt = prompt + compose_tool_use_stanza(tool_catalog)
+    # The employee's operating context (WP-F): platform-resolved, above personality.
+    prompt = prompt + compose_operating_context_stanza(operating_context)
     prompt = prompt + compose_personality_stanza(personality)
     # After personality, so the concrete formatting rules are the last word on FORM, and
     # still above the untrusted admin field, which cannot relax them (Decision #1).

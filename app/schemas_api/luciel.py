@@ -239,6 +239,9 @@ class LucielOut(WireModel):
     # (round 6 WP-E). Both null until the owner sets them.
     timezone: str | None = None
     team_availability: TeamAvailabilityWire | None = None
+    # What Luciel calls the business in greetings, and the morning-brief opt-out (WP-F).
+    business_short_name: str | None = None
+    daily_brief_enabled: bool = True
     grace_window_started_at: datetime | None = None
 
 
@@ -513,6 +516,27 @@ class UpdateTeamAvailabilityRequest(StrictWireModel):
         if self.enabled and not self.timezone:
             raise ValueError("Choose your timezone before turning this on.")
         return self
+
+
+class UpdateDailyBriefRequest(StrictWireModel):
+    """PUT /admin/luciel/daily-brief — the morning brief opt-out (round 6 WP-F)."""
+
+    enabled: bool
+
+
+class UpdateBusinessNameRequest(StrictWireModel):
+    """PUT /admin/luciel/business-name — what Luciel calls the business (WP-F).
+
+    A SHORT name for greetings and the AI-identity disclosure ("an AI assistant for
+    Acme"), never the Luciel's own name. Empty clears it back to "this business"."""
+
+    business_short_name: str | None = Field(default=None, max_length=80)
+
+    @field_validator("business_short_name")
+    @classmethod
+    def _trimmed(cls, value: str | None) -> str | None:
+        cleaned = (value or "").strip()
+        return cleaned or None
 
 
 class UpdateLeadRetentionRequest(StrictWireModel):

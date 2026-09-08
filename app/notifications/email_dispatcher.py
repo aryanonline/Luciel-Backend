@@ -547,3 +547,29 @@ async def send_payment_failed(
         extra_payload={"dunning_state": dunning_state, "attempt_number": attempt_number},
         sender=sender,
     )
+
+
+async def send_daily_brief(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    subject: str,
+    body: str,
+    notice_id: str,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """The owner's morning brief (round 6 WP-F) — rendered by app.employee.brief from
+    rows that already exist; sent once per local day (the sweep keys it
+    ``brief:<date>`` in the notice ledger)."""
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="daily_brief",
+        audit_event="daily_brief_sent",
+        extra_payload={"notice_id": notice_id, "kind": "daily_brief"},
+        sender=sender,
+    )

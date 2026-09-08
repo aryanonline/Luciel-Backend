@@ -44,6 +44,7 @@ Never put credentials, customer data, or live operational secrets in this repo.
 | `app/channels/` | Widget/email/SMS/voice/Meta ingress and honest outbound delivery. |
 | `app/connections/` | BYO provider lifecycle, OAuth, health, registry, and tenant secrets. |
 | `app/db/` | SQLAlchemy engine/session setup and tenant RLS context. |
+| `app/employee/` | The employee layer (round 6 WP-F): status (can/needs/did), operating-context prompt stanza, morning brief. |
 | `app/jobs/` | Scheduled lifecycle, retention, reconciliation, and deferred-health sweeps. |
 | `app/knowledge/` | File ingestion, sync, scope, chunks, embeddings, graph, and retrieval inputs. |
 | `app/lifecycle/` | Delete/restore/close, exports, grace expiry, retention, and cascades. |

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
@@ -24,10 +25,12 @@ from app.api.v1.admin.luciel_invariants import (
 from app.audit import log as audit
 from app.connections import gate
 from app.db.session import tenant_session
+from app.employee.status import build_employee_status
 from app.lifecycle import state_machine
 from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
+from app.schemas_api.employee import EmployeeStatusOut
 from app.schemas_api.luciel import (
     CapabilityGroupOut,
     ChannelConfigIn,
@@ -37,7 +40,9 @@ from app.schemas_api.luciel import (
     TestSmsRequest,
     TestSmsResult,
     UpdateAllowedOriginsRequest,
+    UpdateBusinessNameRequest,
     UpdateChannelsRequest,
+    UpdateDailyBriefRequest,
     UpdateEscalationRequest,
     UpdateLeadRetentionRequest,
     UpdatePersonalityRequest,
@@ -184,6 +189,8 @@ def _to_out(
             "allowedOrigins": list(inst.allowed_origins) if inst.allowed_origins else None,
             "timezone": inst.timezone,
             "teamAvailability": inst.team_availability or None,
+            "businessShortName": inst.business_short_name,
+            "dailyBriefEnabled": bool(inst.daily_brief_enabled),
             "graceWindowStartedAt": (
                 inst.grace_window_started_at.isoformat() if inst.grace_window_started_at else None
             ),
@@ -667,6 +674,49 @@ async def update_team_availability(
         return blob
 
     return await _update_config(subject.admin_id, subject.user_id, "team_availability", _build)
+
+
+@router.get("/status")
+async def employee_status(subject: Subject = Depends(current_admin)) -> EmployeeStatusOut | None:
+    """What Luciel can do right now, needs from the owner, and did (round 6 WP-F).
+
+    Derived from rows that already exist — never narrated. ``onDuty`` is a constant:
+    Luciel has no hours. JSON null when the account has no Luciel (same as GET)."""
+    inst = await _load(subject.admin_id)
+    if inst is None:
+        return None
+    async with tenant_session(subject.admin_id) as s:
+        status = await build_employee_status(s, admin_id=subject.admin_id, instance_id=inst.id)
+    if status is None:
+        return None
+    return EmployeeStatusOut.model_validate(asdict(status))
+
+
+@router.put("/daily-brief", response_model=LucielOut)
+async def update_daily_brief(
+    req: UpdateDailyBriefRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """Turn the morning brief on or off (round 6 WP-F). On by default; sent once per
+    local day at 07:00 in the owner's timezone (UTC until one is set)."""
+
+    def _build(_: Instance) -> object:
+        return bool(req.enabled)
+
+    return await _update_config(subject.admin_id, subject.user_id, "daily_brief_enabled", _build)
+
+
+@router.put("/business-name", response_model=LucielOut)
+async def update_business_name(
+    req: UpdateBusinessNameRequest, subject: Subject = Depends(current_admin)
+) -> LucielOut:
+    """The short name Luciel calls the business (round 6 WP-F) — greetings and the
+    AI-identity disclosure say "an AI assistant for Acme" instead of "this business".
+    Never the Luciel's own name. Empty clears it."""
+
+    def _build(_: Instance) -> object:
+        return req.business_short_name
+
+    return await _update_config(subject.admin_id, subject.user_id, "business_short_name", _build)
 
 
 @router.put("/personality", response_model=LucielOut)
