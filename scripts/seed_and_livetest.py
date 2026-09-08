@@ -718,6 +718,7 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
         return [KNOWN_FACT]
 
     replies: dict[str, str] = {}
+    why: dict[str, object] = {}
     for channel in ("widget", "email"):
         res = asyncio.run(
             _run_inprocess_turn(
@@ -730,6 +731,19 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
             )
         )
         replies[channel] = res.reply_text
+        # Why a turn handed off instead of answering (round 6 WP-G reasons): a 60-char
+        # reply prefix is the disclosure line on every first turn and explains nothing.
+        esc = res.escalation
+        why[channel] = (
+            {
+                "signal": getattr(esc.signal, "value", esc.signal),
+                "score": esc.score_or_confidence,
+                "reasons": list(esc.reasons),
+                "grounding": res.grounding_score,
+            }
+            if esc is not None and esc.fired
+            else {"grounding": res.grounding_score}
+        )
 
     parity_ok = all(GROUNDED_TOKEN in v and not v.startswith("Echo:") for v in replies.values())
     ok = disclosure_ok and parity_ok
@@ -737,7 +751,8 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
         "T6 row11-channel-parity-and-disclosure",
         ok,
         f"disclosure={disclosure_ok} parity={parity_ok} "
-        f"widget={replies.get('widget', '')[:60]!r} email={replies.get('email', '')[:60]!r}",
+        f"widget={replies.get('widget', '')[-220:]!r} email={replies.get('email', '')[-220:]!r} "
+        f"why={why}",
     )
 
 

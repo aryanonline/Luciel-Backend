@@ -148,3 +148,25 @@ def test_intake_reasons_name_the_words():
     assert d.reasons == ("upset in 2 of the last 3 messages", "words: scam, useless")
     h = evaluate_intake(["let me talk to a real person"])
     assert h.reasons == ("asked for a person",)
+
+
+# --- F060 follow-up: the delivery line (2026-09-08 dev walk) -------------------------- #
+def test_the_prompt_tells_the_model_the_platform_delivers_copies_only_when_a_channel_is_live():
+    from app.employee.context import OperatingContext
+    from app.runtime.input_safety import compose_operating_context_stanza
+
+    def ctx(*live: str) -> OperatingContext:
+        return OperatingContext(
+            business_short_name="Maple & Main",
+            live_channels=tuple(live),
+            escalation_channel="email",
+            escalation_configured=True,
+            team_reachable_now=None,
+            next_reachable_phrase=None,
+        )
+
+    line = "do not say you cannot email or text"
+    assert line in compose_operating_context_stanza(ctx("widget", "email"))
+    assert line in compose_operating_context_stanza(ctx("sms"))
+    assert line not in compose_operating_context_stanza(ctx("widget"))
+    assert compose_operating_context_stanza(None) == ""

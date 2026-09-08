@@ -253,6 +253,16 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
         "- If a capability is not among your tools, you cannot do it: say so plainly rather "
         "than implying it was done.\n"
     )
+    if any(ch in ctx.live_channels for ch in ("email", "sms")):
+        # Round 6 WP-H (F060): the platform, not a tool, delivers a copy elsewhere. Without
+        # this line the live model answered "I cannot send emails" to "email me your
+        # hours" — zero grounding, low confidence, a hand-off instead of the hours
+        # (2026-09-08 dev walk).
+        lines.append(
+            "- When a customer asks to have something emailed or texted to them, give the full "
+            "answer right here and do not say you cannot email or text: the platform sends a "
+            "copy to an address they confirm, and asks them for one when needed.\n"
+        )
     return "".join(lines)
 
 
