@@ -68,7 +68,7 @@ from app.notifications.escalation_dispatch import (
     notify_escalation_safely,
 )
 from app.observability.metrics import emit_metric
-from app.runtime import budget, handoff, memory
+from app.runtime import budget, channel_switch, handoff, memory
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import (
     EscalationDecision,
@@ -660,6 +660,21 @@ class Orchestrator:
                 escalation=EscalationDecision(True, Signal.budget_exhausted),
             )
 
+        # --- CHANNEL-SWITCH CONFIRMATION (round 6 WP-H, audit F060) ------------ #
+        # The customer asked for the last answer on another channel and was asked
+        # where to send it; this turn is their answer. Deterministic — no model call —
+        # and nothing goes to an address they did not confirm.
+        if sess_obj is not None and sess_obj.pending_outbound:
+            settled = await self._settle_pending_outbound(
+                sess_obj,
+                session_id=session_id,
+                channel=channel,
+                inbound_text=inbound_text,
+                resolved_lead_id=resolved_lead_id,
+            )
+            if settled is not None:
+                return settled
+
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
         mod = moderate(inbound_text)
         if mod.should_escalate:
@@ -821,23 +836,7 @@ class Orchestrator:
             )
 
         # First model call succeeded → fire-once budget counter (§3.4.1b).
-        counted = await budget.count_session_once(
-            self.session, admin_id=admin_id, instance_id=instance_id, session_id=session_id
-        )
-        if counted:
-            # PAYG usage is billed in arrears from this counter (Vision §7): report the
-            # new block to Stripe as it opens, so overage past the free 50 is actually
-            # billed rather than only computed.
-            from app.billing import metering, notice_delivery  # noqa: PLC0415 — import cycle
-
-            await metering.report_usage_after_count(
-                self.session, admin_id=admin_id, instance_id=instance_id
-            )
-            # The block-start / 80% notices are evaluated the moment the count moves
-            # (audit F011), not only by the daily sweep. Never raises.
-            await notice_delivery.send_usage_notices_after_count(
-                self.session, admin_id=admin_id, now=datetime.now(UTC)
-            )
+        counted = await self._count_served_turn(session_id)
 
         # --- §3.3.7 ASK-ATTEMPT BOUND (C4) ----------------------------------- #
         # A turn that ended with the broker rejecting the model's tool intent as
@@ -1019,17 +1018,34 @@ class Orchestrator:
                 business_name=self.business_name,
                 assistant_name=self.assistant_name,
             )
+        requested_channel = channel_switch.detect_requested_channel(inbound_text)
         outbound = choose_outbound_channel(
             inbound_channel=channel,
             enabled_channels=self.enabled_channels or {channel},
             response_length=len(reply_text),
+            customer_requested_channel=requested_channel,
             is_urgent_escalation=outcome.fired,
         )
-        if outbound != channel and escalation is None and outbound in _CHANNEL_OFFER:
-            # The arbiter would rather answer elsewhere (a long answer on SMS, §3.4.2).
-            # Nothing is sent on that channel uninvited (F060): the reply stays on the
-            # channel the lead wrote on and OFFERS the switch.
-            reply_text = reply_text.rstrip() + _CHANNEL_OFFER[outbound]
+        if (
+            outbound != channel
+            and escalation is None
+            and outbound in channel_switch.KIND_FOR_CHANNEL
+        ):
+            if requested_channel == outbound and sess_obj is not None:
+                # The customer ASKED for it there (round 6 WP-H, F060): a confirmed
+                # address gets it now; otherwise ask where and park the answer.
+                reply_text = await self._switch_or_ask(
+                    sess_obj,
+                    outbound=outbound,
+                    reply_text=reply_text,
+                    inbound_text=inbound_text,
+                    resolved_lead_id=resolved_lead_id,
+                )
+            elif outbound in _CHANNEL_OFFER:
+                # The arbiter would rather answer elsewhere (a long answer on SMS,
+                # §3.4.2). Nothing is sent uninvited: the reply stays on the channel
+                # the lead wrote on and OFFERS the switch.
+                reply_text = reply_text.rstrip() + _CHANNEL_OFFER[outbound]
         reply_row = await persist_turn(
             self.session,
             admin_id=admin_id,
@@ -1445,6 +1461,178 @@ class Orchestrator:
             counted=True,
             handed_off=True,
             escalation=EscalationDecision(True, signal, None, score),
+        )
+
+    async def _count_served_turn(self, session_id: uuid.UUID) -> bool:
+        """The fire-once budget counter for a SERVED turn (§3.4.1b), with the arrears
+        usage report and the block notices that ride on the count moving."""
+        counted = await budget.count_session_once(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+        )
+        if counted:
+            # PAYG usage is billed in arrears from this counter (Vision §7): report the
+            # new block to Stripe as it opens, so overage past the free 50 is actually
+            # billed rather than only computed.
+            from app.billing import metering, notice_delivery  # noqa: PLC0415 — import cycle
+
+            await metering.report_usage_after_count(
+                self.session, admin_id=self.admin_id, instance_id=self.instance_id
+            )
+            # The block-start / 80% notices are evaluated the moment the count moves
+            # (audit F011), not only by the daily sweep. Never raises.
+            await notice_delivery.send_usage_notices_after_count(
+                self.session, admin_id=self.admin_id, now=datetime.now(UTC)
+            )
+        return counted
+
+    # --- channel switching with contact confirmation (round 6 WP-H, F060) --------- #
+
+    async def _deliver_elsewhere(self, outbound: str, to: str, body: str) -> bool:
+        """Send ``body`` to a CONFIRMED address on ``outbound`` as the tenant; audited
+        either way; never raises for a delivery problem."""
+        from app.channels.outbound import send_outbound_reply  # noqa: PLC0415
+
+        result = await send_outbound_reply(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            channel=outbound,
+            to=to,
+            body=body,
+            subject="A message from your assistant" if outbound == "email" else None,
+        )
+        await audit.emit(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            actor_type=ActorType.platform,
+            event_type="channel_switch_delivery",
+            payload={"channel": outbound, "delivered": result.delivered, "detail": result.detail},
+        )
+        return result.delivered
+
+    async def _unconfirmed_candidate(self, lead_id: uuid.UUID | None, kind: str) -> str | None:
+        """An address on the lead's own record that was never confirmed — offered back
+        as a question, never used on its own."""
+        if lead_id is None:
+            return None
+        from app.models.lead import Lead  # noqa: PLC0415
+        from app.runtime.lead_capture import identifier_kind  # noqa: PLC0415
+
+        lead = (
+            await self.session.execute(
+                select(Lead).where(Lead.admin_id == self.admin_id, Lead.id == lead_id)
+            )
+        ).scalar_one_or_none()
+        if lead is None:
+            return None
+        for value in (lead.email if kind == "email" else lead.phone, lead.contact_identifier):
+            if value and identifier_kind(value) == kind:
+                return str(value)
+        return None
+
+    async def _switch_or_ask(
+        self,
+        sess_obj: Session,
+        *,
+        outbound: str,
+        reply_text: str,
+        inbound_text: str,
+        resolved_lead_id: uuid.UUID | None,
+    ) -> str:
+        """The customer asked for this answer on ``outbound``. A confirmed address gets
+        it now (with a same-channel note); otherwise ask where, and park the answer."""
+        kind = channel_switch.KIND_FOR_CHANNEL[outbound]
+        typed = channel_switch.identifier_for(kind, inbound_text)
+        to = typed or await channel_switch.confirmed_identifier(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            lead_id=resolved_lead_id,
+            kind=kind,
+        )
+        if to is not None:
+            if typed and resolved_lead_id is not None:
+                await channel_switch.confirm_identifier(
+                    self.session,
+                    admin_id=self.admin_id,
+                    instance_id=self.instance_id,
+                    lead_id=resolved_lead_id,
+                    kind=kind,
+                    value=typed,
+                    source="volunteered",
+                )
+            delivered = await self._deliver_elsewhere(outbound, to, reply_text)
+            note = (
+                channel_switch.also_sent_line(outbound, to)
+                if delivered
+                else channel_switch.failed_line(outbound)
+            )
+            return f"{reply_text.rstrip()}\n\n{note}"
+        candidate = await self._unconfirmed_candidate(resolved_lead_id, kind)
+        sess_obj.pending_outbound = channel_switch.new_pending(
+            outbound, reply_text, candidate
+        ).as_json()
+        await self.session.flush()
+        return f"{reply_text.rstrip()}\n\n{channel_switch.ask_line(outbound, candidate)}"
+
+    async def _settle_pending_outbound(
+        self,
+        sess_obj: Session,
+        *,
+        session_id: uuid.UUID,
+        channel: str,
+        inbound_text: str,
+        resolved_lead_id: uuid.UUID | None,
+    ) -> LoopResult | None:
+        """This turn answers "where should I send it?". A typed address or a yes to the
+        offered one sends the parked answer; a no drops it; anything else means the
+        customer moved on — the parked answer is dropped and the loop runs normally."""
+        pending = channel_switch.PendingOutbound.from_json(sess_obj.pending_outbound)
+        sess_obj.pending_outbound = None
+        await self.session.flush()
+        if pending is None:
+            return None
+        kind = channel_switch.KIND_FOR_CHANNEL[pending.channel]
+        typed = channel_switch.identifier_for(kind, inbound_text)
+        to = typed or (pending.candidate if channel_switch.is_confirmation(inbound_text) else None)
+        if to is None and not channel_switch.is_decline(inbound_text):
+            return None
+        if to is None:
+            reply = channel_switch.DECLINED_LINE
+        else:
+            if resolved_lead_id is not None:
+                await channel_switch.confirm_identifier(
+                    self.session,
+                    admin_id=self.admin_id,
+                    instance_id=self.instance_id,
+                    lead_id=resolved_lead_id,
+                    kind=kind,
+                    value=to,
+                    source="volunteered",
+                )
+            delivered = await self._deliver_elsewhere(pending.channel, to, pending.body)
+            reply = (
+                channel_switch.sent_line(pending.channel, to)
+                if delivered
+                else f"{channel_switch.failed_line(pending.channel)}\n\n{pending.body}"
+            )
+        row = await persist_turn(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+            role="luciel",
+            text=reply,
+            at=datetime.now(UTC),
+            deterministic=True,
+        )
+        counted = await self._count_served_turn(session_id)
+        return LoopResult(
+            reply_message_id=row.id, reply_text=reply, outbound_channel=channel, counted=counted
         )
 
     async def _emit_budget_exhausted(

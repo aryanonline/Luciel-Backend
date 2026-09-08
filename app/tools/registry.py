@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.channels.twilio_sender import build_sms_sender
 from app.connections import sandbox
@@ -51,6 +51,9 @@ from app.runtime.integration_status import null_in_live
 from app.tools import calendar_backend, catalog
 from app.tools import contract as c
 from app.tools.contract import Tool, ToolContext, ToolResult
+
+if TYPE_CHECKING:
+    from app.tools.calendly_backend import CalendlyBackend
 
 # Tools whose real effect is reachable today with no external OAuth backend.
 FUNCTIONAL_TOOL_IDS = frozenset({"schedule_callback", "send_email", "send_sms"})
@@ -129,15 +132,25 @@ class _TenantCalendarBackend:
     def __init__(self) -> None:
         self._unavailable = _UnavailableExternalBackend()
         self._google: calendar_backend.GoogleCalendarBackend | None = None
+        self._calendly: CalendlyBackend | None = None
 
     async def _for(
         self, ctx: ToolContext
-    ) -> _UnavailableExternalBackend | calendar_backend.GoogleCalendarBackend:
-        if await self._calendar_provider(ctx) != "google_calendar":
-            return self._unavailable
-        if self._google is None:
-            self._google = calendar_backend.GoogleCalendarBackend()
-        return self._google
+    ) -> _UnavailableExternalBackend | calendar_backend.GoogleCalendarBackend | CalendlyBackend:
+        provider = await self._calendar_provider(ctx)
+        if provider == "google_calendar":
+            if self._google is None:
+                self._google = calendar_backend.GoogleCalendarBackend()
+            return self._google
+        if provider == "calendly":
+            # Round 6 WP-H (F055): Calendly books through a scheduling link the customer
+            # completes; the backend says so in every payload rather than claiming a write.
+            if self._calendly is None:
+                from app.tools.calendly_backend import CalendlyBackend  # noqa: PLC0415
+
+                self._calendly = CalendlyBackend()
+            return self._calendly
+        return self._unavailable
 
     @staticmethod
     async def _calendar_provider(ctx: ToolContext) -> str | None:
@@ -220,6 +233,11 @@ class _TenantRecordBackend:
             from app.tools.record_backend import CsvRecordBackend  # noqa: PLC0415
 
             return await CsvRecordBackend().lookup(ctx, query)
+        if provider == "api":
+            # Round 6 WP-H (F062): the owner's own endpoint, through the SSRF seam.
+            from app.tools.record_backend import LiveRecordBackend  # noqa: PLC0415
+
+            return await LiveRecordBackend().lookup(ctx, query)
         return await self._unavailable.lookup(ctx, query)
 
 
@@ -253,6 +271,25 @@ class _EmailMessengerBackend:
     SUBJECT = "A message from your assistant"
 
     async def send(self, ctx: ToolContext, to: str, body: str) -> str | None:
+        # Round 6 WP-H (F141): with a session, the email goes out the same way a reply
+        # does — through the tenant's OWN mailbox (Outlook) or their legacy provisioned
+        # address, with the AI-identity footer, never from a platform address behind the
+        # owner's back. No mailbox connected → provider_rejected, honestly.
+        if ctx.session is not None:
+            from app.channels.outbound import send_outbound_email  # noqa: PLC0415
+
+            receipt = await send_outbound_email(
+                ctx.session,
+                ctx.admin_id,
+                ctx.instance_id,
+                to=to,
+                body=body,
+                subject=self.SUBJECT,
+            )
+            if not receipt.accepted:
+                return None
+            # Graph's 202 carries no id; an accepted send still needs a truthful marker.
+            return receipt.provider_message_id or "mailbox:accepted"
         sender = build_email_sender()
         # A Null sender in live mode cannot put anything on the wire. Returning an id
         # would make the tool answer ok/accepted_for_delivery and Luciel would tell the

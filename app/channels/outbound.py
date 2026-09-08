@@ -224,6 +224,23 @@ async def _send_email(
     )
 
 
+async def send_outbound_email(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    *,
+    to: str,
+    body: str,
+    subject: str | None = None,
+) -> DeliveryReceipt:
+    """Send one email AS the tenant (round 6 WP-H, F141): the BYO mailbox when one is
+    connected, else the legacy provisioned address; no silent SES fallback and the
+    footer every reply carries. The ``send_email`` tool and the channel-switch path
+    use this so an email Luciel starts is indistinguishable, to the customer, from
+    one it replies with."""
+    return await _send_email(session, admin_id, instance_id, to=to, body=body, subject=subject)
+
+
 async def _email_sender_row(
     session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
 ) -> Any:  # InstanceConnection | None (lazy import keeps module import light)

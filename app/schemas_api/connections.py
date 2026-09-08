@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from app.schemas_api.common import WireModel
 
@@ -45,6 +45,33 @@ class TenantNumbersOut(WireModel):
     the UI falls back to manual E.164 entry rather than blocking the designate."""
 
     numbers: list[TenantNumberOut] | None
+
+
+class CalendlyEventTypeOut(WireModel):
+    """One of the owner's active Calendly event types (round 6 WP-H)."""
+
+    uri: str
+    name: str
+    active: bool
+    duration_minutes: int
+    scheduling_url: str
+
+
+class CalendlyEventTypesOut(WireModel):
+    """``eventTypes`` is None when the account could not be read (token unusable)."""
+
+    event_types: list[CalendlyEventTypeOut] | None
+    chosen_uri: str | None = None
+
+
+class UpdateConnectionSettingsRequest(WireModel):
+    """PUT /connections/{id}/settings — provider settings that are not credentials.
+    Today: the Calendly event type customers book (round 6 WP-H)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type_uri: str | None = None
+    event_type_name: str | None = None
 
 
 class ConnectionOut(WireModel):

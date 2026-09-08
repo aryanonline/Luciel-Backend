@@ -82,6 +82,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "sms_compliance_ack_withdrawn",
         "carrier_registration_attestation_withdrawn",
         "record_source_cleared",
+        # Provider settings that are not credentials (WP-H: the Calendly event type).
+        "connection_settings_updated",
+        # An answer sent on the channel the customer asked for (WP-H, F060).
+        "channel_switch_delivery",
         "channel_abuse_blocked",
         "prompt_injection_detected",
         "content_moderation_event",

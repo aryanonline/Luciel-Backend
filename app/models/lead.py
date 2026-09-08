@@ -95,3 +95,8 @@ class LeadIdentifier(Base, TenantMixin, TimestampMixin):
     lead_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     value: Mapped[str] = mapped_column(String(320), nullable=False)
+    # Round 6 WP-H (F060, migration 0063): when the CUSTOMER confirmed this identifier
+    # is theirs — it arrived with the channel (``transport``) or they said so in
+    # conversation (``volunteered``). Nothing is sent to an unconfirmed one.
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)

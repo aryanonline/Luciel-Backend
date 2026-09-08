@@ -521,7 +521,7 @@ async def submit_credentials(
     # resolve to public addresses (the sandbox re-checks per call; this makes a
     # bad endpoint an honest 422 at setup instead of a dead tool later).
     raw_url = non_secret.get("url")
-    if raw_url and connection.connection_type in ("outbound_webhook", "crm"):
+    if raw_url and connection.connection_type in ("outbound_webhook", "crm", "record_source"):
         from urllib.parse import urlparse
 
         parsed = urlparse(str(raw_url))
@@ -539,6 +539,29 @@ async def submit_credentials(
                 )
         non_secret["egressAllowlist"] = [parsed.hostname]
 
+    if connection.connection_type == "record_source" and spec.provider == "api" and raw_url:
+        # Round 6 WP-H (F062): prove the endpoint answers a test query BEFORE the row
+        # claims to be connected — a URL that 404s or returns HTML would otherwise
+        # produce a healthy-looking row and a tool that fails on every lookup.
+        from app.tools.record_backend import (  # noqa: PLC0415
+            RecordSourceUnavailable,
+            build_record_transport,
+            query_live_records,
+        )
+
+        try:
+            await query_live_records(
+                url=str(raw_url),
+                query="ping",
+                api_key=str(material.get("api_key") or "") or None,
+                allowlist=frozenset(),
+                transport=build_record_transport(),
+            )
+        except RecordSourceUnavailable as exc:
+            raise CredentialRejected(
+                "Your record lookup URL did not answer a test query with a JSON array "
+                f"of records ({exc}). Check the address and the API key."
+            ) from exc
     if not connection.secret_ref:
         connection.secret_ref = secret_ref_for(
             admin_id, connection.instance_id, connection.connection_type

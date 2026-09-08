@@ -194,15 +194,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
         client_id_setting="calendly_client_id",
         client_secret_setting="calendly_client_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="calendly_redirect_uri",
-        help_text="Offer and book times from your Calendly availability — not available yet.",
-        # No Calendly effect layer exists (tools/registry falls to the honest
-        # unavailable backend), and Calendly's API books via a scheduling link
-        # the LEAD completes — a different conversational contract than
-        # book_appointment, deferred to its own round (audit round 3, Phase 4;
-        # owner decision 2026-08-23). Without this guard, provisioning
-        # CALENDLY_* creds would light a working consent screen with a dead
-        # tool behind it.
-        unavailable_for=frozenset({"calendar"}),
+        help_text=(
+            "Offer times from your Calendly availability; customers book through a "
+            "Calendly link for the exact slot (round 6 WP-H)."
+        ),
     ),
     # --- CRM (Decision #6: hubspot | salesforce | custom_webhook) -----------------
     "hubspot": ProviderSpec(
@@ -273,11 +268,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
             CredentialField("api_key", "API key", secret=True, required=False),
         ),
         auth_class="long_lived_token",
-        help_text="Look records up live from your system of record — not available yet.",
-        # No live-connector effect layer exists (tools/registry falls to the honest
-        # unavailable backend), so offering the form would take credentials for a
-        # tool that then answers `failed` on every lookup (audit round 3, Phase 4).
-        unavailable_for=frozenset({"record_source"}),
+        help_text=(
+            "Look records up live from your own system: an https endpoint that answers "
+            "GET ?q=<query> with a JSON array of records (round 6 WP-H)."
+        ),
     ),
     "csv": ProviderSpec(
         provider="csv",

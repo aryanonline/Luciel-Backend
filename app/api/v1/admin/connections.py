@@ -53,6 +53,7 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, Instance
 from app.schemas_api.connections import (
     BindDestinationRequest,
+    CalendlyEventTypesOut,
     ConnectionOut,
     ConnectionProvidersOut,
     DisconnectResult,
@@ -67,6 +68,7 @@ from app.schemas_api.connections import (
     SwitchConnectionRequest,
     TenantNumberOut,
     TenantNumbersOut,
+    UpdateConnectionSettingsRequest,
 )
 from app.schemas_api.knowledge import OAuthCallbackRequest
 
@@ -561,6 +563,132 @@ async def rotate_sms_capability(subject: Subject = Depends(current_admin)) -> Co
                 conn=row,
                 e164_number=destination,
             )
+        return _connection_out(row)
+
+
+@router.get("/{connection_id}/calendly/event-types", response_model=CalendlyEventTypesOut)
+async def list_calendly_event_types(
+    connection_id: uuid.UUID, subject: Subject = Depends(current_admin)
+) -> CalendlyEventTypesOut:
+    """The owner's active Calendly event types, for choosing which one customers book
+    (round 6 WP-H). ``eventTypes: null`` when the account could not be read."""
+    from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+    from app.tools.calendly_backend import (  # noqa: PLC0415
+        CalendlyCredentials,
+        CalendlyUnavailable,
+        build_calendly_api,
+    )
+
+    async with tenant_session(subject.admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                    InstanceConnection.connection_type == "calendar",
+                    InstanceConnection.provider == "calendly",
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise not_found("Connection not found.")
+        cfg = dict(row.non_secret_config or {})
+        user_uri = str(cfg.get("userUri") or "")
+        chosen = str(cfg.get("eventTypeUri") or "") or None
+        token = await ensure_fresh_access_token(
+            s, subject.admin_id, row.instance_id, connection_type="calendar"
+        )
+        if not token or not user_uri:
+            return CalendlyEventTypesOut(event_types=None, chosen_uri=chosen)
+        try:
+            types = await build_calendly_api().event_types(
+                CalendlyCredentials(
+                    access_token=token, user_uri=user_uri, event_type_uri=chosen or ""
+                ),
+                user_uri,
+            )
+        except CalendlyUnavailable:
+            return CalendlyEventTypesOut(event_types=None, chosen_uri=chosen)
+        return CalendlyEventTypesOut(
+            event_types=[
+                {
+                    "uri": t.uri,
+                    "name": t.name,
+                    "active": t.active,
+                    "durationMinutes": t.duration_minutes,
+                    "schedulingUrl": t.scheduling_url,
+                }
+                for t in types
+            ],
+            chosen_uri=chosen,
+        )
+
+
+@router.put("/{connection_id}/settings", response_model=ConnectionOut)
+async def update_connection_settings(
+    connection_id: uuid.UUID,
+    req: UpdateConnectionSettingsRequest,
+    subject: Subject = Depends(current_admin),
+) -> ConnectionOut:
+    """Provider settings that are not credentials (round 6 WP-H): which Calendly event
+    type customers book. Audited; the URI must be one the account offers when it can
+    be read."""
+    from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+    from app.tools.calendly_backend import (  # noqa: PLC0415
+        CalendlyCredentials,
+        CalendlyUnavailable,
+        build_calendly_api,
+    )
+
+    async with tenant_session(subject.admin_id) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise not_found("Connection not found.")
+        if row.connection_type != "calendar" or row.provider != "calendly":
+            raise validation_error("This connection has no settings to change here.")
+        if not req.event_type_uri:
+            raise validation_error("Choose the event type customers should book.")
+        cfg = dict(row.non_secret_config or {})
+        name = (req.event_type_name or "").strip()
+        user_uri = str(cfg.get("userUri") or "")
+        token = await ensure_fresh_access_token(
+            s, subject.admin_id, row.instance_id, connection_type="calendar"
+        )
+        if token and user_uri:
+            try:
+                offered = await build_calendly_api().event_types(
+                    CalendlyCredentials(access_token=token, user_uri=user_uri, event_type_uri=""),
+                    user_uri,
+                )
+            except CalendlyUnavailable:
+                offered = []
+            if offered and req.event_type_uri not in {t.uri for t in offered}:
+                raise validation_error("That event type is not one your Calendly account offers.")
+            match = next((t for t in offered if t.uri == req.event_type_uri), None)
+            if match is not None and not name:
+                name = match.name
+        cfg["eventTypeUri"] = req.event_type_uri
+        cfg["eventTypeName"] = name
+        row.non_secret_config = cfg
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=row.instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="connection_settings_updated",
+            payload={"connection_id": str(row.connection_id), "eventTypeName": name},
+        )
         return _connection_out(row)
 
 

@@ -34,6 +34,8 @@ from sqlalchemy import select
 
 pytestmark = [pytest.mark.asyncio]
 
+LIVE_RECORD_URL = "https://records.acme.example/lookup"
+
 LEAD_KEY = "jordan@acme.test"
 
 
@@ -114,6 +116,12 @@ async def _seed(
                     auth_class="provisioned_resource",
                     provider=record_provider,
                     status="connected",
+                    # The live connector (WP-H) reads its endpoint from the row.
+                    non_secret_config=(
+                        {"url": LIVE_RECORD_URL, "egressAllowlist": ["records.acme.example"]}
+                        if record_provider == "api"
+                        else None
+                    ),
                 )
             )
     if crm_provider:
@@ -265,8 +273,21 @@ async def test_lookup_record_reads_the_uploaded_rows_live():
     assert len(ambiguous.payload["candidates"]) == 2
 
 
-async def test_lookup_record_on_a_live_api_connector_stays_unavailable():
+async def test_lookup_record_on_a_live_api_connector_reads_the_owners_endpoint():
+    """Round 6 WP-H (F062): the live connector is real — the owner's endpoint answers
+    the query through the egress seam, and the outcomes follow the same vocabulary."""
+    from app.tools.record_backend import MockRecordTransport
+
+    MockRecordTransport.reset()
     seeded = await _seed(crm_provider=None, record_provider="api", authorize=("lookup_record",))
-    res = await _lookup(seeded, "anything")
-    assert res.outcome is Outcome.failed
-    assert "record_source" in (res.reason or "")
+    MockRecordTransport.seed(LIVE_RECORD_URL, [{"order": "A-100", "status": "shipped"}])
+    res = await _lookup(seeded, "A-100")
+    assert res.outcome is Outcome.ok, res.reason
+    assert res.payload["record"]["status"] == "shipped"
+    MockRecordTransport.seed(LIVE_RECORD_URL, [])
+    assert (await _lookup(seeded, "nothing")).outcome is Outcome.empty
+    MockRecordTransport.seed(LIVE_RECORD_URL, 503)
+    failed = await _lookup(seeded, "anything")
+    assert failed.outcome is Outcome.failed
+    assert "record_source" in (failed.reason or "")
+    MockRecordTransport.reset()

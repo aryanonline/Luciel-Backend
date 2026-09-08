@@ -22,6 +22,18 @@ Controls external tool authorization, selection, execution, normalized outcomes,
 - Live tool delivery fails closed and must never fabricate a send ID or successful side effect.
 - Google Calendar or Calendly provides one scheduling capability; unsupported status must be truthful.
 
+## Round 6 WP-H (2026-09-08)
+- `calendly_backend.py`: Calendly never receives a write — `book_appointment` returns the
+  slot's scheduling link (`state: scheduling_link` + note), `reschedule` the invitee's
+  reschedule link, `cancel` a real cancellation. `_TenantCalendarBackend` dispatches by
+  provider; the event type comes from the connection row (`eventTypeUri`, chosen via
+  PUT /connections/{id}/settings).
+- `record_backend.LiveRecordBackend` (provider `api`): GET `<url>?q=` through the
+  sandbox pin + egress allowlist, bearer `api_key`, 10 s, ≤256 KB, JSON array; the
+  credential submit probes `?q=ping` first. Mock: `MockRecordTransport.seed(url, rows)`.
+- `_EmailMessengerBackend` sends through `channels.outbound.send_outbound_email` — the
+  tenant's mailbox, never a platform address; no mailbox → provider_rejected.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

@@ -40,6 +40,15 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
 - `disclosure_business_name` / `_disclosure_business_name` now serve `instances.
   business_short_name` (PUT /admin/luciel/business-name) and still never the Luciel name.
 
+## Channel switching (round 6 WP-H, F060, 2026-09-08)
+- `channel_switch.py` + `Orchestrator._switch_or_ask` / `_settle_pending_outbound`: an
+  "email me / text me" request sends the answer to a CONFIRMED identifier (transport-
+  carried, confirmed at capture; or typed in the same message) as the tenant, with a
+  same-channel note; otherwise it asks where and parks the answer on
+  `sessions.pending_outbound` for the next turn (yes/an address sends; no drops; anything
+  else drops and the loop runs). Never to an unconfirmed address; audited as
+  `channel_switch_delivery`. The arbiter's own long-SMS switch still only OFFERS.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

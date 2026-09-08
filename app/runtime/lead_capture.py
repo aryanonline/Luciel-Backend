@@ -232,7 +232,9 @@ def _lead_identifier_values(lead: Lead) -> set[str]:
     return {normalize_identifier(v) for v in (lead.contact_identifier, lead.email, lead.phone) if v}
 
 
-async def record_identifiers(session: AsyncSession, lead: Lead) -> None:
+async def record_identifiers(
+    session: AsyncSession, lead: Lead, *, confirmed_transport: str | None = None
+) -> None:
     """Make sure every identifier the row carries has its ``lead_identifiers`` row.
 
     Idempotent (unique on tenant+kind+value, conflicts ignored). A value already
@@ -251,6 +253,22 @@ async def record_identifiers(session: AsyncSession, lead: Lead) -> None:
                 value=value,
             )
             .on_conflict_do_nothing(constraint="uq_lead_identifier")
+        )
+    if confirmed_transport:
+        # Round 6 WP-H (F060): the channel itself named the person — that identifier
+        # is confirmed at capture, so a later "email me" on SMS can go to their
+        # number without asking, and never to an address they did not confirm.
+        from app.runtime.channel_switch import confirm_identifier  # noqa: PLC0415
+
+        key = normalize_identifier(confirmed_transport)
+        await confirm_identifier(
+            session,
+            admin_id=lead.admin_id,
+            instance_id=lead.instance_id,
+            lead_id=lead.id,
+            kind=identifier_kind(key),
+            value=key,
+            source="transport",
         )
 
 
@@ -345,6 +363,12 @@ async def capture_or_update_lead(
     signals = extract_lead_signals(inbound_text)
     score = high_value_lead_score(inbound_text)
     strength = IDENTITY_STRENGTH.get(channel, IdentityStrength.weak)
+    # An identifier the transport carried is the customer's own (F060).
+    transport_confirmed = (
+        transport_identifier
+        if strength in (IdentityStrength.strong, IdentityStrength.platform_scoped_strong)
+        else None
+    )
 
     # Determine the stable contact key for this lead.
     if strength in (IdentityStrength.strong, IdentityStrength.platform_scoped_strong):
@@ -393,7 +417,9 @@ async def capture_or_update_lead(
                         lead.last_activity_at = datetime.now(UTC)
                         await _reactivate_if_archived(session, lead)
                         await session.flush()
-                        await record_identifiers(session, lead)
+                        await record_identifiers(
+                            session, lead, confirmed_transport=transport_confirmed
+                        )
                         return CaptureResult(
                             lead_id=lead.id,
                             changed=changed,
@@ -408,7 +434,7 @@ async def capture_or_update_lead(
             lead.last_activity_at = datetime.now(UTC)
             await _reactivate_if_archived(session, lead)
             await session.flush()
-            await record_identifiers(session, lead)
+            await record_identifiers(session, lead, confirmed_transport=transport_confirmed)
             return CaptureResult(
                 lead_id=lead.id,
                 changed=changed,
@@ -503,7 +529,7 @@ async def capture_or_update_lead(
     await session.flush()
     captured_row = existing if existing is not None else lead
     if captured_row is not None:
-        await record_identifiers(session, captured_row)
+        await record_identifiers(session, captured_row, confirmed_transport=transport_confirmed)
     return CaptureResult(
         lead_id=lead_id,
         changed=changed,

@@ -57,6 +57,10 @@ class Session(Base, TenantMixin, TimestampMixin):
     # set the orchestrator reads from. Usability of each capability stays LIVE via the
     # broker's connection/health gates (safety half wins). NULL → fall back to live config.
     config_snapshot: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # Round 6 WP-H (F060, migration 0063): an answer the customer asked to receive on
+    # another channel, parked until they confirm or supply where it goes
+    # (app/runtime/channel_switch.PendingOutbound). NULL = nothing pending.
+    pending_outbound: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     # §3.3.7 ask-bound (audit round 3, migration 0046): consecutive turns in this
     # session that stalled on a broker missing_input/ambiguous rejection with nothing
     # resolving. Reset on any `ok` tool outcome; at ASK_ATTEMPT_BOUND the orchestrator
