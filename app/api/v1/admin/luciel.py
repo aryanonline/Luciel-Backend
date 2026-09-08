@@ -348,12 +348,78 @@ async def _update_config(
 async def update_channels(
     req: UpdateChannelsRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
+    prior_enabled: dict[str, bool] = {}
+
     def _build(inst: Instance) -> object:
         # Voice-enable requires prior consent-ack (Vision §3.1, Arch §3.1.2).
         validate_channels(req, inst)
+        prior_enabled.update(
+            {
+                str(c.get("id")): bool(c.get("enabled"))
+                for c in (inst.channels or [])
+                if isinstance(c, dict)
+            }
+        )
         return _stamp_voice_consent_ack(_stamp_sms_compliance_ack(req.channels, inst), inst)
 
-    return await _update_config(subject.admin_id, subject.user_id, "channels", _build)
+    async def _after(s: AsyncSession, inst: Instance) -> None:
+        # Round 6 WP-D (audit F163): the dependent send tool goes off WITH its channel,
+        # server-side and in the same transaction — the client used to issue a second
+        # PUT, which a closed tab or a failed request could skip, leaving Send SMS on
+        # over a channel that no longer exists.
+        turned_off = [
+            channel
+            for channel, was_on in prior_enabled.items()
+            if was_on
+            and not any(
+                isinstance(c, dict) and c.get("id") == channel and c.get("enabled")
+                for c in (inst.channels or [])
+            )
+        ]
+        await _cascade_channel_tools(s, subject.admin_id, inst, turned_off)
+
+    return await _update_config(subject.admin_id, subject.user_id, "channels", _build, after=_after)
+
+
+#: The send tool that cannot exist without its channel (Arch §3.3).
+CHANNEL_DEPENDENT_TOOL: dict[str, str] = {"email": "send_email", "sms": "send_sms"}
+
+
+async def _cascade_channel_tools(
+    s: AsyncSession, admin_id: uuid.UUID, inst: Instance, channels_off: list[str]
+) -> None:
+    """Disable the dependent tool of each channel in ``channels_off`` with the reason on
+    it, and keep the broker's authorization table in step (WP-D, F163)."""
+    targets = {
+        CHANNEL_DEPENDENT_TOOL[c]: f"{c}_channel_disabled"
+        for c in channels_off
+        if c in CHANNEL_DEPENDENT_TOOL
+    }
+    if not targets:
+        return
+    changed = False
+    tools: list[dict[str, object]] = []
+    for t in inst.tools or []:
+        if not isinstance(t, dict):
+            continue
+        tool_id = str(t.get("id"))
+        if tool_id in targets and t.get("enabled"):
+            tools.append({**t, "enabled": False, "disabledReason": targets[tool_id]})
+            changed = True
+        else:
+            tools.append(dict(t))
+    if not changed:
+        return
+    inst.tools = tools
+    await s.flush()
+    from app.schemas_api.luciel import AddonToolIn  # noqa: PLC0415
+
+    await sync_tool_authorizations(
+        s,
+        admin_id=admin_id,
+        instance_id=inst.id,
+        tools=[AddonToolIn.model_validate(t) for t in tools],
+    )
 
 
 SMS_ACK_FIELD = "smsComplianceAcknowledgedAt"
@@ -802,6 +868,85 @@ async def acknowledge_voice_consent(subject: Subject = Depends(current_admin)) -
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
         return _to_out(inst, live_channel_status=live_status)
+
+
+@router.delete("/voice-consent", response_model=LucielOut)
+async def withdraw_voice_consent(subject: Subject = Depends(current_admin)) -> LucielOut:
+    """Withdraw the one-time voice recording/AI-disclosure consent (round 6 WP-D).
+
+    Voice is switched off in the same write — it cannot run without the consent —
+    and turning it back on asks for the acknowledgement again. Audited."""
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        ensure_config_editable(inst)
+        channels = []
+        for ch in inst.channels or []:
+            if ch.get("id") == "voice":
+                cleared = {k: v for k, v in ch.items() if k != VOICE_ACK_FIELD}
+                cleared["enabled"] = False
+                channels.append(cleared)
+            else:
+                channels.append(dict(ch))
+        inst.channels = channels
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            actor_user_id=subject.user_id,
+            actor_type=ActorType.admin_user,
+            event_type="voice_consent_withdrawn",
+        )
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
+        return _to_out(inst, live_channel_status=live_status, tool_status=tool_status)
+
+
+@router.delete("/sms-compliance-ack", response_model=LucielOut)
+async def withdraw_sms_compliance_ack(subject: Subject = Depends(current_admin)) -> LucielOut:
+    """Withdraw the A2P 10DLC / sender-of-record / STOP-HELP acknowledgement (WP-D).
+
+    SMS is switched off in the same write and Send SMS goes with it (F163 cascade);
+    enabling SMS again re-asks for the acknowledgement. Audited."""
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        ensure_config_editable(inst)
+        channels = []
+        was_on = False
+        for ch in inst.channels or []:
+            if ch.get("id") == "sms":
+                was_on = bool(ch.get("enabled"))
+                cleared = {k: v for k, v in ch.items() if k != SMS_ACK_FIELD}
+                cleared["enabled"] = False
+                channels.append(cleared)
+            else:
+                channels.append(dict(ch))
+        inst.channels = channels
+        await s.flush()
+        await _cascade_channel_tools(s, subject.admin_id, inst, ["sms"] if was_on else [])
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            actor_user_id=subject.user_id,
+            actor_type=ActorType.admin_user,
+            event_type="sms_compliance_ack_withdrawn",
+        )
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
+        return _to_out(inst, live_channel_status=live_status, tool_status=tool_status)
 
 
 # --- lifecycle -------------------------------------------------------------- #

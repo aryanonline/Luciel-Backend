@@ -77,6 +77,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "widget_origin_blocked",
         # The owner's morning brief went out (round 6 WP-F).
         "daily_brief_sent",
+        # Round 6 WP-D: every acknowledgement can be withdrawn, every source cleared.
+        "voice_consent_withdrawn",
+        "sms_compliance_ack_withdrawn",
+        "carrier_registration_attestation_withdrawn",
+        "record_source_cleared",
         "channel_abuse_blocked",
         "prompt_injection_detected",
         "content_moderation_event",

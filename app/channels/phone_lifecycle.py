@@ -499,6 +499,137 @@ async def attest_carrier_registration(
     return existing
 
 
+class NoNumberToRemove(Exception):
+    """The sms row holds no designated (or pending) number to remove."""
+
+
+async def detach_sms_number(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    webhook_config: TwilioWebhookConfigurator | None = None,
+) -> InstanceConnection | None:
+    """Remove the designated number and keep the Twilio account (round 6 WP-D).
+
+    The owner's own number is their asset; taking it off the Luciel must not cost
+    them the account credentials or make them re-consent. The routable claim
+    (``destination`` / ``pending_destination``) and the number-bound attestation
+    are dropped, the row returns to the honest "add your number" state the
+    credential path uses, and — best effort, never blocking — the number's
+    webhooks are pointed away from the platform so a number the owner reuses
+    elsewhere does not keep ringing here. Returns None when no sms row exists;
+    raises NoNumberToRemove when nothing is on file."""
+    from app.audit import log as audit_log  # noqa: PLC0415
+    from app.connections.service import SMS_NEEDS_NUMBER_DETAIL  # noqa: PLC0415
+    from app.models.audit import ActorType  # noqa: PLC0415
+
+    existing = await _find_sms_sender(session, admin_id, instance_id)
+    if existing is None:
+        return None
+    cfg = dict(existing.non_secret_config or {})
+    number = cfg.get("destination") or cfg.get("pending_destination")
+    if not number:
+        raise NoNumberToRemove()
+    for key in ("destination", "pending_destination", _ATTESTED_AT_KEY, _ATTESTED_BY_KEY):
+        cfg.pop(key, None)
+    old_status = existing.status
+    existing.non_secret_config = cfg
+    existing.status = "unconfigured"
+    existing.status_detail = SMS_NEEDS_NUMBER_DETAIL
+    existing.last_health_check_at = None
+    await session.flush()
+    unpointed = False
+    if isinstance(number, str) and cfg.get("accountSid"):
+        try:
+            from app.channels.tenant_twilio import (  # noqa: PLC0415
+                WebhookUrls,
+                build_tenant_webhook_configurator,
+            )
+
+            configurator = webhook_config or await build_tenant_webhook_configurator(
+                session, admin_id, instance_id
+            )
+            unpointed = await configurator.configure(
+                number, WebhookUrls(voice_url="", sms_url="", status_callback_url="")
+            )
+        except Exception:  # noqa: BLE001 — best effort; the audit row says what happened
+            unpointed = False
+    await audit_log.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(existing.connection_id),
+            "old_status": old_status,
+            "new_status": existing.status,
+            "reason": "sms_number_removed",
+            "number": str(number),
+            "webhooks_unpointed": unpointed,
+        },
+    )
+    return existing
+
+
+async def withdraw_carrier_attestation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+) -> InstanceConnection | None:
+    """Take back the owner's carrier-registration attestation (round 6 WP-D).
+
+    Texting returns to the honest ``pending_carrier_registration`` gate; the
+    number, credentials and calls are untouched. Idempotent when nothing was
+    attested. Returns None when no sms row exists."""
+    from app.audit import log as audit_log  # noqa: PLC0415
+    from app.models.audit import ActorType  # noqa: PLC0415
+
+    existing = await _find_sms_sender(session, admin_id, instance_id)
+    if existing is None:
+        return None
+    cfg = dict(existing.non_secret_config or {})
+    if not cfg.get(_ATTESTED_AT_KEY):
+        return existing
+    cfg.pop(_ATTESTED_AT_KEY, None)
+    cfg.pop(_ATTESTED_BY_KEY, None)
+    existing.non_secret_config = cfg
+    old_status = existing.status
+    if cfg.get("destination") and existing.status == STATUS_CONNECTED:
+        existing.status, existing.status_detail = status_for_confirmed_number(cfg)
+    await audit_log.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+        event_type="carrier_registration_attestation_withdrawn",
+        payload={"connection_id": str(existing.connection_id)},
+    )
+    if existing.status != old_status:
+        await audit_log.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=user_id,
+            event_type="connection_status_changed",
+            payload={
+                "connection_id": str(existing.connection_id),
+                "old_status": old_status,
+                "new_status": existing.status,
+                "reason": "carrier_registration_attestation_withdrawn",
+            },
+        )
+    await session.flush()
+    return existing
+
+
 async def sms_number_status(
     session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID
 ) -> str:

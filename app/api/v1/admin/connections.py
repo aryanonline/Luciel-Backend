@@ -416,6 +416,102 @@ async def attest_sms_registration(subject: Subject = Depends(current_admin)) -> 
         return _connection_out(conn)
 
 
+@router.delete("/sms/number", response_model=ConnectionOut)
+async def remove_sms_number(subject: Subject = Depends(current_admin)) -> ConnectionOut:
+    """Take the designated number off the Luciel, keeping the Twilio account (round 6
+    WP-D). The row returns to "add your number"; the number's webhooks are pointed
+    away from the platform on a best-effort basis. 404 without an sms row; 422 when
+    no number is on file."""
+    from app.channels.phone_lifecycle import (  # noqa: PLC0415
+        NoNumberToRemove,
+        detach_sms_number,
+    )
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        try:
+            conn = await detach_sms_number(
+                s, admin_id=subject.admin_id, instance_id=instance_id, user_id=subject.user_id
+            )
+        except NoNumberToRemove as exc:
+            raise validation_error("There is no number on file to remove.") from exc
+        if conn is None:
+            raise not_found("No SMS connection.")
+        return _connection_out(conn)
+
+
+@router.delete("/sms/attest-registration", response_model=ConnectionOut)
+async def withdraw_sms_attestation(subject: Subject = Depends(current_admin)) -> ConnectionOut:
+    """Withdraw the owner's carrier-registration attestation (round 6 WP-D): texting
+    goes back behind the pending gate; calls, number and credentials stay."""
+    from app.channels.phone_lifecycle import withdraw_carrier_attestation  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        conn = await withdraw_carrier_attestation(
+            s, admin_id=subject.admin_id, instance_id=instance_id, user_id=subject.user_id
+        )
+        if conn is None:
+            raise not_found("No SMS number connection.")
+        return _connection_out(conn)
+
+
+@router.delete("/record-source/csv", response_model=DisconnectResult)
+async def clear_record_source_csv(subject: Subject = Depends(current_admin)) -> DisconnectResult:
+    """Clear the CSV records behind ``lookup_record`` (round 6 WP-D): every row is
+    deleted, the ``record_source`` connection is handed back (so the tool is switched
+    off with the reason on it), and the response says what went off."""
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.record_source import RecordSourceRecord  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = await _instance_id(s, subject.admin_id)
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.instance_id == instance_id,
+                    InstanceConnection.connection_type == "record_source",
+                    InstanceConnection.status != "revoked",
+                )
+            )
+        ).scalar_one_or_none()
+        if conn is None:
+            raise not_found("No records on file.")
+        deleted = await s.execute(
+            sa_delete(RecordSourceRecord).where(RecordSourceRecord.admin_id == subject.admin_id)
+        )
+        removed = int(getattr(deleted, "rowcount", 0) or 0)
+        out = await service.disconnect(
+            s,
+            admin_id=subject.admin_id,
+            connection_id=conn.connection_id,
+            user_id=subject.user_id,
+        )
+        if out is None:
+            raise not_found("No records on file.")
+        row = cast("InstanceConnection", out["connection"])
+        row.status_detail = "No records on file"
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type="record_source_cleared",
+            payload={"connection_id": str(row.connection_id), "records_removed": int(removed or 0)},
+        )
+        return DisconnectResult.model_validate(
+            {
+                "connection": _connection_out(row),
+                "secretDeleted": out["secret_deleted"],
+                "disabledTools": out["disabled_tools"],
+                "disabledChannels": out["disabled_channels"],
+            }
+        )
+
+
 @router.post("/sms/rotate-capability", response_model=ConnectionOut)
 async def rotate_sms_capability(subject: Subject = Depends(current_admin)) -> ConnectionOut:
     """Rotate the webhook capability token and re-point the number's webhooks at

@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
+from app.api.errors import conflict
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
@@ -18,10 +19,20 @@ from app.lifecycle.export_bundle import build_export_zip
 from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
 from app.models.audit import ActorType
-from app.models.instance import Account
+from app.models.instance import Account, Instance, LucielState
 from app.notifications import email_dispatcher
+from app.schemas_api.common import WireModel
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
+
+
+class CloseAccountRequest(WireModel):
+    """POST /admin/account/close body (round 6 WP-D, audit F156).
+
+    Closing subsumes deleting the Luciel (§3.6.6). A Luciel that is still serving is
+    not deleted silently: the body must say so, or the caller deletes it first."""
+
+    confirm_delete_luciel: bool = False
 
 
 class ExportResult(BaseModel):
@@ -124,11 +135,28 @@ async def request_export(
 @router.post("/close", status_code=204)
 async def close_account(
     response: Response,
+    req: CloseAccountRequest | None = None,
     subject: Subject = Depends(current_admin),
     store: ExportStore = Depends(get_export_store),
 ) -> Response:
-    """Close the account — export-first, deletes the Luciel first if present (§3.6.6)."""
+    """Close the account — export-first, deletes the Luciel first if present (§3.6.6).
+
+    Round 6 WP-D (F156): a Luciel that is still active or paused is deleted by the
+    closure, so the request must carry ``confirmDeleteLuciel: true``; otherwise 409
+    names the step (delete the Luciel first, or confirm)."""
     async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if (
+            inst is not None
+            and inst.state in (LucielState.active, LucielState.paused)
+            and not (req and req.confirm_delete_luciel)
+        ):
+            raise conflict(
+                "Your Luciel is still active. Delete it first, or confirm that closing the "
+                "account deletes it."
+            )
         # Export-first: assemble + persist a bundle, issue the link, before destruction.
         await _build_upload_and_notify(
             s,

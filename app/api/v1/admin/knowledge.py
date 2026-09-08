@@ -465,7 +465,9 @@ async def list_sync_connections(
 
 @router.post("/sync-connections", response_model=SyncConnectionOut, status_code=201)
 async def create_sync_connection(
-    req: CreateSyncConnectionRequest, subject: Subject = Depends(current_admin)
+    req: CreateSyncConnectionRequest,
+    response: Response,
+    subject: Subject = Depends(current_admin),
 ) -> SyncConnectionOut:
     """Create a knowledge-sync connection (§3.2.3): reuses the Connections layer
     (§3.8) — an ``instance_connections`` row of connection_type='knowledge_source'
@@ -479,6 +481,31 @@ async def create_sync_connection(
         raise validation_error(f"Unknown knowledge-sync provider: {req.provider}")
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
+        if req.provider == "website_crawl" and req.crawl_urls:
+            # Round 6 WP-D: the same site crawled again is the same connection — every
+            # click used to mint a new row, and the pillar had no list to show them.
+            wanted = sorted(str(u) for u in req.crawl_urls)
+            existing_rows = (
+                (
+                    await s.execute(
+                        select(InstanceConnection).where(
+                            InstanceConnection.admin_id == subject.admin_id,
+                            InstanceConnection.instance_id == instance_id,
+                            InstanceConnection.connection_type == "knowledge_source",
+                            InstanceConnection.provider == "website_crawl",
+                            InstanceConnection.status != "revoked",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in existing_rows:
+                raw = (row.non_secret_config or {}).get("crawl_urls")
+                have = sorted(str(u) for u in raw) if isinstance(raw, list) else []
+                if have == wanted:
+                    response.status_code = 200
+                    return _sync_connection_out(row)
         connection, _result = await connections_service.start_connection(
             s,
             admin_id=subject.admin_id,

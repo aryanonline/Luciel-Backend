@@ -107,7 +107,7 @@ async def test_close_account_also_uploads_export_with_context(client):
         json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"},
     )
 
-    r = await client.post("/api/v1/admin/account/close")
+    r = await client.post("/api/v1/admin/account/close", json={"confirmDeleteLuciel": True})
     assert r.status_code == 204
 
     async with tenant_session(admin_id) as s:

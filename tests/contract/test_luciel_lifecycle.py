@@ -131,5 +131,5 @@ async def test_account_export_and_close(client):
     )
     rex = await client.post("/api/v1/admin/account/export")
     assert rex.status_code == 200 and rex.json()["ok"] is True
-    rc = await client.post("/api/v1/admin/account/close")
+    rc = await client.post("/api/v1/admin/account/close", json={"confirmDeleteLuciel": True})
     assert rc.status_code == 204

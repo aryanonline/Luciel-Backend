@@ -22,6 +22,16 @@ Defines FastAPI v1 routes, dependencies, error behavior, and the control/data-pl
 - Widget CORS is deliberately wildcard without credentials; control-plane CORS is allow-listed with credentials.
 - OAuth callbacks are public only because their signed single-use state authorizes them.
 
+## Configuration maintainability (round 6 WP-D, 2026-09-07)
+- Everything connected can be switched or disconnected: DELETE /admin/connections/sms/number
+  (keeps the Twilio account), DELETE /admin/connections/sms/attest-registration, DELETE
+  /admin/connections/record-source/csv (hands the record_source row back → lookup_record off),
+  DELETE /admin/luciel/voice-consent and /sms-compliance-ack (the channel goes off in the
+  same write; re-enabling re-asks). PUT /channels cascades the dependent send tool off
+  server-side with `disabledReason: <channel>_channel_disabled` (F163). POST
+  /admin/account/close needs `confirmDeleteLuciel: true` while a Luciel is live (F156).
+  POST /knowledge/sync-connections returns the existing crawl row (200) for the same URLs.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.
