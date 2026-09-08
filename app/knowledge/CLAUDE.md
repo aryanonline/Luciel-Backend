@@ -33,3 +33,13 @@ Ingests and syncs knowledge, stores chunks/embeddings/graph data, applies scope,
 Before merge, ask whether this change could hide an unconfigured, failed,
 or tenant-crossing condition behind a successful-looking result. If so,
 make that state explicit and test it.
+
+## Round 6 WP-G (2026-09-08)
+- F122: `graph_extract.LlmGraphExtractor` (LUCIEL_GRAPH_EXTRACTOR=llm, live mode only) infers
+  typed nodes/edges from prose via the fast model under strict, capped JSON and merges the
+  deterministic line grammar in; any failure falls back to deterministic. Ingest calls
+  `extract_async` — the sync Protocol stays deterministic.
+- F044: `service.retrieve` runs `pgvector.search_settings_sql` (SET LOCAL hnsw.ef_search =
+  max(40, 4k); iterative_scan = relaxed_order on 0.8+) before the ANN query so a small tenant
+  beside a large one still gets k. Docker/CI pin `pgvector/pgvector:0.8.0-pg17`; `/healthz`
+  reports `pgvector_too_old:<ver>` below the pin.

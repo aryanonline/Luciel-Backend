@@ -25,9 +25,14 @@ etc. text identically (proven by the two-vertical extraction test).
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -145,16 +150,203 @@ class DeterministicGraphExtractor:
         return ExtractionResult(entities=list(entities.values()), edges=edges)
 
 
+# --- LLM-backed extraction (round 6 WP-G, F122) ----------------------------------------
+#
+# Real prose ("Our Platform team needs senior engineers who know Python") has no node
+# lines for the grammar above to read. The LLM extractor infers typed nodes and edges
+# from prose through the platform's own fast model, under STRICT JSON, with hard caps;
+# the deterministic grammar is always merged in (explicit lines still win), and ANY
+# failure — provider error, cap, malformed JSON — falls back to the deterministic
+# result so ingest never fails or blocks on a vendor. Live mode only, opt-in by config.
+
+MAX_LLM_ENTITIES = 40
+MAX_LLM_EDGES = 80
+MAX_LLM_TEXT_CHARS = 12_000
+_MAX_NAME = 200
+_MAX_TYPE = 64
+_MAX_ATTRS = 20
+
+_LLM_SYSTEM_PROMPT = (
+    "You extract a knowledge graph from a business's own text. Reply with ONE JSON object "
+    "and nothing else, shaped exactly like "
+    '{"entities":[{"name":"...","type":"...","attributes":{"key":"value"}}],'
+    '"edges":[{"source":"...","target":"...","type":"..."}]}. '
+    "Take every type from the text's own vocabulary; there is no fixed list of types. "
+    "Names are short noun phrases as written. Every edge source and target must be an "
+    f"entity name from your list. At most {MAX_LLM_ENTITIES} entities and {MAX_LLM_EDGES} "
+    "edges — prefer the ones a customer would ask about. No prose, no markdown fences."
+)
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def parse_llm_graph(raw: str) -> ExtractionResult | None:
+    """Strict, capped parse of the model's JSON → ExtractionResult; None when unusable."""
+    body = _FENCE_RE.sub("", (raw or "").strip())
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(body[start : end + 1])
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    entities: dict[str, ExtractedEntity] = {}
+    raw_entities = data.get("entities")
+    for item in (raw_entities if isinstance(raw_entities, list) else [])[:MAX_LLM_ENTITIES]:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split())[:_MAX_NAME]
+        if not name:
+            continue
+        etype = " ".join(str(item.get("type") or "").split())[:_MAX_TYPE] or "unknown"
+        attrs_raw = item.get("attributes")
+        attrs: dict[str, object] = {}
+        if isinstance(attrs_raw, dict):
+            for k, v in list(attrs_raw.items())[:_MAX_ATTRS]:
+                key = str(k).strip()[:_MAX_TYPE]
+                if key and isinstance(v, str | int | float | bool):
+                    attrs[key] = str(v)[:_MAX_NAME]
+        entities[canonicalize(name)] = ExtractedEntity(
+            name=name, entity_type=etype, attributes=attrs
+        )
+
+    edges: list[ExtractedEdge] = []
+    seen: set[tuple[str, str, str]] = set()
+    raw_edges = data.get("edges")
+    for item in (raw_edges if isinstance(raw_edges, list) else [])[:MAX_LLM_EDGES]:
+        if not isinstance(item, dict):
+            continue
+        src = " ".join(str(item.get("source") or "").split())[:_MAX_NAME]
+        dst = " ".join(str(item.get("target") or "").split())[:_MAX_NAME]
+        rel = " ".join(str(item.get("type") or "").split()).upper().replace(" ", "_")[:_MAX_TYPE]
+        if not src or not dst or not rel:
+            continue
+        # A dangling endpoint is materialised as an ``unknown`` node so traversal never
+        # dangles — but only while the entity cap holds; past it the edge is dropped.
+        if any(
+            canonicalize(endpoint) not in entities and len(entities) >= MAX_LLM_ENTITIES
+            for endpoint in (src, dst)
+        ):
+            continue
+        for endpoint in (src, dst):
+            entities.setdefault(
+                canonicalize(endpoint),
+                ExtractedEntity(name=endpoint, entity_type="unknown"),
+            )
+        edge_key = (canonicalize(src), rel, canonicalize(dst))
+        if edge_key in seen:
+            continue
+        seen.add(edge_key)
+        edges.append(ExtractedEdge(src_name=src, dst_name=dst, relationship_type=rel))
+    return ExtractionResult(entities=list(entities.values()), edges=edges)
+
+
+def merge_results(base: ExtractionResult, extra: ExtractionResult) -> ExtractionResult:
+    """Union of two extractions by canonical name / (src, rel, dst); ``base`` wins on type."""
+    entities: dict[str, ExtractedEntity] = {e.canonical: e for e in base.entities}
+    for ent in extra.entities:
+        existing = entities.get(ent.canonical)
+        if existing is None:
+            entities[ent.canonical] = ent
+        elif existing.entity_type == "unknown" and ent.entity_type != "unknown":
+            entities[ent.canonical] = ExtractedEntity(
+                name=existing.name,
+                entity_type=ent.entity_type,
+                attributes={**ent.attributes, **existing.attributes},
+            )
+    edges: list[ExtractedEdge] = list(base.edges)
+    seen = {
+        (canonicalize(e.src_name), e.relationship_type, canonicalize(e.dst_name)) for e in edges
+    }
+    for edge in extra.edges:
+        key = (canonicalize(edge.src_name), edge.relationship_type, canonicalize(edge.dst_name))
+        if key not in seen:
+            seen.add(key)
+            edges.append(edge)
+    return ExtractionResult(entities=list(entities.values()), edges=edges)
+
+
+class LlmGraphExtractor:
+    """Prose → typed nodes/edges through the platform fast model (F122).
+
+    ``extract`` (the sync Protocol) stays deterministic; ingest calls ``aextract``
+    through ``extract_async``. ``router_factory`` is the seam tests bind a fake to."""
+
+    def __init__(self, router_factory: Callable[[], Any] | None = None) -> None:
+        self._router_factory = router_factory
+        self._router: Any = None
+        self._fallback = DeterministicGraphExtractor()
+
+    def _router_or_build(self) -> Any:
+        if self._router is None:
+            if self._router_factory is not None:
+                self._router = self._router_factory()
+            else:
+                from app.config import get_settings  # noqa: PLC0415 — import cycle
+                from app.runtime.provider_factory import build_llm_router  # noqa: PLC0415
+
+                self._router = build_llm_router(get_settings())
+        return self._router
+
+    def extract(self, text: str) -> ExtractionResult:
+        return self._fallback.extract(text)
+
+    async def aextract(self, text: str) -> ExtractionResult:
+        base = self._fallback.extract(text)
+        clipped = (text or "")[:MAX_LLM_TEXT_CHARS]
+        if not clipped.strip():
+            return base
+        try:
+            resp = await self._router_or_build().complete(
+                _LLM_SYSTEM_PROMPT,
+                [{"role": "user", "content": clipped}],
+                requires_tools=False,
+                context_tokens=0,
+                complexity=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let a vendor break ingest
+            log.warning("graph_extract.llm_failed", extra={"error": type(exc).__name__})
+            return base
+        parsed = parse_llm_graph(getattr(resp, "text", "") or "")
+        if parsed is None:
+            log.warning("graph_extract.llm_unparseable")
+            return base
+        return merge_results(base, parsed)
+
+
+async def extract_async(extractor: GraphExtractor, text: str) -> ExtractionResult:
+    """Run an extractor from async ingest: ``aextract`` when it has one, else ``extract``."""
+    afn: Callable[[str], Awaitable[ExtractionResult]] | None = getattr(extractor, "aextract", None)
+    if afn is not None:
+        return await afn(text)
+    return extractor.extract(text)
+
+
 _default: GraphExtractor | None = None
 
 
 def get_extractor() -> GraphExtractor:
-    """Return the bound extractor. Defaults to the deterministic one (§3.2.1).
+    """Return the bound extractor (§3.2.1).
 
-    Production may swap in an LLM-backed extractor via config behind this same seam —
-    the ingest path depends only on the GraphExtractor Protocol, never the concrete type.
+    Deterministic by default. ``LUCIEL_GRAPH_EXTRACTOR=llm`` binds the LLM-backed
+    extractor — in live mode only, so mock/CI never reaches a vendor — behind this same
+    seam: the ingest path depends only on the GraphExtractor Protocol.
     """
     global _default
     if _default is None:
-        _default = DeterministicGraphExtractor()
+        from app.config import get_settings, live_mode  # noqa: PLC0415 — import cycle
+
+        if get_settings().graph_extractor == "llm" and live_mode():
+            _default = LlmGraphExtractor()
+        else:
+            _default = DeterministicGraphExtractor()
     return _default
+
+
+def reset_extractor() -> None:
+    """Forget the bound extractor (tests; settings changed)."""
+    global _default
+    _default = None

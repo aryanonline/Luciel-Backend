@@ -69,6 +69,7 @@ from app.notifications.escalation_dispatch import (
 )
 from app.observability.metrics import emit_metric
 from app.runtime import budget, channel_switch, handoff, memory
+from app.runtime import personality as personality_rules
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import (
     EscalationDecision,
@@ -374,6 +375,7 @@ async def _record_escalation(
     signal: str,
     gate: str,
     score: float | None,
+    reasons: list[str] | None = None,
 ) -> bool:
     """Write the escalation_events row + the audit event, then notify (§3.5.2 / §5.2).
 
@@ -396,6 +398,7 @@ async def _record_escalation(
             signal=signal,
             gate=gate,
             score_or_confidence=score,
+            reasons=reasons or None,
             delivery_status="pending",
         )
         .on_conflict_do_nothing(
@@ -717,6 +720,7 @@ class Orchestrator:
                 signal=intake.signal or Signal.explicit_human_request,
                 gate="intake",
                 score=intake.score_or_confidence,
+                reasons=intake.reasons,
                 ack=self._with_contact_ask(
                     await self._handoff_ack(),
                     channel=channel,
@@ -895,6 +899,12 @@ class Orchestrator:
             message=inbound_text,
             plan_confidence=resp.confidence,
             grounding_score=grounding.score,
+            # The owner's own hot-lead phrases (F102): the one admin input to the fixed
+            # high_value_lead signal, matched over the same recent turns.
+            custom_rules_hit=personality_rules.custom_rules_hit(
+                self.personality, " ".join([*trailing[-5:], inbound_text])
+            )
+            or False,
             resolving_tool_succeeded=tool_succeeded,
             # The lead's recent turns (F106): a budget in one message and "this week"
             # in the next is one hot lead, not two lukewarm messages.
@@ -926,6 +936,7 @@ class Orchestrator:
                     signal=(outcome.signal or Signal.cannot_answer).value,
                     gate="outcome",
                     score=outcome.score_or_confidence,
+                    reasons=list(outcome.reasons),
                 )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
@@ -1422,6 +1433,7 @@ class Orchestrator:
         gate: str,
         score: float | None,
         ack: str,
+        reasons: tuple[str, ...] = (),
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
@@ -1435,6 +1447,7 @@ class Orchestrator:
             signal=signal.value,
             gate=gate,
             score=score,
+            reasons=list(reasons),
         )
         ack_row = await persist_turn(
             self.session,

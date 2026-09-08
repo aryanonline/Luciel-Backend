@@ -21,6 +21,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.api.errors import register_error_handlers
 from app.config import get_settings
 from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
+from app.knowledge.pgvector import installed_version as _pgvector_installed_version
+from app.knowledge.pgvector import too_old_reason as _pgvector_too_old_reason
 from app.observability.context import admin_id_var, bind_trace, new_trace_id, trace_id_var
 from app.observability.logging import install_structured_logging
 from app.observability.metrics import install_metrics_logger
@@ -218,6 +220,15 @@ def create_app() -> FastAPI:
     # send otherwise looks identical to a working one from the outside.
     log_resolved_bindings()
 
+    async def pgvector_too_old_reason() -> str | None:
+        from app.db.engine import get_sessionmaker  # noqa: PLC0415 — import cost off boot path
+
+        try:
+            async with get_sessionmaker()() as s:
+                return _pgvector_too_old_reason(await _pgvector_installed_version(s))
+        except Exception as exc:  # noqa: BLE001 — health must never raise
+            return f"pgvector_too_old:unreadable:{type(exc).__name__}"
+
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
         # Binding NAMES only — never a credential and never whether a given secret is
@@ -237,6 +248,12 @@ def create_app() -> FastAPI:
         # ``degraded`` entry — that list gates deploys on binding truth, this is an
         # operations signal. ``None`` when the database is unreachable.
         backlog = await escalation_backlog() if database_reason is None else None
+        if database_reason is None:
+            # Round 6 WP-G (F044): retrieval quality depends on pgvector 0.8+'s iterative
+            # scans; an older extension is a binding problem this list exists to surface.
+            too_old = await pgvector_too_old_reason()
+            if too_old:
+                degraded.append(too_old)
         return {
             "status": "ok" if database_reason is None else "degraded",
             "integrationMode": settings.integration_mode,

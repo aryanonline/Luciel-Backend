@@ -280,6 +280,11 @@ class Settings(BaseSettings):
     # open-ended default timeout used to stack minutes of silence in front of that.
     llm_timeout_seconds: float = 30.0
     llm_openai_fallback_model: str = "gpt-5.4"
+    # Knowledge-graph extraction at ingest (round 6 WP-G, F122): "deterministic" reads
+    # the explicit node/edge line grammar only; "llm" also infers nodes and edges from
+    # prose through the fast model (live mode only; falls back to deterministic on any
+    # failure). LUCIEL_GRAPH_EXTRACTOR.
+    graph_extractor: str = "deterministic"
 
     # Upper bound on generated tokens per LLM call (platform cost control).
     llm_max_output_tokens: int = 1024

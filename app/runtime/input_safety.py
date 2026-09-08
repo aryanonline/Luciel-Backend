@@ -322,6 +322,20 @@ def ensure_ai_identity_disclosure(
     return f"{line}\n\n{reply}" if reply else line
 
 
+# Round 6 WP-G (F124): a real self-reported confidence. The tag is parsed and stripped
+# by app.runtime.providers.parse_confidence_tag before the text reaches anyone; a model
+# that ignores the instruction reports 1.0 exactly as before, so the OR-gate only ever
+# gains a signal, never loses one.
+_CONFIDENCE_STANZA = (
+    "\n--- Confidence (platform rule) ---\n"
+    "After your reply, on its own final line, write <confidence>X</confidence> where X is "
+    "a number from 0.0 to 1.0: how sure you are that the reply is correct AND supported by "
+    "the knowledge or tool results you were given. Use 0.3 or lower when you are guessing "
+    "or the material does not cover the question. That line is removed before the customer "
+    "sees your reply; never mention it.\n"
+)
+
+
 def build_system_prompt(
     business_context: str | None,
     luciel_email_address: str | None = None,
@@ -376,6 +390,7 @@ def build_system_prompt(
     # After personality, so the concrete formatting rules are the last word on FORM, and
     # still above the untrusted admin field, which cannot relax them (Decision #1).
     prompt = prompt + _ANSWER_STYLE_STANZA
+    prompt = prompt + _CONFIDENCE_STANZA
     ctx = (business_context or "").strip()
     if ctx:
         ctx = ctx[:BUSINESS_CONTEXT_MAX_CHARS]

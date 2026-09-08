@@ -58,6 +58,10 @@ class EscalationDecision:
     signal: Signal | None = None
     gate: Gate | None = None
     score_or_confidence: float | None = None
+    # WHY it fired, in the owner's words (round 6 WP-G, F124): short deterministic
+    # phrases written to the escalation row so the dashboard can say "budget figure +
+    # this week" instead of a bare score. Empty when nothing fired.
+    reasons: tuple[str, ...] = ()
 
 
 # --- pluggable classifiers (deterministic heuristics for dev/test) ---------- #
@@ -73,21 +77,127 @@ _HUMAN_PATTERNS = re.compile(
     r"|\bforget me\b|\bright to be forgotten\b|\bstop (storing|keeping) my\b",
     re.IGNORECASE,
 )
+# Round 6 WP-G (F124): a real complaint vocabulary (~80 terms) instead of 13 words, and
+# negation-aware scoring below ("not bad" / "never disappointed" are not complaints).
+# Still deterministic and hermetic; still platform-owned, never admin-configurable.
 _NEGATIVE_WORDS = {
+    # anger
     "angry",
     "furious",
+    "livid",
+    "irate",
+    "enraged",
+    "outraged",
+    "fuming",
+    "pissed",
+    "mad",
+    "seething",
+    "infuriated",
+    "infuriating",
+    # disappointment / frustration
+    "frustrated",
+    "frustrating",
+    "disappointed",
+    "disappointing",
+    "disgusted",
+    "disgusting",
+    "annoyed",
+    "annoying",
+    "irritated",
+    "irritating",
+    "upset",
+    "exasperated",
+    # quality judgments
     "terrible",
     "awful",
+    "horrible",
+    "horrendous",
+    "atrocious",
+    "appalling",
+    "dreadful",
+    "abysmal",
+    "pathetic",
     "useless",
-    "hate",
-    "ridiculous",
-    "unacceptable",
+    "worthless",
+    "garbage",
+    "trash",
+    "rubbish",
     "worst",
-    "frustrated",
-    "disgusted",
-    "outraged",
+    "ridiculous",
+    "absurd",
+    "unacceptable",
+    "incompetent",
+    "unprofessional",
+    "shoddy",
+    "sloppy",
+    "shameful",
+    "disgrace",
+    "disgraceful",
+    "joke",
+    "nightmare",
+    # trust / money
     "scam",
+    "scammed",
+    "scammers",
+    "fraud",
+    "fraudulent",
+    "ripoff",
+    "rip-off",
+    "ripped",
+    "cheated",
+    "cheat",
+    "liar",
+    "lied",
+    "lying",
+    "dishonest",
+    "stolen",
+    "stole",
+    "robbed",
+    # escalation / threat (NOT "refund", "cancel", "review": a polite cancellation or a
+    # refund question is a request, not a complaint — see test_judgment_wp6)
+    "lawyer",
+    "lawsuit",
+    "sue",
+    "suing",
+    "complaint",
+    "chargeback",
+    "bbb",
+    # hostility
+    "hate",
+    "hated",
+    "hateful",
+    "loathe",
+    "despise",
+    "crap",
+    "bullshit",
+    "wtf",
+    "idiot",
+    "idiots",
+    "stupid",
+    "clueless",
+    "ignored",
+    "ignoring",
+    "rude",
 }
+# Words that flip the polarity of the next few tokens ("not bad", "never disappointed").
+_NEGATORS = {
+    "not",
+    "no",
+    "never",
+    "hardly",
+    "isnt",
+    "wasnt",
+    "dont",
+    "didnt",
+    "cant",
+    "wont",
+    "without",
+    "nothing",
+    "neither",
+    "nor",
+    "n't",
+}
+_NEGATION_WINDOW = 2
 
 
 # "Are you a human?" asks WHAT Luciel is; it does not ask FOR a human (2026-09-05
@@ -246,41 +356,76 @@ def is_repeated_question(reply: str, previous_luciel_reply: str | None) -> bool:
     return overlap >= _REPEATED_QUESTION_OVERLAP
 
 
+def negative_terms(text: str) -> list[str]:
+    """The complaint terms in ``text`` that are NOT negated (round 6 WP-G, F124).
+
+    A term within two tokens after a negator ("not bad", "never disappointed", "no
+    complaint") is skipped; contractions are normalised so "isn't terrible" negates."""
+    normalised = (text or "").lower().replace("’", "'")
+    tokens = re.findall(r"[a-z]+(?:'[a-z]+)?", normalised)
+    hits: list[str] = []
+    for i, tok in enumerate(tokens):
+        word = tok.replace("'", "")
+        if word not in _NEGATIVE_WORDS:
+            continue
+        window = tokens[max(0, i - _NEGATION_WINDOW) : i]
+        if any(w.replace("'", "") in _NEGATORS or w.endswith("n't") for w in window):
+            continue
+        hits.append(word)
+    return hits
+
+
 def sentiment_score(text: str) -> float:
-    """Crude polarity in [-1, 1]; negative words push toward -1."""
-    words = re.findall(r"[a-z']+", (text or "").lower())
-    if not words:
-        return 0.0
-    neg = sum(1 for w in words if w in _NEGATIVE_WORDS)
+    """Crude polarity in [-1, 1]; un-negated complaint terms push toward -1."""
+    neg = len(negative_terms(text))
     if neg == 0:
         return 0.0
     return max(-1.0, -0.4 - 0.3 * neg)
 
 
-def high_value_lead_score(text: str, custom_rules_hit: bool = False, context: str = "") -> float:
-    """Domain-agnostic heuristic (Architecture §3.4.5 weights), capped at 1.0.
+def high_value_lead_reasons(
+    text: str, custom_rules_hit: bool | str = False, context: str = ""
+) -> tuple[float, tuple[str, ...]]:
+    """Domain-agnostic heuristic (Architecture §3.4.5 weights), capped at 1.0, with the
+    reasons that scored (round 6 WP-G, F124).
 
     Scored over the message AND the conversation so far (``context``, the lead's
     recent turns — 2026-09-05 audit F106): the flagship scene is a budget stated in
     one turn and "can we start this week?" in the next, which no single message ever
-    scored above the line.
+    scored above the line. ``custom_rules_hit`` is the owner's phrase that matched
+    (F102) — or a bare True for callers that only know THAT one did.
     """
     t = f"{context or ''} {text or ''}".lower()
     score = 0.0
+    reasons: list[str] = []
     # explicit budget figure
     if re.search(
         r"(\$|usd|budget|/month|per month|k\b)\s*\d|\d+\s*(k|dollars|/mo)", t
     ) or re.search(r"\$\s?\d", t):
         score += 0.5
+        reasons.append("named a budget")
     # time-constrained decision
     if re.search(r"\b(today|this week|tomorrow|urgent|urgently|asap|right now)\b", t):
         score += 0.3
+        reasons.append("wants it soon")
     # explicit purchase/booking intent
     if re.search(r"\b(book|buy|purchase|sign up|get started|schedule|hire|engage)\b", t):
         score += 0.4
+        reasons.append("ready to buy or book")
     if custom_rules_hit:
         score += 0.3
-    return min(1.0, score)
+        reasons.append(
+            f'said "{custom_rules_hit}"'
+            if isinstance(custom_rules_hit, str)
+            else "matched your phrase"
+        )
+    return min(1.0, score), tuple(reasons)
+
+
+def high_value_lead_score(
+    text: str, custom_rules_hit: bool | str = False, context: str = ""
+) -> float:
+    return high_value_lead_reasons(text, custom_rules_hit, context)[0]
 
 
 # --- the two gates ---------------------------------------------------------- #
@@ -289,14 +434,30 @@ def evaluate_intake(trailing_messages: list[str]) -> EscalationDecision:
     latest = trailing_messages[-1] if trailing_messages else ""
     conf = classify_request_human(latest)
     if conf >= REQUEST_HUMAN_CONF:
-        return EscalationDecision(True, Signal.explicit_human_request, Gate.intake, conf)
+        return EscalationDecision(
+            True, Signal.explicit_human_request, Gate.intake, conf, ("asked for a person",)
+        )
 
     # strong negative sentiment: <= -0.7 across >= 2 of the trailing 3 messages.
     last3 = trailing_messages[-3:]
     negatives = [m for m in last3 if sentiment_score(m) <= NEGATIVE_SENTIMENT_THRESHOLD]
     if len(negatives) >= 2:
         worst = min(sentiment_score(m) for m in last3)
-        return EscalationDecision(True, Signal.strong_negative_sentiment, Gate.intake, worst)
+        terms: list[str] = []
+        for m in negatives:
+            for term in negative_terms(m):
+                if term not in terms:
+                    terms.append(term)
+        return EscalationDecision(
+            True,
+            Signal.strong_negative_sentiment,
+            Gate.intake,
+            worst,
+            (
+                f"upset in {len(negatives)} of the last {len(last3)} messages",
+                "words: " + ", ".join(terms[:5]),
+            ),
+        )
     return EscalationDecision(False)
 
 
@@ -305,7 +466,7 @@ def evaluate_outcome(
     message: str,
     plan_confidence: float,
     grounding_score: float,
-    custom_rules_hit: bool = False,
+    custom_rules_hit: bool | str = False,
     resolving_tool_succeeded: bool = False,
     context: str = "",
 ) -> EscalationDecision:
@@ -334,9 +495,11 @@ def evaluate_outcome(
     # message ("$5000 budget, want to book today") deserves urgent human follow-up
     # regardless of how well-grounded the reply happened to be — masking that behind
     # a grounding failure would bury the more business-critical signal.
-    lead_score = high_value_lead_score(message, custom_rules_hit, context=context)
+    lead_score, lead_reasons = high_value_lead_reasons(message, custom_rules_hit, context=context)
     if lead_score >= 0.5:
-        return EscalationDecision(True, Signal.high_value_lead, Gate.outcome, lead_score)
+        return EscalationDecision(
+            True, Signal.high_value_lead, Gate.outcome, lead_score, lead_reasons
+        )
 
     # A conversational/social turn (thanks, declines, goodbyes — see
     # is_conversational_turn) carries no factual claim, so the grounding floor
@@ -350,6 +513,11 @@ def evaluate_outcome(
         and (grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE)
     ):
         score = min(plan_confidence, grounding_score)
-        return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, score)
+        why: list[str] = []
+        if grounding_score < GROUNDING_FLOOR:
+            why.append(f"answer only {grounding_score:.0%} backed by your knowledge")
+        if plan_confidence < CANNOT_ANSWER_CONFIDENCE:
+            why.append(f"the model was {plan_confidence:.0%} sure")
+        return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, score, tuple(why))
 
     return EscalationDecision(False)

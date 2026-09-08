@@ -17,8 +17,9 @@ import uuid
 
 import pytest
 from app.db.session import tenant_session
-from app.knowledge import service
+from app.knowledge import pgvector, service
 from app.models.instance import Account, AccountState, Instance, LucielState
+from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from app.runtime.embeddings import EMBED_DIM
 
 pytestmark = [pytest.mark.asyncio]
@@ -108,3 +109,57 @@ async def test_paraphrased_query_ranks_the_relevant_chunk_first(monkeypatch: pyt
     assert [c.text for c, _ in results][0] == relevant
     top_distance, next_distance = results[0][1], results[1][1]
     assert top_distance < next_distance, "ranking must come from cosine distance, not insert order"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_small_tenant_beside_a_large_one_still_gets_k(monkeypatch: pytest.MonkeyPatch):
+    """Round 6 WP-G (F044): one global HNSW index, tenant filter AFTER the walk. With the
+    default ef_search a 3-chunk tenant whose vectors tie with 300 of a neighbour's would
+    get the neighbour's 40 candidates, filtered to nothing. ``retrieve`` sets ef_search
+    and (pgvector 0.8+) iterative scans per transaction, so it still returns k."""
+    monkeypatch.setattr(service, "get_embedder", lambda *a, **k: ConceptEmbedder())
+    pgvector.reset_cache()
+    big, small = uuid.uuid4(), uuid.uuid4()
+    big_iid, small_iid = await _seed(big), await _seed(small)
+    refunds_vec = (await ConceptEmbedder().embed(["refund money"]))[0]
+
+    async with tenant_session(big) as s:
+        src = KnowledgeSource(
+            id=uuid.uuid4(),
+            admin_id=big,
+            instance_id=big_iid,
+            name="big.txt",
+            origin="upload",
+            ingestion_status="ready",
+            size_bytes=1,
+        )
+        s.add(src)
+        for i in range(300):
+            s.add(
+                KnowledgeChunk(
+                    id=uuid.uuid4(),
+                    admin_id=big,
+                    instance_id=big_iid,
+                    source_id=src.id,
+                    ordinal=i,
+                    text=f"refund policy paragraph {i}",
+                    embedding=refunds_vec,
+                    embedding_model="concept",
+                )
+            )
+    async with tenant_session(small) as s:
+        for i in range(3):
+            await service.ingest_text(
+                s,
+                admin_id=small,
+                instance_id=small_iid,
+                name=f"refunds-{i}.txt",
+                text=f"Refunds: money is returned within {i + 7} days.",
+            )
+        version = await pgvector.installed_version(s)
+        assert pgvector.supports_iterative_scan(version), version
+        results = await service.retrieve(
+            s, admin_id=small, instance_id=small_iid, query="refund my money", k=3
+        )
+    assert len(results) == 3
+    assert all(c.admin_id == small for c, _ in results)

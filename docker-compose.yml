@@ -14,7 +14,7 @@
 
 services:
   db:
-    image: pgvector/pgvector:pg17
+    image: pgvector/pgvector:0.8.0-pg17
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

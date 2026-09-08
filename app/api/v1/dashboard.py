@@ -518,6 +518,7 @@ async def list_escalations(
                 gate=r.gate,
                 fired_at=r.fired_at,
                 score_or_confidence=r.score_or_confidence,
+                reasons=[str(x) for x in (r.reasons or [])],
             )
             for r in rows
         ]

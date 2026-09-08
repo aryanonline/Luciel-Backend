@@ -15,13 +15,14 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.knowledge import pgvector
 from app.knowledge.chunking import chunk_text
 from app.knowledge.embeddings import get_embedder
-from app.knowledge.graph_extract import GraphExtractor, get_extractor
+from app.knowledge.graph_extract import GraphExtractor, extract_async, get_extractor
 from app.models.audit import ActorType
 from app.models.knowledge import (
     KnowledgeChunk,
@@ -168,7 +169,7 @@ async def _store_graph(
     Returns the canonical-name → entity_id map. Edges are resolved against that map so
     src/dst reference the persisted entity rows; an endpoint with no node row was already
     materialized as an `unknown` entity by the extractor, so edges never dangle."""
-    result = extractor.extract(text)
+    result = await extract_async(extractor, text)
     id_by_canonical: dict[str, uuid.UUID] = {}
     for ent in result.entities:
         eid = uuid.uuid4()
@@ -674,6 +675,13 @@ async def retrieve(
     embedder = get_embedder()
     qvec = (await embedder.embed([query]))[0]
     distance = KnowledgeChunk.embedding.cosine_distance(qvec)
+    # One global HNSW index, tenant filter after the walk (round 6 WP-G, F044): widen the
+    # walk with k and let pgvector 0.8+ keep walking until the filtered set is full, so a
+    # small tenant beside a large one still gets k rows. Transaction-local settings.
+    for stmt in pgvector.search_settings_sql(
+        k + _RERANK_OVERFETCH, await pgvector.installed_version(session)
+    ):
+        await session.execute(text(stmt))
     # Over-fetch: the ANN gives us more candidates than k so step-3 re-ranking has
     # material to reorder within the cosine band before we truncate to k.
     rows = (

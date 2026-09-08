@@ -94,6 +94,10 @@ PersonalityPresetWire = Literal[
     "warm_concierge", "professional_advisor", "friendly_expert", "trusted_authority", "custom"
 ]
 
+#: Owner phrases that mean a hot lead (round 6 WP-G, F102): a short list of short phrases.
+MAX_HIGH_VALUE_SIGNALS = 20
+MAX_HIGH_VALUE_SIGNAL_LEN = 60
+
 
 class ChannelConfigOut(WireModel):
     id: ChannelIdWire
@@ -160,6 +164,10 @@ class PersonalityConfigWire(WireModel):
     preset: PersonalityPresetWire
     axes: PersonalityAxes | None = None
     business_context: str | None = Field(default=None, max_length=280)
+    # Phrases that mean a hot lead FOR THIS BUSINESS (round 6 WP-G, F102): the one
+    # admin-extensible input to the high-value-lead heuristic (Locked Decision §7 #16).
+    # They add weight to the fixed signal; they never add a signal.
+    high_value_signals: list[str] | None = Field(default=None, max_length=MAX_HIGH_VALUE_SIGNALS)
     # The runtime already reads assistantName for the AI-identity disclosure (§3.4.16);
     # declaring it makes it settable instead of always falling back to
     # "<business>'s assistant".
@@ -385,6 +393,30 @@ class UpdatePersonalityRequest(StrictWireModel):
     axes: PersonalityAxesIn | None = None
     business_context: str | None = Field(default=None, max_length=280)
     assistant_name: str | None = Field(default=None, max_length=80)
+    high_value_signals: list[str] | None = Field(default=None, max_length=MAX_HIGH_VALUE_SIGNALS)
+
+    @field_validator("high_value_signals")
+    @classmethod
+    def _clean_signals(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in v:
+            phrase = " ".join(str(raw).split())
+            if not phrase:
+                continue
+            if len(phrase) > MAX_HIGH_VALUE_SIGNAL_LEN:
+                raise ValueError(
+                    f"Each phrase is at most {MAX_HIGH_VALUE_SIGNAL_LEN} characters: "
+                    f"'{phrase[:24]}…'."
+                )
+            key = phrase.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(phrase)
+        return out
 
 
 class UpdateAllowedOriginsRequest(StrictWireModel):

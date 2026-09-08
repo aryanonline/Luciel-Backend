@@ -113,6 +113,33 @@ def compose_personality_stanza(personality: dict[str, object] | None) -> str:
     return "".join(lines)
 
 
+def high_value_signals_of(personality: dict[str, object] | None) -> list[str]:
+    """The owner's hot-lead phrases (round 6 WP-G, F102) — ``highValueSignals`` on the
+    personality pillar; [] when unset. Cleaned the way the wire validator cleans them."""
+    raw = (personality or {}).get("highValueSignals")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        phrase = " ".join(str(item).split())
+        if phrase:
+            out.append(phrase)
+    return out
+
+
+def custom_rules_hit(personality: dict[str, object] | None, text: str) -> str | None:
+    """The first owner phrase that appears in ``text`` (case- and whitespace-insensitive),
+    or None. Feeds ``high_value_lead_score(custom_rules_hit=...)`` — the ONLY admin input to
+    the fixed escalation signals (Locked Decision §7 #16)."""
+    haystack = " ".join((text or "").lower().split())
+    if not haystack:
+        return None
+    for phrase in high_value_signals_of(personality):
+        if phrase.lower() in haystack:
+            return phrase
+    return None
+
+
 def business_context_of(personality: dict[str, object] | None) -> str | None:
     """The admin-editable 280-char business-context field (Vision §3.5).
 

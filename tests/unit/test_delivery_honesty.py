@@ -316,6 +316,9 @@ def test_healthz_reports_the_resolved_mode_and_degraded_seams():
     assert body["status"] == "ok"
     assert body["integrationMode"] == "mock"
     assert "platform_email:NullEmailSender" in body["degraded"]
+    # Round 6 WP-G (F044): the local extension meets the pin, so nothing is reported;
+    # an older one would appear as pgvector_too_old:<version>.
+    assert not any(e.startswith("pgvector_too_old") for e in body["degraded"]), body
 
 
 def _sessionmaker_pointed_at_a_dead_database():

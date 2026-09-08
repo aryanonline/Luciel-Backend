@@ -165,6 +165,8 @@ class EscalationEventOut(WireModel):
     gate: GateWire
     fired_at: datetime
     score_or_confidence: float | None = None
+    # Why it fired, in short phrases (round 6 WP-G, F124); [] for older rows.
+    reasons: list[str] = Field(default_factory=list)
 
 
 class LeadOut(WireModel):

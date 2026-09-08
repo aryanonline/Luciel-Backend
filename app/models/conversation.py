@@ -138,6 +138,9 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
     signal: Mapped[str] = mapped_column(String(32), nullable=False)
     gate: Mapped[str] = mapped_column(String(16), nullable=False)
     score_or_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Why it fired, in short owner-facing phrases (round 6 WP-G, F124). NULL on rows
+    # from before the column existed and on server-originated signals.
+    reasons: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     fired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

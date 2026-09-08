@@ -49,6 +49,17 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
   else drops and the loop runs). Never to an unconfirmed address; audited as
   `channel_switch_delivery`. The arbiter's own long-SMS switch still only OFFERS.
 
+## Judgment quality (round 6 WP-G, 2026-09-08)
+- F124: live providers parse a trailing `<confidence>X</confidence>` line the prompt asks
+  for (`providers.parse_confidence_tag`; absent → 1.0 as before) so the grounding-OR-
+  confidence gate finally has a real second input. `EscalationDecision.reasons` (owner
+  phrases: "named a budget", "the model was 30% sure") persist on `escalation_events.reasons`.
+  The complaint lexicon is ~80 terms and negation-aware; "refund"/"cancel"/"review" are
+  requests, not complaints.
+- F102: `personality.highValueSignals` (≤ 20 phrases ≤ 60 chars) is the ONE admin input to
+  the fixed high_value_lead signal — `personality.custom_rules_hit` over the recent turns
+  adds 0.3; it never adds a signal.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

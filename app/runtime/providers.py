@@ -22,6 +22,7 @@ time — clients are built on first ``complete``.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -226,13 +227,39 @@ class AnthropicProvider:
                         "inputs": getattr(block, "input", {}) or {},
                     }
                 )
+        text, confidence = parse_confidence_tag("".join(text_parts))
         return LLMResponse(
-            text="".join(text_parts),
+            text=text,
             provider=self.name,
             model_class=ModelClass.primary,
-            confidence=1.0,
+            confidence=confidence,
             tool_calls=tool_calls,
         )
+
+
+# Round 6 WP-G (F124): the prompt asks the model for a trailing ``<confidence>0.0-1.0
+# </confidence>`` line (input_safety.compose_confidence_stanza). It is parsed here, ONCE,
+# for both providers, stripped before the text reaches the customer, and reported as
+# LLMResponse.confidence. A reply without the tag keeps the pre-WP-G value 1.0, so the
+# grounding-OR-confidence gate is byte-identical for models that ignore the instruction.
+_CONFIDENCE_TAG = re.compile(
+    r"\s*<confidence>\s*(?P<value>\d+(?:\.\d+)?|\.\d+)\s*</confidence>\s*$", re.IGNORECASE
+)
+
+
+def parse_confidence_tag(text: str) -> tuple[str, float]:
+    """Split a trailing confidence tag off ``text`` → (clean_text, confidence in [0, 1]).
+
+    Absent → (text unchanged, 1.0); an out-of-range number is clamped. Only a TRAILING tag
+    counts: a tag quoted mid-answer is customer-visible text and is left alone."""
+    m = _CONFIDENCE_TAG.search(text or "")
+    if not m:
+        return text, 1.0
+    try:
+        value = float(m.group("value"))
+    except ValueError:
+        return text, 1.0
+    return text[: m.start()].rstrip(), max(0.0, min(1.0, value))
 
 
 class OpenAIProvider:
@@ -328,6 +355,7 @@ class OpenAIProvider:
                     "inputs": inputs,
                 }
             )
+        text, confidence = parse_confidence_tag(text)
         return LLMResponse(
             text=text,
             provider=self.name,
@@ -335,6 +363,6 @@ class OpenAIProvider:
             # the response is a primary-equivalent reply (the fast/primary split is an
             # Anthropic-side routing concern, §7 #9). used_fallback is set by the router.
             model_class=ModelClass.primary,
-            confidence=1.0,
+            confidence=confidence,
             tool_calls=tool_calls,
         )
