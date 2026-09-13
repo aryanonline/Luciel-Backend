@@ -168,5 +168,7 @@ def test_the_prompt_tells_the_model_the_platform_delivers_copies_only_when_a_cha
     line = "do not say you cannot email or text"
     assert line in compose_operating_context_stanza(ctx("widget", "email"))
     assert line in compose_operating_context_stanza(ctx("sms"))
+    # R6-8: the wording steer that keeps the draft a promise, not a completed claim.
+    assert "never say it has already been sent" in compose_operating_context_stanza(ctx("sms"))
     assert line not in compose_operating_context_stanza(ctx("widget"))
     assert compose_operating_context_stanza(None) == ""

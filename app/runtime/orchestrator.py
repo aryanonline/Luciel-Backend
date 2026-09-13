@@ -124,11 +124,18 @@ _SUCCESS_CLAIM = re.compile(
 
 # The same guard for a turn in which NO action tool ran at all (2026-09-05 audit
 # F110): first-person claims only, so a knowledge answer that merely contains the
-# word "confirmed" ("orders are confirmed by email") is left alone.
+# word "confirmed" ("orders are confirmed by email") is left alone. A PROMISE is not
+# a claim either (round 6 dev walk 2026-09-13, R6-8): the operating-context stanza
+# tells the model the platform delivers a copy elsewhere, so "I'll have a copy sent
+# to your email once you confirm the address" is the honest wording of the channel
+# switch, not a completed action - the gap between subject and verb refuses to cross
+# a future/conditional modal. "I can confirm it has been sent" is still caught: the
+# second subject ("it has been") starts a fresh match after the modal.
 _FIRST_PERSON_SUCCESS_CLAIM = re.compile(
     r"\b(i'?ve|i have|we'?ve|we have|i|we|it'?s been|it has been|has been|have been"
     r"|is now|are now)\b"
-    r"[^.!?]{0,30}?"
+    r"(?:(?!\b(?:will|'ll|can|could|would|shall|should|may|might|going to|about to"
+    r"|able to|happy to|glad to)\b)[^.!?]){0,30}?"
     r"\b(booked|scheduled|rescheduled|cancelled|canceled|sent|delivered"
     r"|added to (?:the|your) calendar|updated your)\b",
     re.IGNORECASE,

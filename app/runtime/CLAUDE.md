@@ -78,4 +78,11 @@ make that state explicit and test it.
   `score_grounding` now drops delivery/courtesy words from the answer side (like the
   pleasantry stopwords) and, given `question=`, drops unsupported words the customer used
   (a restatement, not a claim). A fabricated fact behind the same offer still scores ~0.
+- R6-8 (2026-09-13 dev walk, after R6-6): the same email-me turn cleared the floor and was
+  still replaced - by the unfounded-claim guard (C4/F110). Told that the platform delivers
+  a copy, the model wrote "I'll have a copy sent to your email once you confirm the
+  address", and `_FIRST_PERSON_SUCCESS_CLAIM` read "I ... sent" as a completed action. A
+  promise is not a claim: the regex gap now refuses to cross a future/conditional modal
+  (a second subject after the modal - "I can confirm it has been sent" - is still
+  caught), and the operating-context stanza says "never say it has already been sent".
 

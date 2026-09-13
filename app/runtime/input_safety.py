@@ -261,7 +261,8 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
         lines.append(
             "- When a customer asks to have something emailed or texted to them, give the full "
             "answer right here and do not say you cannot email or text: the platform sends a "
-            "copy to an address they confirm, and asks them for one when needed.\n"
+            "copy to an address they confirm, and asks them for one when needed. Say a copy "
+            "can be sent once they confirm an address; never say it has already been sent.\n"
         )
     return "".join(lines)
 

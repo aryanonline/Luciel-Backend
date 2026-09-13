@@ -72,6 +72,8 @@ def test_first_person_claims_are_caught_and_knowledge_statements_are_not():
         "Done — we have sent the quote to your inbox.",
         "Your appointment has been scheduled.",
         "It's been added to your calendar.",
+        # A modal before a SECOND subject does not launder a completed claim (R6-8).
+        "I can confirm it has been sent to your inbox.",
     )
     for text in caught:
         assert _FIRST_PERSON_SUCCESS_CLAIM.search(text), text
@@ -79,6 +81,13 @@ def test_first_person_claims_are_caught_and_knowledge_statements_are_not():
         "Orders are confirmed by email within a day.",
         "We deliver across the city every weekday.",
         "Bookings can be scheduled up to 30 days ahead.",
+        # Round 6 dev walk 2026-09-13 (R6-8): a promise is not a claim. The stanza tells
+        # the model the platform delivers a copy, so this is the honest channel-switch
+        # wording - the guard used to read "I ... sent" as an action no tool performed.
+        "I'll have a copy sent to your email once you confirm the address.",
+        "I can send a copy to your email if you share the address.",
+        "We will make sure a copy is sent to you.",
+        "A copy will be sent to your email.",
     )
     for text in left_alone:
         assert not _FIRST_PERSON_SUCCESS_CLAIM.search(text), text

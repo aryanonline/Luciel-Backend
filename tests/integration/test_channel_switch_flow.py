@@ -74,12 +74,12 @@ async def _seed(s, admin, iid, *, channel="widget") -> uuid.UUID:
     return sid
 
 
-def _orch(s, admin, iid) -> Orchestrator:
+def _orch(s, admin, iid, *, reply: str = ANSWER) -> Orchestrator:
     return Orchestrator(
         session=s,
         router=LLMRouter(
-            primary=EchoModel(confidence=0.9, fixed_reply=ANSWER),
-            fallback=EchoModel(confidence=0.9, fixed_reply=ANSWER),
+            primary=EchoModel(confidence=0.9, fixed_reply=reply),
+            fallback=EchoModel(confidence=0.9, fixed_reply=reply),
         ),
         retriever=_grounding_retriever,
         admin_id=admin,
@@ -89,8 +89,8 @@ def _orch(s, admin, iid) -> Orchestrator:
     )
 
 
-async def _turn(s, admin, iid, sid, text, *, channel="widget", transport=None):
-    return await _orch(s, admin, iid).run_turn(
+async def _turn(s, admin, iid, sid, text, *, channel="widget", transport=None, reply=ANSWER):
+    return await _orch(s, admin, iid, reply=reply).run_turn(
         session_id=sid,
         resolved_lead_id=None,
         channel=channel,
@@ -201,3 +201,30 @@ async def test_a_failed_delivery_keeps_the_answer_in_the_conversation(sent):
             "I couldn't email that just now, so here it is in full."
         )
         assert ANSWER in result.reply_text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_promise_to_send_a_copy_is_the_switch_not_an_unfounded_claim(sent):
+    """Round 6 dev walk 2026-09-13 (R6-8): told that the platform delivers a copy, the live
+    model wrote the answer plus "I'll have a copy sent to your email once you confirm the
+    address" - and the unfounded-claim guard replaced the whole turn with the failure ack
+    and flagged the team. A promise is not a claim: the switch runs, the ask goes out."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    promise = ANSWER + " I'll have a copy sent to your email once you confirm the address."
+    async with tenant_session(admin) as s:
+        sid = await _seed(s, admin, iid)
+        first = await _turn(
+            s,
+            admin,
+            iid,
+            sid,
+            "Could you email me the details of the starter package?",
+            reply=promise,
+        )
+        assert ANSWER in first.reply_text
+        assert "What's the best email address to send it to?" in first.reply_text
+        assert "wasn't able to complete" not in first.reply_text
+        assert first.escalation is None
+        row = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
+        assert row.pending_outbound and row.pending_outbound["channel"] == "email"
+        assert sent.calls == []
