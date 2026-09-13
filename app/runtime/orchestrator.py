@@ -892,7 +892,7 @@ class Orchestrator:
             and r.outcome is tool_contract.Outcome.ok
             for call, r in resp.dispatched
         )
-        grounding = score_grounding(resp.text, raw_chunks, tool_succeeded)
+        grounding = score_grounding(resp.text, raw_chunks, tool_succeeded, question=inbound_text)
 
         # --- ESCALATION GATE 2 — OUTCOME (§3.4.5) ---------------------------- #
         outcome = evaluate_outcome(

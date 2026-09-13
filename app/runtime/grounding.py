@@ -125,6 +125,79 @@ _GROUNDING_STOPWORDS = frozenset(
     }
 )
 
+# Round 6 dev walk 2026-09-13 (R6-6): "Could you email me your Saturday opening hours?"
+# retrieved the right chunk and still handed off at 4/11 = 0.36. The hours matched; the
+# delivery offer the operating-context stanza asks the model to make ("I can send a copy
+# to your email — what's the best address?") is claim-free in the same way a pleasantry
+# is: nothing about the business is asserted, so nothing can be "supported". A fabricated
+# fact behind the same offer still fails — its substantive tokens are unchanged.
+_DELIVERY_AND_COURTESY_WORDS = frozenset(
+    {
+        "send",
+        "sent",
+        "sending",
+        "copy",
+        "email",
+        "emailed",
+        "text",
+        "texted",
+        "address",
+        "best",
+        "message",
+        "happy",
+        "glad",
+        "course",
+        "certainly",
+        "absolutely",
+        "definitely",
+        "right",
+        "away",
+        "confirm",
+        "confirmed",
+        "details",
+        "provide",
+        "share",
+        "reach",
+        "contact",
+        "like",
+        "want",
+        "need",
+        "get",
+        "give",
+        "receive",
+        "along",
+        "over",
+        "via",
+        "way",
+        "well",
+        "great",
+        "perfect",
+        "sounds",
+        "good",
+        "welcome",
+        "assist",
+        "follow",
+        "use",
+        "note",
+        "info",
+        "information",
+        "moment",
+        "shortly",
+        "soon",
+        "once",
+        "when",
+        "where",
+        "how",
+        "why",
+        "again",
+        "below",
+        "above",
+        "full",
+        "quick",
+        "summary",
+    }
+)
+
 
 @dataclass
 class GroundingResult:
@@ -134,7 +207,11 @@ class GroundingResult:
 
 
 def score_grounding(
-    answer: str, retrieved_chunks: list[str], tool_succeeded: bool
+    answer: str,
+    retrieved_chunks: list[str],
+    tool_succeeded: bool,
+    *,
+    question: str | None = None,
 ) -> GroundingResult:
     """Estimate how well an answer is grounded in retrieved knowledge / tool results.
 
@@ -143,6 +220,11 @@ def score_grounding(
     the retrieved chunks (a deterministic, dependency-free proxy for the production
     grounding model). Below the 0.50 floor with no resolving tool => not grounded
     => cannot_answer escalation (§3.4.13 / §3.4.5).
+
+    Claim-free tokens never count against the answer: stopwords and pleasantries
+    (Harmony wave 2), delivery/courtesy words (round 6 R6-6), and — when ``question``
+    is given — a word the customer used that no chunk supports, which the model is
+    restating, not asserting ("opening hours" in "Our opening hours are 9am-2pm").
     """
     if tool_succeeded:
         return GroundingResult(1.0, True, "tool_result")
@@ -154,7 +236,11 @@ def score_grounding(
     def toks(s: str, *, drop_stopwords: bool) -> set[str]:
         words = (w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) > 2)
         if drop_stopwords:
-            return {w for w in words if w not in _GROUNDING_STOPWORDS}
+            return {
+                w
+                for w in words
+                if w not in _GROUNDING_STOPWORDS and w not in _DELIVERY_AND_COURTESY_WORDS
+            }
         return set(words)
 
     # Only the answer side drops stopwords/filler -- claim-free connective tissue
@@ -167,6 +253,12 @@ def score_grounding(
     support = set()
     for chunk in retrieved_chunks:
         support |= toks(chunk, drop_stopwords=False)
+    if question:
+        # Words the customer used that nothing supports are the question restated,
+        # not a claim ("your opening hours" -> "our opening hours are 9am-2pm").
+        answer_tokens -= toks(question, drop_stopwords=True) - support
+        if not answer_tokens:
+            return GroundingResult(0.0, False, "question_echo_only")
     overlap = len(answer_tokens & support) / len(answer_tokens)
     return GroundingResult(overlap, overlap >= GROUNDING_FLOOR, "knowledge_overlap")
 

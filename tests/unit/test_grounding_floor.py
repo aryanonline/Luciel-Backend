@@ -176,3 +176,55 @@ def test_conversational_skip_never_weakens_the_or_gate_for_questions() -> None:
     )
     assert decision.fired is True
     assert decision.signal is Signal.cannot_answer
+
+
+def test_a_delivery_offer_around_a_grounded_fact_scores_above_floor() -> None:
+    """LIVE (round 6 dev walk, 2026-09-13, R6-6): "Could you email me your Saturday opening
+    hours?" retrieved the clinic chunk and still handed off — the draft scored 4/11 = 0.36.
+    The hours matched; the delivery offer the operating-context stanza asks for and the
+    customer's echoed words ("opening hours") carry no claim and diluted the proxy."""
+    chunk = (
+        "Maple & Main Dental is open Monday to Friday 8am-6pm and Saturday 9am-2pm. "
+        "We are closed Sundays. New patient checkup with cleaning costs $180."
+    )
+    question = "Could you email me your Saturday opening hours?"
+    answer = (
+        "Our Saturday opening hours are 9am to 2pm. I can send a copy of this to your "
+        "email — what's the best address to use?"
+    )
+    result = score_grounding(answer, [chunk], False, question=question)
+    assert result.score >= GROUNDING_FLOOR, result
+    assert result.grounded is True
+
+
+def test_a_fabricated_fact_behind_the_same_delivery_offer_still_fails() -> None:
+    """The delivery words are claim-free; the fact behind them is not."""
+    chunk = "Our store hours are 9am to 6pm Monday through Friday."
+    question = "Could you email me your warranty terms?"
+    answer = (
+        "We offer a lifetime warranty on every product. I can send a copy of this to "
+        "your email — what's the best address to use?"
+    )
+    result = score_grounding(answer, [chunk], False, question=question)
+    assert result.score < GROUNDING_FLOOR, result
+    assert result.grounded is False
+
+
+def test_restating_the_customers_words_is_not_a_claim_but_an_unsupported_yes_is() -> None:
+    chunk = "Open Saturday 9am-2pm."
+    grounded = score_grounding(
+        "Our opening hours are 9am to 2pm on Saturday.",
+        [chunk],
+        False,
+        question="What are your opening hours?",
+    )
+    assert grounded.grounded is True, grounded
+    # Nothing but the question's own words, and none of them supported: a bare "yes"
+    # the knowledge never backed.
+    fabricated = score_grounding(
+        "Yes, we do teeth whitening.", [chunk], False, question="Do you do teeth whitening?"
+    )
+    assert fabricated.score == 0.0
+    assert fabricated.reason == "question_echo_only"
+    # Without a question the scorer behaves exactly as before.
+    assert score_grounding("Yes, we do teeth whitening.", [chunk], False).score == 0.0

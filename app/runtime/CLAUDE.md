@@ -71,3 +71,11 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
 Before merge, ask whether this change could hide an unconfigured, failed,
 or tenant-crossing condition behind a successful-looking result. If so,
 make that state explicit and test it.
+- R6-6 (2026-09-13 dev walk): "Could you email me your Saturday opening hours?" retrieved the
+  clinic chunk and still handed off — the token-overlap proxy scored the draft 4/11 = 0.36
+  because the delivery offer the operating-context stanza asks for ("send a copy … best
+  address") and the customer's echoed words ("opening hours") have no chunk support.
+  `score_grounding` now drops delivery/courtesy words from the answer side (like the
+  pleasantry stopwords) and, given `question=`, drops unsupported words the customer used
+  (a restatement, not a claim). A fabricated fact behind the same offer still scores ~0.
+
