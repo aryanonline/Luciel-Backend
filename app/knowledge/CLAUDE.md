@@ -43,3 +43,11 @@ make that state explicit and test it.
   max(40, 4k); iterative_scan = relaxed_order on 0.8+) before the ANN query so a small tenant
   beside a large one still gets k. Docker/CI pin `pgvector/pgvector:0.8.0-pg17`; `/healthz`
   reports `pgvector_too_old:<ver>` below the pin.
+- F121b (2026-09-13 dev walk): the walk tenant's clinic-hours chunk carried a pre-cutover hash
+  vector stamped `text-embedding-3-small` by migration 0058's backfill — cosine distance 0.978
+  from every query, dropped by the live relevance floor on every turn, invisible to the
+  label-based re-embed. `service.verify_chunk_embeddings` (called by the knowledge_sync
+  sweep, 20 chunks per tenant per pass, `embedding_verified_at`) re-embeds any vector that
+  disagrees with a fresh embedding of its own text; migration 0065 also makes every tenant
+  with chunks a knowledge_sync candidate, not only tenants with a connected sync source.
+

@@ -12,6 +12,7 @@ RLS guarantees a tenant only ever ingests/retrieves its own knowledge.
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -738,6 +739,65 @@ def _rerank(
         return (band, -recency, chunk.ordinal, dist)
 
     return sorted(candidates, key=sort_key)
+
+
+#: A same-model embedding of the same text lands within a hair of the stored vector;
+#: anything past this is a vector that was never this text under this model.
+EMBEDDING_VERIFY_MAX_DISTANCE = 0.2
+
+
+def cosine_distance(a: list[float], b: list[float]) -> float:
+    """1 - cosine similarity; 1.0 when either vector is empty or all zeros."""
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 1.0
+    return 1.0 - dot / (na * nb)
+
+
+async def verify_chunk_embeddings(
+    session: AsyncSession, *, admin_id: uuid.UUID, limit: int = 20
+) -> tuple[int, int]:
+    """Check a bounded batch of never-verified chunks against a fresh embedding of their
+    own text and re-embed the ones that disagree (round 6 F121b).
+
+    The model label alone cannot catch a vector that came from another embedder but
+    carries the current name (migration 0058 backfilled every unlabelled row with the
+    live model), or a vector that is missing. Such a chunk sits past the relevance floor
+    on every query — the owner's knowledge is silently dead. Returns (checked, repaired);
+    every checked row is stamped so the pass converges over sweeps."""
+    embedder = get_embedder()
+    current = embedding_model_name(embedder)
+    rows = (
+        (
+            await session.execute(
+                select(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.admin_id == admin_id,
+                    KnowledgeChunk.embedding_verified_at.is_(None),
+                )
+                .order_by(KnowledgeChunk.created_at, KnowledgeChunk.ordinal)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0, 0
+    fresh = await embedder.embed([r.text for r in rows])
+    now = datetime.now(UTC)
+    repaired = 0
+    for row, vec in zip(rows, fresh, strict=True):
+        stored = list(row.embedding) if row.embedding is not None else []
+        if not stored or cosine_distance(stored, list(vec)) > EMBEDDING_VERIFY_MAX_DISTANCE:
+            row.embedding = vec
+            row.embedding_model = current
+            repaired += 1
+        row.embedding_verified_at = now
+    await session.flush()
+    return len(rows), repaired
 
 
 async def reembed_outdated_chunks(

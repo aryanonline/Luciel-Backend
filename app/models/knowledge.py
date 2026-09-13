@@ -63,6 +63,13 @@ class KnowledgeChunk(Base, TenantMixin, TimestampMixin):
     # Which embedding model produced ``embedding`` (2026-09-05 audit F121): the
     # knowledge_sync sweep re-embeds rows whose model is not the current pin.
     embedding_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # When the stored vector was last checked against a fresh embedding of the chunk's
+    # own text (round 6 F121b, 2026-09-13 dev walk): a label can lie — migration 0058
+    # stamped pre-cutover hash vectors with the live model's name — and a vector that
+    # does not match its text is unretrievable under the relevance floor forever.
+    embedding_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 # --- Graph store (Architecture §3.2.1 — Path Locked: PostgreSQL ONLY) ------------- #

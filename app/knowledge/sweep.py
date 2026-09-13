@@ -158,4 +158,12 @@ async def sync_due_connections(
             logger.info("knowledge_reembed chunks=%d", reembedded)
     except Exception:  # noqa: BLE001 — never fail the sweep on the re-embed pass
         logger.exception("knowledge_reembed_failed")
+    # A vector that does not match its own text (F121b): the label check above cannot
+    # see it; a bounded batch per pass is checked against a fresh embedding and repaired.
+    try:
+        checked, repaired = await service.verify_chunk_embeddings(session, admin_id=admin_id)
+        if checked:
+            logger.info("knowledge_embeddings_verified checked=%d repaired=%d", checked, repaired)
+    except Exception:  # noqa: BLE001 — never fail the sweep on the verify pass
+        logger.exception("knowledge_embeddings_verify_failed")
     return synced
