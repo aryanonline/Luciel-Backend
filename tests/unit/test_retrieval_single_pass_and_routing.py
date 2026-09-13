@@ -84,6 +84,31 @@ def test_the_floor_is_live_only_by_construction():
     assert knowledge_retrieval._relevance_floor_active() is False
 
 
+def test_the_floor_keeps_the_distances_a_real_question_lands_at():
+    """Round 6 R6-2, measured 2026-09-13 with text-embedding-3-small against a clinic
+    chunk: relevant questions 0.52–0.66, unrelated 0.71–0.91. The old ceiling of 0.6
+    dropped every relevant hit and the walk got a hand-off for "What are your hours?"."""
+    hits = [("hours", 0.619), ("insurance", 0.652), ("returns", 0.872), ("weather", 0.906)]
+    defaults = get_settings()
+    kept = knowledge_retrieval.apply_relevance_floor(
+        hits,
+        ceiling=defaults.knowledge_relevance_max_distance,
+        band=defaults.knowledge_relevance_band,
+    )
+    assert [c for c, _d in kept] == ["hours", "insurance"]
+    # The band: a hit far behind the best one is noise even under the ceiling.
+    kept = knowledge_retrieval.apply_relevance_floor(
+        [("best", 0.30), ("close", 0.42), ("far", 0.55)], ceiling=0.8, band=0.15
+    )
+    assert [c for c, _d in kept] == ["best", "close"]
+    # Nothing relevant at all: everything past the ceiling is dropped — honest "no sources".
+    assert knowledge_retrieval.apply_relevance_floor([("x", 0.85)], ceiling=0.8, band=0.15) == []
+    # Unscored hits are never judged.
+    assert knowledge_retrieval.apply_relevance_floor([("y", None)], ceiling=0.8, band=0.15) == [
+        ("y", None)
+    ]
+
+
 # --- fast routing hints ------------------------------------------------------------- #
 TOOLS = [{"name": "book_appointment", "input_schema": {}}]
 

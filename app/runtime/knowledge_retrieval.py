@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -122,6 +123,28 @@ def _relevance_floor_active() -> bool:
     return get_settings().integration_mode == "live"
 
 
+def apply_relevance_floor[Hit: tuple[Any, float | None]](
+    hits: Sequence[Hit], *, ceiling: float, band: float
+) -> list[Hit]:
+    """Drop hits past the absolute distance ``ceiling`` and hits more than ``band``
+    farther than the best hit (round 6 R6-2). Unscored hits are kept."""
+    scored = [float(hit[1]) for hit in hits if hit[1] is not None]
+    best = min(scored) if scored else None
+    kept: list[Hit] = []
+    for hit in hits:
+        d = hit[1]
+        if d is None:
+            kept.append(hit)
+            continue
+        dist = float(d)
+        if dist > ceiling:
+            continue
+        if best is not None and dist > best + band:
+            continue
+        kept.append(hit)
+    return kept
+
+
 async def hybrid_retrieve_bundle(
     session: AsyncSession,
     *,
@@ -135,9 +158,10 @@ async def hybrid_retrieve_bundle(
     The vector leg runs ONCE (one embedding, one ANN); graph facts join the prompt
     list for structured-filter intent exactly as ``hybrid_retrieve`` does. In live
     mode a chunk beyond the relevance floor (cosine distance above
-    ``knowledge_relevance_max_distance``) is dropped before it can be injected — an
-    unrelated chunk is noise the model may answer from, and an honest "no sources"
-    beats a confident answer from the wrong page."""
+    ``knowledge_relevance_max_distance``, or more than ``knowledge_relevance_band``
+    farther than the best hit) is dropped before it can be injected — an unrelated
+    chunk is noise the model may answer from, and an honest "no sources" beats a
+    confident answer from the wrong page."""
     intent = classify_intent(query)
     graph_facts: list[str] = []
     if intent is QueryIntent.structured_filter_intent:
@@ -160,8 +184,12 @@ async def hybrid_retrieve_bundle(
         emit_metric("KnowledgeRetrievalDegraded", dimensions={"Reason": unavailable_reason})
         vector_hits = []
     if _relevance_floor_active():
-        ceiling = get_settings().knowledge_relevance_max_distance
-        vector_hits = [(c, d) for c, d in vector_hits if d is None or float(d) <= ceiling]
+        settings = get_settings()
+        vector_hits = apply_relevance_floor(
+            vector_hits,
+            ceiling=settings.knowledge_relevance_max_distance,
+            band=settings.knowledge_relevance_band,
+        )
     attributed: list[dict[str, object]] = []
     if vector_hits:
         source_ids = {chunk.source_id for chunk, _d in vector_hits}

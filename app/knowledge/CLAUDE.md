@@ -43,11 +43,18 @@ make that state explicit and test it.
   max(40, 4k); iterative_scan = relaxed_order on 0.8+) before the ANN query so a small tenant
   beside a large one still gets k. Docker/CI pin `pgvector/pgvector:0.8.0-pg17`; `/healthz`
   reports `pgvector_too_old:<ver>` below the pin.
-- F121b (2026-09-13 dev walk): the walk tenant's clinic-hours chunk carried a pre-cutover hash
-  vector stamped `text-embedding-3-small` by migration 0058's backfill — cosine distance 0.978
-  from every query, dropped by the live relevance floor on every turn, invisible to the
-  label-based re-embed. `service.verify_chunk_embeddings` (called by the knowledge_sync
-  sweep, 20 chunks per tenant per pass, `embedding_verified_at`) re-embeds any vector that
-  disagrees with a fresh embedding of its own text; migration 0065 also makes every tenant
-  with chunks a knowledge_sync candidate, not only tenants with a connected sync source.
+- R6-2 (2026-09-13 dev walk): "What are your opening hours?" handed off with 0% grounding
+  although the clinic-hours chunk was ready. Cause: the live relevance floor. Measured with
+  text-embedding-3-small, relevant questions land at cosine distance 0.52–0.66 against a
+  real multi-topic chunk (0.619 for that question), unrelated ones at 0.71–0.91; the ceiling
+  of 0.6 dropped the relevant hits. Now `knowledge_relevance_max_distance` = 0.8 plus
+  `knowledge_relevance_band` = 0.15 relative to the best hit (`apply_relevance_floor`).
+- F121b (same walk, safety net): `service.verify_chunk_embeddings` (knowledge_sync sweep, 20
+  chunks per tenant per pass, `embedding_verified_at`) re-embeds a vector that disagrees with
+  a fresh embedding of its own text — the case migration 0058's backfill could create (a
+  pre-cutover hash vector stamped with the live name). Migration 0065 also makes every tenant
+  with chunks a knowledge_sync candidate. NEVER run the knowledge sweep from a mock-mode
+  container against live data: the Verify task is mock-mode and its hash embedder rewrote a
+  live tenant's chunks on 2026-09-13 (the live sweep restored them); both passes now refuse
+  to touch live-labelled rows when the mock embedder is active.
 

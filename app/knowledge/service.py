@@ -756,6 +756,16 @@ def cosine_distance(a: list[float], b: list[float]) -> float:
     return 1.0 - dot / (na * nb)
 
 
+def _rewriting_live_vectors_with_mock(current: str, label: str | None) -> bool:
+    """True when a MOCK embedder is about to overwrite a vector the live model produced
+    (2026-09-13: a sweep run from a mock-mode container re-embedded a live tenant's
+    chunks with hash vectors). The live model name is the configured pin."""
+    from app.config import get_settings  # noqa: PLC0415 — import cycle
+
+    live_model = str(get_settings().knowledge_embedding_model or "text-embedding-3-small")
+    return current == "hashing-mock" and label == live_model
+
+
 async def verify_chunk_embeddings(
     session: AsyncSession, *, admin_id: uuid.UUID, limit: int = 20
 ) -> tuple[int, int]:
@@ -784,6 +794,7 @@ async def verify_chunk_embeddings(
         .scalars()
         .all()
     )
+    rows = [r for r in rows if not _rewriting_live_vectors_with_mock(current, r.embedding_model)]
     if not rows:
         return 0, 0
     fresh = await embedder.embed([r.text for r in rows])
@@ -824,11 +835,14 @@ async def reembed_outdated_chunks(
         .scalars()
         .all()
     )
+    rows = [r for r in rows if not _rewriting_live_vectors_with_mock(current, r.embedding_model)]
     if not rows:
         return 0
     vectors = await embedder.embed([r.text for r in rows])
+    now = datetime.now(UTC)
     for row, vec in zip(rows, vectors, strict=True):
         row.embedding = vec
         row.embedding_model = current
+        row.embedding_verified_at = now  # a fresh same-model vector is verified by construction
     await session.flush()
     return len(rows)

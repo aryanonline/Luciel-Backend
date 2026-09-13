@@ -147,3 +147,33 @@ async def test_a_tenant_with_only_pasted_knowledge_is_a_knowledge_sync_candidate
             .all()
         )
     assert admin in set(rows)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_mock_embedder_never_rewrites_a_live_models_vectors():
+    """2026-09-13: a knowledge sweep run from a mock-mode container re-embedded a live
+    tenant's chunks with hash vectors. Rows labelled with the live model are left alone
+    by both passes when the current embedder is the mock."""
+    from app.config import get_settings
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    live_model = str(get_settings().knowledge_embedding_model or "text-embedding-3-small")
+    async with tenant_session(admin) as s:
+        await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="d", text="Open 9-5.", origin="paste"
+        )
+        await s.execute(
+            update(KnowledgeChunk)
+            .where(KnowledgeChunk.admin_id == admin)
+            .values(embedding=_garbage_vector(), embedding_model=live_model)
+        )
+    async with tenant_session(admin) as s:
+        assert await service.reembed_outdated_chunks(s, admin_id=admin) == 0
+        assert await service.verify_chunk_embeddings(s, admin_id=admin) == (0, 0)
+        row = (
+            await s.execute(select(KnowledgeChunk).where(KnowledgeChunk.admin_id == admin))
+        ).scalar_one()
+        assert row.embedding_model == live_model
+        assert row.embedding_verified_at is None
+        assert list(row.embedding) == _garbage_vector()

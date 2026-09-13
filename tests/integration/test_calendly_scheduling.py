@@ -20,7 +20,9 @@ pytestmark = [pytest.mark.asyncio]
 
 EVENT_TYPE = "https://api.calendly.com/event_types/ET-walk"
 USER = "https://api.calendly.com/users/U-walk"
-T0 = datetime(2026, 9, 12, 15, 0, tzinfo=UTC)
+# A week ahead of the wall clock: find_bookings searches forward from now, so a fixed
+# date went stale the day after it passed (the 2026-09-13 full suite caught it).
+T0 = (datetime.now(UTC) + timedelta(days=7)).replace(minute=0, second=0, microsecond=0)
 LEAD = "dana@lead.example"
 
 

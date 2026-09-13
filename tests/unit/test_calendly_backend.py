@@ -16,7 +16,9 @@ from app.tools.contract import ToolContext
 
 EVENT_TYPE = "https://api.calendly.com/event_types/ET1"
 USER = "https://api.calendly.com/users/U1"
-T0 = datetime(2026, 9, 10, 14, 0, tzinfo=UTC)
+# A week ahead of the wall clock: find_bookings searches forward from now, so a fixed
+# date went stale the day after it passed (the 2026-09-13 full suite caught it).
+T0 = (datetime.now(UTC) + timedelta(days=7)).replace(minute=0, second=0, microsecond=0)
 
 
 class _Backend(cb.CalendlyBackend):

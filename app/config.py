@@ -365,11 +365,16 @@ class Settings(BaseSettings):
     # pages per crawl and link depth, robots.txt honoured (F123).
     website_crawl_max_pages: int = 40
     website_crawl_max_depth: int = 2
-    # Retrieval relevance floor (cosine DISTANCE ceiling) applied in live mode before
-    # a chunk is injected into the prompt: an unrelated chunk is noise the model may
-    # answer from. Mock posture uses hashed vectors whose distances carry no meaning,
-    # so the floor is live-only.
-    knowledge_relevance_max_distance: float = 0.6
+    # Retrieval relevance floor applied in live mode before a chunk is injected into the
+    # prompt: an unrelated chunk is noise the model may answer from. Two rules, both
+    # cosine DISTANCE: an absolute ceiling, and a band relative to the best hit. Mock
+    # posture uses hashed vectors whose distances carry no meaning, so both are live-only.
+    # Measured 2026-09-13 with text-embedding-3-small on a real clinic chunk: relevant
+    # questions land at 0.52–0.66 ("What are your opening hours?" 0.619, "Do you take
+    # insurance?" 0.652), unrelated ones at 0.71–0.91. The previous ceiling of 0.6 dropped
+    # the relevant ones and every answer became a hand-off (round 6 dev walk, R6-2).
+    knowledge_relevance_max_distance: float = 0.8
+    knowledge_relevance_band: float = 0.15
 
     def model_post_init(self, __context: object) -> None:
         """Overlay platform-owned OAuth app credentials from the platform-secret
