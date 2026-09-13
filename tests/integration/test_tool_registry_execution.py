@@ -265,7 +265,19 @@ async def test_schedule_callback_durably_writes_a_deferred_action() -> None:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_send_email_executes_through_the_platform_sender() -> None:
+async def test_send_email_goes_out_as_the_tenant_mailbox(monkeypatch) -> None:
+    """Round 6 WP-H (F141): the tool sends AS the tenant through the same seam channel
+    replies use (send_outbound_email) — never the platform SES identity."""
+    from app.channels import outbound
+    from app.channels.outbound import DeliveryReceipt
+
+    sent: list[dict[str, object]] = []
+
+    async def fake_send(session, admin_id, instance_id, *, to, body, subject=None):
+        sent.append({"to": to, "body": body, "subject": subject})
+        return DeliveryReceipt(accepted=True, provider_message_id="mailbox-msg-1")
+
+    monkeypatch.setattr(outbound, "send_outbound_email", fake_send)
     admin = uuid.uuid4()
     iid = await _seed(
         admin,
@@ -285,7 +297,38 @@ async def test_send_email_executes_through_the_platform_sender() -> None:
         # ok = accepted-for-delivery, not inbox-delivered (§3.3.6 honesty).
         assert res.outcome is Outcome.ok
         assert res.payload["state"] == "accepted_for_delivery"
-        assert res.payload["providerMessageId"]
+        assert res.payload["providerMessageId"] == "mailbox-msg-1"
+    assert sent == [
+        {
+            "to": "lead@example.com",
+            "body": "Following up.",
+            "subject": "A message from your assistant",
+        }
+    ]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_send_email_with_no_usable_mailbox_is_provider_rejected() -> None:
+    """The seeded 'platform' email_sender row has no mailbox and no provisioned address:
+    the tool must say so (provider_rejected), never fabricate an accepted send."""
+    admin = uuid.uuid4()
+    iid = await _seed(
+        admin,
+        authorize=["send_email"],
+        channels=[{"id": "email", "enabled": True}],
+        connections=["email_sender"],
+    )
+    tool = build_tool("send_email")
+    assert tool is not None
+    async with tenant_session(admin) as s:
+        res = await ToolBroker(s).dispatch(
+            tool,
+            {"to": "lead@example.com", "body": "Following up."},
+            admin_id=admin,
+            instance_id=iid,
+        )
+        assert res.outcome is Outcome.failed
+        assert res.reason == "provider_rejected"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -478,9 +521,11 @@ async def test_google_calendar_connection_gets_the_real_booking_backend() -> Non
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_calendly_stays_honestly_unavailable() -> None:
-    """No Calendly OAuth client is registered yet, so a Calendly calendar must keep
-    failing cleanly rather than borrowing the Google backend and booking nowhere."""
+async def test_calendly_without_its_account_details_is_failed_never_empty() -> None:
+    """Round 6 WP-H (F055): Calendly dispatches through its own backend. A row with a
+    token but no user/event-type details (the verifier never ran) is a structured
+    failure naming the Calendly backend — never the Google one, never an ``empty`` that
+    would read as "no slots"."""
     admin = uuid.uuid4()
     iid = await _seed_calendar(admin, "calendly")
     tool = build_tool("book_appointment")
@@ -494,7 +539,8 @@ async def test_calendly_stays_honestly_unavailable() -> None:
             instance_id=iid,
         )
     assert res.outcome is Outcome.failed
-    assert res.reason == "calendar_error: BackendNotConnected"
+    assert res.outcome is not Outcome.empty
+    assert res.reason == "calendar_error: CalendlyUnavailable"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -519,8 +565,15 @@ async def test_google_calendar_without_a_stored_token_is_failed_never_empty() ->
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_every_dispatch_outcome_is_traced() -> None:
+async def test_every_dispatch_outcome_is_traced(monkeypatch) -> None:
     """§3.3.4 rule 3 — including the refusals, which is where a silent drop would hide."""
+    from app.channels import outbound
+    from app.channels.outbound import DeliveryReceipt
+
+    async def accepted(session, admin_id, instance_id, *, to, body, subject=None):
+        return DeliveryReceipt(accepted=True, provider_message_id="m")
+
+    monkeypatch.setattr(outbound, "send_outbound_email", accepted)
     admin = uuid.uuid4()
     iid = await _seed(
         admin,

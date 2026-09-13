@@ -164,12 +164,10 @@ async def test_unconfigured_oauth_providers_report_configured_false(client):
 
     for provider in ("google_calendar", "calendly", "meta", "instagram"):
         assert by_provider[provider]["configured"] is False, provider
-    # live_connector joined the honest-disabled set in Phase 4 (audit round 3):
-    # its lookup effect layer is unbuilt, so offering the form would take a
-    # credential for a tool that answers `failed` on every call.
-    assert by_provider["live_connector"]["configured"] is False
-
-    for provider in ("twilio", "custom_webhook", "csv"):
+    # Round 6 WP-H (F062): the live record connector's lookup effect layer is built
+    # (LiveRecordBackend through the pinned sandbox transport), so its credential form
+    # is offered like every other BYO-credential provider.
+    for provider in ("twilio", "custom_webhook", "csv", "live_connector"):
         assert by_provider[provider]["configured"] is True, provider
 
 
