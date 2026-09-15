@@ -636,6 +636,9 @@ class Orchestrator:
             admin_id=admin_id,
             instance_id=instance_id,
             has_payment_method=self.has_payment_method,
+            # Legal §A3 #3: a conversation already counted is served to its end; the
+            # cap gates NEW conversations (round 7 WP-1 #1).
+            session_id=session_id,
         )
         if budget_state.at_cap:
             # Graceful single-turn reply WITHOUT an LLM call; escalation row signal

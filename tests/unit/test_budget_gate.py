@@ -63,6 +63,45 @@ async def test_at_cap_when_free_allowance_consumed_and_no_payment_method():
         assert with_pm.at_cap is False
 
 
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_counted_session_is_never_at_cap_but_a_new_one_is():
+    """Legal §A3 #3 / round 7 WP-1 #1: the cap gates NEW conversations. A session
+    already in the fire-once ledger is one the tenant was counted for, so the gate
+    keeps serving it after the counter reaches the free allowance — the 50th free
+    conversation used to be cut after the very turn that counted it."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    in_flight = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        state0 = await budget.check_budget(s, admin_id=admin, instance_id=iid)
+        for _ in range(state0.free_allowance - 1):
+            await budget.count_session_once(
+                s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+            )
+        # The 50th conversation counts itself on its first served turn.
+        assert await budget.count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=in_flight
+        )
+        assert (await budget.check_budget(s, admin_id=admin, instance_id=iid)).at_cap is True
+
+        # Its next turn names the session and is still served.
+        continuing = await budget.check_budget(
+            s, admin_id=admin, instance_id=iid, session_id=in_flight
+        )
+        assert continuing.at_cap is False
+        assert continuing.counted == state0.free_allowance  # the read mutates nothing
+        # A conversation the ledger has never seen is what the cap is for.
+        fresh = await budget.check_budget(
+            s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
+        )
+        assert fresh.at_cap is True
+        # A live card lifts the cap for everyone, counted or not.
+        assert (
+            await budget.check_budget(
+                s, admin_id=admin, instance_id=iid, has_payment_method=True, session_id=uuid.uuid4()
+            )
+        ).at_cap is False
+
+
 # --- the period anchor (P0-4) ---------------------------------------------- #
 
 
