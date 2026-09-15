@@ -206,6 +206,11 @@ class Settings(BaseSettings):
     # escalation, dunning, export-ready) via SES (§3.1.2/§3.6.7). Must be a
     # SES-verified identity. Empty in mock/CI -> NullEmailSender (audit-only).
     platform_email_sender: str = ""
+    # Where the marketing contact form lands (owner decision D12, 2026-09-14): the one
+    # address the business operates. Distinct from the SES sender identity above (the
+    # From), which need not be a mailbox anyone reads. Override per environment through
+    # the platform secret's PLATFORM_CONTACT_INBOX.
+    platform_contact_inbox: str = "info@vantagemind.ai"
     # Round 5B item 13 — SES configuration set routing bounce/complaint events to
     # SNS, and the topic the events webhook pins its subscriptions to. Empty =
     # the pipeline is off (mock/CI); deployed envs set both via the platform
@@ -430,6 +435,7 @@ class Settings(BaseSettings):
             "MICROSOFT_REDIRECT_URI": "microsoft_redirect_uri",
             "MICROSOFT_CLIENT_SECRET": "microsoft_client_secret",  # nosec B105
             "PLATFORM_EMAIL_SENDER": "platform_email_sender",
+            "PLATFORM_CONTACT_INBOX": "platform_contact_inbox",
             # Not secret material, but it is per-environment Stripe account state that
             # travels with the Stripe keys — so it is rotated in the same blob rather
             # than pinned in a task definition.

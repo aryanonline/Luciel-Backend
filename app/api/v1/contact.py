@@ -70,8 +70,14 @@ async def _notify(submission_id: uuid.UUID, payload: ContactIn) -> bool:
     from app.config import get_settings
     from app.notifications.email_sender import build_email_sender
 
-    recipient = get_settings().platform_email_sender
-    if not recipient:
+    settings = get_settings()
+    # The inbox a person reads (info@vantagemind.ai by default; D12), never merely the
+    # SES sender identity — sending still needs that identity as the From, which
+    # build_email_sender resolves.
+    recipient = settings.platform_contact_inbox
+    # No sender identity (mock/CI) means nothing can leave the process: say so
+    # honestly rather than counting a Null send as a notification.
+    if not recipient or not settings.platform_email_sender:
         return False
     body = (
         f"From: {payload.name} <{payload.email}>\n"
