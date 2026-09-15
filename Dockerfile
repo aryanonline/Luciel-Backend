@@ -1,6 +1,6 @@
 # Luciel backend — production image (Phase B compute, §5.5).
 # Multi-stage: build deps with uv, run a slim non-root runtime.
-FROM python:3.12-slim AS base
+FROM python:3.12.14-slim AS base
 # Apply OS security upgrades at build time so the image doesn't ship stale base
 # CVEs. The python:3.12-slim base carries perl (CVE-2026-12087, CRITICAL) which
 # ECR scan-on-push blocks (§5.14); `apt-get upgrade` pulls the patched perl even

@@ -69,10 +69,10 @@ jobs:
           npm ci --no-audit --no-fund >/dev/null 2>&1 || true
           npm outdated 2>&1 | tee ../outdated-infra.txt || true
 
-      - name: Image CVE waivers expiring within 14 days
+      - name: Image CVE waivers expiring within 35 days
         id: expiry
         continue-on-error: true
-        run: python3 scripts/allowlist_expiry.py --within-days 14 --markdown expiry.md
+        run: python3 scripts/allowlist_expiry.py --within-days 35 --markdown expiry.md
 
       - name: Configure AWS credentials (OIDC, dev deploy role)
         id: aws
@@ -112,7 +112,7 @@ jobs:
             echo "## pip-audit — **$AUDIT_OUTCOME**"
             echo '```'; tail -n 40 audit.txt 2>/dev/null || echo "(no output)"; echo '```'
             echo
-            echo "## Image CVE waivers — **$EXPIRY_OUTCOME** (⚠️ = expires within 14 days)"
+            echo "## Image CVE waivers — **$EXPIRY_OUTCOME** (⚠️ = expires within 35 days)"
             cat expiry.md 2>/dev/null || echo "(no waivers file)"
             echo
             echo "## Latest dev image scan (severity counts)"
