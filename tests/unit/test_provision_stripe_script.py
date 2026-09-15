@@ -71,8 +71,26 @@ def make_fake_stripe() -> tuple[types.SimpleNamespace, dict]:
             state["prices"].append(price)
             return price
 
+    state["portals"] = []
+
+    class Configuration:
+        @staticmethod
+        def list(**_kw):
+            return {"data": list(state["portals"])}
+
+        @staticmethod
+        def create(**kw):
+            state["creates"] += 1
+            cfg = {"id": f"bpc_{len(state['portals']) + 1}", **kw}
+            state["portals"].append(cfg)
+            return cfg
+
     mod = types.SimpleNamespace(
-        billing=types.SimpleNamespace(Meter=Meter), Product=Product, Price=Price, api_key=None
+        billing=types.SimpleNamespace(Meter=Meter),
+        billing_portal=types.SimpleNamespace(Configuration=Configuration),
+        Product=Product,
+        Price=Price,
+        api_key=None,
     )
     return mod, state
 
@@ -104,6 +122,33 @@ def test_fresh_account_provisions_meter_product_price_with_the_gateway_shape():
         "meter": meter["id"],
     }
     assert price["metadata"] == {"luciel_key": "payg_block_3900"}
+
+    # Round 7 WP-1: the Billing Portal configuration the "Update payment method"
+    # path names explicitly (test mode has no Dashboard default until a person
+    # saves one). Card update + invoice history ONLY — never subscription changes.
+    (portal,) = state["portals"]
+    assert portal["metadata"] == {"luciel_key": "portal_default"}
+    assert portal["features"]["payment_method_update"] == {"enabled": True}
+    assert portal["features"]["invoice_history"] == {"enabled": True}
+    assert portal["features"]["subscription_cancel"] == {"enabled": False}
+    assert portal["features"]["subscription_update"] == {"enabled": False}
+    assert portal["features"]["customer_update"] == {"enabled": False}
+    app_base = get_settings().app_base_url.rstrip("/")
+    assert portal["default_return_url"] == f"{app_base}/dashboard/billing"
+    assert portal["business_profile"]["terms_of_service_url"] == f"{app_base}/legal/terms"
+    assert portal["business_profile"]["privacy_policy_url"] == f"{app_base}/legal/privacy"
+
+
+def test_a_portal_configuration_that_allows_subscription_changes_is_refused():
+    fake, state = make_fake_stripe()
+    assert script.provision(fake, verify_only=False) == 0
+    # Sabotage: same tag, but someone enabled cancellation in the Dashboard.
+    state["portals"][0]["features"]["subscription_cancel"] = {"enabled": True}
+
+    creates_before = state["creates"]
+    assert script.provision(fake, verify_only=False) == 1
+    assert state["creates"] == creates_before  # refused loudly; nothing new created
+    assert script.provision(fake, verify_only=True) == 1
 
 
 def test_a_second_run_creates_nothing():

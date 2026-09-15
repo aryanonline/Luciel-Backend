@@ -150,6 +150,14 @@ class Settings(BaseSettings):
     # the platform secret's STRIPE_PAYG_PRICE_ID. Empty is correct for mock mode, where
     # nothing is billed at all.
     stripe_payg_price_id: str = ""
+    # The Stripe Billing Portal configuration (``bpc_...``) the "Update payment method"
+    # path opens (round 7 WP-1). Named explicitly because Stripe's test mode has no
+    # default configuration until a person saves one in the Dashboard, and because an
+    # explicit id pins WHAT the portal may do (card update + invoice history, never a
+    # subscription change) to the object scripts/provision_stripe_test.py creates.
+    # Per environment via LUCIEL_STRIPE_PORTAL_CONFIGURATION_ID or the platform
+    # secret's STRIPE_PORTAL_CONFIGURATION_ID; empty means "Stripe's default".
+    stripe_portal_configuration_id: str = ""
 
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
@@ -440,6 +448,7 @@ class Settings(BaseSettings):
             # travels with the Stripe keys — so it is rotated in the same blob rather
             # than pinned in a task definition.
             "STRIPE_PAYG_PRICE_ID": "stripe_payg_price_id",
+            "STRIPE_PORTAL_CONFIGURATION_ID": "stripe_portal_configuration_id",
             # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret,
             # rather than needing a task-definition change to reach every account.
             "PLATFORM_NOTICES": "platform_notices",
