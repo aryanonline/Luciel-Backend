@@ -94,6 +94,24 @@ export interface EnvConfig {
    */
   readonly redisSnapshotRetentionDays: number;
   /**
+   * ElastiCache node type. The cache holds LLM-cap counters and abuse ceilings —
+   * kilobytes of TTL'd keys — so the smallest Graviton node fits every
+   * environment today; it is a knob so prod can grow without a construct edit.
+   */
+  readonly redisNodeType: string;
+  /**
+   * Total Redis nodes in the replication group (one primary + replicas).
+   * 1 in dev: Redis cannot scale to zero, and a dev cache that dies rebuilds
+   * itself. 2 in preprod/prod: a replica in the SECOND AZ with automatic
+   * failover — the Multi-AZ replication Architecture §4.4 promises production.
+   * Before this knob every environment ran the single dev node (round 7 WP-8):
+   * a lost AZ took the abuse ceilings and LLM caps down with it, and the app's
+   * fallback is per-task in-memory counters that reset on every deploy (which
+   * live /healthz reports as a degraded binding). Preprod mirrors prod so the
+   * release rehearsal exercises the failover-capable shape.
+   */
+  readonly redisNodes: number;
+  /**
    * Cheap-idle pause switch (§ pause/resume). When true, EVERY ECS service in the
    * environment (backend control/data plane + frontend web) is set to desiredCount
    * 0 so compute cost drops to zero while the data layer floor remains. Reversible
@@ -155,6 +173,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     productionPosture: false,
     logRetention: logs.RetentionDays.ONE_MONTH,
     redisSnapshotRetentionDays: 0,
+    redisNodeType: 'cache.t4g.micro',
+    redisNodes: 1, // single node: dev is single-AZ by design (§4)
     paused: false,
     stripeIntegrationPosture: 'test',
     // Dev's measured run-rate (Cost Explorer 2026-09-01..13) is ≈ $195/mo
@@ -187,6 +207,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // is already longer than any preprod log can be worth reading.
     logRetention: logs.RetentionDays.ONE_WEEK,
     redisSnapshotRetentionDays: 0,
+    // Prod-shaped: primary + one replica across the two AZs, automatic failover.
+    redisNodeType: 'cache.t4g.micro',
+    redisNodes: 2,
     paused: false,
     // Prod-shaped in sizing, but the Stripe rehearsal runs against TEST keys - preprod
     // must never move money, and 'live' is not a value this seam accepts anyway.
@@ -208,6 +231,10 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     productionPosture: true,
     logRetention: logs.RetentionDays.THREE_MONTHS, // doctrine §5.1: 90d app logs
     redisSnapshotRetentionDays: 0,
+    // Architecture §4.4: Multi-AZ replication in prod — primary + one replica in
+    // the second AZ with automatic failover (~$12/mo for the second t4g.micro).
+    redisNodeType: 'cache.t4g.micro',
+    redisNodes: 2,
     paused: false,
     // NOT 'test': prod must not bill against a Stripe test account, and the live
     // cutover is owner-gated and unimplemented. 'mock' keeps prod honest - /healthz
