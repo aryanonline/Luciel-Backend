@@ -98,6 +98,13 @@ def degraded_bindings() -> list[str]:
     # would bind the process-wide instance as a side effect of a health check.
     if settings.stripe_integration_posture != "test":
         degraded.append("stripe_gateway:FakeStripeGateway")
+    if settings.stripe_integration_posture != "mock" and not settings.stripe_payg_price_id:
+        # Round 7 WP-1 #4: a real Stripe binding with no metered price is a deployment
+        # that saves cards and then cannot bill a single block — usage past the free
+        # 50 accrues on the watermark and never reaches an invoice. Reported here (a
+        # NAME, never a value) so the gap is loud before the first tenant crosses 50.
+        # Mock posture bills nothing by design, so an empty price is correct there.
+        degraded.append("stripe_payg_price:unset")
     if not live_mode():
         degraded.append("llm:EchoModel")
     # Round 5B item 17: hCaptcha in live mode. With no secret configured, captcha

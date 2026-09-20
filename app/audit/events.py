@@ -49,6 +49,12 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # §3.4.1b: the free-allowance anchor moved from the calendar month to the Stripe
         # billing period the moment billing began (payload: old + new anchor dates).
         "billing_period_anchored",
+        # Round 7 WP-1 #4: a live-card tenant accrued PAYG blocks that could not be
+        # reported because the deployment has no metered price bound
+        # (STRIPE_PAYG_PRICE_ID empty in a non-mock Stripe posture). Once per
+        # (tenant, accrual period); payload: the period + the unreported block count,
+        # never a key. The blocks stay on the watermark until a price is bound.
+        "billing_meter_unbound",
         "connection_status_changed",
         # A push_to_crm upsert landed (§3.3.6 traced create-vs-update history).
         # Payload: provider + action + record id — never lead PII (§3.4.11).
