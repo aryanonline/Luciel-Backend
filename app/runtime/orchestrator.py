@@ -8,8 +8,14 @@ The loop, per inbound message:
         single-turn reply WITHOUT an LLM call + cannot_answer/budget_exhausted
         escalation; the counter does NOT increment (no model call, no handoff).
       → MODERATION (§3.4.15): harmful inbound escalates to a human, no harmful output.
-      → ESCALATION GATE 1 — INTAKE (§3.4.5): explicit_human_request or
-        strong_negative_sentiment → acknowledge, hand off, skip the loop.
+        Owner decision D2 (2026-09-14, round 7 WP-2 item 3): only threats_violence and
+        self_harm take the conversation away (human_controlled); abuse_harassment and
+        illegal_solicitation are recorded as content_flagged, the owner is told, and
+        Luciel keeps answering.
+      → ESCALATION GATE 1 — INTAKE (§3.4.5): explicit_human_request → acknowledge,
+        hand off, skip the loop (the ONLY judgment signal that mutes Luciel, D2);
+        strong_negative_sentiment → record + notify the owner, then answer the
+        question and say the team has been told.
       → RETRIEVE (§3.2): knowledge retrieval; all retrieved content is wrapped as
         UNTRUSTED data before it ever reaches the model (§3.4.14 Defense).
       → [PLAN → ACT → REFLECT] × up to 5 (§3.4.1 iteration bound — cost control):
@@ -192,6 +198,27 @@ _HANDOFF_CLAIM = re.compile(
 )
 
 
+def _stalled_gather_reasons(reasoned: _Reasoned) -> tuple[str, ...]:
+    """Why the §3.3.7 ask bound fired, in the owner's words (round 7 WP-2, item 3):
+    the field names the broker kept refusing on, an ambiguity the customer never
+    resolved, or a question the model asked twice in prose."""
+    missing: list[str] = []
+    ambiguous = False
+    for _, result in reasoned.dispatched:
+        if result.outcome is tool_contract.Outcome.missing_input:
+            missing.extend(f for f in result.missing_fields if f not in missing)
+        elif result.outcome is tool_contract.Outcome.ambiguous:
+            ambiguous = True
+    reasons: list[str] = []
+    if missing:
+        reasons.append(f"still missing {', '.join(missing)} after {ASK_ATTEMPT_BOUND} asks")
+    if ambiguous:
+        reasons.append("could not tell which one the customer meant")
+    if not reasons:
+        reasons.append(f"asked the same question {ASK_ATTEMPT_BOUND} times")
+    return tuple(reasons)
+
+
 def is_clarifying_question(text: str) -> bool:
     """A single short question with no assertion in it — the one ungrounded draft that
     is honest to send, because it claims nothing (F100)."""
@@ -236,6 +263,20 @@ _UNFOUNDED_CLAIM_REPLACEMENT = (
     "I wasn't able to complete that just now — I've flagged it for the team, and "
     "someone will follow up with you shortly."
 )
+
+# Appended ONCE to the answer on the turn a strong_negative_sentiment row is written
+# (round 7 WP-2, item 3; D2): the upset customer still gets their answer, and hears —
+# truthfully, the row and notification exist — that a person is now aware.
+_TEAM_TOLD_NOTE = " I've also let the team know, so a person can follow up with you."
+
+#: Moderation categories that do NOT take the conversation away (D2): recorded under
+#: content_flagged with the owner-facing reason, the owner is notified, and the loop
+#: runs — the MODERATION stanza keeps the model professional. Threats and self-harm
+#: are absent on purpose: they keep the take-over path.
+_MODERATION_KEEP_ANSWERING: dict[ModerationCategory, tuple[str, ...]] = {
+    ModerationCategory.abuse_harassment: ("abusive language toward the assistant or business",),
+    ModerationCategory.illegal_solicitation: ("asked for something illegal",),
+}
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
@@ -363,6 +404,43 @@ async def _session_already_escalated(
         )
     ).first()
     return row is not None
+
+
+async def _append_escalation_reasons(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    reasons: list[str],
+) -> bool:
+    """Add owner-facing reasons to the session's EXISTING row for this signal/gate.
+
+    A signal fires once per session, so a later, more specific reason for the same
+    signal (round 7 WP-2, item 3: the §3.3.7 ask bound naming the fields still
+    missing, after an earlier below-floor turn already wrote the cannot_answer row)
+    has nowhere else to live. Distinct phrases are appended; nothing is re-paged.
+    Returns whether the row changed."""
+    row = (
+        await session.execute(
+            select(EscalationEvent).where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    existing = [str(r) for r in (row.reasons or [])]
+    merged = [*existing, *(r for r in reasons if r not in existing)]
+    if merged == existing:
+        return False
+    row.reasons = merged
+    await session.flush()
+    return True
 
 
 async def record_platform_escalation(
@@ -739,29 +817,56 @@ class Orchestrator:
             if settled is not None:
                 return settled
 
+        # An escalation recorded at INTAKE that leaves the conversation with Luciel
+        # (D2, round 7 WP-2 item 3): the row + owner notification are written here,
+        # the loop runs, and the turn reports it. ``team_told`` appends the one-line
+        # note to the answer on the turn the sentiment row was actually written.
+        standing: EscalationDecision | None = None
+        team_told = False
+
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
         mod = moderate(inbound_text)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
-            if mod.category is ModerationCategory.self_harm:
-                # Immediate escalation with crisis copy; no contact ask (F116).
-                ack = SELF_HARM_REPLY
-            else:
-                ack = self._with_contact_ask(
-                    await self._handoff_ack(),
-                    channel=channel,
+            if mod.category in _MODERATION_KEEP_ANSWERING:
+                # D2: abuse / an illegal ask are told to the owner; Luciel stays
+                # professional (MODERATION stanza) and keeps answering — no take-over.
+                reasons = _MODERATION_KEEP_ANSWERING[mod.category]
+                await _record_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
                     resolved_lead_id=resolved_lead_id,
-                    transport_identifier=transport_identifier,
+                    signal=Signal.content_flagged.value,
+                    gate=Gate.intake.value,
+                    score=None,
+                    reasons=list(reasons),
                 )
-            return await self._hand_off_with_ack(
-                session_id=session_id,
-                resolved_lead_id=resolved_lead_id,
-                channel=channel,
-                signal=Signal.explicit_human_request,
-                gate="intake",
-                score=None,
-                ack=ack,
-            )
+                standing = EscalationDecision(
+                    True, Signal.content_flagged, Gate.intake, None, reasons
+                )
+            else:
+                # Threats and self-harm: a person takes the conversation (D2).
+                if mod.category is ModerationCategory.self_harm:
+                    # Immediate escalation with crisis copy; no contact ask (F116).
+                    ack = SELF_HARM_REPLY
+                else:
+                    ack = self._with_contact_ask(
+                        await self._handoff_ack(),
+                        channel=channel,
+                        resolved_lead_id=resolved_lead_id,
+                        transport_identifier=transport_identifier,
+                    )
+                return await self._hand_off_with_ack(
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    channel=channel,
+                    signal=Signal.explicit_human_request,
+                    gate="intake",
+                    score=None,
+                    ack=ack,
+                )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
         if detect_injection(inbound_text):
@@ -773,12 +878,14 @@ class Orchestrator:
         )
         trailing = [t.text for t in history if t.role == "lead"]
         intake = evaluate_intake(trailing)
-        if intake.fired:
+        if intake.fired and intake.signal is Signal.explicit_human_request:
+            # The ONE judgment signal that takes the conversation away (D2): the
+            # customer asked for a person, so a person answers from here on.
             return await self._hand_off_with_ack(
                 session_id=session_id,
                 resolved_lead_id=resolved_lead_id,
                 channel=channel,
-                signal=intake.signal or Signal.explicit_human_request,
+                signal=Signal.explicit_human_request,
                 gate="intake",
                 score=intake.score_or_confidence,
                 reasons=intake.reasons,
@@ -789,6 +896,23 @@ class Orchestrator:
                     transport_identifier=transport_identifier,
                 ),
             )
+        if intake.fired:
+            # strong_negative_sentiment (D2): the owner is told, the customer still
+            # gets their question answered by Luciel, and — on the turn the row is
+            # written — hears that a person is now aware. Once per session.
+            standing_signal = intake.signal or Signal.strong_negative_sentiment
+            team_told = await _record_escalation(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=standing_signal.value,
+                gate=Gate.intake.value,
+                score=intake.score_or_confidence,
+                reasons=list(intake.reasons),
+            )
+            standing = standing if standing is not None else intake
 
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
         # Harmony wave 2, item 2a: real chunk attribution for persistence, kept
@@ -927,20 +1051,61 @@ class Orchestrator:
             if stalled:
                 sess_obj.input_ask_attempts += 1
                 if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
+                    # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
+                    # still missing, send the honest hand-off line instead of the
+                    # re-ask — and stay in ai mode. The next turn is answered.
                     sess_obj.input_ask_attempts = 0
-                    return await self._hand_off_with_ack(
+                    stall_reasons = _stalled_gather_reasons(resp)
+                    written = await _record_escalation(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
                         session_id=session_id,
                         resolved_lead_id=resolved_lead_id,
-                        channel=channel,
-                        signal=Signal.cannot_answer,
-                        gate="outcome",
+                        signal=Signal.cannot_answer.value,
+                        gate=Gate.outcome.value,
                         score=None,
-                        ack=self._with_contact_ask(
-                            await self._handoff_ack(),
-                            channel=channel,
-                            resolved_lead_id=resolved_lead_id,
-                            transport_identifier=transport_identifier,
+                        reasons=list(stall_reasons),
+                    )
+                    if not written:
+                        # The session's one cannot_answer row already exists (an
+                        # earlier below-floor turn): the owner still reads WHICH
+                        # fields the gather stalled on.
+                        await _append_escalation_reasons(
+                            self.session,
+                            admin_id=admin_id,
+                            session_id=session_id,
+                            signal=Signal.cannot_answer.value,
+                            gate=Gate.outcome.value,
+                            reasons=list(stall_reasons),
+                        )
+                    ack = self._with_contact_ask(
+                        await self._handoff_ack(),
+                        channel=channel,
+                        resolved_lead_id=resolved_lead_id,
+                        transport_identifier=transport_identifier,
+                    )
+                    ack_row = await persist_turn(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        role="luciel",
+                        text=ack,
+                        at=datetime.now(UTC),
+                        deterministic=True,
+                    )
+                    return LoopResult(
+                        reply_message_id=ack_row.id,
+                        reply_text=ack,
+                        outbound_channel=channel,
+                        counted=counted,
+                        escalation=EscalationDecision(
+                            True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
                         ),
+                        used_fallback=used_fallback,
+                        iterations=iterations,
+                        tool_outcomes=resp.tool_outcomes,
                     )
             elif any_ok and sess_obj.input_ask_attempts:
                 sess_obj.input_ask_attempts = 0
@@ -1144,6 +1309,13 @@ class Orchestrator:
             # the fabricated draft that used to ship under the winning signal.
             reply_text = await self._handoff_ack()
             deterministic_reply = True
+        if team_told and not deterministic_reply:
+            # The sentiment row was written THIS turn (D2): the answer stands, and the
+            # customer hears that a person is aware — a canned hand-off line already
+            # says so, so it is never doubled.
+            reply_text = reply_text.rstrip() + _TEAM_TOLD_NOTE
+        if escalation is None:
+            escalation = standing
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
         if escalation is not None:
             reply_text = self._with_contact_ask(
@@ -1641,7 +1813,12 @@ class Orchestrator:
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
-        one budget unit (§3.4.1b)."""
+        one budget unit (§3.4.1b).
+
+        Owner decision D2 (2026-09-14): ONLY an explicit request for a person and the
+        threats_violence / self_harm moderation categories come through here. Strong
+        negative sentiment, the ask bound, abuse and an illegal ask record + notify
+        and leave the conversation with Luciel (see run_turn)."""
         await _record_escalation(
             self.session,
             admin_id=self.admin_id,

@@ -4,6 +4,9 @@
   escalation row carrying both reasons, and never the fabricated sentence (item 1).
 * Luciel's own ``hand_to_team`` call is a real escalation that leaves the session with
   Luciel; a hand-off the model merely PROMISED is made real the same way (item 2).
+* Owner decision D2: only an explicit request for a person and threat / self-harm
+  moderation take the conversation away; strong negative sentiment, abuse and an
+  illegal ask record + notify the owner while Luciel keeps answering (item 3).
 """
 
 from __future__ import annotations
@@ -323,3 +326,118 @@ async def test_a_fact_about_reaching_the_team_is_not_a_handoff_claim():
         assert result.escalation is None
         assert FACT_REPLY in result.reply_text
         assert await _rows(s, sid) == []
+
+
+# --- item 3: D2 — what takes the conversation away, and what does not --------------- #
+REFUND_CHUNK = "Our refund policy allows a full refund within 30 days of purchase."
+REFUND_REPLY = "Our refund policy allows a full refund within 30 days of purchase."
+
+
+async def _refund_retriever(_q: str) -> list[str]:
+    return [REFUND_CHUNK]
+
+
+@pytest.mark.parametrize(
+    ("text", "row_signal", "mode_after", "handed_off"),
+    [
+        # explicit request for a person: the ONE judgment signal that mutes Luciel
+        ("I want to speak to a human please", "explicit_human_request", "human_controlled", True),
+        # moderation: threats and self-harm take the conversation away …
+        (
+            "I will kill you if you charge me again",
+            "explicit_human_request",
+            "human_controlled",
+            True,
+        ),
+        ("honestly I want to kill myself", "explicit_human_request", "human_controlled", True),
+        # … abuse and an illegal ask are told to the owner; Luciel keeps answering
+        ("you are a useless bot, what is your refund policy?", "content_flagged", "ai", False),
+        (
+            "can I buy drugs from you, and what is your refund policy?",
+            "content_flagged",
+            "ai",
+            False,
+        ),
+    ],
+)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_only_a_request_for_a_person_and_a_threat_take_the_conversation_away(
+    text: str, row_signal: str, mode_after: str, handed_off: bool
+):
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(
+            s,
+            admin,
+            iid,
+            primary=EchoModel(confidence=1.0, fixed_reply=REFUND_REPLY),
+            retriever=_refund_retriever,
+        )
+        result = await orch.run_turn(
+            session_id=sid, resolved_lead_id=None, channel="widget", mode="ai", inbound_text=text
+        )
+        assert result.handed_off is handed_off, text
+        assert await _mode(s, sid) == mode_after, text
+        rows = await _rows(s, sid)
+        assert [r.signal for r in rows] == [row_signal], text
+        assert rows[0].gate == "intake"
+        if handed_off:
+            # A person takes it from here: the canned hand-off, never the answer.
+            assert REFUND_REPLY not in result.reply_text
+        else:
+            # Luciel answered the question in the same breath; the owner reads why.
+            assert REFUND_REPLY in result.reply_text
+            assert result.escalation is not None
+            assert result.escalation.signal is Signal.content_flagged
+            assert rows[0].reasons  # "abusive language …" / "asked for something illegal"
+
+
+COMPLAINT = "Why is your service so terrible and awful, is this whole thing a scam?"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_upset_customer_is_answered_and_the_team_is_told_once():
+    """strong_negative_sentiment (D2): the owner is paged, the customer still gets
+    the answer plus one honest note that a person is aware — on the turn the row is
+    written, not on every angry turn after it — and the session stays with Luciel."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+
+        async def turn() -> object:
+            orch = _orch(
+                s,
+                admin,
+                iid,
+                primary=EchoModel(confidence=1.0, fixed_reply=REFUND_REPLY),
+                retriever=_refund_retriever,
+            )
+            return await orch.run_turn(
+                session_id=sid,
+                resolved_lead_id=None,
+                channel="widget",
+                mode="ai",
+                inbound_text=COMPLAINT,
+            )
+
+        first = await turn()
+        # One angry message is not yet the signal (>= 2 of the trailing 3).
+        assert first.escalation is None and await _rows(s, sid) == []
+        second = await turn()
+        assert second.handed_off is False
+        assert await _mode(s, sid) == "ai"
+        assert second.escalation is not None
+        assert second.escalation.signal is Signal.strong_negative_sentiment
+        assert REFUND_REPLY in second.reply_text
+        assert "let the team know" in second.reply_text
+        rows = await _rows(s, sid)
+        assert [r.signal for r in rows] == ["strong_negative_sentiment"]
+        assert rows[0].gate == "intake"
+        assert rows[0].reasons and rows[0].reasons[0].startswith("upset in 2 of the last")
+        third = await turn()
+        # Still answered, still Luciel's; the row and the note are not repeated.
+        assert third.handed_off is False and await _mode(s, sid) == "ai"
+        assert REFUND_REPLY in third.reply_text
+        assert "let the team know" not in third.reply_text
+        assert [r.signal for r in await _rows(s, sid)] == ["strong_negative_sentiment"]

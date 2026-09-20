@@ -29,6 +29,7 @@ _SIGNAL_LABELS: dict[str, str] = {
     "llm_unavailable": "Luciel could not reach its model provider",
     "luciel_requested_handoff": "Luciel asked for a person",
     "reply_undeliverable": "Luciel's reply could not be delivered",
+    "content_flagged": "a message was flagged",
 }
 
 _CHANNEL_LABELS: dict[str, str] = {

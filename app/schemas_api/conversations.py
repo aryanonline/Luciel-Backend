@@ -46,6 +46,7 @@ EscalationEventSignalWire = Literal[
     "budget_exhausted",
     "llm_unavailable",
     "luciel_requested_handoff",
+    "content_flagged",
     "reply_undeliverable",
 ]
 

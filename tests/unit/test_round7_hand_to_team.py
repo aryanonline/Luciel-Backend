@@ -122,3 +122,14 @@ def test_a_row_without_reasons_renders_exactly_as_before() -> None:
     n = _notification("high_value_lead", ())
     assert "Details:" not in EmailNotifier().format(n)
     assert "Why:" not in SmsNotifier().format(n)
+
+
+def test_every_signal_has_owner_facing_copy() -> None:
+    """A row the loop can write must render on the owner's page (email subject / next
+    step) instead of falling back to the raw enum value."""
+    from app.notifications.base import _NEXT_STEP
+    from app.notifications.email_notifier import _SIGNAL_LABELS
+
+    for signal in Signal:
+        assert signal.value in _SIGNAL_LABELS, signal
+        assert signal.value in _NEXT_STEP, signal

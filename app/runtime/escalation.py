@@ -51,6 +51,11 @@ class Signal(str, enum.Enum):
     # with the reason; Luciel keeps answering (D2: only an explicit human request and
     # threat/self-harm moderation take the conversation away).
     luciel_requested_handoff = "luciel_requested_handoff"
+    # Moderation that does NOT take the conversation away (round 7 WP-2, item 3; D2):
+    # abuse/harassment and an illegal solicitation are recorded and the owner is told
+    # what was said, while Luciel stays professional and keeps answering. Threats and
+    # self-harm keep their take-over path (explicit_human_request at intake).
+    content_flagged = "content_flagged"
 
 
 class Gate(str, enum.Enum):

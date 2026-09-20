@@ -50,6 +50,11 @@ _NEXT_STEP: dict[str, str] = {
         "Luciel wrote a reply the channel could not deliver — the customer is waiting. "
         "Reach them another way and check the channel's connection."
     ),
+    "content_flagged": (
+        "A message was flagged (abuse, or a request for something illegal). Luciel stays "
+        "professional and keeps answering; read the conversation and step in if you want "
+        "to end it."
+    ),
 }
 
 
