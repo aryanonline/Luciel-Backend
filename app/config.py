@@ -154,14 +154,6 @@ class Settings(BaseSettings):
     # the platform secret's STRIPE_PAYG_PRICE_ID. Empty is correct for mock mode, where
     # nothing is billed at all.
     stripe_payg_price_id: str = ""
-    # The Stripe Billing Portal configuration (``bpc_...``) the "Update payment method"
-    # path opens (round 7 WP-1). Named explicitly because Stripe's test mode has no
-    # default configuration until a person saves one in the Dashboard, and because an
-    # explicit id pins WHAT the portal may do (card update + invoice history, never a
-    # subscription change) to the object scripts/provision_stripe_test.py creates.
-    # Per environment via LUCIEL_STRIPE_PORTAL_CONFIGURATION_ID or the platform
-    # secret's STRIPE_PORTAL_CONFIGURATION_ID; empty means "Stripe's default".
-    stripe_portal_configuration_id: str = ""
 
     # The Stripe Billing Portal CONFIGURATION (``bpc_...``) the card-update portal
     # session is created against (round 7 WP-1 #5). Stripe TEST mode has no default
