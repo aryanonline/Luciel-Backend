@@ -51,9 +51,10 @@ describe('SeedTest task knows which API it drives', () => {
         ContainerDefinitions: [
           Match.objectLike({
             Name: 'SeedTestContainer',
+            // arrayWith is order-sensitive: LUCIEL_ENV is declared first.
             Environment: Match.arrayWith([
-              { Name: 'LUCIEL_API_BASE', Value: `https://${DOMAINS.api}` },
               { Name: 'LUCIEL_ENV', Value: envName },
+              { Name: 'LUCIEL_API_BASE', Value: `https://${DOMAINS.api}` },
             ]),
           }),
         ],
