@@ -24,6 +24,7 @@ import { DnsStack } from '../lib/dns-stack';
 import { WebStack } from '../lib/web-stack';
 import { WidgetCertStack, WidgetStack } from '../lib/widget-stack';
 import { BoundedLambdaLogs } from '../lib/log-retention-aspect';
+import { applyCostAllocationTags } from '../lib/cost-tags';
 import {
   getEnvConfig,
   applyContextOverrides,
@@ -135,6 +136,17 @@ new BudgetStack(app, `${prefix}-Budget`, {
   envConfig,
   alertEmail: app.node.tryGetContext('budgetAlertEmail') as string | undefined,
 });
+
+// Cost-allocation tags on EVERY stack (round 7 WP-8, D7): Environment=<env> and
+// Component=<stack short name>, propagated by CloudFormation to each taggable
+// resource. BudgetStack filters each environment's ceiling on the Environment
+// tag, so a stack missing the tag is spend the budget cannot see — hence the
+// loop over the app's stacks rather than a per-stack call somebody forgets.
+for (const child of app.node.children) {
+  if (cdk.Stack.isStack(child)) {
+    applyCostAllocationTags(child, envConfig, child.stackName.replace(`${prefix}-`, ''));
+  }
+}
 
 // App-wide so it also reaches the functions CDK generates inside constructs the
 // stacks do not own — those are exactly the ones nobody would otherwise bound.
