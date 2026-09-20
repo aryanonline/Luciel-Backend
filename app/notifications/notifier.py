@@ -179,6 +179,7 @@ async def notify_payment_method_removed(
     if base:
         body = f"{body} Update it: {base}/dashboard/billing"
     notifier = SmsNotifier()
+    detail: str | None
     if not notifier.verify_config(number):
         receipt_status, detail, sid = "failed", "malformed_contact", None
     else:
