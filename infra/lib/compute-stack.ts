@@ -73,6 +73,22 @@ export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> =
   ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
 ];
 
+/**
+ * Every backend task runs on Graviton (round 7 WP-8, owner decision D7
+ * 2026-09-14): ARM64 Fargate bills ~20% less per vCPU-hour than x86 for the
+ * same work. Declaring ARM64 here is only safe because deploy.yml pushes a
+ * MULTI-ARCH image (buildx, linux/amd64 + linux/arm64 under one tag) and
+ * scripts/gate_image_scan.sh refuses a tag whose index lacks the arm64 child —
+ * a task definition that says ARM64 over an amd64-only image is a service that
+ * never starts (CannotPullContainerError). test/graviton.test.ts pins both
+ * halves. The web task (web-stack.ts) stays x86 until the FRONTEND repo builds
+ * its image multi-arch; see the TODO there.
+ */
+export const GRAVITON_RUNTIME: ecs.RuntimePlatform = {
+  cpuArchitecture: ecs.CpuArchitecture.ARM64,
+  operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+};
+
 export class ComputeStack extends Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly cluster: ecs.Cluster;
@@ -493,6 +509,7 @@ export class ComputeStack extends Stack {
         cpu: envConfig.envName === 'prod' ? 1024 : 256,
         memoryLimitMiB: envConfig.envName === 'prod' ? 2048 : 512,
         taskRole: role,
+        runtimePlatform: GRAVITON_RUNTIME,
       });
       // The EXECUTION role resolves `secrets:` at task startup. It needs both
       // secret-read AND kms:Decrypt on the CMK (the secrets are CMK-encrypted).
@@ -630,6 +647,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     migrationTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -672,6 +690,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     verifyTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -713,6 +732,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     seedTestTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -762,6 +782,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole: sweepRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     this.sweepTaskFamily = sweepTask.family;
     // The model_currency watchdog's RETIREMENT AUTO-SWAP (owner decision, §3.4.3):

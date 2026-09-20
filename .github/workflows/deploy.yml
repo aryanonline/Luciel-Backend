@@ -8,7 +8,9 @@ name: deploy
 #
 # Build+scan image -> push ECR (CVE gate) -> deploy stacks via the OIDC deploy
 # role (no static keys; INFRA-SEC-01 fix) -> run migrations as a one-off ECS task
-# INSIDE the VPC (RDS is private).
+# INSIDE the VPC (RDS is private). The image is MULTI-ARCH (buildx, linux/amd64 +
+# linux/arm64 under one tag) because every backend task definition runs on
+# Graviton (round 7 WP-8, D7); scripts/gate_image_scan.sh gates each platform child.
 #
 # Triggers (dispatch only — there is no push trigger: `main` is a stale revert and
 # the `guard` job refuses any ref but the release branch):
@@ -109,6 +111,13 @@ jobs:
       # Skipped on a pause run: pausing takes the environment DOWN, so it must never
       # be blocked by a build or a red CVE gate (that inversion actually happened —
       # a critical-CVE day made the environment impossible to pause).
+      # buildx + QEMU: the arm64 half of the multi-arch image is cross-built on
+      # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
+      - uses: docker/setup-qemu-action@v3
+        if: inputs.paused != 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: inputs.paused != 'true'
+
       - name: Build, scan, push image
         if: inputs.paused != 'true'
         env:
@@ -118,29 +127,28 @@ jobs:
         run: |
           # Idempotent: if this commit's image is already in ECR (e.g. a re-run of
           # the same SHA against an IMMUTABLE repo), skip build/push and reuse it.
+          # The gate below still checks that the existing tag is a multi-arch index:
+          # an amd64-only image from before the Graviton move fails closed instead
+          # of deploying a task ECS can never start on ARM64.
           if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
             echo "Image $TAG already present - skipping build/push, reusing it."
           else
-            docker build -t "$ECR/$REPO:$TAG" .
-            docker push "$ECR/$REPO:$TAG"
+            # ONE tag, TWO platforms (round 7 WP-8, D7 Graviton): buildx + QEMU build
+            # linux/amd64 and linux/arm64 and push them under an OCI image index, so
+            # the ARM64 task definitions and any amd64 consumer (local docker run, an
+            # x86 fallback) pull the same gated tag. --provenance/--sbom off: buildx
+            # would otherwise add attestation manifests (platform unknown/unknown)
+            # to the index, which ECR lists as phantom images.
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              --provenance=false --sbom=false \
+              -t "$ECR/$REPO:$TAG" --push .
           fi
-          # Governed CVE gate (scripts/check_image_scan.py): fails CLOSED on scan
-          # unavailability, on any non-allowlisted CRITICAL, and on expired
-          # allowlist entries. The describe call is NOT error-swallowed — an API
-          # failure must block, not pass.
-          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
-          # scan exists and completes — the ECR waiter errors on ScanNotFound
-          # instead of retrying, which is the exact race the old gate's
-          # `|| echo None` silently turned into a PASS. If it never completes,
-          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
-          for i in $(seq 1 60); do
-            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
-              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
-              [ "$status" = "COMPLETE" ] && break
-            fi
-            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
-          done
-          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+          # Governed CVE gate (scripts/gate_image_scan.sh -> check_image_scan.py):
+          # resolves the tag's platform children and gates EACH one — the index
+          # itself is not an image ECR can scan. Fails CLOSED on scan unavailability,
+          # on any non-allowlisted CRITICAL/HIGH, on expired allowlist entries, and
+          # on a tag that is not a multi-arch index.
+          bash scripts/gate_image_scan.sh "$REPO" "$TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
       # A pause run deploys no new code, so it reuses the image the environment is
@@ -275,31 +283,41 @@ jobs:
       # environment whose whole purpose is to rehearse prod ran ungated bytes. It now
       # builds/scans/gates into the PROD repo under this commit's SHA, so the §10
       # rehearsal exercises the exact artifact prod will deploy.
+      # buildx + QEMU: the arm64 half of the multi-arch image is cross-built on
+      # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
       - name: Build, scan, push image (prod repo — the release artifact)
         env:
           ECR: ${{ steps.ecr.outputs.registry }}
           REPO: luciel-backend-prod
           TAG: ${{ github.sha }}
         run: |
+          # Idempotent: if this commit's image is already in ECR (e.g. a re-run of
+          # the same SHA against an IMMUTABLE repo), skip build/push and reuse it.
+          # The gate below still checks that the existing tag is a multi-arch index:
+          # an amd64-only image from before the Graviton move fails closed instead
+          # of deploying a task ECS can never start on ARM64.
           if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
             echo "Image $TAG already present - skipping build/push, reusing it."
           else
-            docker build -t "$ECR/$REPO:$TAG" .
-            docker push "$ECR/$REPO:$TAG"
+            # ONE tag, TWO platforms (round 7 WP-8, D7 Graviton): buildx + QEMU build
+            # linux/amd64 and linux/arm64 and push them under an OCI image index, so
+            # the ARM64 task definitions and any amd64 consumer (local docker run, an
+            # x86 fallback) pull the same gated tag. --provenance/--sbom off: buildx
+            # would otherwise add attestation manifests (platform unknown/unknown)
+            # to the index, which ECR lists as phantom images.
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              --provenance=false --sbom=false \
+              -t "$ECR/$REPO:$TAG" --push .
           fi
-          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
-          # scan exists and completes — the ECR waiter errors on ScanNotFound
-          # instead of retrying, which is the exact race the old gate's
-          # `|| echo None` silently turned into a PASS. If it never completes,
-          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
-          for i in $(seq 1 60); do
-            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
-              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
-              [ "$status" = "COMPLETE" ] && break
-            fi
-            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
-          done
-          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+          # Governed CVE gate (scripts/gate_image_scan.sh -> check_image_scan.py):
+          # resolves the tag's platform children and gates EACH one — the index
+          # itself is not an image ECR can scan. Fails CLOSED on scan unavailability,
+          # on any non-allowlisted CRITICAL/HIGH, on expired allowlist entries, and
+          # on a tag that is not a multi-arch index.
+          bash scripts/gate_image_scan.sh "$REPO" "$TAG"
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
@@ -371,6 +389,13 @@ jobs:
       # running it — so prod reuses the artifact and this step is normally the
       # idempotent-skip path. The gate still re-runs: an allowlist entry can expire
       # between rehearsal and release.
+      # buildx + QEMU: the arm64 half of the multi-arch image is cross-built on
+      # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
+      - uses: docker/setup-qemu-action@v3
+        if: inputs.paused != 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: inputs.paused != 'true'
+
       - name: Build, scan, push image
         if: inputs.paused != 'true'
         env:
@@ -378,25 +403,30 @@ jobs:
           REPO: luciel-backend-prod
           TAG: ${{ github.sha }}
         run: |
+          # Idempotent: if this commit's image is already in ECR (e.g. a re-run of
+          # the same SHA against an IMMUTABLE repo), skip build/push and reuse it.
+          # The gate below still checks that the existing tag is a multi-arch index:
+          # an amd64-only image from before the Graviton move fails closed instead
+          # of deploying a task ECS can never start on ARM64.
           if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
             echo "Image $TAG already present - skipping build/push, reusing it."
           else
-            docker build -t "$ECR/$REPO:$TAG" .
-            docker push "$ECR/$REPO:$TAG"
+            # ONE tag, TWO platforms (round 7 WP-8, D7 Graviton): buildx + QEMU build
+            # linux/amd64 and linux/arm64 and push them under an OCI image index, so
+            # the ARM64 task definitions and any amd64 consumer (local docker run, an
+            # x86 fallback) pull the same gated tag. --provenance/--sbom off: buildx
+            # would otherwise add attestation manifests (platform unknown/unknown)
+            # to the index, which ECR lists as phantom images.
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              --provenance=false --sbom=false \
+              -t "$ECR/$REPO:$TAG" --push .
           fi
-          # Scan-on-push takes a few seconds to even REGISTER, so poll until the
-          # scan exists and completes — the ECR waiter errors on ScanNotFound
-          # instead of retrying, which is the exact race the old gate's
-          # `|| echo None` silently turned into a PASS. If it never completes,
-          # scan-findings.json is absent or non-COMPLETE and the gate fails closed.
-          for i in $(seq 1 60); do
-            if aws ecr describe-image-scan-findings --repository-name "$REPO"                  --image-id imageTag="$TAG" > scan-findings.json 2>/dev/null; then
-              status=$(python3 -c "import json;print(json.load(open('scan-findings.json')).get('imageScanStatus',{}).get('status',''))")
-              [ "$status" = "COMPLETE" ] && break
-            fi
-            echo "[gate] scan not ready (attempt $i) - waiting 5s"; sleep 5
-          done
-          python3 scripts/check_image_scan.py scan-findings.json .security/cve-allowlist.json
+          # Governed CVE gate (scripts/gate_image_scan.sh -> check_image_scan.py):
+          # resolves the tag's platform children and gates EACH one — the index
+          # itself is not an image ECR can scan. Fails CLOSED on scan unavailability,
+          # on any non-allowlisted CRITICAL/HIGH, on expired allowlist entries, and
+          # on a tag that is not a multi-arch index.
+          bash scripts/gate_image_scan.sh "$REPO" "$TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Resolve the currently deployed image tag (pause runs only)

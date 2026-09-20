@@ -86,6 +86,13 @@ export class WebStack extends Stack {
     const taskDef = new ecs.FargateTaskDefinition(this, 'WebTask', {
       cpu: envConfig.envName === 'prod' ? 1024 : 256,
       memoryLimitMiB: envConfig.envName === 'prod' ? 2048 : 512,
+      // TODO(round 7 WP-8, D7 Graviton): `runtimePlatform: GRAVITON_RUNTIME`
+      // (compute-stack.ts) — ONLY after Luciel-Frontend's CI builds the web image
+      // multi-arch (docker buildx --platform linux/amd64,linux/arm64 --push in
+      // apps/web's workflow). This image is built by THAT repo, so flipping here
+      // first would point an ARM64 task at an amd64-only image and the service
+      // would never start. test/graviton.test.ts asserts this task stays x86
+      // until the frontend precondition lands; the owner flips it afterwards.
     });
     taskDef.addContainer('WebContainer', {
       image: ecs.ContainerImage.fromEcrRepository(this.ecrRepo, imageTag),
