@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.channels.base import InboundRejected
 from app.models.audit import ActorType
 from app.models.conversation import Session
 from app.models.instance import Instance
@@ -65,6 +66,33 @@ IDENTITY_STRENGTH = {
     "instagram_messenger": IdentityStrength.platform_scoped_strong,
     "widget": IdentityStrength.weak,
 }
+
+
+#: Channels whose conversations are keyed by a SERVER-minted handle: the widget opens a
+#: session with no key at all on its first message and hands the new session id back
+#: to the client, which carries it on every later turn (§3.4.9 widget row). Every
+#: other channel is keyed by its transport identifier (``participant_key_for``) or a
+#: resolved lead — a session there with no key would be unresumable AND unanswerable
+#: (the reply goes ``to=customer_identifier``), so it is refused, not opened.
+SERVER_KEYED_CHANNELS: frozenset[str] = frozenset({"widget"})
+
+
+class SessionUnkeyable(InboundRejected):
+    """No handle at all to key a conversation on (round 7 WP-3a).
+
+    Raised by ``resolve_or_open_session`` when a transport-keyed channel arrives with
+    no client session id, no resolved lead and no participant key — e.g. a Meta
+    messaging event with no ``sender.id`` (customer_identifier ""). Before this
+    guard every such message skipped every lookup, opened a brand-new session row,
+    and was billed at the first model call: an unkeyable, unanswerable conversation
+    per message. It is an ``InboundRejected`` so the channel edge records it with
+    the same vocabulary as an unresolvable destination (``pipeline.
+    record_inbound_rejection``) and drops the message honestly instead.
+    """
+
+    def __init__(self, channel: str) -> None:
+        self.channel = channel
+        super().__init__(f"unkeyable_session:{channel}")
 
 
 def can_carry_cross_session_memory(channel: str) -> bool:
@@ -195,7 +223,20 @@ async def resolve_or_open_session(
     Architecture §3.4.10a: if the resolved lead is in ``archived`` state, it is
     automatically reactivated (archived → active) and a ``lead_reactivated`` audit
     event is emitted.
+
+    Raises ``SessionUnkeyable`` (an ``InboundRejected``) when a transport-keyed
+    channel supplies none of the three keys: nothing could ever resume — or answer —
+    the session that would be opened, so none is (round 7 WP-3a). The widget is the
+    one channel that legitimately opens with no key (``SERVER_KEYED_CHANNELS``).
     """
+    if (
+        session_id is None
+        and resolved_lead_id is None
+        and participant_key is None
+        and channel not in SERVER_KEYED_CHANNELS
+    ):
+        raise SessionUnkeyable(channel)
+
     timeout = INACTIVITY_TIMEOUT.get(channel, timedelta(minutes=30))
     cutoff = _now() - timeout
 

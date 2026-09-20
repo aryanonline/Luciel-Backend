@@ -324,27 +324,34 @@ async def twilio_voice_turn(request: Request) -> Response:
         # handle_turn owns the paused branch (spoken unavailable + hangup, the
         # shared is_paused gate) and the at-cap graceful no-LLM reply.
         call_sid = str(outcome.channel_metadata.get("call_sid") or "")
-        result = await voice_pipeline.handle_turn(
-            s,
-            instance=inst,
-            admin_id=outcome.admin_id,
-            instance_id=outcome.instance_id,
-            from_number=outcome.customer_identifier,
-            speech_audio_ref=outcome.body,
-            action_url=action_url,
-            stt=TwilioGatherTranscript(),
-            # Hosted synthesis (<Play> via ElevenLabs + S3, §3.1.2) when live mode
-            # AND the bucket exist; the honest <Say> delivery otherwise — and the
-            # hosted wrapper itself degrades to <Say> on any failure, so a worse
-            # voice never becomes a dead call.
-            tts=build_hosted_voice_tts(
-                admin_id=outcome.admin_id, instance_id=outcome.instance_id, call_sid=call_sid
+        try:
+            result = await voice_pipeline.handle_turn(
+                s,
+                instance=inst,
+                admin_id=outcome.admin_id,
+                instance_id=outcome.instance_id,
+                from_number=outcome.customer_identifier,
+                speech_audio_ref=outcome.body,
+                action_url=action_url,
+                stt=TwilioGatherTranscript(),
+                # Hosted synthesis (<Play> via ElevenLabs + S3, §3.1.2) when live mode
+                # AND the bucket exist; the honest <Say> delivery otherwise — and the
+                # hosted wrapper itself degrades to <Say> on any failure, so a worse
+                # voice never becomes a dead call.
+                tts=build_hosted_voice_tts(
+                    admin_id=outcome.admin_id, instance_id=outcome.instance_id, call_sid=call_sid
+                )
+                or TwilioSayDelivery(),
+                router=build_llm_router(admin_id=outcome.admin_id),
+                has_payment_method=await metering.has_live_card(s, admin_id=outcome.admin_id),
+                provider_call_id=call_sid or None,
             )
-            or TwilioSayDelivery(),
-            router=build_llm_router(admin_id=outcome.admin_id),
-            has_payment_method=await metering.has_live_card(s, admin_id=outcome.admin_id),
-            provider_call_id=call_sid or None,
-        )
+        except InboundRejected as rej:
+            # A turn with neither a CallSid nor a From has nothing to key its session
+            # on (sessions.SessionUnkeyable, round 7 WP-3a): recorded like any other
+            # rejected inbound, answered with the closed TwiML — never a 5xx.
+            await pipeline.record_inbound_rejection(s, reason=rej.reason, channel="voice")
+            return _voice_unavailable_twiml()
     return Response(content=result.twiml, media_type="application/xml")
 
 

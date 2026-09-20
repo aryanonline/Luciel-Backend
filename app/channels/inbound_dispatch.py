@@ -115,7 +115,10 @@ async def dispatch_inbound_reply(
 
     Signature/resolution failures are rejected + logged (never raised to the provider
     as a 5xx — a rejected inbound is a clean no-op ack so the provider does not retry
-    a spoofed/garbled request forever)."""
+    a spoofed/garbled request forever). The runtime can reject too: an admitted
+    message with no key at all (no session id, no lead, no transport identifier —
+    ``sessions.SessionUnkeyable``, round 7 WP-3a) opens no session and is recorded
+    here with the same vocabulary, instead of surfacing as a 5xx the provider retries."""
     async with untenanted_session() as s:
         try:
             outcome = await pipeline.ingest(adapter, req, s)
@@ -125,7 +128,14 @@ async def dispatch_inbound_reply(
             )
             return None
     if isinstance(outcome, InboundMessage):
-        return await run_and_reply_full(outcome)
+        try:
+            return await run_and_reply_full(outcome)
+        except InboundRejected as rej:
+            async with untenanted_session() as s:
+                await pipeline.record_inbound_rejection(
+                    s, reason=rej.reason, channel=adapter.channel_id
+                )
+            return None
     if isinstance(outcome, pipeline.OptOutHandled):
         await _confirm_opt_keyword(outcome)
         return None
