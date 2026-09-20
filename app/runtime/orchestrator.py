@@ -46,7 +46,8 @@ code regardless of what the model is convinced to say.
 
 An escalation writes the escalation_events row + audit event and THEN notifies the
 admin's configured contact (§3.5.3, app/notifications/escalation_dispatch.py); delivery
-is best-effort against the row and never blocks the lead's turn (§3.5.4).
+is best-effort against the row and never blocks the lead's turn (§3.5.4): it starts as
+a background task once the turn's transaction has committed (round 7 WP-2, item 5).
 
 FLAGGED: Vector RETRIEVAL is Arc 11 and graph/hybrid is Arc 16
 — the loop calls a retrieval callable injected by the caller so it is testable now
@@ -75,7 +76,7 @@ from app.models.conversation import EscalationEvent, Session, Transcript
 from app.models.instance import Instance
 from app.notifications.escalation_dispatch import (
     has_configured_escalation_contact,
-    notify_escalation_safely,
+    schedule_notification_after_commit,
 )
 from app.observability.metrics import emit_metric
 from app.runtime import budget, channel_switch, handoff, memory
@@ -529,7 +530,9 @@ async def _record_escalation(
 
     The row is written and flushed FIRST: it is the authoritative record and delivery is
     best-effort against it (§3.5.2). Notification never blocks or breaks the lead's turn
-    (§3.5.4).
+    (§3.5.4): it is scheduled to start after this transaction commits, as a background
+    task in its own tenant session (item 5) — a test that asserts delivery drains it
+    with ``escalation_dispatch.drain_background_notifications()``.
 
     ONCE per (session, signal, gate): the insert itself is the arbiter (unique index
     ``uq_escalation_once``, 2026-09-05 audit F053/F061) — a pre-check-then-insert let
@@ -567,7 +570,10 @@ async def _record_escalation(
         payload={"signal": signal, "gate": gate, "session_id": str(session_id)},
     )
     await session.flush()
-    await notify_escalation_safely(
+    # Delivery starts AFTER this transaction commits, off the customer's turn (§3.5.4;
+    # round 7 WP-2 item 5) — it used to be awaited right here, before the reply was
+    # composed, with blocking SDK calls on the event loop.
+    schedule_notification_after_commit(
         session,
         admin_id=admin_id,
         instance_id=instance_id,

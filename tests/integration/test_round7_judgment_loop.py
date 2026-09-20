@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -521,3 +522,73 @@ async def test_an_exhausted_cap_answers_honestly_instead_of_raising(monkeypatch,
         ]
         # The refused turn did not burn an admission either.
         assert store.current_count(str(admin)) == LLM_CAP_PER_MINUTE
+
+
+# --- item 5: the reply comes first; the owner's page starts after the commit ------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_reply_returns_before_the_owner_is_notified(monkeypatch):
+    """§3.5.4: the customer's reply is sent before the notification pipeline starts.
+    An awaitable notifier fake records the ordering: nothing is called while the
+    turn runs, nothing until the turn's transaction commits, and then — once the
+    background task is drained — exactly one notification for the row."""
+    from app.notifications import escalation_dispatch
+
+    events: list[str] = []
+
+    async def fake_notify(session, **kw):
+        events.append(f"notified:{kw['signal']}")
+
+    monkeypatch.setattr(escalation_dispatch, "notify_escalation_safely", fake_notify)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        orch = _orch(s, admin, iid, primary=EchoModel(confidence=1.0, fixed_reply=FABRICATED))
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text=HOT_LEAD,
+        )
+        events.append("reply")
+        assert result.escalation is not None
+        # The row is already durable-to-be: written in this transaction …
+        assert [r.signal for r in await _rows(s, sid)] == ["high_value_lead"]
+        # … but nobody has been paged yet, and nothing will be until the commit.
+        await asyncio.sleep(0)
+        assert events == ["reply"]
+    # Committed. The task is scheduled but the test has not yielded to it.
+    await escalation_dispatch.drain_background_notifications()
+    assert events == ["reply", "notified:high_value_lead"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rolled_back_turn_never_pages_the_owner(monkeypatch):
+    from app.notifications import escalation_dispatch
+    from app.runtime.orchestrator import _record_escalation
+
+    calls: list[str] = []
+
+    async def fake_notify(session, **kw):
+        calls.append(kw["signal"])
+
+    monkeypatch.setattr(escalation_dispatch, "notify_escalation_safely", fake_notify)
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with pytest.raises(RuntimeError, match="turn exploded"):
+        async with tenant_session(admin) as s:
+            assert (
+                await _record_escalation(
+                    s,
+                    admin_id=admin,
+                    instance_id=iid,
+                    session_id=sid,
+                    resolved_lead_id=None,
+                    signal="high_value_lead",
+                    gate="outcome",
+                    score=0.9,
+                )
+                is True
+            )
+            raise RuntimeError("turn exploded")
+    await escalation_dispatch.drain_background_notifications()
+    assert calls == []  # no row exists, so no page about it

@@ -302,3 +302,16 @@ async def _clean_tables() -> AsyncIterator[None]:
         "ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate",
         db=TEST_DB,
     )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _drain_offturn_notifications() -> AsyncIterator[None]:
+    """Escalation notifications run OFF the customer's turn as background tasks that
+    start after the turn's commit (round 7 WP-2, item 5). A test that asserts on
+    delivery drains them itself; this teardown drains whatever a test left running
+    so no task outlives its event loop. Defined after ``_clean_tables`` so it tears
+    down first (before the tables are truncated)."""
+    from app.notifications import escalation_dispatch
+
+    yield
+    await escalation_dispatch.drain_background_notifications()

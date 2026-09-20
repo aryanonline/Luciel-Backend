@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
 from app.knowledge.pgvector import installed_version as _pgvector_installed_version
 from app.knowledge.pgvector import too_old_reason as _pgvector_too_old_reason
+from app.notifications.escalation_dispatch import drain_background_work
 from app.observability.context import admin_id_var, bind_trace, new_trace_id, trace_id_var
 from app.observability.logging import install_structured_logging
 from app.observability.metrics import install_metrics_logger
@@ -178,7 +179,9 @@ def install_log_redaction() -> None:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Background work that belongs to the running process, not a scheduler:
     the data plane's in-process mailbox poll (cost) — started only where the
-    environment asks for it, stopped cleanly on shutdown."""
+    environment asks for it, stopped cleanly on shutdown — and, on shutdown, the
+    escalation notifications and retry ladders running off customers' turns
+    (round 7 WP-2, item 5): a deploy must not drop a hot lead's page on the floor."""
     settings = get_settings()
     stop = asyncio.Event()
     poller: asyncio.Task[int] | None = None
@@ -197,6 +200,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if poller is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(poller, timeout=10)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(drain_background_work(), timeout=15)
 
 
 def create_app() -> FastAPI:

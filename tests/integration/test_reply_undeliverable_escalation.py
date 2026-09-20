@@ -18,6 +18,7 @@ from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.conversation import EscalationEvent
 from app.models.instance import Account, AccountState, Instance, LucielState
+from app.notifications import escalation_dispatch
 from sqlalchemy import select
 
 pytestmark = [pytest.mark.asyncio]
@@ -78,6 +79,9 @@ async def test_an_undeliverable_reply_escalates_once_per_session():
     assert first.reply_text  # Luciel DID write an answer
     second = await inbound_dispatch.run_and_reply_full(_email(admin, iid, "Hello? Anyone?"))
     assert second.session_id == first.session_id
+    # The owner notification runs off the turn (round 7 WP-2, item 5): drain it so the
+    # audit trail below is complete.
+    await escalation_dispatch.drain_background_notifications()
 
     async with tenant_session(admin) as s:
         rows = (

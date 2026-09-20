@@ -13,6 +13,7 @@ notifier/auth/lifecycle/export code call the dispatcher. Secrets are never logge
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -134,7 +135,9 @@ class SesEmailSender:
             kwargs["ConfigurationSetName"] = config_set
         if tags:
             kwargs["EmailTags"] = [{"Name": k, "Value": v} for k, v in tags.items()]
-        resp = client.send_email(**kwargs)  # type: ignore[attr-defined]
+        # boto3 is synchronous: off the event loop (round 7 WP-2, item 5), so a slow
+        # SES call never stalls every other conversation this process is serving.
+        resp = await asyncio.to_thread(client.send_email, **kwargs)  # type: ignore[attr-defined]
         return str(resp.get("MessageId", ""))
 
 
