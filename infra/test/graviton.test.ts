@@ -100,7 +100,10 @@ describe('Backend Fargate tasks run on Graviton (D7)', () => {
 });
 
 describe('The pipeline pushes a multi-arch image before any task says ARM64', () => {
-  const read = (rel: string) => fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+  // Normalise line endings: a Windows checkout (core.autocrlf) hands the workflow
+  // text back with CRLF, and the buildx continuation regex below keys on `\` + LF.
+  const read = (rel: string) =>
+    fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8').replace(/\r\n/g, '\n');
 
   test.each([['.github/workflows/deploy.yml'], ['.github/workflows/image-rebuild.yml']])(
     '%s builds linux/amd64 + linux/arm64 with buildx and gates through the multi-arch gate',
