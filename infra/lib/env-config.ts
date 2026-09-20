@@ -157,7 +157,15 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     redisSnapshotRetentionDays: 0,
     paused: false,
     stripeIntegrationPosture: 'test',
-    monthlyBudgetUsd: 150,
+    // Dev's measured run-rate (Cost Explorer 2026-09-01..13) is ≈ $195/mo
+    // running incl. tax and ≈ $110/mo paused: RDS t4g.micro, one NAT, 2×ALB,
+    // Redis, Fargate for two planes plus the sweeps. The previous 150 sat BELOW
+    // the running rate, so the 80% alert fired on day ~19 of every month and the
+    // ceiling meant "dev is on", not "something changed" — the same
+    // alert-blindness the prod entry below describes. 250 restores meaning: 80%
+    // (~$200) is the top of a normal running month, 100% means a real change
+    // (an un-paused weekend, a runaway NAT bill, a leaked resource).
+    monthlyBudgetUsd: 250,
     imageRepoName: 'luciel-backend-dev',
     vpcInterfaceEndpoints: false,
   },
