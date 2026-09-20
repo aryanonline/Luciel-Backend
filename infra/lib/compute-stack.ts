@@ -1022,10 +1022,13 @@ export class ComputeStack extends Stack {
       {
         // Hourly, because owners sit in different zones: a tenant is due once its
         // LOCAL clock passes 07:00 and no ledger row exists for the day (round 6 WP-F).
-        // :50 staggers off the deferred (:10), session_finalize (:25) and health
-        // (:40) hourly slots.
+        // :55 staggers off the deferred (:10), session_finalize (:25) and health
+        // (:40) hourly slots AND off knowledge_sync's :50 — the previous :50 slot
+        // collided with it four times a day (00/06/12/18 UTC), two sweep tasks
+        // contending for the same DB at once (round 7 WP-8). sweep-schedules.test.ts
+        // refuses any two schedules that share a firing minute.
         name: 'daily_brief',
-        cron: 'cron(50 * * * ? *)',
+        cron: 'cron(55 * * * ? *)',
         description: "Email each owner's morning brief once per local day (round 6 WP-F)",
       },
     ];
