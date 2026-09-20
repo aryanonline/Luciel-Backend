@@ -30,6 +30,7 @@ from app.billing import metering
 from app.connections import gate, registry
 from app.models.audit import AdminAuditLog
 from app.models.booking import BookingEvent
+from app.models.budget import CountedSession
 from app.models.conversation import EscalationEvent
 from app.models.conversation import Session as SessionModel
 from app.models.deferred import DeferredAction
@@ -62,10 +63,18 @@ CHANNEL_LABELS: dict[str, str] = {
 
 #: Statuses that mean "nothing is connected" (as opposed to "connected but broken").
 _MISSING = frozenset({"unconfigured", "not_connected", "revoked"})
+#: ``dormant`` is a BILLING state, not a health state (Legal §A3): the credential is
+#: intact and Connect refuses to re-arm it (connections.service.DormantConnection) —
+#: only a card on the Billing page brings it back. The Today card must send the owner
+#: there, never to a Connect button that will refuse (round 7 WP-3a). Same words as
+#: the Configure page.
+DORMANT_STATUS_DETAIL = "paused until a card is on file"
+DORMANT_NEED_DETAIL = "Add a card on the Billing page and it resumes."
+BILLING_HREF = "/dashboard/billing"
 _STATUS_DETAIL: dict[str, str] = {
     "expired": "needs reconnecting",
     "error": "connection error — reconnect",
-    "dormant": "dormant — reconnect",
+    "dormant": DORMANT_STATUS_DETAIL,
     "pending_carrier_registration": "carrier registration pending",
     "pending_email_routing": "email routing pending",
     "not_operable_hosting_required": "number is not in your Twilio account",
@@ -327,6 +336,16 @@ def derive_needs(snap: Snapshot) -> list[Need]:  # noqa: C901, PLR0912, PLR0915 
                     configure,
                 )
             )
+        elif status == "dormant":
+            needs.append(
+                Need(
+                    f"channel_dormant:{channel}",
+                    "attention",
+                    f"{label}: {DORMANT_STATUS_DETAIL}",
+                    DORMANT_NEED_DETAIL,
+                    BILLING_HREF,
+                )
+            )
         else:
             needs.append(
                 Need(
@@ -363,6 +382,16 @@ def derive_needs(snap: Snapshot) -> list[Need]:  # noqa: C901, PLR0912, PLR0915 
                     f"{label} is on but nothing is connected",
                     "Connect the account under Configure → Tools, or turn the tool off.",
                     configure,
+                )
+            )
+        elif tool_state == "dormant":
+            needs.append(
+                Need(
+                    f"tool_dormant:{tool_id}",
+                    "attention",
+                    f"{label}: {DORMANT_STATUS_DETAIL}",
+                    DORMANT_NEED_DETAIL,
+                    BILLING_HREF,
                 )
             )
         else:
@@ -560,14 +589,30 @@ async def day_counts(
     start: datetime,
     end: datetime,
 ) -> DayCounts:
-    """Counts over [start, end) from rows that already exist — no narration."""
+    """Counts over [start, end) from rows that already exist — no narration.
+
+    A "conversation" here is a BILLED session — the same thing Overview, Billing and
+    Analytics mean by it (root invariants): a session row joined to the
+    ``counted_sessions`` ledger the fire-once counter writes at the first model call
+    (``app.runtime.budget.count_session_once``). Round 7 WP-3a: this read the
+    deprecated ``sessions.counted`` column, which nothing ever sets True, so the Today
+    card and the morning brief said "0 conversations" / "A quiet day" forever. A
+    session that opened but never reached a model call is not a conversation here
+    either, exactly as in ``app.analytics.service``.
+    """
     by_channel_rows = (
         await session.execute(
             select(SessionModel.channel, func.count())
+            .select_from(SessionModel)
+            .join(
+                CountedSession,
+                (CountedSession.admin_id == SessionModel.admin_id)
+                & (CountedSession.instance_id == SessionModel.instance_id)
+                & (CountedSession.session_id == SessionModel.id),
+            )
             .where(
                 SessionModel.admin_id == admin_id,
                 SessionModel.instance_id == instance_id,
-                SessionModel.counted.is_(True),
                 SessionModel.started_at >= start,
                 SessionModel.started_at < end,
             )

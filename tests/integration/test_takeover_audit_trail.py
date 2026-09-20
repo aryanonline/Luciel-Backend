@@ -20,6 +20,7 @@ from app.models.conversation import Session as ConvSession
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.runtime import handoff
+from app.runtime.budget import count_session_once
 from app.runtime.session_close import finalize_due_sessions
 from sqlalchemy import select
 
@@ -47,12 +48,15 @@ async def _seed_session(
                 instance_id=iid,
                 channel="sms",
                 mode=mode,
-                counted=True,
                 resolved_lead_id=lead_id,
                 started_at=last - timedelta(minutes=5),
                 last_message_at=last,
             )
         )
+        await s.flush()
+        # A conversation a person held was billed like any other: counted through the
+        # real fire-once ledger, never by seeding the deprecated ``counted`` column.
+        assert await count_session_once(s, admin_id=admin, instance_id=iid, session_id=sid)
         for i, (role, text) in enumerate(
             [("lead", "can someone call me?"), ("human_agent", "Ana here — calling now.")]
         ):

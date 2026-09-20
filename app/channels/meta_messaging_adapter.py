@@ -28,18 +28,47 @@ from app.channels.sms_adapter import classify_keyword
 from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
 
 
+def _is_echo(event: dict[str, Any]) -> bool:
+    return bool((event.get("message") or {}).get("is_echo"))
+
+
 def _first_messaging_event(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract the first inbound messaging event from Meta's Messenger/IG webhook.
+    """Extract the first CUSTOMER messaging event from Meta's Messenger/IG webhook.
 
     Shape: entry[].messaging[] (Messenger) — each entry carries the recipient (the
     tenant's page/IG-account id) and the sender (the lead's PSID/IGSID).
+
+    Two event kinds ride the same webhook and are NOT customer turns (round 7 WP-3a):
+
+    * ``message.is_echo`` — the ``message_echoes`` field: an echo of the page's OWN
+      outbound (Luciel's reply, or a person answering from the Page inbox), with
+      ``sender.id`` = the page. Ingesting it opened a conversation keyed on the page
+      id and answered Luciel's own words. Skipped.
+    * ``entry.standby`` — the handover protocol's feed for an app that does NOT hold
+      the thread. Luciel implements no handover today, so a standby event belongs to
+      whichever app does; answering it would speak over that app. Ignored.
     """
     for entry in payload.get("entry", []):
-        messaging = entry.get("messaging") or entry.get("standby") or []
-        for event in messaging:
-            if event.get("message"):
+        for event in entry.get("messaging") or []:
+            if event.get("message") and not _is_echo(event):
                 return {"entry": entry, "event": event}
     return None
+
+
+def _no_message_reason(payload: dict[str, Any]) -> str:
+    """Why ``_first_messaging_event`` found nothing — an honest rejection reason for
+    the inbound log, so an echo storm or a standby feed is visible as itself."""
+    saw_echo = saw_standby = False
+    for entry in payload.get("entry", []):
+        if any(_is_echo(event) for event in entry.get("messaging") or []):
+            saw_echo = True
+        if entry.get("standby"):
+            saw_standby = True
+    if saw_echo:
+        return "meta_echo_ignored"
+    if saw_standby:
+        return "meta_standby_ignored"
+    return "meta_no_message"
 
 
 class MetaMessagingAdapter:
@@ -61,7 +90,7 @@ class MetaMessagingAdapter:
 
         parsed = _first_messaging_event(request["payload"])
         if parsed is None:
-            raise InboundRejected("meta_no_message")
+            raise InboundRejected(_no_message_reason(request["payload"]))
         # Destination = tenant's page/IG-account id (entry.id), the resolution key.
         destination_id = parsed["entry"].get("id")
         if not destination_id:
@@ -84,8 +113,14 @@ class MetaMessagingAdapter:
         if parsed is None:
             # verify_inbound already guaranteed a message event; a None here means the
             # payload changed between verify and receive. Reject rather than crash.
-            raise InboundRejected("meta_no_message")
+            raise InboundRejected(_no_message_reason(request["payload"]))
         event = parsed["event"]
+        sender_id = str((event.get("sender") or {}).get("id") or "")
+        if not sender_id:
+            # No PSID/IGSID: nothing to key the conversation on and nothing to reply
+            # to (round 7 WP-3a). Dropped here, with a reason, rather than admitted as
+            # customer_identifier "" — which opened an unkeyable session per message.
+            raise InboundRejected("meta_no_sender")
         body = (event.get("message") or {}).get("text", "")
         metadata: dict[str, Any] = {
             "mid": (event.get("message") or {}).get("mid"),
@@ -100,7 +135,7 @@ class MetaMessagingAdapter:
             instance_id=ctx.instance_id,
             channel=self.channel_id,
             session_id=None,
-            customer_identifier=(event.get("sender") or {}).get("id", ""),
+            customer_identifier=sender_id,
             body=body,
             channel_metadata=metadata,
             received_at=datetime.now(UTC),

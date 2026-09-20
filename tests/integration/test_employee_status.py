@@ -1,7 +1,13 @@
 """Round 6 WP-F: employee status is derived from rows that already exist, per tenant,
 in the owner's local day. Pinned with a real database: the counts, the day
 boundaries, tenant isolation, and that a capability is never ``ready`` without a
-live connection."""
+live connection.
+
+Round 7 WP-3a: a "conversation" is a BILLED session — one the fire-once counter
+(``app.runtime.budget.count_session_once``) wrote to the ``counted_sessions`` ledger.
+The sessions here are counted through that real path, never by seeding the
+deprecated ``sessions.counted`` column (which nothing in the product ever sets, so a
+test that seeded it proved nothing about what the owner sees)."""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ from datetime import UTC, datetime
 
 import pytest
 from app.db.session import tenant_session
+from app.employee.brief import render_daily_brief
 from app.employee.status import build_employee_status
 from app.models.audit import ActorType, AdminAuditLog
 from app.models.connection import InstanceConnection
@@ -17,6 +24,7 @@ from app.models.conversation import EscalationEvent
 from app.models.conversation import Session as SessionModel
 from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
+from app.runtime.budget import count_session_once
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -58,17 +66,25 @@ async def _seed(s, admin, iid, *, channels, tools, connections=(), timezone="Ame
     await s.flush()
 
 
-def _session(admin, iid, *, at, channel="widget", counted=True):
-    return SessionModel(
+async def _session(s, admin, iid, *, at, channel="widget", counted=True) -> SessionModel:
+    """A session row that opened at ``at``; ``counted`` runs it through the REAL
+    fire-once counter (the ledger the Today card reads), exactly as the first model
+    call does in production. ``counted=False`` is a session that opened and never
+    reached a model call — not a conversation anywhere in the product."""
+    row = SessionModel(
         id=uuid.uuid4(),
         admin_id=admin,
         instance_id=iid,
         channel=channel,
         mode="ai",
-        counted=counted,
         started_at=at,
         last_message_at=at,
     )
+    s.add(row)
+    await s.flush()
+    if counted:
+        assert await count_session_once(s, admin_id=admin, instance_id=iid, session_id=row.id)
+    return row
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -76,10 +92,10 @@ async def test_counts_follow_the_owners_local_day_and_only_counted_sessions():
     admin, iid = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
         await _seed(s, admin, iid, channels=[{"id": "widget", "enabled": True}], tools=[])
-        s.add(_session(admin, iid, at=LAST_NIGHT_LOCAL))  # local yesterday
-        s.add(_session(admin, iid, at=LAST_NIGHT_LOCAL, channel="sms"))
-        s.add(_session(admin, iid, at=THIS_MORNING))  # local today
-        s.add(_session(admin, iid, at=THIS_MORNING, counted=False))  # never a conversation
+        await _session(s, admin, iid, at=LAST_NIGHT_LOCAL)  # local yesterday
+        await _session(s, admin, iid, at=LAST_NIGHT_LOCAL, channel="sms")
+        await _session(s, admin, iid, at=THIS_MORNING)  # local today
+        await _session(s, admin, iid, at=THIS_MORNING, counted=False)  # never a conversation
         s.add(
             Lead(
                 id=uuid.uuid4(),
@@ -127,6 +143,43 @@ async def test_counts_follow_the_owners_local_day_and_only_counted_sessions():
     assert status.today.conversations == 1
     assert status.today.human_takeovers == 1
     assert status.today.leads == 0
+    # The same ledger feeds the budget line, so the card and Billing agree (invariant:
+    # a conversation means the same thing everywhere).
+    assert status.conversations_used == 3
+    # And the 7am brief reports the day instead of "A quiet day" (round 7 WP-3a).
+    subject, body = render_daily_brief(
+        status, local_date=datetime(2026, 9, 8).date(), due_callbacks_today=0
+    )
+    assert subject == "Yesterday at Acme: 2 conversations, 1 lead — Aurora's brief"
+    # Equal counts tie, and the mix order then follows the GROUP BY — pin the facts,
+    # not the tie-break.
+    assert "- 2 conversations (" in body
+    assert "1 on website chat" in body and "1 on text messages" in body
+    assert "A quiet day" not in body
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_session_that_never_reached_a_model_call_is_not_a_conversation():
+    """The live defect (round 7 WP-3a): sessions were counted by ``sessions.counted``,
+    a column nothing sets, so a day with real billed conversations still read as
+    quiet. The card reads the ``counted_sessions`` ledger — and ONLY that: an open
+    session that never reached the fire-once counter is not a conversation, and a
+    session counted twice (a retried turn) is still one."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        await _seed(s, admin, iid, channels=[{"id": "widget", "enabled": True}], tools=[])
+        billed = await _session(s, admin, iid, at=THIS_MORNING, channel="whatsapp")
+        await _session(s, admin, iid, at=THIS_MORNING, counted=False)
+        # A second turn on the billed session hits the fire-once guard: no double count.
+        assert not await count_session_once(
+            s, admin_id=admin, instance_id=iid, session_id=billed.id
+        )
+        status = await build_employee_status(s, admin_id=admin, instance_id=iid, now=NOW)
+    assert status is not None
+    assert status.today.conversations == 1
+    assert status.today.by_channel == {"whatsapp": 1}
+    assert status.today.quiet is False
+    assert status.yesterday.quiet is True
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -136,8 +189,7 @@ async def test_another_tenants_rows_never_count():
     async with tenant_session(b) as s:
         await _seed(s, b, ib, channels=[{"id": "widget", "enabled": True}], tools=[])
         for _ in range(3):
-            s.add(_session(b, ib, at=THIS_MORNING))
-        await s.flush()
+            await _session(s, b, ib, at=THIS_MORNING)
     async with tenant_session(a) as s:
         await _seed(s, a, ia, channels=[{"id": "widget", "enabled": True}], tools=[])
         status = await build_employee_status(s, admin_id=a, instance_id=ia, now=NOW)
@@ -185,8 +237,7 @@ async def test_no_timezone_means_utc_days_and_no_team_claim():
         await _seed(
             s, admin, iid, channels=[{"id": "widget", "enabled": True}], tools=[], timezone=None
         )
-        s.add(_session(admin, iid, at=LAST_NIGHT_LOCAL))  # 00:00 UTC today
-        await s.flush()
+        await _session(s, admin, iid, at=LAST_NIGHT_LOCAL)  # 00:00 UTC today
         status = await build_employee_status(s, admin_id=admin, instance_id=iid, now=NOW)
     assert status is not None
     assert status.timezone is None
