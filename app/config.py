@@ -151,6 +151,15 @@ class Settings(BaseSettings):
     # nothing is billed at all.
     stripe_payg_price_id: str = ""
 
+    # The Stripe Billing Portal CONFIGURATION (``bpc_...``) the card-update portal
+    # session is created against (round 7 WP-1 #5). Stripe TEST mode has no default
+    # portal configuration, so in the "test" posture the portal cannot open without the
+    # operator-provisioned one; a live account with a default set may leave this empty
+    # and the gateway then omits the parameter. Like the price it is an account-specific
+    # object id, supplied per environment via LUCIEL_STRIPE_PORTAL_CONFIGURATION_ID or
+    # the platform secret's STRIPE_PORTAL_CONFIGURATION_ID — never a literal here.
+    stripe_portal_configuration_id: str = ""
+
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
 
@@ -434,6 +443,7 @@ class Settings(BaseSettings):
             # travels with the Stripe keys — so it is rotated in the same blob rather
             # than pinned in a task definition.
             "STRIPE_PAYG_PRICE_ID": "stripe_payg_price_id",
+            "STRIPE_PORTAL_CONFIGURATION_ID": "stripe_portal_configuration_id",
             # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret,
             # rather than needing a task-definition change to reach every account.
             "PLATFORM_NOTICES": "platform_notices",

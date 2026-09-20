@@ -105,6 +105,15 @@ def degraded_bindings() -> list[str]:
         # NAME, never a value) so the gap is loud before the first tenant crosses 50.
         # Mock posture bills nothing by design, so an empty price is correct there.
         degraded.append("stripe_payg_price:unset")
+    if (
+        settings.stripe_integration_posture != "mock"
+        and not settings.stripe_portal_configuration_id
+    ):
+        # Round 7 WP-1 #5: Stripe TEST mode has no default Billing Portal configuration,
+        # so a "test" posture without the operator-provisioned one cannot open the
+        # card-update portal at all (POST /billing/portal fails at Stripe). Named here
+        # for the same reason as the price: loud before the first admin clicks it.
+        degraded.append("stripe_portal_configuration:unset")
     if not live_mode():
         degraded.append("llm:EchoModel")
     # Round 5B item 17: hCaptcha in live mode. With no secret configured, captcha

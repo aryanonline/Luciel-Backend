@@ -36,7 +36,13 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+# Round 7 WP-1 #5: the webhook receiver ignores events in the mock posture, so every
+# signed-webhook test here runs in the "test" posture with the fake injected.
+pytestmark = [
+    pytest.mark.contract,
+    pytest.mark.asyncio,
+    pytest.mark.usefixtures("stripe_test_posture"),
+]
 
 # D1: exactly these four go dormant at the reduction; nothing else ever does.
 ACTION_TOOLS: frozenset[str] = frozenset({"calendar", "crm", "record_source", "outbound_webhook"})

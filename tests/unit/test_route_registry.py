@@ -167,6 +167,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # billing
         ("GET", "/api/v1/billing"),
         ("POST", "/api/v1/billing/checkout"),
+        # Round 7 WP-1 #5: the Stripe Billing Portal — the card-UPDATE path (Checkout
+        # only adds a first card). Deliberate addition; refuses in the mock posture.
+        ("POST", "/api/v1/billing/portal"),
         ("DELETE", "/api/v1/billing/payment-method"),
         # The providers' registered OAuth redirect target (§3.8) — public by necessity,
         # authorized by the signed single-use state, answers only in 3xx.

@@ -35,6 +35,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "budget_overage_threshold",
         # Billing / metering lifecycle (Architecture §3.4.1b, CJ §6, Legal §A3)
         "billing_checkout_started",
+        # Round 7 WP-1 #5: the admin opened the Stripe Billing Portal to UPDATE the card
+        # Stripe holds (Checkout adds a first card; the portal replaces it). Payload:
+        # the portal session id only — the card change itself arrives as the
+        # payment_method_added / payment_method_removed events below, via webhook.
+        "billing_portal_session_created",
         "payment_method_added",
         "payment_method_removed",
         "invoice_paid",

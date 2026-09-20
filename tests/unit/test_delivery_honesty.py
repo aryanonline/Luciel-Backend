@@ -296,6 +296,25 @@ def test_degraded_bindings_names_an_unbound_payg_price_in_a_real_stripe_posture(
     assert "stripe_payg_price:unset" not in degraded_bindings()
 
 
+def test_degraded_bindings_names_an_unbound_portal_configuration_in_a_real_posture(
+    monkeypatch,
+):
+    """Round 7 WP-1 #5: Stripe TEST mode has no default Billing Portal configuration, so
+    a "test" posture without one cannot open the card-update portal — named
+    ``stripe_portal_configuration:unset``. Mock posture never opens a portal."""
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_integration_posture", "mock")
+    monkeypatch.setattr(settings, "stripe_portal_configuration_id", "")
+    assert "stripe_portal_configuration:unset" not in degraded_bindings()
+
+    monkeypatch.setattr(settings, "stripe_integration_posture", "test")
+    assert "stripe_portal_configuration:unset" in degraded_bindings()
+
+    monkeypatch.setattr(settings, "stripe_portal_configuration_id", "bpc_bound")
+    assert "stripe_portal_configuration:unset" not in degraded_bindings()
+
+
 def test_degraded_bindings_never_leaks_a_secret_value(live):
     rendered = " ".join(degraded_bindings())
     for value in REQUIRED_IN_LIVE_MODE.values():
