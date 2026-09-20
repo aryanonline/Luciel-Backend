@@ -401,9 +401,9 @@ async def _build_notification(
             .limit(1)
         )
     ).scalar_one_or_none()
-    fired_at = (
+    fired_row = (
         await session.execute(
-            select(EscalationEvent.fired_at)
+            select(EscalationEvent.fired_at, EscalationEvent.reasons)
             .where(
                 EscalationEvent.admin_id == admin_id,
                 EscalationEvent.session_id == session_id,
@@ -412,7 +412,11 @@ async def _build_notification(
             .order_by(EscalationEvent.fired_at.desc())
             .limit(1)
         )
-    ).scalar_one_or_none()
+    ).one_or_none()
+    fired_at = fired_row[0] if fired_row else None
+    # The row's own reasons (F124), read here at send time like everything else — a
+    # hand_to_team page (round 7 WP-2, item 2) is worthless without Luciel's reason.
+    reasons = tuple(str(r) for r in (fired_row[1] or [])) if fired_row else ()
     # The customer's transport identity — only where the channel PROVIDES one
     # (voice/SMS number, email address, Meta id via the lead row). Widget visitors
     # are genuinely anonymous unless they volunteered contact info (then the lead
@@ -438,6 +442,7 @@ async def _build_notification(
         customer_identifier=customer_identifier,
         triggering_message=triggering_message,
         dashboard_url=dashboard_url,
+        reasons=reasons,
     )
     return notification, inst, owner_email
 

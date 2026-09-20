@@ -77,6 +77,7 @@ from app.runtime import personality as personality_rules
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import (
     EscalationDecision,
+    Gate,
     Signal,
     evaluate_intake,
     evaluate_outcome,
@@ -100,7 +101,12 @@ from app.runtime.team_availability import follow_up_phrase
 from app.runtime.team_availability import parse as parse_team_availability
 from app.tools import contract as tool_contract
 from app.tools.contract import Tool, ToolResult
-from app.tools.schemas import ACTION_TOOLS, build_tool_defs
+from app.tools.schemas import (
+    ACTION_TOOLS,
+    HAND_TO_TEAM_TOOL_ID,
+    build_tool_defs,
+    with_cognition_tools,
+)
 
 MAX_ITERATIONS = 5  # §3.4.1 — internal cost-control constant, identical on every tier.
 
@@ -151,6 +157,37 @@ _FIRST_PERSON_SUCCESS_CLAIM = re.compile(
     r"|able to|happy to|glad to)\b)[^.!?]){0,30}?"
     r"\b(booked|scheduled|rescheduled|cancelled|canceled|sent|delivered"
     r"|added to (?:the|your) calendar|updated your)\b",
+    re.IGNORECASE,
+)
+
+
+# A HAND-OFF claim (round 7 WP-2, item 2): the reply tells the customer the team has
+# been (or will be) told — "I've flagged this for the team", "I'll pass this along",
+# "someone will reach out", "your request has been forwarded". The model has exactly
+# one way to make that true: the always-on ``hand_to_team`` tool. A reply that claims
+# a hand-off on a turn with no recorded escalation used to ship with nothing behind
+# it — no row, no owner notification, a customer waiting for a call that was never
+# coming. The claim is not stripped: the customer was promised a person, so the
+# orchestrator RECORDS the escalation through the standard path and the words become
+# true. Offers ("I can pass this along if you'd like", "would you like me to flag
+# this?") and statements about the business ("you can reach the team at …") are not
+# claims and never match.
+_HANDOFF_CLAIM = re.compile(
+    # first-person, completed or promised: I've / I'll / we have / I will / I'm going to
+    r"\b(?:i|we)(?:'ve|'ll|'m going to|'re going to| have| will| am going to| are going to)"
+    r" (?:also |just |already |now |gone ahead and )?"
+    r"(?:flag(?:ged)?|pass(?:ed)?(?: (?:this|that|it|your [a-z]+))? (?:along|on)"
+    r"|let the (?:team|owner|manager) know|notif(?:y|ied)|escalat(?:e|ed)|forward(?:ed)?"
+    r"|loop(?:ed)? in|rais(?:e|ed) (?:this|that|it)"
+    r"|hand(?:ed)? (?:this|that|it|you) (?:over|off))\b"
+    # a person will reach out: "someone will get back to you", "the team will be in touch"
+    r"|\b(?:someone|somebody|a (?:team )?member|a person|the (?:team|owner|manager)|our team"
+    r"|they)(?: from (?:the|our) team)?(?:'ll| will| is going to| are going to) "
+    r"(?:reach out|get back|be in touch|follow up|contact you|call you|email you|text you)\b"
+    # the customer's own thing, passive: "your request has been forwarded / flagged"
+    r"|\b(?:your [a-z]+|this|that|it)(?: has| have|'s) been "
+    r"(?:flagged|passed (?:along|on)|escalated|forwarded|shared with the team"
+    r"|sent to the team|raised with the team)\b",
     re.IGNORECASE,
 )
 
@@ -532,6 +569,10 @@ class Orchestrator:
             # not by the platform's product name (live-caught 2026-08-17: greeting
             # said "Aurora", the model then said "I'm Luciel").
             assistant_name=self.assistant_name,
+            # The always-on hand_to_team cognition tool (round 7 WP-2, item 2) is
+            # described on EVERY turn, tools wired or not — the model must be able to
+            # reach the team on any turn, or it will promise a hand-off it cannot make.
+            tool_catalog=with_cognition_tools(None),
             operating_context=self.operating_context,
         )
 
@@ -985,6 +1026,25 @@ class Orchestrator:
                         reasons=list(outcome.answer_reasons),
                     )
 
+        # --- LUCIEL'S OWN HAND-OFF (round 7 WP-2, item 2; Vision §3.4) ------- #
+        # The model called hand_to_team this turn: the row + notification were
+        # written at dispatch (so the tool result it read back was true). The turn
+        # reports it as its escalation when no platform gate named one first; the
+        # session stays in ai mode (D2) — Luciel keeps answering.
+        handed_to_team = any(
+            str(call.get("tool_id", "")) == HAND_TO_TEAM_TOOL_ID
+            and r.outcome is tool_contract.Outcome.ok
+            for call, r in resp.dispatched
+        )
+        if escalation is None and handed_to_team:
+            escalation = EscalationDecision(
+                True,
+                Signal.luciel_requested_handoff,
+                Gate.outcome,
+                None,
+                ("Luciel asked for a person",),
+            )
+
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
         # model may have produced and never lets the untrusted-data delimiters leak.
@@ -1043,6 +1103,29 @@ class Orchestrator:
                     f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
                 )
                 reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
+        if not claimed_without_action and escalation is None and _HANDOFF_CLAIM.search(reply_text):
+            # The reply promises the team a hand-off that nothing recorded (round 7
+            # WP-2, item 2): no gate fired, hand_to_team was not called. The customer
+            # was promised a person, so the promise is made REAL through the same path
+            # the tool uses — row, audit, owner notification — and the words are left
+            # as they are, now honest. (Once per session: a row already written by an
+            # earlier hand_to_team call backs this claim too, and pages nobody twice.)
+            emit_metric("HandoffClaimedWithoutTool", dimensions={"Channel": channel})
+            promised = ("Luciel told the customer the team would follow up",)
+            await _record_escalation(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=Signal.luciel_requested_handoff.value,
+                gate=Gate.outcome.value,
+                score=None,
+                reasons=list(promised),
+            )
+            escalation = EscalationDecision(
+                True, Signal.luciel_requested_handoff, Gate.outcome, None, promised
+            )
         if (
             not claimed_without_action
             and escalation is not None
@@ -1086,7 +1169,9 @@ class Orchestrator:
             enabled_channels=self.enabled_channels or {channel},
             response_length=len(reply_text),
             customer_requested_channel=requested_channel,
-            is_urgent_escalation=outcome.fired,
+            # Any escalation this turn recorded — a gate's, the model's own hand_to_team,
+            # a promised hand-off made real — is the urgent case the arbiter weighs.
+            is_urgent_escalation=escalation is not None,
         )
         if (
             outbound != channel
@@ -1161,14 +1246,20 @@ class Orchestrator:
         )
 
     # --- internals ---------------------------------------------------------- #
-    async def _turn_tool_defs(self) -> list[dict[str, Any]] | None:
+    async def _turn_tool_defs(self) -> list[dict[str, Any]]:
         """The provider-neutral tool defs THIS turn may propose (C4).
 
         Intersection of: the session's frozen snapshot capability set (§3.8.7 rule E;
         None = older session → no snapshot filter), the instance's LIVE enabled
         authorizations (default-deny — an unauthorized tool is never even described
-        to the model), and the ids the resolver can bind. None when no tools are
-        wired — which keeps the call byte-identical to pre-tool-use behavior."""
+        to the model), and the ids the resolver can bind — PLUS the always-on
+        ``hand_to_team`` cognition tool (round 7 WP-2, item 2), which no gate governs:
+        it is Luciel's own judgment, dispatched by the loop itself, never listed on the
+        Configure surface, and present on every turn whether or not tools are wired."""
+        return with_cognition_tools(await self._catalog_tool_defs())
+
+    async def _catalog_tool_defs(self) -> list[dict[str, Any]] | None:
+        """The gated CATALOG defs alone (see ``_turn_tool_defs``); None when none apply."""
         if self.tool_resolver is None:
             return None
         from app.models.tool_auth import InstanceToolAuthorization  # noqa: PLC0415
@@ -1382,6 +1473,20 @@ class Orchestrator:
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
             inputs = call.get("inputs", {})
+            if tool_id == HAND_TO_TEAM_TOOL_ID:
+                # Always-on cognition (round 7 WP-2, item 2): no snapshot, no
+                # authorization row, no connection — Luciel may always reach the team.
+                results.append(
+                    (
+                        dict(call),
+                        await self._hand_to_team(
+                            dict(inputs) if isinstance(inputs, dict) else {},
+                            session_id=session_id,
+                            resolved_lead_id=resolved_lead_id,
+                        ),
+                    )
+                )
+                continue
             # §3.8.7 rule E capability gate: a tool enabled AFTER this conversation
             # opened is not part of its frozen snapshot capability set, so it is
             # unavailable to THIS conversation (applies to the next one). Deferred
@@ -1406,6 +1511,54 @@ class Orchestrator:
             )
             results.append((dict(call), result))
         return results
+
+    #: Longest reason the model may attach to a hand-off (owner-facing phrase, F124).
+    HAND_TO_TEAM_REASON_CAP = 240
+
+    async def _hand_to_team(
+        self,
+        inputs: dict[str, Any],
+        *,
+        session_id: uuid.UUID | None,
+        resolved_lead_id: uuid.UUID | None,
+    ) -> ToolResult:
+        """Execute ``hand_to_team`` (round 7 WP-2, item 2): Luciel's own judgment that a
+        person should step in, recorded through the STANDARD escalation path — the
+        ``escalation_events`` row, the ``escalation_fired`` audit event, the owner
+        notification carrying the model's reason. The session is NOT taken away (D2):
+        Luciel keeps answering while the team is on their way.
+
+        Once per conversation like every other signal: a second call in the same
+        session writes nothing and pages nobody, and says so in its payload — the
+        team IS flagged, so the outcome is still ``ok``. A blank reason is recorded as
+        such rather than refused: an escalation the model asked for is never dropped
+        on a formality, and the owner reads "no reason given" instead of nothing."""
+        if session_id is None:
+            return tool_contract.failed("no_session")
+        reason = " ".join(str(inputs.get("reason") or "").split())[: self.HAND_TO_TEAM_REASON_CAP]
+        reasons = ["Luciel asked for a person", reason or "no reason given"]
+        written = await _record_escalation(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=Signal.luciel_requested_handoff.value,
+            gate=Gate.outcome.value,
+            score=None,
+            reasons=reasons,
+        )
+        return tool_contract.ok(
+            {
+                "passed_to_team": True,
+                "state": "recorded" if written else "already_passed_this_conversation",
+                # Read back by the model (T3): the honest wording of what happens next.
+                "note": (
+                    "The team has been notified and a person will follow up later; keep "
+                    "helping the customer now. Never promise a time or a real-time reply."
+                ),
+            }
+        )
 
     @staticmethod
     def _with_contact_ask(

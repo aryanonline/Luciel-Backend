@@ -34,7 +34,10 @@ ChannelIdWire = Literal[
 LeadStateWire = Literal["active", "archived"]  # NO 'pruned' — prune deletes (§3.4.10a).
 MessageRoleWire = Literal["lead", "luciel", "human_agent"]
 GateWire = Literal["intake", "outcome"]
-# The 4 fixed signals + the 2 server-only signals (schemas/conversations.ts).
+# The 4 fixed signals + the server-only signals (schemas/conversations.ts).
+# ``luciel_requested_handoff`` (round 7 WP-2, item 2) is Luciel's own hand_to_team
+# judgment; ``reply_undeliverable`` (audit F077) is the platform's undeliverable-reply
+# escalation — both are rows the escalations list serves, so they must parse here.
 EscalationEventSignalWire = Literal[
     "explicit_human_request",
     "strong_negative_sentiment",
@@ -42,6 +45,8 @@ EscalationEventSignalWire = Literal[
     "high_value_lead",
     "budget_exhausted",
     "llm_unavailable",
+    "luciel_requested_handoff",
+    "reply_undeliverable",
 ]
 
 

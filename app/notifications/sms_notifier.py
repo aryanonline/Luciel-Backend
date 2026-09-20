@@ -45,6 +45,10 @@ class SmsNotifier:
         if notification.lead_intent:
             intent = notification.lead_intent[:_MAX_INTENT].rstrip()
             parts.append(f"Wants: {intent}.")
+        if notification.reasons:
+            # Condensed like the intent: the row's phrases, one segment's worth at most.
+            why = "; ".join(notification.reasons)[:_MAX_INTENT].rstrip()
+            parts.append(f"Why: {why}.")
         parts.append(notification.next_step)
         # The dashboard row's #ref — the SMS previously carried NO conversation handle.
         parts.append(f"#{notification.short_ref}")

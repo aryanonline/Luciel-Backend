@@ -44,6 +44,13 @@ class Signal(str, enum.Enum):
     # "budget_exhausted" while returning cannot_answer to the caller.
     budget_exhausted = "budget_exhausted"
     llm_unavailable = "llm_unavailable"
+    # Luciel's OWN judgment (round 7 WP-2, item 2; Vision §3.4): the model called the
+    # always-on ``hand_to_team`` cognition tool with a reason — or promised the
+    # customer a hand-off in prose, which the orchestrator turns into this same real
+    # escalation rather than letting the promise ship unbacked. The owner is notified
+    # with the reason; Luciel keeps answering (D2: only an explicit human request and
+    # threat/self-harm moderation take the conversation away).
+    luciel_requested_handoff = "luciel_requested_handoff"
 
 
 class Gate(str, enum.Enum):

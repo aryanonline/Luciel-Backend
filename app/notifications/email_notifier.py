@@ -27,6 +27,8 @@ _SIGNAL_LABELS: dict[str, str] = {
     "high_value_lead": "high-value lead",
     "budget_exhausted": "conversation limit reached",
     "llm_unavailable": "Luciel could not reach its model provider",
+    "luciel_requested_handoff": "Luciel asked for a person",
+    "reply_undeliverable": "Luciel's reply could not be delivered",
 }
 
 _CHANNEL_LABELS: dict[str, str] = {
@@ -61,6 +63,9 @@ class EmailNotifier:
             "",
             f"Why: {_SIGNAL_LABELS.get(notification.signal, notification.signal)}",
         ]
+        if notification.reasons:
+            # The row's own phrases (F124) — for a hand_to_team page, Luciel's reason.
+            lines.append(f"Details: {'; '.join(notification.reasons)}")
         if notification.channel:
             label = _CHANNEL_LABELS.get(notification.channel, notification.channel)
             lines.append(f"Channel: {label}")
