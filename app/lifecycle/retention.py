@@ -8,6 +8,13 @@ Postgres-side reconciliation — the application sweep that deletes aged
 ``Transcript``, ``SessionSummary`` and ``Session`` rows on LIVE (non-deleted)
 tenants and emits a ``data_retention_hard_delete`` audit event per data class.
 
+The stored ORIGINALS of knowledge files (app/knowledge/original_store.py) ride
+the same sweep as a reconciliation rather than a timer: their bucket has no
+expiration by design (an original lives exactly as long as its source), so an
+object whose delete failed during a source purge would survive forever. The
+sweep lists the tenant's originals prefix and deletes every object whose
+knowledge_sources row no longer exists (round 7 WP-8).
+
 Captured Leads are NOT on that platform timer (Legal §B5 makes them Admin-managed
 business data). They get a second, opt-in policy in the same sweep —
 ``prune_stale_leads`` acts only for a tenant that set ``leadRetentionDays`` itself
@@ -36,12 +43,18 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.knowledge.original_store import (
+    ListedOriginal,
+    get_original_store,
+    original_prefix_for,
+)
 from app.lifecycle.transcript_store import get_transcript_store
 from app.models.audit import ActorType
 from app.models.billing import ProcessedStripeEvent
 from app.models.conversation import EscalationEvent, Session, SessionSummary, Transcript
 from app.models.deferred import DeferredAction
 from app.models.instance import Instance
+from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead, LeadState
 from app.models.trace import RetrievalTraceEvent, ToolTraceEvent
 
@@ -61,6 +74,11 @@ STRIPE_EVENT_RETENTION_DAYS = 400
 # visitors): PII with previously NO retention and NO deletion path anywhere.
 # Aligned with the 1-year conversation retention (Legal §B5 posture).
 CONTACT_SUBMISSION_RETENTION_DAYS = 365
+# A stored knowledge original younger than this is never reaped as an orphan: the
+# upload route keeps the bytes INSIDE the ingest transaction (keep_original runs
+# before the row commits), so a sweep landing in that window would see a key with
+# no committed row. An hour is far past any ingest; a real orphan waits one run.
+ORIGINAL_ORPHAN_MIN_AGE = timedelta(hours=1)
 
 # (model, data_class label used in the audit payload) for each swept class, children
 # before the parent conversation row. Every model here carries admin_id (TenantMixin)
@@ -232,6 +250,16 @@ async def expire_aged_data(
         )
     counts["knowledge_source_grace_expired"] = purged_sources
 
+    # Orphaned stored originals (round 7 WP-8): the originals bucket has NO
+    # expiration by design — an original lives exactly as long as its source —
+    # so an object whose delete failed during a source purge (logged and
+    # swallowed there, the prefix sweep at the cascade being the only backstop)
+    # would survive an ACTIVE tenant forever. Reconcile the prefix against the
+    # rows instead of adding a blanket expiry that would also eat live files.
+    counts["knowledge_original_orphan"] = await reap_orphaned_originals(
+        session, admin_id=admin_id, instance_id=instance_id, now=now
+    )
+
     # Terminal deferred-action rows: receipts of delivered/abandoned follow-ups,
     # kept 90 days for support forensics, then pruned. The QUEUE (status=queued)
     # is never touched — a pending promise to a customer is not "aged data".
@@ -272,6 +300,112 @@ async def expire_aged_data(
 
     await session.flush()
     return counts
+
+
+def orphaned_original_keys(
+    listed: list[ListedOriginal],
+    *,
+    prefix: str,
+    live_source_ids: set[uuid.UUID],
+    modified_before: datetime,
+) -> list[str]:
+    """The keys under a tenant's originals ``prefix`` that no knowledge_sources row
+    owns and that were written before ``modified_before``. Key layout is
+    ``{prefix}{source_id}/{filename}`` (original_key_for); the source-id segment is
+    the ownership link. A key outside the prefix is never a candidate (the store is
+    asked for the prefix, but the sweep must not rely on that); a segment that is
+    not a UUID names no row and is an orphan too. Tombstoned (soft-deleted) sources
+    still have a row, so their originals — the undo window's payload — are kept.
+    An object written at or after ``modified_before`` is kept whatever the rows say:
+    it may be an upload whose row has not committed yet (ORIGINAL_ORPHAN_MIN_AGE)."""
+    orphans: list[str] = []
+    for entry in listed:
+        key = entry.key
+        if not key.startswith(prefix) or entry.last_modified >= modified_before:
+            continue
+        segment = key[len(prefix) :].split("/", 1)[0]
+        try:
+            source_id = uuid.UUID(segment)
+        except ValueError:
+            orphans.append(key)
+            continue
+        if source_id not in live_source_ids:
+            orphans.append(key)
+    return orphans
+
+
+async def reap_orphaned_originals(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID | None = None,
+    now: datetime | None = None,
+    min_age: timedelta = ORIGINAL_ORPHAN_MIN_AGE,
+) -> int:
+    """Delete stored originals whose knowledge_sources row is gone (round 7 WP-8).
+
+    Lists the tenant's originals prefix through the bound OriginalStore, keeps
+    every object whose source-id segment names an EXISTING row for this tenant
+    (soft-deleted rows included — their originals are the undo window's payload)
+    and every object younger than ``min_age`` (an upload in flight has its bytes
+    before its row commits), and deletes the rest. Emits ONE
+    ``data_retention_hard_delete`` audit event with ``data_class``
+    ``knowledge_original`` when anything was orphaned (count and delete_errors on
+    the payload). Returns the number of objects deleted.
+
+    Best-effort against the store: a listing failure is logged at ERROR (the sweep
+    log group's SweepErrors alarm reads that) and reaps nothing this run rather
+    than rolling back the tenant's row retention; a per-object delete failure is
+    counted on the audit payload and retried by the next nightly run.
+    """
+    now = now or datetime.now(UTC)
+    prefix = original_prefix_for(admin_id)
+    store = get_original_store()
+    try:
+        listed = await store.list_prefix(prefix=prefix)
+    except Exception:  # noqa: BLE001 — see docstring
+        logging.getLogger(__name__).error(
+            "knowledge_original_orphan_list_failed admin_id=%s", admin_id, exc_info=True
+        )
+        return 0
+    if not listed:
+        return 0
+    live_ids = set(
+        (
+            await session.execute(
+                select(KnowledgeSource.id).where(KnowledgeSource.admin_id == admin_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphans = orphaned_original_keys(
+        listed, prefix=prefix, live_source_ids=live_ids, modified_before=now - min_age
+    )
+    if not orphans:
+        return 0
+    deleted = 0
+    delete_errors = 0
+    for key in orphans:
+        try:
+            await store.delete(key=key)
+            deleted += 1
+        except Exception:  # noqa: BLE001 — counted; the next run retries
+            delete_errors += 1
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="data_retention_hard_delete",
+        payload={
+            "data_class": "knowledge_original",
+            "count": deleted,
+            "delete_errors": delete_errors,
+            "retention_policy": "orphan_reconcile:no_knowledge_sources_row",
+        },
+    )
+    return deleted
 
 
 async def prune_stale_leads(

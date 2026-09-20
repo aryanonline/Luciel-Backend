@@ -18,7 +18,8 @@ from __future__ import annotations
 import re
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
@@ -44,6 +45,19 @@ def original_key_for(admin_id: uuid.UUID, source_id: uuid.UUID, filename: str) -
 class StoredOriginal:
     data: bytes
     content_type: str
+    # When the bytes were written (S3: the object's LastModified). The retention
+    # sweep's orphan reaper reads it to leave an in-flight upload alone.
+    stored_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True)
+class ListedOriginal:
+    """One object under a prefix, as ``list_prefix`` reports it: the key and when it
+    was last written. The store reports facts; which of them are orphans is the
+    retention sweep's policy (app/lifecycle/retention.py)."""
+
+    key: str
+    last_modified: datetime
 
 
 @runtime_checkable
@@ -57,6 +71,12 @@ class OriginalStore(Protocol):
     async def delete(self, *, key: str) -> None: ...
 
     async def delete_prefix(self, *, prefix: str) -> int: ...
+
+    async def list_prefix(self, *, prefix: str) -> list[ListedOriginal]:
+        """Every object under ``prefix`` with its last-written time (tz-aware) — the
+        retention sweep's orphan reconciliation reads the tenant's prefix and compares
+        it against the knowledge_sources rows (round 7 WP-8)."""
+        ...
 
 
 class LocalOriginalStore:
@@ -83,6 +103,14 @@ class LocalOriginalStore:
             for k in doomed:
                 del type(self)._store[k]
             return len(doomed)
+
+    async def list_prefix(self, *, prefix: str) -> list[ListedOriginal]:
+        with self._lock:
+            return [
+                ListedOriginal(k, v.stored_at)
+                for k, v in sorted(type(self)._store.items())
+                if k.startswith(prefix)
+            ]
 
     @classmethod
     def keys(cls) -> list[str]:
@@ -148,6 +176,22 @@ class S3OriginalStore:
                 removed += len(doomed)
             if not page.get("IsTruncated"):
                 return removed
+            kwargs["ContinuationToken"] = page.get("NextContinuationToken")
+
+    async def list_prefix(self, *, prefix: str) -> list[ListedOriginal]:
+        client = self._get_client()
+        listed: list[ListedOriginal] = []
+        kwargs: dict[str, object] = {"Bucket": self._bucket, "Prefix": prefix}
+        while True:
+            page = client.list_objects_v2(**kwargs)  # type: ignore[attr-defined]
+            for item in page.get("Contents", []):
+                # boto3 hands back a tz-aware LastModified; a naive one is UTC.
+                modified: datetime = item["LastModified"]
+                if modified.tzinfo is None:
+                    modified = modified.replace(tzinfo=UTC)
+                listed.append(ListedOriginal(str(item["Key"]), modified))
+            if not page.get("IsTruncated"):
+                return listed
             kwargs["ContinuationToken"] = page.get("NextContinuationToken")
 
 
