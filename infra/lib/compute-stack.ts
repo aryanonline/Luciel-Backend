@@ -764,6 +764,15 @@ export class ComputeStack extends Stack {
         // Wire the real Redis so the cap tests (T2/T3) exercise the Redis-backed
         // store exactly as the app does, not the in-memory degraded fallback.
         LUCIEL_REDIS_URL: redisUrl,
+        // The API the harness drives (scripts/seed_and_livetest.py reads
+        // LUCIEL_API_BASE and otherwise defaults to the public hostname). Injected
+        // per environment (round 7 WP-8): without it the PREPROD rehearsal drove
+        // whatever the public hostname pointed at while reading preprod's own
+        // database — a harness proving one environment's behavior against
+        // another's rows. Derived from DOMAINS.api for now; the per-environment
+        // hostname move (owner console work) changes this ONE value and nothing
+        // in the harness.
+        LUCIEL_API_BASE: publicApiBaseUrl,
       },
     });
     new cdk.CfnOutput(this, 'SeedTestTaskArn', {
