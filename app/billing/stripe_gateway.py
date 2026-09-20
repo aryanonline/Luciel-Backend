@@ -78,6 +78,19 @@ class CheckoutSession:
     session_id: str
 
 
+@dataclass(frozen=True)
+class PortalSession:
+    """Hosted Stripe Billing Portal session — the card-UPDATE page (round 7 WP-1 #5).
+
+    Checkout adds a card; the portal is where the admin replaces the one Stripe already
+    holds. Same shape as :class:`CheckoutSession`: a URL the UI redirects to, plus the
+    session id for the audit trail. Short-lived (Stripe expires it in minutes).
+    """
+
+    url: str
+    session_id: str
+
+
 METER_EVENT_NAME = "luciel_payg_blocks"
 """``event_name`` of the Stripe Billing Meter every PAYG usage event is posted to.
 
@@ -116,6 +129,19 @@ def payg_price_id() -> str:
     return get_settings().stripe_payg_price_id or ""
 
 
+def portal_configuration_id() -> str:
+    """The configured Stripe Billing Portal configuration (``bpc_...``), or "" when unset.
+
+    Stripe TEST mode has no default portal configuration, so the "test" posture needs
+    the operator-provisioned one to open the portal at all. Empty means "omit the
+    parameter" — a live account then uses its default. See
+    :meth:`StripeGateway.create_portal_session`.
+    """
+    from app.config import get_settings  # noqa: PLC0415 — avoids an import cycle
+
+    return get_settings().stripe_portal_configuration_id or ""
+
+
 @dataclass(frozen=True)
 class StripeEvent:
     """A verified, parsed Stripe webhook event (signature already checked)."""
@@ -141,6 +167,13 @@ class StripeGateway(Protocol):
         self, *, customer_id: str, success_url: str, cancel_url: str
     ) -> CheckoutSession:
         """Hosted Checkout to add a card — NO charge at save (CJ §6)."""
+        ...
+
+    async def create_portal_session(self, *, customer_id: str, return_url: str) -> PortalSession:
+        """Hosted Billing Portal so the admin can UPDATE the card Stripe holds (round 7
+        WP-1 #5). ``return_url`` is where Stripe sends them back: the dashboard billing
+        page. The card change itself reaches us as ``payment_method.attached`` /
+        ``.detached`` webhooks, exactly like a Checkout-added card."""
         ...
 
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
@@ -333,6 +366,10 @@ class FakeStripeGateway:
         self.cancelled_subscriptions: list[tuple[str, bool]] = []
         self.deleted_customers: list[str] = []
         self._existing_customers: set[str] = set()
+        # (customer id, return_url) per Billing Portal session minted, in order — proves
+        # the card-update page was opened for the right customer and lands back on the
+        # dashboard billing page (round 7 WP-1 #5).
+        self.portal_sessions: list[tuple[str, str]] = []
         # Injectable clock so a test can place the subscription anchor deliberately.
         self.now: datetime | None = None
 
@@ -368,6 +405,14 @@ class FakeStripeGateway:
             brand="visa", last4="4242", exp_month=12, exp_year=2030
         )
         return CheckoutSession(url=f"https://checkout.stripe.com/c/pay/{sid}", session_id=sid)
+
+    async def create_portal_session(self, *, customer_id: str, return_url: str) -> PortalSession:
+        # Deterministic per customer so a test can assert the exact URL. The fake
+        # changes NO card state here: in the real flow the admin's edits inside the
+        # portal come back as payment_method webhooks, never as a return value.
+        sid = f"bps_fake_{customer_id.removeprefix('cus_fake_')}"
+        self.portal_sessions.append((customer_id, return_url))
+        return PortalSession(url=f"https://billing.stripe.com/p/session/{sid}", session_id=sid)
 
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
         # Same price-id gate as RealStripeGateway: a fake that happily minted a
@@ -533,6 +578,22 @@ class RealStripeGateway:
         )
         return CheckoutSession(url=str(session["url"]), session_id=str(session["id"]))
 
+    async def create_portal_session(self, *, customer_id: str, return_url: str) -> PortalSession:
+        """POST /v1/billing_portal/sessions — the hosted card-update page.
+
+        ``configuration`` is passed only when one is bound (``portal_configuration_id``):
+        Stripe TEST mode has no default portal configuration, so the test posture needs
+        the operator-provisioned one, while an empty value leaves a live account on its
+        own default rather than sending an empty string Stripe would reject.
+        """
+        client = self._get_client()
+        params: dict[str, object] = {"customer": customer_id, "return_url": return_url}
+        configuration = portal_configuration_id()
+        if configuration:
+            params["configuration"] = configuration
+        session = client.billing_portal.Session.create(**params)  # type: ignore[attr-defined]
+        return PortalSession(url=str(session["url"]), session_id=str(session["id"]))
+
     async def ensure_metered_subscription(self, *, customer_id: str) -> str | None:
         """Find or create the customer's PAYG meter-backed subscription.
 
@@ -556,8 +617,13 @@ class RealStripeGateway:
         created = client.Subscription.create(  # type: ignore[attr-defined]
             customer=customer_id,
             items=[{"price": price_id}],
-            # Idempotent per customer so a retry cannot create a second subscription.
-            idempotency_key=f"payg-sub:{customer_id}",
+            # Unique per ATTEMPT (round 7 WP-1 #5). The key used to be the bare customer
+            # id, and Stripe replays a keyed request's original response for 24 hours:
+            # a card removed (subscription cancelled with its final invoice) and re-added
+            # the same day had its next block "created" as the CANCELLED subscription,
+            # which invoices nothing. The active-subscription lookup above is what keeps
+            # a retry from minting a second one; the key only has to never collide.
+            idempotency_key=f"payg-sub:{customer_id}:{uuid.uuid4().hex}",
         )
         return str(created["id"])
 
@@ -599,8 +665,18 @@ class RealStripeGateway:
         inv = customer["invoice_settings"] if "invoice_settings" in customer else None
         pm_id = inv["default_payment_method"] if inv and "default_payment_method" in inv else None
         if not pm_id:
-            return None
-        pm = client.PaymentMethod.retrieve(pm_id)  # type: ignore[attr-defined]
+            # No invoice default yet. Checkout in setup mode attaches the card WITHOUT
+            # making it the default (F006) — the attached webhook does that — so between
+            # the Checkout redirect and the webhook the card on file is the newest
+            # attached one. The same rule ``remove_payment_method`` already applies:
+            # a card attached with no default is still a card on file (round 7 WP-1 #5).
+            listed = client.PaymentMethod.list(customer=customer_id, type="card", limit=1)  # type: ignore[attr-defined]
+            cards = listed["data"] if "data" in listed else []
+            if not cards:
+                return None
+            pm = cards[0]
+        else:
+            pm = client.PaymentMethod.retrieve(pm_id)  # type: ignore[attr-defined]
         card = pm["card"] if "card" in pm else None
         if not card:
             return None

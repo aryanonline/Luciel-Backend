@@ -161,19 +161,50 @@ async def _get_or_create_row(
     ).scalar_one()
 
 
+async def session_is_counted(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> bool:
+    """Whether this session already holds a row in the fire-once ledger — i.e. it IS
+    one of the conversations the tenant has been counted (and, past the free 50,
+    billed) for. The ledger is keyed on the session, not the period (F029), so a
+    conversation that straddles a period boundary reads as counted on both sides."""
+    return (
+        await session.execute(
+            select(CountedSession.id).where(
+                CountedSession.admin_id == admin_id,
+                CountedSession.instance_id == instance_id,
+                CountedSession.session_id == session_id,
+            )
+        )
+    ).scalar_one_or_none() is not None
+
+
 async def check_budget(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     has_payment_method: bool = False,
+    session_id: uuid.UUID | None = None,
 ) -> BudgetState:
     """Read the gate state without mutating the counter (run BEFORE PLAN, §3.4.1b).
 
     at_cap is true once the free allowance is consumed AND no payment method is on
-    file. With a payment method, PAYG would continue serving (Arc 18) — here we
-    report not-at-cap so the loop semantics are correct once metering lands, but the
-    actual overage billing is Arc 18 (flagged above)."""
+    file. With a payment method, PAYG continues serving and the overage is metered.
+
+    The cap applies to NEW conversations only (Legal §A3 #3: in-flight conversations
+    are honored at a reduction). ``session_id`` names the conversation this turn
+    belongs to; a session already in the ``counted_sessions`` ledger is one the
+    tenant has been counted for and is never reported at_cap, whatever the counter
+    says. Without this (round 7 WP-1 #1) the gate read the counter alone, so the
+    50th free conversation was cut after its first turn — the turn that counted it
+    pushed the counter to 50 — and a card removal or a day-7 dunning reduction
+    severed every live chat mid-sentence. Callers that have no session (the widget
+    bootstrap render-state read) pass nothing and get the pure counter answer."""
     settings = get_settings()
     period = await resolve_billing_period_start(session, admin_id=admin_id)
     row = await _get_or_create_row(
@@ -181,6 +212,14 @@ async def check_budget(
     )
     free = settings.free_allowance  # literally 50 (§3.4.1b / BUILD_SPEC §6)
     at_cap = row.counted_conversations >= free and not has_payment_method
+    if (
+        at_cap
+        and session_id is not None
+        and await session_is_counted(
+            session, admin_id=admin_id, instance_id=instance_id, session_id=session_id
+        )
+    ):
+        at_cap = False
     return BudgetState(counted=row.counted_conversations, free_allowance=free, at_cap=at_cap)
 
 

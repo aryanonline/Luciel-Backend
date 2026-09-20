@@ -17,6 +17,7 @@ the ``processed_stripe_events`` primary key.
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Request
@@ -30,9 +31,11 @@ from app.billing.stripe_gateway import (
     StripeGateway,
     get_stripe_gateway,
 )
+from app.config import get_settings
 from app.db.session import tenant_session, untenanted_session
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
+_log = logging.getLogger(__name__)
 
 
 def _metadata_admin_id(event: StripeEvent) -> uuid.UUID | None:
@@ -87,6 +90,21 @@ async def stripe_webhook(
         # 422 maps to validation_error on the frontend; for a server-to-server
         # webhook the body is non-customer-facing. Reject without processing.
         raise validation_error("Invalid Stripe signature.") from exc
+
+    if get_settings().stripe_integration_posture == "mock":
+        # Round 7 WP-1 #5: billing is NOT live in this posture — the gateway is the
+        # in-process fake and nothing this deployment shows as "saved" or "billed" came
+        # from Stripe. A verified event still mutates nothing here: a real whsec_ in a
+        # mock-posture production would otherwise let Stripe's account state (or a
+        # replay of it) flip billing state the deployment cannot honour. 200 so Stripe
+        # stops retrying; logged so the operator can see events reaching a deployment
+        # that ignores them; nothing claimed, so the posture flip processes a redelivery.
+        _log.warning(
+            "stripe webhook ignored: stripe_integration_posture=mock event_id=%s type=%s",
+            event.event_id,
+            event.type,
+        )
+        return {"status": "ignored", "reason": "mock_posture"}
 
     admin_id = await _resolve_tenant(event)
     if admin_id is None:

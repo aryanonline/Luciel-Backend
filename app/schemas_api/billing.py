@@ -68,3 +68,13 @@ class CheckoutSessionOut(WireModel):
     """Hosted Stripe Checkout result (frozen billing.ts ``checkoutSession``)."""
 
     url: str
+
+
+class PortalSessionOut(WireModel):
+    """Hosted Stripe Billing Portal session — the card-update page (round 7 WP-1 #5).
+
+    Same one-field shape as ``CheckoutSessionOut`` so the dashboard treats both the
+    same way: redirect to ``url``; Stripe sends the admin back to the billing page.
+    """
+
+    url: str

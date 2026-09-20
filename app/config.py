@@ -159,6 +159,15 @@ class Settings(BaseSettings):
     # secret's STRIPE_PORTAL_CONFIGURATION_ID; empty means "Stripe's default".
     stripe_portal_configuration_id: str = ""
 
+    # The Stripe Billing Portal CONFIGURATION (``bpc_...``) the card-update portal
+    # session is created against (round 7 WP-1 #5). Stripe TEST mode has no default
+    # portal configuration, so in the "test" posture the portal cannot open without the
+    # operator-provisioned one; a live account with a default set may leave this empty
+    # and the gateway then omits the parameter. Like the price it is an account-specific
+    # object id, supplied per environment via LUCIEL_STRIPE_PORTAL_CONFIGURATION_ID or
+    # the platform secret's STRIPE_PORTAL_CONFIGURATION_ID — never a literal here.
+    stripe_portal_configuration_id: str = ""
+
     # --- Grounding (Architecture §9 #18) ---------------------------------
     grounding_floor: float = 0.50
 

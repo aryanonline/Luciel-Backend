@@ -521,30 +521,123 @@ async def send_card_expiry_notice(
     )
 
 
+#: ``notice_type`` of the day-7 reduction notice (Legal §A3 / §3.6.7) — distinct from
+#: the per-retry ``payment_failed_retry`` so the audit trail says which one went out.
+DUNNING_REDUCED_NOTICE = "dunning_reduced"
+PAYMENT_FAILED_RETRY_NOTICE = "payment_failed_retry"
+PAYMENT_METHOD_REMOVED_NOTICE = "payment_method_removed"
+
+# What the owner keeps in every billing state (owner decision D1, 2026-09-14): their
+# own mailbox and Twilio are theirs, and a conversation in flight is never cut off
+# (Legal §A3 #3). Said in every dunning / removal notice so the consequence is exact.
+_KEEPS = (
+    "Your own email and SMS channels keep working, and a conversation already in "
+    "progress is never cut off."
+)
+_BILLING_PAGE = "You can add or update your card any time from the Billing page of your dashboard."
+
+
+def _dunning_body(dunning_state: str, attempt_number: int | None) -> tuple[str, str]:
+    """(subject, body) for the dunning state the account is in RIGHT NOW.
+
+    One fixed body used to go out regardless of state (round 7 WP-1 #3b), so the day-7
+    reduction notice read like retry number one. ``retrying`` says what the schedule is
+    and what happens when it runs out; ``reduced`` says what has already happened.
+    """
+    if dunning_state == "reduced":
+        subject = "Your VantageMind account is now on the free allowance"
+        body = (
+            "We could not collect your VantageMind payment after retrying on days 1, 3, 5 "
+            "and 7.\n\n"
+            "Your account is now on the free allowance: your Luciel answers the first 50 "
+            "conversations of each period, and action tools (calendar, CRM, record "
+            "lookups, webhooks) are paused until a valid card is added. "
+            f"{_KEEPS}\n\n"
+            f"{_BILLING_PAGE}"
+        )
+        return subject, body
+    attempt = f"This was retry attempt {attempt_number}. " if attempt_number is not None else ""
+    subject = "Action needed: payment issue on your VantageMind account"
+    body = (
+        "We couldn't process your latest VantageMind payment.\n\n"
+        f"{attempt}We will retry automatically on days 1, 3, 5 and 7 after the first "
+        "failure. After that your Luciel answers only the free 50 conversations for the "
+        "period and action tools (calendar, CRM, record lookups, webhooks) pause until a "
+        f"valid card is added. {_KEEPS}\n\n"
+        f"{_BILLING_PAGE}"
+    )
+    return subject, body
+
+
 async def send_payment_failed(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
     to: str,
     dunning_state: str,
-    attempt_number: int,
+    attempt_number: int | None,
     sender: EmailSender | None = None,
 ) -> DeliveryOutcome:
-    """Dunning retry notice (Legal §A3 / §3.6.7 — a notice at each retry)."""
-    body = (
-        "We couldn't process your latest VantageMind payment.\n\n"
-        f"This was retry attempt {attempt_number}. We'll try again automatically.\n"
-        "Please check your payment method to avoid an interruption to your service."
+    """Dunning notice (Legal §A3 / §3.6.7): one at each retry, and the final one at the
+    day-7 reduction. The body states the consequence for the state the account is in
+    (see :func:`_dunning_body`); ``attempt_number`` is None when the notice is the
+    schedule-driven reduction (``dunning.advance_if_due``) rather than a Stripe retry."""
+    subject, body = _dunning_body(dunning_state, attempt_number)
+    notice_type = (
+        DUNNING_REDUCED_NOTICE if dunning_state == "reduced" else PAYMENT_FAILED_RETRY_NOTICE
     )
     return await _dispatch(
         session,
         admin_id=admin_id,
         to=to,
-        subject="Action needed: payment issue on your VantageMind account",
+        subject=subject,
         body=body,
-        notice_type="payment_failed_retry",
+        notice_type=notice_type,
         audit_event="lifecycle_notice_sent",
         extra_payload={"dunning_state": dunning_state, "attempt_number": attempt_number},
+        sender=sender,
+    )
+
+
+def payment_method_removed_text(reason: str) -> str:
+    """The one-paragraph consequence of a card removal (D1) — shared by the email body
+    and the SMS leg so both say the same thing."""
+    how = (
+        "was removed from your Stripe customer"
+        if reason == "stripe_detached"
+        else "was removed from your account"
+    )
+    return (
+        f"The payment card on your VantageMind account {how}. Luciel keeps answering: "
+        "after this period's free 50 conversations, new conversations wait until a card "
+        f"is added. Nothing else changes. {_KEEPS}"
+    )
+
+
+async def send_payment_method_removed(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    reason: str,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Card-removed notice (round 7 WP-1 #3c; Legal §A3 / §3.6.7).
+
+    Neither removal path — the admin's DELETE nor Stripe's payment_method.detached —
+    told the owner anything; a detach the owner did not initiate (an issuer pulling
+    the card) was silent until the cap bit. ``reason`` is the same value the
+    ``payment_method_removed`` audit event carries."""
+    body = f"{payment_method_removed_text(reason)}\n\n{_BILLING_PAGE}"
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="The payment card on your VantageMind account was removed",
+        body=body,
+        notice_type=PAYMENT_METHOD_REMOVED_NOTICE,
+        audit_event="lifecycle_notice_sent",
+        extra_payload={"reason": reason},
         sender=sender,
     )
 

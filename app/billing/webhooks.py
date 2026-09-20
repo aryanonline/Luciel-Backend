@@ -20,7 +20,12 @@ Events handled:
                                       make the card the invoice default, clear any dunning
                                       (a new card IS the remedy, F012), restore dormant
                                       connections to their pre-dormant status (Legal §A3).
-  * payment_method.detached         → flip billingState→free_cap + clear display tuple.
+  * payment_method.detached         → flip billingState→free_cap + clear display tuple,
+                                      tell the owner (email + escalation SMS when on
+                                      file, lifecycle_notice_sent). NOTHING else changes
+                                      (owner decision D1, 2026-09-14): connections keep
+                                      their status; only the day-7 dunning reduction
+                                      dormants action tools.
   * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
 """
 
@@ -295,19 +300,52 @@ async def _on_pm_attached(
         ey = card.get("exp_year")
         account.pm_exp_month = int(em) if isinstance(em, (int, float)) else None
         account.pm_exp_year = int(ey) if isinstance(ey, (int, float)) else None
+    # The event's ``id`` is the payment-method id; Stripe holds the card, we hold the
+    # pointer — and only long enough to make it the invoice default.
+    pm_id = event.data.get("id")
+    await apply_card_on_file(
+        session,
+        admin_id=admin_id,
+        account=account,
+        payment_method_id=pm_id if isinstance(pm_id, str) and pm_id else None,
+        source="payment_method.attached",
+    )
+    return "payment_method.attached"
+
+
+async def apply_card_on_file(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    account: BillingAccount,
+    payment_method_id: str | None,
+    source: str,
+) -> None:
+    """The ONE transition a card on file causes (§3.4.1b, Vision §7) — idempotent.
+
+    payg_enabled; the card made the invoice default when its id is known (F006);
+    dunning cleared (a new card is the remedy, F012); dormant connections restored
+    (Legal §A3); audited. Applied by the ``payment_method.attached`` webhook and —
+    round 7 WP-1 #5 — by the billing read when Stripe already reports the card and the
+    webhook has not yet been delivered, so "card saved" and "no card on file" never
+    stand side by side on the dashboard. Whichever path runs second finds nothing
+    left to change (no second lifecycle_transition, no second dunning change).
+
+    The caller stores the display tuple first. ``source`` names the path in the
+    audit trail; ``payment_method_id`` is None when the path has no pointer (the read
+    only sees the display tuple) — the default is then left for the webhook to set.
+    """
     prev_billing_state = account.billing_state
     account.billing_state = "payg_enabled"  # adding a card flips behavior >50 (Vision §7)
 
     # A card attached through Checkout in setup mode is NOT automatically the customer's
     # invoice default (audit F006): without this, the first metered invoice had no
-    # payment method to charge and went straight to payment_failed. The event's ``id``
-    # is the payment-method id; Stripe holds the card, we hold the pointer.
-    pm_id = event.data.get("id")
+    # payment method to charge and went straight to payment_failed.
     default_set: bool | None = None
-    if isinstance(pm_id, str) and pm_id and account.stripe_customer_id:
+    if payment_method_id and account.stripe_customer_id:
         try:
             default_set = await get_stripe_gateway().set_default_payment_method(
-                customer_id=account.stripe_customer_id, payment_method_id=pm_id
+                customer_id=account.stripe_customer_id, payment_method_id=payment_method_id
             )
         except Exception:  # noqa: BLE001 — never strand the attach event on a Stripe blip
             _log.exception("default payment method set failed admin_id=%s", admin_id)
@@ -332,6 +370,7 @@ async def _on_pm_attached(
             "brand": account.pm_brand,
             "last4": account.pm_last4,
             "invoice_default_set": default_set,
+            "source": source,
         },
     )
     if prev_dunning != account.dunning_state:
@@ -362,7 +401,6 @@ async def _on_pm_attached(
     # Legal §A3: "connections that go dormant … are restored automatically if a valid
     # payment method is added within the retention window."
     await _restore_dormant_connections(session, admin_id=admin_id, reason="payment_method")
-    return "payment_method.attached"
 
 
 async def _restore_dormant_connections(
@@ -419,10 +457,11 @@ async def _restore_dormant_connections(
 async def _on_pm_detached(
     session: AsyncSession, *, admin_id: uuid.UUID, account: BillingAccount
 ) -> str:
-    """payment_method.detached → free_cap + clear the display tuple (Legal §A3).
+    """payment_method.detached → free_cap + clear the display tuple (§3.4.1b).
 
-    Also sends action-tool connections dormant (Legal §A3: losing a payment
-    method reverts to free-cap behavior AND "Action-tool connections go dormant").
+    Owner decision D1 (2026-09-14): a card removal — here or through the admin's
+    DELETE — changes NOTHING but the 50-conversation cap. No connection goes
+    dormant on this path; that is the day-7 dunning reduction's consequence alone.
     """
     # Bill what they already ran BEFORE the account stops looking billable: once
     # billing_state is free_cap, build_budget reports zero blocks and report_usage
@@ -458,9 +497,8 @@ async def _on_pm_detached(
             event_type="lifecycle_transition",
             payload={"from": prev_billing_state, "to": "free_cap", "trigger": "payment_method"},
         )
-    # Legal §A3: the card is gone — action-tool connections go dormant immediately
-    # (not just at day-7 dunning exhaustion; a detached card is an immediate loss).
-    await dunning.set_dormant_for_action_tools(
-        session, admin_id=admin_id, reason="payment_method_detached"
-    )
+    # D1: no dormancy here. The cap is the whole consequence of a card removal — and
+    # the owner is told so (email + escalation SMS when on file; Legal §A3 / §3.6.7,
+    # round 7 WP-1 #3c). A Stripe-side detach is the one the owner may not have done.
+    await notify.notify_payment_method_removed(session, admin_id=admin_id, reason="stripe_detached")
     return "payment_method.detached"

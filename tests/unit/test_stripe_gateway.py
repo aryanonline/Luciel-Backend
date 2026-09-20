@@ -475,3 +475,184 @@ def test_the_real_gateway_verifies_identically_to_the_fake() -> None:
                 secret, payload, timestamp=int(time.time()) - 3600
             ),
         )
+
+
+# --- round 7 WP-1 #5: the card-update portal, the per-attempt subscription key -- #
+
+
+class _PortalStripeClient:
+    """Stands in for the stripe module's billing_portal namespace. NO network."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        outer = self
+
+        class _Session:
+            @staticmethod
+            def create(**kwargs):
+                outer.calls.append(kwargs)
+                return {
+                    "id": "bps_test_1",
+                    "url": "https://billing.stripe.com/p/session/bps_test_1",
+                }
+
+        class _BillingPortal:
+            Session = _Session
+
+        self.billing_portal = _BillingPortal()
+
+
+def test_real_gateway_opens_the_portal_against_the_bound_configuration(monkeypatch) -> None:
+    """Stripe TEST mode has no default portal configuration, so the test posture must
+    name the operator-provisioned one; an EMPTY id is omitted rather than sent, so a
+    live account with a default is not handed an empty string Stripe would reject."""
+    from app.config import get_settings
+
+    client = _PortalStripeClient()
+    gw = _real_gateway_with(client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(get_settings(), "stripe_portal_configuration_id", "bpc_test_cfg")
+    session = asyncio.run(
+        gw.create_portal_session(customer_id="cus_x", return_url="https://app/dashboard/billing")
+    )
+    assert session.url == "https://billing.stripe.com/p/session/bps_test_1"
+    assert session.session_id == "bps_test_1"
+    assert client.calls == [
+        {
+            "customer": "cus_x",
+            "return_url": "https://app/dashboard/billing",
+            "configuration": "bpc_test_cfg",
+        }
+    ]
+
+    monkeypatch.setattr(get_settings(), "stripe_portal_configuration_id", "")
+    asyncio.run(gw.create_portal_session(customer_id="cus_x", return_url="https://app/b"))
+    assert client.calls[-1] == {"customer": "cus_x", "return_url": "https://app/b"}
+
+
+def test_portal_configuration_id_comes_from_the_platform_secret(monkeypatch) -> None:
+    """Same publication path as the price: the operator binds it by rotating the secret."""
+    from app.billing.stripe_gateway import portal_configuration_id
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert portal_configuration_id() == ""
+    finally:
+        get_settings.cache_clear()
+    monkeypatch.setenv(
+        "LUCIEL_PLATFORM_SECRET", json.dumps({"STRIPE_PORTAL_CONFIGURATION_ID": "bpc_from_secret"})
+    )
+    get_settings.cache_clear()
+    try:
+        assert portal_configuration_id() == "bpc_from_secret"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_fake_portal_session_is_deterministic_and_changes_no_card_state() -> None:
+    gw = FakeStripeGateway()
+
+    async def run() -> tuple[str, str]:
+        cid = await gw.create_customer(admin_id=uuid.UUID(int=7), email="x@y.com")
+        first = await gw.create_portal_session(customer_id=cid, return_url="https://r")
+        second = await gw.create_portal_session(customer_id=cid, return_url="https://r")
+        assert first == second
+        assert await gw.get_payment_method(customer_id=cid) is None  # nothing attached
+        return cid, first.url
+
+    cid, url = asyncio.run(run())
+    assert url == f"https://billing.stripe.com/p/session/bps_fake_{cid.removeprefix('cus_fake_')}"
+    assert gw.portal_sessions == [(cid, "https://r"), (cid, "https://r")]
+
+
+class _SubscriptionStripeClient:
+    """Records Subscription.create calls; the active-subscription lookup finds none."""
+
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+        outer = self
+
+        class _Subscription:
+            @staticmethod
+            def list(**kwargs):
+                return {"data": []}
+
+            @staticmethod
+            def create(**kwargs):
+                outer.created.append(kwargs)
+                return {"id": f"sub_{len(outer.created)}"}
+
+        self.Subscription = _Subscription
+
+
+def test_subscription_create_idempotency_key_is_unique_per_attempt(monkeypatch) -> None:
+    """The key used to be the bare customer id. Stripe replays a keyed request's
+    ORIGINAL response for 24 hours, so a card removed (subscription cancelled with its
+    final invoice) and re-added the same day had its next block "created" as the
+    cancelled subscription — which invoices nothing. Every attempt now carries a fresh
+    key; the active-subscription lookup is what keeps a retry from minting a second one."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "stripe_payg_price_id", "price_bound")
+    client = _SubscriptionStripeClient()
+    gw = _real_gateway_with(client)  # type: ignore[arg-type]
+
+    first = asyncio.run(gw.ensure_metered_subscription(customer_id="cus_k"))
+    second = asyncio.run(gw.ensure_metered_subscription(customer_id="cus_k"))
+    assert (first, second) == ("sub_1", "sub_2")
+    keys = [c["idempotency_key"] for c in client.created]
+    assert all(k.startswith("payg-sub:cus_k:") for k in keys)
+    assert len(set(keys)) == 2, "a cancel-then-recreate must never reuse a spent key"
+    assert all(c["items"] == [{"price": "price_bound"}] for c in client.created)
+
+
+class _NoDefaultCardClient:
+    """A customer with NO invoice default (a Checkout setup-mode card before the
+    attached webhook made it the default, F006) and the given attached cards."""
+
+    def __init__(self, cards: list[dict]) -> None:
+        class Customer:
+            @staticmethod
+            def retrieve(cid):
+                return {"invoice_settings": {"default_payment_method": None}}
+
+        class PaymentMethod:
+            @staticmethod
+            def list(**kwargs):
+                assert kwargs == {"customer": "cus_x", "type": "card", "limit": 1}
+                return {"data": cards}
+
+            @staticmethod
+            def retrieve(pmid):
+                raise AssertionError("no default to retrieve")
+
+        self.Customer = Customer
+        self.PaymentMethod = PaymentMethod
+
+
+def test_get_payment_method_falls_back_to_the_newest_attached_card_without_a_default() -> None:
+    """Between the Checkout redirect and the attached webhook the card IS on file at
+    Stripe but is not yet the invoice default. The read must see it (the billing-read
+    reconcile depends on this), the same way remove_payment_method already treats a
+    card attached with no default as a card to detach."""
+    gw = _real_gateway_with(  # type: ignore[arg-type]
+        _NoDefaultCardClient(
+            [
+                {
+                    "id": "pm_new",
+                    "card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2030},
+                }
+            ]
+        )
+    )
+    disp = asyncio.run(gw.get_payment_method(customer_id="cus_x"))
+    assert disp is not None and (disp.brand, disp.last4, disp.exp_month, disp.exp_year) == (
+        "visa",
+        "4242",
+        12,
+        2030,
+    )
+
+    gw = _real_gateway_with(_NoDefaultCardClient([]))  # type: ignore[arg-type]
+    assert asyncio.run(gw.get_payment_method(customer_id="cus_x")) is None

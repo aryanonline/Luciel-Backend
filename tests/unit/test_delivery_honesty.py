@@ -277,6 +277,44 @@ def test_degraded_bindings_names_every_null_seam_in_mock_mode():
     assert all(entry.count(":") == 1 and entry.split(":", 1)[1] for entry in degraded)
 
 
+def test_degraded_bindings_names_an_unbound_payg_price_in_a_real_stripe_posture(monkeypatch):
+    """Round 7 WP-1 #4: a real Stripe binding with no metered price can save cards and
+    bill nothing — named ``stripe_payg_price:unset`` so /healthz shows it. Mock posture
+    bills nothing by design, so an empty price is NOT degraded there."""
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_integration_posture", "mock")
+    monkeypatch.setattr(settings, "stripe_payg_price_id", "")
+    assert "stripe_payg_price:unset" not in degraded_bindings()
+
+    monkeypatch.setattr(settings, "stripe_integration_posture", "test")
+    degraded = degraded_bindings()
+    assert "stripe_payg_price:unset" in degraded
+    assert "stripe_gateway:FakeStripeGateway" not in degraded
+
+    monkeypatch.setattr(settings, "stripe_payg_price_id", "price_bound")
+    assert "stripe_payg_price:unset" not in degraded_bindings()
+
+
+def test_degraded_bindings_names_an_unbound_portal_configuration_in_a_real_posture(
+    monkeypatch,
+):
+    """Round 7 WP-1 #5: Stripe TEST mode has no default Billing Portal configuration, so
+    a "test" posture without one cannot open the card-update portal — named
+    ``stripe_portal_configuration:unset``. Mock posture never opens a portal."""
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    settings = get_settings()
+    monkeypatch.setattr(settings, "stripe_integration_posture", "mock")
+    monkeypatch.setattr(settings, "stripe_portal_configuration_id", "")
+    assert "stripe_portal_configuration:unset" not in degraded_bindings()
+
+    monkeypatch.setattr(settings, "stripe_integration_posture", "test")
+    assert "stripe_portal_configuration:unset" in degraded_bindings()
+
+    monkeypatch.setattr(settings, "stripe_portal_configuration_id", "bpc_bound")
+    assert "stripe_portal_configuration:unset" not in degraded_bindings()
+
+
 def test_degraded_bindings_never_leaks_a_secret_value(live):
     rendered = " ".join(degraded_bindings())
     for value in REQUIRED_IN_LIVE_MODE.values():

@@ -40,7 +40,7 @@ from app.audit import log as audit
 from app.billing import dunning
 from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.config import get_settings
-from app.models.audit import ActorType
+from app.models.audit import ActorType, AdminAuditLog
 from app.models.billing import BillingAccount
 from app.models.budget import ConversationBudget, CountedSession
 from app.runtime.budget import current_period, period_start_for
@@ -299,7 +299,25 @@ async def report_usage(
     account = await get_or_create_billing_account(session, admin_id=admin_id)
 
     period = period_start_for(account, now)
-    await _roll_accrual_period(session, account=account, period=period, gateway=gateway)
+    had_subscription = account.stripe_subscription_id is not None
+    if not await _roll_accrual_period(session, account=account, period=period, gateway=gateway):
+        # An older period's residual is still unposted and there is no subscription to
+        # post it to. The watermarks are kept as they are (round 7 WP-1 #4) — nothing
+        # accrues against the new period until the old one is settled, or the two
+        # would share one watermark and the smaller be lost.
+        await _alarm_meter_unbound(session, account=account, period=account.accrual_period_start)
+        return 0
+    if not had_subscription and account.stripe_subscription_id is not None:
+        # The roll bound the subscription to settle the residual: billing has begun, so
+        # the counter moves to the Stripe cycle exactly as the lazy bind below does.
+        period = await _anchor_to_subscription(
+            session,
+            account=account,
+            instance_id=instance_id,
+            sub_id=account.stripe_subscription_id,
+            gateway=gateway,
+            now=now,
+        )
 
     budget = await build_budget(session, admin_id=admin_id, instance_id=instance_id, now=now)
     # The accrual is the period high-water mark, not the current reading: build_budget
@@ -325,14 +343,23 @@ async def report_usage(
             return 0
         sub_id = await gateway.ensure_metered_subscription(customer_id=account.stripe_customer_id)
         if sub_id is None:
-            return 0  # no metered price bound → report nothing rather than mis-bill
+            # No metered price bound → report nothing rather than mis-bill. The blocks
+            # stay accrued on the watermark (never zeroed) and, outside the mock posture,
+            # this is an operator-visible failure, not a quiet zero (round 7 WP-1 #4).
+            await _alarm_meter_unbound(session, account=account, period=period)
+            return 0
         account.stripe_subscription_id = sub_id
         await session.flush()
         # Billing has begun: from here the free 50 is "per Stripe billing period", so
         # the counter's anchor moves from the calendar month to the subscription's
         # cycle and the rows counted so far move with it (audit F004/F030).
         period = await _anchor_to_subscription(
-            session, account=account, instance_id=instance_id, sub_id=sub_id, gateway=gateway
+            session,
+            account=account,
+            instance_id=instance_id,
+            sub_id=sub_id,
+            gateway=gateway,
+            now=now,
         )
 
     return await _post_usage(
@@ -347,6 +374,7 @@ async def _anchor_to_subscription(
     instance_id: uuid.UUID,
     sub_id: str,
     gateway: StripeGateway,
+    now: datetime | None = None,
 ) -> date:
     """Re-key the tenant's period from the calendar fallback to the Stripe cycle.
 
@@ -357,8 +385,13 @@ async def _anchor_to_subscription(
     resetting to zero (which would hand out a second free 50) or being stranded under
     a key nothing reads again (which would freeze the counter).
 
+    ``now`` is the instant the caller keyed the counter on. The old anchor must be
+    read at that same instant: a residual settled at a period roll (round 7 WP-1 #4)
+    would otherwise re-key the rows of the period that just closed into the one that
+    just opened, and count them twice.
+
     Returns the period the counter is now keyed on."""
-    old_period = period_start_for(account)
+    old_period = period_start_for(account, now)
     try:
         bounds = await gateway.get_subscription_period(subscription_id=sub_id)
     except Exception:  # noqa: BLE001 — the calendar anchor keeps working until the next try
@@ -448,7 +481,7 @@ async def _roll_accrual_period(
     account: BillingAccount,
     period: date,
     gateway: StripeGateway,
-) -> None:
+) -> bool:
     """Bring the usage watermarks into the period the counter is keyed on.
 
     The counter rolls on its own (``current_period``), but the watermarks belong to
@@ -459,14 +492,34 @@ async def _roll_accrual_period(
 
     Any residual the old period still owes is flushed under the OLD period's
     identifiers first; only then do the watermarks reset for the new period. A
-    failing flush raises, leaving everything as it was for the next retry."""
+    failing flush raises, leaving everything as it was for the next retry.
+
+    A residual with NO subscription to post to — blocks accrued while the metered
+    price was unbound (round 7 WP-1 #4) — is never zeroed: that voided usage the
+    tenant ran with a live card. If the account can still be billed the subscription
+    is bound here and the residual posted under its own period; otherwise the
+    watermarks are left exactly as they were and False is returned, meaning the
+    period did NOT roll and nothing may accrue against the new one yet.
+
+    Returns whether the watermarks now describe ``period``."""
     if account.accrual_period_start is None:
         account.accrual_period_start = period
         await session.flush()
-        return
+        return True
     if account.accrual_period_start == period:
-        return
-    if account.accrued_blocks > account.last_reported_blocks and account.stripe_subscription_id:
+        return True
+    if account.accrued_blocks > account.last_reported_blocks:
+        if account.stripe_subscription_id is None and (
+            account.billing_state == "payg_enabled" and account.stripe_customer_id
+        ):
+            sub_id = await gateway.ensure_metered_subscription(
+                customer_id=account.stripe_customer_id
+            )
+            if sub_id is not None:
+                account.stripe_subscription_id = sub_id
+                await session.flush()
+        if account.stripe_subscription_id is None:
+            return False
         await _post_usage(
             session,
             account=account,
@@ -478,6 +531,59 @@ async def _roll_accrual_period(
     account.last_reported_blocks = 0
     account.accrual_period_start = period
     await session.flush()
+    return True
+
+
+async def _alarm_meter_unbound(
+    session: AsyncSession, *, account: BillingAccount, period: date | None
+) -> None:
+    """A live-card tenant has PAYG blocks nobody can report (round 7 WP-1 #4).
+
+    ``ensure_metered_subscription`` returns None when ``STRIPE_PAYG_PRICE_ID`` is empty.
+    In the mock posture that is the designed state (nothing is billed, CI/local) and
+    stays silent. In the test/live posture it is a deployment gap that was returning a
+    quiet 0 while ``accrued_blocks`` kept climbing: an ERROR line for the alarm, one
+    ``billing_meter_unbound`` audit event per (tenant, accrual period) for the record,
+    and ``integration_status.degraded_bindings`` names ``stripe_payg_price:unset``.
+    Only fires for an account that is actually billable (a live card, a customer)."""
+    settings = get_settings()
+    if settings.stripe_integration_posture == "mock":
+        return
+    if account.billing_state != "payg_enabled" or account.stripe_customer_id is None:
+        return
+    unreported = account.accrued_blocks - account.last_reported_blocks
+    period_key = period.isoformat() if period is not None else None
+    _log.error(
+        "PAYG meter unbound: stripe_payg_price_id is empty while admin_id=%s has a live "
+        "card; %d accrued block(s) for period %s cannot be reported to Stripe",
+        account.admin_id,
+        unreported,
+        period_key,
+    )
+    already = (
+        await session.execute(
+            select(AdminAuditLog.event_id)
+            .where(
+                AdminAuditLog.admin_id == account.admin_id,
+                AdminAuditLog.event_type == "billing_meter_unbound",
+                AdminAuditLog.event_payload["period_start"].astext == period_key,
+            )
+            .limit(1)
+        )
+    ).first()
+    if already is not None:
+        return
+    await audit.emit(
+        session,
+        admin_id=account.admin_id,
+        actor_type=ActorType.platform,
+        event_type="billing_meter_unbound",
+        payload={
+            "period_start": period_key,
+            "unreported_blocks": unreported,
+            "binding": "stripe_payg_price:unset",
+        },
+    )
 
 
 async def _post_usage(
@@ -546,11 +652,16 @@ async def report_accrued_usage(
     account = await get_or_create_billing_account(session, admin_id=admin_id)
     if account.accrued_blocks <= account.last_reported_blocks:
         return 0
-    if account.stripe_subscription_id is None:
-        return 0  # nothing was ever metered against this tenant
     # The residual belongs to the period it accrued in, which is not necessarily the
     # current one (the counter may have rolled since the last turn).
     period = account.accrual_period_start or period_start_for(account, now)
+    if account.stripe_subscription_id is None:
+        # Nothing was ever metered against this tenant — either the free 50 was never
+        # exceeded with a card, or the metered price was unbound when it was. The
+        # latter is the alarm case (round 7 WP-1 #4); the residual stays on the
+        # watermark either way.
+        await _alarm_meter_unbound(session, account=account, period=period)
+        return 0
     return await _post_usage(
         session, account=account, quantity=account.accrued_blocks, gateway=gateway, period=period
     )

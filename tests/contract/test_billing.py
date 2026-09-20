@@ -160,7 +160,7 @@ async def test_payg_not_near_next_block(client) -> None:
     assert r.json()["budget"]["nearNextBlock"] is False
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "stripe_test_posture")
 async def test_checkout_returns_url(client) -> None:
     admin = await _signup_verify_login(client)
     await _seed_instance(admin)
@@ -174,7 +174,7 @@ async def test_checkout_returns_url(client) -> None:
         set_stripe_gateway(None)
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "stripe_test_posture")
 async def test_checkout_return_urls_derive_from_app_base_url(client, monkeypatch) -> None:
     """Live-caught 2026-08-17: the return URLs were hardcoded to a placeholder
     domain the product does not serve, so after saving a card Stripe redirected
@@ -326,7 +326,7 @@ async def test_usage_audit_log_shape(client) -> None:
         assert "eventId" in row and "eventType" in row and "at" in row
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "stripe_test_posture")
 async def test_webhook_unverified_rejected(client) -> None:
     set_stripe_gateway(FakeStripeGateway())
     try:
@@ -340,7 +340,7 @@ async def test_webhook_unverified_rejected(client) -> None:
         set_stripe_gateway(None)
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "stripe_test_posture")
 async def test_webhook_verified_invoice_paid_processed(client) -> None:
     admin = await _signup_verify_login(client)
     await _seed_instance(admin, counted=120)
