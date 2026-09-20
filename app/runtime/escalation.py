@@ -78,9 +78,21 @@ class EscalationDecision:
 
 
 # --- pluggable classifiers (deterministic heuristics for dev/test) ---------- #
+# A request FOR a person is an ask-for-a-person PHRASE, never a bare word (round 7
+# WP-2, item 2): "Can I speak to a hygienist?" and "Do you have human staff?" used to
+# hand the whole conversation to the owner on "speak to a" / "human" alone, muting
+# Luciel for a visitor who asked an ordinary question.
 _HUMAN_PATTERNS = re.compile(
-    r"\b(speak|talk|connect)\b.{0,20}\b(human|person|someone|representative|agent|real)\b"
-    r"|\bhuman\b|\breal person\b|\bspeak to a\b"
+    # the ask itself: speak / talk / connect / transfer / put me ... to a person
+    r"\b(speak|talk|connect|transfer|put me|get me)\b.{0,20}"
+    r"\b(human|person|someone|somebody|representative|agent|real)\b"
+    # "I want / need / 'd like a (real) human / person / agent"
+    r"|\bi(?:'d)? ?(?:want|need|would like|like) (?:a|an) (?:real |actual )?"
+    r"(?:human|person|agent|representative)\b"
+    # "human please", "a real person please"
+    r"|\b(?:a |an )?(?:real |actual )?(?:human|person)\b,? please\b"
+    # "get me through", "put me in touch"
+    r"|\b(?:get|put) me (?:through|in touch)\b"
     # Round 5C item 8: a data-deletion/right-to-be-forgotten request is a request
     # only a HUMAN can honor (erasure is the tenant's dashboard action, §3.4.11)
     # — Luciel must hand it off with context, never answer around it or fabricate

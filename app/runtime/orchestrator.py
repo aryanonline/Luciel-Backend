@@ -135,9 +135,18 @@ _SUCCESS_CLAIM = re.compile(
 # switch, not a completed action - the gap between subject and verb refuses to cross
 # a future/conditional modal. "I can confirm it has been sent" is still caught: the
 # second subject ("it has been") starts a fresh match after the modal.
+#
+# The SUBJECT must be first person or the customer's own thing (round 7 WP-2, item
+# 2): "I've booked", "we have sent", "your appointment has been scheduled", "it's
+# been added to your calendar". A bare "has been / is now / are now" used to count as
+# a subject, so a paraphrase of the knowledge base with a generic subject
+# ("Appointments are now booked through the portal") was rewritten into the
+# unfounded-claim replacement and escalated — a true statement about the business
+# read as a lie about an action.
 _FIRST_PERSON_SUCCESS_CLAIM = re.compile(
-    r"\b(i'?ve|i have|we'?ve|we have|i|we|it'?s been|it has been|has been|have been"
-    r"|is now|are now)\b"
+    r"\b(i'?ve|i have|we'?ve|we have|i|we"
+    r"|it'?s been|it has been|that'?s been|that has been|this has been"
+    r"|your [a-z][a-z' -]{0,30}?(?:has|have) been|your [a-z][a-z' -]{0,30}?(?:is|are) now)\b"
     r"(?:(?!\b(?:will|'ll|can|could|would|shall|should|may|might|going to|about to"
     r"|able to|happy to|glad to)\b)[^.!?]){0,30}?"
     r"\b(booked|scheduled|rescheduled|cancelled|canceled|sent|delivered"
