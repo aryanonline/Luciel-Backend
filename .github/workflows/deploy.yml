@@ -503,10 +503,15 @@ jobs:
       - name: Confirm preprod is gone
         run: |
           set -e
+          # EVERY status except DELETE_COMPLETE (round 7 WP-8). The old filter named
+          # four SUCCESS states, so a stack stuck in DELETE_FAILED, ROLLBACK_FAILED
+          # or UPDATE_ROLLBACK_FAILED — exactly what a failed teardown leaves behind,
+          # burning prod-shaped cost — matched nothing and the job passed green.
+          # list-stacks keeps DELETE_COMPLETE summaries for 90 days, hence the one
+          # exclusion; the status is printed with the name so the failure says why.
           LEFT=$(aws cloudformation list-stacks --region "$AWS_REGION" \
-            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE UPDATE_ROLLBACK_COMPLETE \
-            --query "StackSummaries[?starts_with(StackName, 'Luciel-preprod-')].StackName" --output text)
-          if [ -n "$LEFT" ]; then
+            --query "StackSummaries[?starts_with(StackName, 'Luciel-preprod-') && StackStatus != 'DELETE_COMPLETE'].join(' ', [StackName, StackStatus])" --output text)
+          if [ -n "$LEFT" ] && [ "$LEFT" != "None" ]; then
             echo "::error::preprod stacks still present after teardown: $LEFT"; exit 1
           fi
           echo "[teardown] preprod fully torn down."
