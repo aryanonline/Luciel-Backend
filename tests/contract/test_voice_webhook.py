@@ -16,6 +16,7 @@ nothing while showing Connected. These pin the ingress that closes that:
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 import pytest
@@ -26,8 +27,10 @@ from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.budget import CountedSession
+from app.models.conversation import Session as ConvSession
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.voice import VoiceCallRecord
+from app.runtime.voice_pipeline import VOICE_UNAVAILABLE_REPLY
 from sqlalchemy import func, select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
@@ -437,3 +440,47 @@ async def test_status_callback_for_an_unknown_call_is_a_quiet_ack(client, monkey
         headers=_signed(STATUS_URL, params, auth_token),
     )
     assert r.status_code == 200
+
+
+async def test_a_turn_with_no_caller_and_no_call_id_opens_nothing_and_hangs_up(
+    client, monkeypatch, caplog
+):
+    """Round 7 WP-3a at the voice edge: a signed turn carrying neither ``From`` nor
+    ``CallSid`` has nothing to key a session on (``participant_key_for`` of an empty
+    identifier is None). Before the guard the runtime opened a fresh, unresumable
+    session for it and billed it at the first model call; now the runtime refuses
+    (``sessions.SessionUnkeyable``), the route records it like any other rejected
+    inbound and answers the closed TwiML — a spoken notice and a hangup, never a 5xx
+    Twilio would retry and never dead air."""
+    auth_token = "authtok-voice"
+    monkeypatch.setattr(get_settings(), "twilio_auth_token", auth_token, raising=False)
+    admin, _ = await _seed()
+
+    params = {"To": BYO_NUMBER, "SpeechResult": "Are you taking new clients this month?"}
+    with caplog.at_level(logging.WARNING, logger="app.channels.pipeline"):
+        r = await client.post(
+            "/api/v1/webhooks/twilio/voice/turn",
+            data=params,
+            headers=_signed(TURN_URL, params, auth_token),
+        )
+    assert r.status_code == 200
+    assert VOICE_UNAVAILABLE_REPLY in r.text and "<Hangup/>" in r.text
+    assert "<Gather" not in r.text
+    async with tenant_session(admin) as s:
+        sessions = (
+            await s.execute(
+                select(func.count()).select_from(ConvSession).where(ConvSession.admin_id == admin)
+            )
+        ).scalar_one()
+        counted = (
+            await s.execute(
+                select(func.count())
+                .select_from(CountedSession)
+                .where(CountedSession.admin_id == admin)
+            )
+        ).scalar_one()
+    assert int(sessions) == 0 and int(counted) == 0
+    lines = [m.getMessage() for m in caplog.records if "inbound_rejected" in m.getMessage()]
+    assert lines == [
+        "inbound_rejected channel=voice reason=unkeyable_session:voice source_hint=None"
+    ]
