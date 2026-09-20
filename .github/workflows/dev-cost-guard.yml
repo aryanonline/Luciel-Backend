@@ -1,11 +1,21 @@
-# Dev cost guard — re-stop the dev database while the environment is paused.
+# Cost guard — re-stop the database while an environment is paused.
 #
 # AWS auto-restarts a stopped RDS instance after 7 days ("maintenance can't be
-# applied to a stopped instance"), so a paused dev environment silently resumes
-# paying db.t4g.micro hours until someone notices. Nothing else in the account
-# needs the database when both ECS services sit at desiredCount 0, so this
-# weekly job stops it again — and does NOTHING when the environment is actually
-# in use (any service scaled up = not paused = leave the database alone).
+# applied to a stopped instance"), so a paused environment silently resumes
+# paying db.t4g.micro hours until someone notices. Nothing in the account needs
+# the database when EVERY ECS service — in BOTH clusters, the backend planes
+# (ComputeStack) and the frontend web service (WebStack) — sits at desiredCount
+# 0, so this daily job stops it again, and does NOTHING when the environment is
+# actually in use (any service in either cluster scaled up = not paused = leave
+# the database alone). Round 7 WP-8: the guard used to read the backend cluster
+# only, so a web service left running was invisible to it.
+#
+# Parameterized by environment: the schedule guards dev (the environment that
+# gets paused); a manual dispatch can point the same check at prod, under the
+# prod deploy role and the prod GitHub environment's approval rule. NOTE: the
+# rds:DescribeDBInstances / rds:StopDBInstance grant the guard needs is NOT in
+# PipelineStack (the dev role carries it out-of-band); a prod dispatch needs the
+# same grant on luciel-prod-github-deploy before it can stop anything.
 #
 # GitHub-hosted cron instead of standing AWS infra (EventBridge + Lambda) on
 # purpose: the guard costs nothing while it idles, which is the whole point.
@@ -18,7 +28,13 @@ on:
     # week of billed hours. Daily caps the drift at under a day for a job
     # that costs nothing to run.
     - cron: '0 9 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment whose paused database to re-stop
+        type: choice
+        options: [dev, prod]
+        default: dev
 
 permissions:
   id-token: write
@@ -26,45 +42,71 @@ permissions:
 
 env:
   AWS_REGION: ca-central-1
+  # A scheduled run has no inputs and guards dev.
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
 
 jobs:
-  restop-dev-db:
+  restop-db:
     runs-on: ubuntu-latest
-    environment: dev
+    environment: ${{ inputs.environment || 'dev' }}
     steps:
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
+          role-to-assume: arn:aws:iam::729005488042:role/luciel-${{ inputs.environment || 'dev' }}-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Stop the dev DB if (and only if) the environment is paused
+      - name: Stop the DB if (and only if) every service in BOTH clusters is at zero
         run: |
-          cluster=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='Luciel-dev-ClusterName'].Value" --output text)
-          if [ -z "$cluster" ] || [ "$cluster" = "None" ]; then
-            echo "[guard] no dev cluster export found — nothing to do"; exit 0
+          set -euo pipefail
+          # Backend cluster: the ClusterName export ComputeStack declares.
+          backend=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='Luciel-${ENVIRONMENT}-ClusterName'].Value" --output text)
+          if [ -z "$backend" ] || [ "$backend" = "None" ]; then
+            echo "[guard] no ${ENVIRONMENT} backend cluster export found — nothing to do"; exit 0
           fi
-          services=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns' --output text)
+          # Web cluster: the WebClusterName export WebStack declares (round 7 WP-8).
+          # Until that export reaches a deployed stack, fall back to discovering the
+          # CloudFormation-generated cluster name by prefix — tolerated when the role
+          # lacks ecs:ListClusters. Not finding the web cluster at all means the
+          # guard cannot PROVE the environment is idle, so it leaves the database
+          # alone rather than stopping it under a service it never looked at.
+          web=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='Luciel-${ENVIRONMENT}-WebClusterName'].Value" --output text)
+          if [ -z "$web" ] || [ "$web" = "None" ]; then
+            web=$(aws ecs list-clusters \
+              --query "clusterArns[?contains(@, ':cluster/Luciel-${ENVIRONMENT}-Web-')] | [0]" \
+              --output text 2>/dev/null || true)
+          fi
+          if [ -z "$web" ] || [ "$web" = "None" ]; then
+            echo "::warning::[guard] ${ENVIRONMENT} web cluster not found (no WebClusterName export yet) — cannot prove the environment is idle; leaving the database alone"
+            exit 0
+          fi
           desired_total=0
-          if [ -n "$services" ] && [ "$services" != "None" ]; then
-            desired_total=$(aws ecs describe-services --cluster "$cluster" --services $services \
-              --query 'sum(services[].desiredCount)' --output text)
-          fi
+          for cluster in "$backend" "$web"; do
+            services=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns' --output text)
+            desired=0
+            if [ -n "$services" ] && [ "$services" != "None" ]; then
+              desired=$(aws ecs describe-services --cluster "$cluster" --services $services \
+                --query 'sum(services[].desiredCount)' --output text)
+            fi
+            echo "[guard] cluster ${cluster##*/}: desired=$desired"
+            desired_total=$((desired_total + desired))
+          done
           if [ "$desired_total" != "0" ]; then
-            echo "[guard] dev is ACTIVE (desired=$desired_total) — leaving the database alone"
+            echo "[guard] ${ENVIRONMENT} is ACTIVE (desired=$desired_total across both clusters) — leaving the database alone"
             exit 0
           fi
           db=$(aws rds describe-db-instances \
-            --query "DBInstances[?starts_with(DBInstanceIdentifier, 'luciel-dev-')].DBInstanceIdentifier | [0]" \
+            --query "DBInstances[?starts_with(DBInstanceIdentifier, 'luciel-${ENVIRONMENT}-')].DBInstanceIdentifier | [0]" \
             --output text)
           if [ -z "$db" ] || [ "$db" = "None" ]; then
-            echo "[guard] no dev DB instance found — nothing to do"; exit 0
+            echo "[guard] no ${ENVIRONMENT} DB instance found — nothing to do"; exit 0
           fi
           status=$(aws rds describe-db-instances --db-instance-identifier "$db" \
             --query 'DBInstances[0].DBInstanceStatus' --output text)
           if [ "$status" = "available" ]; then
-            echo "[guard] dev is paused but the DB is running (AWS 7-day auto-restart) — stopping $db"
+            echo "[guard] ${ENVIRONMENT} is paused but the DB is running (AWS 7-day auto-restart) — stopping $db"
             aws rds stop-db-instance --db-instance-identifier "$db" \
               --query 'DBInstance.DBInstanceStatus' --output text
           else

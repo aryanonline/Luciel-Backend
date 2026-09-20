@@ -187,7 +187,14 @@ export class WebStack extends Stack {
 
     new CfnOutput(this, 'WebEcrRepoUri', { value: this.ecrRepo.repositoryUri });
     new CfnOutput(this, 'WebServiceName', { value: this.service.serviceName });
-    new CfnOutput(this, 'WebClusterName', { value: this.cluster.clusterName });
+    // Exported (round 7 WP-8) so the cost guard workflow can read BOTH clusters'
+    // desired counts before it re-stops a paused environment's database — the
+    // backend ClusterName export was the only one, and a web service left
+    // running was invisible to the guard. Same export naming as ComputeStack.
+    new CfnOutput(this, 'WebClusterName', {
+      value: this.cluster.clusterName,
+      exportName: `Luciel-${envConfig.envName}-WebClusterName`,
+    });
     new CfnOutput(this, 'WebAlbDns', { value: this.alb.loadBalancerDnsName });
   }
 }
