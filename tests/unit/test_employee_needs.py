@@ -99,6 +99,32 @@ def test_a_channel_on_with_a_broken_connection_names_the_state():
     assert _by_id(snap)["sms"] == ("attention", "carrier registration pending")
 
 
+def test_dormant_sends_the_owner_to_billing_never_to_a_connect_button():
+    """``dormant`` is billing-suspended (Legal §A3): Connect refuses to re-arm it
+    (DormantConnection), so "dormant — reconnect" pointed the owner at a button that
+    fails. The need says what the Configure page says — add a card and it resumes —
+    and links the Billing page (round 7 WP-3a). Channels (sms_sender / email_sender
+    are action-tool connections) and tools alike."""
+    snap = _snap(
+        channels_enabled={"widget": True, "sms": True},
+        channel_status={"sms": "dormant"},
+        tools_enabled={"push_to_crm": True},
+        tool_status={"push_to_crm": "dormant"},
+        tool_provider_available={"push_to_crm": True},
+    )
+    needs = {n.code: n for n in derive_needs(snap)}
+    assert set(needs) == {"channel_dormant:sms", "tool_dormant:push_to_crm"}
+    for need in needs.values():
+        assert need.severity == "attention"
+        assert need.detail == "Add a card on the Billing page and it resumes."
+        assert need.href == "/dashboard/billing"
+        assert "reconnect" not in need.title.lower()
+    assert needs["channel_dormant:sms"].title == "Text messages: paused until a card is on file"
+    caps = _by_id(snap)
+    assert caps["sms"] == ("attention", "paused until a card is on file")
+    assert caps["push_to_crm"] == ("attention", "paused until a card is on file")
+
+
 def test_a_connected_channel_is_ready_and_a_disconnected_one_is_never_ready():
     connected = _snap(
         channels_enabled={"widget": True, "sms": True}, channel_status={"sms": "connected"}

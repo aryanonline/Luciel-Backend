@@ -28,8 +28,12 @@ class Session(Base, TenantMixin, TimestampMixin):
     # SAME billed session instead of opening (and billing) a new one per message.
     participant_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="ai")
-    # DEPRECATED: never written True anywhere; the fire-once billing guard is the
-    # counted_sessions ledger (app/models/budget.py). Kept only for schema stability.
+    # DEPRECATED: never written True and never read. The fire-once billing guard is
+    # the counted_sessions ledger (app/models/budget.py), and every conversation
+    # count — budget, analytics, the Today card, the morning brief — joins that
+    # ledger (round 7 WP-3a: the employee status read this column and so reported
+    # "0 conversations" forever). Do not seed it True in tests; count a session
+    # through app.runtime.budget.count_session_once. Kept only for schema stability.
     counted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
