@@ -41,13 +41,17 @@ NONE = "none"
 RETRYING = "retrying"
 REDUCED = "reduced"
 
-# Action-tool connection types (Architecture §3.8.2 enum) that go dormant on
-# payment loss (Legal §A3: "Action-tool connections go dormant"). Deliberately
-# EXCLUDES `channel_auth` and `knowledge_source` — those are not action tools;
-# Legal §A3 only speaks to action-tool connections, so a channel/knowledge
-# connection stays live through a billing degradation.
+# Action-tool connection types (Architecture §3.8.2 enum) that go dormant when
+# dunning reaches ``reduced`` (Legal §A3: "Action-tool connections go dormant").
+# Owner decision D1 (2026-09-14): ONLY true action tools. The BYO channel
+# connections — ``email_sender`` (the owner's own mailbox) and ``sms_sender`` (the
+# owner's own Twilio, which also carries voice; registry.DEPENDENT_CHANNELS) — stay
+# live through every billing state, because the customer pays Microsoft/Twilio
+# directly and the platform is not in that billing path; Legal §A3's "paid
+# channels" phrase is being redlined out. ``channel_auth`` / ``instagram_auth`` /
+# ``knowledge_source`` were never action tools and are likewise untouched.
 ACTION_TOOL_CONNECTION_TYPES: frozenset[str] = frozenset(
-    {"calendar", "crm", "record_source", "email_sender", "sms_sender", "outbound_webhook"}
+    {"calendar", "crm", "record_source", "outbound_webhook"}
 )
 
 
@@ -143,11 +147,14 @@ async def set_dormant_for_action_tools(
     / Architecture §3.6.7): "Action-tool connections go dormant (credentials
     retained, not purged)".
 
-    Fires on: dunning reaching ``reduced`` (day-7 exhaustion), the Stripe
-    ``payment_method.detached`` webhook, and the admin's DELETE payment-method
-    call — i.e. every path that removes/loses PAYG capability. Scoped to the
-    ACTION_TOOL_CONNECTION_TYPES set — channel_auth and knowledge_source
-    connections are NOT touched (Legal §A3 only covers action tools). Only rows
+    Fires on exactly ONE path: dunning reaching ``reduced`` (day-7 exhaustion,
+    from the ``invoice.payment_failed`` webhook or the scheduled
+    :func:`advance_if_due`). A VOLUNTARY card removal — the admin's DELETE
+    payment-method call or the Stripe ``payment_method.detached`` webhook — does
+    NOT dormant anything (owner decision D1, 2026-09-14: removing a payment method
+    changes nothing but the 50-conversation cap). Scoped to the
+    ACTION_TOOL_CONNECTION_TYPES set — BYO channel connections (email_sender,
+    sms_sender), channel_auth and knowledge_source are NOT touched. Only rows
     currently ``connected`` move (an already-dormant/error/expired/revoked row is
     left alone — this is a downgrade, not a status reset). Idempotent: calling
     this twice in a row is a no-op the second time (no rows match).

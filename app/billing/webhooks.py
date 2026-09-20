@@ -21,6 +21,9 @@ Events handled:
                                       (a new card IS the remedy, F012), restore dormant
                                       connections to their pre-dormant status (Legal §A3).
   * payment_method.detached         → flip billingState→free_cap + clear display tuple.
+                                      NOTHING else changes (owner decision D1,
+                                      2026-09-14): connections keep their status; only
+                                      the day-7 dunning reduction dormants action tools.
   * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
 """
 
@@ -419,10 +422,11 @@ async def _restore_dormant_connections(
 async def _on_pm_detached(
     session: AsyncSession, *, admin_id: uuid.UUID, account: BillingAccount
 ) -> str:
-    """payment_method.detached → free_cap + clear the display tuple (Legal §A3).
+    """payment_method.detached → free_cap + clear the display tuple (§3.4.1b).
 
-    Also sends action-tool connections dormant (Legal §A3: losing a payment
-    method reverts to free-cap behavior AND "Action-tool connections go dormant").
+    Owner decision D1 (2026-09-14): a card removal — here or through the admin's
+    DELETE — changes NOTHING but the 50-conversation cap. No connection goes
+    dormant on this path; that is the day-7 dunning reduction's consequence alone.
     """
     # Bill what they already ran BEFORE the account stops looking billable: once
     # billing_state is free_cap, build_budget reports zero blocks and report_usage
@@ -458,9 +462,5 @@ async def _on_pm_detached(
             event_type="lifecycle_transition",
             payload={"from": prev_billing_state, "to": "free_cap", "trigger": "payment_method"},
         )
-    # Legal §A3: the card is gone — action-tool connections go dormant immediately
-    # (not just at day-7 dunning exhaustion; a detached card is an immediate loss).
-    await dunning.set_dormant_for_action_tools(
-        session, admin_id=admin_id, reason="payment_method_detached"
-    )
+    # D1: no dormancy here. The cap is the whole consequence of a card removal.
     return "payment_method.detached"

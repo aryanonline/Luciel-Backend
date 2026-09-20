@@ -1,16 +1,21 @@
-"""Action-tool connections go dormant on payment loss (Legal §A3 / Architecture
-§3.6.7) and are restored when a valid payment method returns.
+"""Dormancy is the day-7 dunning reduction's consequence and nothing else's
+(Legal §A3 / Architecture §3.6.7; owner decision D1, 2026-09-14).
 
-Three trigger paths, all covered:
+D1: removing a payment method changes NOTHING but the 50-conversation cap. So of
+the three paths that used to dormant action tools, exactly ONE remains:
+
   1. dunning exhausting to `reduced` (day-7, driven by a signed invoice.payment_failed
-     webhook against a dunning_started_at 8 days in the past).
-  2. Stripe `payment_method.detached` webhook (immediate card loss).
-  3. DELETE /api/v1/billing/payment-method (admin-initiated removal).
+     webhook against a dunning_started_at 8 days in the past) — dormants EXACTLY the
+     four action-tool types (calendar, crm, record_source, outbound_webhook).
+  2. Stripe `payment_method.detached` webhook — leaves every connection untouched.
+  3. DELETE /api/v1/billing/payment-method — leaves every connection untouched.
 
-channel_auth / knowledge_source connections are explicitly excluded from the
-dormant transition (Legal §A3 only covers action-tool connections) — asserted
-against directly. Restore-on-payment (`invoice.paid` / `payment_method.attached`)
-uses the PRE-EXISTING `_restore_dormant_connections` path.
+The BYO channel connections (email_sender = the owner's own mailbox, sms_sender = the
+owner's own Twilio, which also carries voice) stay live in EVERY billing state: the
+customer pays Microsoft/Twilio directly, so the platform has no standing to pause them.
+channel_auth / knowledge_source were never action tools. Restore-on-payment
+(`invoice.paid` / `payment_method.attached`) uses the PRE-EXISTING
+`_restore_dormant_connections` path and stays green.
 
 FakeStripeGateway only — every webhook is signed with its WEBHOOK_SECRET (verify-
 before-route, HARD CONSTRAINT #4). NO real Stripe network call.
@@ -33,6 +38,19 @@ from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
+# D1: exactly these four go dormant at the reduction; nothing else ever does.
+ACTION_TOOLS: frozenset[str] = frozenset({"calendar", "crm", "record_source", "outbound_webhook"})
+# The owner's own providers — never touched by billing.
+BYO_CHANNELS: tuple[str, ...] = ("email_sender", "sms_sender")
+NOT_TOOLS: tuple[str, ...] = ("channel_auth", "knowledge_source")
+ALL_TYPES: tuple[str, ...] = (*sorted(ACTION_TOOLS), *BYO_CHANNELS, *NOT_TOOLS)
+
+
+async def test_d1_action_tool_set_is_exactly_the_four() -> None:
+    """The constant IS the decision: email_sender / sms_sender are BYO channels, not
+    action tools, and must never re-enter this set."""
+    assert dunning.ACTION_TOOL_CONNECTION_TYPES == ACTION_TOOLS
+
 
 async def _signup_verify_login(client) -> uuid.UUID:
     from app.auth import access
@@ -49,9 +67,9 @@ async def _signup_verify_login(client) -> uuid.UUID:
 
 
 async def _seed_instance_and_connections(admin: uuid.UUID) -> uuid.UUID:
-    """One Instance + one connected row per action-tool type, PLUS one
-    channel_auth and one knowledge_source connection (both connected) so the
-    exclusion can be asserted directly."""
+    """One Instance + one connected row per action-tool type, PLUS the two BYO
+    channel connections and one channel_auth / knowledge_source row (all connected)
+    so every exclusion can be asserted directly."""
     iid = uuid.uuid4()
     async with tenant_session(admin) as s:
         s.add(
@@ -66,7 +84,7 @@ async def _seed_instance_and_connections(admin: uuid.UUID) -> uuid.UUID:
                 personality={},
             )
         )
-        for ctype in (*dunning.ACTION_TOOL_CONNECTION_TYPES, "channel_auth", "knowledge_source"):
+        for ctype in ALL_TYPES:
             s.add(
                 InstanceConnection(
                     connection_id=uuid.uuid4(),
@@ -93,123 +111,158 @@ async def _connection_statuses(admin: uuid.UUID) -> dict[str, str]:
     return {ctype: status for ctype, status in rows}
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_dunning_reduced_sends_action_tools_dormant_not_channels(client) -> None:
-    admin = await _signup_verify_login(client)
-    await _seed_instance_and_connections(admin)
+def _all_connected(statuses: dict[str, str]) -> bool:
+    return set(statuses) == set(ALL_TYPES) and all(v == "connected" for v in statuses.values())
 
-    # Put the account into `retrying` dunning with the clock already past day 7
-    # so the signed invoice.payment_failed webhook's advance() lands on `reduced`.
+
+async def _post_signed(client, gw: FakeStripeGateway, event: dict) -> dict:
+    payload = json.dumps(event).encode()
+    header = build_signature_header(gw.WEBHOOK_SECRET, payload)
+    r = await client.post(
+        "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+    )
+    assert r.status_code == 200
+    return r.json()
+
+
+async def _reduce_via_day7_webhook(client, admin: uuid.UUID) -> None:
+    """Put the account into `retrying` with the clock already past day 7 so the signed
+    invoice.payment_failed webhook's advance() lands on `reduced`."""
     async with tenant_session(admin) as s:
         acct = await get_or_create_billing_account(s, admin_id=admin)
         acct.dunning_state = dunning.RETRYING
         acct.dunning_started_at = datetime.now(UTC) - timedelta(days=8)
         await s.flush()
-
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
-        payload = json.dumps(
+        body = await _post_signed(
+            client,
+            gw,
             {
-                "id": "evt_fail_1",
+                "id": f"evt_fail_{uuid.uuid4().hex[:8]}",
                 "type": "invoice.payment_failed",
                 "data": {"object": {"metadata": {"admin_id": str(admin)}}},
-            }
-        ).encode()
-        header = build_signature_header(gw.WEBHOOK_SECRET, payload)
-        r = await client.post(
-            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+            },
         )
-        assert r.status_code == 200
-        assert r.json()["action"] == "payment_failed"
+        assert body["action"] == "payment_failed"
     finally:
         set_stripe_gateway(None)
 
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_dunning_reduced_dormants_exactly_the_four_action_tools(client) -> None:
+    admin = await _signup_verify_login(client)
+    await _seed_instance_and_connections(admin)
+    assert _all_connected(await _connection_statuses(admin))
+
+    await _reduce_via_day7_webhook(client, admin)
+
     statuses = await _connection_statuses(admin)
-    for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert statuses[ctype] == "dormant", f"{ctype} should be dormant"
-    # Explicitly excluded — Legal §A3 only covers action tools.
-    assert statuses["channel_auth"] == "connected"
-    assert statuses["knowledge_source"] == "connected"
+    dormant = {ctype for ctype, status in statuses.items() if status == "dormant"}
+    assert dormant == ACTION_TOOLS, f"dormant set must be exactly the four: {dormant}"
+    # D1: the owner's own mailbox and Twilio keep serving through the reduction.
+    for ctype in BYO_CHANNELS:
+        assert statuses[ctype] == "connected", f"{ctype} is a BYO channel, never dormant"
+    for ctype in NOT_TOOLS:
+        assert statuses[ctype] == "connected"
 
     # Path back: invoice.paid restores dormant → the status each row HAD (F069): these
     # were connected, and a billing dormancy never touched their credentials.
     gw2 = FakeStripeGateway()
     set_stripe_gateway(gw2)
     try:
-        payload2 = json.dumps(
+        body = await _post_signed(
+            client,
+            gw2,
             {
                 "id": "evt_paid_1",
                 "type": "invoice.paid",
                 "data": {"object": {"metadata": {"admin_id": str(admin)}}},
-            }
-        ).encode()
-        header2 = build_signature_header(gw2.WEBHOOK_SECRET, payload2)
-        r2 = await client.post(
-            "/api/v1/webhooks/stripe", content=payload2, headers={"Stripe-Signature": header2}
+            },
         )
-        assert r2.status_code == 200
-        assert r2.json()["action"] == "invoice_paid"
+        assert body["action"] == "invoice_paid"
     finally:
         set_stripe_gateway(None)
-
-    restored = await _connection_statuses(admin)
-    for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert restored[ctype] == "connected"
-    assert restored["channel_auth"] == "connected"  # untouched throughout
+    assert _all_connected(await _connection_statuses(admin))
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_payment_method_detached_webhook_sends_dormant(client) -> None:
+async def test_payment_method_detached_webhook_leaves_every_connection_untouched(client) -> None:
+    """D1: a Stripe-side detach reverts billing_state and clears the display tuple —
+    and changes nothing else."""
     admin = await _signup_verify_login(client)
     await _seed_instance_and_connections(admin)
+    async with tenant_session(admin) as s:
+        acct = await get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        await s.flush()
 
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
-        payload = json.dumps(
+        body = await _post_signed(
+            client,
+            gw,
             {
                 "id": "evt_detach_1",
                 "type": "payment_method.detached",
                 "data": {"object": {"metadata": {"admin_id": str(admin)}}},
-            }
-        ).encode()
-        header = build_signature_header(gw.WEBHOOK_SECRET, payload)
-        r = await client.post(
-            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+            },
         )
-        assert r.status_code == 200
-        assert r.json()["action"] == "payment_method.detached"
+        assert body["action"] == "payment_method.detached"
     finally:
         set_stripe_gateway(None)
 
-    statuses = await _connection_statuses(admin)
-    for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert statuses[ctype] == "dormant"
-    assert statuses["channel_auth"] == "connected"
-    assert statuses["knowledge_source"] == "connected"
+    async with tenant_session(admin) as s:
+        acct = await get_or_create_billing_account(s, admin_id=admin)
+        assert acct.billing_state == "free_cap"
+        assert acct.pm_brand is None
+    assert _all_connected(await _connection_statuses(admin))
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_delete_payment_method_sends_dormant_then_pm_attached_restores(client) -> None:
+async def test_delete_payment_method_leaves_every_connection_untouched(client) -> None:
+    """D1: the admin's own card removal changes nothing but the cap. The read that
+    comes back says free_cap; every connection still says connected."""
     admin = await _signup_verify_login(client)
     await _seed_instance_and_connections(admin)
+    async with tenant_session(admin) as s:
+        acct = await get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        await s.flush()
 
-    # DELETE /payment-method is idempotent even with no card on file (existing
-    # behavior) but must still emit the dormant transition (admin-initiated loss).
-    r = await client.delete("/api/v1/billing/payment-method")
-    assert r.status_code == 200
+    set_stripe_gateway(FakeStripeGateway())
+    try:
+        r = await client.delete("/api/v1/billing/payment-method")
+        assert r.status_code == 200
+        assert r.json()["budget"]["billingState"] == "free_cap"
+    finally:
+        set_stripe_gateway(None)
 
+    assert _all_connected(await _connection_statuses(admin))
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_card_returning_restores_the_dunning_dormancy(client) -> None:
+    """The restore path is unchanged: connections the day-7 reduction sent dormant come
+    back to their prior status on payment_method.attached (Legal §A3 / F069)."""
+    admin = await _signup_verify_login(client)
+    await _seed_instance_and_connections(admin)
+    await _reduce_via_day7_webhook(client, admin)
     statuses = await _connection_statuses(admin)
-    for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert statuses[ctype] == "dormant"
-    assert statuses["channel_auth"] == "connected"
+    assert {c for c, st in statuses.items() if st == "dormant"} == ACTION_TOOLS
 
-    # Repayment restore: payment_method.attached restores dormant → prior status (F069).
     gw = FakeStripeGateway()
     set_stripe_gateway(gw)
     try:
-        payload = json.dumps(
+        body = await _post_signed(
+            client,
+            gw,
             {
                 "id": "evt_attach_1",
                 "type": "payment_method.attached",
@@ -224,26 +277,23 @@ async def test_delete_payment_method_sends_dormant_then_pm_attached_restores(cli
                         },
                     }
                 },
-            }
-        ).encode()
-        header = build_signature_header(gw.WEBHOOK_SECRET, payload)
-        r2 = await client.post(
-            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+            },
         )
-        assert r2.status_code == 200
-        assert r2.json()["action"] == "payment_method.attached"
+        assert body["action"] == "payment_method.attached"
     finally:
         set_stripe_gateway(None)
 
-    restored = await _connection_statuses(admin)
-    for ctype in dunning.ACTION_TOOL_CONNECTION_TYPES:
-        assert restored[ctype] == "connected"
+    assert _all_connected(await _connection_statuses(admin))
+    async with tenant_session(admin) as s:
+        acct = await get_or_create_billing_account(s, admin_id=admin)
+        assert acct.dunning_state == dunning.NONE  # a new card is the remedy (F012)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_set_dormant_for_action_tools_is_idempotent(client) -> None:
     """Calling the transition twice only emits the audit event once (no rows
-    match the second time — Legal §A3 dormant is a downgrade, not a reset)."""
+    match the second time — Legal §A3 dormant is a downgrade, not a reset). The
+    count is the four action tools — the BYO channels are not in the set."""
     admin = await _signup_verify_login(client)
     await _seed_instance_and_connections(admin)
 
@@ -252,5 +302,8 @@ async def test_set_dormant_for_action_tools_is_idempotent(client) -> None:
     async with tenant_session(admin) as s:
         second = await dunning.set_dormant_for_action_tools(s, admin_id=admin, reason="test")
 
-    assert first == len(dunning.ACTION_TOOL_CONNECTION_TYPES)
+    assert first == len(ACTION_TOOLS) == 4
     assert second == 0
+    statuses = await _connection_statuses(admin)
+    for ctype in BYO_CHANNELS:
+        assert statuses[ctype] == "connected"

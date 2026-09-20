@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import Subject, current_admin
 from app.api.errors import not_found
 from app.audit import log as audit
-from app.billing import dunning, metering
+from app.billing import metering
 from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.config import get_settings
 from app.db.session import tenant_session
@@ -156,7 +156,13 @@ async def remove_payment_method(
     subject: Subject = Depends(current_admin),
     gateway: StripeGateway = Depends(get_stripe_gateway),
 ) -> BillingInfoOut:
-    """Remove the card → revert toward free_cap behavior (§3.4.1b / Legal §A3).
+    """Remove the card → revert toward free_cap behavior (§3.4.1b).
+
+    Owner decision D1 (2026-09-14): a voluntary card removal changes NOTHING but the
+    50-conversation cap. Every connection — action tools included — keeps its status;
+    only the day-7 dunning reduction (``dunning.advance_if_due`` / the
+    ``invoice.payment_failed`` webhook) sends action tools dormant. A conversation
+    already in flight is served to its end (Legal §A3 #3; ``budget.check_budget``).
 
     Axis10-F01: returns the updated BillingInfo (200) so the wire return type matches
     the frontend client (`Promise<BillingInfo>`) and the mock adapter — previously this
@@ -197,12 +203,7 @@ async def remove_payment_method(
             event_type="payment_method_removed",
             payload={"reason": "admin_removed"},
         )
-        # Legal §A3 / Architecture §3.6.7: an admin-initiated payment-method removal
-        # is a loss of PAYG capability just like a Stripe-side detach — action-tool
-        # connections go dormant (credentials retained, not purged).
-        await dunning.set_dormant_for_action_tools(
-            s, admin_id=subject.admin_id, reason="payment_method_removed"
-        )
+        # D1: no connection changes hands here — the cap is the whole consequence.
         instance_id = await _instance_id(s, subject.admin_id)
         budget = await metering.build_budget(s, admin_id=subject.admin_id, instance_id=instance_id)
         # After removal the account is free_cap, so paymentMethod is omitted.
