@@ -26,7 +26,27 @@ import re
 import uuid
 from typing import Any
 
-from app.runtime.llm_router import LLMResponse, ModelClass, ProviderError
+from app.runtime.llm_router import (
+    RETRYABLE_PROVIDER_STATUSES,
+    LLMResponse,
+    ModelClass,
+    ProviderError,
+)
+
+
+def _provider_error(prefix: str, exc: BaseException) -> ProviderError:
+    """Map an SDK exception to ``ProviderError`` (§3.4.3), carrying its HTTP status so
+    the router can tell a 429/529 refusal (worth ONE retry on the fallback leg, round 7
+    WP-2 item 6) from everything else. The exception type name is safe to surface; the
+    message is not — it may embed request content."""
+    raw = getattr(exc, "status_code", None)
+    status = int(raw) if isinstance(raw, int) else None
+    return ProviderError(
+        f"{prefix}:{type(exc).__name__}",
+        retryable=status in RETRYABLE_PROVIDER_STATUSES,
+        status_code=status,
+    )
+
 
 # Tool JSON counts against the output-token budget on both providers; a tool-bearing
 # call gets at least this much headroom so a serialized tool_use block cannot be
@@ -209,9 +229,7 @@ class AnthropicProvider:
             resp = await client.messages.create(**kwargs)  # type: ignore[attr-defined]
         except AnthropicError as exc:
             # Map ANY SDK error to ProviderError so the router fails over (§3.4.3).
-            # The exception type name is safe to surface; the message is not logged
-            # here to avoid leaking request content.
-            raise ProviderError(f"anthropic_error:{type(exc).__name__}") from exc
+            raise _provider_error("anthropic_error", exc) from exc
 
         text_parts: list[str] = []
         tool_calls: list[dict[str, object]] = []
@@ -332,7 +350,7 @@ class OpenAIProvider:
         try:
             resp = await client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
         except OpenAIError as exc:
-            raise ProviderError(f"openai_error:{type(exc).__name__}") from exc
+            raise _provider_error("openai_error", exc) from exc
 
         choice = resp.choices[0]
         text = choice.message.content or ""

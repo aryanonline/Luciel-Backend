@@ -14,14 +14,23 @@ bind in deployment behind the same interface.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import enum
+import random
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 CONTEXT_TOKEN_BUDGET_FAST = 4000  # §7 #9
+
+# Provider HTTP statuses that mean "try again in a moment", not "this request is
+# wrong": 429 (rate limited) and 529 (Anthropic overloaded). Round 7 WP-2, item 6.
+RETRYABLE_PROVIDER_STATUSES: frozenset[int] = frozenset({429, 529})
+# The one bounded retry on the FALLBACK leg waits a short, jittered moment in this
+# range (seconds), never more than a quarter of llm_timeout_seconds. Tests set (0, 0).
+FALLBACK_RETRY_DELAY_RANGE: tuple[float, float] = (0.5, 1.5)
 
 
 class ModelClass(str, enum.Enum):
@@ -73,7 +82,32 @@ class LLMProvider(Protocol):
 
 
 class ProviderError(Exception):
-    pass
+    """A provider could not serve the call.
+
+    ``retryable`` (round 7 WP-2, item 6) is True for the 429/529 class — a refusal
+    that may clear within a second — and False for everything else (auth, bad
+    request, timeout, connection). Only the fallback leg ever acts on it, once."""
+
+    def __init__(
+        self, message: str = "", *, retryable: bool = False, status_code: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+def _fallback_retry_delay() -> float:
+    """A short jittered wait before the ONE fallback retry, kept inside the provider
+    timeout so the customer's turn cannot stretch past what one call may take."""
+    low, high = FALLBACK_RETRY_DELAY_RANGE
+    delay = random.uniform(low, high)  # noqa: S311 — jitter, not security
+    try:
+        from app.config import get_settings  # noqa: PLC0415 — import cycle
+
+        ceiling = float(get_settings().llm_timeout_seconds) / 4
+    except Exception:  # noqa: BLE001 — settings unavailable → the range alone binds
+        return delay
+    return max(0.0, min(delay, ceiling))
 
 
 def should_route_fast(*, requires_tools: bool, context_tokens: int, complexity: float) -> bool:
@@ -199,6 +233,17 @@ class LLMRouter:
         except ProviderError:
             # Immediate failover, NO retry on primary (§3.4.3). The neutral message
             # shape replays any tool turns correctly through the other provider.
-            resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+            try:
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+            except ProviderError as exc:
+                if not exc.retryable:
+                    raise
+                # ONE bounded retry on the fallback leg for the 429/529 class only
+                # (round 7 WP-2, item 6): a 529 on the primary and a 429 on the
+                # fallback in the same second used to declare both providers down
+                # and hand the customer the outage line. Anything else — auth, a bad
+                # request, a timeout — still fails immediately.
+                await asyncio.sleep(_fallback_retry_delay())
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = True
             return resp
