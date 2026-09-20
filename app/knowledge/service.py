@@ -170,7 +170,7 @@ async def _store_graph(
     Returns the canonical-name → entity_id map. Edges are resolved against that map so
     src/dst reference the persisted entity rows; an endpoint with no node row was already
     materialized as an `unknown` entity by the extractor, so edges never dangle."""
-    result = await extract_async(extractor, text)
+    result = await extract_async(extractor, text, admin_id=admin_id)
     id_by_canonical: dict[str, uuid.UUID] = {}
     for ent in result.entities:
         eid = uuid.uuid4()

@@ -14,8 +14,10 @@ bind in deployment behind the same interface.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -83,10 +85,16 @@ class LLMRouter:
     """Routes to primary, falls back to secondary immediately on primary failure
     (no retry on primary). Fallback is recorded but never surfaced.
 
-    Architecture §9 C9 / §4.6: enforces per-admin_id concurrency cap (50/min)
-    before every LLM call. Raises ``LLMCapExceeded`` when the tenant is over cap.
-    The cap is checked at the router level so it is uniform across all callers
-    (orchestrator, handoff, any future runtime path)."""
+    Architecture §9 C9 / §4.6: enforces per-admin_id concurrency cap (50/min).
+    Raises ``LLMCapExceeded`` when the tenant is over cap. The cap is checked at
+    the router level so it is uniform across all callers (orchestrator, ingest,
+    any future runtime path).
+
+    The unit the cap counts is the customer TURN, not the model call (round 7 WP-2,
+    item 4): the orchestrator opens ``turn()`` once per inbound message, and every
+    ``complete()`` inside it skips re-admission — a tool-using turn used to burn up
+    to five of the fifty. A caller that never opens a turn (graph extraction at
+    ingest) is admitted per call, exactly as before."""
 
     def __init__(
         self,
@@ -104,6 +112,29 @@ class LLMRouter:
         # (None), routing is 100% unchanged from pre-fast-routing behavior — the
         # gate in .complete() below can never select fast without a bound provider.
         self._fast = fast
+        # True while a ``turn()`` is open: the cap was paid at the turn boundary.
+        self._in_turn = False
+
+    @contextlib.contextmanager
+    def turn(self) -> Iterator[None]:
+        """Admit the tenant's per-minute cap ONCE for one customer turn (§9 C9).
+
+        Raises ``LLMCapExceeded`` at entry when the tenant is over cap — before any
+        model is called — so the orchestrator answers the turn honestly instead of
+        an exception reaching the transport. Inside the block ``complete()`` never
+        re-admits. No admin_id bound (tests, legacy construction) → no cap, as
+        before; a nested ``turn()`` is a no-op."""
+        if self._in_turn or self._admin_id is None:
+            yield
+            return
+        from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415 — import cycle
+
+        admit_llm_call(self._admin_id)
+        self._in_turn = True
+        try:
+            yield
+        finally:
+            self._in_turn = False
 
     async def complete(
         self,
@@ -133,7 +164,10 @@ class LLMRouter:
         on-primary failover behavior are unaffected either way.
         """
         effective_admin_id = admin_id if admin_id is not None else self._admin_id
-        if effective_admin_id is not None:
+        # Inside an open ``turn()`` the cap was paid at the turn boundary; only a call
+        # on behalf of a DIFFERENT tenant (explicit admin_id) is admitted on its own.
+        already_paid = self._in_turn and effective_admin_id == self._admin_id
+        if effective_admin_id is not None and not already_paid:
             # Circular import avoided: import inline, module is small + stable.
             from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415
 

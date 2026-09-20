@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -294,7 +295,11 @@ class LlmGraphExtractor:
     def extract(self, text: str) -> ExtractionResult:
         return self._fallback.extract(text)
 
-    async def aextract(self, text: str) -> ExtractionResult:
+    async def aextract(self, text: str, *, admin_id: uuid.UUID | None = None) -> ExtractionResult:
+        """``admin_id`` is the ingesting tenant (round 7 WP-2, item 4): the extractor is
+        a process singleton built without one, so the call itself carries it and the
+        router admits it against THAT tenant's per-minute cap (§9 C9) — an owner
+        pasting a large document is capped exactly like their customers' turns."""
         base = self._fallback.extract(text)
         clipped = (text or "")[:MAX_LLM_TEXT_CHARS]
         if not clipped.strip():
@@ -306,6 +311,7 @@ class LlmGraphExtractor:
                 requires_tools=False,
                 context_tokens=0,
                 complexity=0.0,
+                admin_id=admin_id,
             )
         except Exception as exc:  # noqa: BLE001 — never let a vendor break ingest
             log.warning("graph_extract.llm_failed", extra={"error": type(exc).__name__})
@@ -317,11 +323,16 @@ class LlmGraphExtractor:
         return merge_results(base, parsed)
 
 
-async def extract_async(extractor: GraphExtractor, text: str) -> ExtractionResult:
-    """Run an extractor from async ingest: ``aextract`` when it has one, else ``extract``."""
-    afn: Callable[[str], Awaitable[ExtractionResult]] | None = getattr(extractor, "aextract", None)
+async def extract_async(
+    extractor: GraphExtractor, text: str, *, admin_id: uuid.UUID | None = None
+) -> ExtractionResult:
+    """Run an extractor from async ingest: ``aextract`` when it has one, else ``extract``.
+
+    ``admin_id`` (the ingesting tenant) reaches an LLM-backed extractor so its model
+    call is capped under that tenant (item 4); the deterministic extractor ignores it."""
+    afn: Callable[..., Awaitable[ExtractionResult]] | None = getattr(extractor, "aextract", None)
     if afn is not None:
-        return await afn(text)
+        return await afn(text, admin_id=admin_id)
     return extractor.extract(text)
 
 

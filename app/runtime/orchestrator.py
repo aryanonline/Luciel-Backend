@@ -102,6 +102,7 @@ from app.runtime.input_safety import (
 )
 from app.runtime.knowledge_retrieval import RetrieverBundle
 from app.runtime.lead_capture import capture_or_update_lead
+from app.runtime.llm_cap import LLMCapExceeded
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
 from app.runtime.team_availability import follow_up_phrase
 from app.runtime.team_availability import parse as parse_team_availability
@@ -263,6 +264,18 @@ _UNFOUNDED_CLAIM_REPLACEMENT = (
     "I wasn't able to complete that just now — I've flagged it for the team, and "
     "someone will follow up with you shortly."
 )
+
+# Why no model served the turn (round 7 WP-2, item 4), for the llm_unavailable row.
+# ``provider``: both providers failed (the pre-existing case, no reason on the row);
+# ``cap``: the tenant's per-minute model-call cap (§9 C9) refused the turn — it used
+# to escape as a bare exception, a JSON 429 to Twilio's voice webhook (a hang-up) and
+# nothing at all to an SMS/WhatsApp sender.
+_LLM_FAILURE_PROVIDER = "provider"
+_LLM_FAILURE_CAP = "cap"
+_LLM_FAILURE_REASONS: dict[str, tuple[str, ...]] = {
+    _LLM_FAILURE_PROVIDER: (),
+    _LLM_FAILURE_CAP: ("this account's per-minute model-call cap was reached",),
+}
 
 # Appended ONCE to the answer on the turn a strong_negative_sentiment row is written
 # (round 7 WP-2, item 3; D2): the upset customer still gets their answer, and hears —
@@ -964,7 +977,7 @@ class Orchestrator:
         )
 
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
-        resp, iterations, used_fallback, llm_failed = await self._reason(
+        resp, iterations, used_fallback, llm_failure = await self._reason(
             inbound_text,
             history,
             wrapped_chunks,
@@ -990,9 +1003,17 @@ class Orchestrator:
                 actor_type=ActorType.luciel_runtime,
                 payload={"session_id": str(session_id), "channel": channel},
             )
-        if llm_failed:
-            # Both providers down → llm_unavailable escalation (§3.4.5 server signal).
-            await self._emit_llm_unavailable(session_id, resolved_lead_id)
+        if llm_failure is not None:
+            # No model served the turn — both providers down, or the tenant's cap
+            # refused it (item 4) → llm_unavailable escalation (§3.4.5 server signal)
+            # with the SAME graceful, un-billed, deterministic reply on every channel
+            # (voice stays TwiML). The cap case is distinct in the metric and on the
+            # row's reasons, never a different customer experience.
+            failure_reasons = _LLM_FAILURE_REASONS[llm_failure]
+            if llm_failure == _LLM_FAILURE_CAP:
+                _LOG.warning("llm_cap_exceeded session=%s channel=%s", session_id, channel)
+                emit_metric("LLMCapExceeded", dimensions={"Channel": channel})
+            await self._emit_llm_unavailable(session_id, resolved_lead_id, reasons=failure_reasons)
             ack = self._with_contact_ask(
                 "I'm having a brief technical issue — I've flagged this so a person "
                 "can follow up with you shortly.",
@@ -1020,7 +1041,9 @@ class Orchestrator:
                 outbound_channel=channel,
                 counted=False,
                 # Same-signal harmony as the persisted llm_unavailable row (C4).
-                escalation=EscalationDecision(True, Signal.llm_unavailable),
+                escalation=EscalationDecision(
+                    True, Signal.llm_unavailable, Gate.outcome, None, failure_reasons
+                ),
                 iterations=iterations,
             )
 
@@ -1521,10 +1544,15 @@ class Orchestrator:
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
-    ) -> tuple[_Reasoned, int, bool, bool]:
+    ) -> tuple[_Reasoned, int, bool, str | None]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
-        answer, the iteration count, whether the fallback provider was used, and
-        whether BOTH providers failed (llm_failed).
+        answer, the iteration count, whether the fallback provider was used, and why
+        no model served the turn: None, ``_LLM_FAILURE_PROVIDER`` (BOTH providers
+        failed) or ``_LLM_FAILURE_CAP`` (the tenant's per-minute cap refused it).
+
+        The cap is admitted ONCE at the turn boundary (``router.turn()``, round 7
+        WP-2 item 4): the iterations inside share that admission, so a tool-using
+        turn is one of the fifty, not five.
 
         Termination (C4): the loop ends when a response proposes NO tool calls —
         natural completion — or at the iteration bound. Tool results are fed back as
@@ -1563,54 +1591,70 @@ class Orchestrator:
         dispatched: list[tuple[dict[str, Any], ToolResult]] = []
         last: LLMResponse | None = None
         iterations = 0
-        for _ in range(MAX_ITERATIONS):
-            iterations += 1
-            try:
-                resp = await self.router.complete(
-                    prompt,
-                    messages,
-                    tools=tool_defs,
-                    **routing_hints(inbound_text, prompt, messages, tool_defs),
-                )
-            except ProviderError:
-                # Router already failed primary→fallback; a ProviderError here means
-                # BOTH providers are down (§3.4.3 immediate failover, no retry).
-                return (
-                    _Reasoned("", 0.0, tool_outcomes, dispatched),
-                    iterations,
-                    used_fallback,
-                    True,
-                )
-            used_fallback = used_fallback or resp.used_fallback
-            last = resp
-            if not resp.tool_calls:
-                # Natural completion: the model answered without (further) tool use.
-                break
-            # ACT: dispatch the proposed calls via the Arc 12 broker contract, then
-            # REFLECT: append the assistant's tool turn + one structured tool_result
-            # turn per call (untrusted-wrapped — results embed lead/provider content).
-            results = await self._dispatch_tools(
-                resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+        try:
+            # ONE cap admission for the whole turn (item 4): raises LLMCapExceeded at
+            # entry when the tenant is over its per-minute cap — no model is called.
+            with self.router.turn():
+                for _ in range(MAX_ITERATIONS):
+                    iterations += 1
+                    try:
+                        resp = await self.router.complete(
+                            prompt,
+                            messages,
+                            tools=tool_defs,
+                            **routing_hints(inbound_text, prompt, messages, tool_defs),
+                        )
+                    except ProviderError:
+                        # Router already failed primary→fallback; a ProviderError here
+                        # means BOTH providers are down (§3.4.3 immediate failover).
+                        return (
+                            _Reasoned("", 0.0, tool_outcomes, dispatched),
+                            iterations,
+                            used_fallback,
+                            _LLM_FAILURE_PROVIDER,
+                        )
+                    used_fallback = used_fallback or resp.used_fallback
+                    last = resp
+                    if not resp.tool_calls:
+                        # Natural completion: the model answered without (further)
+                        # tool use.
+                        break
+                    # ACT: dispatch the proposed calls via the Arc 12 broker contract,
+                    # then REFLECT: append the assistant's tool turn + one structured
+                    # tool_result turn per call (untrusted-wrapped — results embed
+                    # lead/provider content).
+                    results = await self._dispatch_tools(
+                        resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+                    )
+                    dispatched.extend(results)
+                    tool_outcomes.extend(r.outcome.value for _, r in results)
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": resp.text,
+                            "tool_calls": resp.tool_calls,
+                        }
+                    )
+                    for call, result in results:
+                        messages.append(
+                            {
+                                "role": "tool_result",
+                                "call_id": str(call.get("call_id", "")),
+                                "tool_id": str(call.get("tool_id", "")),
+                                "content": wrap_untrusted(self._tool_result_feedback(call, result)),
+                                "is_error": result.outcome is tool_contract.Outcome.failed,
+                            }
+                        )
+        except LLMCapExceeded:
+            # The tenant's cap refused the turn (§9 C9): the same honest, un-billed
+            # reply path as a provider outage, under its own reason — never a bare
+            # exception to the transport (a JSON 429 hangs up a Twilio call).
+            return (
+                _Reasoned("", 0.0, tool_outcomes, dispatched),
+                iterations,
+                used_fallback,
+                _LLM_FAILURE_CAP,
             )
-            dispatched.extend(results)
-            tool_outcomes.extend(r.outcome.value for _, r in results)
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": resp.text,
-                    "tool_calls": resp.tool_calls,
-                }
-            )
-            for call, result in results:
-                messages.append(
-                    {
-                        "role": "tool_result",
-                        "call_id": str(call.get("call_id", "")),
-                        "tool_id": str(call.get("tool_id", "")),
-                        "content": wrap_untrusted(self._tool_result_feedback(call, result)),
-                        "is_error": result.outcome is tool_contract.Outcome.failed,
-                    }
-                )
 
         if last is None:
             # Unreachable: MAX_ITERATIONS >= 1 so the loop always assigns or returns.
@@ -1619,7 +1663,7 @@ class Orchestrator:
             _Reasoned(last.text, last.confidence, tool_outcomes, dispatched),
             iterations,
             used_fallback,
-            False,
+            None,
         )
 
     async def _dispatch_tools(
@@ -2054,10 +2098,15 @@ class Orchestrator:
         )
 
     async def _emit_llm_unavailable(
-        self, session_id: uuid.UUID, resolved_lead_id: uuid.UUID | None
+        self,
+        session_id: uuid.UUID,
+        resolved_lead_id: uuid.UUID | None,
+        *,
+        reasons: tuple[str, ...] = (),
     ) -> None:
         # Once per session, same reasoning as budget_exhausted: an outage is one
-        # event for the conversation, however many turns it spans.
+        # event for the conversation, however many turns it spans. ``reasons`` names
+        # the cap case (item 4) on the row; a provider outage keeps no reason.
         if await _session_already_escalated(
             self.session,
             admin_id=self.admin_id,
@@ -2074,6 +2123,7 @@ class Orchestrator:
             signal="llm_unavailable",
             gate="outcome",
             score=None,
+            reasons=list(reasons),
         )
 
     async def _audit_moderation(self, session_id: uuid.UUID, category: str) -> None:

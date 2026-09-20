@@ -140,3 +140,21 @@ def test_the_seam_binds_the_llm_extractor_only_in_live_mode(monkeypatch: pytest.
         ge.reset_extractor()
         monkeypatch.delenv("LUCIEL_GRAPH_EXTRACTOR", raising=False)
         get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+async def test_ingest_time_extraction_is_capped_under_the_ingesting_tenant():
+    """Round 7 WP-2, item 4: the extractor is a process singleton built without a
+    tenant, so the ingest call itself carries admin_id to the router's cap."""
+    import uuid
+
+    admin = uuid.uuid4()
+    router = _FakeRouter("```json\n" + _GOOD + "\n```")
+    llm = ge.LlmGraphExtractor(router_factory=lambda: router)
+    await ge.extract_async(llm, PROSE, admin_id=admin)
+    assert router.calls[0]["admin_id"] == admin
+    # Direct use without a tenant stays uncapped, exactly as before.
+    await llm.aextract(PROSE)
+    assert router.calls[1]["admin_id"] is None
+    # The deterministic extractor ignores the tenant.
+    det = ge.DeterministicGraphExtractor()
+    assert (await ge.extract_async(det, "A (Thing)", admin_id=admin)).entities[0].name == "A"

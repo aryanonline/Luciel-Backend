@@ -133,3 +133,76 @@ def test_llm_cap_exceeded_str() -> None:
     admin = uuid.uuid4()
     exc = LLMCapExceeded(admin)
     assert str(admin) in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# The unit the cap counts is the customer TURN (round 7 WP-2, item 4)
+# ---------------------------------------------------------------------------
+def _bind_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryLLMCapStore:
+    import app.runtime.llm_cap as llm_cap_module  # noqa: PLC0415
+
+    store = InMemoryLLMCapStore()
+    monkeypatch.setattr(llm_cap_module, "_store", store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_a_turn_admits_the_cap_once_however_many_calls_it_makes(monkeypatch) -> None:
+    """A tool-using turn makes up to five model calls; it is ONE of the fifty."""
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    store = _bind_store(monkeypatch)
+    admin = uuid.uuid4()
+    router = LLMRouter(primary=EchoModel(), fallback=EchoModel(), admin_id=admin)
+    with router.turn():
+        for _ in range(5):
+            await router.complete("sys", [{"role": "user", "content": "hi"}])
+    assert store.current_count(str(admin)) == 1
+    # Outside a turn (ingest-time callers) every call is admitted on its own, as before.
+    await router.complete("sys", [{"role": "user", "content": "hi"}])
+    assert store.current_count(str(admin)) == 2
+    # A call on behalf of ANOTHER tenant inside a turn pays under that tenant.
+    other = uuid.uuid4()
+    with router.turn():
+        await router.complete("sys", [{"role": "user", "content": "hi"}], admin_id=other)
+    assert store.current_count(str(other)) == 1
+    assert store.current_count(str(admin)) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_cap_refuses_at_the_turn_boundary_before_any_model_call(
+    monkeypatch,
+) -> None:
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    store = _bind_store(monkeypatch)
+    admin = uuid.uuid4()
+    for _ in range(LLM_CAP_PER_MINUTE):
+        assert store.admit(str(admin)) is True
+
+    class _Counting(EchoModel):
+        calls = 0
+
+        async def complete(self, *a, **kw):  # type: ignore[override]
+            _Counting.calls += 1
+            return await super().complete(*a, **kw)
+
+    router = LLMRouter(primary=_Counting(), fallback=EchoModel(), admin_id=admin)
+    with pytest.raises(LLMCapExceeded), router.turn():
+        await router.complete("sys", [{"role": "user", "content": "hi"}])
+    assert _Counting.calls == 0
+    # The failed turn left no admission state behind: later turns start clean.
+    assert router._in_turn is False
+
+
+def test_a_turn_without_a_bound_tenant_is_a_no_op(monkeypatch) -> None:
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    store = _bind_store(monkeypatch)
+    router = LLMRouter(primary=EchoModel(), fallback=EchoModel())
+    with router.turn(), router.turn():  # nested is fine too
+        pass
+    assert store._calls == {}

@@ -7,6 +7,8 @@
 * Owner decision D2: only an explicit request for a person and threat / self-harm
   moderation take the conversation away; strong negative sentiment, abuse and an
   illegal ask record + notify the owner while Luciel keeps answering (item 3).
+* The per-tenant model-call cap is one admission per turn, and an exhausted cap is
+  the honest outage reply on every channel, never an exception (item 4).
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
+from app.runtime import llm_cap as llm_cap_module
 from app.runtime.escalation import Signal
 from app.runtime.grounding import GROUNDING_FLOOR
+from app.runtime.llm_cap import LLM_CAP_PER_MINUTE, InMemoryLLMCapStore
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
@@ -441,3 +445,79 @@ async def test_an_upset_customer_is_answered_and_the_team_is_told_once():
         assert REFUND_REPLY in third.reply_text
         assert "let the team know" not in third.reply_text
         assert [r.signal for r in await _rows(s, sid)] == ["strong_negative_sentiment"]
+
+
+# --- item 4: the model-call cap is one admission per turn, and never an exception --- #
+def _bind_cap_store(monkeypatch) -> InMemoryLLMCapStore:
+    store = InMemoryLLMCapStore()
+    monkeypatch.setattr(llm_cap_module, "_store", store)
+    return store
+
+
+def _capped_orch(s, admin, iid, *, primary) -> Orchestrator:
+    return Orchestrator(
+        session=s,
+        router=LLMRouter(primary=primary, fallback=EchoModel(), admin_id=admin),
+        retriever=_invoice_retriever,
+        admin_id=admin,
+        instance_id=iid,
+        enabled_channels={"widget", "voice"},
+        has_payment_method=False,
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_tool_using_turn_is_one_admission_against_the_cap(monkeypatch):
+    store = _bind_cap_store(monkeypatch)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        model = _hand_to_team_model()  # proposes a tool, reads the result, answers
+        result = await _capped_orch(s, admin, iid, primary=model).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="I want to dispute invoice #4471, the amount is wrong",
+        )
+        assert result.iterations == 2 and len(model.turns) == 2
+        assert store.current_count(str(admin)) == 1
+
+
+@pytest.mark.parametrize("channel", ["widget", "voice", "sms"])
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_exhausted_cap_answers_honestly_instead_of_raising(monkeypatch, channel: str):
+    """LLMCapExceeded used to escape the loop as a JSON 429 — to Twilio's voice
+    webhook that is an application error and a hang-up; an SMS sender got nothing.
+    Now it is the same graceful, un-billed reply path as a provider outage, under
+    its own reason, on every channel."""
+    store = _bind_cap_store(monkeypatch)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    for _ in range(LLM_CAP_PER_MINUTE):
+        assert store.admit(str(admin)) is True
+    model = _RecordingEcho(confidence=1.0, fixed_reply=INVOICE_REPLY)
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel=channel)
+        result = await _capped_orch(s, admin, iid, primary=model).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel=channel,
+            mode="ai",
+            inbound_text="what are your hours?",
+            transport_identifier=None if channel == "widget" else "+16045550107",
+        )
+        assert model.turns == []  # no model was called
+        assert "technical issue" in result.reply_text
+        assert result.counted is False and result.handed_off is False
+        assert result.escalation is not None
+        assert result.escalation.signal is Signal.llm_unavailable
+        assert result.escalation.reasons == (
+            "this account's per-minute model-call cap was reached",
+        )
+        rows = await _rows(s, sid)
+        assert [r.signal for r in rows] == ["llm_unavailable"]
+        assert list(rows[0].reasons or []) == [
+            "this account's per-minute model-call cap was reached"
+        ]
+        # The refused turn did not burn an admission either.
+        assert store.current_count(str(admin)) == LLM_CAP_PER_MINUTE
