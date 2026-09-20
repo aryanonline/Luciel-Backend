@@ -135,3 +135,10 @@ def test_engine_settings_are_bounded():
     assert 5_000 <= s.db_statement_timeout_ms <= 300_000
     assert s.log_format in ("text", "json")
     assert os.environ.get("LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS") is None
+
+
+def test_statement_timeout_is_the_architectures_thirty_seconds():
+    # Architecture §4.7 says 30 seconds; the setting shipped at 60_000 (round 7
+    # WP-8). Read the class default, not the environment, so a developer's .env
+    # cannot make this pass or fail.
+    assert Settings.model_fields["db_statement_timeout_ms"].default == 30_000

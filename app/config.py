@@ -41,7 +41,11 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 5
     db_pool_recycle_seconds: int = 1800
-    db_statement_timeout_ms: int = 60_000
+    # Architecture §4.7: 30 seconds. Shipped at 60_000 (round 7 WP-8): twice the
+    # documented deadline, so a query the architecture calls runaway held a
+    # pooled connection for another half minute. tests/unit/test_observability_wp7.py
+    # pins the documented value.
+    db_statement_timeout_ms: int = 30_000
     # 'json' puts trace_id/admin_id on every log line (the ECS task definitions set
     # it); 'text' keeps a developer terminal readable.
     log_format: str = "text"
