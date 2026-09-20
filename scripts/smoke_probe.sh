@@ -3,11 +3,22 @@
 # the deploy intended BEFORE the deploy is called done — and if it does not, the
 # workflow rolls the services back to the task definitions that were serving.
 #
-#   scripts/smoke_probe.sh <api-base-url> <expected-integration-mode>
+#   scripts/smoke_probe.sh <api-base-url> <expected-integration-mode> [stripe-posture]
 #
 # Public probes only (the runner is outside the VPC):
-#   1. /healthz reports status ok, the expected integrationMode and an EMPTY
-#      degraded list — a non-empty list in live mode means sends are fabricated.
+#   1. /healthz reports status ok, the expected integrationMode and EXACTLY the
+#      degraded set that mode selects (app/runtime/integration_status.py
+#      degraded_bindings): EMPTY in live mode — a non-empty list there means
+#      sends are fabricated — and, in mock mode, precisely the in-process
+#      stand-ins (Null email/SMS senders, the local secret store, the in-memory
+#      calendar, the echo LLM) and nothing else. The old probe demanded an empty
+#      list for ANY mode, which mock can never satisfy, so a mock deploy always
+#      failed the probe and rolled back (round 7 WP-8). The optional third
+#      argument is the environment's Stripe posture (default `test`, dev's):
+#      a `mock` posture (prod) adds stripe_gateway:FakeStripeGateway to the
+#      expected set in either mode, because that is the honest answer there.
+#      An entry outside the expected set — a database:... or pgvector_too_old
+#      report — still fails the probe in every mode.
 #   2. An unauthenticated control-plane call (/api/v1/auth/me) is answered by the
 #      APP with 401 — never a 502/503/504 from the load balancer, which is what a
 #      broken listener rule or an unhealthy control-plane target looks like (F067).
@@ -17,6 +28,7 @@ set -euo pipefail
 
 BASE="${1:?api base url, e.g. https://api.vantagemind.ai}"
 MODE="${2:?expected integration mode: mock|live}"
+STRIPE_POSTURE="${3:-test}"
 TMP="$(mktemp -d)"
 
 probe() {
@@ -34,19 +46,35 @@ probe() {
 ok=false
 for i in $(seq 1 24); do
   code=$(probe GET /healthz "$TMP/healthz.json")
-  if [ "$code" = "200" ] && python3 - "$MODE" "$TMP/healthz.json" <<'PY'
+  if [ "$code" = "200" ] && python3 - "$MODE" "$STRIPE_POSTURE" "$TMP/healthz.json" <<'PY'
 import json, sys
-mode, path = sys.argv[1], sys.argv[2]
+mode, stripe_posture, path = sys.argv[1], sys.argv[2], sys.argv[3]
 d = json.load(open(path))
 status, got_mode, degraded = d.get("status"), d.get("integrationMode"), d.get("degraded")
-print(f"[smoke] healthz status={status} integrationMode={got_mode} degraded={degraded}")
-sys.exit(0 if (status == "ok" and got_mode == mode and degraded == []) else 1)
+# The EXACT set /healthz must list for this mode — the names are the
+# `seam:ImplClass` strings app/runtime/integration_status.py degraded_bindings
+# emits. Compared as a set equality, so an unexpected entry (database:...,
+# pgvector_too_old:..., a live-mode Null sender) fails the probe.
+expected = set()
+if mode == "mock":
+    expected = {
+        "platform_email:NullEmailSender",
+        "platform_sms:NullSmsSender",
+        "secret_store:LocalSecretStore",
+        "calendar_api:InMemoryCalendarApi",
+        "llm:EchoModel",
+    }
+if stripe_posture != "test":
+    expected.add("stripe_gateway:FakeStripeGateway")
+got = set(degraded or [])
+print(f"[smoke] healthz status={status} integrationMode={got_mode} degraded={sorted(got)} expected={sorted(expected)}")
+sys.exit(0 if (status == "ok" and got_mode == mode and got == expected) else 1)
 PY
   then ok=true; break; fi
   echo "[smoke] healthz not ready or not healthy (attempt $i/24, http $code) - waiting 15s"
   sleep 15
 done
-$ok || { echo "::error::/healthz never reported status=ok, integrationMode=$MODE, degraded=[]"; exit 1; }
+$ok || { echo "::error::/healthz never reported status=ok, integrationMode=$MODE with the expected degraded set for that mode (stripe posture $STRIPE_POSTURE)"; exit 1; }
 
 # 2) control plane answers (401 from the app, not a load-balancer error).
 code=$(probe GET /api/v1/auth/me "$TMP/me.json")
@@ -63,4 +91,4 @@ case "$code" in
   *) echo "::error::data-plane route /api/v1/chat-widget/bootstrap answered HTTP $code (expected a 4xx from the app)"; exit 1 ;;
 esac
 
-echo "[smoke] PASS: healthz ok/$MODE with no degraded bindings; control plane answered 401; data plane answered $code."
+echo "[smoke] PASS: healthz ok/$MODE with exactly the expected degraded set; control plane answered 401; data plane answered $code."

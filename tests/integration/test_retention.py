@@ -134,6 +134,8 @@ async def test_expire_aged_data_deletes_old_keeps_recent_and_audits():
             "retrieval_trace_event": 0,
             # Owner-deleted knowledge past its 30-day undo window (audit F109).
             "knowledge_source_grace_expired": 0,
+            # Stored originals with no knowledge_sources row (round 7 WP-8).
+            "knowledge_original_orphan": 0,
         }
 
     async with tenant_session(admin) as s:
@@ -185,6 +187,8 @@ async def test_expire_aged_data_is_idempotent():
             "retrieval_trace_event": 0,
             # Owner-deleted knowledge past its 30-day undo window (audit F109).
             "knowledge_source_grace_expired": 0,
+            # Stored originals with no knowledge_sources row (round 7 WP-8).
+            "knowledge_original_orphan": 0,
         }
     # Re-run: nothing left aged → zero deletes (idempotent).
     async with tenant_session(admin) as s:
@@ -200,6 +204,8 @@ async def test_expire_aged_data_is_idempotent():
             "retrieval_trace_event": 0,
             # Owner-deleted knowledge past its 30-day undo window (audit F109).
             "knowledge_source_grace_expired": 0,
+            # Stored originals with no knowledge_sources row (round 7 WP-8).
+            "knowledge_original_orphan": 0,
         }
 
 
@@ -588,3 +594,160 @@ async def test_platform_data_enforcers_prune_contact_forms_and_cap_the_access_lo
             await s.execute(sa_text("SELECT internal_access_prune(:cutoff)"), {"cutoff": now})
         ).scalar_one()
         assert int(pruned_again or 0) == 0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_retention_reaps_orphaned_knowledge_originals_and_keeps_owned_ones():
+    """Round 7 WP-8: the originals bucket has NO expiration by design, so an object
+    whose knowledge_sources row is gone must be reaped by the sweep — and ONLY that
+    object, and only once it is older than ORIGINAL_ORPHAN_MIN_AGE (an upload keeps
+    its bytes before its row commits). A live source's file, a tombstoned source's
+    undo payload and another tenant's prefix all survive; the reap is audited once
+    and is idempotent."""
+    from app.knowledge.original_store import (
+        LocalOriginalStore,
+        original_key_for,
+        set_original_store,
+    )
+    from app.knowledge.service import DELETED_BY_OWNER
+    from app.lifecycle.retention import ORIGINAL_ORPHAN_MIN_AGE
+    from app.models.knowledge import KnowledgeSource
+
+    LocalOriginalStore.reset()
+    store = LocalOriginalStore()
+    set_original_store(store)
+    try:
+        admin, other = uuid.uuid4(), uuid.uuid4()
+        iid = await _seed_tenant(admin)
+        await _seed_tenant(other)
+        uploaded_at = datetime.now(UTC)
+        live_id, tombstoned_id, gone_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        live_key = original_key_for(admin, live_id, "live.pdf")
+        undo_key = original_key_for(admin, tombstoned_id, "undo.pdf")
+        orphan_key = original_key_for(admin, gone_id, "orphan.pdf")  # no row: a failed delete
+        theirs_key = original_key_for(other, uuid.uuid4(), "theirs.pdf")
+        async with tenant_session(admin) as s:
+            s.add(
+                KnowledgeSource(
+                    id=live_id,
+                    admin_id=admin,
+                    instance_id=iid,
+                    name="live.pdf",
+                    origin="upload",
+                    original_key=live_key,
+                )
+            )
+            s.add(
+                KnowledgeSource(
+                    id=tombstoned_id,
+                    admin_id=admin,
+                    instance_id=iid,
+                    name="undo.pdf",
+                    origin="upload",
+                    original_key=undo_key,
+                    # One day into the 30-day undo window: the row stays, so must its file.
+                    soft_deleted_at=uploaded_at - timedelta(days=1),
+                    deleted_by=DELETED_BY_OWNER,
+                )
+            )
+            await s.flush()
+        for key in (live_key, undo_key, orphan_key, theirs_key):
+            await store.put(key=key, data=b"%PDF", content_type="application/pdf")
+
+        # A sweep landing right after the upload sees a key with no row — the
+        # in-flight shape — and must leave it alone (nothing reaped, nothing audited).
+        async with tenant_session(admin) as s:
+            fresh = await expire_aged_data(s, admin_id=admin, now=uploaded_at)
+        assert fresh["knowledge_original_orphan"] == 0
+        assert {live_key, undo_key, orphan_key, theirs_key} <= set(LocalOriginalStore.keys())
+
+        # Past the minimum age (the sweep's clock moved on; the tombstone is still
+        # well inside its undo window) the orphan — and only the orphan — goes.
+        now = uploaded_at + ORIGINAL_ORPHAN_MIN_AGE + timedelta(hours=1)
+        async with tenant_session(admin) as s:
+            counts = await expire_aged_data(s, admin_id=admin, now=now)
+        assert counts["knowledge_original_orphan"] == 1
+        assert counts["knowledge_source_grace_expired"] == 0
+        remaining = set(LocalOriginalStore.keys())
+        assert orphan_key not in remaining
+        assert {live_key, undo_key, theirs_key} <= remaining
+
+        async with tenant_session(admin) as s:
+            evts = (
+                (
+                    await s.execute(
+                        select(AdminAuditLog).where(
+                            AdminAuditLog.admin_id == admin,
+                            AdminAuditLog.event_type == "data_retention_hard_delete",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            payloads = [e.event_payload or {} for e in evts]
+            assert [p_["data_class"] for p_ in payloads] == ["knowledge_original"]
+            assert payloads[0]["count"] == 1 and payloads[0]["delete_errors"] == 0
+            assert payloads[0]["retention_policy"] == "orphan_reconcile:no_knowledge_sources_row"
+            assert await verify_chain(s, admin) is True
+
+        # Idempotent: the second pass finds nothing orphaned and writes no audit row.
+        async with tenant_session(admin) as s:
+            again = await expire_aged_data(s, admin_id=admin, now=now)
+        assert again["knowledge_original_orphan"] == 0
+        async with tenant_session(admin) as s:
+            n = (
+                await s.execute(
+                    select(func.count())
+                    .select_from(AdminAuditLog)
+                    .where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "data_retention_hard_delete",
+                    )
+                )
+            ).scalar_one()
+            assert n == 1
+        assert {live_key, undo_key, theirs_key} <= set(LocalOriginalStore.keys())
+    finally:
+        set_original_store(None)
+        LocalOriginalStore.reset()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_orphan_reap_survives_a_store_outage_without_losing_row_retention():
+    """A listing failure must not roll back the tenant's row deletions: it is logged
+    at ERROR (the sweep alarm reads that) and the run reaps nothing."""
+    from app.knowledge.original_store import set_original_store
+
+    class _DownStore:
+        async def put(self, *, key, data, content_type):  # pragma: no cover - unused
+            raise AssertionError
+
+        async def get(self, *, key):  # pragma: no cover - unused
+            return None
+
+        async def delete(self, *, key):  # pragma: no cover - unused
+            raise AssertionError
+
+        async def delete_prefix(self, *, prefix):  # pragma: no cover - unused
+            return 0
+
+        async def list_prefix(self, *, prefix):
+            raise OSError("bucket unreachable")
+
+    set_original_store(_DownStore())
+    try:
+        admin = uuid.uuid4()
+        iid = await _seed_tenant(admin)
+        now = datetime.now(UTC)
+        async with tenant_session(admin) as s:
+            await _add_transcript(
+                s, admin_id=admin, instance_id=iid, created_at=now - timedelta(days=400)
+            )
+            await s.flush()
+        async with tenant_session(admin) as s:
+            counts = await expire_aged_data(s, admin_id=admin, now=now)
+        assert counts["transcript"] == 1  # the row retention still happened
+        assert counts["knowledge_original_orphan"] == 0
+    finally:
+        set_original_store(None)

@@ -73,6 +73,22 @@ export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> =
   ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
 ];
 
+/**
+ * Every backend task runs on Graviton (round 7 WP-8, owner decision D7
+ * 2026-09-14): ARM64 Fargate bills ~20% less per vCPU-hour than x86 for the
+ * same work. Declaring ARM64 here is only safe because deploy.yml pushes a
+ * MULTI-ARCH image (buildx, linux/amd64 + linux/arm64 under one tag) and
+ * scripts/gate_image_scan.sh refuses a tag whose index lacks the arm64 child —
+ * a task definition that says ARM64 over an amd64-only image is a service that
+ * never starts (CannotPullContainerError). test/graviton.test.ts pins both
+ * halves. The web task (web-stack.ts) stays x86 until the FRONTEND repo builds
+ * its image multi-arch; see the TODO there.
+ */
+export const GRAVITON_RUNTIME: ecs.RuntimePlatform = {
+  cpuArchitecture: ecs.CpuArchitecture.ARM64,
+  operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+};
+
 export class ComputeStack extends Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly cluster: ecs.Cluster;
@@ -493,6 +509,7 @@ export class ComputeStack extends Stack {
         cpu: envConfig.envName === 'prod' ? 1024 : 256,
         memoryLimitMiB: envConfig.envName === 'prod' ? 2048 : 512,
         taskRole: role,
+        runtimePlatform: GRAVITON_RUNTIME,
       });
       // The EXECUTION role resolves `secrets:` at task startup. It needs both
       // secret-read AND kms:Decrypt on the CMK (the secrets are CMK-encrypted).
@@ -630,6 +647,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     migrationTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -672,6 +690,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     verifyTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -713,6 +732,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     seedTestTask.addToExecutionRolePolicy(
       new iam.PolicyStatement({
@@ -744,6 +764,15 @@ export class ComputeStack extends Stack {
         // Wire the real Redis so the cap tests (T2/T3) exercise the Redis-backed
         // store exactly as the app does, not the in-memory degraded fallback.
         LUCIEL_REDIS_URL: redisUrl,
+        // The API the harness drives (scripts/seed_and_livetest.py reads
+        // LUCIEL_API_BASE and otherwise defaults to the public hostname). Injected
+        // per environment (round 7 WP-8): without it the PREPROD rehearsal drove
+        // whatever the public hostname pointed at while reading preprod's own
+        // database — a harness proving one environment's behavior against
+        // another's rows. Derived from DOMAINS.api for now; the per-environment
+        // hostname move (owner console work) changes this ONE value and nothing
+        // in the harness.
+        LUCIEL_API_BASE: publicApiBaseUrl,
       },
     });
     new cdk.CfnOutput(this, 'SeedTestTaskArn', {
@@ -762,6 +791,7 @@ export class ComputeStack extends Stack {
       cpu: 256,
       memoryLimitMiB: 512,
       taskRole: sweepRole,
+      runtimePlatform: GRAVITON_RUNTIME,
     });
     this.sweepTaskFamily = sweepTask.family;
     // The model_currency watchdog's RETIREMENT AUTO-SWAP (owner decision, §3.4.3):
@@ -1022,10 +1052,13 @@ export class ComputeStack extends Stack {
       {
         // Hourly, because owners sit in different zones: a tenant is due once its
         // LOCAL clock passes 07:00 and no ledger row exists for the day (round 6 WP-F).
-        // :50 staggers off the deferred (:10), session_finalize (:25) and health
-        // (:40) hourly slots.
+        // :55 staggers off the deferred (:10), session_finalize (:25) and health
+        // (:40) hourly slots AND off knowledge_sync's :50 — the previous :50 slot
+        // collided with it four times a day (00/06/12/18 UTC), two sweep tasks
+        // contending for the same DB at once (round 7 WP-8). sweep-schedules.test.ts
+        // refuses any two schedules that share a firing minute.
         name: 'daily_brief',
-        cron: 'cron(50 * * * ? *)',
+        cron: 'cron(55 * * * ? *)',
         description: "Email each owner's morning brief once per local day (round 6 WP-F)",
       },
     ];

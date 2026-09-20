@@ -29,14 +29,20 @@ code=$(aws ecs describe-tasks --region "$REGION" --cluster "$cluster" --tasks "$
   --query 'tasks[0].containers[0].exitCode' --output text)
 echo "[verify] exit code: $code"
 
-# Print the probe output from CloudWatch (luciel-verify stream).
+# Print the probe output from CloudWatch. The group is the one ComputeStack
+# declares — /luciel/<env>/verify (round 7 WP-8: the old lookup searched for
+# 'Verify' case-sensitively, matched nothing, and always printed "(logs not yet
+# available)" — the same defect run-seedtest-task.sh fixed under F174, so the
+# §10 probe's own output never reached the workflow log).
 taskid="${arn##*/}"
+log_group="/luciel/${ENVIRONMENT}/verify"
+echo "[verify] task definition: $taskdef"
+echo "[verify] log group: $log_group  stream: luciel-verify/VerifyContainer/${taskid}"
 sleep 5
 aws logs get-log-events --region "$REGION" \
-  --log-group-name "$(aws logs describe-log-groups --region "$REGION" \
-     --query "logGroups[?contains(logGroupName,'Verify')].logGroupName | [0]" --output text)" \
+  --log-group-name "$log_group" \
   --log-stream-name "luciel-verify/VerifyContainer/${taskid}" \
-  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available)"
+  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available for $log_group)"
 
 [ "$code" = "0" ] || { echo "::error::verify task FAILED (exit $code)"; exit 1; }
 echo "[verify] §10 live probe PASSED."

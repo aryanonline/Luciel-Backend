@@ -15,6 +15,16 @@ ObservabilityStack alarms reference:
                          a turn ran with NO knowledge because the embedding
                          provider failed, or an ingest could not embed
                          (dim: Reason, prefixed ingest: for the latter)
+
+Dimension sets (round 7 WP-8): by default a datum publishes ONE dimension set,
+``[Environment]`` — the set every ObservabilityStack alarm reads
+(``dimensionsMap: { Environment }``). The extra values (Plane, Channel, Signal,
+Sweep, Reason ...) are still on the document as plain properties, so Logs
+Insights can filter and group by them for free; they only become billed custom
+metrics when a caller opts in with ``full_dimensions=True``, which publishes the
+full combination as a second set. Publishing both sets for every datum was
+doubling the custom-metric count (each dimension combination is a separate
+billed metric) for drill-downs nothing read.
 """
 
 from __future__ import annotations
@@ -69,22 +79,26 @@ def emf_document(
     unit: str = "Count",
     dimensions: dict[str, str] | None = None,
     environment: str | None = None,
+    full_dimensions: bool = False,
 ) -> dict[str, object]:
     dims: dict[str, str] = {
         "Environment": environment or os.environ.get("LUCIEL_ENVIRONMENT") or "local",
         "Plane": os.environ.get("LUCIEL_PLANE") or "local",
         **(dimensions or {}),
     }
+    # [Environment] alone is what the alarms read and the only set published by
+    # default; the full combination is an opt-in second set (see module docstring).
+    # Every value in ``dims`` stays on the document either way, as a property.
+    dimension_sets: list[list[str]] = [["Environment"]]
+    if full_dimensions:
+        dimension_sets.append(list(dims.keys()))
     return {
         "_aws": {
             "Timestamp": int(time.time() * 1000),
             "CloudWatchMetrics": [
                 {
                     "Namespace": NAMESPACE,
-                    # Two dimension sets: the full one for drill-down and
-                    # [Environment] alone so an alarm can sum the environment's
-                    # total without enumerating channels, planes or signals.
-                    "Dimensions": [["Environment"], list(dims.keys())],
+                    "Dimensions": dimension_sets,
                     "Metrics": [{"Name": name, "Unit": unit}],
                 }
             ],
@@ -100,8 +114,14 @@ def emit_metric(
     *,
     unit: str = "Count",
     dimensions: dict[str, str] | None = None,
+    full_dimensions: bool = False,
 ) -> None:
-    """Emit one metric datum. Never raises: telemetry must not break a turn."""
+    """Emit one metric datum. Never raises: telemetry must not break a turn.
+
+    ``full_dimensions=True`` additionally publishes the full dimension combination
+    as a billed metric; the default publishes ``[Environment]`` only (the set the
+    alarms read) and keeps the other values as document properties.
+    """
     try:
         from app.config import get_settings  # noqa: PLC0415 — keep this module import-light
 
@@ -112,7 +132,14 @@ def emit_metric(
         install_metrics_logger()
         _logger.info(
             json.dumps(
-                emf_document(name, value, unit=unit, dimensions=dimensions, environment=environment)
+                emf_document(
+                    name,
+                    value,
+                    unit=unit,
+                    dimensions=dimensions,
+                    environment=environment,
+                    full_dimensions=full_dimensions,
+                )
             )
         )
     except Exception:  # noqa: BLE001 — a metric is never worth an exception

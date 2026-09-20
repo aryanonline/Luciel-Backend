@@ -7,6 +7,8 @@
 import { App } from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { BudgetStack } from '../lib/budget-stack';
+import { SecurityStack } from '../lib/security-stack';
+import { applyCostAllocationTags, environmentCostFilter } from '../lib/cost-tags';
 import { getEnvConfig, OFFERING_REGION, EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
@@ -57,5 +59,47 @@ describe('Monthly cost ceiling (AWS Budgets)', () => {
 
   test('without an alert email the budget still synthesizes (ceiling visible)', () => {
     build('dev').resourceCountIs('AWS::Budgets::Budget', 1);
+  });
+
+  test('dev ceiling clears the measured running run-rate (≈$195/mo) so 80% means "top of normal"', () => {
+    // Cost Explorer 2026-09-01..13: ≈ $195/mo running incl. tax, ≈ $110 paused.
+    // A ceiling at or below the running rate fires every month and trains
+    // alert-blindness (the prod entry's reasoning, applied to dev).
+    expect(getEnvConfig('dev').monthlyBudgetUsd).toBeGreaterThanOrEqual(250);
+    expect(getEnvConfig('prod').monthlyBudgetUsd).toBe(1000);
+  });
+});
+
+describe('Per-environment cost attribution (round 7 WP-8, D7)', () => {
+  test.each([['dev'], ['preprod'], ['prod']])(
+    "%s's budget filters on its own Environment tag, not the account total",
+    (envName) => {
+      const cfg = getEnvConfig(envName as EnvName);
+      expect(environmentCostFilter(cfg)).toBe(`user:Environment$${envName}`);
+      build(envName as EnvName).hasResourceProperties('AWS::Budgets::Budget', {
+        Budget: Match.objectLike({
+          CostFilters: { TagKeyValue: [`user:Environment$${envName}`] },
+        }),
+      });
+    },
+  );
+
+  test('a tagged stack carries Environment + Component at the stack level and on its resources', () => {
+    // The stack-level tags are what CloudFormation propagates to every taggable
+    // resource, and the ones the budget filter matches on. Checked on a stack
+    // with ordinary taggable resources (KMS key, secret) — the bin applies the
+    // same call to every stack in the app.
+    const app = new App();
+    const cfg = getEnvConfig('prod');
+    const sec = new SecurityStack(app, 'Luciel-prod-Security', { env: ENV, envConfig: cfg });
+    applyCostAllocationTags(sec, cfg, 'Security');
+    const t = Template.fromStack(sec);
+    expect(sec.tags.tagValues()).toEqual({ Environment: 'prod', Component: 'Security' });
+    t.hasResourceProperties('AWS::KMS::Key', {
+      Tags: Match.arrayWith([
+        { Key: 'Component', Value: 'Security' },
+        { Key: 'Environment', Value: 'prod' },
+      ]),
+    });
   });
 });

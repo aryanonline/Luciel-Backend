@@ -96,6 +96,40 @@ describe('Background sweep schedules (Legal §B5 / §A3)', () => {
     });
   });
 
+  test('no two sweeps share a firing minute (round 7 WP-8: daily_brief vs knowledge_sync)', () => {
+    // daily_brief shipped at :50 hourly, which is knowledge_sync's :50 every-6h
+    // slot: four times a day two sweep tasks launched at the same instant and
+    // contended for the same DB. Expand every schedule into the (hour, minute)
+    // slots it fires in over a day and refuse any slot claimed twice. The parser
+    // accepts exactly the cron shapes this stack uses so a new shape has to be
+    // added here deliberately rather than slipping past the check.
+    const schedules = buildCompute().findResources('AWS::Scheduler::Schedule');
+    const hoursOf = (field: string): number[] => {
+      if (field === '*') return Array.from({ length: 24 }, (_, h) => h);
+      const step = /^\*\/(\d+)$/.exec(field);
+      if (step) {
+        const n = Number(step[1]);
+        return Array.from({ length: Math.ceil(24 / n) }, (_, i) => i * n);
+      }
+      if (/^\d+$/.test(field)) return [Number(field)];
+      throw new Error(`unsupported cron hour field: ${field}`);
+    };
+    const claimed = new Map<string, string>();
+    for (const [, res] of Object.entries(schedules)) {
+      const props = res.Properties as { Name: string; ScheduleExpression: string };
+      const m = /^cron\((\d+) (\S+) \S+ \S+ \S+ \S+\)$/.exec(props.ScheduleExpression);
+      if (!m) throw new Error(`unsupported cron expression: ${props.ScheduleExpression}`);
+      const minute = Number(m[1]);
+      for (const hour of hoursOf(m[2])) {
+        const slot = `${hour}:${minute}`;
+        const other = claimed.get(slot);
+        expect(other === undefined ? '' : `${props.Name} and ${other} both fire at ${slot} UTC`).toBe('');
+        claimed.set(slot, props.Name);
+      }
+    }
+    expect(claimed.size).toBeGreaterThan(SWEEPS.length);
+  });
+
   test('sweep tasks run in private subnets with no public IP', () => {
     buildCompute().hasResourceProperties('AWS::Scheduler::Schedule', {
       Target: Match.objectLike({

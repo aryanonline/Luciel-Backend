@@ -247,3 +247,17 @@ describe('Backend ALB gains the api HTTPS listener (spec §1)', () => {
     });
   });
 });
+
+describe('Cost guard inputs (round 7 WP-8)', () => {
+  test('the web cluster name is exported like the backend one so the guard reads both', () => {
+    // .github/workflows/dev-cost-guard.yml sums desiredCount across BOTH clusters
+    // before stopping a paused environment's database; the backend export is
+    // Luciel-<env>-ClusterName (ComputeStack) and this is its web counterpart.
+    buildWeb('dev').hasOutput('WebClusterName', {
+      Export: { Name: 'Luciel-dev-WebClusterName' },
+    });
+    buildWeb('prod').hasOutput('WebClusterName', {
+      Export: { Name: 'Luciel-prod-WebClusterName' },
+    });
+  });
+});

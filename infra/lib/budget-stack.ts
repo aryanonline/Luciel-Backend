@@ -23,6 +23,7 @@ import { Stack, StackProps } from 'aws-cdk-lib';
 import * as budgets from 'aws-cdk-lib/aws-budgets';
 import { Construct } from 'constructs';
 import { EnvConfig } from './env-config';
+import { environmentCostFilter } from './cost-tags';
 
 export interface BudgetStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -80,6 +81,19 @@ export class BudgetStack extends Stack {
         budgetType: 'COST',
         timeUnit: 'MONTHLY',
         budgetLimit: { amount: envConfig.monthlyBudgetUsd, unit: 'USD' },
+        // Watch THIS environment's spend (round 7 WP-8, D7). Without the filter
+        // all three per-environment budgets summed the same account total, so
+        // the dev ceiling tripped on prod's bill and the prod one never carried
+        // information of its own. The filter keys on the Environment tag every
+        // stack carries (bin/luciel-infra.ts + lib/cost-tags.ts).
+        //
+        // OWNER STEP: the `Environment` tag key must be ACTIVATED as a cost
+        // allocation tag in the Billing console (Cost allocation tags →
+        // user-defined) — until it is, a tag-filtered budget reads $0 and no
+        // threshold can ever fire. Spend that AWS cannot attribute to a tagged
+        // resource (some data transfer, tax) is outside every environment's
+        // budget; the account-level view in Billing remains the backstop for that.
+        costFilters: { TagKeyValue: [environmentCostFilter(envConfig)] },
       },
       // AWS Budgets requires at least one subscriber per notification; with no
       // alert email the budget is declared without notifications (still visible

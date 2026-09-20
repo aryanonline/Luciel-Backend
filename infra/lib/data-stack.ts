@@ -247,15 +247,22 @@ export class DataStack extends Stack {
       cacheSubnetGroupName: `luciel-${envConfig.envName}-redis`,
     });
 
-    // Single small node for dev; preprod/prod scale the node type via env if needed.
-    // At-rest encryption uses the CMK; in-transit TLS is ON (so the app uses rediss://).
+    // Node type and count come from env-config (round 7 WP-8): a single node in
+    // dev (Redis cannot scale to 0), primary + replica across the two AZs with
+    // automatic failover in preprod/prod — the Multi-AZ replication Architecture
+    // §4.4 promises. Before that knob every environment carried this stack's
+    // dev shape. At-rest encryption uses the CMK; in-transit TLS is ON (so the
+    // app uses rediss://).
+    const redisMultiAz = envConfig.redisNodes > 1;
     const redis = new elasticache.CfnReplicationGroup(this, 'Redis', {
       replicationGroupDescription: `Luciel ${envConfig.envName} LLM-cap Redis`,
       engine: 'redis',
-      cacheNodeType: 'cache.t4g.micro',
-      numCacheClusters: 1, // single node for dev (Redis cannot scale to 0)
-      automaticFailoverEnabled: false,
-      multiAzEnabled: false,
+      cacheNodeType: envConfig.redisNodeType,
+      numCacheClusters: envConfig.redisNodes,
+      // Both require a second node; ElastiCache places the replica in another
+      // AZ of the subnet group (isolated subnets in every AZ the VPC spans).
+      automaticFailoverEnabled: redisMultiAz,
+      multiAzEnabled: redisMultiAz,
       atRestEncryptionEnabled: true,
       kmsKeyId: cmk.keyId,
       transitEncryptionEnabled: true,

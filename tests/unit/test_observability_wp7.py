@@ -83,10 +83,44 @@ def test_a_metric_is_one_emf_line(monkeypatch):
     envelope = doc["_aws"]["CloudWatchMetrics"][0]
     assert envelope["Namespace"] == "Luciel"
     assert envelope["Metrics"] == [{"Name": "SweepTenantFailure", "Unit": "Count"}]
-    assert envelope["Dimensions"] == [["Environment"], ["Environment", "Plane", "Sweep"]]
+    # ONE dimension set by default — the [Environment] set every alarm reads.
+    # The other values stay on the document as properties (round 7 WP-8).
+    assert envelope["Dimensions"] == [["Environment"]]
     assert doc["Environment"] == "dev" and doc["Plane"] == "sweep" and doc["Sweep"] == "retention"
     assert doc["SweepTenantFailure"] == 1.0
     json.dumps(doc)  # serialisable as-is
+
+
+def test_the_full_dimension_set_is_an_opt_in_second_set(monkeypatch):
+    # Each dimension COMBINATION is a separately billed custom metric, so the full
+    # drill-down set is published only when a caller asks for it — and then in
+    # addition to [Environment], never instead of it (the alarms keep reading).
+    monkeypatch.setenv("LUCIEL_PLANE", "data-plane")
+    doc = metrics.emf_document(
+        "BudgetGateHit",
+        1.0,
+        dimensions={"Channel": "widget"},
+        environment="dev",
+        full_dimensions=True,
+    )
+    assert doc["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [
+        ["Environment"],
+        ["Environment", "Plane", "Channel"],
+    ]
+    assert doc["Channel"] == "widget" and doc["Plane"] == "data-plane"
+
+
+def test_emit_metric_defaults_to_the_alarm_dimension_set(capsys):
+    metrics.emit_metric("EscalationFired", dimensions={"Signal": "explicit_request"})
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert line["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [["Environment"]]
+    assert line["Signal"] == "explicit_request"  # still there for Logs Insights
+    metrics.emit_metric("EscalationFired", dimensions={"Signal": "x"}, full_dimensions=True)
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert line["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [
+        ["Environment"],
+        ["Environment", "Plane", "Signal"],
+    ]
 
 
 def test_emit_metric_writes_the_line_and_never_raises(capsys):
@@ -135,3 +169,10 @@ def test_engine_settings_are_bounded():
     assert 5_000 <= s.db_statement_timeout_ms <= 300_000
     assert s.log_format in ("text", "json")
     assert os.environ.get("LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS") is None
+
+
+def test_statement_timeout_is_the_architectures_thirty_seconds():
+    # Architecture §4.7 says 30 seconds; the setting shipped at 60_000 (round 7
+    # WP-8). Read the class default, not the environment, so a developer's .env
+    # cannot make this pass or fail.
+    assert Settings.model_fields["db_statement_timeout_ms"].default == 30_000
