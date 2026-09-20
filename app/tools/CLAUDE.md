@@ -45,3 +45,12 @@ Controls external tool authorization, selection, execution, normalized outcomes,
 Before merge, ask whether this change could hide an unconfigured, failed,
 or tenant-crossing condition behind a successful-looking result. If so,
 make that state explicit and test it.
+
+## Always-on cognition tool (round 7 WP-2 item 2, 2026-09-20)
+- `schemas.HAND_TO_TEAM_TOOL_ID` / `HAND_TO_TEAM_DEF` / `with_cognition_tools(defs)`:
+  Luciel's own "a person should step in" door. Deliberately NOT in `catalog.ALL_TOOL_IDS`
+  or `TOOL_SCHEMAS` (`test_tool_schemas` pins that equality), so it never reaches the
+  Configure surface, `DEFAULT_TOOLS`, an authorization row, a capability snapshot or a
+  connection gate; `registry.build_tool("hand_to_team")` is None. The orchestrator
+  appends it to every turn's tool defs and executes it itself as a standard escalation
+  (`luciel_requested_handoff`). Do not add it to the catalog to "make it configurable".

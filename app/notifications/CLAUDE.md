@@ -43,3 +43,18 @@ Delivers internal/customer notifications and runs the deferred escalation-dispat
 Before merge, ask whether this change could hide an unconfigured, failed,
 or tenant-crossing condition behind a successful-looking result. If so,
 make that state explicit and test it.
+
+## Delivery off the customer's turn (round 7 WP-2 item 5, 2026-09-20)
+- `escalation_dispatch.schedule_notification_after_commit(session, ...)` is what
+  `orchestrator._record_escalation` calls now (never `notify_escalation_safely` inline):
+  the notification starts as a background task on the SQLAlchemy `after_commit` of the
+  turn's session, in its own `tenant_session`, so the row is durable before anything
+  reads it back and a rolled-back turn pages nobody. Tracked in
+  `_BACKGROUND_NOTIFICATIONS`; `drain_background_notifications()` (tests) and
+  `drain_background_work()` (the FastAPI lifespan shutdown in `app/main.py`) await it.
+- A test that asserts on delivery through the loop or `_record_escalation` must exit
+  the session (commit) and then `await escalation_dispatch.drain_background_notifications()`;
+  `tests/conftest.py` drains leftovers at teardown so no task outlives its loop.
+- `SesEmailSender.send` and `TwilioSmsSender.send_sms` run the SDK call via
+  `asyncio.to_thread`; the notification body also carries the row's `reasons` (email
+  "Details:", SMS "Why:"), read at send time like everything else in `_build_notification`.

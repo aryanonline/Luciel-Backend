@@ -38,8 +38,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session as SyncSession
 
 from app.audit import log as audit
 from app.channels.base import DeliveryReceipt
@@ -352,6 +353,115 @@ async def drain_background_retries() -> None:
         await asyncio.gather(*list(_BACKGROUND_RETRIES), return_exceptions=True)
 
 
+# --- delivery OFF the customer's turn (round 7 WP-2, item 5; §3.5.4) ---------------- #
+#
+# The escalation row is written inside the customer's request; the owner notification
+# used to be awaited right there, BEFORE the reply was even composed — with the SES and
+# Twilio SDKs making blocking calls on the event loop. Architecture §3.5.4 says the
+# reply is sent before the notification pipeline starts. So the notification is now
+# scheduled to start AFTER the request's transaction commits (the row must be durable
+# and visible from another connection before anything reads it back), runs as a
+# background task in its own tenant session, and is tracked so tests and the process
+# shutdown can drain it. A rolled-back request never notifies about a row that does
+# not exist.
+_BACKGROUND_NOTIFICATIONS: set[asyncio.Task[None]] = set()
+_AFTER_COMMIT_QUEUE = "escalation_notifications_after_commit"
+_AFTER_COMMIT_LISTENER = "escalation_notifications_listener"
+
+
+def schedule_notification_after_commit(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+) -> None:
+    """Queue the owner notification for a row this session just wrote; it starts as a
+    background task once the session COMMITS (never on rollback), in its own tenant
+    session, after the customer's turn has been answered (§3.5.4).
+
+    Must be called from inside the running event loop (it is: the loop's own turn)."""
+    loop = asyncio.get_running_loop()
+    sync = session.sync_session
+    queue: list[tuple[asyncio.AbstractEventLoop, dict[str, object]]] = sync.info.setdefault(
+        _AFTER_COMMIT_QUEUE, []
+    )
+    queue.append(
+        (
+            loop,
+            {
+                "admin_id": admin_id,
+                "instance_id": instance_id,
+                "session_id": session_id,
+                "resolved_lead_id": resolved_lead_id,
+                "signal": signal,
+                "gate": gate,
+                "score": score,
+            },
+        )
+    )
+    if not sync.info.get(_AFTER_COMMIT_LISTENER):
+        sync.info[_AFTER_COMMIT_LISTENER] = True
+        event.listen(sync, "after_commit", _start_notifications_after_commit)
+
+
+def _start_notifications_after_commit(sync_session: SyncSession) -> None:
+    """SQLAlchemy ``after_commit`` hook: the row is durable, start the delivery tasks."""
+    queued = sync_session.info.pop(_AFTER_COMMIT_QUEUE, [])
+    for loop, kwargs in queued:
+        task = loop.create_task(_notify_in_own_session(**kwargs))
+        _BACKGROUND_NOTIFICATIONS.add(task)
+        task.add_done_callback(_BACKGROUND_NOTIFICATIONS.discard)
+
+
+async def _notify_in_own_session(
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+) -> None:
+    from app.db.session import tenant_session  # noqa: PLC0415
+
+    try:
+        async with tenant_session(admin_id) as s:
+            await notify_escalation_safely(
+                s,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=signal,
+                gate=gate,
+                score=score,
+            )
+    except Exception:  # noqa: BLE001 — the row stands; the sweep still sees pending
+        _LOG.exception(
+            "background escalation notification failed: signal=%s session=%s", signal, session_id
+        )
+
+
+async def drain_background_notifications() -> None:
+    """Await every off-turn notification currently running (tests / shutdown)."""
+    while _BACKGROUND_NOTIFICATIONS:
+        await asyncio.gather(*list(_BACKGROUND_NOTIFICATIONS), return_exceptions=True)
+
+
+async def drain_background_work() -> None:
+    """Everything this module runs off the customer's turn: the notifications and
+    the retry ladders they may start. Wired into the process shutdown."""
+    while _BACKGROUND_NOTIFICATIONS or _BACKGROUND_RETRIES:
+        await drain_background_notifications()
+        await drain_background_retries()
+
+
 async def _build_notification(
     session: AsyncSession,
     *,
@@ -401,9 +511,9 @@ async def _build_notification(
             .limit(1)
         )
     ).scalar_one_or_none()
-    fired_at = (
+    fired_row = (
         await session.execute(
-            select(EscalationEvent.fired_at)
+            select(EscalationEvent.fired_at, EscalationEvent.reasons)
             .where(
                 EscalationEvent.admin_id == admin_id,
                 EscalationEvent.session_id == session_id,
@@ -412,7 +522,11 @@ async def _build_notification(
             .order_by(EscalationEvent.fired_at.desc())
             .limit(1)
         )
-    ).scalar_one_or_none()
+    ).one_or_none()
+    fired_at = fired_row[0] if fired_row else None
+    # The row's own reasons (F124), read here at send time like everything else — a
+    # hand_to_team page (round 7 WP-2, item 2) is worthless without Luciel's reason.
+    reasons = tuple(str(r) for r in (fired_row[1] or [])) if fired_row else ()
     # The customer's transport identity — only where the channel PROVIDES one
     # (voice/SMS number, email address, Meta id via the lead row). Widget visitors
     # are genuinely anonymous unless they volunteered contact info (then the lead
@@ -438,6 +552,7 @@ async def _build_notification(
         customer_identifier=customer_identifier,
         triggering_message=triggering_message,
         dashboard_url=dashboard_url,
+        reasons=reasons,
     )
     return notification, inst, owner_email
 

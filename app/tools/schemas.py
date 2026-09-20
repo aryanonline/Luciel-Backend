@@ -240,3 +240,47 @@ def build_tool_defs(tool_ids: set[str] | frozenset[str]) -> list[dict[str, Any]]
             }
         )
     return defs
+
+
+# --- always-on cognition (round 7 WP-2, item 2; D2 2026-09-14) -------------------
+#
+# ``hand_to_team`` is Luciel's OWN judgment that a person should step in (Vision §3.4:
+# Luciel decides when to escalate). It is cognition, not a catalog tool: it is never in
+# ``catalog.ALL_TOOL_IDS`` / ``TOOL_SCHEMAS`` (so it never appears on the Configure
+# surface, never needs an ``instance_tool_authorizations`` row, is never part of a
+# session's capability snapshot, and needs no connection), and the orchestrator
+# dispatches it itself, before the resolver and the broker. Its execution records an
+# escalation through the standard path (row + audit + owner notification) and Luciel
+# KEEPS ANSWERING — the session is not taken away (D2).
+HAND_TO_TEAM_TOOL_ID = "hand_to_team"
+
+HAND_TO_TEAM_DEF: dict[str, Any] = {
+    "tool_id": HAND_TO_TEAM_TOOL_ID,
+    "description": (
+        "Pass this conversation to the business's human team with a short reason, "
+        "when your own judgment says a person should step in (a complaint you cannot "
+        "resolve, a request outside what you can do, something that needs the "
+        "owner's decision). Always available. The team is notified and follows up "
+        "later; you keep helping the customer meanwhile. This is the ONLY way to reach "
+        "the team — never say something was flagged or passed along without calling it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": (
+                    "One or two plain sentences for the team: what the customer needs "
+                    "and why a person should handle it."
+                ),
+            }
+        },
+        "required": ["reason"],
+    },
+}
+
+
+def with_cognition_tools(defs: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """The defs a turn is told about: the gated catalog defs plus the always-on
+    cognition tool, which rides last so the sorted catalog prefix is unchanged."""
+    return [*(defs or []), HAND_TO_TEAM_DEF]

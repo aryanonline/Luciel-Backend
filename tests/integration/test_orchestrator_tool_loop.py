@@ -206,15 +206,38 @@ async def test_ask_bound_converts_repeated_stall_into_handoff():
             mode="ai",
             inbound_text="just book it",
         )
-        # Second consecutive stall hits ASK_ATTEMPT_BOUND → honest handoff, not a nag
-        # (§3.3.7 rule 4). Counter resets so a restored conversation starts clean.
+        # Second consecutive stall hits ASK_ATTEMPT_BOUND → honest hand-off line, not a
+        # nag (§3.3.7 rule 4), the owner reads WHAT is still missing, and — owner
+        # decision D2 (round 7 WP-2, item 3) — Luciel is NOT muted: the session stays
+        # in ai mode and the counter resets so the conversation starts clean.
         assert ASK_ATTEMPT_BOUND == 2
-        assert second.handed_off is True
+        assert second.handed_off is False
+        assert "Could I get your email?" not in second.reply_text
+        assert "team" in second.reply_text
         assert second.escalation is not None
         assert second.escalation.signal is Signal.cannot_answer
+        assert second.escalation.reasons == ("still missing email after 2 asks",)
         sess = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
-        assert sess.mode == "human_controlled"
+        assert sess.mode == "ai"
         assert sess.input_ask_attempts == 0
+        # ONE cannot_answer row per session (the first ungrounded ask already wrote
+        # it); the stall reason is appended to it so the owner reads what is missing.
+        row = (
+            await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid))
+        ).scalar_one()
+        assert row.signal == "cannot_answer" and row.gate == "outcome"
+        assert "still missing email after 2 asks" in list(row.reasons or [])
+        # The very next turn is answered by Luciel again — no take-over happened.
+        third = await _orch(s, admin, iid, primary=EchoModel(), tool=tool).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode=sess.mode,
+            inbound_text="ok, what are your hours?",
+        )
+        assert third.handed_off is False
+        assert third.iterations == 1  # the model was called: the loop still runs
+        assert "Echo:" in third.reply_text
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

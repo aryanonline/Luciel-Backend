@@ -112,8 +112,14 @@ class TwilioSmsSender:
         return self._client
 
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None:
+        import asyncio  # noqa: PLC0415
+
         client = self._get_client()
-        msg = client.messages.create(from_=from_number, to=to, body=body)  # type: ignore[attr-defined]
+        # The Twilio REST client is synchronous: off the event loop (round 7 WP-2,
+        # item 5), like the tenant webhook configurator already is.
+        msg = await asyncio.to_thread(
+            lambda: client.messages.create(from_=from_number, to=to, body=body)  # type: ignore[attr-defined]
+        )
         return str(getattr(msg, "sid", "")) or None
 
 

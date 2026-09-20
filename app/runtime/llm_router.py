@@ -14,12 +14,23 @@ bind in deployment behind the same interface.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import enum
+import random
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 CONTEXT_TOKEN_BUDGET_FAST = 4000  # §7 #9
+
+# Provider HTTP statuses that mean "try again in a moment", not "this request is
+# wrong": 429 (rate limited) and 529 (Anthropic overloaded). Round 7 WP-2, item 6.
+RETRYABLE_PROVIDER_STATUSES: frozenset[int] = frozenset({429, 529})
+# The one bounded retry on the FALLBACK leg waits a short, jittered moment in this
+# range (seconds), never more than a quarter of llm_timeout_seconds. Tests set (0, 0).
+FALLBACK_RETRY_DELAY_RANGE: tuple[float, float] = (0.5, 1.5)
 
 
 class ModelClass(str, enum.Enum):
@@ -71,7 +82,32 @@ class LLMProvider(Protocol):
 
 
 class ProviderError(Exception):
-    pass
+    """A provider could not serve the call.
+
+    ``retryable`` (round 7 WP-2, item 6) is True for the 429/529 class — a refusal
+    that may clear within a second — and False for everything else (auth, bad
+    request, timeout, connection). Only the fallback leg ever acts on it, once."""
+
+    def __init__(
+        self, message: str = "", *, retryable: bool = False, status_code: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+def _fallback_retry_delay() -> float:
+    """A short jittered wait before the ONE fallback retry, kept inside the provider
+    timeout so the customer's turn cannot stretch past what one call may take."""
+    low, high = FALLBACK_RETRY_DELAY_RANGE
+    delay = random.uniform(low, high)  # noqa: S311 — jitter, not security
+    try:
+        from app.config import get_settings  # noqa: PLC0415 — import cycle
+
+        ceiling = float(get_settings().llm_timeout_seconds) / 4
+    except Exception:  # noqa: BLE001 — settings unavailable → the range alone binds
+        return delay
+    return max(0.0, min(delay, ceiling))
 
 
 def should_route_fast(*, requires_tools: bool, context_tokens: int, complexity: float) -> bool:
@@ -83,10 +119,16 @@ class LLMRouter:
     """Routes to primary, falls back to secondary immediately on primary failure
     (no retry on primary). Fallback is recorded but never surfaced.
 
-    Architecture §9 C9 / §4.6: enforces per-admin_id concurrency cap (50/min)
-    before every LLM call. Raises ``LLMCapExceeded`` when the tenant is over cap.
-    The cap is checked at the router level so it is uniform across all callers
-    (orchestrator, handoff, any future runtime path)."""
+    Architecture §9 C9 / §4.6: enforces per-admin_id concurrency cap (50/min).
+    Raises ``LLMCapExceeded`` when the tenant is over cap. The cap is checked at
+    the router level so it is uniform across all callers (orchestrator, ingest,
+    any future runtime path).
+
+    The unit the cap counts is the customer TURN, not the model call (round 7 WP-2,
+    item 4): the orchestrator opens ``turn()`` once per inbound message, and every
+    ``complete()`` inside it skips re-admission — a tool-using turn used to burn up
+    to five of the fifty. A caller that never opens a turn (graph extraction at
+    ingest) is admitted per call, exactly as before."""
 
     def __init__(
         self,
@@ -104,6 +146,29 @@ class LLMRouter:
         # (None), routing is 100% unchanged from pre-fast-routing behavior — the
         # gate in .complete() below can never select fast without a bound provider.
         self._fast = fast
+        # True while a ``turn()`` is open: the cap was paid at the turn boundary.
+        self._in_turn = False
+
+    @contextlib.contextmanager
+    def turn(self) -> Iterator[None]:
+        """Admit the tenant's per-minute cap ONCE for one customer turn (§9 C9).
+
+        Raises ``LLMCapExceeded`` at entry when the tenant is over cap — before any
+        model is called — so the orchestrator answers the turn honestly instead of
+        an exception reaching the transport. Inside the block ``complete()`` never
+        re-admits. No admin_id bound (tests, legacy construction) → no cap, as
+        before; a nested ``turn()`` is a no-op."""
+        if self._in_turn or self._admin_id is None:
+            yield
+            return
+        from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415 — import cycle
+
+        admit_llm_call(self._admin_id)
+        self._in_turn = True
+        try:
+            yield
+        finally:
+            self._in_turn = False
 
     async def complete(
         self,
@@ -133,7 +198,10 @@ class LLMRouter:
         on-primary failover behavior are unaffected either way.
         """
         effective_admin_id = admin_id if admin_id is not None else self._admin_id
-        if effective_admin_id is not None:
+        # Inside an open ``turn()`` the cap was paid at the turn boundary; only a call
+        # on behalf of a DIFFERENT tenant (explicit admin_id) is admitted on its own.
+        already_paid = self._in_turn and effective_admin_id == self._admin_id
+        if effective_admin_id is not None and not already_paid:
             # Circular import avoided: import inline, module is small + stable.
             from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415
 
@@ -165,6 +233,17 @@ class LLMRouter:
         except ProviderError:
             # Immediate failover, NO retry on primary (§3.4.3). The neutral message
             # shape replays any tool turns correctly through the other provider.
-            resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+            try:
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+            except ProviderError as exc:
+                if not exc.retryable:
+                    raise
+                # ONE bounded retry on the fallback leg for the 429/529 class only
+                # (round 7 WP-2, item 6): a 529 on the primary and a 429 on the
+                # fallback in the same second used to declare both providers down
+                # and hand the customer the outage line. Anything else — auth, a bad
+                # request, a timeout — still fails immediately.
+                await asyncio.sleep(_fallback_retry_delay())
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = True
             return resp

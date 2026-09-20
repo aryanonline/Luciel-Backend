@@ -86,3 +86,31 @@ make that state explicit and test it.
   (a second subject after the modal - "I can confirm it has been sent" - is still
   caught), and the operating-context stanza says "never say it has already been sent".
 
+
+## Judgment as an employee (round 7 WP-2, D2 2026-09-14; built 2026-09-20)
+- Gate 2 judges the ANSWER and the OPPORTUNITY on every turn: `EscalationDecision.
+  answer_ungrounded` is the floor/confidence verdict, independent of which signal names
+  the row; the orchestrator replaces a below-floor draft whichever signal won (item 1).
+- `hand_to_team(reason)` is always-on cognition (`app/tools/schemas.HAND_TO_TEAM_DEF`,
+  never in the catalog): the loop dispatches it itself in `_dispatch_tools`, before the
+  resolver/broker, and `_hand_to_team` records `luciel_requested_handoff` through
+  `_record_escalation` (row + audit + owner page carrying the reason). The session stays
+  in ai mode. `_HANDOFF_CLAIM` turns a reply that claims/promises a hand-off on a turn
+  with no recorded escalation into that same real escalation; the words stay (item 2).
+- D2 takeover scope: `_hand_off_with_ack` (→ `handoff.take_over`) is reached ONLY by
+  explicit_human_request and the threats_violence / self_harm moderation categories.
+  abuse_harassment / illegal_solicitation → `content_flagged` row at intake, loop runs;
+  strong_negative_sentiment → row at intake, question answered, `_TEAM_TOLD_NOTE` once;
+  the ask bound → cannot_answer with the missing field names (appended to the session's
+  existing row when one exists), the hand-off line, ai mode kept (item 3).
+- The per-tenant LLM cap is paid once per turn (`LLMRouter.turn()` around `_reason`'s
+  loop); `LLMCapExceeded` is caught beside `ProviderError` and answers through the
+  llm_unavailable path with its own reason and the `LLMCapExceeded` metric — never an
+  exception to the transport (item 4). Ingest-time graph extraction passes `admin_id`
+  per call so it is capped under the ingesting tenant.
+- Owner notifications start after the turn's commit, in a background task (item 5; see
+  app/notifications/CLAUDE.md). `ProviderError.retryable` (429/529) buys the FALLBACK
+  leg one jittered retry; the primary still gets none (item 6).
+- Known gap (not changed here): gate 2 records + pages `cannot_answer` for a bare
+  clarifying question on the FIRST stall ("what's your email?") even though F100 lets
+  the question go out; four established loop tests lean on that echo shape.

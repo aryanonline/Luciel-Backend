@@ -119,7 +119,7 @@ async def _seed(
 
 async def _fire(admin: uuid.UUID, iid: uuid.UUID, sid: uuid.UUID, lead_id: uuid.UUID) -> bool:
     async with tenant_session(admin) as s:
-        return await _record_escalation(
+        written = await _record_escalation(
             s,
             admin_id=admin,
             instance_id=iid,
@@ -129,6 +129,10 @@ async def _fire(admin: uuid.UUID, iid: uuid.UUID, sid: uuid.UUID, lead_id: uuid.
             gate="outcome",
             score=0.91,
         )
+    # Delivery runs off the customer's turn, after the commit (round 7 WP-2, item 5):
+    # a test that asserts on it drains it explicitly.
+    await escalation_dispatch.drain_background_notifications()
+    return written
 
 
 async def _row(admin: uuid.UUID, sid: uuid.UUID) -> EscalationEvent:

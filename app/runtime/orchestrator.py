@@ -8,19 +8,29 @@ The loop, per inbound message:
         single-turn reply WITHOUT an LLM call + cannot_answer/budget_exhausted
         escalation; the counter does NOT increment (no model call, no handoff).
       → MODERATION (§3.4.15): harmful inbound escalates to a human, no harmful output.
-      → ESCALATION GATE 1 — INTAKE (§3.4.5): explicit_human_request or
-        strong_negative_sentiment → acknowledge, hand off, skip the loop.
+        Owner decision D2 (2026-09-14, round 7 WP-2 item 3): only threats_violence and
+        self_harm take the conversation away (human_controlled); abuse_harassment and
+        illegal_solicitation are recorded as content_flagged, the owner is told, and
+        Luciel keeps answering.
+      → ESCALATION GATE 1 — INTAKE (§3.4.5): explicit_human_request → acknowledge,
+        hand off, skip the loop (the ONLY judgment signal that mutes Luciel, D2);
+        strong_negative_sentiment → record + notify the owner, then answer the
+        question and say the team has been told.
       → RETRIEVE (§3.2): knowledge retrieval; all retrieved content is wrapped as
         UNTRUSTED data before it ever reaches the model (§3.4.14 Defense).
       → [PLAN → ACT → REFLECT] × up to 5 (§3.4.1 iteration bound — cost control):
         the first model call fires the budget counter once (§3.4.1b). Tool calls
         dispatch via the Arc 12 broker (§3.3.3) using the five-outcome contract.
       → GROUNDING (§3.4.13): score the answer against retrieved chunks / tool result.
-      → ESCALATION GATE 2 — OUTCOME (§3.4.5): high_value_lead (checked first — an
-        opportunity signal independent of answer quality), else cannot_answer (low
-        confidence OR below the 0.50 grounding floor, with no resolving tool —
-        harmony fix 2026-08-04 item 3: AND made this gate unsatisfiable in live mode
-        because providers always report confidence=1.0).
+      → ESCALATION GATE 2 — OUTCOME (§3.4.5): BOTH signals are evaluated on every
+        turn (round 7 WP-2, item 1). high_value_lead (an opportunity signal
+        independent of answer quality) names the row when it fires; the
+        answer-quality verdict — low confidence OR below the 0.50 grounding floor,
+        with no resolving tool (harmony fix 2026-08-04 item 3: AND made this gate
+        unsatisfiable in live mode because providers always report confidence=1.0)
+        — rides on ``EscalationDecision.answer_ungrounded`` and replaces the draft
+        with the honest hand-off whichever signal won the row. Alone, it is the
+        cannot_answer signal.
 
   Half B — emission:
     RESPOND: channel arbiter picks the outbound channel (§3.4.2).
@@ -36,7 +46,8 @@ code regardless of what the model is convinced to say.
 
 An escalation writes the escalation_events row + audit event and THEN notifies the
 admin's configured contact (§3.5.3, app/notifications/escalation_dispatch.py); delivery
-is best-effort against the row and never blocks the lead's turn (§3.5.4).
+is best-effort against the row and never blocks the lead's turn (§3.5.4): it starts as
+a background task once the turn's transaction has committed (round 7 WP-2, item 5).
 
 FLAGGED: Vector RETRIEVAL is Arc 11 and graph/hybrid is Arc 16
 — the loop calls a retrieval callable injected by the caller so it is testable now
@@ -65,7 +76,7 @@ from app.models.conversation import EscalationEvent, Session, Transcript
 from app.models.instance import Instance
 from app.notifications.escalation_dispatch import (
     has_configured_escalation_contact,
-    notify_escalation_safely,
+    schedule_notification_after_commit,
 )
 from app.observability.metrics import emit_metric
 from app.runtime import budget, channel_switch, handoff, memory
@@ -73,6 +84,7 @@ from app.runtime import personality as personality_rules
 from app.runtime.channel_arbiter import choose_outbound_channel
 from app.runtime.escalation import (
     EscalationDecision,
+    Gate,
     Signal,
     evaluate_intake,
     evaluate_outcome,
@@ -91,12 +103,18 @@ from app.runtime.input_safety import (
 )
 from app.runtime.knowledge_retrieval import RetrieverBundle
 from app.runtime.lead_capture import capture_or_update_lead
+from app.runtime.llm_cap import LLMCapExceeded
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
 from app.runtime.team_availability import follow_up_phrase
 from app.runtime.team_availability import parse as parse_team_availability
 from app.tools import contract as tool_contract
 from app.tools.contract import Tool, ToolResult
-from app.tools.schemas import ACTION_TOOLS, build_tool_defs
+from app.tools.schemas import (
+    ACTION_TOOLS,
+    HAND_TO_TEAM_TOOL_ID,
+    build_tool_defs,
+    with_cognition_tools,
+)
 
 MAX_ITERATIONS = 5  # §3.4.1 — internal cost-control constant, identical on every tier.
 
@@ -131,15 +149,76 @@ _SUCCESS_CLAIM = re.compile(
 # switch, not a completed action - the gap between subject and verb refuses to cross
 # a future/conditional modal. "I can confirm it has been sent" is still caught: the
 # second subject ("it has been") starts a fresh match after the modal.
+#
+# The SUBJECT must be first person or the customer's own thing (round 7 WP-2, item
+# 2): "I've booked", "we have sent", "your appointment has been scheduled", "it's
+# been added to your calendar". A bare "has been / is now / are now" used to count as
+# a subject, so a paraphrase of the knowledge base with a generic subject
+# ("Appointments are now booked through the portal") was rewritten into the
+# unfounded-claim replacement and escalated — a true statement about the business
+# read as a lie about an action.
 _FIRST_PERSON_SUCCESS_CLAIM = re.compile(
-    r"\b(i'?ve|i have|we'?ve|we have|i|we|it'?s been|it has been|has been|have been"
-    r"|is now|are now)\b"
+    r"\b(i'?ve|i have|we'?ve|we have|i|we"
+    r"|it'?s been|it has been|that'?s been|that has been|this has been"
+    r"|your [a-z][a-z' -]{0,30}?(?:has|have) been|your [a-z][a-z' -]{0,30}?(?:is|are) now)\b"
     r"(?:(?!\b(?:will|'ll|can|could|would|shall|should|may|might|going to|about to"
     r"|able to|happy to|glad to)\b)[^.!?]){0,30}?"
     r"\b(booked|scheduled|rescheduled|cancelled|canceled|sent|delivered"
     r"|added to (?:the|your) calendar|updated your)\b",
     re.IGNORECASE,
 )
+
+
+# A HAND-OFF claim (round 7 WP-2, item 2): the reply tells the customer the team has
+# been (or will be) told — "I've flagged this for the team", "I'll pass this along",
+# "someone will reach out", "your request has been forwarded". The model has exactly
+# one way to make that true: the always-on ``hand_to_team`` tool. A reply that claims
+# a hand-off on a turn with no recorded escalation used to ship with nothing behind
+# it — no row, no owner notification, a customer waiting for a call that was never
+# coming. The claim is not stripped: the customer was promised a person, so the
+# orchestrator RECORDS the escalation through the standard path and the words become
+# true. Offers ("I can pass this along if you'd like", "would you like me to flag
+# this?") and statements about the business ("you can reach the team at …") are not
+# claims and never match.
+_HANDOFF_CLAIM = re.compile(
+    # first-person, completed or promised: I've / I'll / we have / I will / I'm going to
+    r"\b(?:i|we)(?:'ve|'ll|'m going to|'re going to| have| will| am going to| are going to)"
+    r" (?:also |just |already |now |gone ahead and )?"
+    r"(?:flag(?:ged)?|pass(?:ed)?(?: (?:this|that|it|your [a-z]+))? (?:along|on)"
+    r"|let the (?:team|owner|manager) know|notif(?:y|ied)|escalat(?:e|ed)|forward(?:ed)?"
+    r"|loop(?:ed)? in|rais(?:e|ed) (?:this|that|it)"
+    r"|hand(?:ed)? (?:this|that|it|you) (?:over|off))\b"
+    # a person will reach out: "someone will get back to you", "the team will be in touch"
+    r"|\b(?:someone|somebody|a (?:team )?member|a person|the (?:team|owner|manager)|our team"
+    r"|they)(?: from (?:the|our) team)?(?:'ll| will| is going to| are going to) "
+    r"(?:reach out|get back|be in touch|follow up|contact you|call you|email you|text you)\b"
+    # the customer's own thing, passive: "your request has been forwarded / flagged"
+    r"|\b(?:your [a-z]+|this|that|it)(?: has| have|'s) been "
+    r"(?:flagged|passed (?:along|on)|escalated|forwarded|shared with the team"
+    r"|sent to the team|raised with the team)\b",
+    re.IGNORECASE,
+)
+
+
+def _stalled_gather_reasons(reasoned: _Reasoned) -> tuple[str, ...]:
+    """Why the §3.3.7 ask bound fired, in the owner's words (round 7 WP-2, item 3):
+    the field names the broker kept refusing on, an ambiguity the customer never
+    resolved, or a question the model asked twice in prose."""
+    missing: list[str] = []
+    ambiguous = False
+    for _, result in reasoned.dispatched:
+        if result.outcome is tool_contract.Outcome.missing_input:
+            missing.extend(f for f in result.missing_fields if f not in missing)
+        elif result.outcome is tool_contract.Outcome.ambiguous:
+            ambiguous = True
+    reasons: list[str] = []
+    if missing:
+        reasons.append(f"still missing {', '.join(missing)} after {ASK_ATTEMPT_BOUND} asks")
+    if ambiguous:
+        reasons.append("could not tell which one the customer meant")
+    if not reasons:
+        reasons.append(f"asked the same question {ASK_ATTEMPT_BOUND} times")
+    return tuple(reasons)
 
 
 def is_clarifying_question(text: str) -> bool:
@@ -186,6 +265,32 @@ _UNFOUNDED_CLAIM_REPLACEMENT = (
     "I wasn't able to complete that just now — I've flagged it for the team, and "
     "someone will follow up with you shortly."
 )
+
+# Why no model served the turn (round 7 WP-2, item 4), for the llm_unavailable row.
+# ``provider``: both providers failed (the pre-existing case, no reason on the row);
+# ``cap``: the tenant's per-minute model-call cap (§9 C9) refused the turn — it used
+# to escape as a bare exception, a JSON 429 to Twilio's voice webhook (a hang-up) and
+# nothing at all to an SMS/WhatsApp sender.
+_LLM_FAILURE_PROVIDER = "provider"
+_LLM_FAILURE_CAP = "cap"
+_LLM_FAILURE_REASONS: dict[str, tuple[str, ...]] = {
+    _LLM_FAILURE_PROVIDER: (),
+    _LLM_FAILURE_CAP: ("this account's per-minute model-call cap was reached",),
+}
+
+# Appended ONCE to the answer on the turn a strong_negative_sentiment row is written
+# (round 7 WP-2, item 3; D2): the upset customer still gets their answer, and hears —
+# truthfully, the row and notification exist — that a person is now aware.
+_TEAM_TOLD_NOTE = " I've also let the team know, so a person can follow up with you."
+
+#: Moderation categories that do NOT take the conversation away (D2): recorded under
+#: content_flagged with the owner-facing reason, the owner is notified, and the loop
+#: runs — the MODERATION stanza keeps the model professional. Threats and self-harm
+#: are absent on purpose: they keep the take-over path.
+_MODERATION_KEEP_ANSWERING: dict[ModerationCategory, tuple[str, ...]] = {
+    ModerationCategory.abuse_harassment: ("abusive language toward the assistant or business",),
+    ModerationCategory.illegal_solicitation: ("asked for something illegal",),
+}
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
@@ -315,6 +420,43 @@ async def _session_already_escalated(
     return row is not None
 
 
+async def _append_escalation_reasons(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    reasons: list[str],
+) -> bool:
+    """Add owner-facing reasons to the session's EXISTING row for this signal/gate.
+
+    A signal fires once per session, so a later, more specific reason for the same
+    signal (round 7 WP-2, item 3: the §3.3.7 ask bound naming the fields still
+    missing, after an earlier below-floor turn already wrote the cannot_answer row)
+    has nowhere else to live. Distinct phrases are appended; nothing is re-paged.
+    Returns whether the row changed."""
+    row = (
+        await session.execute(
+            select(EscalationEvent).where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    existing = [str(r) for r in (row.reasons or [])]
+    merged = [*existing, *(r for r in reasons if r not in existing)]
+    if merged == existing:
+        return False
+    row.reasons = merged
+    await session.flush()
+    return True
+
+
 async def record_platform_escalation(
     session: AsyncSession,
     *,
@@ -388,7 +530,9 @@ async def _record_escalation(
 
     The row is written and flushed FIRST: it is the authoritative record and delivery is
     best-effort against it (§3.5.2). Notification never blocks or breaks the lead's turn
-    (§3.5.4).
+    (§3.5.4): it is scheduled to start after this transaction commits, as a background
+    task in its own tenant session (item 5) — a test that asserts delivery drains it
+    with ``escalation_dispatch.drain_background_notifications()``.
 
     ONCE per (session, signal, gate): the insert itself is the arbiter (unique index
     ``uq_escalation_once``, 2026-09-05 audit F053/F061) — a pre-check-then-insert let
@@ -426,7 +570,10 @@ async def _record_escalation(
         payload={"signal": signal, "gate": gate, "session_id": str(session_id)},
     )
     await session.flush()
-    await notify_escalation_safely(
+    # Delivery starts AFTER this transaction commits, off the customer's turn (§3.5.4;
+    # round 7 WP-2 item 5) — it used to be awaited right here, before the reply was
+    # composed, with blocking SDK calls on the event loop.
+    schedule_notification_after_commit(
         session,
         admin_id=admin_id,
         instance_id=instance_id,
@@ -519,6 +666,10 @@ class Orchestrator:
             # not by the platform's product name (live-caught 2026-08-17: greeting
             # said "Aurora", the model then said "I'm Luciel").
             assistant_name=self.assistant_name,
+            # The always-on hand_to_team cognition tool (round 7 WP-2, item 2) is
+            # described on EVERY turn, tools wired or not — the model must be able to
+            # reach the team on any turn, or it will promise a hand-off it cannot make.
+            tool_catalog=with_cognition_tools(None),
             operating_context=self.operating_context,
         )
 
@@ -688,29 +839,56 @@ class Orchestrator:
             if settled is not None:
                 return settled
 
+        # An escalation recorded at INTAKE that leaves the conversation with Luciel
+        # (D2, round 7 WP-2 item 3): the row + owner notification are written here,
+        # the loop runs, and the turn reports it. ``team_told`` appends the one-line
+        # note to the answer on the turn the sentiment row was actually written.
+        standing: EscalationDecision | None = None
+        team_told = False
+
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
         mod = moderate(inbound_text)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
-            if mod.category is ModerationCategory.self_harm:
-                # Immediate escalation with crisis copy; no contact ask (F116).
-                ack = SELF_HARM_REPLY
-            else:
-                ack = self._with_contact_ask(
-                    await self._handoff_ack(),
-                    channel=channel,
+            if mod.category in _MODERATION_KEEP_ANSWERING:
+                # D2: abuse / an illegal ask are told to the owner; Luciel stays
+                # professional (MODERATION stanza) and keeps answering — no take-over.
+                reasons = _MODERATION_KEEP_ANSWERING[mod.category]
+                await _record_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
                     resolved_lead_id=resolved_lead_id,
-                    transport_identifier=transport_identifier,
+                    signal=Signal.content_flagged.value,
+                    gate=Gate.intake.value,
+                    score=None,
+                    reasons=list(reasons),
                 )
-            return await self._hand_off_with_ack(
-                session_id=session_id,
-                resolved_lead_id=resolved_lead_id,
-                channel=channel,
-                signal=Signal.explicit_human_request,
-                gate="intake",
-                score=None,
-                ack=ack,
-            )
+                standing = EscalationDecision(
+                    True, Signal.content_flagged, Gate.intake, None, reasons
+                )
+            else:
+                # Threats and self-harm: a person takes the conversation (D2).
+                if mod.category is ModerationCategory.self_harm:
+                    # Immediate escalation with crisis copy; no contact ask (F116).
+                    ack = SELF_HARM_REPLY
+                else:
+                    ack = self._with_contact_ask(
+                        await self._handoff_ack(),
+                        channel=channel,
+                        resolved_lead_id=resolved_lead_id,
+                        transport_identifier=transport_identifier,
+                    )
+                return await self._hand_off_with_ack(
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    channel=channel,
+                    signal=Signal.explicit_human_request,
+                    gate="intake",
+                    score=None,
+                    ack=ack,
+                )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
         if detect_injection(inbound_text):
@@ -722,12 +900,14 @@ class Orchestrator:
         )
         trailing = [t.text for t in history if t.role == "lead"]
         intake = evaluate_intake(trailing)
-        if intake.fired:
+        if intake.fired and intake.signal is Signal.explicit_human_request:
+            # The ONE judgment signal that takes the conversation away (D2): the
+            # customer asked for a person, so a person answers from here on.
             return await self._hand_off_with_ack(
                 session_id=session_id,
                 resolved_lead_id=resolved_lead_id,
                 channel=channel,
-                signal=intake.signal or Signal.explicit_human_request,
+                signal=Signal.explicit_human_request,
                 gate="intake",
                 score=intake.score_or_confidence,
                 reasons=intake.reasons,
@@ -738,6 +918,23 @@ class Orchestrator:
                     transport_identifier=transport_identifier,
                 ),
             )
+        if intake.fired:
+            # strong_negative_sentiment (D2): the owner is told, the customer still
+            # gets their question answered by Luciel, and — on the turn the row is
+            # written — hears that a person is now aware. Once per session.
+            standing_signal = intake.signal or Signal.strong_negative_sentiment
+            team_told = await _record_escalation(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=standing_signal.value,
+                gate=Gate.intake.value,
+                score=intake.score_or_confidence,
+                reasons=list(intake.reasons),
+            )
+            standing = standing if standing is not None else intake
 
         # --- RETRIEVE (§3.2) — wrap as UNTRUSTED before the model (§3.4.14) --- #
         # Harmony wave 2, item 2a: real chunk attribution for persistence, kept
@@ -789,7 +986,7 @@ class Orchestrator:
         )
 
         # --- PLAN → ACT → REFLECT × up to 5 (§3.4.1) ------------------------- #
-        resp, iterations, used_fallback, llm_failed = await self._reason(
+        resp, iterations, used_fallback, llm_failure = await self._reason(
             inbound_text,
             history,
             wrapped_chunks,
@@ -815,9 +1012,17 @@ class Orchestrator:
                 actor_type=ActorType.luciel_runtime,
                 payload={"session_id": str(session_id), "channel": channel},
             )
-        if llm_failed:
-            # Both providers down → llm_unavailable escalation (§3.4.5 server signal).
-            await self._emit_llm_unavailable(session_id, resolved_lead_id)
+        if llm_failure is not None:
+            # No model served the turn — both providers down, or the tenant's cap
+            # refused it (item 4) → llm_unavailable escalation (§3.4.5 server signal)
+            # with the SAME graceful, un-billed, deterministic reply on every channel
+            # (voice stays TwiML). The cap case is distinct in the metric and on the
+            # row's reasons, never a different customer experience.
+            failure_reasons = _LLM_FAILURE_REASONS[llm_failure]
+            if llm_failure == _LLM_FAILURE_CAP:
+                _LOG.warning("llm_cap_exceeded session=%s channel=%s", session_id, channel)
+                emit_metric("LLMCapExceeded", dimensions={"Channel": channel})
+            await self._emit_llm_unavailable(session_id, resolved_lead_id, reasons=failure_reasons)
             ack = self._with_contact_ask(
                 "I'm having a brief technical issue — I've flagged this so a person "
                 "can follow up with you shortly.",
@@ -845,7 +1050,9 @@ class Orchestrator:
                 outbound_channel=channel,
                 counted=False,
                 # Same-signal harmony as the persisted llm_unavailable row (C4).
-                escalation=EscalationDecision(True, Signal.llm_unavailable),
+                escalation=EscalationDecision(
+                    True, Signal.llm_unavailable, Gate.outcome, None, failure_reasons
+                ),
                 iterations=iterations,
             )
 
@@ -876,20 +1083,61 @@ class Orchestrator:
             if stalled:
                 sess_obj.input_ask_attempts += 1
                 if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
+                    # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
+                    # still missing, send the honest hand-off line instead of the
+                    # re-ask — and stay in ai mode. The next turn is answered.
                     sess_obj.input_ask_attempts = 0
-                    return await self._hand_off_with_ack(
+                    stall_reasons = _stalled_gather_reasons(resp)
+                    written = await _record_escalation(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
                         session_id=session_id,
                         resolved_lead_id=resolved_lead_id,
-                        channel=channel,
-                        signal=Signal.cannot_answer,
-                        gate="outcome",
+                        signal=Signal.cannot_answer.value,
+                        gate=Gate.outcome.value,
                         score=None,
-                        ack=self._with_contact_ask(
-                            await self._handoff_ack(),
-                            channel=channel,
-                            resolved_lead_id=resolved_lead_id,
-                            transport_identifier=transport_identifier,
+                        reasons=list(stall_reasons),
+                    )
+                    if not written:
+                        # The session's one cannot_answer row already exists (an
+                        # earlier below-floor turn): the owner still reads WHICH
+                        # fields the gather stalled on.
+                        await _append_escalation_reasons(
+                            self.session,
+                            admin_id=admin_id,
+                            session_id=session_id,
+                            signal=Signal.cannot_answer.value,
+                            gate=Gate.outcome.value,
+                            reasons=list(stall_reasons),
+                        )
+                    ack = self._with_contact_ask(
+                        await self._handoff_ack(),
+                        channel=channel,
+                        resolved_lead_id=resolved_lead_id,
+                        transport_identifier=transport_identifier,
+                    )
+                    ack_row = await persist_turn(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        role="luciel",
+                        text=ack,
+                        at=datetime.now(UTC),
+                        deterministic=True,
+                    )
+                    return LoopResult(
+                        reply_message_id=ack_row.id,
+                        reply_text=ack,
+                        outbound_channel=channel,
+                        counted=counted,
+                        escalation=EscalationDecision(
+                            True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
                         ),
+                        used_fallback=used_fallback,
+                        iterations=iterations,
+                        tool_outcomes=resp.tool_outcomes,
                     )
             elif any_ok and sess_obj.input_ask_attempts:
                 sess_obj.input_ask_attempts = 0
@@ -937,17 +1185,62 @@ class Orchestrator:
                 signal=fired_signal,
             )
             if not suppress:
+                # ONE row for the turn: the signal that won it, with BOTH sets of
+                # reasons when a hot lead also got an ungrounded draft (round 7
+                # WP-2, item 1) — the owner reads "named a budget; answer only 10%
+                # backed by your knowledge" on the same line.
                 await _record_escalation(
                     self.session,
                     admin_id=admin_id,
                     instance_id=instance_id,
                     session_id=session_id,
                     resolved_lead_id=resolved_lead_id,
-                    signal=(outcome.signal or Signal.cannot_answer).value,
+                    signal=fired_signal,
                     gate="outcome",
                     score=outcome.score_or_confidence,
                     reasons=list(outcome.reasons),
                 )
+            elif outcome.answer_ungrounded and outcome.signal is not Signal.cannot_answer:
+                # The lead signal already fired earlier in this session, but THIS
+                # turn's answer is a guess: that is cannot_answer news of its own
+                # (once per session like any other signal), never buried under the
+                # suppressed repeat.
+                if not await _session_already_escalated(
+                    self.session,
+                    admin_id=admin_id,
+                    session_id=session_id,
+                    signal=Signal.cannot_answer.value,
+                ):
+                    await _record_escalation(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        resolved_lead_id=resolved_lead_id,
+                        signal=Signal.cannot_answer.value,
+                        gate="outcome",
+                        score=min(resp.confidence, grounding.score),
+                        reasons=list(outcome.answer_reasons),
+                    )
+
+        # --- LUCIEL'S OWN HAND-OFF (round 7 WP-2, item 2; Vision §3.4) ------- #
+        # The model called hand_to_team this turn: the row + notification were
+        # written at dispatch (so the tool result it read back was true). The turn
+        # reports it as its escalation when no platform gate named one first; the
+        # session stays in ai mode (D2) — Luciel keeps answering.
+        handed_to_team = any(
+            str(call.get("tool_id", "")) == HAND_TO_TEAM_TOOL_ID
+            and r.outcome is tool_contract.Outcome.ok
+            for call, r in resp.dispatched
+        )
+        if escalation is None and handed_to_team:
+            escalation = EscalationDecision(
+                True,
+                Signal.luciel_requested_handoff,
+                Gate.outcome,
+                None,
+                ("Luciel asked for a person",),
+            )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
@@ -975,7 +1268,9 @@ class Orchestrator:
             reply_text = _UNFOUNDED_CLAIM_REPLACEMENT
             deterministic_reply = True
             if escalation is None:
-                escalation = EscalationDecision(True, Signal.cannot_answer, None, None)
+                escalation = EscalationDecision(
+                    True, Signal.cannot_answer, None, None, answer_ungrounded=True
+                )
                 if not await _session_already_escalated(
                     self.session,
                     admin_id=admin_id,
@@ -1005,10 +1300,33 @@ class Orchestrator:
                     f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
                 )
                 reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
+        if not claimed_without_action and escalation is None and _HANDOFF_CLAIM.search(reply_text):
+            # The reply promises the team a hand-off that nothing recorded (round 7
+            # WP-2, item 2): no gate fired, hand_to_team was not called. The customer
+            # was promised a person, so the promise is made REAL through the same path
+            # the tool uses — row, audit, owner notification — and the words are left
+            # as they are, now honest. (Once per session: a row already written by an
+            # earlier hand_to_team call backs this claim too, and pages nobody twice.)
+            emit_metric("HandoffClaimedWithoutTool", dimensions={"Channel": channel})
+            promised = ("Luciel told the customer the team would follow up",)
+            await _record_escalation(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=Signal.luciel_requested_handoff.value,
+                gate=Gate.outcome.value,
+                score=None,
+                reasons=list(promised),
+            )
+            escalation = EscalationDecision(
+                True, Signal.luciel_requested_handoff, Gate.outcome, None, promised
+            )
         if (
             not claimed_without_action
             and escalation is not None
-            and escalation.signal is Signal.cannot_answer
+            and escalation.answer_ungrounded
             and not is_clarifying_question(reply_text)
         ):
             # Below the grounding floor the draft is a guess (2026-09-05 audit F100):
@@ -1017,9 +1335,19 @@ class Orchestrator:
             # does not know says so and gets a person — the draft never leaves. A
             # bare clarifying question ("what's your email?") asserts nothing and
             # still goes out; an unfounded action claim keeps its own, more
-            # specific replacement above.
+            # specific replacement above. The verdict is read from
+            # ``answer_ungrounded``, not from the signal (round 7 WP-2, item 1): a
+            # hot lead whose row says high_value_lead gets the same honest ack, not
+            # the fabricated draft that used to ship under the winning signal.
             reply_text = await self._handoff_ack()
             deterministic_reply = True
+        if team_told and not deterministic_reply:
+            # The sentiment row was written THIS turn (D2): the answer stands, and the
+            # customer hears that a person is aware — a canned hand-off line already
+            # says so, so it is never doubled.
+            reply_text = reply_text.rstrip() + _TEAM_TOLD_NOTE
+        if escalation is None:
+            escalation = standing
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
         if escalation is not None:
             reply_text = self._with_contact_ask(
@@ -1045,7 +1373,9 @@ class Orchestrator:
             enabled_channels=self.enabled_channels or {channel},
             response_length=len(reply_text),
             customer_requested_channel=requested_channel,
-            is_urgent_escalation=outcome.fired,
+            # Any escalation this turn recorded — a gate's, the model's own hand_to_team,
+            # a promised hand-off made real — is the urgent case the arbiter weighs.
+            is_urgent_escalation=escalation is not None,
         )
         if (
             outbound != channel
@@ -1120,14 +1450,20 @@ class Orchestrator:
         )
 
     # --- internals ---------------------------------------------------------- #
-    async def _turn_tool_defs(self) -> list[dict[str, Any]] | None:
+    async def _turn_tool_defs(self) -> list[dict[str, Any]]:
         """The provider-neutral tool defs THIS turn may propose (C4).
 
         Intersection of: the session's frozen snapshot capability set (§3.8.7 rule E;
         None = older session → no snapshot filter), the instance's LIVE enabled
         authorizations (default-deny — an unauthorized tool is never even described
-        to the model), and the ids the resolver can bind. None when no tools are
-        wired — which keeps the call byte-identical to pre-tool-use behavior."""
+        to the model), and the ids the resolver can bind — PLUS the always-on
+        ``hand_to_team`` cognition tool (round 7 WP-2, item 2), which no gate governs:
+        it is Luciel's own judgment, dispatched by the loop itself, never listed on the
+        Configure surface, and present on every turn whether or not tools are wired."""
+        return with_cognition_tools(await self._catalog_tool_defs())
+
+    async def _catalog_tool_defs(self) -> list[dict[str, Any]] | None:
+        """The gated CATALOG defs alone (see ``_turn_tool_defs``); None when none apply."""
         if self.tool_resolver is None:
             return None
         from app.models.tool_auth import InstanceToolAuthorization  # noqa: PLC0415
@@ -1217,10 +1553,15 @@ class Orchestrator:
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
-    ) -> tuple[_Reasoned, int, bool, bool]:
+    ) -> tuple[_Reasoned, int, bool, str | None]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
-        answer, the iteration count, whether the fallback provider was used, and
-        whether BOTH providers failed (llm_failed).
+        answer, the iteration count, whether the fallback provider was used, and why
+        no model served the turn: None, ``_LLM_FAILURE_PROVIDER`` (BOTH providers
+        failed) or ``_LLM_FAILURE_CAP`` (the tenant's per-minute cap refused it).
+
+        The cap is admitted ONCE at the turn boundary (``router.turn()``, round 7
+        WP-2 item 4): the iterations inside share that admission, so a tool-using
+        turn is one of the fifty, not five.
 
         Termination (C4): the loop ends when a response proposes NO tool calls —
         natural completion — or at the iteration bound. Tool results are fed back as
@@ -1259,54 +1600,70 @@ class Orchestrator:
         dispatched: list[tuple[dict[str, Any], ToolResult]] = []
         last: LLMResponse | None = None
         iterations = 0
-        for _ in range(MAX_ITERATIONS):
-            iterations += 1
-            try:
-                resp = await self.router.complete(
-                    prompt,
-                    messages,
-                    tools=tool_defs,
-                    **routing_hints(inbound_text, prompt, messages, tool_defs),
-                )
-            except ProviderError:
-                # Router already failed primary→fallback; a ProviderError here means
-                # BOTH providers are down (§3.4.3 immediate failover, no retry).
-                return (
-                    _Reasoned("", 0.0, tool_outcomes, dispatched),
-                    iterations,
-                    used_fallback,
-                    True,
-                )
-            used_fallback = used_fallback or resp.used_fallback
-            last = resp
-            if not resp.tool_calls:
-                # Natural completion: the model answered without (further) tool use.
-                break
-            # ACT: dispatch the proposed calls via the Arc 12 broker contract, then
-            # REFLECT: append the assistant's tool turn + one structured tool_result
-            # turn per call (untrusted-wrapped — results embed lead/provider content).
-            results = await self._dispatch_tools(
-                resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+        try:
+            # ONE cap admission for the whole turn (item 4): raises LLMCapExceeded at
+            # entry when the tenant is over its per-minute cap — no model is called.
+            with self.router.turn():
+                for _ in range(MAX_ITERATIONS):
+                    iterations += 1
+                    try:
+                        resp = await self.router.complete(
+                            prompt,
+                            messages,
+                            tools=tool_defs,
+                            **routing_hints(inbound_text, prompt, messages, tool_defs),
+                        )
+                    except ProviderError:
+                        # Router already failed primary→fallback; a ProviderError here
+                        # means BOTH providers are down (§3.4.3 immediate failover).
+                        return (
+                            _Reasoned("", 0.0, tool_outcomes, dispatched),
+                            iterations,
+                            used_fallback,
+                            _LLM_FAILURE_PROVIDER,
+                        )
+                    used_fallback = used_fallback or resp.used_fallback
+                    last = resp
+                    if not resp.tool_calls:
+                        # Natural completion: the model answered without (further)
+                        # tool use.
+                        break
+                    # ACT: dispatch the proposed calls via the Arc 12 broker contract,
+                    # then REFLECT: append the assistant's tool turn + one structured
+                    # tool_result turn per call (untrusted-wrapped — results embed
+                    # lead/provider content).
+                    results = await self._dispatch_tools(
+                        resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+                    )
+                    dispatched.extend(results)
+                    tool_outcomes.extend(r.outcome.value for _, r in results)
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": resp.text,
+                            "tool_calls": resp.tool_calls,
+                        }
+                    )
+                    for call, result in results:
+                        messages.append(
+                            {
+                                "role": "tool_result",
+                                "call_id": str(call.get("call_id", "")),
+                                "tool_id": str(call.get("tool_id", "")),
+                                "content": wrap_untrusted(self._tool_result_feedback(call, result)),
+                                "is_error": result.outcome is tool_contract.Outcome.failed,
+                            }
+                        )
+        except LLMCapExceeded:
+            # The tenant's cap refused the turn (§9 C9): the same honest, un-billed
+            # reply path as a provider outage, under its own reason — never a bare
+            # exception to the transport (a JSON 429 hangs up a Twilio call).
+            return (
+                _Reasoned("", 0.0, tool_outcomes, dispatched),
+                iterations,
+                used_fallback,
+                _LLM_FAILURE_CAP,
             )
-            dispatched.extend(results)
-            tool_outcomes.extend(r.outcome.value for _, r in results)
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": resp.text,
-                    "tool_calls": resp.tool_calls,
-                }
-            )
-            for call, result in results:
-                messages.append(
-                    {
-                        "role": "tool_result",
-                        "call_id": str(call.get("call_id", "")),
-                        "tool_id": str(call.get("tool_id", "")),
-                        "content": wrap_untrusted(self._tool_result_feedback(call, result)),
-                        "is_error": result.outcome is tool_contract.Outcome.failed,
-                    }
-                )
 
         if last is None:
             # Unreachable: MAX_ITERATIONS >= 1 so the loop always assigns or returns.
@@ -1315,7 +1672,7 @@ class Orchestrator:
             _Reasoned(last.text, last.confidence, tool_outcomes, dispatched),
             iterations,
             used_fallback,
-            False,
+            None,
         )
 
     async def _dispatch_tools(
@@ -1341,6 +1698,20 @@ class Orchestrator:
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
             inputs = call.get("inputs", {})
+            if tool_id == HAND_TO_TEAM_TOOL_ID:
+                # Always-on cognition (round 7 WP-2, item 2): no snapshot, no
+                # authorization row, no connection — Luciel may always reach the team.
+                results.append(
+                    (
+                        dict(call),
+                        await self._hand_to_team(
+                            dict(inputs) if isinstance(inputs, dict) else {},
+                            session_id=session_id,
+                            resolved_lead_id=resolved_lead_id,
+                        ),
+                    )
+                )
+                continue
             # §3.8.7 rule E capability gate: a tool enabled AFTER this conversation
             # opened is not part of its frozen snapshot capability set, so it is
             # unavailable to THIS conversation (applies to the next one). Deferred
@@ -1365,6 +1736,54 @@ class Orchestrator:
             )
             results.append((dict(call), result))
         return results
+
+    #: Longest reason the model may attach to a hand-off (owner-facing phrase, F124).
+    HAND_TO_TEAM_REASON_CAP = 240
+
+    async def _hand_to_team(
+        self,
+        inputs: dict[str, Any],
+        *,
+        session_id: uuid.UUID | None,
+        resolved_lead_id: uuid.UUID | None,
+    ) -> ToolResult:
+        """Execute ``hand_to_team`` (round 7 WP-2, item 2): Luciel's own judgment that a
+        person should step in, recorded through the STANDARD escalation path — the
+        ``escalation_events`` row, the ``escalation_fired`` audit event, the owner
+        notification carrying the model's reason. The session is NOT taken away (D2):
+        Luciel keeps answering while the team is on their way.
+
+        Once per conversation like every other signal: a second call in the same
+        session writes nothing and pages nobody, and says so in its payload — the
+        team IS flagged, so the outcome is still ``ok``. A blank reason is recorded as
+        such rather than refused: an escalation the model asked for is never dropped
+        on a formality, and the owner reads "no reason given" instead of nothing."""
+        if session_id is None:
+            return tool_contract.failed("no_session")
+        reason = " ".join(str(inputs.get("reason") or "").split())[: self.HAND_TO_TEAM_REASON_CAP]
+        reasons = ["Luciel asked for a person", reason or "no reason given"]
+        written = await _record_escalation(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=Signal.luciel_requested_handoff.value,
+            gate=Gate.outcome.value,
+            score=None,
+            reasons=reasons,
+        )
+        return tool_contract.ok(
+            {
+                "passed_to_team": True,
+                "state": "recorded" if written else "already_passed_this_conversation",
+                # Read back by the model (T3): the honest wording of what happens next.
+                "note": (
+                    "The team has been notified and a person will follow up later; keep "
+                    "helping the customer now. Never promise a time or a real-time reply."
+                ),
+            }
+        )
 
     @staticmethod
     def _with_contact_ask(
@@ -1447,7 +1866,12 @@ class Orchestrator:
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
-        one budget unit (§3.4.1b)."""
+        one budget unit (§3.4.1b).
+
+        Owner decision D2 (2026-09-14): ONLY an explicit request for a person and the
+        threats_violence / self_harm moderation categories come through here. Strong
+        negative sentiment, the ask bound, abuse and an illegal ask record + notify
+        and leave the conversation with Luciel (see run_turn)."""
         await _record_escalation(
             self.session,
             admin_id=self.admin_id,
@@ -1683,10 +2107,15 @@ class Orchestrator:
         )
 
     async def _emit_llm_unavailable(
-        self, session_id: uuid.UUID, resolved_lead_id: uuid.UUID | None
+        self,
+        session_id: uuid.UUID,
+        resolved_lead_id: uuid.UUID | None,
+        *,
+        reasons: tuple[str, ...] = (),
     ) -> None:
         # Once per session, same reasoning as budget_exhausted: an outage is one
-        # event for the conversation, however many turns it spans.
+        # event for the conversation, however many turns it spans. ``reasons`` names
+        # the cap case (item 4) on the row; a provider outage keeps no reason.
         if await _session_already_escalated(
             self.session,
             admin_id=self.admin_id,
@@ -1703,6 +2132,7 @@ class Orchestrator:
             signal="llm_unavailable",
             gate="outcome",
             score=None,
+            reasons=list(reasons),
         )
 
     async def _audit_moderation(self, session_id: uuid.UUID, category: str) -> None:

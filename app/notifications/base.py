@@ -42,6 +42,19 @@ _NEXT_STEP: dict[str, str] = {
         "Luciel could not reach its model provider and could not answer. Reply manually — the "
         "platform is retrying automatically."
     ),
+    "luciel_requested_handoff": (
+        "Luciel judged that a person should step in — read its reason, then reply to the "
+        "lead directly. Luciel keeps answering in the meantime."
+    ),
+    "reply_undeliverable": (
+        "Luciel wrote a reply the channel could not deliver — the customer is waiting. "
+        "Reach them another way and check the channel's connection."
+    ),
+    "content_flagged": (
+        "A message was flagged (abuse, or a request for something illegal). Luciel stays "
+        "professional and keeps answering; read the conversation and step in if you want "
+        "to end it."
+    ),
 }
 
 
@@ -71,6 +84,10 @@ class EscalationNotification:
     customer_identifier: str | None = None
     triggering_message: str | None = None
     dashboard_url: str | None = None
+    # Why it fired, in short phrases (round 6 WP-G, F124) — read from the escalation
+    # row at send time (round 7 WP-2, item 2): for ``luciel_requested_handoff`` this is
+    # the model's own reason, which is the whole point of that page.
+    reasons: tuple[str, ...] = ()
 
     @property
     def conversation_ref(self) -> str:
