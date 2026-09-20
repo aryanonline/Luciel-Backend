@@ -16,11 +16,15 @@ The loop, per inbound message:
         the first model call fires the budget counter once (§3.4.1b). Tool calls
         dispatch via the Arc 12 broker (§3.3.3) using the five-outcome contract.
       → GROUNDING (§3.4.13): score the answer against retrieved chunks / tool result.
-      → ESCALATION GATE 2 — OUTCOME (§3.4.5): high_value_lead (checked first — an
-        opportunity signal independent of answer quality), else cannot_answer (low
-        confidence OR below the 0.50 grounding floor, with no resolving tool —
-        harmony fix 2026-08-04 item 3: AND made this gate unsatisfiable in live mode
-        because providers always report confidence=1.0).
+      → ESCALATION GATE 2 — OUTCOME (§3.4.5): BOTH signals are evaluated on every
+        turn (round 7 WP-2, item 1). high_value_lead (an opportunity signal
+        independent of answer quality) names the row when it fires; the
+        answer-quality verdict — low confidence OR below the 0.50 grounding floor,
+        with no resolving tool (harmony fix 2026-08-04 item 3: AND made this gate
+        unsatisfiable in live mode because providers always report confidence=1.0)
+        — rides on ``EscalationDecision.answer_ungrounded`` and replaces the draft
+        with the honest hand-off whichever signal won the row. Alone, it is the
+        cannot_answer signal.
 
   Half B — emission:
     RESPOND: channel arbiter picks the outbound channel (§3.4.2).
@@ -934,17 +938,43 @@ class Orchestrator:
                 signal=fired_signal,
             )
             if not suppress:
+                # ONE row for the turn: the signal that won it, with BOTH sets of
+                # reasons when a hot lead also got an ungrounded draft (round 7
+                # WP-2, item 1) — the owner reads "named a budget; answer only 10%
+                # backed by your knowledge" on the same line.
                 await _record_escalation(
                     self.session,
                     admin_id=admin_id,
                     instance_id=instance_id,
                     session_id=session_id,
                     resolved_lead_id=resolved_lead_id,
-                    signal=(outcome.signal or Signal.cannot_answer).value,
+                    signal=fired_signal,
                     gate="outcome",
                     score=outcome.score_or_confidence,
                     reasons=list(outcome.reasons),
                 )
+            elif outcome.answer_ungrounded and outcome.signal is not Signal.cannot_answer:
+                # The lead signal already fired earlier in this session, but THIS
+                # turn's answer is a guess: that is cannot_answer news of its own
+                # (once per session like any other signal), never buried under the
+                # suppressed repeat.
+                if not await _session_already_escalated(
+                    self.session,
+                    admin_id=admin_id,
+                    session_id=session_id,
+                    signal=Signal.cannot_answer.value,
+                ):
+                    await _record_escalation(
+                        self.session,
+                        admin_id=admin_id,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        resolved_lead_id=resolved_lead_id,
+                        signal=Signal.cannot_answer.value,
+                        gate="outcome",
+                        score=min(resp.confidence, grounding.score),
+                        reasons=list(outcome.answer_reasons),
+                    )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
         # Defense 4 (§3.4.14): pre-send check strips any platform-impersonation the
@@ -972,7 +1002,9 @@ class Orchestrator:
             reply_text = _UNFOUNDED_CLAIM_REPLACEMENT
             deterministic_reply = True
             if escalation is None:
-                escalation = EscalationDecision(True, Signal.cannot_answer, None, None)
+                escalation = EscalationDecision(
+                    True, Signal.cannot_answer, None, None, answer_ungrounded=True
+                )
                 if not await _session_already_escalated(
                     self.session,
                     admin_id=admin_id,
@@ -1005,7 +1037,7 @@ class Orchestrator:
         if (
             not claimed_without_action
             and escalation is not None
-            and escalation.signal is Signal.cannot_answer
+            and escalation.answer_ungrounded
             and not is_clarifying_question(reply_text)
         ):
             # Below the grounding floor the draft is a guess (2026-09-05 audit F100):
@@ -1014,7 +1046,10 @@ class Orchestrator:
             # does not know says so and gets a person — the draft never leaves. A
             # bare clarifying question ("what's your email?") asserts nothing and
             # still goes out; an unfounded action claim keeps its own, more
-            # specific replacement above.
+            # specific replacement above. The verdict is read from
+            # ``answer_ungrounded``, not from the signal (round 7 WP-2, item 1): a
+            # hot lead whose row says high_value_lead gets the same honest ack, not
+            # the fabricated draft that used to ship under the winning signal.
             reply_text = await self._handoff_ack()
             deterministic_reply = True
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.

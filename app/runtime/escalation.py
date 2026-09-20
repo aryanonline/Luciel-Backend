@@ -15,6 +15,10 @@ Gate 2 — outcome (post-REFLECT), needs the loop's output:
     grounding must be sufficient on its own to gate a response)
   - high_value_lead (normalized lead-score; budget 0.5 + time-pressure 0.3 +
     purchase/booking intent 0.4, capped at 1.0)
+  Both are evaluated on every turn (round 7 WP-2, item 1): the opportunity signal
+  names the row, and ``EscalationDecision.answer_ungrounded`` carries the
+  answer-quality verdict independently, so a hot lead never ships a fabricated
+  answer just because the more business-critical signal won the row.
 
 Classifiers (intent/sentiment) are pluggable; deterministic heuristics here exercise
 the gates without an LLM. The thresholds are platform constants (never admin-set).
@@ -62,6 +66,15 @@ class EscalationDecision:
     # phrases written to the escalation row so the dashboard can say "budget figure +
     # this week" instead of a bare score. Empty when nothing fired.
     reasons: tuple[str, ...] = ()
+    # The answer-quality verdict, independent of which signal names the row (round 7
+    # WP-2, item 1): True when the draft is below the grounding floor OR the model
+    # reported low confidence and no resolving tool backed it — the OR-gate. The
+    # orchestrator replaces the draft with the honest hand-off whenever this is set,
+    # whether the row says cannot_answer or high_value_lead. ``answer_reasons`` are
+    # the answer-quality phrases alone (``reasons`` carries them too, after the
+    # signal's own).
+    answer_ungrounded: bool = False
+    answer_reasons: tuple[str, ...] = ()
 
 
 # --- pluggable classifiers (deterministic heuristics for dev/test) ---------- #
@@ -490,34 +503,59 @@ def evaluate_outcome(
     tests today, or a real one if a provider ever supplies it) still escalates even
     when grounding happens to clear the floor.
     """
-    # high_value_lead is checked FIRST: it is a content/opportunity signal, entirely
-    # independent of whether Luciel's own answer was grounded. A high-value lead
-    # message ("$5000 budget, want to book today") deserves urgent human follow-up
-    # regardless of how well-grounded the reply happened to be — masking that behind
-    # a grounding failure would bury the more business-critical signal.
-    lead_score, lead_reasons = high_value_lead_reasons(message, custom_rules_hit, context=context)
-    if lead_score >= 0.5:
-        return EscalationDecision(
-            True, Signal.high_value_lead, Gate.outcome, lead_score, lead_reasons
-        )
-
+    # Answer quality is judged on EVERY turn, before the opportunity signal is even
+    # looked at (round 7 WP-2, item 1). It used to be evaluated only when
+    # high_value_lead had NOT fired — the lead signal returned first and
+    # short-circuited — so a fabricated answer to a hot lead shipped verbatim.
+    #
     # A conversational/social turn (thanks, declines, goodbyes — see
     # is_conversational_turn) carries no factual claim, so the grounding floor
     # does not apply to it. This narrows WHICH turns count as answers; for real
     # questions the OR-gate below is byte-for-byte unchanged and must never
     # become an AND (harmony fix above still binds).
+    why: list[str] = []
     if (
         not resolving_tool_succeeded
         and not is_conversational_turn(message)
         and not is_contact_details_turn(message)
         and (grounding_score < GROUNDING_FLOOR or plan_confidence < CANNOT_ANSWER_CONFIDENCE)
     ):
-        score = min(plan_confidence, grounding_score)
-        why: list[str] = []
         if grounding_score < GROUNDING_FLOOR:
             why.append(f"answer only {grounding_score:.0%} backed by your knowledge")
         if plan_confidence < CANNOT_ANSWER_CONFIDENCE:
             why.append(f"the model was {plan_confidence:.0%} sure")
-        return EscalationDecision(True, Signal.cannot_answer, Gate.outcome, score, tuple(why))
+    answer_ungrounded = bool(why)
+
+    # high_value_lead names the ROW when it fires: it is a content/opportunity
+    # signal, entirely independent of whether Luciel's own answer was grounded. A
+    # high-value lead message ("$5000 budget, want to book today") deserves urgent
+    # human follow-up regardless of how well-grounded the reply happened to be —
+    # masking that behind a grounding failure would bury the more business-critical
+    # signal. The answer verdict rides alongside it (never behind it): the row's
+    # reasons carry both, and the orchestrator reads ``answer_ungrounded`` to keep
+    # the draft from leaving.
+    lead_score, lead_reasons = high_value_lead_reasons(message, custom_rules_hit, context=context)
+    if lead_score >= 0.5:
+        return EscalationDecision(
+            True,
+            Signal.high_value_lead,
+            Gate.outcome,
+            lead_score,
+            (*lead_reasons, *why),
+            answer_ungrounded=answer_ungrounded,
+            answer_reasons=tuple(why),
+        )
+
+    if answer_ungrounded:
+        score = min(plan_confidence, grounding_score)
+        return EscalationDecision(
+            True,
+            Signal.cannot_answer,
+            Gate.outcome,
+            score,
+            tuple(why),
+            answer_ungrounded=True,
+            answer_reasons=tuple(why),
+        )
 
     return EscalationDecision(False)
