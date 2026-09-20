@@ -34,6 +34,7 @@ from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.audit import ActorType
 from app.models.instance import Account, Instance
+from app.notifications import notifier as notify
 from app.schemas_api.billing import (
     BillingInfoOut,
     BudgetOut,
@@ -204,6 +205,11 @@ async def remove_payment_method(
             payload={"reason": "admin_removed"},
         )
         # D1: no connection changes hands here — the cap is the whole consequence.
+        # The owner is told so (email + escalation SMS when on file; Legal §A3 /
+        # §3.6.7, round 7 WP-1 #3c) — audited as lifecycle_notice_sent.
+        await notify.notify_payment_method_removed(
+            s, admin_id=subject.admin_id, reason="admin_removed"
+        )
         instance_id = await _instance_id(s, subject.admin_id)
         budget = await metering.build_budget(s, admin_id=subject.admin_id, instance_id=instance_id)
         # After removal the account is free_cap, so paymentMethod is omitted.

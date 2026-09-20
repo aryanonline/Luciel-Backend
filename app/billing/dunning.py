@@ -137,6 +137,12 @@ async def advance_if_due(
     )
     if new_state == REDUCED:
         await set_dormant_for_action_tools(session, admin_id=admin_id, reason="dunning_reduced")
+        # The FINAL reduction notice (Legal §A3 / Architecture §3.6.7; round 7 WP-1 #3a).
+        # The webhook path notifies because a retry just failed; this path had no retry
+        # behind it and dropped the account to the free allowance in silence.
+        from app.notifications import notifier as notify  # noqa: PLC0415 (import cycle)
+
+        await notify.notify_dunning_reduced(session, admin_id=admin_id, now=now)
     return new_state
 
 

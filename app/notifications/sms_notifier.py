@@ -11,6 +11,8 @@ owner's email (§3.5.4) instead of leaving the escalation undelivered.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.base import DeliveryReceipt
@@ -53,24 +55,49 @@ class SmsNotifier:
     async def send(
         self, session: AsyncSession, notification: EscalationNotification, *, to: str
     ) -> DeliveryReceipt:
-        from_number = await resolve_sms_number(
-            session, notification.admin_id, notification.instance_id
+        return await self.send_text(
+            session,
+            admin_id=notification.admin_id,
+            instance_id=notification.instance_id,
+            to=to,
+            body=self.format(notification),
         )
+
+    async def send_text(
+        self,
+        session: AsyncSession,
+        *,
+        admin_id: uuid.UUID,
+        instance_id: uuid.UUID,
+        to: str,
+        body: str,
+    ) -> DeliveryReceipt:
+        """One text to the owner through THEIR Twilio, reported as data (never a raise).
+
+        The escalation page and the billing notices (round 7 WP-1 #3c: the card-removed
+        notice reaches the escalation SMS number when one is on file) share this leg so
+        the BYO rule and the honest-degradation rule are written once: no provisioned
+        number → ``sms_channel_not_provisioned``; a live deployment whose sender
+        resolved to the Null stand-in → ``sms_sender_not_provisioned`` (nothing left the
+        system); outside live mode the Null sender's fake sid is reported with
+        ``detail="recorded"`` so a caller can audit it as recorded, not sent.
+        """
+        from_number = await resolve_sms_number(session, admin_id, instance_id)
         if not from_number:
             return DeliveryReceipt(accepted=False, detail="sms_channel_not_provisioned")
         # BYO (§3.1.4): the page goes out through the tenant's OWN Twilio account, the
         # same one their customer SMS rides — the platform is not in the billing path.
-        sender = await build_tenant_sms_sender(
-            session, notification.admin_id, notification.instance_id
-        )
+        sender = await build_tenant_sms_sender(session, admin_id, instance_id)
         try:
-            sid = await sender.send_sms(from_number, to, self.format(notification))
+            sid = await sender.send_sms(from_number, to, body)
         except Exception as exc:  # noqa: BLE001 — a send failure is data, not a raise
             return DeliveryReceipt(accepted=False, detail=f"twilio_error:{type(exc).__name__}")
-        if isinstance(sender, NullSmsSender) and get_settings().integration_mode == "live":
-            # Live deployment without complete Twilio credentials (see twilio_sender's
-            # Account-SID gap): nothing left the system.
-            return DeliveryReceipt(accepted=False, detail="sms_sender_not_provisioned")
+        if isinstance(sender, NullSmsSender):
+            if get_settings().integration_mode == "live":
+                # Live deployment without complete Twilio credentials (see twilio_sender's
+                # Account-SID gap): nothing left the system.
+                return DeliveryReceipt(accepted=False, detail="sms_sender_not_provisioned")
+            return DeliveryReceipt(accepted=True, provider_message_id=sid, detail="recorded")
         if sid is None:
             return DeliveryReceipt(accepted=False, detail="twilio_rejected")
         return DeliveryReceipt(accepted=True, provider_message_id=sid)

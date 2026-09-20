@@ -20,10 +20,12 @@ Events handled:
                                       make the card the invoice default, clear any dunning
                                       (a new card IS the remedy, F012), restore dormant
                                       connections to their pre-dormant status (Legal §A3).
-  * payment_method.detached         → flip billingState→free_cap + clear display tuple.
-                                      NOTHING else changes (owner decision D1,
-                                      2026-09-14): connections keep their status; only
-                                      the day-7 dunning reduction dormants action tools.
+  * payment_method.detached         → flip billingState→free_cap + clear display tuple,
+                                      tell the owner (email + escalation SMS when on
+                                      file, lifecycle_notice_sent). NOTHING else changes
+                                      (owner decision D1, 2026-09-14): connections keep
+                                      their status; only the day-7 dunning reduction
+                                      dormants action tools.
   * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
 """
 
@@ -462,5 +464,8 @@ async def _on_pm_detached(
             event_type="lifecycle_transition",
             payload={"from": prev_billing_state, "to": "free_cap", "trigger": "payment_method"},
         )
-    # D1: no dormancy here. The cap is the whole consequence of a card removal.
+    # D1: no dormancy here. The cap is the whole consequence of a card removal — and
+    # the owner is told so (email + escalation SMS when on file; Legal §A3 / §3.6.7,
+    # round 7 WP-1 #3c). A Stripe-side detach is the one the owner may not have done.
+    await notify.notify_payment_method_removed(session, admin_id=admin_id, reason="stripe_detached")
     return "payment_method.detached"
