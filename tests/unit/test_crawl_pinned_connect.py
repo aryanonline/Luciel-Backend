@@ -19,6 +19,8 @@ pytestmark = [pytest.mark.asyncio]
 
 class _Resp:
     text = "<html><body>Pricing: from $10</body></html>"
+    status_code = 200
+    headers: dict[str, str] = {}
 
     def raise_for_status(self) -> None:
         return None
@@ -53,8 +55,10 @@ async def test_the_crawl_connects_to_the_validated_address_with_the_name_as_host
     assert _Client.calls == [
         {
             "url": "https://93.184.216.34/pricing",
-            "headers": {"Host": "acme.example"},
+            "headers": {"Host": "acme.example", "User-Agent": providers.CRAWL_USER_AGENT},
             "extensions": {"sni_hostname": "acme.example"},
+            # Redirects are followed by hand so every hop is re-pinned (WP-4c #1).
+            "follow_redirects": False,
         }
     ]
 
