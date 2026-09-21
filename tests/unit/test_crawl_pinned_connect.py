@@ -45,14 +45,14 @@ async def test_the_crawl_connects_to_the_validated_address_with_the_name_as_host
     monkeypatch,
 ):
     _Client.calls = []
-    monkeypatch.setattr(sandbox, "_resolve_ips", lambda host: ["203.0.113.9"])
+    monkeypatch.setattr(sandbox, "_resolve_ips", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
     provider = WebsiteCrawlProvider(urls=["https://acme.example/pricing"])
     body = await provider._fetch_one("https://acme.example/pricing")
     assert "Pricing" in body
     assert _Client.calls == [
         {
-            "url": "https://203.0.113.9/pricing",
+            "url": "https://93.184.216.34/pricing",
             "headers": {"Host": "acme.example"},
             "extensions": {"sni_hostname": "acme.example"},
         }
