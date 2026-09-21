@@ -100,7 +100,7 @@ def _fallback_retry_delay() -> float:
     """A short jittered wait before the ONE fallback retry, kept inside the provider
     timeout so the customer's turn cannot stretch past what one call may take."""
     low, high = FALLBACK_RETRY_DELAY_RANGE
-    delay = random.uniform(low, high)  # noqa: S311 — jitter, not security
+    delay = random.uniform(low, high)  # noqa: S311  # nosec B311 — jitter, not security
     try:
         from app.config import get_settings  # noqa: PLC0415 — import cycle
 
