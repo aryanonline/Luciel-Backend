@@ -134,6 +134,22 @@ def _status_for(result: OperabilityResult, cfg: dict[str, object] | None = None)
     return STATUS_NOT_OPERABLE, _DETAIL_UNKNOWN
 
 
+def auth_class_for_credential_on_file(existing: InstanceConnection) -> str:
+    """The behavior class an sms row keeps through a number attach (round 7 WP-4a item 2).
+
+    A number designation says nothing about HOW the account is authenticated, so it
+    must not re-stamp the class: attach used to write ``api_key`` unconditionally, and
+    an OAuth tenant's row (bearer grant on file, ``mode`` ``oauth``) stopped being
+    probed — the sweep's bearer liveness call and the refresh path both key on
+    ``oauth_token`` — the moment they designated a number. Derived from the credential
+    shape on file: the OAuth class (or the OAuth ``mode`` the verify step stamped)
+    stays; everything else is the API-key class the credential form writes."""
+    cfg = existing.non_secret_config or {}
+    if existing.auth_class == "oauth_token" or cfg.get("mode") == "oauth":
+        return "oauth_token"
+    return "api_key"
+
+
 def status_for_confirmed_number(cfg: dict[str, object]) -> tuple[str, str]:
     """(status, detail) for an sms row whose ``destination`` is already the
     confirmed-operable claim: connected iff attested, else pending (§3.1.4).
@@ -211,7 +227,9 @@ async def attach_sms_number(
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is not None:
         existing.provider = "twilio"
-        existing.auth_class = "api_key"
+        # The class follows the CREDENTIAL on file, not the attach (item 2): an OAuth
+        # row keeps oauth_token so the bearer probe and refresh keep running.
+        existing.auth_class = auth_class_for_credential_on_file(existing)
         # Merge, don't replace: the BYO Twilio account id (§3.1.4) also lives here, and
         # designating a number must not silently unbind the account it belongs to.
         prior_cfg = existing.non_secret_config or {}
