@@ -141,11 +141,124 @@ async def test_take_over_and_hand_back_carry_trigger_channel_and_hashed_lead():
         )
 
     (started,) = await _events(admin, "human_takeover_started")
-    assert started.event_payload["trigger"] == "admin"
+    # Round 7 WP-3b item 8: the trigger says WHO decided — the owner's button here.
+    assert started.event_payload["trigger"] == handoff.TRIGGER_ADMIN_INITIATED == "admin_initiated"
     assert started.event_payload["channel"] == "sms"
     assert started.event_payload["resolved_lead_id_hash"] == audit.hash_lead_id(lead_id)
+    assert str(lead_id) not in str(started.event_payload)
 
     (ended,) = await _events(admin, "human_takeover_ended")
     assert ended.event_payload["trigger"] == "hand_back"
     assert ended.event_payload["channel"] == "sms"
     assert ended.event_payload["resolved_lead_id_hash"] == audit.hash_lead_id(lead_id)
+    # How long a person held it — a real number off the persisted start, not absent.
+    assert isinstance(ended.event_payload["duration_seconds"], int)
+    assert ended.event_payload["duration_seconds"] >= 0
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_luciel_escalation_is_recorded_as_luciel_escalated():
+    """Luciel's own judgment (explicit_human_request, a moderation category) is a
+    different decision-maker from the owner's button, and the trail must say which."""
+    admin, iid, lead_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_instance(admin, iid)
+    sid = await _seed_session(admin, iid, mode="ai", idle=timedelta(minutes=1), lead_id=lead_id)
+
+    async with tenant_session(admin) as s:
+        await handoff.take_over(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            session_id=sid,
+            actor_user_id=None,
+            luciel_initiated=True,
+        )
+
+    (started,) = await _events(admin, "human_takeover_started")
+    assert handoff.TRIGGER_LUCIEL_ESCALATED == "luciel_escalated"
+    assert started.event_payload["trigger"] == handoff.TRIGGER_LUCIEL_ESCALATED
+    assert started.event_payload["luciel_initiated"] is True
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hand_back_measures_the_duration_from_the_persisted_takeover_start():
+    """The number is read off ``sessions.human_controlled_since`` (migration 0066), so
+    a takeover that began an hour ago hands back with ~3600, not with whatever the
+    audit rows happen to say."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed_instance(admin, iid)
+    sid = await _seed_session(admin, iid, mode="ai", idle=timedelta(minutes=1), lead_id=None)
+
+    async with tenant_session(admin) as s:
+        sess = await handoff.take_over(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+        assert sess.human_controlled_since is not None
+        # Re-asserting the takeover keeps the ORIGINAL start (idempotent, §3.4.12).
+        first_start = sess.human_controlled_since
+        sess = await handoff.take_over(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+        assert sess.human_controlled_since == first_start
+        sess.human_controlled_since = datetime.now(UTC) - timedelta(hours=1)
+        await s.flush()
+        sess = await handoff.hand_back(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+        assert sess.human_controlled_since is None  # cleared with the takeover
+
+    (ended,) = await _events(admin, "human_takeover_ended")
+    assert 3600 <= ended.event_payload["duration_seconds"] <= 3600 + 60
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_takeover_that_predates_the_start_column_hands_back_with_unknown_duration():
+    """A session already human_controlled before 0066 has no recorded start: the
+    end event says ``None`` rather than fabricating 0 from a stamp taken now."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed_instance(admin, iid)
+    sid = await _seed_session(
+        admin, iid, mode="human_controlled", idle=timedelta(minutes=1), lead_id=None
+    )
+
+    async with tenant_session(admin) as s:
+        # The owner presses "Take over" again on the legacy row: still no start.
+        sess = await handoff.take_over(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+        assert sess.human_controlled_since is None
+        await handoff.hand_back(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+        )
+
+    (ended,) = await _events(admin, "human_takeover_ended")
+    assert ended.event_payload["duration_seconds"] is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_take_over_refuses_an_ended_session():
+    """Round 7 WP-3b item 4: an ended session (``ended_at`` set) is never resumed and
+    nothing on the customer's transport is waiting on it — switching it to
+    human_controlled would show a person "holding" a conversation nobody can answer
+    into. Refused with a typed error; no mode change, no budget count, no audit row."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    await _seed_instance(admin, iid)
+    sid = await _seed_session(admin, iid, mode="ai", idle=timedelta(minutes=1), lead_id=None)
+    async with tenant_session(admin) as s:
+        sess = (await s.execute(select(ConvSession).where(ConvSession.id == sid))).scalar_one()
+        sess.ended_at = NOW
+        await s.flush()
+
+    async with tenant_session(admin) as s:
+        with pytest.raises(handoff.SessionEnded) as excinfo:
+            await handoff.take_over(
+                s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=admin
+            )
+        assert excinfo.value.session_id == sid
+        assert str(excinfo.value) == "session_ended"
+
+    async with tenant_session(admin) as s:
+        sess = (await s.execute(select(ConvSession).where(ConvSession.id == sid))).scalar_one()
+        assert sess.mode == "ai"
+        assert sess.human_controlled_since is None
+    assert await _events(admin, "human_takeover_started") == []
