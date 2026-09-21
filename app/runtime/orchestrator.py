@@ -287,10 +287,27 @@ _TEAM_TOLD_NOTE = " I've also let the team know, so a person can follow up with 
 #: content_flagged with the owner-facing reason, the owner is notified, and the loop
 #: runs — the MODERATION stanza keeps the model professional. Threats and self-harm
 #: are absent on purpose: they keep the take-over path.
-_MODERATION_KEEP_ANSWERING: dict[ModerationCategory, tuple[str, ...]] = {
-    ModerationCategory.abuse_harassment: ("abusive language toward the assistant or business",),
-    ModerationCategory.illegal_solicitation: ("asked for something illegal",),
+_MODERATION_KEEP_ANSWERING: frozenset[ModerationCategory] = frozenset(
+    {ModerationCategory.abuse_harassment, ModerationCategory.illegal_solicitation}
+)
+
+#: The owner-facing phrase for each moderation category (round 7 WP-2, item 7).
+_MODERATION_REASON: dict[ModerationCategory, str] = {
+    ModerationCategory.threats_violence: "threatened violence",
+    ModerationCategory.self_harm: "said they may harm themselves",
+    ModerationCategory.abuse_harassment: "abusive language toward the assistant or business",
+    ModerationCategory.illegal_solicitation: "asked for something illegal",
 }
+
+
+def moderation_reasons(category: ModerationCategory) -> tuple[str, ...]:
+    """The reasons every moderation escalation row carries (round 7 WP-2, item 7):
+    FIRST a stable ``moderation:<category>`` entry the delivery layer routes and
+    labels on, then the owner-facing phrase. Threats/self-harm rows (which take the
+    conversation away under explicit_human_request, D2) used to carry no reasons at
+    all, so the owner could not tell a threat from a polite request for a person."""
+    return (f"moderation:{category.value}", _MODERATION_REASON[category])
+
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
@@ -525,6 +542,7 @@ async def _record_escalation(
     gate: str,
     score: float | None,
     reasons: list[str] | None = None,
+    audit_detail: dict[str, object] | None = None,
 ) -> bool:
     """Write the escalation_events row + the audit event, then notify (§3.5.2 / §5.2).
 
@@ -537,7 +555,10 @@ async def _record_escalation(
     ONCE per (session, signal, gate): the insert itself is the arbiter (unique index
     ``uq_escalation_once``, 2026-09-05 audit F053/F061) — a pre-check-then-insert let
     two turns racing on the same session page the owner twice. Returns whether this
-    call wrote the row; a loser writes nothing and notifies nobody."""
+    call wrote the row; a loser writes nothing and notifies nobody.
+
+    ``audit_detail`` rides on the ``escalation_fired`` audit payload only (round 7
+    WP-2, item 7: the moderation category) — non-identifying keys, never lead PII."""
     inserted = await session.execute(
         pg_insert(EscalationEvent)
         .values(
@@ -566,8 +587,14 @@ async def _record_escalation(
         instance_id=instance_id,
         event_type="escalation_fired",
         actor_type=ActorType.luciel_runtime,
-        # No raw lead PII in the payload (§3.4.11) — signal + session id only.
-        payload={"signal": signal, "gate": gate, "session_id": str(session_id)},
+        # No raw lead PII in the payload (§3.4.11) — signal + session id (+ the
+        # moderation category when one applies), never the customer's words.
+        payload={
+            "signal": signal,
+            "gate": gate,
+            "session_id": str(session_id),
+            **(audit_detail or {}),
+        },
     )
     await session.flush()
     # Delivery starts AFTER this transaction commits, off the customer's turn (§3.5.4;
@@ -694,25 +721,6 @@ class Orchestrator:
         timestamp (live-caught 2026-08-17: every widget turn read 0s)."""
         admin_id, instance_id = self.admin_id, self.instance_id
 
-        # Human-controlled sessions STOP the loop (§3.4.12): persist the inbound for
-        # the dashboard live feed, make no LLM call.
-        if not handoff.loop_should_run(mode):
-            await persist_turn(
-                self.session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                session_id=session_id,
-                role="lead",
-                text=inbound_text,
-                at=received_at,
-            )
-            return LoopResult(
-                reply_text="",
-                outbound_channel=channel,
-                counted=False,
-                handed_off=True,
-            )
-
         await persist_turn(
             self.session,
             admin_id=admin_id,
@@ -731,7 +739,10 @@ class Orchestrator:
         # Runs BEFORE the budget gate (C5 — audit round 3): capture is deterministic
         # cognition with no LLM call, and the docs promise "leads still captured +
         # escalated" AT CAP — the at-cap escalation row used to carry no lead id
-        # because capture only ran after the gate.
+        # because capture only ran after the gate. It also runs BEFORE the
+        # human-controlled early return below (round 7 WP-2, item 8): a visitor who
+        # types their email while a person holds the session used to have it dropped
+        # on the floor, because the take-over return sat above this block.
         sess_obj = (
             await self.session.execute(
                 select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
@@ -780,6 +791,17 @@ class Orchestrator:
                     tool_resolver=self.tool_resolver,
                     session_id=session_id,
                 )
+
+        # Human-controlled sessions STOP the loop (§3.4.12): the inbound is persisted
+        # for the dashboard live feed and the lead record was maintained above (item
+        # 8); no LLM call is made and nothing is said.
+        if not handoff.loop_should_run(mode):
+            return LoopResult(
+                reply_text="",
+                outbound_channel=channel,
+                counted=False,
+                handed_off=True,
+            )
 
         # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
         budget_state = await budget.check_budget(
@@ -850,10 +872,13 @@ class Orchestrator:
         mod = moderate(inbound_text)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
+            # Every moderation row: "moderation:<category>" first, then the owner's
+            # phrase (item 7); the category also reaches the escalation_fired audit.
+            reasons = moderation_reasons(mod.category)
+            audit_detail: dict[str, object] = {"moderation_category": mod.category.value}
             if mod.category in _MODERATION_KEEP_ANSWERING:
                 # D2: abuse / an illegal ask are told to the owner; Luciel stays
                 # professional (MODERATION stanza) and keeps answering — no take-over.
-                reasons = _MODERATION_KEEP_ANSWERING[mod.category]
                 await _record_escalation(
                     self.session,
                     admin_id=admin_id,
@@ -864,6 +889,7 @@ class Orchestrator:
                     gate=Gate.intake.value,
                     score=None,
                     reasons=list(reasons),
+                    audit_detail=audit_detail,
                 )
                 standing = EscalationDecision(
                     True, Signal.content_flagged, Gate.intake, None, reasons
@@ -888,6 +914,8 @@ class Orchestrator:
                     gate="intake",
                     score=None,
                     ack=ack,
+                    reasons=reasons,
+                    audit_detail=audit_detail,
                 )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -1863,6 +1891,7 @@ class Orchestrator:
         score: float | None,
         ack: str,
         reasons: tuple[str, ...] = (),
+        audit_detail: dict[str, object] | None = None,
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
@@ -1882,6 +1911,7 @@ class Orchestrator:
             gate=gate,
             score=score,
             reasons=list(reasons),
+            audit_detail=audit_detail,
         )
         ack_row = await persist_turn(
             self.session,
@@ -1907,7 +1937,7 @@ class Orchestrator:
             outbound_channel=channel,
             counted=True,
             handed_off=True,
-            escalation=EscalationDecision(True, signal, None, score),
+            escalation=EscalationDecision(True, signal, None, score, reasons),
         )
 
     async def _count_served_turn(self, session_id: uuid.UUID) -> bool:
