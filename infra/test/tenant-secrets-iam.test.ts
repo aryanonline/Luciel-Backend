@@ -64,16 +64,27 @@ describe.each<EnvName>(['dev', 'prod'])('Tenant connection secrets IAM (%s)', (e
     expect(statement.Resource).toBe(TENANT_SECRET_ARN);
   });
 
-  test('the grant is prefix-scoped — no wildcard secretsmanager resource', () => {
+  test('the grant is prefix-scoped — the only wildcard secretsmanager statement is ListSecrets alone', () => {
+    // ListSecrets is not resource-scoped in IAM (it accepts only `*`) and returns
+    // names, never values; the tenant-prefix sweep needs it (round 7: the live SeedTest
+    // teardown hit AccessDenied). Every value-bearing or mutating action stays on vm/*.
     const policies = buildCompute(envName).findResources('AWS::IAM::Policy');
+    let listStatements = 0;
+    let manageStatements = 0;
     for (const policy of Object.values(policies)) {
       for (const statement of policy.Properties.PolicyDocument.Statement) {
         const actions = [statement.Action].flat();
         if (!actions.some((a) => typeof a === 'string' && a.startsWith('secretsmanager:'))) continue;
-        for (const resource of [statement.Resource].flat()) {
-          expect(resource).not.toBe('*');
+        if (statement.Sid === 'ManageTenantConnectionSecrets') manageStatements += 1;
+        const resources = [statement.Resource].flat();
+        if (resources.includes('*')) {
+          expect(actions).toEqual(['secretsmanager:ListSecrets']);
+          listStatements += 1;
         }
       }
     }
+    // Every plane role that may delete vm/* secrets can also list them — no more, no less.
+    expect(manageStatements).toBeGreaterThanOrEqual(1);
+    expect(listStatements).toBe(manageStatements);
   });
 });

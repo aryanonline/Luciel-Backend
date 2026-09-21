@@ -467,8 +467,22 @@ async def _run_inprocess_turn(
     from app.db.session import tenant_session
     from app.models.instance import Instance
     from app.runtime.orchestrator import Orchestrator
-    from app.runtime.sessions import resolve_or_open_session
+    from app.runtime.sessions import participant_key_for, resolve_or_open_session
     from sqlalchemy import select
+
+    # Every transport channel keys its session on the customer's transport identifier
+    # (§3.4.8); a session with no key is refused since round 7 (SessionUnkeyable), so
+    # the harness supplies the synthetic identifier a real inbound would carry — the
+    # widget alone is server-keyed and opens without one.
+    synthetic_identifier = {
+        "email": f"parity-{RUN_ID}@seedtest.invalid",
+        "sms": "+15005550006",
+        "whatsapp": "+15005550006",
+        "messenger": f"psid-{RUN_ID}",
+        "instagram": f"igsid-{RUN_ID}",
+        "voice": f"CA{RUN_ID:0>32}",
+    }.get(channel)
+    participant_key = participant_key_for(admin_id, channel, synthetic_identifier)
 
     # This coroutine is invoked from several separate asyncio.run() blocks; dispose
     # the global engine on exit so it is never reused across a dead event loop.
@@ -483,6 +497,7 @@ async def _run_inprocess_turn(
                 instance_id=instance_id,
                 channel=channel,
                 resolved_lead_id=None,
+                participant_key=participant_key,
             )
             orch = Orchestrator(
                 session=s,

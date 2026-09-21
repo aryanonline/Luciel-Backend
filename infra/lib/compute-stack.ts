@@ -218,6 +218,20 @@ export class ComputeStack extends Stack {
           resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:vm/*`],
         }),
       );
+      // The day-30 hard-delete cascade (and the SeedTest teardown) sweep the tenant's
+      // `vm/{admin_id}/` prefix through ListSecrets so an orphaned credential never
+      // outlives its tenant (§3.6.5 step 7). ListSecrets is not resource-scoped in IAM —
+      // it only accepts `*` — and returns names/ARNs, never values; every delete it
+      // feeds is still authorised only against `secret:vm/*` above. Round 7: the live
+      // SeedTest teardown surfaced AccessDenied on ListSecrets, so the sweep had never
+      // run in a deployed environment.
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'ListSecretsForTenantPrefixSweep',
+          actions: ['secretsmanager:ListSecrets'],
+          resources: ['*'],
+        }),
+      );
       role.addToPolicy(
         new iam.PolicyStatement({
           sid: 'UseCmk',
