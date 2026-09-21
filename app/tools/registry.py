@@ -221,20 +221,28 @@ class _TenantCrmBackend:
 
 class _TenantRecordBackend:
     """Dispatches ``lookup_record`` on the connected record-source provider:
-    ``csv`` reads the uploaded rows live at call time; a live-API connector has
-    no effect layer yet and stays honestly unavailable."""
+    ``csv`` reads the uploaded rows live at call time; ``live_connector`` reads the
+    owner's own endpoint through the SSRF seam (round 6 WP-H, F062)."""
 
     def __init__(self) -> None:
         self._unavailable = _UnavailableExternalBackend()
 
     async def lookup(self, ctx: ToolContext, query: str) -> list[dict[str, Any]]:
+        from app.connections import registry as provider_registry  # noqa: PLC0415
+
         provider = await _connection_provider(ctx, "record_source")
         if provider == "csv":
             from app.tools.record_backend import CsvRecordBackend  # noqa: PLC0415
 
             return await CsvRecordBackend().lookup(ctx, query)
-        if provider == "api":
-            # Round 6 WP-H (F062): the owner's own endpoint, through the SSRF seam.
+        # Round 7 WP-4a item 1: dispatch on the id the CONNECT FLOW writes
+        # (``live_connector``, the registered provider). WP-H keyed this on "api",
+        # which the registry never offered, so every live connector read "connected"
+        # and every lookup fell through to unavailable. ``canonical_provider`` keeps a
+        # row written under the old id resolving.
+        if provider is not None and provider_registry.canonical_provider(provider) == (
+            "live_connector"
+        ):
             from app.tools.record_backend import LiveRecordBackend  # noqa: PLC0415
 
             return await LiveRecordBackend().lookup(ctx, query)

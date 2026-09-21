@@ -525,10 +525,18 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "email_sender": ("outlook",),
 }
 
-# Provider ids that were split before the single-Meta correction. Rows already written
-# under them keep resolving (and normalize to ``meta`` on the next connect) instead of
-# turning into an unregistered provider with no OAuth config.
-_ALIASES: dict[str, str] = {"meta_whatsapp": "meta", "meta_instagram": "meta"}
+# Superseded provider ids. Rows already written under them keep resolving (and
+# normalize to the registered id on the next connect) instead of turning into an
+# unregistered provider with no config:
+#   * ``meta_whatsapp`` / ``meta_instagram`` — split before the single-Meta correction;
+#   * ``api`` — what the round 6 WP-H record-source dispatch and connect-time proof
+#     keyed on, while the registry only ever offered ``live_connector`` (round 7
+#     WP-4a item 1: the live connector was permanently green and permanently dead).
+_ALIASES: dict[str, str] = {
+    "meta_whatsapp": "meta",
+    "meta_instagram": "meta",
+    "api": "live_connector",
+}
 
 
 def canonical_provider(provider: str) -> str:

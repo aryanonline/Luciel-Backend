@@ -540,29 +540,27 @@ async def submit_credentials(
                 )
         non_secret["egressAllowlist"] = [parsed.hostname]
 
-    if connection.connection_type == "record_source" and spec.provider == "api" and raw_url:
-        # Round 6 WP-H (F062): prove the endpoint answers a test query BEFORE the row
-        # claims to be connected — a URL that 404s or returns HTML would otherwise
-        # produce a healthy-looking row and a tool that fails on every lookup.
-        from app.tools.record_backend import (  # noqa: PLC0415
-            RecordSourceUnavailable,
-            build_record_transport,
-            query_live_records,
+    if (
+        connection.connection_type == "record_source"
+        and spec.provider == "live_connector"
+        and raw_url
+    ):
+        # Round 6 WP-H (F062) / round 7 WP-4a item 1: prove the endpoint answers an
+        # authenticated test query BEFORE the row claims to be connected — a URL that
+        # returns HTML, refuses the key, or is down would otherwise produce a
+        # healthy-looking row and a tool that fails on every lookup. Keyed on the id
+        # the connect flow writes (``live_connector``); the old ``api`` key never ran.
+        from app.connections.probes import (  # noqa: PLC0415
+            LiveConnectorProofFailed,
+            prove_live_connector,
         )
 
         try:
-            await query_live_records(
-                url=str(raw_url),
-                query="ping",
-                api_key=str(material.get("api_key") or "") or None,
-                allowlist=frozenset(),
-                transport=build_record_transport(),
+            await prove_live_connector(
+                url=str(raw_url), api_key=str(material.get("api_key") or "") or None
             )
-        except RecordSourceUnavailable as exc:
-            raise CredentialRejected(
-                "Your record lookup URL did not answer a test query with a JSON array "
-                f"of records ({exc}). Check the address and the API key."
-            ) from exc
+        except LiveConnectorProofFailed as exc:
+            raise CredentialRejected(str(exc)) from exc
     if not connection.secret_ref:
         connection.secret_ref = secret_ref_for(
             admin_id, connection.instance_id, connection.connection_type
