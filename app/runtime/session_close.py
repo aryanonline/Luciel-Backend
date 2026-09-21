@@ -31,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
-from app.models.audit import ActorType
+from app.models.audit import ActorType, AdminAuditLog
 from app.models.conversation import Session
 from app.runtime import memory
 from app.runtime.sessions import INACTIVITY_TIMEOUT
@@ -47,6 +47,32 @@ def _timeout_for(channel: str) -> timedelta:
     return INACTIVITY_TIMEOUT.get(channel, _DEFAULT_TIMEOUT)
 
 
+async def takeover_duration_seconds(
+    session: AsyncSession, *, admin_id: uuid.UUID, sess: Session, ended_at: datetime
+) -> int | None:
+    """How long a person held ``sess`` (round 7 WP-2, item 9): from the session's
+    latest ``human_takeover_started`` audit event — the persisted proof of when the
+    take-over began — falling back to the session's own start when no event exists
+    (a row set human_controlled before the trail was recorded). None only when
+    neither is known."""
+    started = (
+        await session.execute(
+            select(AdminAuditLog.created_at)
+            .where(
+                AdminAuditLog.admin_id == admin_id,
+                AdminAuditLog.event_type == "human_takeover_started",
+                AdminAuditLog.event_payload["session_id"].astext == str(sess.id),
+            )
+            .order_by(AdminAuditLog.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    origin = started or sess.started_at
+    if origin is None:
+        return None
+    return max(0, int((ended_at - origin).total_seconds()))
+
+
 async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at: datetime) -> None:
     """Seal one session: stamp ``ended_at``; summarize + persist when it has content.
 
@@ -60,7 +86,10 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
         # The takeover ended with the session, not with a hand-back (§3.4.12 — "if
         # the admin never hands back, the session ends via the inactivity timeout").
         # Audit F078: this end was never recorded, so the takeover audit trail had a
-        # start for every timeout and no end.
+        # start for every timeout and no end. Round 7 WP-2 item 9: the end carries
+        # how long the person held it, and the sealed row returns to ai mode —
+        # hand-back was the only writer, so a stale human_controlled outlived the
+        # session and read as an open take-over on every dashboard that lists it.
         await audit.emit(
             session,
             admin_id=sess.admin_id,
@@ -75,8 +104,12 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
                     audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
                 ),
                 "ended_at": ended_at.isoformat(),
+                "duration_seconds": await takeover_duration_seconds(
+                    session, admin_id=sess.admin_id, sess=sess, ended_at=ended_at
+                ),
             },
         )
+        sess.mode = "ai"
     history = await memory.load_session_history(session, admin_id=sess.admin_id, session_id=sess.id)
     if not history:
         await session.flush()

@@ -144,6 +144,8 @@ async def hand_back(
     was_human = sess.mode == ConversationMode.human_controlled.value
     sess.mode = ConversationMode.ai.value
     if was_human:
+        from app.runtime.session_close import takeover_duration_seconds  # noqa: PLC0415
+
         await audit.emit(
             session,
             admin_id=admin_id,
@@ -157,6 +159,11 @@ async def hand_back(
                 "channel": sess.channel,
                 "resolved_lead_id_hash": (
                     audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
+                ),
+                # Round 7 WP-2 item 9: how long the person held it (same measure the
+                # inactivity sealer stamps).
+                "duration_seconds": await takeover_duration_seconds(
+                    session, admin_id=admin_id, sess=sess, ended_at=datetime.now(UTC)
                 ),
             },
         )
