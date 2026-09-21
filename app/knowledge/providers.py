@@ -1148,7 +1148,7 @@ class WebsiteCrawlProvider:
             except CrawlFetchRefused as exc:
                 if exc.status_code in (401, 403):
                     parser = RobotFileParser()
-                    parser.disallow_all = True
+                    parser.parse(["User-agent: *", "Disallow: /"])
                 else:
                     parser = None
             except (ProviderUnavailable, httpx.HTTPError, ValueError):
