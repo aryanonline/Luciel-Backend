@@ -36,8 +36,9 @@ from app.connections.secrets import (
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 
-# §3.8.2: auth_class is the behavior key (drives §3.8.5 health cadence + refresh),
-# defaulted from connection_type. The provider brand never reaches this table's
+# §3.8.2: auth_class is the behavior key (drives what the §3.8.5 health probe and
+# token refresh do for the row — the sweep is one 6-hour cron), defaulted from
+# connection_type. The provider brand never reaches this table's
 # logic — a new provider in an existing class inherits behavior automatically.
 _AUTH_CLASS_BY_TYPE: dict[str, str] = {
     "calendar": "oauth_token",
@@ -62,14 +63,14 @@ _OAUTH_CLASSES = frozenset({"oauth_token"})
 
 
 def _auth_class_for(connection_type: str, provider: str | None = None) -> str:
-    """The behavior key for this connection (§3.8.5 health cadence + refresh).
+    """The behavior key for this connection (§3.8.5 health probe + refresh).
 
     The registered PROVIDER wins when there is one, because the auth class is a property
     of the integration and not of the slot it fills: a CRM connection is oauth_token via
     HubSpot but long_lived_token via a custom webhook (Decision #6), and giving both the
-    type's default would put the webhook on a token-refresh cadence it has no token for.
-    Unknown types fall back to api_key (safe, 60-min cadence) rather than erroring, so the
-    catalog can add a type before this map is updated."""
+    type's default would put the webhook on a token-refresh path it has no token for.
+    Unknown types fall back to api_key (safe: no refresh attempted) rather than erroring,
+    so the catalog can add a type before this map is updated."""
     spec = registry.get_provider(provider) if provider else None
     if spec is not None and spec.connection_type == connection_type:
         return spec.auth_class
@@ -851,7 +852,7 @@ async def confirm_reconnect(
             connection.provider = str(pending_provider)
             # The behavior key follows the provider (§3.8.5): a cross-class swap
             # (provisioned ses → oauth_token outlook) that kept the old class would
-            # put the new credential on a cadence with no refresh and no expiry.
+            # leave the new credential with no refresh path and no expiry hint.
             connection.auth_class = _auth_class_for(
                 connection.connection_type, str(pending_provider)
             )

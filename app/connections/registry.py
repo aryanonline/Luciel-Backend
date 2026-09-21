@@ -127,8 +127,9 @@ class ProviderSpec:
     redirect_uri_setting: str | None = None
     # Non-OAuth providers: the fields their connect form collects.
     credential_fields: tuple[CredentialField, ...] = ()
-    # §3.8.5 health cadence is keyed on auth_class; this is the behavior key the
-    # connection row inherits, so a new provider in an existing class needs no code.
+    # §3.8.5: auth_class is the behavior key the connection row inherits (what the
+    # health probe and the token refresh DO for it — the sweep itself is one 6-hour
+    # cron for every class), so a new provider in an existing class needs no code.
     auth_class: str = "oauth_token"
     # Knowledge sources: the scope the owner may select (Decision #9). None = no scope.
     scope_kind: str | None = None

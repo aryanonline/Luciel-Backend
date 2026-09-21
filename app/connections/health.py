@@ -3,8 +3,9 @@
 Runs per connection in ``instance_connections`` and applies UNIFORMLY to every
 connection type — tool, channel, and knowledge-sync alike ("a connection is a
 connection", §3.8.5). It:
-  * health-probes the connection on a cadence keyed to ``auth_class`` (NOT provider
-    brand, §3.8.5) — so a new provider inherits the right behavior automatically;
+  * health-probes the connection on ONE 6-hour cron (the ``health`` EventBridge
+    sweep in ``app/jobs/sweeps.py``) — the same pass for every auth class; the
+    behavior that differs per class is what a probe/refresh does, not when it runs;
   * proactively refreshes OAuth/long-lived tokens ~30 min before expiry (§3.8.5
     refresh path); on refresh failure → status='expired' + status_detail + audit;
   * transitions status (connected / error / expired) and stamps
@@ -53,16 +54,6 @@ from app.models.connection import InstanceConnection
 
 _log = logging.getLogger(__name__)
 
-# §3.8.5 TARGET cadence per auth_class. Honesty note (round 5B): the deployed
-# scheduler runs ONE 6-hour EventBridge cron for every class — this table is the
-# design target a per-class scheduler would read, not a description of what runs
-# today. Kept because the sweep entrypoint is cadence-agnostic either way.
-HEALTH_CADENCE: dict[str, timedelta] = {
-    "oauth_token": timedelta(minutes=15),
-    "long_lived_token": timedelta(minutes=60),
-    "api_key": timedelta(minutes=60),
-    "provisioned_resource": timedelta(hours=4),
-}
 # §3.8.5 refresh path: refresh proactively ~30 min before known expiry.
 REFRESH_LEAD = timedelta(minutes=30)
 
@@ -382,9 +373,9 @@ async def run_health_sweep(
 ) -> dict[str, str]:
     """One-shot sweep over every non-revoked connection for a tenant (§3.8.5).
 
-    Returns {connection_id: resulting_status} for tests/observability. A real
-    background worker calls this on the auth-class cadence; CI calls it directly as a
-    one-shot so no live loop is required."""
+    Returns {connection_id: resulting_status} for tests/observability. The 6-hour
+    ``health`` cron calls this per tenant; CI calls it directly as a one-shot so no
+    live loop is required."""
     store = store or get_secret_store()
     now = now or datetime.now(UTC)
     connections = (
