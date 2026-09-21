@@ -43,6 +43,9 @@ LEAD_KEY = "jordan@acme.test"
 class _Seeded:
     admin: uuid.UUID
     iid: uuid.UUID
+    # The conversation's resolved lead, which OWNS ``LEAD_KEY`` (round 7 WP-3c item 8:
+    # a push with no resolved lead is refused, so every push here carries one).
+    lead_id: uuid.UUID | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +62,7 @@ async def _seed(
     crm_provider: str | None = "hubspot",
     record_provider: str | None = None,
     authorize: tuple[str, ...] = ("push_to_crm",),
+    token: str = "hs-token",
 ) -> _Seeded:
     admin, iid = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
@@ -124,23 +128,39 @@ async def _seed(
                     ),
                 )
             )
+    lead_id: uuid.UUID | None = None
     if crm_provider:
         from app.connections.secrets import get_secret_store
+        from app.models.lead import Lead, LeadState
 
-        await get_secret_store().put(f"vm/{admin}/{iid}/crm", {"access_token": "hs-token"})
-    return _Seeded(admin=admin, iid=iid)
+        await get_secret_store().put(f"vm/{admin}/{iid}/crm", {"access_token": token})
+        lead_id = uuid.uuid4()
+        async with tenant_session(admin) as s:
+            s.add(
+                Lead(
+                    id=lead_id,
+                    admin_id=admin,
+                    instance_id=iid,
+                    contact_identifier=LEAD_KEY,
+                    state=LeadState.active,
+                )
+            )
+    return _Seeded(admin=admin, iid=iid, lead_id=lead_id)
 
 
-async def _push(seeded: _Seeded, fields: dict[str, object]):
+async def _push(
+    seeded: _Seeded, fields: dict[str, object], *, resolved: bool = True, lead_key: str = LEAD_KEY
+):
     tool = build_tool("push_to_crm")
     assert tool is not None
     async with tenant_session(seeded.admin) as s:
         broker = ToolBroker(s)
         return await broker.dispatch(
             tool,
-            {"lead_key": LEAD_KEY, "fields": fields},
+            {"lead_key": lead_key, "fields": fields},
             admin_id=seeded.admin,
             instance_id=seeded.iid,
+            resolved_lead_id=seeded.lead_id if resolved else None,
         )
 
 
@@ -178,7 +198,7 @@ async def test_the_link_row_pins_the_record_and_survives_healing():
     # heal: re-create + re-link, never fail forever on a dead id.
     api = crm_backend.build_crm_api()
     assert isinstance(api, crm_backend.InMemoryCrmApi)
-    del api.records[record_id]
+    api.forget(record_id)
 
     healed = await _push(seeded, {"budget": "75k"})
     assert healed.outcome is Outcome.ok, healed.reason
@@ -210,6 +230,50 @@ async def test_upserts_are_audited_without_lead_pii():
     assert [e.event_payload["action"] for e in events] == ["created", "updated"]
     for e in events:
         assert LEAD_KEY not in str(e.event_payload)  # never the lead's email
+
+
+async def test_a_push_with_no_resolved_lead_is_refused_and_creates_nothing():
+    """Round 7 WP-3c item 8: the key-ownership guard used to run only when a lead was
+    resolved, so an anonymous turn could create a CRM contact under any key the
+    model chose. No resolved lead → failed / no_resolved_lead, nothing written."""
+    seeded = await _seed()
+    res = await _push(seeded, {"budget": "5k"}, resolved=False)
+    assert res.outcome is Outcome.failed
+    assert res.reason == "crm_error: no_resolved_lead"
+    api = crm_backend.build_crm_api()
+    assert isinstance(api, crm_backend.InMemoryCrmApi)
+    assert api.records == {}
+    async with tenant_session(seeded.admin) as s:
+        assert (
+            await s.execute(select(CrmLeadLink).where(CrmLeadLink.admin_id == seeded.admin))
+        ).scalar_one_or_none() is None
+
+
+async def test_two_mock_tenants_never_share_a_crm_record_store():
+    """Round 7 WP-3c item 15: the in-memory CRM is keyed by (token, record) like the
+    calendar mock. Tenant B's push of the SAME email must create B's own record under
+    B's token — never find and PATCH tenant A's record, which the live APIs (one
+    token, one portal) can never do either."""
+    a = await _seed(token="tok-a")
+    b = await _seed(token="tok-b")
+    first = await _push(a, {"budget": "5k"})
+    assert first.outcome is Outcome.ok, first.reason
+    assert first.payload["action"] == "created"
+    second = await _push(b, {"budget": "9k"})
+    assert second.outcome is Outcome.ok, second.reason
+    assert second.payload["action"] == "created"  # B did not "update" A's contact
+    assert second.payload["crmRecordId"] != first.payload["crmRecordId"]
+
+    api = crm_backend.build_crm_api()
+    assert isinstance(api, crm_backend.InMemoryCrmApi)
+    assert set(api.records_for("tok-a")) == {first.payload["crmRecordId"]}
+    assert set(api.records_for("tok-b")) == {second.payload["crmRecordId"]}
+    assert api.records[first.payload["crmRecordId"]]["fields"]["budget"] == "5k"  # untouched
+    # And each tenant's later push still updates ITS OWN record in place.
+    again = await _push(b, {"budget": "12k"})
+    assert again.payload["action"] == "updated"
+    assert again.payload["crmRecordId"] == second.payload["crmRecordId"]
+    assert len(api.records) == 2
 
 
 async def test_salesforce_crm_pushes_with_its_own_link_namespace():

@@ -86,20 +86,42 @@ class CrmApi(Protocol):
 
 
 class InMemoryCrmApi:
-    """Deterministic in-process CRM for mock/CI — transport only (module note)."""
+    """Deterministic in-process CRM for mock/CI — transport only (module note).
+
+    Round 7 WP-3c item 15: records are keyed by ``(token, record_id)`` exactly like
+    ``InMemoryCalendarApi._store`` — the token IS the tenant's CRM account, so two
+    mock tenants have two record stores. The old single dict let tenant B's push
+    find and PATCH tenant A's record by email, a tenant-crossing the live APIs can
+    never do (each token only reaches its own portal/org)."""
 
     def __init__(self) -> None:
-        # record_id -> {"lead_key": ..., "fields": {...}}
-        self.records: dict[str, dict[str, Any]] = {}
+        # (token, record_id) -> {"lead_key": ..., "fields": {...}, "notes": {...}}
+        self._records: dict[tuple[str, str], dict[str, Any]] = {}
+
+    @property
+    def records(self) -> dict[str, dict[str, Any]]:
+        """Every record across every token, by record id (ids are unique per store).
+
+        Kept for the tests that assert "one record, never a duplicate" without caring
+        which token wrote it; ``records_for(token)`` is the per-tenant view."""
+        return {record_id: rec for (_token, record_id), rec in self._records.items()}
+
+    def records_for(self, token: str) -> dict[str, dict[str, Any]]:
+        return {rid: rec for (tok, rid), rec in self._records.items() if tok == token}
+
+    def forget(self, record_id: str) -> None:
+        """Delete a record out of band (a test's "deleted inside the CRM")."""
+        for key in [k for k in self._records if k[1] == record_id]:
+            del self._records[key]
 
     async def find_by_key(self, token: str, lead_key: str) -> CrmRecord | None:
-        for record_id, rec in self.records.items():
-            if rec["lead_key"] == lead_key:
+        for (tok, record_id), rec in self._records.items():
+            if tok == token and rec["lead_key"] == lead_key:
                 return CrmRecord(record_id=record_id)
         return None
 
     async def get(self, token: str, record_id: str) -> CrmRecord | None:
-        return CrmRecord(record_id=record_id) if record_id in self.records else None
+        return CrmRecord(record_id=record_id) if (token, record_id) in self._records else None
 
     async def create(
         self,
@@ -109,7 +131,7 @@ class InMemoryCrmApi:
         notes: dict[str, str] | None = None,
     ) -> CrmRecord:
         record_id = f"mock-{uuid.uuid4().hex[:10]}"
-        self.records[record_id] = {
+        self._records[(token, record_id)] = {
             "lead_key": lead_key,
             "fields": dict(fields),
             "notes": dict(notes or {}),
@@ -124,7 +146,7 @@ class InMemoryCrmApi:
         fields: dict[str, Any],
         notes: dict[str, str] | None = None,
     ) -> CrmRecord | None:
-        rec = self.records.get(record_id)
+        rec = self._records.get((token, record_id))
         if rec is None:
             return None
         del lead_key  # updates never rewrite the key (item 1) — mirror the live APIs
@@ -453,6 +475,58 @@ def build_crm_api() -> CrmApi:
     return _mock_api
 
 
+async def resolve_owning_lead(ctx: ToolContext, lead_key: str) -> Any:
+    """The conversation's resolved lead, proven to OWN ``lead_key`` (round 7 WP-3c item 8).
+
+    A push with NO resolved lead used to skip the F095 key-ownership guard entirely,
+    so an anonymous turn could create a CRM contact under any key the model chose.
+    Now the guard is unconditional: no resolved lead → ``no_resolved_lead``; a key
+    the lead does not own → ``crm_lead_key_not_owned``. Ownership means the lead's
+    OWN confirmed columns (email / contact_identifier / phone) — a merely mentioned
+    address (item 2) is never a key and never owned."""
+    from app.models.lead import Lead  # noqa: PLC0415
+    from app.runtime.lead_capture import normalize_identifier  # noqa: PLC0415
+
+    if ctx.session is None:
+        raise CrmUnavailable("crm_session_unavailable")
+    if ctx.resolved_lead_id is None:
+        raise CrmUnavailable("no_resolved_lead")
+    lead_row = (
+        await ctx.session.execute(
+            select(Lead).where(Lead.admin_id == ctx.admin_id, Lead.id == ctx.resolved_lead_id)
+        )
+    ).scalar_one_or_none()
+    if lead_row is None:
+        raise CrmUnavailable("no_resolved_lead")
+    owned_keys = {
+        normalize_identifier(k)
+        for k in (lead_row.email, lead_row.contact_identifier, lead_row.phone)
+        if k
+    }
+    if normalize_identifier(lead_key) not in owned_keys:
+        # 2026-09-05 audit F095: a key the conversation's lead does not own is a
+        # stranger's record — the push is refused outright instead of creating or
+        # patching someone else's contact.
+        raise CrmUnavailable("crm_lead_key_not_owned")
+    return lead_row
+
+
+def lead_notes(lead_row: Any) -> dict[str, str]:
+    """The record's current Luciel-maintained facts, merged into every push (F130)."""
+    return {
+        k: v
+        for k, v in (
+            ("intent", lead_row.intent or ""),
+            (
+                "lead_score",
+                f"{lead_row.lead_score:g}" if lead_row.lead_score is not None else "",
+            ),
+            ("outcome", lead_row.outcome or ""),
+        )
+        if v
+    }
+
+
 class _NativeCrmBackend:
     """The shared upsert/link/heal discipline over any native ``CrmApi``.
 
@@ -512,57 +586,22 @@ class _NativeCrmBackend:
         # key-ownership guard is what makes lead_id trustworthy: a model-proposed
         # push can carry any email, and without the guard a stranger's key would
         # PATCH the current lead's record with someone else's identity.
-        verified_lead_id: uuid.UUID | None = None
-        notes: dict[str, str] | None = None
-        if ctx.resolved_lead_id is not None:
-            from app.models.lead import Lead  # noqa: PLC0415
+        lead_row = await resolve_owning_lead(ctx, lead_key)
+        verified_lead_id: uuid.UUID = lead_row.id
+        # The record's current Luciel-maintained facts ride every push so
+        # the CRM's free-text field is merged, never overwritten (F130).
+        notes: dict[str, str] | None = lead_notes(lead_row)
 
-            lead_row = (
-                await ctx.session.execute(
-                    select(Lead).where(
-                        Lead.admin_id == ctx.admin_id, Lead.id == ctx.resolved_lead_id
-                    )
+        link: CrmLeadLink | None = (
+            await ctx.session.execute(
+                select(CrmLeadLink).where(
+                    CrmLeadLink.admin_id == ctx.admin_id,
+                    CrmLeadLink.instance_id == ctx.instance_id,
+                    CrmLeadLink.provider == self.provider,
+                    CrmLeadLink.lead_id == verified_lead_id,
                 )
-            ).scalar_one_or_none()
-            if lead_row is not None:
-                owned_keys = {
-                    k.strip().lower()
-                    for k in (lead_row.email, lead_row.contact_identifier)
-                    if k and "@" in k
-                }
-                if lead_key.strip().lower() not in owned_keys:
-                    # 2026-09-05 audit F095: a key the conversation's lead does not
-                    # own is a stranger's record — the push is refused outright
-                    # instead of creating or patching someone else's contact.
-                    raise CrmUnavailable("crm_lead_key_not_owned")
-                verified_lead_id = lead_row.id
-                # The record's current Luciel-maintained facts ride every push so
-                # the CRM's free-text field is merged, never overwritten (F130).
-                notes = {
-                    k: v
-                    for k, v in (
-                        ("intent", lead_row.intent or ""),
-                        (
-                            "lead_score",
-                            f"{lead_row.lead_score:g}" if lead_row.lead_score is not None else "",
-                        ),
-                        ("outcome", lead_row.outcome or ""),
-                    )
-                    if v
-                }
-
-        link: CrmLeadLink | None = None
-        if verified_lead_id is not None:
-            link = (
-                await ctx.session.execute(
-                    select(CrmLeadLink).where(
-                        CrmLeadLink.admin_id == ctx.admin_id,
-                        CrmLeadLink.instance_id == ctx.instance_id,
-                        CrmLeadLink.provider == self.provider,
-                        CrmLeadLink.lead_id == verified_lead_id,
-                    )
-                )
-            ).scalar_one_or_none()
+            )
+        ).scalar_one_or_none()
         if link is None:
             link = (
                 await ctx.session.execute(
@@ -733,6 +772,9 @@ class WebhookCrmBackend:
 
         if ctx.session is None:
             raise CrmUnavailable("crm_session_unavailable")
+        # Item 8 applies here too: the tenant's endpoint is still THEIR CRM, and a
+        # key no resolved lead owns must never be posted to it.
+        await resolve_owning_lead(ctx, lead_key)
         row = (
             await ctx.session.execute(
                 select(InstanceConnection.non_secret_config, InstanceConnection.secret_ref).where(
