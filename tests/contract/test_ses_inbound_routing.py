@@ -73,11 +73,14 @@ async def _provision(admin: uuid.UUID, iid: uuid.UUID) -> str:
         return str((conn.non_secret_config or {})["address"])
 
 
+CUSTOMER_MESSAGE_ID = "<ses-inbound-1@lead.example>"
+
+
 def _sns_notification(*, recipient: str, sender: str, subject: str, body: str) -> dict:
     content = base64.b64encode(
         (
             f"From: {sender}\r\nTo: {recipient}\r\nSubject: {subject}\r\n"
-            f"Content-Type: text/plain\r\n\r\n{body}\r\n"
+            f"Message-ID: {CUSTOMER_MESSAGE_ID}\r\nContent-Type: text/plain\r\n\r\n{body}\r\n"
         ).encode()
     ).decode()
     return {
@@ -87,7 +90,12 @@ def _sns_notification(*, recipient: str, sender: str, subject: str, body: str) -
                 "mail": {
                     "destination": [recipient],
                     "source": sender,
-                    "commonHeaders": {"from": [sender], "subject": subject},
+                    "commonHeaders": {
+                        "from": [sender],
+                        "subject": subject,
+                        # SES surfaces the RFC 5322 Message-ID here (real shape).
+                        "messageId": CUSTOMER_MESSAGE_ID,
+                    },
                 },
                 "receipt": {
                     "spfVerdict": {"status": "PASS"},
@@ -134,6 +142,10 @@ async def test_inbound_email_to_the_provisioned_address_reaches_the_runtime(clie
             await s.execute(select(ConvSession).where(ConvSession.admin_id == admin))
         ).scalar_one()
     assert session_row.channel == "email"
+    # Round 7 WP-3b item 2: the SES ingress leaves the reply context on the session,
+    # so a takeover reply hours later threads under the customer's own mail.
+    assert session_row.inbound_subject == "Do you deliver?"
+    assert session_row.inbound_message_id == CUSTOMER_MESSAGE_ID
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

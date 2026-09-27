@@ -617,7 +617,18 @@ def _build_email_adapter() -> EmailAdapter:
         def __init__(self) -> None:
             self._inner = build_email_sender()
 
-        async def send_email(self, sender: str, to: str, subject: str, body: str) -> str | None:
+        async def send_email(
+            self,
+            sender: str,
+            to: str,
+            subject: str,
+            body: str,
+            *,
+            headers: dict[str, str] | None = None,
+        ) -> str | None:
+            # This adapter is the INBOUND half of the SES channel; every reply leaves
+            # through ``channels.outbound`` (which threads ``headers``). Accepted so
+            # the adapter keeps satisfying the EmailSender protocol; never reached.
             return await self._inner.send(to=to, subject=subject, body_text=body)
 
     return EmailAdapter(sender=_ChannelEmailSender(), sns_verifier=ConfigGatedSnsVerifier())
@@ -648,6 +659,10 @@ def _parse_ses_inbound(sns_message: dict[str, Any]) -> dict[str, Any]:
         "recipient": str(destination[0]) if destination else "",
         "from_address": parseaddr(str(from_header))[1],
         "subject": headers.get("subject"),
+        # The customer's RFC 5322 Message-ID (``mail.commonHeaders.messageId``): the
+        # session keeps it so a later takeover reply threads under their mail with
+        # In-Reply-To / References (round 7 WP-3b, item 2). None when SES omitted it.
+        "internet_message_id": headers.get("messageId"),
         "text": _plain_text_body(inner.get("content")),
         # SES's authentication verdicts (§3.1.5). They inform trust, and NEVER authorize
         # PII disclosure back to the lead (§3.4.9).
