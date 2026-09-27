@@ -1435,8 +1435,19 @@ class Orchestrator:
             reply_text = reply_text.rstrip() + _TEAM_TOLD_NOTE
         if escalation is None:
             escalation = standing
+        # The customer asked for this answer on another channel (round 6 WP-H, F060).
+        # Decided BEFORE the contact ask: when the switch below will itself ask for an
+        # address, the escalation-time contact ask is not doubled on top of it.
+        requested_channel = channel_switch.detect_requested_channel(inbound_text)
+        switch_will_ask = (
+            requested_channel is not None
+            and requested_channel != channel
+            and requested_channel in channel_switch.KIND_FOR_CHANNEL
+            and requested_channel in (self.enabled_channels or {channel})
+            and sess_obj is not None
+        )
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
-        if escalation is not None:
+        if escalation is not None and not switch_will_ask:
             reply_text = self._with_contact_ask(
                 reply_text,
                 channel=channel,
@@ -1454,7 +1465,6 @@ class Orchestrator:
                 business_name=self.business_name,
                 assistant_name=self.assistant_name,
             )
-        requested_channel = channel_switch.detect_requested_channel(inbound_text)
         outbound = choose_outbound_channel(
             inbound_channel=channel,
             enabled_channels=self.enabled_channels or {channel},
@@ -1464,14 +1474,13 @@ class Orchestrator:
             # a promised hand-off made real — is the urgent case the arbiter weighs.
             is_urgent_escalation=escalation is not None,
         )
-        if (
-            outbound != channel
-            and escalation is None
-            and outbound in channel_switch.KIND_FOR_CHANNEL
-        ):
+        if outbound != channel and outbound in channel_switch.KIND_FOR_CHANNEL:
             if requested_channel == outbound and sess_obj is not None:
                 # The customer ASKED for it there (round 6 WP-H, F060): a confirmed
-                # address gets it now; otherwise ask where and park the answer.
+                # address gets it now; otherwise ask where and park the answer. This
+                # runs whether or not the turn escalated (round 7 WP-2, item 6):
+                # "email me your prices, I'd like to book this week" is a hot lead AND
+                # a request for an address — it used to be neither asked nor sent.
                 reply_text = await self._switch_or_ask(
                     sess_obj,
                     outbound=outbound,
@@ -1479,7 +1488,7 @@ class Orchestrator:
                     inbound_text=inbound_text,
                     resolved_lead_id=resolved_lead_id,
                 )
-            elif outbound in _CHANNEL_OFFER:
+            elif escalation is None and outbound in _CHANNEL_OFFER:
                 # The arbiter would rather answer elsewhere (a long answer on SMS,
                 # §3.4.2). Nothing is sent uninvited: the reply stays on the channel
                 # the lead wrote on and OFFERS the switch.

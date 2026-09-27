@@ -155,3 +155,57 @@ async def test_an_email_typed_during_a_human_takeover_is_captured_on_the_lead():
         sess = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
         assert sess.resolved_lead_id == lead.id
         assert sess.mode == "human_controlled"
+
+
+# --- item 6: a channel switch runs on an escalating turn too ------------------------ #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_hot_lead_who_asks_for_email_is_asked_for_an_address_and_the_answer_is_parked(
+    monkeypatch,
+):
+    """The message "Email me your refund policy — I'd like to book this week" is a hot
+    lead AND a request for an address. The switch/park used to be wrapped in ``escalation is
+    None``, so the stanza's promise ("the platform sends a copy to an address they
+    confirm, and asks them for one when needed") was broken on exactly the turns that
+    matter most: nobody was asked and nothing was sent."""
+    from app.channels import outbound
+    from app.channels.outbound import OutboundResult
+    from app.runtime.escalation import Signal
+
+    sent: list[tuple[str, str, str]] = []
+
+    async def fake(session, *, admin_id, instance_id, channel, to, body, subject=None, **kw):
+        sent.append((channel, to, body))
+        return OutboundResult(channel=channel, delivered=True, detail=None)
+
+    monkeypatch.setattr(outbound, "send_outbound_reply", fake)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        first = await _orch(s, admin, iid).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Email me your refund policy — I'd like to book this week",
+        )
+        assert first.escalation is not None
+        assert first.escalation.signal is Signal.high_value_lead
+        # Asked where to send it, the answer parked — and the escalation-time contact
+        # ask is not doubled on top of the switch's own ask.
+        assert "What's the best email address to send it to?" in first.reply_text
+        assert "best email or phone number" not in first.reply_text
+        assert REFUND_CHUNK in first.reply_text  # the answer stays on the channel
+        sess = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
+        assert sess.pending_outbound and sess.pending_outbound["channel"] == "email"
+        assert sent == []
+        # The next turn names the address: the parked answer goes there.
+        second = await _orch(s, admin, iid).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="dana@lead.example",
+        )
+        assert second.reply_text == "Sent — check your email at dana@lead.example."
+        assert [(c, to) for c, to, _b in sent] == [("email", "dana@lead.example")]
+        assert REFUND_CHUNK in sent[0][2]
