@@ -370,3 +370,149 @@ async def test_a_repaired_credential_returns_a_parked_number_to_its_honest_state
     row = await _row(admin, cid)
     assert row.status == "not_operable_hosting_required"
     assert (row.non_secret_config or {}).get("pending_destination") == "+14155550133"
+
+
+# --------------------------------------------------------------------------- #
+# Item 9 — re-verify and attach write status through the shared owner transition
+# --------------------------------------------------------------------------- #
+
+
+async def _status_change_rows(admin: uuid.UUID) -> list[AdminAuditLog]:
+    async with tenant_session(admin) as s:
+        return list(
+            (
+                await s.execute(
+                    select(AdminAuditLog)
+                    .where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "connection_status_changed",
+                    )
+                    .order_by(AdminAuditLog.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_reverify_demotion_from_connected_is_audited_under_the_owner_without_an_email():
+    """A re-verify that finds the attested, texting-enabled number no longer operable
+    switches texting off — the live condition that emitted no audit row at all."""
+    from app.channels.phone_lifecycle import reverify_sms_number
+    from app.models.audit import ActorType
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="connected",
+        detail="attested",
+        cfg={
+            "accountSid": ACCOUNT_SID,
+            "destination": "+14155550140",
+            "carrier_registration_attested_at": "2026-09-01T00:00:00+00:00",
+        },
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",
+    )
+    async with tenant_session(admin) as s:
+        conn = await reverify_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            probe=_FixedProbe(OperabilityResult.NOT_OPERABLE),
+            user_id=admin,
+        )
+        assert conn is not None
+        assert conn.status == "not_operable_hosting_required"
+    rows = await _status_change_rows(admin)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.actor_type is ActorType.admin_user
+    assert row.actor_user_id == admin
+    payload = dict(row.event_payload or {})
+    assert payload["connection_id"] == str(cid)
+    assert (payload["old_status"], payload["new_status"]) == (
+        "connected",
+        "not_operable_hosting_required",
+    )
+    assert payload["reason"] == "sms_number_reverified"
+    # Owner-initiated: the sweep's attention email never fires here.
+    assert await _attention_emails(admin) == 0
+    assert (await _row(admin, cid)).last_health_check_at is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_reverify_that_changes_nothing_writes_no_audit_row():
+    from app.channels.phone_lifecycle import reverify_sms_number
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="pending_carrier_registration",
+        cfg={"accountSid": ACCOUNT_SID, "destination": "+14155550141"},
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",
+    )
+    async with tenant_session(admin) as s:
+        conn = await reverify_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            probe=_FixedProbe(OperabilityResult.OPERABLE),
+            user_id=admin,
+        )
+        assert conn is not None and conn.status == "pending_carrier_registration"
+    assert await _status_change_rows(admin) == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_number_change_that_demotes_a_serving_row_is_audited():
+    """Attaching a number the account cannot operate over a connected row is a
+    demotion the owner's audit page must show."""
+    from app.channels.phone_lifecycle import attach_sms_number
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="connected",
+        cfg={
+            "accountSid": ACCOUNT_SID,
+            "destination": "+14155550142",
+            "carrier_registration_attested_at": "2026-09-01T00:00:00+00:00",
+        },
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",
+    )
+    async with tenant_session(admin) as s:
+        conn = await attach_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            e164_number="+14155550143",
+            probe=_FixedProbe(OperabilityResult.NOT_OPERABLE),
+            user_id=admin,
+        )
+        assert conn.status == "not_operable_hosting_required"
+    changes = await _status_changes(admin)
+    assert changes == [
+        {
+            "connection_id": str(cid),
+            "old_status": "connected",
+            "new_status": "not_operable_hosting_required",
+            "reason": "sms_number_attached",
+        }
+    ]
+    assert await _attention_emails(admin) == 0

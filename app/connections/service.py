@@ -251,6 +251,7 @@ async def start_connection(
             admin_id=admin_id,
             instance_id=instance_id,
             e164_number=phone_number,
+            user_id=user_id,
         )
         await audit.emit(
             session,

@@ -314,20 +314,13 @@ async def _transition(
     connection.status_detail = detail
     connection.last_health_check_at = now
     if new_status != old_status:
-        # §3.8.4: status changes → admin_audit_log connection_status_changed with
-        # old/new status + reason. NEVER any secret material (§3.8.3 rule 4).
-        await audit.emit(
+        await _audit_status_change(
             session,
-            admin_id=connection.admin_id,
-            instance_id=connection.instance_id,
+            connection,
+            old_status=old_status,
+            new_status=new_status,
+            reason=detail or "health_check",
             actor_type=ActorType.platform,
-            event_type="connection_status_changed",
-            payload={
-                "connection_id": str(connection.connection_id),
-                "old_status": old_status,
-                "new_status": new_status,
-                "reason": detail or "health_check",
-            },
         )
         # §3.8.5's second half (Phase 6.6): the TRANSITION into a broken state is
         # the once-per-incident boundary — a still-broken row on the next sweep
@@ -338,6 +331,70 @@ async def _transition(
         broken = ("expired", "error")
         if new_status in broken and old_status not in broken:
             await _notify_owner_attention(session, connection, new_status, detail)
+
+
+async def transition_by_owner(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    new_status: str,
+    detail: str | None,
+    *,
+    reason: str,
+    user_id: uuid.UUID | None = None,
+) -> bool:
+    """An OWNER-initiated status write through the sweep's audit half (round 7 WP-4a
+    item 9): the same status + detail write and the same ``connection_status_changed``
+    row on a real transition as ``_transition`` — under the acting admin, never the
+    platform — and NEVER the attention email (the owner is looking at the result).
+    The health-check stamp stays with the sweep: a number re-verify or a number
+    attach is not a credential check. Returns whether the status changed.
+
+    Before this, ``phone_lifecycle`` assigned ``status`` directly, so a re-verify
+    that demoted a connected number to not_operable_hosting_required — texting
+    switched off — left no audit row at all."""
+    old_status = connection.status
+    connection.status = new_status
+    connection.status_detail = detail
+    if new_status == old_status:
+        return False
+    await _audit_status_change(
+        session,
+        connection,
+        old_status=old_status,
+        new_status=new_status,
+        reason=reason,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+    )
+    return True
+
+
+async def _audit_status_change(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    *,
+    old_status: str,
+    new_status: str,
+    reason: str,
+    actor_type: ActorType,
+    actor_user_id: uuid.UUID | None = None,
+) -> None:
+    # §3.8.4: status changes → admin_audit_log connection_status_changed with
+    # old/new status + reason. NEVER any secret material (§3.8.3 rule 4).
+    await audit.emit(
+        session,
+        admin_id=connection.admin_id,
+        instance_id=connection.instance_id,
+        actor_type=actor_type,
+        actor_user_id=actor_user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": new_status,
+            "reason": reason,
+        },
+    )
 
 
 # Owner-facing surface names for the attention email (never raw enums).

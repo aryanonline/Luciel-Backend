@@ -196,6 +196,7 @@ async def attach_sms_number(
     e164_number: str,
     probe: NumberOperabilityProbe | None = None,
     webhook_config: TwilioWebhookConfigurator | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> InstanceConnection:
     """Attach (or change) the tenant's BYO SMS number, gated on live operability.
 
@@ -204,6 +205,7 @@ async def attach_sms_number(
     required`` with guidance. NO number provisioning happens (BYO, §3.1.4). Changing
     the number re-runs the gate from scratch (number-change invalidation), so a new
     number never inherits the old number's status. Idempotent per tenant/instance.
+    A status change on an EXISTING row is audited under ``user_id`` (item 9).
     """
     number = _validate_e164(e164_number)
     # Cross-tenant uniqueness (§3.1.3) BEFORE the operability probe: every other
@@ -254,8 +256,14 @@ async def attach_sms_number(
             merged.pop(_ATTESTED_BY_KEY, None)
         status, detail = _status_for(result, merged)
         existing.non_secret_config = merged
-        existing.status = status
-        existing.status_detail = detail
+        # Round 7 WP-4a item 9: the status write goes through the shared owner
+        # transition so a number change that demotes a serving row (connected →
+        # not_operable on a number the account cannot operate) leaves an audit row.
+        from app.connections import health  # noqa: PLC0415 — circular at module import
+
+        await health.transition_by_owner(
+            session, existing, status, detail, reason="sms_number_attached", user_id=user_id
+        )
         conn = existing
     else:
         status, detail = _status_for(result, dict(cfg_update))
@@ -390,6 +398,7 @@ async def reverify_sms_number(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     probe: NumberOperabilityProbe | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> InstanceConnection | None:
     """Re-run the operability probe against the CURRENTLY attached number (§3.1.4).
 
@@ -397,7 +406,10 @@ async def reverify_sms_number(
     swapped-in number is what gets checked, never a remembered value) and re-derives the
     status from a fresh Twilio probe. No background poller, no expiry — the tenant clicks
     this after hosting/registering their number. Returns the updated row, or None if no
-    number has been attached yet (nothing to re-verify)."""
+    number has been attached yet (nothing to re-verify). A real status change (a
+    promotion, or a demotion that switches texting off) is audited under ``user_id``
+    through the shared owner transition (round 7 WP-4a item 9); a re-verify that
+    changes nothing writes no audit row."""
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is None:
         return None
@@ -429,8 +441,11 @@ async def reverify_sms_number(
     # a failed probe demotes honestly but RETAINS the attestation keys (a Twilio
     # outage must not erase the owner's attestation — round 5B item 10).
     status, detail = _status_for(result, existing.non_secret_config or {})
-    existing.status = status
-    existing.status_detail = detail
+    from app.connections import health  # noqa: PLC0415 — circular at module import
+
+    await health.transition_by_owner(
+        session, existing, status, detail, reason="sms_number_reverified", user_id=user_id
+    )
     await session.flush()
 
     # Round 5B item 15 — webhook drift repair: Re-verify is the customer's "make

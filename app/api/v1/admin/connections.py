@@ -340,7 +340,9 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
         try:
-            conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
+            conn = await _reverify(
+                s, admin_id=subject.admin_id, instance_id=instance_id, user_id=subject.user_id
+            )
         except _Claimed as exc:
             # c21: promoting a pending number is a claim point — another tenant may
             # have claimed it while this one was still hosting/registering. Audited
