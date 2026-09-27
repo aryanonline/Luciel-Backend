@@ -70,3 +70,55 @@ def test_canonicalize_normalizes_case_and_space():
 def test_duplicate_edges_deduped():
     res = DeterministicGraphExtractor().extract("A -REL-> B\nA -REL-> B")
     assert len(res.edges) == 1
+
+
+# --- Node grammar tightened (round 7 WP-4c #10, D10) --------------------------------
+# With the LLM extractor on in live posture the grammar runs over prose too. The old
+# pattern read ANY parenthesised aside as a node line.
+
+PROSE_WITH_ASIDES = """
+We are open Monday to Friday (except holidays) and Saturdays by appointment.
+Call us (we're friendly) or book online.
+Prices vary by season (see below).
+Monday to Friday (closed Sunday)
+Open daily (9-5)
+Our team (three dentists and two hygienists) is here to help.
+Opening hours (weekdays): 9am to 5pm
+"""
+
+
+def test_parenthesised_prose_is_not_parsed_as_nodes():
+    res = DeterministicGraphExtractor().extract(PROSE_WITH_ASIDES)
+    assert res.entities == [] and res.edges == []
+
+
+def test_explicit_node_lines_still_parse_after_the_tightening():
+    text = "\n".join(
+        [
+            "Dr. Alice Smith (Dentist)",
+            "Teeth Whitening (Dental Service): price=$200; duration=45min",
+            "Gore-Tex (Feature)",
+            "Platform (Department)",
+            "Widget Pro 3000 (Product): sku=WP-3000",
+        ]
+    )
+    res = DeterministicGraphExtractor().extract(text)
+    by_canon = {e.canonical: e for e in res.entities}
+    assert by_canon["dr. alice smith"].entity_type == "Dentist"
+    assert by_canon["teeth whitening"].entity_type == "Dental Service"
+    assert by_canon["teeth whitening"].attributes == {"price": "$200", "duration": "45min"}
+    assert by_canon["gore-tex"].entity_type == "Feature"
+    assert by_canon["platform"].entity_type == "Department"
+    assert by_canon["widget pro 3000"].attributes == {"sku": "WP-3000"}
+
+
+def test_a_name_longer_than_the_word_cap_is_prose():
+    res = DeterministicGraphExtractor().extract("The best clinic in the whole city (Clinic)")
+    assert res.entities == []
+    res = DeterministicGraphExtractor().extract("Best Clinic In Town (Clinic)")
+    assert [e.name for e in res.entities] == ["Best Clinic In Town"]
+
+
+def test_a_colon_tail_without_key_values_is_prose():
+    res = DeterministicGraphExtractor().extract("Opening hours (weekdays): 9am to 5pm")
+    assert res.entities == []

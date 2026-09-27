@@ -158,3 +158,41 @@ async def test_ingest_time_extraction_is_capped_under_the_ingesting_tenant():
     # The deterministic extractor ignores the tenant.
     det = ge.DeterministicGraphExtractor()
     assert (await ge.extract_async(det, "A (Thing)", admin_id=admin)).entities[0].name == "A"
+
+
+# --- Per-ingest cost bound (round 7 WP-4c #10, D10 turns the pass on for live) -------
+
+
+async def test_a_source_under_the_minimum_size_never_reaches_the_model():
+    router = _FakeRouter(_GOOD)
+    llm = ge.LlmGraphExtractor(router_factory=lambda: router)
+    tiny = "Trail Runner (Product): price=120"
+    assert len(tiny) < ge.MIN_LLM_TEXT_CHARS
+    out = await llm.aextract(tiny)
+    assert router.calls == []  # no call, no cost
+    assert {e.name for e in out.entities} == {"Trail Runner"}  # the grammar still ran
+
+
+async def test_a_large_source_is_read_as_a_bounded_number_of_chunks():
+    from app.knowledge.chunking import DEFAULT_CHUNK_CHARS
+
+    router = _FakeRouter(_GOOD)
+    llm = ge.LlmGraphExtractor(router_factory=lambda: router)
+    # 30 paragraphs of ~one chunk each: far more than the cap, and more than the
+    # character clip alone would admit.
+    paragraphs = [
+        f"Paragraph {i}. " + ("lorem ipsum " * (DEFAULT_CHUNK_CHARS // 12)) for i in range(30)
+    ]
+    text = "\n\n".join(paragraphs)
+    await llm.aextract(text)
+    sent = str(router.calls[0]["messages"][0]["content"])
+    assert len(sent) <= ge.MAX_LLM_TEXT_CHARS
+    assert sent.count("Paragraph ") <= ge.MAX_LLM_CHUNKS
+    assert "Paragraph 0." in sent and "Paragraph 29." not in sent
+
+
+def test_llm_input_for_is_the_single_bound():
+    assert ge.llm_input_for("") is None
+    assert ge.llm_input_for("x" * (ge.MIN_LLM_TEXT_CHARS - 1)) is None
+    body = ge.llm_input_for("word " * 5_000)
+    assert body is not None and len(body) <= ge.MAX_LLM_TEXT_CHARS
