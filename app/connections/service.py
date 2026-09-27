@@ -599,7 +599,15 @@ async def submit_credentials(
         connection.status = "unconfigured"
         connection.status_detail = _SMS_NEEDS_NUMBER
     elif number_pending:
-        pass  # keep the not-operable status + guidance the attach wrote
+        if old_status in ("error", "expired"):
+            # Round 7 WP-4a item 3: the sweep probes not-operable rows too, so a
+            # dead credential lands here as error. The repaired credential returns
+            # the row to the number's honest state (still not operable) instead of
+            # leaving it in the error the owner just fixed.
+            from app.channels.phone_lifecycle import status_for_pending_number  # noqa: PLC0415
+
+            connection.status, connection.status_detail = status_for_pending_number()
+        # else keep the not-operable status + guidance the attach wrote
     elif is_sms:
         # Round 5B item 10: a credential (re)submit on a confirmed number must
         # not blanket-promote past the carrier-registration gate — connected iff
@@ -872,10 +880,15 @@ async def confirm_reconnect(
             # yet means the honest "add your number" state.
             from app.channels.phone_lifecycle import (  # noqa: PLC0415
                 status_for_confirmed_number,
+                status_for_pending_number,
             )
 
             if config.get("destination"):
                 connection.status, connection.status_detail = status_for_confirmed_number(config)
+            elif config.get("pending_destination"):
+                # A parked (never confirmed operable) number keeps its honest
+                # not-operable state through a reconnect (item 3).
+                connection.status, connection.status_detail = status_for_pending_number()
             else:
                 connection.status = "unconfigured"
                 connection.status_detail = _SMS_NEEDS_NUMBER

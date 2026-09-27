@@ -29,12 +29,15 @@ from sqlalchemy import select
 
 pytestmark = [pytest.mark.asyncio]
 
+# Round 7 WP-4a item 3 (owner ruling 2026-09-14): pending_carrier_registration and
+# not_operable_hosting_required moved to the sweep's PROBE-ONLY allowlist — the
+# credential behind them is re-checked (a text can leave on a pending row), but a
+# passing probe never promotes them. Their proofs live in
+# tests/integration/test_connection_lifecycle_truth.py; these three stay untouched.
 SETUP_OWNED = (
     "unconfigured",
     "not_connected",
-    "pending_carrier_registration",
     "pending_email_routing",
-    "not_operable_hosting_required",
 )
 
 

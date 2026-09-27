@@ -67,6 +67,25 @@ REFRESH_LEAD = timedelta(minutes=30)
 # rows to a false "error" with a false attention email.
 HEALTH_OWNED_STATUSES: frozenset[str] = frozenset({"connected", "expired", "error"})
 
+# Round 7 WP-4a item 3: statuses the sweep PROBES but never promotes. An sms row in
+# pending_carrier_registration is SENDING (outbound.SMS_OPERABLE_STATUSES lets a text
+# leave on it) with a credential the sweep never re-checked — a Twilio grant revoked
+# at the provider stayed "pending registration" forever while every send failed in
+# front of a customer. A not_operable_hosting_required row holds the same credential
+# behind a number that is not yet usable. Both keep their setup-owned status and
+# guidance when healthy (a probe passing is not carrier registration, and not a
+# hosted number); a dead or expired credential still flips them to error/expired
+# through the same transition — audit row, one attention email — as any other row.
+HEALTH_PROBE_ONLY_STATUSES: frozenset[str] = frozenset(
+    {"pending_carrier_registration", "not_operable_hosting_required"}
+)
+#: Everything the sweep selects: the rows it owns plus the rows it only probes.
+HEALTH_SWEPT_STATUSES: frozenset[str] = HEALTH_OWNED_STATUSES | HEALTH_PROBE_ONLY_STATUSES
+
+
+def _mid_reconnect(connection: InstanceConnection) -> bool:
+    return (connection.status_detail or "").startswith("reconnect_pending:")
+
 
 def health_owned(connection: InstanceConnection) -> bool:
     """True iff the health worker may transition this row (§3.8.4 taxonomy).
@@ -76,7 +95,15 @@ def health_owned(connection: InstanceConnection) -> bool:
     target ``confirm_reconnect`` needs."""
     if connection.status not in HEALTH_OWNED_STATUSES:
         return False
-    return not (connection.status_detail or "").startswith("reconnect_pending:")
+    return not _mid_reconnect(connection)
+
+
+def health_probed(connection: InstanceConnection) -> bool:
+    """True iff the sweep PROBES this row: health-owned, or probe-only (item 3). The
+    staged-swap marker is respected for both."""
+    if connection.status not in HEALTH_SWEPT_STATUSES:
+        return False
+    return not _mid_reconnect(connection)
 
 
 @dataclass
@@ -205,10 +232,12 @@ async def check_connection(
     liveness. Always stamps last_health_check_at; emits connection_status_changed
     on a real transition. ``dormant`` rows never reach here (the sweep excludes
     them — billing owns that state, module docstring), and setup-owned rows
-    (``health_owned`` False) are returned untouched even when a caller hands one
-    in directly — no stamp, no transition, no email (round 5B item 10)."""
+    (``health_probed`` False) are returned untouched even when a caller hands one
+    in directly — no stamp, no transition, no email (round 5B item 10). A
+    probe-only row (item 3) is probed and may go expired/error, but a passing
+    probe only stamps the check: its status and setup guidance stay."""
     now = now or datetime.now(UTC)
-    if not health_owned(connection):
+    if not health_probed(connection):
         return connection.status
     old_status = connection.status
 
@@ -243,7 +272,13 @@ async def check_connection(
         await _propagate_knowledge_pause(session, connection)
         return connection.status
 
-    # (3) Healthy → connected.
+    # (3) Healthy → connected — unless the row is probe-only (item 3): a credential
+    # the provider still accepts is not carrier registration and not a hosted
+    # number, so the setup-owned status and its guidance stay; only the check is
+    # stamped so the dashboard can say WHEN it was last verified.
+    if old_status in HEALTH_PROBE_ONLY_STATUSES:
+        connection.last_health_check_at = now
+        return connection.status
     await _transition(session, connection, "connected", None, now, old_status)
     return connection.status
 
@@ -391,9 +426,10 @@ async def run_health_sweep(
                     # (live-caught 2026-08-24). revoked stays terminal; dormant
                     # is billing-suspended (Legal §A3) and only the payment
                     # webhooks may leave it; a future unknown status is now safe
-                    # by default. The staged-swap marker is guarded per-row in
-                    # health_owned (it rides status_detail, not status).
-                    InstanceConnection.status.in_(HEALTH_OWNED_STATUSES),
+                    # by default. The probe-only pair (item 3) is selected too
+                    # — probed, never promoted. The staged-swap marker is
+                    # guarded per-row in health_probed (it rides status_detail).
+                    InstanceConnection.status.in_(HEALTH_SWEPT_STATUSES),
                 )
             )
         )
@@ -439,9 +475,9 @@ async def flag_provider_auth_failure(
     """A provider refused the stored credential on a LIVE call: flip the row to
     ``error`` through the sweep's own transition — audit row, one attention email —
     right now, instead of letting it read Connected until the next sweep while every
-    push or booking fails in front of a customer (round 6 WP-C, F081). Health-owned
-    rows only; a row mid-swap or setup-owned is left to its owner. Returns whether a
-    row was flipped."""
+    push or booking fails in front of a customer (round 6 WP-C, F081). Rows the sweep
+    probes only (health-owned or probe-only, item 3); a row mid-swap or setup-owned
+    is left to its owner. Returns whether a row was flipped."""
     stmt = select(InstanceConnection).where(
         InstanceConnection.admin_id == admin_id,
         InstanceConnection.instance_id == instance_id,
@@ -455,7 +491,7 @@ async def flag_provider_auth_failure(
         .scalars()
         .first()
     )
-    if row is None or not health_owned(row):
+    if row is None or not health_probed(row):
         return False
     from app.connections import registry  # noqa: PLC0415 — avoids an import cycle
 

@@ -150,6 +150,16 @@ def auth_class_for_credential_on_file(existing: InstanceConnection) -> str:
     return "api_key"
 
 
+def status_for_pending_number() -> tuple[str, str]:
+    """(status, detail) for an sms row whose number is parked under
+    ``pending_destination`` (never confirmed operable): the honest not-operable
+    state with the hosting guidance. Used when a credential repair lands on a row
+    the sweep had flipped to error/expired (round 7 WP-4a item 3) — the number's
+    truth is unchanged, and leaving the row in error would read as a credential
+    problem the owner just fixed."""
+    return STATUS_NOT_OPERABLE, _DETAIL_NOT_OPERABLE
+
+
 def status_for_confirmed_number(cfg: dict[str, object]) -> tuple[str, str]:
     """(status, detail) for an sms row whose ``destination`` is already the
     confirmed-operable claim: connected iff attested, else pending (§3.1.4).

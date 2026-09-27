@@ -199,3 +199,174 @@ async def test_a_credential_form_twilio_row_stays_api_key_through_a_number_attac
             probe=_FixedProbe(OperabilityResult.OPERABLE),
         )
         assert conn.auth_class == "api_key"
+
+
+# --------------------------------------------------------------------------- #
+# Item 3 — the sweep PROBES pending/not-operable sms rows but never promotes them
+# --------------------------------------------------------------------------- #
+
+PROBE_ONLY = ("pending_carrier_registration", "not_operable_hosting_required")
+
+
+async def _sweep(admin: uuid.UUID, now: datetime = NOW) -> dict[str, str]:
+    from app.connections.health import ReconnectOnExpiry, StoredCredentialProbe, run_health_sweep
+
+    async with tenant_session(admin) as s:
+        return await run_health_sweep(
+            s,
+            admin_id=admin,
+            probe=StoredCredentialProbe(),
+            refresher=ReconnectOnExpiry(),
+            now=now,
+        )
+
+
+async def _attention_emails(admin: uuid.UUID) -> int:
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "connection_attention_emailed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return len(rows)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_sending_pending_registration_row_with_a_dead_credential_flips_to_error():
+    """The live shape: a text can leave on a pending_carrier_registration row
+    (outbound.SMS_OPERABLE_STATUSES), but the sweep never re-checked its credential,
+    so a Twilio grant gone at the provider stayed "pending registration" while every
+    send failed in front of a customer."""
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="pending_carrier_registration",
+        detail="registration guidance",
+        cfg={"accountSid": ACCOUNT_SID, "destination": "+14155550130"},
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",  # stamped, nothing behind it
+    )
+    result = await _sweep(admin)
+    assert result.get(str(cid)) == "error"
+    row = await _row(admin, cid)
+    assert row.status == "error"
+    assert "reconnect" in (row.status_detail or "")
+    assert row.last_health_check_at == NOW
+    assert await _attention_emails(admin) == 1
+    changes = await _status_changes(admin)
+    assert [(c["old_status"], c["new_status"]) for c in changes] == [
+        ("pending_carrier_registration", "error")
+    ]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize("status", PROBE_ONLY)
+async def test_a_healthy_probe_only_row_is_stamped_but_never_promoted(status: str):
+    """A credential Twilio still accepts is not carrier registration and not a hosted
+    number: the setup-owned status and its guidance stay, only the check is stamped."""
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/sms_sender"
+    await get_secret_store().put(ref, {"authToken": "tok"})
+    detail = "setup guidance the owner still needs"
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status=status,
+        detail=detail,
+        cfg={"accountSid": ACCOUNT_SID, "pending_destination": "+14155550131"},
+        secret_ref=ref,
+    )
+    result = await _sweep(admin)
+    assert result.get(str(cid)) == status, "probed — and still its own status"
+    row = await _row(admin, cid)
+    assert row.status == status
+    assert row.status_detail == detail
+    assert row.last_health_check_at == NOW
+    assert await _attention_emails(admin) == 0
+    assert await _status_changes(admin) == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_live_refusal_flips_a_pending_registration_row_at_once():
+    """A 401 on a real send (health.flag_if_provider_auth_failure) reaches the
+    probe-only row too, instead of being left to an owner who cannot see it."""
+    from app.connections import health
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="pending_carrier_registration",
+        cfg={"accountSid": ACCOUNT_SID, "destination": "+14155550132"},
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",
+    )
+    async with tenant_session(admin) as s:
+        flipped = await health.flag_if_provider_auth_failure(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="sms_sender",
+            reason="twilio_send_http_401",
+        )
+        assert flipped is True
+    row = await _row(admin, cid)
+    assert row.status == "error"
+    assert await _attention_emails(admin) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_repaired_credential_returns_a_parked_number_to_its_honest_state():
+    """After the sweep flipped a not-operable row to error, the owner's fixed
+    credential must not leave the row reading "error" (a credential problem they
+    just repaired) — the number's truth is unchanged: still not operable, still the
+    hosting guidance."""
+    from app.connections import service as conn_service
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="error",
+        detail="Your Twilio account rejected the stored credential (HTTP 401) — reconnect",
+        cfg={"accountSid": ACCOUNT_SID, "pending_destination": "+14155550133"},
+        secret_ref=f"vm/{admin}/{iid}/sms_sender",
+    )
+    async with tenant_session(admin) as s:
+        conn = await conn_service.submit_credentials(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            fields={"accountSid": ACCOUNT_SID, "authToken": "fresh-token"},
+            user_id=admin,
+        )
+        assert conn is not None
+        assert conn.status == "not_operable_hosting_required"
+        assert "Re-verify" in (conn.status_detail or "")
+    row = await _row(admin, cid)
+    assert row.status == "not_operable_hosting_required"
+    assert (row.non_secret_config or {}).get("pending_destination") == "+14155550133"
