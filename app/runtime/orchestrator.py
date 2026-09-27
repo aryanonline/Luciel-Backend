@@ -88,6 +88,7 @@ from app.runtime.escalation import (
     Signal,
     evaluate_intake,
     evaluate_outcome,
+    is_contact_details_turn,
     is_conversational_turn,
     is_repeated_question,
 )
@@ -101,7 +102,7 @@ from app.runtime.input_safety import (
     pre_send_check,
     wrap_untrusted,
 )
-from app.runtime.knowledge_retrieval import RetrieverBundle
+from app.runtime.knowledge_retrieval import RetrieverBundle, is_retrieval_unavailable
 from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_cap import LLMCapExceeded
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
@@ -228,6 +229,49 @@ def is_clarifying_question(text: str) -> bool:
     if not body.endswith("?") or len(body) > 160:
         return False
     return sum(body.count(ch) for ch in ".!?") == 1
+
+
+# A question mark or an interrogative anywhere means the message SEEKS something,
+# whatever else it is ("thanks — and do you open Saturdays?"): retrieval must run.
+_CARRIES_QUESTION = re.compile(
+    r"\?|\b(what|how|when|where|why|which|who|whether"
+    r"|do you|can you|could you|would you|are you|is there|does it|did you)\b",
+    re.IGNORECASE,
+)
+
+
+def retrieval_skippable(inbound_text: str, *, gather_pending: bool) -> bool:
+    """True when this turn has nothing to look up (round 7 WP-2 item 3, cost).
+
+    The retriever used to embed and search EVERY turn although the turn classifiers
+    had already decided "thanks!" or "here's my email" carries no question. A social
+    or contact-details turn with no question mark / interrogative, while no tool
+    gather is pending, skips the embedding call and the Knowledge block. Gate 2 is
+    untouched: it already exempts these turns from the floor, and a question in the
+    same breath keeps both the search and the floor."""
+    if gather_pending:
+        return False
+    if _CARRIES_QUESTION.search(inbound_text or ""):
+        return False
+    return is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)
+
+
+#: What the model is told about the knowledge search on a turn with NO chunks
+#: (round 7 WP-2, item 4). Without these it could not tell "nothing matched" from
+#: "the knowledge was never consulted": an absent block now means the search was
+#: skipped (a social turn), and each of the other two states is said in so many
+#: words. Both are deterministic platform notes, never a knowledge claim.
+KNOWLEDGE_NONE_MATCHED = "The business's knowledge was searched and nothing matched this question."
+KNOWLEDGE_UNAVAILABLE = "The knowledge could not be searched right now."
+
+#: ``knowledge_state`` values ``_reason`` composes the prompt from.
+_KNOWLEDGE_FOUND = "found"
+_KNOWLEDGE_NONE_MATCHED = "none_matched"
+_KNOWLEDGE_UNAVAILABLE = "unavailable"
+_KNOWLEDGE_NOT_SEARCHED = "not_searched"
+#: The key a platform-composed note carries on its message so a provider double
+#: (EchoModel) can tell it from the customer's own words. Live providers ignore it.
+PLATFORM_NOTE_KEY = "platform_note"
 
 
 #: Tools whose ``ok`` result the reply READS BACK — a booking, a free/busy answer, a
@@ -972,12 +1016,26 @@ class Orchestrator:
         # fabricated. When bound, an empty list here is a REAL "retrieval found
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
-        if self.retriever_bundle is not None:
-            raw_chunks, attributed_chunks = await self.retriever_bundle(inbound_text)
+        gather_pending = sess_obj is not None and sess_obj.input_ask_attempts > 0
+        if retrieval_skippable(inbound_text, gather_pending=gather_pending):
+            # Nothing to look up (item 3): no embedding call, no Knowledge block, and
+            # the row carries no attribution because no search ran (never a false
+            # "searched, nothing matched").
+            raw_chunks = []
+            knowledge_state = _KNOWLEDGE_NOT_SEARCHED
         else:
-            raw_chunks = await self.retriever(inbound_text)
-            if self.chunk_attributor is not None:
-                attributed_chunks = await self.chunk_attributor(inbound_text)
+            if self.retriever_bundle is not None:
+                raw_chunks, attributed_chunks = await self.retriever_bundle(inbound_text)
+            else:
+                raw_chunks = await self.retriever(inbound_text)
+                if self.chunk_attributor is not None:
+                    attributed_chunks = await self.chunk_attributor(inbound_text)
+            if is_retrieval_unavailable(attributed_chunks):
+                knowledge_state = _KNOWLEDGE_UNAVAILABLE
+            elif raw_chunks:
+                knowledge_state = _KNOWLEDGE_FOUND
+            else:
+                knowledge_state = _KNOWLEDGE_NONE_MATCHED
         wrapped_chunks = [wrap_untrusted(c) for c in raw_chunks]
 
         # --- CROSS-SESSION MEMORY (§3.4.6) ----------------------------------- #
@@ -1024,6 +1082,7 @@ class Orchestrator:
             system_prompt=system_prompt,
             tool_defs=tool_defs,
             session_id=session_id,
+            knowledge_state=knowledge_state,
         )
 
         if used_fallback:
@@ -1581,11 +1640,16 @@ class Orchestrator:
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
+        knowledge_state: str = _KNOWLEDGE_NOT_SEARCHED,
     ) -> tuple[_Reasoned, int, bool, str | None]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and why
         no model served the turn: None, ``_LLM_FAILURE_PROVIDER`` (BOTH providers
         failed) or ``_LLM_FAILURE_CAP`` (the tenant's per-minute cap refused it).
+
+        ``knowledge_state`` (item 4) says what the Knowledge block's absence means:
+        chunks found → the block; searched and nothing matched, or the search could
+        not run → the matching deterministic note; not searched → nothing at all.
 
         The cap is admitted ONCE at the turn boundary (``router.turn()``, round 7
         WP-2 item 4): the iterations inside share that admission, so a tool-using
@@ -1621,6 +1685,19 @@ class Orchestrator:
             messages.append({"role": role, "content": t.text})
         if wrapped_chunks:
             messages.append({"role": "user", "content": "Knowledge:\n" + "\n".join(wrapped_chunks)})
+        elif knowledge_state == _KNOWLEDGE_NONE_MATCHED:
+            # Searched, nothing matched (item 4): said in so many words, so the model
+            # answers from what it was given — or says it does not know — instead of
+            # reading an absent block as "I was never told anything about this".
+            messages.append(
+                {"role": "user", "content": KNOWLEDGE_NONE_MATCHED, PLATFORM_NOTE_KEY: True}
+            )
+        elif knowledge_state == _KNOWLEDGE_UNAVAILABLE:
+            # The embedding provider was down (the bundle persisted its marker): a
+            # different truth from "nothing matched", and the model is told which.
+            messages.append(
+                {"role": "user", "content": KNOWLEDGE_UNAVAILABLE, PLATFORM_NOTE_KEY: True}
+            )
 
         prompt = system_prompt if system_prompt is not None else self.system_prompt
         used_fallback = False
