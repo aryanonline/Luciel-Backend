@@ -557,6 +557,7 @@ async def replace_source(
     size_bytes: int,
     actor_user_id: uuid.UUID | None = None,
     extractor: GraphExtractor | None = None,
+    action: str = "replace",
 ) -> KnowledgeSource | None:
     """Replace affordance (Architecture §3.2.2): re-ingest a NEW file into an
     EXISTING source row. The source id/name/place-in-list is preserved but its
@@ -565,6 +566,13 @@ async def replace_source(
     updated" root-cause-fix flow (§5.2/§9). Returns None if the source does not
     exist for this tenant. Quota is re-checked against the NEW size, crediting
     back the old size first so a same-size or smaller replace never false-fails.
+
+    ``action`` labels the audit row: ``replace`` for the owner's affordance,
+    ``sync_update`` when a live-sync revision change re-ingests through this same
+    path (round 7 WP-4c #2 — the sync used to re-embed inline, skipping the quota
+    check, the size bookkeeping and the graph re-extraction this function does).
+    A ``QuotaError`` is raised BEFORE anything is wiped, so a refused replace leaves
+    the previous chunks and graph serving.
     """
     source = (
         await session.execute(
@@ -640,7 +648,7 @@ async def replace_source(
         actor_user_id=actor_user_id,
         actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
         event_type="knowledge_source_edited",
-        payload={"source_id": str(source_id), "action": "replace", "chunks": len(chunks)},
+        payload={"source_id": str(source_id), "action": action, "chunks": len(chunks)},
     )
     return source
 

@@ -26,13 +26,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.knowledge import service
 from app.models.audit import ActorType
-from app.models.knowledge import KnowledgeChunk, KnowledgeSource
+from app.models.knowledge import KnowledgeSource
 
 
 @dataclass
@@ -91,6 +91,11 @@ class SyncResult:
         self.added: list[str] = []
         self.updated: list[str] = []
         self.removed: list[str] = []
+        # Items the quota refused this pass (round 7 WP-4c #2): a new item over the
+        # per-file cap or the tenant total is not ingested; a changed item that grew
+        # past either keeps its PREVIOUS chunks serving and reads ``sync_status =
+        # "error"`` — never a silently truncated or silently absent page.
+        self.refused: list[str] = []
 
     def as_dict(self) -> dict[str, list[str]]:
         return {"added": self.added, "updated": self.updated, "removed": self.removed}
@@ -167,18 +172,29 @@ async def sync_connection(
             )
         raise SnapshotShrunk(existing=len(existing_by_ext), remote=len(remote_by_id))
 
-    # Additions + updates.
+    # Additions + updates. Both go through the SAME ingest functions the owner's
+    # upload/replace affordances use (round 7 WP-4c #2): the per-file cap, the tenant
+    # total, ``size_bytes`` and the graph extraction all apply to synced content
+    # exactly as they do to uploaded content. The update path used to re-embed inline
+    # — no quota, a size_bytes frozen at the first sync, a graph that never followed
+    # the page — so a synced page could grow past every limit unnoticed.
     for ext_id, item in remote_by_id.items():
         prior = existing_by_ext.get(ext_id)
         if prior is None:
-            src = await service.ingest_text(
-                session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                name=item.name,
-                text=item.text,
-                origin=origin,
-            )
+            try:
+                src = await service.ingest_text(
+                    session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    name=item.name,
+                    text=item.text,
+                    origin=origin,
+                )
+            except service.QuotaError:
+                # Nothing was written for this item (ingest_text checks before it
+                # inserts). It is not synced; the audit row below says so.
+                result.refused.append(ext_id)
+                continue
             src.connection_id = connection_id
             src.external_id = ext_id
             src.last_synced_at = datetime.now(UTC)
@@ -187,36 +203,30 @@ async def sync_connection(
             src.original_object_key = item.revision
             result.added.append(ext_id)
         elif prior.original_object_key != item.revision:
-            # Changed: replace chunks (re-chunk + re-embed) and bump revision.
-            await session.execute(
-                delete(KnowledgeChunk).where(
-                    KnowledgeChunk.admin_id == admin_id,
-                    KnowledgeChunk.source_id == prior.id,
+            # Changed: re-ingest through replace_source — quota (crediting the old
+            # size), chunks, size_bytes, graph — under the same source id.
+            try:
+                await service.replace_source(
+                    session,
+                    admin_id,
+                    prior.id,
+                    text=item.text,
+                    size_bytes=len(item.text.encode("utf-8")),
+                    action="sync_update",
                 )
-            )
-            from app.knowledge.chunking import chunk_text
-            from app.knowledge.embeddings import get_embedder
-
-            chunks = chunk_text(item.text)
-            vectors = await get_embedder().embed(chunks) if chunks else []
-            for ordinal, (c, vec) in enumerate(zip(chunks, vectors, strict=True)):
-                session.add(
-                    KnowledgeChunk(
-                        id=uuid.uuid4(),
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        source_id=prior.id,
-                        ordinal=ordinal,
-                        text=c,
-                        embedding=vec,
-                        embedding_model=service.embedding_model_name(get_embedder()),
-                    )
-                )
+            except service.QuotaError:
+                # The previous revision keeps serving (replace_source refuses before
+                # it wipes); the row reads the honest error state until the page
+                # shrinks or the quota frees up. The revision marker is NOT bumped,
+                # so the next pass tries again.
+                prior.sync_status = "error"
+                prior.last_synced_at = datetime.now(UTC)
+                result.refused.append(ext_id)
+                continue
             prior.name = item.name
             prior.original_object_key = item.revision
             prior.last_synced_at = datetime.now(UTC)
             prior.sync_status = "synced"
-            prior.last_updated_at = datetime.now(UTC)
             result.updated.append(ext_id)
         else:
             prior.last_synced_at = datetime.now(UTC)
@@ -246,6 +256,7 @@ async def sync_connection(
             "connection_id": str(connection_id),
             "origin": origin,
             **result.as_dict(),
+            "refused": result.refused,
         },
     )
     return result
