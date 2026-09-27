@@ -542,7 +542,9 @@ async def expire_platform_data(*, now: datetime | None = None) -> dict[str, int]
         )
         counts["contact_submission"] = int(result.rowcount or 0)  # type: ignore[attr-defined]
 
-        pruned = (
+        # Annotated: a textual SELECT's Result is untyped, and mypy 2.3.1 with the
+        # current SQLAlchemy stubs refuses to infer the scalar (nightly CI 2026-09-25).
+        pruned: int | None = (
             await s.execute(
                 sa_text("SELECT internal_access_prune(:cutoff)"),
                 {"cutoff": now - timedelta(days=3 * 365)},
