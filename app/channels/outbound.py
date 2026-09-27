@@ -41,6 +41,11 @@ POLL_ONLY_CHANNELS = frozenset({"widget"})
 # already on the wire by the time the webhook returns (§3.1.4).
 INLINE_REPLY_CHANNELS = frozenset({"sms"})
 
+# The Meta messaging surfaces (§3.1.2 split ids + the legacy combined id): the reply is
+# sent AS a tenant surface (page / IG account / WhatsApp phone-number id) TO a
+# platform-scoped customer id, through the grant that owns that surface.
+META_CHANNELS = frozenset({"whatsapp", "messenger", "instagram", "instagram_messenger"})
+
 DEFAULT_EMAIL_SUBJECT = "Re: your inquiry"
 
 #: Who wrote the reply (round 7 WP-3b, item 3). Mirrors the transcript roles.
@@ -111,7 +116,7 @@ async def send_outbound_reply(
             in_reply_to=in_reply_to,
             author_role=author_role,
         )
-    elif channel in ("whatsapp", "messenger", "instagram", "instagram_messenger"):
+    elif channel in META_CHANNELS:
         receipt = await _send_meta(
             session, admin_id, instance_id, channel=channel, to=to, body=body, sender_id=sender_id
         )

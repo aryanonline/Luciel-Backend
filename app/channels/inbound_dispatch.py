@@ -132,7 +132,7 @@ async def persist_reply_context(
                 meta.get("graph_message_id") or meta.get("internet_message_id"), _SUBJECT_MAX
             ),
         }
-    elif msg.channel in ("whatsapp", "messenger", "instagram", "instagram_messenger"):
+    elif msg.channel in outbound.META_CHANNELS:
         values = {
             "meta_destination_id": _clip(
                 meta.get("destination_id") or meta.get("phone_number_id"), _META_ID_MAX

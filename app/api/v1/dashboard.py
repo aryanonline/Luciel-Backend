@@ -208,18 +208,16 @@ async def send_human_message(
         await s.refresh(row)  # `at` is a server default — read it back before echoing it
         sess.last_message_at = row.at
 
-        recipient = None
-        if sess.resolved_lead_id is not None:
-            lead = (
-                await s.execute(
-                    select(Lead).where(
-                        Lead.admin_id == subject.admin_id, Lead.id == sess.resolved_lead_id
-                    )
-                )
-            ).scalar_one_or_none()
-            recipient = lead.contact_identifier if lead is not None else None
+        recipient = await _takeover_recipient(s, admin_id=subject.admin_id, sess=sess)
 
-        if sess.channel == "voice":
+        if recipient is None and sess.channel not in outbound.POLL_ONLY_CHANNELS:
+            # The lead is not known by any identifier THIS channel can deliver to
+            # (round 7 WP-3b, item 1). The reply stays persisted and the owner is told
+            # so; it is never re-routed to an identifier on another channel.
+            result = outbound.OutboundResult(
+                channel=sess.channel, delivered=False, detail="no_recipient_for_channel"
+            )
+        elif sess.channel == "voice":
             # A voice conversation has no text transport of its own: the reply reaches
             # the caller as an SMS on the tenant's number (owner decision 2026-09-05).
             # Honest on both sides — gated on the SMS channel being switched on and the
@@ -261,6 +259,77 @@ async def send_human_message(
             delivered=result.delivered,
             delivery_detail=_delivery_detail(detail),
         )
+
+
+async def _session_lead(s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel) -> Lead | None:
+    if sess.resolved_lead_id is None:
+        return None
+    lead: Lead | None = (
+        await s.execute(
+            select(Lead).where(Lead.admin_id == admin_id, Lead.id == sess.resolved_lead_id)
+        )
+    ).scalar_one_or_none()
+    return lead
+
+
+async def _takeover_recipient(
+    s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel
+) -> str | None:
+    """The identifier a human reply on THIS session's channel can reach (round 7
+    WP-3b, item 1), or None when the lead is not known by one of that kind.
+
+    ``Lead.contact_identifier`` is whichever identity the record was keyed on FIRST —
+    after a widget-then-SMS unification that is the older, email-keyed row — so it is
+    not, in general, an identifier the session's transport can deliver to; the reply
+    used to go to it regardless of channel. The destination is picked by the session's
+    channel kind from the identifiers the lead is known by (own columns, then the
+    ``lead_identifiers`` rows a unification re-pointed — confirmed ones first):
+
+      * email → an email identifier;
+      * sms / voice → an E.164 phone (a voice reply bridges to a text);
+      * Meta → the platform-scoped sender id persisted for the session at ingress
+        (item 7). A session from before that column can use the record's own key only
+        when it IS a platform-scoped id — never an email or phone from another channel.
+
+    The widget has no transport at all and is reported as ``widget_poll_only`` by the
+    sender; nothing is picked for it here."""
+    from app.models.lead import LeadIdentifier  # noqa: PLC0415
+    from app.runtime.lead_capture import identifier_kind  # noqa: PLC0415
+
+    if sess.channel in outbound.POLL_ONLY_CHANNELS:
+        return None
+    lead = await _session_lead(s, admin_id=admin_id, sess=sess)
+    if sess.channel in outbound.META_CHANNELS:
+        if sess.meta_sender_id:
+            return sess.meta_sender_id
+        own = lead.contact_identifier if lead is not None else None
+        if own and identifier_kind(own) == "transport":
+            return own.strip()
+        return None
+    if lead is None:
+        return None
+    kind = "email" if sess.channel == "email" else "phone"
+    volunteered = lead.email if kind == "email" else lead.phone
+    for value in (lead.contact_identifier, volunteered):
+        if value and identifier_kind(value) == kind:
+            return value.strip()
+    known: str | None = (
+        await s.execute(
+            select(LeadIdentifier.value)
+            .where(
+                LeadIdentifier.admin_id == admin_id,
+                LeadIdentifier.lead_id == lead.id,
+                LeadIdentifier.kind == kind,
+            )
+            .order_by(
+                LeadIdentifier.confirmed_at.desc().nulls_last(),
+                LeadIdentifier.created_at.desc(),
+                LeadIdentifier.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return known
 
 
 async def _bridge_voice_reply_to_sms(
@@ -314,6 +383,8 @@ _WIRE_DELIVERY_DETAILS = frozenset(
         "sms_sender_not_operable",
         "email_sender_not_connected",
         "mailbox_reconnect_needed",
+        # Round 7 WP-3b item 1: no identifier of this channel's kind on the lead.
+        "no_recipient_for_channel",
     }
 )
 
