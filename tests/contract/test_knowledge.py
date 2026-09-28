@@ -90,9 +90,12 @@ async def test_paste_ingest_then_list_and_chunks(client):
 
     rc = await client.get(f"/api/v1/admin/knowledge/sources/{source_id}/chunks")
     assert rc.status_code == 200
-    chunks = rc.json()
+    page = rc.json()
+    chunks = page["chunks"]
     assert len(chunks) >= 1
     assert "text" in chunks[0] and "ordinal" in chunks[0]
+    # Round 7 WP-4c #6: the page carries the real count, not the page length.
+    assert page["totalChunks"] == len(chunks) and page["pageSize"] == 20
 
     # quota now reflects the ingest
     rq = await client.get("/api/v1/admin/knowledge/quota")

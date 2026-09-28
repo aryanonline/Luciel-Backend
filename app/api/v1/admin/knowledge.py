@@ -49,6 +49,7 @@ from app.models.knowledge import KnowledgeSource
 from app.schemas_api.knowledge import (
     CreateSyncConnectionRequest,
     KnowledgeChunkOut,
+    KnowledgeChunkPageOut,
     KnowledgeQuotaOut,
     KnowledgeScopeOut,
     KnowledgeSourceOut,
@@ -147,20 +148,31 @@ async def list_sources(subject: Subject = Depends(current_admin)) -> list[Knowle
         return [_source_out(x, used.get(x.id, 0)) for x in sources]
 
 
-@router.get("/sources/{source_id}/chunks", response_model=list[KnowledgeChunkOut])
+@router.get("/sources/{source_id}/chunks", response_model=KnowledgeChunkPageOut)
 async def get_chunks(
     source_id: uuid.UUID, subject: Subject = Depends(current_admin)
-) -> list[KnowledgeChunkOut]:
+) -> KnowledgeChunkPageOut:
+    """The first page of a source's chunks plus the honest total (round 7 WP-4c #6).
+
+    The list alone made the raw view print "first 20 of 20" for a source with 300
+    chunks — the page length was standing in for the count."""
     async with tenant_session(subject.admin_id) as s:
         # view_chunks emits the knowledge_source_viewed audit event (Architecture
         # §3.2.2 "view + edit + delete history flows into admin_audit_log"; Axis4-F04).
-        chunks = await service.view_chunks(s, subject.admin_id, source_id, subject.user_id)
-        return [
-            KnowledgeChunkOut.model_validate(
-                {"chunkId": c.id, "sourceId": c.source_id, "ordinal": c.ordinal, "text": c.text}
-            )
-            for c in chunks
-        ]
+        chunks = await service.view_chunks(
+            s, subject.admin_id, source_id, subject.user_id, limit=service.CHUNK_PREVIEW_PAGE
+        )
+        total = await service.count_chunks(s, subject.admin_id, source_id)
+        return KnowledgeChunkPageOut(
+            chunks=[
+                KnowledgeChunkOut.model_validate(
+                    {"chunkId": c.id, "sourceId": c.source_id, "ordinal": c.ordinal, "text": c.text}
+                )
+                for c in chunks
+            ],
+            total_chunks=total,
+            page_size=service.CHUNK_PREVIEW_PAGE,
+        )
 
 
 @router.get("/quota", response_model=KnowledgeQuotaOut)

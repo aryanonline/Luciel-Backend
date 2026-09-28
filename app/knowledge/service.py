@@ -272,8 +272,33 @@ async def sources_by_id(
     return {row[0]: row[1] for row in rows}
 
 
+#: The raw view's chunk preview page (round 7 WP-4c #6). The route returns this many
+#: chunks plus the REAL total, so the UI can say "first 20 of 300" instead of
+#: reading the page length as the count.
+CHUNK_PREVIEW_PAGE = 20
+
+
+async def count_chunks(session: AsyncSession, admin_id: uuid.UUID, source_id: uuid.UUID) -> int:
+    """How many chunks a source has — the honest denominator of the preview."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.admin_id == admin_id,
+                    KnowledgeChunk.source_id == source_id,
+                )
+            )
+        ).scalar_one()
+    )
+
+
 async def get_chunks(
-    session: AsyncSession, admin_id: uuid.UUID, source_id: uuid.UUID, limit: int = 20
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    limit: int = CHUNK_PREVIEW_PAGE,
 ) -> list[KnowledgeChunk]:
     return list(
         (
@@ -297,7 +322,7 @@ async def view_chunks(
     admin_id: uuid.UUID,
     source_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
-    limit: int = 20,
+    limit: int = CHUNK_PREVIEW_PAGE,
 ) -> list[KnowledgeChunk]:
     """Return a source's chunks AND emit a ``knowledge_source_viewed`` audit event.
 
