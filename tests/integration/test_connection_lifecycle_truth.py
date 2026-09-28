@@ -516,3 +516,138 @@ async def test_a_number_change_that_demotes_a_serving_row_is_audited():
         }
     ]
     assert await _attention_emails(admin) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Item 5 — an abandoned reconnect marker stops shielding the row after 15 minutes
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_abandoned_swap_is_cleared_after_fifteen_minutes_and_the_row_is_swept():
+    from datetime import timedelta
+
+    from app.connections import service as conn_service
+    from app.connections.secrets import get_secret_store
+    from app.knowledge.providers import staged_secret_ref
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "live-tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        out = await conn_service.swap(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            provider="salesforce",
+            user_id=admin,
+            now=NOW,
+        )
+        assert out is not None
+    # A consent the owner started but never finished left a staged token behind.
+    await get_secret_store().put(staged_secret_ref(ref), {"access_token": "half-done"})
+
+    row = await _row(admin, cid)
+    cfg = row.non_secret_config or {}
+    assert cfg.get("pending_provider") == "salesforce"
+    assert cfg.get("reconnect_pending_since") == NOW.isoformat()
+    assert (row.status_detail or "").startswith("reconnect_pending:prior_status=connected")
+
+    # Ten minutes in: the attempt is still live — the marker shields the row.
+    result = await _sweep(admin, now=NOW + timedelta(minutes=10))
+    assert result.get(str(cid)) == "connected"
+    row = await _row(admin, cid)
+    assert (row.status_detail or "").startswith("reconnect_pending:")
+    assert row.last_health_check_at is None
+    assert (row.non_secret_config or {}).get("pending_provider") == "salesforce"
+
+    # Sixteen minutes in: abandoned — cleared, restored, audited, then probed.
+    later = NOW + timedelta(minutes=16)
+    result = await _sweep(admin, now=later)
+    assert result.get(str(cid)) == "connected"
+    row = await _row(admin, cid)
+    assert row.status == "connected"
+    assert row.status_detail is None
+    assert row.provider == "hubspot", "the live provider was never cut over"
+    assert row.last_health_check_at == later
+    cfg = row.non_secret_config or {}
+    assert "pending_provider" not in cfg
+    assert "reconnect_pending_since" not in cfg
+    assert "oauth_state_jti" not in cfg
+    assert await get_secret_store().get(staged_secret_ref(ref)) is None
+    assert await get_secret_store().get(ref) == {"access_token": "live-tok"}
+    reasons = [c["reason"] for c in await _status_changes(admin)]
+    assert "reconnect_abandoned" in reasons
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_marker_without_a_timestamp_is_abandoned_and_a_dead_credential_is_caught():
+    """The pre-item-5 shape: a marker nothing could ever clear, over a credential
+    that has since vanished — the row read Connected forever."""
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="calendar",
+        provider="google_calendar",
+        auth_class="oauth_token",
+        status="connected",
+        detail="reconnect_pending:prior_status=connected",
+        cfg={"pending_provider": "calendly", "oauth_state_jti": "stale"},
+        secret_ref=f"vm/{admin}/{iid}/calendar",  # stamped, nothing behind it
+    )
+    result = await _sweep(admin)
+    assert result.get(str(cid)) == "error"
+    row = await _row(admin, cid)
+    assert row.status == "error"
+    assert not (row.status_detail or "").startswith("reconnect_pending:")
+    assert row.provider == "google_calendar"
+    assert "pending_provider" not in (row.non_secret_config or {})
+    assert "oauth_state_jti" not in (row.non_secret_config or {})
+    assert await _attention_emails(admin) == 1
+    transitions = [
+        (c["old_status"], c["new_status"], c["reason"]) for c in await _status_changes(admin)
+    ]
+    assert transitions[0] == ("connected", "connected", "reconnect_abandoned")
+    assert transitions[-1][:2] == ("connected", "error")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_abandoned_reconnect_on_a_pending_number_restores_its_guidance():
+    from datetime import timedelta
+
+    from app.connections import service as conn_service
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/sms_sender"
+    await get_secret_store().put(ref, {"authToken": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="pending_carrier_registration",
+        detail="registration guidance",
+        cfg={"accountSid": ACCOUNT_SID, "destination": "+14155550150"},
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        await conn_service.reconnect(s, admin_id=admin, connection_id=cid, user_id=admin, now=NOW)
+    await _sweep(admin, now=NOW + timedelta(minutes=20))
+    row = await _row(admin, cid)
+    assert row.status == "pending_carrier_registration"
+    assert "A2P 10DLC" in (row.status_detail or ""), "the number guidance is back, not blank"

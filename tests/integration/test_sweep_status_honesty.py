@@ -170,6 +170,11 @@ async def test_sweep_never_touches_setup_owned_statuses(status: str):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_staged_swap_marker_survives_a_sweep():
+    """A FRESH marker (round 7 WP-4a item 5: one stamped within the abandonment
+    window) shields the row; the abandoned-marker proofs live in
+    test_connection_lifecycle_truth.py."""
+    from datetime import UTC, datetime
+
     admin = uuid.uuid4()
     iid = await _seed_tenant(admin)
     cid = await _seed_connection(
@@ -181,6 +186,7 @@ async def test_staged_swap_marker_survives_a_sweep():
         status="connected",
         detail="reconnect_pending:prior_status=connected",
         with_material=True,
+        config={"reconnect_pending_since": datetime.now(UTC).isoformat()},
     )
     await _sweep(admin)
     row = await _row(admin, cid)

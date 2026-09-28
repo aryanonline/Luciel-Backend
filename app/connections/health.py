@@ -83,8 +83,120 @@ HEALTH_PROBE_ONLY_STATUSES: frozenset[str] = frozenset(
 HEALTH_SWEPT_STATUSES: frozenset[str] = HEALTH_OWNED_STATUSES | HEALTH_PROBE_ONLY_STATUSES
 
 
+# Round 7 WP-4a item 5: a proven-before-cutover marker (service.py rule B) parks the
+# row outside the sweep while the owner completes the new consent. An owner who
+# closed the tab left the marker forever — and the row outside health forever, so a
+# credential that died a month later still read Connected. An attempt older than
+# this is abandoned: the sweep clears the marker, restores the prior status and
+# audits it, then probes the row like any other. Fifteen minutes is longer than any
+# consent screen and shorter than the sweep's own cadence.
+RECONNECT_ABANDON_AFTER = timedelta(minutes=15)
+RECONNECT_MARKER_PREFIX = "reconnect_pending:prior_status="
+
+
 def _mid_reconnect(connection: InstanceConnection) -> bool:
     return (connection.status_detail or "").startswith("reconnect_pending:")
+
+
+def _reconnect_since(connection: InstanceConnection) -> datetime | None:
+    from app.connections.service import RECONNECT_PENDING_SINCE_KEY  # noqa: PLC0415
+
+    raw = (connection.non_secret_config or {}).get(RECONNECT_PENDING_SINCE_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def reconnect_abandoned(connection: InstanceConnection, now: datetime) -> bool:
+    """True iff the row carries a staged-swap marker whose attempt is older than
+    ``RECONNECT_ABANDON_AFTER``. A marker with NO timestamp (written before item 5)
+    is abandoned by definition: nothing could ever have cleared it."""
+    if not _mid_reconnect(connection):
+        return False
+    since = _reconnect_since(connection)
+    return since is None or now - since >= RECONNECT_ABANDON_AFTER
+
+
+async def clear_abandoned_reconnect(
+    session: AsyncSession, connection: InstanceConnection, *, now: datetime
+) -> str:
+    """Give up on an abandoned reconnect/swap attempt (round 7 WP-4a item 5).
+
+    The prior status the marker preserved is restored (the live credential never
+    stopped serving — this is bookkeeping, not a cutover), every trace of the
+    attempt goes with it (the staged provider, the parked OAuth state so a late
+    callback cannot redeem it, the staged secret), and the row is audited so the
+    owner's history says the attempt lapsed. Returns the restored status."""
+    from app.connections.service import RECONNECT_PENDING_SINCE_KEY  # noqa: PLC0415
+    from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+    detail = connection.status_detail or ""
+    prior_status = (
+        detail[len(RECONNECT_MARKER_PREFIX) :]
+        if detail.startswith(RECONNECT_MARKER_PREFIX)
+        else connection.status
+    ) or connection.status
+    old_status = connection.status
+    cfg = dict(connection.non_secret_config or {})
+    for key in (
+        "pending_provider",
+        "oauth_state_jti",
+        "authorize_url",
+        RECONNECT_PENDING_SINCE_KEY,
+    ):
+        cfg.pop(key, None)
+    connection.non_secret_config = cfg
+    if connection.secret_ref:
+        try:
+            await get_secret_store().delete(staged_secret_ref(connection.secret_ref))
+        except Exception:  # noqa: BLE001 — a store blip must not wedge the sweep
+            _log.exception("staged secret could not be discarded for an abandoned reconnect")
+    connection.status, connection.status_detail = _status_after_abandoned_reconnect(
+        connection, prior_status
+    )
+    await audit.emit(
+        session,
+        admin_id=connection.admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.platform,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": connection.status,
+            "reason": "reconnect_abandoned",
+        },
+    )
+    await session.flush()
+    return connection.status
+
+
+def _status_after_abandoned_reconnect(
+    connection: InstanceConnection, prior_status: str
+) -> tuple[str, str | None]:
+    """The honest (status, detail) once an attempt lapses: the prior status for every
+    row, with an sms row's number guidance re-derived (the marker had overwritten it)
+    rather than a blank detail over a pending or not-operable number."""
+    if connection.connection_type != "sms_sender":
+        return prior_status, None
+    from app.channels.phone_lifecycle import (  # noqa: PLC0415
+        status_for_confirmed_number,
+        status_for_pending_number,
+    )
+    from app.connections.service import SMS_NEEDS_NUMBER_DETAIL  # noqa: PLC0415
+
+    cfg = connection.non_secret_config or {}
+    if prior_status in ("error", "expired"):
+        return prior_status, None  # the sweep re-probes it in this same pass
+    if cfg.get("destination"):
+        return status_for_confirmed_number(cfg)
+    if cfg.get("pending_destination"):
+        return status_for_pending_number()
+    return "unconfigured", SMS_NEEDS_NUMBER_DETAIL
 
 
 def health_owned(connection: InstanceConnection) -> bool:
@@ -495,6 +607,10 @@ async def run_health_sweep(
     )
     out: dict[str, str] = {}
     for connection in connections:
+        if reconnect_abandoned(connection, now):
+            # Item 5: an attempt nobody finished stops shielding the row; it is
+            # then probed in this same pass like any other.
+            await clear_abandoned_reconnect(session, connection, now=now)
         status = await check_connection(
             session,
             connection=connection,

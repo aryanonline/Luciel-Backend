@@ -662,6 +662,7 @@ async def reconnect(
     admin_id: uuid.UUID,
     connection_id: uuid.UUID,
     user_id: uuid.UUID | None,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Re-initiate a connect flow: proven-before-cutover (Decision §45 / §3.8.7 rule B).
 
@@ -670,7 +671,11 @@ async def reconnect(
     dependency offline before the new credential is confirmed healthy.  Instead:
 
       1. ``status_detail`` records ``reconnect_pending:prior_status=<old>`` so the
-         confirm step (and the health worker) can roll back if the probe fails.
+         confirm step (and the health worker) can roll back if the probe fails, and
+         ``non_secret_config['reconnect_pending_since']`` records WHEN the attempt
+         began (round 7 WP-4a item 5) — the sweep treats a marker older than
+         ``health.RECONNECT_ABANDON_AFTER`` as abandoned and clears it, instead of
+         excluding the row from health forever because the owner closed the tab.
       2. When the OAuth callback / credential submission arrives, the caller invokes
          ``confirm_reconnect()`` which health-checks the new credential and only then
          cuts over to ``connected`` (or restores the prior status on failure).
@@ -692,7 +697,7 @@ async def reconnect(
 
     # Proven-before-cutover: record intent without taking the live connection offline.
     old_status = connection.status
-    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
+    _stage_reconnect_marker(connection, old_status, now or datetime.now(UTC))
     await session.flush()
 
     await audit.emit(
@@ -712,6 +717,22 @@ async def reconnect(
     return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
 
+#: non_secret_config key: ISO timestamp of when the current reconnect/swap attempt
+#: began (round 7 WP-4a item 5). Read by the health sweep's abandonment rule.
+RECONNECT_PENDING_SINCE_KEY = "reconnect_pending_since"
+
+
+def _stage_reconnect_marker(
+    connection: InstanceConnection, prior_status: str, now: datetime
+) -> None:
+    """Write the proven-before-cutover marker (status_detail) and its attempt
+    timestamp (non_secret_config) together, so neither can exist without the other."""
+    connection.status_detail = f"reconnect_pending:prior_status={prior_status}"
+    cfg = dict(connection.non_secret_config or {})
+    cfg[RECONNECT_PENDING_SINCE_KEY] = now.isoformat()
+    connection.non_secret_config = cfg
+
+
 async def swap(
     session: AsyncSession,
     *,
@@ -719,6 +740,7 @@ async def swap(
     connection_id: uuid.UUID,
     provider: str,
     user_id: uuid.UUID | None,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Change the connected account: re-initiate a connect flow against a (possibly
     different) provider WITHOUT taking the current connection offline (§3.8.7 rule B,
@@ -780,7 +802,7 @@ async def swap(
     existing_config = dict(connection.non_secret_config or {})
     existing_config["pending_provider"] = provider
     connection.non_secret_config = existing_config
-    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
+    _stage_reconnect_marker(connection, old_status, now or datetime.now(UTC))
     await session.flush()
 
     await audit.emit(
@@ -851,6 +873,7 @@ async def confirm_reconnect(
     # config; only apply it to `connection.provider` on a confirmed-healthy probe.
     config = dict(connection.non_secret_config or {})
     pending_provider = config.pop("pending_provider", None)
+    config.pop(RECONNECT_PENDING_SINCE_KEY, None)  # the attempt is over either way (item 5)
 
     if probe_ok:
         # New credential confirmed healthy — cut over now (proven-before-cutover).
@@ -1201,7 +1224,12 @@ async def disconnect(
 
     old_status = connection.status
     cfg = dict(connection.non_secret_config or {})
-    for ephemeral in ("oauth_state_jti", "authorize_url", "pending_provider"):
+    for ephemeral in (
+        "oauth_state_jti",
+        "authorize_url",
+        "pending_provider",
+        RECONNECT_PENDING_SINCE_KEY,
+    ):
         cfg.pop(ephemeral, None)
     # A disconnected OUTLOOK mailbox releases its routing claim. Unlike a BYO phone
     # number (kept — it is the owner's own asset to re-link), the mailbox address was
