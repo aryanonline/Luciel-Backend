@@ -56,6 +56,42 @@ class EmailDeliveryIncident(Base, TenantMixin, TimestampMixin):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class EscalationContactConfirmation(Base, TenantMixin, TimestampMixin):
+    """Channel-agnostic proof that an escalation contact can hear a page (round 7 WP-4b).
+
+    One row per (tenant, ``kind``, normalized value). ``email`` rows mirror the link
+    loop above (``confirmed_at`` is written when the link is clicked, so this table is
+    the one place both kinds can be read); ``sms`` rows carry the 6-digit code loop: the
+    hashed code still outstanding, when it was sent, and how many wrong entries it has
+    absorbed. A contact with no ``confirmed_at`` is unproven, and the owner is copied on
+    every page to it — the rule that already held for email and never held for a number.
+    """
+
+    __tablename__ = "escalation_contact_confirmations"
+    __table_args__ = (
+        UniqueConstraint(
+            "admin_id", "kind", "value_normalized", name="uq_escalation_contact_confirmation"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # email | sms
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    # Lower-cased address, or +digits for a number — the join key against the config.
+    value_normalized: Mapped[str] = mapped_column(String(320), nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_code_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Wrong codes entered against the outstanding code; a fresh code resets it.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # SHA-256 of (tenant, value, code) — never the code itself.
+    code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    code_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 def is_suppressed(row: EmailDeliveryIncident | None) -> bool:
     """Hard-bounced or complained, and not re-verified since the incident.
 

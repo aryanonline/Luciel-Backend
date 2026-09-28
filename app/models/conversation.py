@@ -156,3 +156,6 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
     )
     delivery_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The provider id of the send ``delivery_status`` rests on (round 7 WP-4b, migration
+    # 0069): a Twilio status callback finds the row by it and stamps the real DLR.
+    delivery_provider_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
