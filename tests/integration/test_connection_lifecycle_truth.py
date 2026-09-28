@@ -651,3 +651,125 @@ async def test_an_abandoned_reconnect_on_a_pending_number_restores_its_guidance(
     row = await _row(admin, cid)
     assert row.status == "pending_carrier_registration"
     assert "A2P 10DLC" in (row.status_detail or ""), "the number guidance is back, not blank"
+
+
+# --------------------------------------------------------------------------- #
+# Item 4 — a credential-form swap proves its target before the live secret moves
+# --------------------------------------------------------------------------- #
+
+WEBHOOK_URL = "https://hooks.acme.example/leads"
+
+
+@pytest.fixture
+def _record_transport():
+    from app.tools.record_backend import MockRecordTransport
+
+    MockRecordTransport.reset()
+    yield MockRecordTransport
+    MockRecordTransport.reset()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_hubspot_to_webhook_swap_whose_endpoint_refuses_leaves_hubspot_serving(
+    _record_transport,
+):
+    from app.connections import service as conn_service
+    from app.connections.secrets import get_secret_store
+    from app.knowledge.providers import staged_secret_ref
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "hs-live"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        out = await conn_service.swap(
+            s, admin_id=admin, connection_id=cid, provider="custom_webhook", user_id=admin, now=NOW
+        )
+        assert out is not None and out[1] == {"requires_client_form": True}
+
+    # The owner's endpoint refuses the header they pasted.
+    _record_transport.seed(WEBHOOK_URL, 401)
+    with pytest.raises(conn_service.CredentialRejected, match="refused the Authorization header"):
+        async with tenant_session(admin) as s:
+            await conn_service.submit_credentials(
+                s,
+                admin_id=admin,
+                connection_id=cid,
+                fields={"url": WEBHOOK_URL, "auth_header": "Bearer wrong"},
+                user_id=admin,
+            )
+    row = await _row(admin, cid)
+    assert row.provider == "hubspot"
+    assert row.auth_class == "oauth_token"
+    assert row.status == "connected"
+    assert "url" not in (row.non_secret_config or {})
+    assert await get_secret_store().get(ref) == {"access_token": "hs-live"}, "HubSpot still serves"
+    assert await get_secret_store().get(staged_secret_ref(ref)) is None, "the refused copy is gone"
+    # The swap is still open for a corrected submit (item 5 abandons it in 15 minutes).
+    assert (row.non_secret_config or {}).get("pending_provider") == "custom_webhook"
+    assert (row.status_detail or "").startswith("reconnect_pending:prior_status=connected")
+
+    # A corrected header the endpoint accepts (a POST-only receiver answers 405 to
+    # the GET — reachable, header accepted) promotes: cutover happens only now.
+    _record_transport.seed(WEBHOOK_URL, 405)
+    async with tenant_session(admin) as s:
+        conn = await conn_service.submit_credentials(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            fields={"url": WEBHOOK_URL, "auth_header": "Bearer right"},
+            user_id=admin,
+        )
+        assert conn is not None
+    row = await _row(admin, cid)
+    assert row.provider == "custom_webhook"
+    assert row.auth_class == "long_lived_token"
+    assert row.status == "connected"
+    assert row.status_detail is None
+    assert (row.non_secret_config or {}).get("url") == WEBHOOK_URL
+    assert "pending_provider" not in (row.non_secret_config or {})
+    assert await get_secret_store().get(ref) == {"auth_header": "Bearer right"}
+    assert await get_secret_store().get(staged_secret_ref(ref)) is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_down_webhook_endpoint_fails_a_fresh_connect_without_a_connected_row(
+    _record_transport,
+):
+    from app.connections import service as conn_service
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/outbound_webhook"
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="outbound_webhook",
+        provider="outbound_webhook",
+        auth_class="long_lived_token",
+        status="unconfigured",
+        secret_ref=ref,
+    )
+    _record_transport.seed(WEBHOOK_URL, 503)
+    with pytest.raises(conn_service.CredentialRejected, match="did not answer"):
+        async with tenant_session(admin) as s:
+            await conn_service.submit_credentials(
+                s,
+                admin_id=admin,
+                connection_id=cid,
+                fields={"url": WEBHOOK_URL},
+                user_id=admin,
+            )
+    row = await _row(admin, cid)
+    assert row.status == "unconfigured"
+    assert await get_secret_store().get(ref) is None

@@ -547,6 +547,12 @@ def canonical_provider(provider: str) -> str:
 # The connection types that present the owner a provider choice (Decision #6).
 CHOICE_TYPES: frozenset[str] = frozenset(_ORDER)
 
+# Providers whose whole credential is an https URL plus an OPTIONAL Authorization
+# header (round 7 WP-4a items 4/6): proven at connect time by a GET the endpoint must
+# not refuse, and probed by the sweep the same way. ``live_connector`` is URL-shaped
+# too but carries its own record-array proof (item 1).
+URL_SHAPED_PROVIDERS: frozenset[str] = frozenset({"custom_webhook", "outbound_webhook"})
+
 # Providers ACCEPTED for a connection type but deliberately absent from its owner-facing
 # choice list. Knowledge sync (§3.2.3) rides ``knowledge_source`` connections for two cases
 # that are not "pick a knowledge provider" options: the CRM knowledge base (same vendor

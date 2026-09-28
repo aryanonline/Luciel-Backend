@@ -120,6 +120,64 @@ async def prove_live_connector(*, url: str, api_key: str | None, transport: Any 
     )
 
 
+class WebhookProofFailed(Exception):
+    """The owner's webhook endpoint did not prove itself. Carries an owner-facing reason."""
+
+
+async def prove_webhook_endpoint(
+    *, url: str, auth_header: str | None, transport: Any = None
+) -> None:
+    """Connect-time proof for the URL-shaped providers — ``custom_webhook`` and
+    ``outbound_webhook`` (round 7 WP-4a item 4).
+
+    One ``GET <url>`` carrying the owner's Authorization header, through the same
+    pinned transport the record proof uses (``build_record_transport``: connect to the
+    validated address with Host/SNI in live, the seeded mock otherwise). A webhook
+    receiver is a POST target, so the proof asks only what a GET can honestly answer:
+
+      * 401 / 403 → the endpoint refused the Authorization header: the connect fails;
+      * 5xx, a timeout, a transport error → the endpoint did not answer: the connect
+        fails rather than minting a Connected row over a dead URL;
+      * anything else (2xx, a 404 or 405 from a POST-only receiver) → reachable, and
+        the header was accepted.
+
+    Before this a credential-form swap onto a webhook provider wrote the new material
+    straight over the live secret and flipped the row to connected with no proof at
+    all — a HubSpot tenant moving to an endpoint that refused their header lost the
+    working HubSpot credential and gained a dead webhook.
+    """
+    from app.tools.record_backend import (  # noqa: PLC0415 — keeps the probe import light
+        RecordSourceUnavailable,
+        build_record_transport,
+    )
+
+    transport = transport if transport is not None else build_record_transport()
+    headers = {"Accept": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    try:
+        status, _body = await transport.get(url, headers=headers)
+    except RecordSourceUnavailable as exc:
+        raise WebhookProofFailed(
+            f"Your webhook URL could not be reached ({exc}). Check the address."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — transport detail must not leak
+        raise WebhookProofFailed(
+            f"Your webhook URL did not answer a test request ({type(exc).__name__}). "
+            "Check the address."
+        ) from exc
+    if status in AUTH_REFUSED_STATUSES:
+        raise WebhookProofFailed(
+            f"Your webhook URL refused the Authorization header (HTTP {status}). "
+            "Check the header value."
+        )
+    if status >= 500:
+        raise WebhookProofFailed(
+            f"Your webhook URL did not answer a test request (HTTP {status}). "
+            "Check that the endpoint is up and try again."
+        )
+
+
 @dataclass(frozen=True)
 class LivenessRequest:
     """The one GET that proves a stored credential still works at its provider."""

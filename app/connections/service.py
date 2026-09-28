@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,9 @@ from app.connections.secrets import (
 )
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
+
+if TYPE_CHECKING:
+    from app.channels.tenant_twilio import TwilioCredentials
 
 # §3.8.2: auth_class is the behavior key (drives what the §3.8.5 health probe and
 # token refresh do for the row — the sweep is one 6-hour cron), defaulted from
@@ -410,6 +414,64 @@ class CredentialRejected(ValueError):
     """The submitted connect-form credential is missing, malformed, or refused."""
 
 
+async def _prove_submitted_credential(
+    *,
+    provider: str,
+    url: str | None,
+    material: dict[str, str],
+    twilio_creds: TwilioCredentials | None,
+) -> None:
+    """The TARGET proof of a credential-form submit (round 7 WP-4a item 4): what must
+    be true of the submitted credential before it may replace whatever serves today.
+
+    Twilio's live verify (a no-op outside live mode, disclosed in
+    ``tenant_twilio.verify_credentials``); the live connector's authenticated
+    record-array GET (item 1); the webhook GET a URL-shaped endpoint must not refuse.
+    Raises ``CredentialRejected`` with the owner-facing reason — the caller discards
+    the staged copy and the live credential never moved."""
+    if provider == "twilio":
+        from app.channels.tenant_twilio import (  # noqa: PLC0415
+            InvalidTwilioCredentials,
+            verify_credentials,
+        )
+
+        if twilio_creds is None:  # pragma: no cover — the twilio branch always shapes creds
+            raise CredentialRejected("Twilio credentials could not be read.")
+        try:
+            await verify_credentials(twilio_creds)
+        except InvalidTwilioCredentials as exc:
+            raise CredentialRejected(str(exc)) from exc
+        return
+    if not url:
+        return
+    if provider == "live_connector":
+        # Round 6 WP-H (F062) / round 7 WP-4a item 1: a URL that returns HTML, refuses
+        # the key, or is down would otherwise produce a healthy-looking row and a tool
+        # that fails on every lookup. Keyed on the id the connect flow writes.
+        from app.connections.probes import (  # noqa: PLC0415
+            LiveConnectorProofFailed,
+            prove_live_connector,
+        )
+
+        try:
+            await prove_live_connector(url=url, api_key=str(material.get("api_key") or "") or None)
+        except LiveConnectorProofFailed as exc:
+            raise CredentialRejected(str(exc)) from exc
+        return
+    if provider in registry.URL_SHAPED_PROVIDERS:
+        from app.connections.probes import (  # noqa: PLC0415
+            WebhookProofFailed,
+            prove_webhook_endpoint,
+        )
+
+        try:
+            await prove_webhook_endpoint(
+                url=url, auth_header=str(material.get("auth_header") or "") or None
+            )
+        except WebhookProofFailed as exc:
+            raise CredentialRejected(str(exc)) from exc
+
+
 # The "add your number" state (§3.1.4): the Twilio account is connected but Luciel has
 # no number to send FROM, so the channel is not live and says so. Public name because
 # the OAuth-callback completion (C10) lands on the same state for a numberless account.
@@ -490,21 +552,20 @@ async def submit_credentials(
     if missing:
         raise CredentialRejected(f"Missing required field(s): {', '.join(missing)}.")
 
+    twilio_creds: TwilioCredentials | None = None
     if spec.provider == "twilio":
         from app.channels.tenant_twilio import (
             InvalidTwilioCredentials,
             secret_material,
             validate_submitted_credentials,
-            verify_credentials,
         )
 
         try:
-            creds = validate_submitted_credentials(fields)
-            await verify_credentials(creds)
+            twilio_creds = validate_submitted_credentials(fields)
         except InvalidTwilioCredentials as exc:
             raise CredentialRejected(str(exc)) from exc
-        material = secret_material(creds)
-        non_secret: dict[str, object] = {"accountSid": creds.account_sid}
+        material = secret_material(twilio_creds)
+        non_secret: dict[str, object] = {"accountSid": twilio_creds.account_sid}
         # The FORM path is the API-key class even though the twilio spec is
         # OAuth-primary (C10): this row now holds the customer's own keys, so
         # health/refresh must treat it as api_key, not chase a refresh token
@@ -541,32 +602,37 @@ async def submit_credentials(
                 )
         non_secret["egressAllowlist"] = [parsed.hostname]
 
-    if (
-        connection.connection_type == "record_source"
-        and spec.provider == "live_connector"
-        and raw_url
-    ):
-        # Round 6 WP-H (F062) / round 7 WP-4a item 1: prove the endpoint answers an
-        # authenticated test query BEFORE the row claims to be connected — a URL that
-        # returns HTML, refuses the key, or is down would otherwise produce a
-        # healthy-looking row and a tool that fails on every lookup. Keyed on the id
-        # the connect flow writes (``live_connector``); the old ``api`` key never ran.
-        from app.connections.probes import (  # noqa: PLC0415
-            LiveConnectorProofFailed,
-            prove_live_connector,
-        )
-
-        try:
-            await prove_live_connector(
-                url=str(raw_url), api_key=str(material.get("api_key") or "") or None
-            )
-        except LiveConnectorProofFailed as exc:
-            raise CredentialRejected(str(exc)) from exc
     if not connection.secret_ref:
         connection.secret_ref = secret_ref_for(
             admin_id, connection.instance_id, connection.connection_type
         )
-    await (store or get_secret_store()).put(connection.secret_ref, material)
+    # Round 7 WP-4a item 4: PROVEN BEFORE THE LIVE SECRET MOVES. The submitted
+    # material is parked under the staged ref (the same slot the OAuth callback
+    # stages under, so the item-5 abandonment sweep and the cascade prefix sweep
+    # both cover it), the target proof runs against it — Twilio's live verify, the
+    # live connector's record-array GET (item 1), the webhook GET the endpoint must
+    # not refuse — and only a passing proof promotes it over the live ref. A failed
+    # proof discards the staged copy and raises: whatever served before this submit
+    # (a HubSpot token under a HubSpot→webhook swap, a working Twilio key under a
+    # re-credential) keeps serving untouched. Before this the material was written
+    # straight over the live ref and the row flipped to connected unproven.
+    from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+    secret_store = store or get_secret_store()
+    staged_ref = staged_secret_ref(connection.secret_ref)
+    await secret_store.put(staged_ref, material)
+    try:
+        await _prove_submitted_credential(
+            provider=spec.provider,
+            url=str(raw_url) if raw_url else None,
+            material=material,
+            twilio_creds=twilio_creds,
+        )
+    except Exception:
+        await secret_store.delete(staged_ref)
+        raise
+    await secret_store.put(connection.secret_ref, material)
+    await secret_store.delete(staged_ref)
     connection.non_secret_config = {**(connection.non_secret_config or {}), **non_secret}
     # Complete the staged swap only now that the replacement is verified + stored
     # (§3.8.7 rule B): the provider/auth_class flip is the LAST step, and the stale

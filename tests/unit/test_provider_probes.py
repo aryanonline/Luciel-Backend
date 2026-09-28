@@ -248,3 +248,51 @@ async def test_the_dispatching_probe_asks_the_provider_in_live(monkeypatch):
         _conn("hubspot")
     )
     assert result == missing
+
+
+# --- Round 7 WP-4a item 4: the connect-time proof for URL-shaped providers --------- #
+class _ProofTransport:
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[dict[str, Any]] = []
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> tuple[int, bytes]:
+        self.calls.append({"url": url, "headers": dict(headers)})
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer, b""
+
+
+@pytest.mark.parametrize("status", [200, 204, 404, 405, 410])
+async def test_a_reachable_webhook_endpoint_that_accepts_the_header_proves(status):
+    transport = _ProofTransport(status)
+    await probes.prove_webhook_endpoint(
+        url="https://hooks.example.com/x", auth_header="Bearer t", transport=transport
+    )
+    assert transport.calls[0]["headers"]["Authorization"] == "Bearer t"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_webhook_endpoint_that_refuses_the_header_fails_the_proof(status):
+    with pytest.raises(probes.WebhookProofFailed, match="refused the Authorization header"):
+        await probes.prove_webhook_endpoint(
+            url="https://hooks.example.com/x",
+            auth_header="Bearer t",
+            transport=_ProofTransport(status),
+        )
+
+
+@pytest.mark.parametrize("answer", [500, 503, OSError("no route"), TimeoutError()])
+async def test_a_webhook_endpoint_that_does_not_answer_fails_the_proof(answer):
+    with pytest.raises(probes.WebhookProofFailed, match="did not answer"):
+        await probes.prove_webhook_endpoint(
+            url="https://hooks.example.com/x", auth_header=None, transport=_ProofTransport(answer)
+        )
+
+
+async def test_a_webhook_proof_without_a_header_sends_none():
+    transport = _ProofTransport(200)
+    await probes.prove_webhook_endpoint(
+        url="https://hooks.example.com/x", auth_header=None, transport=transport
+    )
+    assert "Authorization" not in transport.calls[0]["headers"]
