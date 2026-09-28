@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
@@ -32,6 +33,7 @@ from app.lifecycle.export_bundle import lead_export_rows, to_csv
 from app.models.audit import ActorType
 from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
+from app.models.instance import Instance
 from app.models.lead import Lead, LeadState
 from app.runtime import handoff
 from app.runtime.knowledge_retrieval import is_retrieval_unavailable
@@ -50,6 +52,7 @@ from app.schemas_api.conversations import (
     ScoringStatusWire,
     SourceChunkOut,
 )
+from app.schemas_api.leads import CrmBackfillResult, LeadPatchRequest
 
 logger = logging.getLogger(__name__)
 
@@ -525,8 +528,80 @@ async def list_escalations(
 
 
 # --- leads -------------------------------------------------------------------- #
-def _lead_out(r: Lead) -> LeadOut:
-    crm_status = r.crm_push_status if r.crm_push_status in ("synced", "failed") else None
+@dataclass(frozen=True)
+class _CrmPosture:
+    """The tenant's CURRENT ability to push a lead (round 7 WP-3c item 5).
+
+    Read through the broker's own gates (authorization table + connection status),
+    so the reason the dashboard shows for a never-pushed lead is exactly the reason
+    the next push would be refused for — never a parallel inference."""
+
+    provider: str | None
+    connection_status: str | None
+    tool_on: bool
+
+    @property
+    def can_push(self) -> bool:
+        from app.connections import gate  # noqa: PLC0415
+
+        return self.tool_on and self.connection_status == gate.CONNECTED
+
+    def never_attempted_reason(self, lead: Lead) -> str:
+        """Why THIS lead has no CRM record yet (``schemas_api.leads.NeverAttemptedReason``)."""
+        from app.connections import gate  # noqa: PLC0415
+        from app.runtime.lead_capture import crm_lead_key, crm_phone_key  # noqa: PLC0415
+
+        if self.connection_status != gate.CONNECTED:
+            return "dormant" if self.connection_status == "dormant" else "crm_not_connected"
+        if not self.tool_on:
+            return "tool_off"
+        has_key = crm_lead_key(lead) is not None or (
+            self.provider == "custom_webhook" and crm_phone_key(lead) is not None
+        )
+        if not has_key:
+            return "no_crm_key"
+        return "not_yet_pushed"
+
+
+async def _crm_posture(
+    s: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> _CrmPosture:
+    from app.models.connection import InstanceConnection  # noqa: PLC0415
+    from app.runtime.crm_push import PUSH_TOOL_ID  # noqa: PLC0415
+    from app.tools.broker import ToolBroker  # noqa: PLC0415
+
+    broker = ToolBroker(s)
+    tool_on = await broker._authorized(admin_id, instance_id, PUSH_TOOL_ID)  # noqa: SLF001
+    status = await broker._connection_status(admin_id, instance_id, "crm")  # noqa: SLF001
+    provider = (
+        await s.execute(
+            select(InstanceConnection.provider).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.instance_id == instance_id,
+                InstanceConnection.connection_type == "crm",
+                InstanceConnection.status != "revoked",
+            )
+        )
+    ).scalar_one_or_none()
+    return _CrmPosture(
+        provider=str(provider) if provider else None,
+        connection_status=str(status) if status else None,
+        tool_on=bool(tool_on),
+    )
+
+
+def _lead_out(r: Lead, posture: _CrmPosture | None = None) -> LeadOut:
+    """The ONE lead wire builder (item 9: every lead response goes through it).
+
+    A row nothing ever pushed is an explicit ``never_attempted`` whose detail is the
+    reason under the tenant's CURRENT posture; without a posture in hand (a caller
+    outside a tenant session) the reason honestly reads ``crm_not_connected`` rather
+    than a fabricated ``not_yet_pushed``."""
+    if r.crm_push_status in ("synced", "failed"):
+        crm_status, crm_detail = r.crm_push_status, r.crm_push_detail
+    else:
+        crm_status = "never_attempted"
+        crm_detail = posture.never_attempted_reason(r) if posture else "crm_not_connected"
     return LeadOut(
         lead_id=r.id,
         name=r.name,
@@ -539,9 +614,14 @@ def _lead_out(r: Lead) -> LeadOut:
         last_activity_at=r.last_activity_at,
         created_at=r.created_at,
         crm_status=crm_status,
-        crm_detail=r.crm_push_detail,
+        crm_detail=crm_detail,
         crm_pushed_at=r.crm_pushed_at,
     )
+
+
+async def _lead_out_in(s: AsyncSession, admin_id: uuid.UUID, lead: Lead) -> LeadOut:
+    posture = await _crm_posture(s, admin_id=admin_id, instance_id=lead.instance_id)
+    return _lead_out(lead, posture)
 
 
 @router.get("/leads", response_model=list[LeadOut])
@@ -567,7 +647,143 @@ async def list_leads(
             .scalars()
             .all()
         )
-        return [_lead_out(r) for r in rows]
+        # One posture read per instance on the page (one Luciel per account, so in
+        # practice one), never one per row.
+        postures: dict[uuid.UUID, _CrmPosture] = {}
+        out: list[LeadOut] = []
+        for r in rows:
+            if r.instance_id not in postures:
+                postures[r.instance_id] = await _crm_posture(
+                    s, admin_id=subject.admin_id, instance_id=r.instance_id
+                )
+            out.append(_lead_out(r, postures[r.instance_id]))
+        return out
+
+
+#: The most leads one backfill call pushes (item 5): bounded so a tenant with years
+#: of leads cannot hold a request open against their CRM's rate limits; the response
+#: says how many remain and the dashboard calls again.
+CRM_BACKFILL_BATCH = 100
+_CRM_BACKFILL_SCAN = 1000
+
+
+@router.post("/leads/crm-backfill", response_model=CrmBackfillResult)
+async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfillResult:
+    """Push every never-attempted, non-archived lead to the CRM (round 7 WP-3c item 5).
+
+    Owner ruling 2026-09-14: a lead captured before a CRM was connected is an explicit
+    "never sent" state, and the dashboard offers a ONE-TIME backfill when a CRM
+    connects. Idempotent by construction — a pushed lead becomes ``synced`` or
+    ``failed`` and drops out of the candidate set, so a second call finds only what
+    the first could not reach — bounded to :data:`CRM_BACKFILL_BATCH` leads per call,
+    and every push goes through the standard broker path (authorization, connection
+    health, the key-ownership guard) exactly like a capture push. 409 when the CRM
+    cannot be pushed to at all, so the owner is told what to fix instead of watching
+    a button do nothing."""
+    from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+    from app.runtime.lead_capture import (  # noqa: PLC0415
+        CaptureResult,
+        crm_lead_key,
+        crm_phone_key,
+    )
+    from app.tools.registry import make_tool_resolver  # noqa: PLC0415
+
+    async with tenant_session(subject.admin_id) as s:
+        instance_id = (
+            await s.execute(select(Instance.id).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if instance_id is None:
+            raise not_found("No Luciel.")
+        posture = await _crm_posture(s, admin_id=subject.admin_id, instance_id=instance_id)
+        if not posture.can_push:
+            if posture.connection_status == "dormant":
+                raise conflict("Your CRM connection is dormant; add a payment method first.")
+            if posture.connection_status != "connected":
+                raise conflict("No CRM is connected, so there is nothing to backfill into.")
+            raise conflict("The Push to CRM tool is switched off.")
+        candidates = (
+            (
+                await s.execute(
+                    select(Lead)
+                    .where(
+                        Lead.admin_id == subject.admin_id,
+                        Lead.instance_id == instance_id,
+                        Lead.state == LeadState.active,
+                        Lead.crm_push_status.is_(None),
+                    )
+                    .order_by(Lead.created_at.asc(), Lead.id.asc())
+                    .limit(_CRM_BACKFILL_SCAN)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        def _keyed(lead: Lead) -> bool:
+            return crm_lead_key(lead) is not None or (
+                posture.provider == "custom_webhook" and crm_phone_key(lead) is not None
+            )
+
+        keyed = [lead for lead in candidates if _keyed(lead)]
+        skipped_no_key = len(candidates) - len(keyed)
+        batch, rest = keyed[:CRM_BACKFILL_BATCH], keyed[CRM_BACKFILL_BATCH:]
+        attempted = synced = failed = 0
+        refused_reason: str | None = None
+        resolver = make_tool_resolver()
+        for lead in batch:
+            receipt = await push_captured_lead(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=instance_id,
+                captured=CaptureResult(
+                    lead_id=lead.id, changed=_current_lead_facts(lead), lead_key=crm_lead_key(lead)
+                ),
+                lead_key=crm_lead_key(lead),
+                snapshot_tool_ids=None,
+                tool_resolver=resolver,
+                session_id=None,
+            )
+            if receipt is None:
+                skipped_no_key += 1
+                continue
+            if receipt.refusal_reason is not None:
+                # The broker refused for the TENANT (tool off / not ready): nothing
+                # was attempted for this lead and nothing will be for the rest.
+                refused_reason = receipt.refusal_reason
+                rest = [lead, *batch[batch.index(lead) + 1 :], *rest]
+                break
+            attempted += 1
+            if receipt.outcome == "ok":
+                synced += 1
+            else:
+                failed += 1
+        remaining = len(rest)
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            event_type="crm_backfill_run",
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            payload={
+                "provider": posture.provider,
+                "attempted": attempted,
+                "synced": synced,
+                "failed": failed,
+                "skipped_no_key": skipped_no_key,
+                "remaining": remaining,
+                "refused_reason": refused_reason,
+            },
+        )
+        await s.flush()
+        return CrmBackfillResult(
+            attempted=attempted,
+            synced=synced,
+            failed=failed,
+            skipped_no_key=skipped_no_key,
+            remaining=remaining,
+            refused_reason=refused_reason,
+        )
 
 
 def _current_lead_facts(lead: Lead) -> dict[str, str]:
@@ -622,7 +838,7 @@ async def retry_crm_push(lead_id: uuid.UUID, subject: Subject = Depends(current_
             # nothing was attempted, so say what to fix instead of a silent 200.
             raise conflict(f"The push was not attempted: {outcome.refusal_reason}.")
         await s.flush()
-        return _lead_out(lead)
+        return await _lead_out_in(s, subject.admin_id, lead)
 
 
 @router.get("/leads/export")
@@ -754,17 +970,167 @@ async def archive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_ad
             payload={"resolved_lead_id_hash": audit.hash_lead_id(lead_id)},
         )
         await s.flush()
-        return LeadOut(
-            lead_id=lead.id,
-            name=lead.name,
-            contact_identifier=lead.contact_identifier,
-            email=lead.email,
-            intent=lead.intent,
-            state=lead.state.value,
-            outcome=lead.outcome,
-            last_activity_at=lead.last_activity_at,
-            created_at=lead.created_at,
+        # Item 9: the hand-built LeadOut here dropped phone + the CRM fields, so the
+        # row the dashboard re-rendered after Archive read "no phone, no CRM state".
+        return await _lead_out_in(s, subject.admin_id, lead)
+
+
+@router.post("/leads/{lead_id}/unarchive", response_model=LeadOut)
+async def unarchive_lead(lead_id: uuid.UUID, subject: Subject = Depends(current_admin)) -> LeadOut:
+    """Archived → active by the owner (round 7 WP-3c item 6; the reverse of archive).
+
+    Idempotent: an active lead is returned as-is with no audit row. A reactivated
+    lead's activity clock restarts here (the same §3.4.10a rule as archive)."""
+    async with tenant_session(subject.admin_id) as s:
+        lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
+        if lead.state == LeadState.archived:
+            lead.state = LeadState.active
+            lead.last_activity_at = datetime.now(UTC)
+            await audit.emit(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=lead.instance_id,
+                event_type="lead_reactivated",
+                actor_type=ActorType.admin_user,
+                actor_user_id=subject.user_id,
+                payload={
+                    "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                    "trigger": "owner_unarchive",
+                },
+            )
+            await s.flush()
+        return await _lead_out_in(s, subject.admin_id, lead)
+
+
+@router.patch("/leads/{lead_id}", response_model=LeadOut)
+async def edit_lead(
+    lead_id: uuid.UUID,
+    body: LeadPatchRequest,
+    subject: Subject = Depends(current_admin),
+) -> LeadOut:
+    """Owner correction of a lead's own facts — name / email / phone (item 6).
+
+    A field the request omits is left alone; an explicit null clears it. Email and
+    phone are normalised the way capture normalises them (case-folded / E.164) and a
+    number that cannot honestly be E.164 is refused rather than guessed. A value
+    ANOTHER lead already owns is a 409, never a silent merge — unification is a
+    runtime judgment made on the customer's own words, not an owner keystroke. The
+    identifier the edit replaced is kept as a ``superseded`` identifier row (the
+    person is still findable by it in the audit of who they were, and it can never
+    again resolve a conversation or receive a delivery); the audit row carries the
+    changed field NAMES only. A changed email/phone is forwarded to the CRM as an
+    update exactly the way a changed phone already is on capture."""
+    from app.runtime import lead_capture  # noqa: PLC0415
+    from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+    from app.runtime.lead_capture import CaptureResult, crm_lead_key  # noqa: PLC0415
+    from app.tools.registry import make_tool_resolver  # noqa: PLC0415
+
+    sent = body.model_fields_set
+    async with tenant_session(subject.admin_id) as s:
+        lead = await _require_lead(s, admin_id=subject.admin_id, lead_id=lead_id)
+        changed_fields: list[str] = []
+        crm_facts: dict[str, str] = {}
+        key_moved = False
+
+        if "name" in sent:
+            new_name = (body.name or "").strip() or None
+            if new_name != lead.name:
+                lead.name = new_name
+                changed_fields.append("name")
+                if new_name:
+                    crm_facts["name"] = new_name
+
+        if "email" in sent:
+            raw = (body.email or "").strip()
+            new_email = lead_capture.normalize_identifier(raw) if raw else None
+            if new_email is not None and not lead_capture.is_email_address(new_email):
+                raise validation_error("That is not a valid email address.")
+            if new_email != lead.email:
+                if new_email is not None:
+                    holder = await lead_capture.find_lead_by_identifier(
+                        s,
+                        admin_id=subject.admin_id,
+                        instance_id=lead.instance_id,
+                        value=new_email,
+                        exclude_id=lead.id,
+                    )
+                    if holder is not None:
+                        raise conflict("That email address already belongs to another lead.")
+                await lead_capture.supersede_identifier(
+                    s, lead, kind="email", old=lead.email, new=new_email
+                )
+                lead.email = new_email
+                changed_fields.append("email")
+                key_moved = True
+
+        if "phone" in sent:
+            raw = (body.phone or "").strip()
+            new_phone = lead_capture.normalize_phone(raw) if raw else None
+            if raw and new_phone is None:
+                raise validation_error(
+                    "That phone number could not be read as an international (E.164) number."
+                )
+            if new_phone != lead.phone:
+                if new_phone is not None:
+                    holder = await lead_capture.find_lead_by_identifier(
+                        s,
+                        admin_id=subject.admin_id,
+                        instance_id=lead.instance_id,
+                        value=new_phone,
+                        exclude_id=lead.id,
+                    )
+                    if holder is not None:
+                        raise conflict("That phone number already belongs to another lead.")
+                await lead_capture.supersede_identifier(
+                    s, lead, kind="phone", old=lead.phone, new=new_phone
+                )
+                lead.phone = new_phone
+                changed_fields.append("phone")
+                if new_phone:
+                    crm_facts["phone"] = new_phone
+
+        if not changed_fields:
+            return await _lead_out_in(s, subject.admin_id, lead)
+
+        # An owner edit is the owner working the lead (§3.4.10a, audit F096).
+        lead.last_activity_at = datetime.now(UTC)
+        await s.flush()
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=lead.instance_id,
+            event_type="lead_edited",
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            payload={
+                "resolved_lead_id_hash": audit.hash_lead_id(lead_id),
+                # Field NAMES only (§3.4.11) — never the old or new values.
+                "changed_fields": changed_fields,
+            },
         )
+        # Forward the change to the CRM through the standard broker gates. A moved
+        # email is the CRM KEY moving: the record's current facts ride so the push
+        # is non-empty and the backend can tell the CRM about the new address (as a
+        # note — the CRM's own Email property is never rewritten, item 2). A push
+        # failure never fails the edit; the lead row is the source of truth.
+        try:
+            await push_captured_lead(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=lead.instance_id,
+                captured=CaptureResult(
+                    lead_id=lead.id,
+                    changed=_current_lead_facts(lead) if key_moved else crm_facts,
+                    lead_key=crm_lead_key(lead),
+                ),
+                lead_key=crm_lead_key(lead),
+                snapshot_tool_ids=None,
+                tool_resolver=make_tool_resolver(),
+                session_id=None,
+            )
+        except Exception:  # noqa: BLE001 — the edit must never fail on a push
+            logger.exception("lead_edit_crm_push_failed")
+        return await _lead_out_in(s, subject.admin_id, lead)
 
 
 @router.post("/leads/{lead_id}/outcome", response_model=LeadOut)
@@ -824,7 +1190,7 @@ async def mark_lead_outcome(
             )
         except Exception:  # noqa: BLE001 — the outcome save must never fail on a push
             logger.exception("lead_outcome_crm_push_failed")
-        return _lead_out(lead)
+        return await _lead_out_in(s, subject.admin_id, lead)
 
 
 def _summary(sess: SessionModel) -> ConversationSummaryOut:

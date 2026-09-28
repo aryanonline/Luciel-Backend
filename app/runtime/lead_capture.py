@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -72,6 +72,11 @@ def normalize_identifier(value: str) -> str:
     """Emails case-fold; phones and transport ids are compared verbatim."""
     text = value.strip()
     return text.lower() if "@" in text else text
+
+
+def is_email_address(value: str) -> bool:
+    """Whole-string email shape (the owner-edit validator, round 7 WP-3c item 6)."""
+    return _EMAIL_RE.fullmatch(value.strip()) is not None
 
 
 def crm_phone_key(lead: Lead) -> str | None:
@@ -269,6 +274,81 @@ async def record_identifiers(
             kind=identifier_kind(key),
             value=key,
             source="transport",
+        )
+
+
+#: Identifier-row kinds that RESOLVE a lead. ``mention`` (round 7 WP-3c item 2: an
+#: address the customer mentioned without claiming it) and ``superseded`` (item 6: a
+#: value an owner edit replaced) are kept for the record and never resolve a
+#: conversation, never key a CRM push, and never receive a delivery.
+RESOLVING_KINDS: frozenset[str] = frozenset({"email", "phone", "transport"})
+MENTION_KIND = "mention"
+SUPERSEDED_KIND = "superseded"
+
+
+async def supersede_identifier(
+    session: AsyncSession,
+    lead: Lead,
+    *,
+    kind: str,
+    old: str | None,
+    new: str | None,
+) -> None:
+    """An owner edit replaced ``old`` with ``new`` on the lead (round 7 WP-3c item 6).
+
+    The replaced value is re-kinded to ``superseded`` rather than dropped — the
+    record still says the person was once known by it — and it stops resolving
+    anything from this moment. The new value gets its own resolving row, recorded
+    as owner-entered and NOT confirmed: only the customer can confirm an address
+    (F060), so a channel switch will still ask before sending there."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    if old:
+        old_key = normalize_identifier(old)
+        already = (
+            await session.execute(
+                select(LeadIdentifier.id).where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.instance_id == lead.instance_id,
+                    LeadIdentifier.kind == SUPERSEDED_KIND,
+                    LeadIdentifier.value == old_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if already is None:
+            await session.execute(
+                update(LeadIdentifier)
+                .where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.instance_id == lead.instance_id,
+                    LeadIdentifier.lead_id == lead.id,
+                    LeadIdentifier.kind == kind,
+                    LeadIdentifier.value == old_key,
+                )
+                .values(kind=SUPERSEDED_KIND, confirmed_at=None, source="owner")
+            )
+        else:
+            await session.execute(
+                delete(LeadIdentifier).where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.lead_id == lead.id,
+                    LeadIdentifier.kind == kind,
+                    LeadIdentifier.value == old_key,
+                )
+            )
+    if new:
+        await session.execute(
+            pg_insert(LeadIdentifier)
+            .values(
+                id=uuid.uuid4(),
+                admin_id=lead.admin_id,
+                instance_id=lead.instance_id,
+                lead_id=lead.id,
+                kind=kind,
+                value=normalize_identifier(new),
+                source="owner",
+            )
+            .on_conflict_do_nothing(constraint="uq_lead_identifier")
         )
 
 

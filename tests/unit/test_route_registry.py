@@ -158,6 +158,11 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/dashboard/leads/{lead_id}/outcome"),
         # 2026-09-05 audit F134: push the lead's current facts to the CRM again.
         ("POST", "/api/v1/dashboard/leads/{lead_id}/crm-retry"),
+        # Round 7 WP-3c: the one-time CRM backfill (item 5), owner edit of a lead's
+        # own facts and the reverse of archive (item 6) — intentional additions.
+        ("POST", "/api/v1/dashboard/leads/crm-backfill"),
+        ("PATCH", "/api/v1/dashboard/leads/{lead_id}"),
+        ("POST", "/api/v1/dashboard/leads/{lead_id}/unarchive"),
         # chat-widget (data plane)
         ("POST", "/api/v1/chat-widget/bootstrap"),
         ("POST", "/api/v1/chat-widget/messages"),

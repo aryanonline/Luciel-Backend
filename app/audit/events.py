@@ -180,6 +180,12 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "deferred_abandon_emailed",
         # Admin marked a lead's business outcome (Vision §7 conversion; C14).
         "lead_outcome_marked",
+        # Round 7 WP-3c item 6: the owner corrected a lead's name / email / phone.
+        # Payload: hashed lead id + the changed field NAMES — never a value.
+        "lead_edited",
+        # Round 7 WP-3c item 5: one bounded pass of the one-time CRM backfill
+        # (leads captured before a CRM connected). Payload: provider + counts only.
+        "crm_backfill_run",
         "lifecycle_notice_sent",
         # A billing/legal notice email left the platform (§A5 allowance
         # reduction, §A10 price change, the 80% pay-as-you-go heads-up).
