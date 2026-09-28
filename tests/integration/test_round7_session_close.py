@@ -2,6 +2,8 @@
 
 * A take-over sealed by the session end returns the row to ai mode and records how
   long the person held it; a hand-back records the same measure (item 9).
+* A session that closes while Luciel was still waiting for a required input tells the
+  owner a booking stalled, naming the field still missing (item 2, §3.3.7 rule 4).
 """
 
 from __future__ import annotations
@@ -12,9 +14,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
+from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as ConvSession
-from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
+from app.models.trace import ToolTraceEvent
 from app.runtime import handoff
 from app.runtime.session_close import finalize_due_sessions, finalize_session
 from sqlalchemy import select
@@ -22,7 +25,14 @@ from sqlalchemy import select
 pytestmark = [pytest.mark.asyncio]
 
 
-async def _seed(admin: uuid.UUID, iid: uuid.UUID, *, channel: str = "widget") -> uuid.UUID:
+async def _seed(
+    admin: uuid.UUID,
+    iid: uuid.UUID,
+    *,
+    channel: str = "widget",
+    ask_attempts: int = 0,
+    missing_fields: list[str] | None = None,
+) -> uuid.UUID:
     sid = uuid.uuid4()
     now = datetime.now(UTC)
     async with tenant_session(admin) as s:
@@ -36,9 +46,25 @@ async def _seed(admin: uuid.UUID, iid: uuid.UUID, *, channel: str = "widget") ->
                 mode="ai",
                 started_at=now - timedelta(minutes=5),
                 last_message_at=now,
+                input_ask_attempts=ask_attempts,
             )
         )
         await s.flush()
+        if missing_fields is not None:
+            # The broker's durable trace of the stalled dispatch (§3.3.4 rule 3).
+            s.add(
+                ToolTraceEvent(
+                    admin_id=admin,
+                    instance_id=iid,
+                    session_id=sid,
+                    tool_id="book_appointment",
+                    outcome="missing_input",
+                    connection_type="calendar",
+                    missing_fields=list(missing_fields),
+                    at=now,
+                )
+            )
+            await s.flush()
         s.add(
             Transcript(
                 id=uuid.uuid4(),
@@ -139,3 +165,62 @@ async def test_a_hand_back_records_how_long_the_person_held_the_session():
     assert ended.event_payload["trigger"] == "hand_back"
     assert 0 <= ended.event_payload["duration_seconds"] <= 5
     assert (await _session(admin, sid)).mode == "ai"
+
+
+# --- item 2: a session that closes mid-gather tells the owner what stalled ---------- #
+async def _escalations(admin: uuid.UUID, sid: uuid.UUID) -> list[EscalationEvent]:
+    async with tenant_session(admin) as s:
+        return list(
+            (await s.execute(select(EscalationEvent).where(EscalationEvent.session_id == sid)))
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_session_closing_mid_gather_tells_the_owner_what_was_still_missing():
+    """The broker refused book_appointment for want of an email, Luciel asked, and the
+    visitor closed the widget. Nothing ever told the owner a booking stalled; now the
+    close writes cannot_answer naming the field, read from the durable tool trace."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    sid = await _seed(admin, iid, ask_attempts=1, missing_fields=["email"])
+    async with tenant_session(admin) as s:
+        assert await finalize_session(
+            s, admin_id=admin, instance_id=iid, channel="widget", session_id=sid
+        )
+    (row,) = await _escalations(admin, sid)
+    assert row.signal == "cannot_answer" and row.gate == "outcome"
+    assert list(row.reasons or []) == [
+        "still missing email",
+        "the conversation ended before the booking could be completed",
+    ]
+    (fired,) = await _events(admin, "escalation_fired")
+    assert fired.event_payload["signal"] == "cannot_answer"
+    assert (await _session(admin, sid)).ended_at is not None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_sweep_reports_a_prose_stall_as_an_unanswered_question():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    sid = await _seed(admin, iid, channel="sms", ask_attempts=1)  # no tool trace behind it
+    async with tenant_session(admin) as s:
+        assert (
+            await finalize_due_sessions(
+                s, admin_id=admin, now=datetime.now(UTC) + timedelta(hours=9)
+            )
+            == 1
+        )
+    (row,) = await _escalations(admin, sid)
+    assert row.signal == "cannot_answer"
+    assert list(row.reasons or [])[0] == "the customer never answered Luciel's last question"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_session_with_no_pending_gather_closes_without_an_escalation():
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    sid = await _seed(admin, iid, ask_attempts=0, missing_fields=["email"])  # resolved later
+    async with tenant_session(admin) as s:
+        assert await finalize_session(
+            s, admin_id=admin, instance_id=iid, channel="widget", session_id=sid
+        )
+    assert await _escalations(admin, sid) == []

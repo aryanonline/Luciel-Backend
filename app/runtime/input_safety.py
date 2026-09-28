@@ -220,6 +220,11 @@ _TOOL_USE_STANZA_HEADER = (
     "fields. Never present an action as done when it is not.\n"
     "T4. CHECK BEFORE BOOKING: offer only times check_availability confirmed open, and "
     "book only one of those.\n"
+    "T5. TAKE NO FOR AN ANSWER (§3.3.7 rule 4): when the customer declines to give a "
+    'detail you asked for — "I\'d rather not", "no thanks", "skip that" — do not ask '
+    "for it again, in any wording. Say you understand and carry on without it; if the "
+    "action cannot go ahead without that detail, say so plainly and that the team can "
+    "pick it up. Never invent the value and never re-ask.\n"
     "Available tools:\n"
 )
 

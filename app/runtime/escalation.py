@@ -394,6 +394,71 @@ def is_repeated_question(reply: str, previous_luciel_reply: str | None) -> bool:
     return overlap >= _REPEATED_QUESTION_OVERLAP
 
 
+# --- declining to give a required input (round 7 WP-2 remainder, item 2) ------------ #
+# §3.3.7 rule 4 (the T5 rule): when a customer declines to give the detail a tool
+# needs, Luciel stops asking. Consulted ONLY while a required-input gather is
+# pending (sessions.input_ask_attempts > 0) — outside a gather these phrases are
+# ordinary conversation. Deterministic and hermetic like every classifier here.
+_DECLINE_VERBS = r"(?:give|share|provide|say|tell|disclose|answer|include|put|type|send)"
+_DECLINE_VERBS_ING = (
+    r"(?:giving|sharing|providing|saying|telling|disclosing|answering|including|putting"
+    r"|typing|sending)"
+)
+_A_DETAIL = r"(?:my|that|this|it|those|(?:an?|the) (?:e-?mail|number|phone|address|name|details?))"
+_DECLINE_PATTERNS = re.compile(
+    # "I'd rather not (say)", "I would prefer not to", "rather not, thanks"
+    r"\b(?:(?:i'?d|i would|i) )?(?:rather|prefer) not(?: to)?"
+    rf"(?: {_DECLINE_VERBS}\b| (?:that|this|it|those)\b|\s*[.!,;]|\s*$)"
+    # "I don't want to give (you) my email", "can't share my number", "won't say"
+    rf"|\b(?:don'?t|do not|won'?t|will not|not going to|not gonna|can'?t|cannot|shan'?t)"
+    rf" (?:want to |wanna |like to |wish to |be )?(?:{_DECLINE_VERBS}|{_DECLINE_VERBS_ING})"
+    # …followed by what is withheld, or nothing: "can't say I've been" is an idiom
+    r"(?: (?:you |them )?(?:that|this|it|those|my|any|out|more|anything)\b|\s*[.!,;]|\s*$)"
+    # "not comfortable sharing / giving out"
+    rf"|\bnot comfortable (?:with )?(?:{_DECLINE_VERBS}|{_DECLINE_VERBS_ING})\b"
+    # "skip that", "let's skip it", "can we skip the email"
+    r"|\b(?:skip|leave out|drop) (?:that|this|it|those|the \w+|my \w+)\b"
+    r"|^\s*(?:just )?skip\b"
+    # "never mind", "forget it"
+    r"|\b(?:never ?mind|forget it)\b"
+    # "(book it) without my email", "without giving you my number"
+    rf"|\bwithout (?:{_DECLINE_VERBS_ING} (?:you )?)?{_A_DETAIL}\b"
+    # "keep that private", "keep my number to myself", "none of your business"
+    r"|\bkeep (?:that|this|it|my \w+) (?:private|to myself)\b"
+    r"|\bnone of your business\b"
+    # "I'm not giving that out"
+    rf"|\b(?:i'?m|i am) not {_DECLINE_VERBS_ING}\b",
+    re.IGNORECASE,
+)
+# A bare no to the question Luciel just asked — only the WHOLE message, so "no
+# thanks, 2pm works" (a choice) is not a decline.
+_BARE_NO = re.compile(
+    r"^\s*(?:no|nope|nah|not really)\b[,.!]?\s*(?:thanks|thank you|thankyou|ta)?\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+# A substitute value in the same breath is an ANSWER, whatever else was said
+# ("it's not that I don't want to share — here: jane@example.com").
+_ANSWERS_WITH_A_VALUE = re.compile(
+    r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|(?<![a-z0-9])\+?\(?\d[\d\s().-]{6,}\d(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def is_decline_turn(text: str) -> bool:
+    """True when the customer declines to GIVE a detail they were asked for.
+
+    Positives: "I'd rather not say", "I don't want to give my email", "no thanks",
+    "skip that", "not comfortable sharing my number", "can you book it without my
+    email?". Negatives: declining an OPTION ("I don't want the 3pm slot"), a
+    preference ("I'd rather not do mornings"), a message that supplies the value
+    after all, and "no thanks, 2pm works" (a choice, not a refusal).
+    """
+    body = (text or "").strip()
+    if not body or _ANSWERS_WITH_A_VALUE.search(body):
+        return False
+    return bool(_BARE_NO.match(body) or _DECLINE_PATTERNS.search(body))
+
+
 # --- distinct unanswered questions (round 7 WP-2 remainder, item 1) ---------------- #
 # The function words every customer question shares; what is left is what the
 # question is ABOUT. "do you do implants?" and "what about implants?" both reduce

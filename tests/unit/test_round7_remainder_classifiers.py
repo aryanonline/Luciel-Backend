@@ -8,11 +8,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from app.runtime.escalation import is_new_question, is_same_question, question_terms
+from app.runtime.escalation import (
+    is_decline_turn,
+    is_new_question,
+    is_same_question,
+    question_terms,
+)
 from app.runtime.orchestrator import (
     ASK_ATTEMPT_BOUND,
     CONTACT_ASK_LINE,
     CONTACT_ASK_RESPITE_TURNS,
+    DECLINED_INPUT_LINE,
     SHORT_HANDOFF_ACKS,
     also_asked_reason,
     contact_ask_due,
@@ -124,6 +130,23 @@ def test_contact_ask_goes_out_once_then_after_a_respite_and_never_past_the_bound
     assert contact_ask_due(asked, anonymous=False) is False
 
 
+def test_the_contact_ask_is_never_due_once_the_customer_declined_a_detail() -> None:
+    """Item 2 (§3.3.7 rule 4): Luciel said "I won't ask for that again"; the contact
+    ask names the very identifiers a booking gather asks for, so it stays off for the
+    rest of the session — even where the respite would otherwise allow it."""
+    declined = [
+        _turn("lead", "book me for 2pm"),
+        _turn("luciel", "What email should I send the confirmation to?"),
+        _turn("lead", "I'd rather not say"),
+        _turn("luciel", f"{DECLINED_INPUT_LINE} I can't complete the booking without it."),
+    ]
+    assert contact_ask_due(declined, anonymous=True) is False
+    history = list(declined)
+    for n in range(2 * CONTACT_ASK_RESPITE_TURNS + 2):
+        history += [_turn("lead", f"q{n}"), _turn("luciel", f"ack {n}")]
+        assert contact_ask_due(history, anonymous=True) is False
+
+
 def test_unanswered_questions_are_the_lead_turns_a_hand_off_ack_answered() -> None:
     history = [
         _turn("lead", "hi"),
@@ -135,3 +158,63 @@ def test_unanswered_questions_are_the_lead_turns_a_hand_off_ack_answered() -> No
         _turn("lead", "do you open saturdays?"),
     ]
     assert unanswered_questions(history) == ["do you do implants?", "how much are crowns?"]
+
+
+# --- item 2: declining to give a required input (§3.3.7 rule 4) ----------------------- #
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I'd rather not",
+        "I'd rather not say",
+        "rather not, thanks",
+        "I would prefer not to",
+        "I don't want to give my email",
+        "don't want to give you my number",
+        "I can't share my number",
+        "I won't say",
+        "not comfortable sharing my number",
+        "I'm not comfortable giving that out",
+        "skip that",
+        "let's skip it",
+        "can we skip the email",
+        "never mind",
+        "forget it",
+        "can you book it without my email?",
+        "book me without giving you my number",
+        "keep that private",
+        "none of your business",
+        "no thanks",
+        "No",
+        "nope.",
+        "I'm not giving that out",
+        "not going to give you that",
+        "I'd rather not, just book it",
+    ],
+)
+def test_is_decline_turn_positives(text: str) -> None:
+    assert is_decline_turn(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I don't want the 3pm slot",  # declines an OPTION, not the detail
+        "I'd rather not do mornings",
+        "I'd rather have the afternoon",
+        "no thanks, 2pm works",  # a choice
+        "no, the 10am one",
+        "it's not that I don't want to share, here: jane@example.com",  # supplies it
+        "my number is 555 123 4567",
+        "sure, it's jane@example.com",
+        "I don't mind sharing my email",  # negated decline
+        "I don't want to wait that long",
+        "not comfortable with mornings",
+        "can't say I've been before",  # an idiom
+        "what time do you open?",
+        "leave it for tomorrow?",
+        "without a doubt I'll book",
+        "",
+    ],
+)
+def test_is_decline_turn_negatives(text: str) -> None:
+    assert is_decline_turn(text) is False

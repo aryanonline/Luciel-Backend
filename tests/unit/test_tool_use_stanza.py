@@ -29,8 +29,21 @@ def test_stanza_lists_rules_and_every_tool() -> None:
         "T2. CONFIRM BEFORE WRITING",
         "T3. READ RESULTS",
         "T4. CHECK BEFORE BOOKING",
+        "T5. TAKE NO FOR AN ANSWER",
     ):
         assert marker in prompt
+
+
+def test_the_t5_rule_tells_the_model_to_stop_asking_after_a_decline() -> None:
+    """§3.3.7 rule 4 (round 7 WP-2 remainder, item 2): a declined detail is not asked
+    for again in other words, is never invented, and a blocked action is said so."""
+    prompt = build_system_prompt(None, tool_catalog=CATALOG)
+    t5 = prompt[prompt.index("T5. TAKE NO FOR AN ANSWER") : prompt.index("Available tools:")]
+    assert "do not ask for it again" in t5
+    assert "Never invent the value" in t5
+    assert "cannot go ahead without that detail" in t5
+    # The rule sits inside the tools stanza, with the other numbered rules.
+    assert prompt.index("T4. CHECK BEFORE BOOKING") < prompt.index("T5. TAKE NO FOR AN ANSWER")
     for tool_id in ("check_availability", "book_appointment", "lookup_record"):
         assert f"- {tool_id}:" in prompt
 

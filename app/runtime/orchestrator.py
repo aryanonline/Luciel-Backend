@@ -90,6 +90,7 @@ from app.runtime.escalation import (
     evaluate_outcome,
     is_contact_details_turn,
     is_conversational_turn,
+    is_decline_turn,
     is_new_question,
     is_repeated_question,
 )
@@ -386,10 +387,16 @@ def contact_ask_due(history: list[Transcript], *, anonymous: bool) -> bool:
     The first escalated turn asks; after that the ask returns only once
     ``CONTACT_ASK_RESPITE_TURNS`` Luciel turns have passed with still nothing on
     file, and never more than ``ASK_ATTEMPT_BOUND`` times in a session — the
-    code-composed re-ask counts against the same bound as the model's (§3.3.7)."""
+    code-composed re-ask counts against the same bound as the model's (§3.3.7).
+
+    Never once the customer has declined a detail this session (item 2, rule 4):
+    Luciel said "I won't ask for that again", and the contact ask names the very
+    identifiers a booking gather asks for."""
     if not anonymous:
         return False
     turns = _luciel_turns(history)
+    if any(DECLINED_INPUT_LINE in text for text in turns):
+        return False
     asked_at = [i for i, text in enumerate(turns) if CONTACT_ASK_LINE in text]
     if not asked_at:
         return True
@@ -411,6 +418,152 @@ def unanswered_questions(history: list[Transcript]) -> list[str]:
                 out.append(last_lead)
                 last_lead = None
     return out
+
+
+# --- declining a required input (round 7 WP-2 remainder, item 2; §3.3.7 rule 4) ----- #
+#: What a stalled tool was trying to do, in the customer's words — for the decline
+#: reply ("I can't complete the booking without it") and the owner's reasons.
+GATHER_WHAT: dict[str, str] = {
+    "book_appointment": "the booking",
+    "reschedule_appointment": "the change to your booking",
+    "cancel_appointment": "the cancellation",
+    "check_availability": "the availability check",
+    "send_email": "sending that email",
+    "send_sms": "sending that text",
+    "schedule_callback": "the follow-up",
+    "push_to_crm": "the update",
+    "lookup_record": "the lookup",
+}
+#: Said once, in code, the moment a customer declines a detail: the ask stops here.
+DECLINED_INPUT_LINE = "No problem — I won't ask for that again."
+#: The decline reply when the conversation simply goes on (nothing was blocked on it).
+DECLINED_INPUT_CONTINUE = f"{DECLINED_INPUT_LINE} Is there anything else I can help you with?"
+
+
+@dataclass(frozen=True)
+class PendingGather:
+    """What the session's last stalled tool dispatch was waiting for: the field names
+    the broker refused on, or an ambiguity the customer never resolved. Empty when
+    the stall was a prose re-ask with no tool behind it (nothing is blocked)."""
+
+    tool_id: str | None = None
+    missing_fields: tuple[str, ...] = ()
+    ambiguous: bool = False
+
+    @property
+    def blocks_action(self) -> bool:
+        return bool(self.missing_fields) or self.ambiguous
+
+    @property
+    def what(self) -> str:
+        return GATHER_WHAT.get(self.tool_id or "", "that")
+
+    def field_reason(self) -> str:
+        """The owner-facing reason naming what is still missing."""
+        if self.missing_fields:
+            return f"still missing {', '.join(self.missing_fields)}"
+        return "could not tell which one the customer meant"
+
+
+async def pending_gather(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> PendingGather:
+    """Read the pending gather from the session's durable tool traces (§3.3.4 rule 3):
+    the dispatches of the LATEST turn (those sharing the newest ``at``), a missing_input
+    among them naming the fields, an ambiguous one the unresolved choice. Field NAMES
+    only — the traces never carry the customer's values."""
+    from app.models.trace import ToolTraceEvent  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(ToolTraceEvent)
+                .where(ToolTraceEvent.admin_id == admin_id, ToolTraceEvent.session_id == session_id)
+                .order_by(ToolTraceEvent.at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return PendingGather()
+    latest = [r for r in rows if r.at == rows[0].at]
+    missing: list[str] = []
+    tool_id: str | None = None
+    for row in latest:
+        if row.outcome == tool_contract.Outcome.missing_input.value:
+            tool_id = tool_id or row.tool_id
+            missing.extend(f for f in (row.missing_fields or []) if f not in missing)
+    if missing:
+        return PendingGather(tool_id, tuple(missing))
+    ambiguous = next(
+        (r for r in latest if r.outcome == tool_contract.Outcome.ambiguous.value), None
+    )
+    if ambiguous is not None:
+        return PendingGather(ambiguous.tool_id, (), True)
+    return PendingGather(latest[0].tool_id)
+
+
+def declined_input_reply(gather: PendingGather) -> str:
+    """The reply when the customer declined a detail the action cannot go without: the
+    ask stops, the limit is said plainly, and the hand-off is REAL (the row and the
+    owner page are written before this is sent). No time is promised."""
+    return (
+        f"{DECLINED_INPUT_LINE} I can't complete {gather.what} without it myself, so I've "
+        "passed this along to the team — a person can pick it up from here."
+    )
+
+
+async def record_or_extend_escalation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    reasons: list[str],
+) -> bool:
+    """Write the signal's row for this session — or, when the session already carries
+    one, add these reasons to it and page the owner AGAIN with them (round 7 WP-2
+    remainder). The row stays one business event; the page carries the news. False
+    when nothing new reached the row (every reason was already on it)."""
+    if await _record_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+        reasons=reasons,
+    ):
+        return True
+    if not await _append_escalation_reasons(
+        session,
+        admin_id=admin_id,
+        session_id=session_id,
+        signal=signal,
+        gate=gate,
+        reasons=reasons,
+    ):
+        return False
+    emit_metric("EscalationRenotified", dimensions={"Signal": signal})
+    schedule_notification_after_commit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+    )
+    return True
 
 
 #: Longest excerpt of a new unanswered question carried on the row's reasons.
@@ -1121,6 +1274,80 @@ class Orchestrator:
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
         gather_pending = sess_obj is not None and sess_obj.input_ask_attempts > 0
+
+        # --- DECLINED INPUT (§3.3.7 rule 4; round 7 WP-2 remainder, item 2) --- #
+        # The last turn stalled asking for a detail and the customer now declines
+        # to give it: the ask stops HERE, in code — never a re-ask in fresh words.
+        # A tool that cannot run without it makes this a real hand-off (row, owner
+        # page naming the field, the honest line); a prose stall just moves on.
+        declined_prefix = ""
+        if sess_obj is not None and gather_pending and is_decline_turn(inbound_text):
+            sess_obj.input_ask_attempts = 0
+            gather_pending = False
+            gather = await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            if gather.blocks_action:
+                emit_metric("GatherDeclined", dimensions={"Channel": channel})
+                decline_reasons = [
+                    f"customer declined to give {', '.join(gather.missing_fields)}"
+                    if gather.missing_fields
+                    else "customer declined to say which one they meant",
+                    f"{gather.what} cannot go ahead without it",
+                ]
+                await record_or_extend_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=Signal.cannot_answer.value,
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=decline_reasons,
+                )
+                declined_text = declined_input_reply(gather)
+                declined_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=declined_text,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=declined_row.id,
+                    reply_text=declined_text,
+                    outbound_channel=channel,
+                    counted=False,
+                    escalation=EscalationDecision(
+                        True, Signal.cannot_answer, Gate.outcome, None, tuple(decline_reasons)
+                    ),
+                )
+            if not _CARRIES_QUESTION.search(inbound_text):
+                # Nothing was blocked and nothing was asked: acknowledge and move on,
+                # with no model call to tempt a re-ask.
+                declined_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=DECLINED_INPUT_CONTINUE,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=declined_row.id,
+                    reply_text=DECLINED_INPUT_CONTINUE,
+                    outbound_channel=channel,
+                    counted=False,
+                    escalation=standing,
+                )
+            # The decline came with a question: the loop answers it, and the reply
+            # opens by taking no for an answer.
+            declined_prefix = f"{DECLINED_INPUT_LINE} "
+
         if retrieval_skippable(inbound_text, gather_pending=gather_pending):
             # Nothing to look up (item 3): no embedding call, no Knowledge block, and
             # the row carries no attribution because no search ran (never a false
@@ -1552,6 +1779,12 @@ class Orchestrator:
                 else await self._handoff_ack()
             )
             deterministic_reply = True
+        if declined_prefix:
+            # The customer declined a detail and asked something in the same breath
+            # (item 2): whatever answers the question — the model's grounded reply
+            # or the honest hand-off line for an uncovered one — opens by taking no
+            # for an answer.
+            reply_text = declined_prefix + reply_text
         if team_told and not deterministic_reply:
             # The sentiment row was written THIS turn (D2): the answer stands, and the
             # customer hears that a person is aware — a canned hand-off line already
@@ -1571,7 +1804,9 @@ class Orchestrator:
             and sess_obj is not None
         )
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
-        if escalation is not None and not switch_will_ask:
+        # Never on the turn the customer declined a detail (item 2): "I won't ask for
+        # that again" followed by "what's the best email" is the re-ask rule 4 forbids.
+        if escalation is not None and not switch_will_ask and not declined_prefix:
             reply_text = self._with_contact_ask(
                 reply_text,
                 channel=channel,
@@ -2056,18 +2291,8 @@ class Orchestrator:
             )
             else fired_signal
         )
-        appended = await _append_escalation_reasons(
-            self.session,
-            admin_id=self.admin_id,
-            session_id=session_id,
-            signal=signal,
-            gate=Gate.outcome.value,
-            reasons=[also_asked_reason(inbound_text)],
-        )
-        if not appended:
-            return False
-        emit_metric("EscalationRenotified", dimensions={"Signal": signal})
-        schedule_notification_after_commit(
+        # The row exists (the caller checked), so this extends it and re-pages.
+        return await record_or_extend_escalation(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
@@ -2076,8 +2301,8 @@ class Orchestrator:
             signal=signal,
             gate=Gate.outcome.value,
             score=None,
+            reasons=[also_asked_reason(inbound_text)],
         )
-        return True
 
     @staticmethod
     def _with_contact_ask(

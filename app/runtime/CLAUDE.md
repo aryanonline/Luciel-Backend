@@ -127,3 +127,18 @@ make that state explicit and test it.
   `unanswered_questions(history)`) appends `also asked: "…"` to the row's reasons and
   re-notifies the same row (`_renotify_new_question`, metric `EscalationRenotified`); a
   repeat pages nobody.
+- Taking no for an answer (item 2, §3.3.7 rule 4 / stanza rule T5): `escalation.
+  is_decline_turn` (deterministic, negation-aware, a supplied value always wins) is
+  consulted ONLY while `sessions.input_ask_attempts > 0`. On a decline the counter
+  resets and the ask stops in code: `pending_gather` reads the latest turn's durable
+  tool traces — a `missing_input` there (or an unresolved `ambiguous`) means the action
+  is blocked, so `declined_input_reply` goes out with a REAL cannot_answer row naming
+  the field (`record_or_extend_escalation`: new row, or the session's existing row
+  extended and re-paged) and no model call; a prose stall gets
+  `DECLINED_INPUT_CONTINUE`; a decline carrying a question is answered by the loop,
+  opened by `DECLINED_INPUT_LINE`. That line in a Luciel turn switches
+  `contact_ask_due` off for the rest of the session (the contact ask names the very
+  identifiers a gather asks for). `session_close._escalate_unfinished_gather`: a session
+  sealed with `input_ask_attempts > 0` writes the same cannot_answer row so the owner
+  learns a booking stalled. Edge kept: explicit_human_request at intake still runs
+  before the decline check.

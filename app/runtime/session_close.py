@@ -73,6 +73,40 @@ async def takeover_duration_seconds(
     return max(0, int((ended_at - origin).total_seconds()))
 
 
+async def _escalate_unfinished_gather(session: AsyncSession, sess: Session) -> None:
+    """The session ends while Luciel was still waiting for a required input (round 7
+    WP-2 remainder, item 2; §3.3.7 rule 4): the customer's last turn stalled a tool
+    gather (``input_ask_attempts > 0``) and nothing resolved it before they left. The
+    owner learns that a booking stalled — a ``cannot_answer`` row (or the session's
+    existing one, extended and re-paged) naming the field still missing, read from
+    the durable tool traces; a prose stall says the question went unanswered."""
+    from app.runtime.escalation import Gate, Signal  # noqa: PLC0415
+    from app.runtime.orchestrator import (  # noqa: PLC0415 — the loop imports nothing from here
+        pending_gather,
+        record_or_extend_escalation,
+    )
+
+    gather = await pending_gather(session, admin_id=sess.admin_id, session_id=sess.id)
+    if gather.blocks_action:
+        reasons = [
+            gather.field_reason(),
+            f"the conversation ended before {gather.what} could be completed",
+        ]
+    else:
+        reasons = ["the customer never answered Luciel's last question", "the conversation ended"]
+    await record_or_extend_escalation(
+        session,
+        admin_id=sess.admin_id,
+        instance_id=sess.instance_id,
+        session_id=sess.id,
+        resolved_lead_id=sess.resolved_lead_id,
+        signal=Signal.cannot_answer.value,
+        gate=Gate.outcome.value,
+        score=None,
+        reasons=reasons,
+    )
+
+
 async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at: datetime) -> None:
     """Seal one session: stamp ``ended_at``; summarize + persist when it has content.
 
@@ -110,6 +144,8 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
             },
         )
         sess.mode = "ai"
+    if sess.input_ask_attempts > 0:
+        await _escalate_unfinished_gather(session, sess)
     history = await memory.load_session_history(session, admin_id=sess.admin_id, session_id=sess.id)
     if not history:
         await session.flush()
