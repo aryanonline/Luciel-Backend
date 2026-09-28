@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.base import DeliveryReceipt
 from app.config import get_settings
-from app.notifications.base import EscalationNotification
+from app.notifications.base import EscalationNotification, owner_facing_reasons
 from app.notifications.email_sender import NullEmailSender, build_email_sender
 
 _SIGNAL_LABELS: dict[str, str] = {
@@ -52,8 +52,22 @@ class EmailNotifier:
         return "@" in to and " " not in to.strip() and not to.startswith("@")
 
     def subject(self, notification: EscalationNotification) -> str:
+        if notification.safety_label:
+            # Round 7 WP-4b (item 4): a moderation take-over is a safety page, never
+            # "the lead asked for a person".
+            return f"SAFETY: {notification.safety_label} — Luciel needs you"
         label = _SIGNAL_LABELS.get(notification.signal, notification.signal)
         return f"Luciel needs you: {label}"
+
+    @staticmethod
+    def _why(notification: EscalationNotification) -> str:
+        if notification.safety_label:
+            return f"SAFETY — {notification.safety_label}"
+        label = _SIGNAL_LABELS.get(notification.signal, notification.signal)
+        if notification.signal == "content_flagged" and notification.reasons:
+            # Say WHAT was flagged, not just that something was.
+            return f"{label} — {notification.reasons[0]}"
+        return label
 
     def format(self, notification: EscalationNotification) -> str:
         """The §3.5.1 payload as an email body: why/where/when, who, what they said,
@@ -62,11 +76,13 @@ class EmailNotifier:
         lines = [
             f"{notification.business_name}'s Luciel escalated a conversation.",
             "",
-            f"Why: {_SIGNAL_LABELS.get(notification.signal, notification.signal)}",
+            f"Why: {self._why(notification)}",
         ]
-        if notification.reasons:
-            # The row's own phrases (F124) — for a hand_to_team page, Luciel's reason.
-            lines.append(f"Details: {'; '.join(notification.reasons)}")
+        details = owner_facing_reasons(notification.reasons)
+        if details:
+            # The row's own phrases (F124) — for a hand_to_team page, Luciel's reason;
+            # for the ask bound, the field names still missing.
+            lines.append(f"Details: {'; '.join(details)}")
         if notification.channel:
             label = _CHANNEL_LABELS.get(notification.channel, notification.channel)
             lines.append(f"Channel: {label}")
@@ -80,6 +96,11 @@ class EmailNotifier:
         lines += ["", "Who to reach:"]
         lines.append(f"  Name: {notification.lead_name or 'not captured'}")
         lines.append(f"  Contact: {contact or 'not captured'}")
+        # Item 3: what the lead volunteered on top of the transport identity.
+        if notification.lead_email and notification.lead_email != contact:
+            lines.append(f"  Email: {notification.lead_email}")
+        if notification.lead_phone and notification.lead_phone != contact:
+            lines.append(f"  Phone: {notification.lead_phone}")
         if notification.triggering_message:
             lines += ["", f'What they said: "{notification.triggering_message}"']
         lines += [

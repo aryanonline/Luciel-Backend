@@ -45,12 +45,17 @@ from sqlalchemy.orm import Session as SyncSession
 from app.audit import log as audit
 from app.channels.base import DeliveryReceipt
 from app.config import get_settings
-from app.models.audit import ActorType
+from app.models.audit import ActorType, AdminAuditLog
 from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.instance import Account, Instance
 from app.models.lead import Lead
-from app.notifications.base import EscalationNotification, NotificationAdapter
+from app.notifications.base import (
+    SAFETY_CATEGORIES,
+    EscalationNotification,
+    NotificationAdapter,
+    safety_category_from_reasons,
+)
 from app.notifications.email_notifier import EmailNotifier
 from app.notifications.sms_notifier import SmsNotifier
 from app.runtime import team_availability as team_hours
@@ -75,6 +80,17 @@ DELIVERY_DELIVERED = "delivered"  # a CONFIGURED contact heard
 DELIVERY_OWNER_FALLBACK = "owner_fallback"  # only the account owner heard so far
 DELIVERY_QUEUED = "queued"  # nobody yet; the deferred queue / ladder own it
 DELIVERY_FAILED = "failed"  # terminal
+#: Round 7 WP-4b: the provider accepted the page and the carrier has yet to report —
+#: an SMS with a delivery receipt outstanding. Not a retry candidate; ``delivered`` is
+#: stamped by the receipt (``record_sms_delivery_receipt``), never by the API accept.
+DELIVERY_SENT = "sent"
+#: Statuses under which nothing may page the configured contact again.
+_SETTLED = frozenset({DELIVERY_DELIVERED, DELIVERY_SENT})
+
+#: Refusals that look exactly the same tomorrow (round 7 WP-4b, item 6): a contact
+#: that could never be an address or a number, and an SMS contact with no number
+#: connected to send from. Reported once and stamped terminal — never queued for 24h.
+TERMINAL_REFUSALS = frozenset({"malformed_contact", "sms_channel_not_provisioned"})
 
 
 @dataclass(frozen=True)
@@ -206,12 +222,17 @@ async def _stamp_delivery(
     gate: str,
     status: str,
     detail: str | None = None,
+    provider_message_id: str | None = None,
 ) -> None:
-    """Record what happened to the notification on its escalation row (F079/F083)."""
+    """Record what happened to the notification on its escalation row (F079/F083).
+    ``provider_message_id`` is the send the status rests on — what a delivery receipt
+    later finds the row by (round 7 WP-4b)."""
     values: dict[str, object] = {
         "delivery_status": status,
         "delivery_detail": (detail or None) and str(detail)[:64],
     }
+    if provider_message_id:
+        values["delivery_provider_message_id"] = str(provider_message_id)[:64]
     if status == DELIVERY_DELIVERED:
         values["delivered_at"] = datetime.now(UTC)
     await session.execute(
@@ -326,8 +347,12 @@ async def _background_retry(
                 status = await delivery_status_of(
                     s, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
                 )
-                if status == DELIVERY_DELIVERED:
+                if status in _SETTLED:
                     return
+                if status == DELIVERY_OWNER_FALLBACK:
+                    # The owner heard through another pass (the sweep, an earlier rung):
+                    # this rung is for the configured contact alone (item 7).
+                    contacts_only = True
                 if await notify_escalation(
                     s,
                     admin_id=admin_id,
@@ -532,6 +557,19 @@ async def _build_notification(
     # are genuinely anonymous unless they volunteered contact info (then the lead
     # row carries it and lead_contact serves it).
     customer_identifier = lead.contact_identifier if lead else None
+    # Item 3: the address / number the lead VOLUNTEERED on top of the transport key
+    # (lead.email / lead.phone are NULL when contact_identifier already is it).
+    lead_email = (lead.email or None) if lead else None
+    lead_phone = (lead.phone or None) if lead else None
+    # Item 4: a moderation take-over (self_harm / threats_violence) is a SAFETY page.
+    # The row's first reason names it; a row written without the token (the runtime
+    # audits ``content_moderation_event`` right before it takes over) is read back
+    # from that audit trail — never rendered as "the customer asked for a person".
+    safety_category = safety_category_from_reasons(reasons)
+    if safety_category is None and signal == "explicit_human_request":
+        safety_category = await _moderation_takeover_category(
+            session, admin_id=admin_id, session_id=session_id
+        )
     base = get_settings().app_base_url.rstrip("/")
     dashboard_url = f"{base}/dashboard/conversations?open={session_id}" if base else None
 
@@ -553,8 +591,41 @@ async def _build_notification(
         triggering_message=triggering_message,
         dashboard_url=dashboard_url,
         reasons=reasons,
+        lead_email=lead_email,
+        lead_phone=lead_phone,
+        safety_category=safety_category,
     )
     return notification, inst, owner_email
+
+
+async def _moderation_takeover_category(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> str | None:
+    """The safety category behind an ``explicit_human_request`` row written by the
+    moderation take-over (item 4): the runtime audits ``content_moderation_event`` for
+    the session right before it hands the conversation to a person. None for a real
+    request for a person."""
+    rows = (
+        (
+            await session.execute(
+                select(AdminAuditLog.event_payload)
+                .where(
+                    AdminAuditLog.admin_id == admin_id,
+                    AdminAuditLog.event_type == "content_moderation_event",
+                    AdminAuditLog.event_payload["session_id"].astext == str(session_id),
+                )
+                .order_by(AdminAuditLog.seq.desc())
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for payload in rows:
+        category = payload.get("category") if isinstance(payload, dict) else None
+        if isinstance(category, str) and category in SAFETY_CATEGORIES:
+            return category
+    return None
 
 
 async def notify_escalation(
@@ -624,6 +695,7 @@ async def notify_escalation(
         is_suppressed,
         is_verified,
     )
+    from app.notifications import contact_confirmation  # noqa: PLC0415
     from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
 
     email_states = await states_for(
@@ -631,14 +703,37 @@ async def notify_escalation(
         admin_id,
         [c for c in (routing.primary, routing.secondary, owner_email) if c],
     )
+    # Round 7 WP-4b: the same rule for a number — until the contact answered its code,
+    # the owner is copied on every page to it (SMS contacts were never proven before).
+    sms_states = (
+        await contact_confirmation.states_for(
+            session,
+            admin_id,
+            [(contact_confirmation.KIND_SMS, c) for c in (routing.primary, routing.secondary) if c],
+        )
+        if routing.channel == "sms"
+        else {}
+    )
 
     def _state_of(address: str) -> EmailDeliveryIncident | None:
         return email_states.get(address.strip().lower())
 
+    def _proven(contact: str) -> bool:
+        if routing.channel == "email":
+            return is_verified(_state_of(contact))
+        return contact_confirmation.is_confirmed(
+            sms_states.get(
+                (contact_confirmation.KIND_SMS, contact_confirmation.normalize_number(contact))
+            )
+        )
+
     delivered = False
     delivered_unverified = False
+    delivered_role: str | None = None
     attempted: set[tuple[str, str]] = set()
     last_refusal: str | None = None  # a provider refusal that could clear on its own
+    terminal_refusal: str | None = None  # a refusal that waiting cannot change (item 6)
+    owner_fallback: DeliveryReceipt | None = None  # the owner-email last resort, if tried
     for role, contact in (("primary", routing.primary), ("secondary", routing.secondary)):
         if not contact:
             continue
@@ -675,19 +770,33 @@ async def notify_escalation(
         )
         delivered = receipt.accepted
         if delivered:
-            delivered_unverified = routing.channel == "email" and not is_verified(
-                _state_of(contact)
-            )
+            delivered_unverified = not _proven(contact)
+            delivered_role = role
             await _stamp_delivery(
                 session,
                 admin_id=admin_id,
                 session_id=session_id,
                 signal=signal,
                 gate=gate,
-                status=DELIVERY_DELIVERED,
+                # A live SMS with a delivery receipt outstanding is ``sent``; the
+                # carrier's receipt makes it ``delivered`` (round 7 WP-4b).
+                status=(
+                    DELIVERY_SENT if receipt.detail == _sms_dlr_pending() else DELIVERY_DELIVERED
+                ),
                 detail=f"{routing.channel}:{role}",
+                provider_message_id=receipt.provider_message_id,
             )
             break
+        if receipt.detail in TERMINAL_REFUSALS:
+            terminal_refusal = receipt.detail
+            await _record_terminal_refusal(
+                session,
+                admin_id=admin_id,
+                channel=routing.channel,
+                contact=contact,
+                reason=receipt.detail,
+            )
+            continue
         last_refusal = receipt.detail or "refused"
 
     if contacts_only:
@@ -706,10 +815,11 @@ async def notify_escalation(
         # Round 5B item 13: an UNCONFIRMED contact accepted the send — copy the
         # account owner too. SES acceptance is not delivery, and until the
         # contact proves out (or for legacy contacts saved before verification
-        # existed), silence toward a typo'd address must not be trusted.
+        # existed), silence toward a typo'd address must not be trusted. Round 7
+        # WP-4b: the same for a number that never answered its confirmation code.
         if delivered_unverified and owner_email and ("email", owner_email) not in attempted:
             attempted.add(("email", owner_email))
-            await _deliver(
+            copy = await _deliver(
                 session, notification, channel="email", to=owner_email, role="owner_unverified_copy"
             )
             await audit.emit(
@@ -726,6 +836,19 @@ async def notify_escalation(
                     "configured_channel": routing.channel,
                 },
             )
+            if copy.accepted:
+                # Remembered on the row: a failed delivery receipt for the contact
+                # must not page the owner a second time for this escalation.
+                await session.execute(
+                    update(EscalationEvent)
+                    .where(
+                        EscalationEvent.admin_id == admin_id,
+                        EscalationEvent.session_id == session_id,
+                        EscalationEvent.signal == signal,
+                        EscalationEvent.gate == gate,
+                    )
+                    .values(delivery_detail=f"{routing.channel}:{delivered_role}+owner"[:64])
+                )
         return True
     # Nothing reached the configured contacts — fall back to the account owner (§3.5.4).
     if owner_email and ("email", owner_email) not in attempted:
@@ -754,7 +877,7 @@ async def notify_escalation(
                 },
             )
         elif (
-            await _deliver(
+            owner_fallback := await _deliver(
                 session, notification, channel="email", to=owner_email, role="owner_fallback"
             )
         ).accepted:
@@ -783,8 +906,15 @@ async def notify_escalation(
                 signal=signal,
                 gate=gate,
                 status=DELIVERY_OWNER_FALLBACK,
-                detail=last_refusal or "no_contact_configured",
+                detail=last_refusal or terminal_refusal or "no_contact_configured",
             )
+            if not queue_retry and last_refusal is not None:
+                # A REPLAY (sweep or ladder) reached the owner: the queued item for this
+                # row must not page the owner again on its next pass — re-point it to
+                # the configured contact alone (round 7 WP-4b, item 7).
+                await _repoint_queued_to_contacts_only(
+                    session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+                )
             if queue_retry and last_refusal is not None:
                 # The owner heard, but the person the owner CONFIGURED did not (audit
                 # F083): keep trying that contact — contacts only, the owner is never
@@ -841,6 +971,29 @@ async def notify_escalation(
         )
         return False
 
+    # The owner-email last resort refused by the provider is a blip like any other —
+    # the tenant with no contacts configured (P1-6) is retried through it.
+    owner_refusal = (
+        (owner_fallback.detail or "refused")
+        if owner_fallback is not None and not owner_fallback.accepted
+        else None
+    )
+    if last_refusal is None and owner_refusal is None:
+        # Every refusal was terminal (item 6): a malformed contact or an SMS contact
+        # with no number to send from looks exactly the same in an hour. The owner
+        # fallback above was the last resort; nothing is left to retry. Stamped
+        # ``failed`` now — never a 24h queue of noise ending in the same answer.
+        await _stamp_delivery(
+            session,
+            admin_id=admin_id,
+            session_id=session_id,
+            signal=signal,
+            gate=gate,
+            status=DELIVERY_FAILED,
+            detail=terminal_refusal or "refused",
+        )
+        return False
+
     if queue_retry:
         # Contacts existed and every send was refused — the provider blip case (P1-6).
         # The deferred queue owns the long tail; the in-process ladder (F065) owns the
@@ -863,7 +1016,7 @@ async def notify_escalation(
             signal=signal,
             gate=gate,
             status=DELIVERY_QUEUED,
-            detail=last_refusal or "refused",
+            detail=last_refusal or owner_refusal or "refused",
         )
         _schedule_background_retries(
             admin_id=admin_id,
@@ -896,13 +1049,14 @@ async def replay_queued_notification(
     sid = uuid.UUID(session_id)
     # The in-process ladder (F065) may already have reached the contact while this item
     # waited its backoff: a second page for the same escalation is noise, not delivery.
-    if (
-        await delivery_status_of(
-            session, admin_id=admin_id, session_id=sid, signal=signal, gate=gate
-        )
-        == DELIVERY_DELIVERED
-    ):
+    status = await delivery_status_of(
+        session, admin_id=admin_id, session_id=sid, signal=signal, gate=gate
+    )
+    if status in _SETTLED:
         return True
+    # The owner already heard (the ladder's fallback landed while this item waited):
+    # this pass is for the configured contact alone, whatever the item says (item 7).
+    contacts_only = bool(action_payload.get("contacts_only")) or status == DELIVERY_OWNER_FALLBACK
     return await notify_escalation(
         session,
         admin_id=admin_id,
@@ -913,7 +1067,7 @@ async def replay_queued_notification(
         gate=gate,
         score=score if isinstance(score, (int, float)) else None,
         queue_retry=False,
-        contacts_only=bool(action_payload.get("contacts_only")),
+        contacts_only=contacts_only,
     )
 
 
@@ -945,6 +1099,182 @@ async def mark_abandoned(session: AsyncSession, action_payload: Mapping[str, obj
         return
     row.delivery_status = DELIVERY_FAILED
     row.delivery_detail = "abandoned_after_24h"
+
+
+def _sms_dlr_pending() -> str:
+    from app.notifications.sms_notifier import DLR_PENDING  # noqa: PLC0415
+
+    return DLR_PENDING
+
+
+async def _record_terminal_refusal(
+    session: AsyncSession, *, admin_id: uuid.UUID, channel: str, contact: str, reason: str
+) -> None:
+    """A malformed EMAIL contact is recorded as a delivery incident (item 6): mail to it
+    can never land, which is exactly what the dashboard's ``escalation_bouncing`` need
+    and the contact-health surface already say about a hard-bounced address — the
+    existing seam, so the owner is told to fix the address without a new rule. A
+    number with no SMS channel behind it has no email row to speak through; the
+    contact-health surface names ``sms_channel_not_provisioned`` for it instead."""
+    if channel != "email" or reason != "malformed_contact":
+        return
+    from app.notifications.delivery_incidents import _upsert_row  # noqa: PLC0415
+
+    row = await _upsert_row(session, admin_id, contact)
+    now = datetime.now(UTC)
+    if row.hard_bounced_at is None or row.last_event_detail != "malformed_contact":
+        row.hard_bounced_at = now
+        row.last_event_at = now
+        row.last_event_detail = "malformed_contact"
+        await session.flush()
+
+
+async def _repoint_queued_to_contacts_only(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+) -> int:
+    """Mark this row's queued retry ``contacts_only`` (item 7). Returns rows changed."""
+    from app.models.deferred import DeferredAction  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(DeferredAction).where(
+                    DeferredAction.admin_id == admin_id,
+                    DeferredAction.action_type == ESCALATION_RETRY_ACTION,
+                    DeferredAction.status == "queued",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changed = 0
+    for action in rows:
+        payload = dict(action.payload or {})
+        if (
+            payload.get("session_id") != str(session_id)
+            or payload.get("signal") != signal
+            or payload.get("gate") != gate
+            or payload.get("contacts_only")
+        ):
+            continue
+        payload["contacts_only"] = True
+        action.payload = payload  # a NEW dict so the JSONB change is flushed
+        changed += 1
+    if changed:
+        await session.flush()
+    return changed
+
+
+#: Twilio ``MessageStatus`` values a delivery receipt settles a row with.
+_DLR_DELIVERED = frozenset({"delivered", "read"})
+_DLR_FAILED = frozenset({"failed", "undelivered"})
+
+
+async def record_sms_delivery_receipt(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    provider_message_id: str,
+    message_status: str,
+    error_code: str | None = None,
+) -> str:
+    """Stamp a page's row from the carrier's word (round 7 WP-4b): ``delivered`` when
+    Twilio says delivered; on ``failed`` / ``undelivered`` the contact did not hear,
+    so the failure is audited and the owner is paged by email now — unless the owner
+    was already copied when the page went out (an unproven contact), in which case the
+    row simply reads ``owner_fallback``. Interim statuses are ignored. Returns what
+    was done: delivered | owner_fallback | failed | ignored | unknown_message."""
+    status = (message_status or "").strip().lower()
+    if status not in _DLR_DELIVERED and status not in _DLR_FAILED:
+        return "ignored"
+    row = (
+        await session.execute(
+            select(EscalationEvent).where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.delivery_provider_message_id == provider_message_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or row.session_id is None:
+        return "unknown_message"
+    if status in _DLR_DELIVERED:
+        if row.delivery_status != DELIVERY_DELIVERED:
+            row.delivery_status = DELIVERY_DELIVERED
+            row.delivered_at = datetime.now(UTC)
+            await session.flush()
+        return "delivered"
+    if row.delivery_status in (DELIVERY_FAILED, DELIVERY_OWNER_FALLBACK):
+        return "ignored"  # a retried receipt for a row already settled by one
+    reason = f"sms_dlr:{status}" + (f":{error_code}" if error_code else "")
+    notification, _inst, owner_email = await _build_notification(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=row.session_id,
+        resolved_lead_id=row.resolved_lead_id,
+        signal=row.signal,
+        gate=row.gate,
+        score=row.score_or_confidence,
+    )
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        event_type="escalation_delivery_failed",
+        actor_type=ActorType.platform,
+        payload={
+            "signal": row.signal,
+            "gate": row.gate,
+            "conversation_ref": notification.conversation_ref,
+            "delivery_method": "sms",
+            "provider_message_id": provider_message_id,
+            "failure_reason": reason,
+        },
+    )
+    if "+owner" in (row.delivery_detail or ""):
+        row.delivery_status = DELIVERY_OWNER_FALLBACK
+        row.delivery_detail = reason[:64]
+        await session.flush()
+        return "owner_fallback"
+    from app.models.email_incident import is_suppressed  # noqa: PLC0415
+    from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
+
+    if owner_email and not is_suppressed(
+        (await states_for(session, admin_id, [owner_email])).get(owner_email.strip().lower())
+    ):
+        fallback = await _deliver(
+            session, notification, channel="email", to=owner_email, role="owner_fallback"
+        )
+        if fallback.accepted:
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                event_type="escalation_owner_fallback",
+                actor_type=ActorType.platform,
+                payload={
+                    "signal": row.signal,
+                    "gate": row.gate,
+                    "conversation_ref": notification.conversation_ref,
+                    "reason": "sms_delivery_failed",
+                    "configured_channel": "sms",
+                },
+            )
+            row.delivery_status = DELIVERY_OWNER_FALLBACK
+            row.delivery_detail = reason[:64]
+            await session.flush()
+            return "owner_fallback"
+    row.delivery_status = DELIVERY_FAILED
+    row.delivery_detail = reason[:64]
+    await session.flush()
+    return "failed"
 
 
 async def notify_escalation_safely(

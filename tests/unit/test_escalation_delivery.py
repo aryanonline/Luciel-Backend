@@ -16,7 +16,7 @@ from app.connections.secrets import secret_ref_for
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from app.models.connection import InstanceConnection
-from app.models.email_incident import EmailDeliveryIncident
+from app.models.email_incident import EmailDeliveryIncident, EscalationContactConfirmation
 from app.models.instance import Account, AccountState, Instance
 from app.models.lead import Lead
 from app.notifications import email_notifier, sms_notifier
@@ -68,6 +68,7 @@ async def _seed_tenant(
     escalation: dict[str, object],
     sms_number: str | None = None,
     verified_contacts: tuple[str, ...] = (),
+    verified_sms_contacts: tuple[str, ...] = (),
 ) -> uuid.UUID:
     """One verified account + one Luciel with the given escalation pillar, plus a lead.
 
@@ -75,7 +76,9 @@ async def _seed_tenant(
     item 13): a delivered-but-unverified contact additionally copies the account
     owner, so routing tests that pin exact recipient lists seed the confirmation.
     The unverified-copy behavior itself is pinned in
-    ``tests/contract/test_escalation_contact_reliability.py``.
+    ``tests/contract/test_escalation_contact_reliability.py``. ``verified_sms_contacts``
+    is the same for a number (round 7 WP-4b): a number that never answered its
+    confirmation code copies the owner too — pinned below.
     """
     lead_id = uuid.uuid4()
     async with tenant_session(admin_id) as s:
@@ -85,6 +88,15 @@ async def _seed_tenant(
                     admin_id=admin_id,
                     email_lower=address.strip().lower(),
                     verified_at=datetime.now(UTC),
+                )
+            )
+        for number in verified_sms_contacts:
+            s.add(
+                EscalationContactConfirmation(
+                    admin_id=admin_id,
+                    kind="sms",
+                    value_normalized=number,
+                    confirmed_at=datetime.now(UTC),
                 )
             )
         s.add(
@@ -211,6 +223,7 @@ async def test_preferred_channel_sms_pages_the_sms_contact_from_the_tenant_numbe
             "preferredChannel": "sms",
         },
         sms_number="+15559990000",
+        verified_sms_contacts=("+15550001111",),
     )
 
     rows = await _fire(admin_id, instance_id, lead_id)
@@ -339,3 +352,52 @@ async def test_server_only_signal_with_no_lead_still_notifies(senders):
     body = str(email_fake.sent[0]["body"])
     assert "not captured" in body
     assert "payment method" in body
+
+
+# --- round 7 WP-4b: an SMS contact is proven, or the owner is copied ----------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_unconfirmed_sms_contact_pages_the_number_and_copies_the_owner(senders):
+    """Twilio accepting a request used to be the whole proof that a number could hear a
+    page. Until the contact answers its confirmation code, every page to it also goes
+    to the account owner — the rule the email loop already had (round 5B item 13)."""
+    email_fake, sms_fake = senders
+    admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
+    lead_id = await _seed_tenant(
+        admin_id,
+        instance_id,
+        escalation={"primarySms": "+15550001111", "preferredChannel": "sms"},
+        sms_number="+15559990000",
+    )
+
+    rows = await _fire(admin_id, instance_id, lead_id)
+
+    assert [m["to"] for m in sms_fake.sent] == ["+15550001111"]
+    assert [m["to"] for m in email_fake.sent] == [OWNER_EMAIL]
+    roles = [
+        r.event_payload["recipient_role"] for r in _events(rows, "escalation_notification_sent")
+    ]
+    assert roles == ["primary", "owner_unverified_copy"]
+    fallback = _events(rows, "escalation_owner_fallback")
+    assert len(fallback) == 1
+    assert fallback[0].event_payload["reason"] == "contact_unverified"
+    assert fallback[0].event_payload["configured_channel"] == "sms"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_confirmed_sms_contact_is_paged_alone(senders):
+    """Once the number answered its code, the owner is not copied any more."""
+    email_fake, sms_fake = senders
+    admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
+    lead_id = await _seed_tenant(
+        admin_id,
+        instance_id,
+        escalation={"primarySms": "+15550001111", "preferredChannel": "sms"},
+        sms_number="+15559990000",
+        verified_sms_contacts=("+15550001111",),
+    )
+
+    rows = await _fire(admin_id, instance_id, lead_id)
+
+    assert [m["to"] for m in sms_fake.sent] == ["+15550001111"]
+    assert email_fake.sent == []
+    assert _events(rows, "escalation_owner_fallback") == []

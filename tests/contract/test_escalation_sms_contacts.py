@@ -138,10 +138,14 @@ async def test_a_test_text_goes_out_on_the_tenants_own_number_and_is_audited(cli
             .scalars()
             .all()
         )
-    assert len(rows) == 1
-    assert rows[0].event_payload["delivered"] is True
-    assert rows[0].event_payload["number_suffix"] == CONTACT[-4:]
-    assert CONTACT not in str(rows[0].event_payload)  # suffix only (§3.4.11)
+    # Two sends were audited: saving the number started its confirmation-code loop
+    # (round 7 WP-4b; through the notification leg, which this fixture does not
+    # intercept), then the owner's test text went out. The test text names its slot.
+    assert len(rows) == 2
+    (test_row,) = [r for r in rows if r.event_payload.get("slot") == "primary"]
+    assert test_row.event_payload["delivered"] is True
+    assert test_row.event_payload["number_suffix"] == CONTACT[-4:]
+    assert CONTACT not in str(test_row.event_payload)  # suffix only (§3.4.11)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

@@ -439,6 +439,68 @@ async def twilio_voice_status(request: Request) -> Response:
     return Response(status_code=200)
 
 
+@router.post("/twilio/notifications/status")
+async def twilio_notification_status(request: Request) -> Response:
+    """Delivery receipt for an OWNER notification text (round 7 WP-4b).
+
+    The escalation SMS leg asks Twilio to post each page's ``MessageStatus`` here, so
+    ``escalation_events.delivery_status`` reads ``delivered`` when the carrier delivered
+    it and ``failed`` (with the owner paged by email) when it did not — Twilio accepting
+    the request used to be the whole proof. Same posture as the voice status route:
+    verify → resolve → stamp, no admission/opt-out semantics, and the tenant is the
+    owner of the FROM number (their own BYO number, the one the page went out on),
+    never the To. A receipt for a message this platform did not send is a no-op 200.
+    """
+    from app.channels import pipeline, rate_limit  # noqa: PLC0415
+    from app.channels.signatures import verify_twilio_inbound  # noqa: PLC0415
+    from app.notifications import escalation_dispatch  # noqa: PLC0415
+
+    settings = get_settings()
+    form = await request.form()
+    params: dict[str, str] = {k: str(v) for k, v in form.items()}
+    from_number = params.get("From", "")
+    admitted = rate_limit.get_store().check_source(
+        "voice_status", f"notification:{from_number or '?'}"
+    )
+    if not admitted.allowed:
+        return Response(status_code=429)
+    tenant_token, capability = await _tenant_twilio_inbound_auth(from_number)
+    async with untenanted_session() as s:
+        if not verify_twilio_inbound(
+            tenant_token or settings.twilio_auth_token,
+            str(request.url),
+            params,
+            request.headers.get("X-Twilio-Signature", ""),
+            capability_token=capability,
+        ):
+            await pipeline.record_inbound_rejection(
+                s, reason="twilio_signature_invalid", channel="sms"
+            )
+            if "cap=" in str(request.url.query or ""):
+                await _audit_capability_rejection(from_number)
+            return Response(status_code=403)
+        try:
+            ctx = await _resolve("sms_sender", from_number)
+        except InboundRejected as rej:
+            await pipeline.record_inbound_rejection(s, reason=rej.reason, channel="sms")
+            return Response(status_code=200)
+
+    message_sid = params.get("MessageSid") or params.get("SmsSid") or ""
+    message_status = params.get("MessageStatus") or params.get("SmsStatus") or ""
+    if not message_sid or not message_status:
+        return Response(status_code=200)
+    async with tenant_session(ctx.admin_id) as s:
+        await escalation_dispatch.record_sms_delivery_receipt(
+            s,
+            admin_id=ctx.admin_id,
+            instance_id=ctx.instance_id,
+            provider_message_id=message_sid,
+            message_status=message_status,
+            error_code=params.get("ErrorCode") or None,
+        )
+    return Response(status_code=200)
+
+
 # --------------------------------------------------------------------------- #
 # SES inbound email (delivered via SNS)
 # --------------------------------------------------------------------------- #

@@ -34,6 +34,8 @@ from app.schemas_api.employee import EmployeeStatusOut
 from app.schemas_api.luciel import (
     CapabilityGroupOut,
     ChannelConfigIn,
+    ConfirmSmsContactRequest,
+    ConfirmSmsContactResult,
     CreateLucielRequest,
     LucielOut,
     ResendContactConfirmationRequest,
@@ -91,41 +93,124 @@ def _merge_live_channel_status(
     ]
 
 
+def _after_hours_contact(team_availability: object) -> tuple[str, str] | None:
+    """(channel, contact) named under ``afterHours.escalation`` (round 6 WP-E), read
+    from the stored wire blob whether or not the setting is switched on — a contact
+    that will take pages once it is enabled is confirmed when it is saved."""
+    blob = team_availability if isinstance(team_availability, dict) else {}
+    after_hours = blob.get("afterHours")
+    escalation = after_hours.get("escalation") if isinstance(after_hours, dict) else None
+    if not isinstance(escalation, dict):
+        return None
+    channel = escalation.get("channel")
+    if channel == "sms" and escalation.get("contactSms"):
+        return "sms", str(escalation["contactSms"])
+    if channel == "email" and escalation.get("contactEmail"):
+        return "email", str(escalation["contactEmail"])
+    return None
+
+
+def _configured_contacts(inst: Instance) -> list[tuple[str, str, str]]:
+    """Every escalation contact the Luciel can page, as (channel, role, value): the
+    pillar's email and SMS slots plus the after-hours contact (round 7 WP-4b, item 2)."""
+    escalation = inst.escalation if isinstance(inst.escalation, dict) else {}
+    out: list[tuple[str, str, str]] = []
+    for role, key in (("primary", "primaryEmail"), ("secondary", "secondaryEmail")):
+        value = escalation.get(key)
+        if value:
+            out.append(("email", role, str(value)))
+    for role, key in (("primary", "primarySms"), ("secondary", "secondarySms")):
+        value = escalation.get(key)
+        if value:
+            out.append(("sms", role, str(value)))
+    after_hours = _after_hours_contact(inst.team_availability)
+    if after_hours is not None:
+        out.append((after_hours[0], "after_hours", after_hours[1]))
+    return out
+
+
 async def _contact_health(
-    s: AsyncSession, admin_id: uuid.UUID, escalation: dict[str, object] | None
+    s: AsyncSession, admin_id: uuid.UUID, inst: Instance
 ) -> list[dict[str, object]]:
-    """Deliverability truth for the configured email contacts (round 5B #13)."""
+    """Deliverability truth for every configured contact (round 5B #13; round 7 WP-4b
+    adds the SMS slots and the after-hours contact). An SMS contact reports whether its
+    code went out, and names the honest refusal when no number is connected to send
+    it from."""
+    from app.connections.service import resolve_sms_number  # noqa: PLC0415
     from app.models.email_incident import is_suppressed, is_verified  # noqa: PLC0415
+    from app.notifications import contact_confirmation  # noqa: PLC0415
     from app.notifications.delivery_incidents import states_for  # noqa: PLC0415
 
-    escalation = escalation or {}
-    addresses = [
-        str(a) for a in (escalation.get("primaryEmail"), escalation.get("secondaryEmail")) if a
-    ]
-    if not addresses:
+    contacts = _configured_contacts(inst)
+    if not contacts:
         return []
-    states = await states_for(s, admin_id, addresses)
-    out: list[dict[str, object]] = []
-    for address in addresses:
-        row = states.get(address.strip().lower())
-        if is_suppressed(row):
-            state = "bouncing"
-        elif is_verified(row):
-            state = "verified"
-        elif row is not None and row.verification_pending_jti:
-            state = "pending_confirmation"
-        else:
-            state = "unverified"
-        out.append(
-            {
-                "address": address,
-                "state": state,
-                "verifiedAt": row.verified_at.isoformat() if row and row.verified_at else None,
-                "lastBouncedAt": (
-                    row.hard_bounced_at.isoformat() if row and row.hard_bounced_at else None
-                ),
-            }
+    emails = [value for channel, _role, value in contacts if channel == "email"]
+    numbers = [value for channel, _role, value in contacts if channel == "sms"]
+    email_states = await states_for(s, admin_id, emails) if emails else {}
+    sms_states = (
+        await contact_confirmation.states_for(
+            s, admin_id, [(contact_confirmation.KIND_SMS, n) for n in numbers]
         )
+        if numbers
+        else {}
+    )
+    sms_from = await resolve_sms_number(s, admin_id, inst.id) if numbers else None
+    now = datetime.now(UTC)
+    out: list[dict[str, object]] = []
+    for channel, role, value in contacts:
+        entry: dict[str, object] = {"address": value, "channel": channel, "role": role}
+        if channel == "email":
+            row = email_states.get(value.strip().lower())
+            if is_suppressed(row):
+                state = "bouncing"
+            elif is_verified(row):
+                state = "verified"
+            elif row is not None and row.verification_pending_jti:
+                state = "pending_confirmation"
+            else:
+                state = "unverified"
+            entry.update(
+                {
+                    "state": state,
+                    "verifiedAt": row.verified_at.isoformat() if row and row.verified_at else None,
+                    "lastBouncedAt": (
+                        row.hard_bounced_at.isoformat() if row and row.hard_bounced_at else None
+                    ),
+                    "detail": (row.last_event_detail if row and state == "bouncing" else None),
+                }
+            )
+        else:
+            sms_row = sms_states.get(
+                (contact_confirmation.KIND_SMS, contact_confirmation.normalize_number(value))
+            )
+            if contact_confirmation.is_confirmed(sms_row):
+                state = "verified"
+            elif (
+                sms_row is not None
+                and sms_row.code_hash is not None
+                and sms_row.code_expires_at is not None
+                and sms_row.code_expires_at > now
+            ):
+                state = "pending_confirmation"
+            else:
+                state = "unverified"
+            entry.update(
+                {
+                    "state": state,
+                    "verifiedAt": (
+                        sms_row.confirmed_at.isoformat()
+                        if sms_row and sms_row.confirmed_at
+                        else None
+                    ),
+                    "lastBouncedAt": None,
+                    "detail": (
+                        "sms_channel_not_provisioned"
+                        if state != "verified" and not sms_from
+                        else None
+                    ),
+                }
+            )
+        out.append(entry)
     return out
 
 
@@ -216,7 +301,7 @@ async def get_luciel(subject: Subject = Depends(current_admin)) -> LucielOut | N
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
         tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
-        health = await _contact_health(s, subject.admin_id, inst.escalation)
+        health = await _contact_health(s, subject.admin_id, inst)
     return _to_out(
         inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
     )
@@ -338,7 +423,7 @@ async def _update_config(
             else None
         )
         tool_status = await _tool_statuses(s, admin_id, inst.id)
-        health = await _contact_health(s, admin_id, inst.escalation)
+        health = await _contact_health(s, admin_id, inst)
         return _to_out(
             inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
         )
@@ -540,6 +625,32 @@ async def _kick_contact_verification(
         )
 
 
+async def _kick_sms_confirmation(
+    s: AsyncSession,
+    admin_id: uuid.UUID,
+    inst: Instance,
+    numbers: list[str],
+    *,
+    actor_user_id: uuid.UUID | None = None,
+) -> None:
+    """Start the code loop for each configured SMS contact not yet confirmed (round 7
+    WP-4b). Same-transaction with the pillar write; a number already confirmed, or
+    with a live code outstanding, is not texted again on a re-save. A tenant with no
+    SMS number connected gets an honest refusal recorded — the contact-health surface
+    names it — never a fabricated send."""
+    from app.notifications import contact_confirmation  # noqa: PLC0415
+
+    for number in numbers:
+        await contact_confirmation.begin_sms_confirmation(
+            s,
+            admin_id=admin_id,
+            instance_id=inst.id,
+            number=number,
+            business_name=inst.name,
+            actor_user_id=actor_user_id,
+        )
+
+
 @router.put("/escalation", response_model=LucielOut)
 async def update_escalation(
     req: UpdateEscalationRequest, subject: Subject = Depends(current_admin)
@@ -552,17 +663,93 @@ async def update_escalation(
     def _build(_: Instance) -> object:
         return req.model_dump(by_alias=True, exclude_none=True)
 
-    async def _after(s: AsyncSession, _inst: Instance) -> None:
-        # Round 5B item 13: saving a contact starts its confirmation loop.
+    async def _after(s: AsyncSession, inst: Instance) -> None:
+        # Round 5B item 13: saving a contact starts its confirmation loop. Round 7
+        # WP-4b: a number too — the code goes out through the tenant's own number.
         await _kick_contact_verification(
             s,
             subject.admin_id,
             [a for a in (req.primary_email, req.secondary_email) if a],
         )
+        await _kick_sms_confirmation(
+            s,
+            subject.admin_id,
+            inst,
+            [n for n in (req.primary_sms, req.secondary_sms) if n],
+            actor_user_id=subject.user_id,
+        )
 
     return await _update_config(
         subject.admin_id, subject.user_id, "escalation", _build, after=_after
     )
+
+
+@router.post("/escalation/contacts/confirm-sms", response_model=ConfirmSmsContactResult)
+async def confirm_sms_contact(
+    req: ConfirmSmsContactRequest, subject: Subject = Depends(current_admin)
+) -> ConfirmSmsContactResult:
+    """The owner enters the 6-digit code an SMS escalation contact received (round 7
+    WP-4b). The contact may instead text the code back to the number that sent it.
+    Rate-limited per tenant and every entry is audited; five wrong entries kill the
+    code and the owner asks for a new one."""
+    from app.channels import rate_limit  # noqa: PLC0415
+    from app.notifications import contact_confirmation  # noqa: PLC0415
+
+    decision = rate_limit.get_store().check_source(
+        "escalation_test_sms", f"confirm:{subject.admin_id}"
+    )
+    if not decision.allowed:
+        from app.api.errors import rate_limited  # noqa: PLC0415
+
+        raise rate_limited(
+            "Too many code entries. Please wait a few minutes.", retry_after_seconds=60
+        )
+    async with tenant_session(subject.admin_id) as s:
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        if inst is None:
+            raise not_found("No Luciel.")
+        number = contact_confirmation.normalize_number(req.number)
+        configured = {
+            contact_confirmation.normalize_number(value)
+            for channel, _role, value in _configured_contacts(inst)
+            if channel == "sms"
+        }
+        if not number or number not in configured:
+            raise validation_error(
+                "That number is not currently configured as an escalation contact."
+            )
+        outcome = await contact_confirmation.confirm_sms_code(
+            s, admin_id=subject.admin_id, number=number, code=req.code
+        )
+        await audit.emit(
+            s,
+            admin_id=subject.admin_id,
+            instance_id=inst.id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=subject.user_id,
+            event_type=(
+                "escalation_contact_verified"
+                if outcome == contact_confirmation.CONFIRMED
+                else "escalation_contact_code_rejected"
+            ),
+            payload={"channel": "sms", "number_suffix": number[-4:], "outcome": outcome},
+        )
+        live_status = await gate.channel_connection_statuses(
+            s, admin_id=subject.admin_id, instance_id=inst.id
+        )
+        tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
+        health = await _contact_health(s, subject.admin_id, inst)
+        return ConfirmSmsContactResult(
+            outcome=outcome,
+            luciel=_to_out(
+                inst,
+                live_channel_status=live_status,
+                contact_health=health,
+                tool_status=tool_status,
+            ),
+        )
 
 
 @router.post("/escalation/test-sms", response_model=TestSmsResult)
@@ -627,13 +814,14 @@ async def resend_contact_confirmation(
     req: ResendContactConfirmationRequest, subject: Subject = Depends(current_admin)
 ) -> LucielOut:
     """Re-send the confirmation link for a currently configured contact (round 5B
-    item 13). Re-minting invalidates the previous link; a 5-minute cooldown keeps
-    this from becoming a send-spam vector."""
+    item 13), or — round 7 WP-4b — a fresh code to a configured SMS contact.
+    Re-minting invalidates the previous link/code; a 5-minute cooldown keeps this
+    from becoming a send-spam vector. The after-hours contact counts (item 2)."""
     from datetime import timedelta  # noqa: PLC0415
 
     from app.auth.tokens import mint_link_token  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
-    from app.notifications import email_dispatcher  # noqa: PLC0415
+    from app.notifications import contact_confirmation, email_dispatcher  # noqa: PLC0415
     from app.notifications.delivery_incidents import begin_verification, states_for  # noqa: PLC0415
 
     async with tenant_session(subject.admin_id) as s:
@@ -642,13 +830,52 @@ async def resend_contact_confirmation(
         ).scalar_one_or_none()
         if inst is None:
             raise not_found("No Luciel.")
-        escalation = inst.escalation or {}
-        configured = {
-            str(a).strip().lower()
-            for a in (escalation.get("primaryEmail"), escalation.get("secondaryEmail"))
-            if a
-        }
-        address = req.address.strip().lower()
+        contacts = _configured_contacts(inst)
+        raw = req.address.strip()
+        if raw.startswith("+") or raw.replace(" ", "").isdigit():
+            number = contact_confirmation.normalize_number(raw)
+            configured_numbers = {
+                contact_confirmation.normalize_number(v) for ch, _r, v in contacts if ch == "sms"
+            }
+            if not number or number not in configured_numbers:
+                raise validation_error(
+                    "That number is not currently configured as an escalation contact."
+                )
+            start = await contact_confirmation.begin_sms_confirmation(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=inst.id,
+                number=number,
+                business_name=inst.name,
+                force=True,
+                actor_user_id=subject.user_id,
+            )
+            if start.reason == "cooldown":
+                raise validation_error(
+                    "A code was sent moments ago — give it a few minutes, then retry."
+                )
+            if start.reason == "already_confirmed":
+                raise validation_error("That number is already confirmed.")
+            if not start.sent:
+                if start.reason == "sms_channel_not_provisioned":
+                    raise validation_error(
+                        "Connect an SMS number under Configure → Channels first — the "
+                        "confirmation code is sent from your own number."
+                    )
+                raise validation_error(f"The code could not be sent ({start.reason}).")
+            live_status = await gate.channel_connection_statuses(
+                s, admin_id=subject.admin_id, instance_id=inst.id
+            )
+            tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
+            health = await _contact_health(s, subject.admin_id, inst)
+            return _to_out(
+                inst,
+                live_channel_status=live_status,
+                contact_health=health,
+                tool_status=tool_status,
+            )
+        configured = {v.strip().lower() for ch, _r, v in contacts if ch == "email"}
+        address = raw.lower()
         if address not in configured:
             raise validation_error(
                 "That address is not currently configured as an escalation contact."
@@ -680,7 +907,7 @@ async def resend_contact_confirmation(
             s, admin_id=subject.admin_id, instance_id=inst.id
         )
         tool_status = await _tool_statuses(s, subject.admin_id, inst.id)
-        health = await _contact_health(s, subject.admin_id, inst.escalation)
+        health = await _contact_health(s, subject.admin_id, inst)
         return _to_out(
             inst, live_channel_status=live_status, contact_health=health, tool_status=tool_status
         )
@@ -739,7 +966,26 @@ async def update_team_availability(
         blob.pop("timezone", None)
         return blob
 
-    return await _update_config(subject.admin_id, subject.user_id, "team_availability", _build)
+    async def _after(s: AsyncSession, inst: Instance) -> None:
+        # Round 7 WP-4b (item 2): the after-hours contact takes real pages, so it is
+        # proven like any other — the link loop for an address, the code for a number.
+        escalation = req.after_hours.escalation if req.after_hours else None
+        if escalation is None:
+            return
+        if escalation.channel == "email" and escalation.contact_email:
+            await _kick_contact_verification(s, subject.admin_id, [str(escalation.contact_email)])
+        elif escalation.channel == "sms" and escalation.contact_sms:
+            await _kick_sms_confirmation(
+                s,
+                subject.admin_id,
+                inst,
+                [str(escalation.contact_sms)],
+                actor_user_id=subject.user_id,
+            )
+
+    return await _update_config(
+        subject.admin_id, subject.user_id, "team_availability", _build, after=_after
+    )
 
 
 @router.get("/status")
