@@ -370,3 +370,75 @@ async def test_the_backlog_counts_queued_retries_and_terminal_misses(ses):
     assert backlog is not None
     assert backlog["queued"] >= 1
     assert backlog["failed24h"] >= 1
+
+
+# --- round 7 WP-4b item 7: the ladder and the queue never page the owner twice ------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rung_that_reaches_the_owner_repoints_the_queued_item_to_the_contact(
+    ses, monkeypatch
+):
+    """Everything refused on the turn: queued (owner included) + ladder scheduled. The
+    provider recovers for the OWNER only before the first rung, so the rung's fallback
+    lands. The queued item was filed for everyone; left alone, the hourly sweep would
+    page the owner a second time for the same escalation. The rung re-points it to the
+    configured contact alone, and the replay pages only the contact."""
+    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (0.25,))
+    ses.refuse = None
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid)
+
+    await _fire(admin, iid, sid, lead)
+    assert (await _row(admin, sid)).delivery_status == "queued"
+    (item,) = await _queued(admin)
+    assert item.payload["contacts_only"] is False
+
+    ses.refuse = {CONTACT}  # the owner is reachable again; the contact still is not
+    await escalation_dispatch.drain_background_retries()
+
+    assert ses.sent == [OWNER_EMAIL]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    (item,) = await _queued(admin)
+    assert item.payload["contacts_only"] is True
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
+
+    ses.refuse = set()
+    async with tenant_session(admin) as s:
+        assert (
+            await replay_queued_notification(
+                s, item.payload, admin_id=admin, instance_id=iid, resolved_lead_id=lead
+            )
+            is True
+        )
+    assert ses.sent == [OWNER_EMAIL, CONTACT]
+    assert (await _row(admin, sid)).delivery_status == "delivered"
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_replay_stands_down_from_the_owner_when_the_row_already_reads_owner_fallback(
+    ses,
+):
+    """The other half: whatever the queued item says, a row that reads owner_fallback
+    means the owner heard. The replay is for the configured contact alone, and while
+    the contact stays refused the owner is not paged again."""
+    ses.refuse = {CONTACT}
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid)
+
+    await _fire(admin, iid, sid, lead)
+    assert ses.sent == [OWNER_EMAIL]
+    assert (await _row(admin, sid)).delivery_status == "owner_fallback"
+    (item,) = await _queued(admin)
+
+    stale_payload = {**item.payload, "contacts_only": False}  # an item filed before the fix
+    async with tenant_session(admin) as s:
+        assert (
+            await replay_queued_notification(
+                s, stale_payload, admin_id=admin, instance_id=iid, resolved_lead_id=lead
+            )
+            is False
+        )
+    assert ses.sent == [OWNER_EMAIL]  # the contact was tried and refused; nobody else
+    assert (await _row(admin, sid)).delivery_status == "owner_fallback"
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
