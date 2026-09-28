@@ -23,7 +23,9 @@ from app.models.email_incident import EmailDeliveryIncident, EscalationContactCo
 from app.models.instance import Account, AccountState, Instance
 from app.models.lead import Lead
 from app.notifications import email_notifier, sms_notifier
+from app.notifications.base import EscalationNotification
 from app.notifications.escalation_dispatch import notify_escalation
+from app.runtime.orchestrator import ASK_ATTEMPT_BOUND
 from sqlalchemy import select
 
 pytestmark = [pytest.mark.asyncio]
@@ -698,3 +700,130 @@ async def test_a_provider_blip_is_still_queued(senders, monkeypatch):
 
     assert (await _row(admin_id, session_id)).delivery_status == "queued"
     assert await _queued_count(admin_id) == 1
+
+
+# --- round 7 WP-4b item 4: the renderings the read-back above does not pin ---------- #
+#
+# The moderation take-over can name its category on the row itself (first reason
+# ``moderation:<category>``) instead of only in the audit trail; a flagged row says WHAT
+# was flagged; the ask bound lists the field names still missing. Each is rendered on
+# both channels — the SMS is the one the owner reads on the move.
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_threat_named_in_the_rows_first_reason_is_a_safety_page(senders):
+    """Reasons path, end to end: the row's ``moderation:threats_violence`` token routes
+    the page where a request for a person goes (the signal is still
+    explicit_human_request) and renders it as SAFETY. The token never reaches the
+    owner; the phrase behind it does."""
+    email_fake, _ = senders
+    admin_id, instance_id = uuid.uuid4(), uuid.uuid4()
+    lead_id = await _seed_tenant(
+        admin_id,
+        instance_id,
+        escalation={"primaryEmail": "sales@acme.example"},
+        verified_contacts=("sales@acme.example",),
+    )
+    session_id = await _escalation_row(
+        admin_id,
+        instance_id,
+        lead_id,
+        signal="explicit_human_request",
+        gate="intake",
+        reasons=["moderation:threats_violence", "threatened to come to the office"],
+    )
+
+    await _fire(
+        admin_id,
+        instance_id,
+        lead_id,
+        signal="explicit_human_request",
+        gate="intake",
+        session_id=session_id,
+    )
+
+    (page,) = email_fake.sent
+    assert page["to"] == "sales@acme.example"
+    assert str(page["subject"]).startswith("SAFETY: a threat of violence")
+    body = str(page["body"])
+    assert "Why: SAFETY — a threat of violence" in body
+    assert "Details: threatened to come to the office" in body
+    assert "moderation:" not in body
+    assert "local authorities" in body
+    assert "asked" not in body.lower() and "speak to a person" not in body.lower()
+
+
+def _notification(**overrides: object) -> EscalationNotification:
+    fields: dict[str, object] = {
+        "admin_id": uuid.uuid4(),
+        "instance_id": uuid.uuid4(),
+        "session_id": uuid.uuid4(),
+        "signal": "high_value_lead",
+        "gate": "outcome",
+        "business_name": "Acme Patios",
+        "lead_name": "Dana Lee",
+        "lead_contact": "+15550001111",
+    }
+    fields.update(overrides)
+    return EscalationNotification(**fields)  # type: ignore[arg-type]
+
+
+async def test_a_self_harm_token_renders_as_an_urgent_safety_text_and_a_safety_email():
+    n = _notification(
+        signal="explicit_human_request", gate="intake", reasons=("moderation:self_harm",)
+    )
+    sms = sms_notifier.SmsNotifier().format(n)
+    assert sms.startswith("Acme Patios: URGENT SAFETY — a customer may be at risk of self-harm.")
+    assert "explicit_human_request" not in sms and "asked" not in sms.lower()
+    assert "emergency services" in sms
+    assert "Why:" not in sms and "moderation:" not in sms  # the token is not a reason
+    email = email_notifier.EmailNotifier()
+    assert email.subject(n) == "SAFETY: a customer may be at risk of self-harm — Luciel needs you"
+    body = email.format(n)
+    assert "Why: SAFETY — a customer may be at risk of self-harm" in body
+    assert "Details:" not in body and "moderation:" not in body
+    assert "emergency services" in body
+    assert "asked" not in body.lower() and "speak to a person" not in body.lower()
+
+
+async def test_a_threats_token_renders_the_violence_label_on_both_channels():
+    n = _notification(
+        signal="explicit_human_request",
+        gate="intake",
+        reasons=("moderation:threats_violence", "threatened staff"),
+    )
+    sms = sms_notifier.SmsNotifier().format(n)
+    assert sms.startswith("Acme Patios: URGENT SAFETY — a threat of violence.")
+    assert "Why: threatened staff." in sms and "moderation:" not in sms
+    assert "local authorities" in sms
+    email = email_notifier.EmailNotifier()
+    assert email.subject(n).startswith("SAFETY: a threat of violence")
+    body = email.format(n)
+    assert "Why: SAFETY — a threat of violence" in body
+    assert "Details: threatened staff" in body and "moderation:" not in body
+    assert "local authorities" in body
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["abusive language toward the assistant or business", "asked for something illegal"],
+)
+async def test_a_flagged_row_says_what_was_flagged(reason: str):
+    """The two D2 keep-answering categories, worded as the runtime writes them."""
+    n = _notification(signal="content_flagged", gate="intake", reasons=(reason,))
+    email = email_notifier.EmailNotifier()
+    assert email.subject(n) == "Luciel needs you: a message was flagged"
+    body = email.format(n)
+    assert f"Why: a message was flagged — {reason}" in body
+    assert "keeps answering" in body
+    sms = sms_notifier.SmsNotifier().format(n)
+    assert f"Acme Patios: Luciel escalated (content_flagged: {reason})." in sms
+
+
+async def test_an_ask_bound_row_lists_the_missing_fields():
+    """The §3.3.7 ask bound writes the field names still missing; the page carries
+    them verbatim so the owner knows what to ask for."""
+    reason = f"still missing email, phone after {ASK_ATTEMPT_BOUND} asks"
+    n = _notification(signal="cannot_answer", gate="outcome", reasons=(reason,))
+    body = email_notifier.EmailNotifier().format(n)
+    assert "Why: Luciel could not answer confidently" in body
+    assert f"Details: {reason}" in body
+    assert f"Why: {reason}." in sms_notifier.SmsNotifier().format(n)
