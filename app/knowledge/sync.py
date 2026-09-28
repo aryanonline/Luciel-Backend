@@ -248,7 +248,13 @@ async def sync_connection(
             src.sync_status = "error"
             continue
         if ext_id not in remote_by_id:
-            await service.delete_source(session, admin_id, src.id)
+            # Tagged ``origin``, not ``owner`` (round 7 WP-4c #9): the owner did not
+            # choose this, so restore refuses it honestly and the retention pass
+            # purges it at the next run instead of holding a 30-day undo window
+            # for a page its origin no longer has.
+            await service.delete_source(
+                session, admin_id, src.id, deleted_by=service.DELETED_BY_ORIGIN
+            )
             result.removed.append(ext_id)
 
     await session.flush()

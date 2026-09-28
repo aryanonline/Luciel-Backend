@@ -16,7 +16,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -359,6 +359,21 @@ DELETE_GRACE_DAYS = 30
 #: Who tombstoned a source (``knowledge_sources.deleted_by``, migration 0056).
 DELETED_BY_OWNER = "owner"
 DELETED_BY_LIFECYCLE = "lifecycle"
+#: The item disappeared at its sync origin (Drive / Notion / the crawled site) — round 7
+#: WP-4c #9. That is not the owner's mis-click, so there is nothing to undo here: the
+#: honest way back is re-adding it at the origin and syncing. Purged at the next
+#: retention pass, not after the 30-day window (the window exists for the owner's
+#: change of mind, not for content the origin no longer has). Before #9 these were
+#: stamped ``owner`` — restorable for 30 days, reviving a page its origin had deleted.
+DELETED_BY_ORIGIN = "origin"
+
+
+class RemovedAtOrigin(Exception):
+    """``restore_source`` was asked to revive an origin tombstone (round 7 WP-4c #9)."""
+
+    def __init__(self, source: KnowledgeSource) -> None:
+        super().__init__(f"{source.name} was removed at its sync origin")
+        self.source = source
 
 
 async def delete_source(
@@ -366,6 +381,8 @@ async def delete_source(
     admin_id: uuid.UUID,
     source_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
+    *,
+    deleted_by: str = DELETED_BY_OWNER,
 ) -> bool:
     """Tombstone the source for the documented 30-day undo window (§3.2.2).
 
@@ -376,6 +393,12 @@ async def delete_source(
     the chunks hard-deleted in the same call, so the advertised grace window had
     nothing to restore and no sweep ever purged the tombstones. The hard delete now
     happens in ``purge_expired_deletions`` (the nightly retention pass).
+
+    ``deleted_by`` is ``owner`` (the default: the owner's own delete, undo-able for
+    the window) or ``origin`` (the sync found the item gone at its source — round 7
+    WP-4c #9 — not restorable, purged at the next pass). The audit payload carries
+    it, with ``grace_days`` 0 for an origin tombstone so the log never advertises a
+    window that does not exist.
     """
     source = (
         await session.execute(
@@ -387,7 +410,7 @@ async def delete_source(
     if source is None or source.soft_deleted_at is not None:
         return False
     source.soft_deleted_at = datetime.now(UTC)
-    source.deleted_by = DELETED_BY_OWNER
+    source.deleted_by = deleted_by
     await session.flush()
     await audit.emit(
         session,
@@ -396,7 +419,11 @@ async def delete_source(
         actor_user_id=actor_user_id,
         actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
         event_type="knowledge_source_deleted",
-        payload={"source_id": str(source_id), "grace_days": DELETE_GRACE_DAYS},
+        payload={
+            "source_id": str(source_id),
+            "deleted_by": deleted_by,
+            "grace_days": DELETE_GRACE_DAYS if deleted_by == DELETED_BY_OWNER else 0,
+        },
     )
     return True
 
@@ -414,6 +441,10 @@ async def restore_source(
     ``state_machine.restore`` — and never through this call, which would otherwise
     revive one source of a Luciel that is itself deleted. Returns None when there is
     nothing to restore (unknown id, not deleted, lifecycle-deleted, or already purged).
+    An ORIGIN tombstone (the item is gone at Drive / Notion / the site — round 7 WP-4c
+    #9) raises ``RemovedAtOrigin`` so the caller can say so honestly instead of
+    "not in its undo window": there never was a window, and reviving it would serve
+    a page its origin deleted.
     """
     source = (
         await session.execute(
@@ -422,7 +453,11 @@ async def restore_source(
             )
         )
     ).scalar_one_or_none()
-    if source is None or source.soft_deleted_at is None or source.deleted_by != DELETED_BY_OWNER:
+    if source is None or source.soft_deleted_at is None:
+        return None
+    if source.deleted_by == DELETED_BY_ORIGIN:
+        raise RemovedAtOrigin(source)
+    if source.deleted_by != DELETED_BY_OWNER:
         return None
     source.soft_deleted_at = None
     source.deleted_by = None
@@ -520,7 +555,9 @@ async def purge_expired_deletions(
     now: datetime | None = None,
     grace_days: int = DELETE_GRACE_DAYS,
 ) -> int:
-    """Hard-delete owner-tombstoned sources whose undo window has closed.
+    """Hard-delete owner-tombstoned sources whose undo window has closed, and every
+    origin tombstone (round 7 WP-4c #9) regardless of age — an item gone at its
+    sync origin never had a window.
 
     Returns the number of sources destroyed. Lifecycle tombstones are not touched —
     they belong to the Luciel's own grace window and its day-30 cascade. Idempotent.
@@ -532,9 +569,14 @@ async def purge_expired_deletions(
             await session.execute(
                 select(KnowledgeSource).where(
                     KnowledgeSource.admin_id == admin_id,
-                    KnowledgeSource.deleted_by == DELETED_BY_OWNER,
                     KnowledgeSource.soft_deleted_at.is_not(None),
-                    KnowledgeSource.soft_deleted_at < cutoff,
+                    or_(
+                        and_(
+                            KnowledgeSource.deleted_by == DELETED_BY_OWNER,
+                            KnowledgeSource.soft_deleted_at < cutoff,
+                        ),
+                        KnowledgeSource.deleted_by == DELETED_BY_ORIGIN,
+                    ),
                 )
             )
         )

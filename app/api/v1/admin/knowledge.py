@@ -200,7 +200,18 @@ async def restore_source(
 ) -> KnowledgeSourceOut:
     """Undo a delete inside its 30-day window (§3.2.2, audit F109)."""
     async with tenant_session(subject.admin_id) as s:
-        src = await service.restore_source(s, subject.admin_id, source_id, subject.user_id)
+        try:
+            src = await service.restore_source(s, subject.admin_id, source_id, subject.user_id)
+        except service.RemovedAtOrigin as exc:
+            # Round 7 WP-4c #9: the sync found this item gone at its origin. That is
+            # not the owner's mis-click and the content is no longer at the source,
+            # so nothing here can bring it back — say so, not "not in its window".
+            gone = exc.source
+            raise conflict(
+                f"{gone.name} was removed at its sync source "
+                f"({gone.source_origin or gone.origin}) and cannot be restored here. "
+                "Re-add it at the source and sync again."
+            ) from exc
         if src is None:
             raise not_found("Nothing to restore: the source is not in its undo window.")
         used = await _used_by_questions_7d(s, subject.admin_id)

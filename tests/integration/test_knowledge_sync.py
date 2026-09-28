@@ -322,3 +322,127 @@ async def test_a_new_synced_item_over_the_cap_is_not_ingested(monkeypatch):
     async with tenant_session(admin) as s:
         rows = await service.list_sources(s, admin)
         assert [r.external_id for r in rows] == ["ok"]  # no half-written row for "big"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_origin_removal_is_not_restorable_and_is_purged_without_the_window():
+    """Round 7 WP-4c #9: an item gone at its sync origin used to be tombstoned as an
+    OWNER delete — restorable for 30 days (reviving a page Drive no longer had) and
+    held for the whole window before the purge. It is now an ``origin`` tombstone:
+    restore refuses it honestly, the next retention pass purges it, and the owner's
+    own tombstone made at the same moment keeps its window."""
+    from datetime import UTC, datetime
+
+    from app.models.audit import AdminAuditLog
+    from app.models.knowledge import KnowledgeChunk, KnowledgeSource
+    from sqlalchemy import func
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    conn = uuid.uuid4()
+    doc1 = RemoteItem(
+        external_id="doc1", name="Playbook A", text="alpha pricing 899", revision="r1"
+    )
+    doc2 = RemoteItem(
+        external_id="doc2", name="Playbook B", text="beta hours weekdays", revision="r1"
+    )
+    provider = FakeDriveProvider([doc1, doc2])
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="google_drive",
+            provider=provider,
+        )
+        assert set(res.added) == {"doc1", "doc2"}
+        # The owner's own delete, made in the same moment, keeps its 30-day window.
+        mine = await service.ingest_text(
+            s, admin_id=admin, instance_id=iid, name="mine.txt", text="owner deleted this by hand"
+        )
+        mine_id = mine.id
+        assert await service.delete_source(s, admin, mine_id, admin) is True
+
+    # doc2 disappears at the origin.
+    provider.set_items([doc1])
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="google_drive",
+            provider=provider,
+        )
+        assert res.removed == ["doc2"]
+
+    async with tenant_session(admin) as s:
+        gone = (
+            await s.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == admin, KnowledgeSource.external_id == "doc2"
+                )
+            )
+        ).scalar_one()
+        gone_id = gone.id
+        assert gone.soft_deleted_at is not None
+        assert gone.deleted_by == service.DELETED_BY_ORIGIN
+        # The audit row says who tombstoned it and advertises no window.
+        by_source = {
+            r.event_payload["source_id"]: r.event_payload
+            for r in (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "knowledge_source_deleted",
+                    )
+                )
+            ).scalars()
+        }
+        assert by_source[str(gone_id)]["deleted_by"] == "origin"
+        assert by_source[str(gone_id)]["grace_days"] == 0
+        assert by_source[str(mine_id)]["deleted_by"] == "owner"
+        assert by_source[str(mine_id)]["grace_days"] == service.DELETE_GRACE_DAYS
+        # Restore refuses it — as an origin removal, not "not in its undo window".
+        with pytest.raises(service.RemovedAtOrigin):
+            await service.restore_source(s, admin, gone_id, admin)
+
+    # The next retention pass purges it NOW — no 30 days — while the owner tombstone
+    # of the same age keeps its window.
+    async with tenant_session(admin) as s:
+        assert await service.purge_expired_deletions(s, admin_id=admin, now=datetime.now(UTC)) == 1
+    async with tenant_session(admin) as s:
+        assert (
+            await s.execute(select(KnowledgeSource).where(KnowledgeSource.id == gone_id))
+        ).scalar_one_or_none() is None
+        assert (
+            await s.execute(
+                select(func.count())
+                .select_from(KnowledgeChunk)
+                .where(KnowledgeChunk.source_id == gone_id)
+            )
+        ).scalar_one() == 0
+        kept = (
+            await s.execute(select(KnowledgeSource).where(KnowledgeSource.id == mine_id))
+        ).scalar_one()
+        assert kept.soft_deleted_at is not None and kept.deleted_by == service.DELETED_BY_OWNER
+        assert await service.restore_source(s, admin, mine_id, admin) is not None
+        # A second pass has nothing left to purge.
+        assert await service.purge_expired_deletions(s, admin_id=admin, now=datetime.now(UTC)) == 0
+
+    # The honest way back: re-add it at the origin and sync — a fresh source.
+    provider.set_items([doc1, doc2])
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="google_drive",
+            provider=provider,
+        )
+        assert res.added == ["doc2"] and res.removed == []
+    async with tenant_session(admin) as s:
+        ext_ids = {x.external_id for x in await service.list_sources(s, admin)}
+        assert ext_ids == {"doc1", "doc2", None}
