@@ -183,6 +183,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # Round 7 WP-3c item 6: the owner corrected a lead's name / email / phone.
         # Payload: hashed lead id + the changed field NAMES — never a value.
         "lead_edited",
+        # Round 7 WP-3c item 7: a transport (SMS From / email From) proved an
+        # identifier an anonymous lead had only typed; the row moved to the proven
+        # owner and the typed claim became a mention. Payload: kind + hashed ids.
+        "lead_identifier_rehomed",
         # Round 7 WP-3c item 5: one bounded pass of the one-time CRM backfill
         # (leads captured before a CRM connected). Payload: provider + counts only.
         "crm_backfill_run",

@@ -68,13 +68,18 @@ async def test_salesforce_update_carries_changed_name_without_fallbacks():
     assert "Company" not in payload and "Email" not in payload
 
 
-async def test_salesforce_update_writes_email_only_when_the_identity_moved():
-    """The 'email' field appears in an update's fields exactly when the link's
-    last-pushed key differs — the one legitimate Email write."""
+async def test_salesforce_update_never_writes_email_even_when_the_identity_moved():
+    """Round 7 WP-3c item 2: the tenant's Email is never rewritten by a push. A
+    moved identity reaches the org as a Description line (the backend puts the
+    current address in ``notes``); an 'email' FIELD lands there too, never on Email."""
     transport = _CapturingTransport()
-    await _sf(transport).update("tok", "rec-1", "new@acme.com", {"email": "new@acme.com"})
+    await _sf(transport).update(
+        "tok", "rec-1", "new@acme.com", {"phone": "+16045550100"}, {"email": "new@acme.com"}
+    )
     _, _, payload = transport.requests[0]
-    assert payload["Email"] == "new@acme.com"
+    assert "Email" not in payload
+    assert payload["Phone"] == "+16045550100"
+    assert payload["Description"] == "email: new@acme.com"
     assert "Unknown" not in str(payload.values())
 
 
