@@ -187,7 +187,12 @@ async def test_a_replay_that_fails_again_backs_off_rather_than_forking_a_new_ttl
     (before,) = await _queued(admin_id)
 
     swept_at = datetime.now(UTC) + SETTLED
-    assert await _sweep(admin_id, now=swept_at) == {"delivered": 0, "abandoned": 0, "retried": 1}
+    assert await _sweep(admin_id, now=swept_at) == {
+        "delivered": 0,
+        "abandoned": 0,
+        "retried": 1,
+        "held": 0,
+    }
 
     (after,) = await _queued(admin_id)
     assert after.id == before.id
