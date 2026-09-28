@@ -43,6 +43,23 @@ async def resolve_widget(session: AsyncSession, embed_key: str) -> InstanceConte
     return InstanceContext(admin_id=row.admin_id, instance_id=row.instance_id)
 
 
+async def _resolve(
+    session: AsyncSession, connection_type: str, destination: str, *, include_quiescing: bool
+) -> InstanceContext:
+    row = (
+        await session.execute(
+            text(
+                "SELECT admin_id, instance_id "
+                "FROM channel_resolve_destination(:ct, :dest, :quiescing)"
+            ),
+            {"ct": connection_type, "dest": destination, "quiescing": include_quiescing},
+        )
+    ).one_or_none()
+    if row is None:
+        raise InboundRejected(f"unresolvable_destination:{connection_type}")
+    return InstanceContext(admin_id=row.admin_id, instance_id=row.instance_id)
+
+
 async def resolve_destination(
     session: AsyncSession, connection_type: str, destination: str
 ) -> InstanceContext:
@@ -50,16 +67,11 @@ async def resolve_destination(
 
     Matches against instance_connections.non_secret_config->>'destination' for the
     given connection_type, over non-revoked rows, via a SECURITY DEFINER function.
+    A ``quiescing`` row (a Luciel in its delete drain, round 7 WP-5) IS admitted here:
+    the customer mid-conversation at the delete instant must keep reaching the tenant
+    so the §3.6.3 drain can finish on their channel.
     """
-    row = (
-        await session.execute(
-            text("SELECT admin_id, instance_id FROM channel_resolve_destination(:ct, :dest)"),
-            {"ct": connection_type, "dest": destination},
-        )
-    ).one_or_none()
-    if row is None:
-        raise InboundRejected(f"unresolvable_destination:{connection_type}")
-    return InstanceContext(admin_id=row.admin_id, instance_id=row.instance_id)
+    return await _resolve(session, connection_type, destination, include_quiescing=True)
 
 
 async def owner_of_destination(
@@ -71,10 +83,15 @@ async def owner_of_destination(
     It goes through the same SECURITY DEFINER resolver as inbound routing on purpose: RLS
     hides other tenants' rows from an ordinary query, so a plain SELECT would report every
     foreign claim as unclaimed. Sharing the resolver also means the answer cannot disagree
-    with the row ``resolve_destination`` will actually pick at delivery time.
+    with the row ``resolve_destination`` will actually pick at delivery time — with ONE
+    deliberate difference: a ``quiescing`` row routes inbound (the drain) but holds no
+    claim, so a deleted Luciel releases its number/address for the grace window exactly
+    as a revoked one did (c21), and the newest live claim wins from that moment on.
     """
     try:
-        return (await resolve_destination(session, connection_type, destination)).admin_id
+        return (
+            await _resolve(session, connection_type, destination, include_quiescing=False)
+        ).admin_id
     except InboundRejected:
         return None
 

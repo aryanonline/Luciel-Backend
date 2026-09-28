@@ -24,9 +24,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
-from app.models.connection import InstanceConnection
+from app.models.connection import NOT_SERVING_STATUSES, QUIESCING, InstanceConnection
 from app.models.instance import Instance, LucielState
 from app.models.knowledge import KnowledgeSource
+
+__all__ = [
+    "NOT_SERVING_STATUSES",
+    "QUIESCING",
+    "LifecycleError",
+    "delete_luciel",
+    "pause",
+    "restore",
+    "resume",
+    "serving_status",
+]
 
 
 def _now() -> datetime:
@@ -35,6 +46,47 @@ def _now() -> datetime:
 
 class LifecycleError(Exception):
     """Illegal transition (mapped to 409 conflict at the API edge)."""
+
+
+# ``QUIESCING`` — the connection status a Luciel delete writes (round 7 WP-5, item 1;
+# the constant lives on ``app.models.connection`` so the gate, the outbound seams and
+# the mailbox poll import it without a cycle). A row in this state is DRAINING: the
+# inbound resolver still routes its destination to this tenant
+# (``channel_resolve_destination``, migration 0068, admits ``quiescing`` rows for
+# inbound routing) so a customer mid-conversation at the delete instant keeps getting
+# answers on their channel, and the outbound seams may still send on it — but only
+# for the in-flight session the runtime drain gate admits; every NEW conversation is
+# refused with the honest drain reply. Before this status existed the delete wrote
+# ``revoked``, the resolver dropped every non-widget inbound as
+# ``unresolvable_destination``, and the "drain" was silence forever for anyone who
+# was mid-text.
+#
+# A quiescing row does NOT hold its destination claim (c21): the claim gate asks the
+# resolver with ``p_include_quiescing = false`` and the 0045 uniqueness index excludes
+# quiescing rows, so another tenant may legitimately claim the number/address during
+# the grace window exactly as before — and restore strips a foreign-held destination.
+# The resolver's newest-claim-wins ordering routes inbound to the live claimant from
+# that moment on. Nor is it broker-visible (``gate.connection_status`` excludes it
+# exactly as it excludes revoked), health-swept (not a health-owned status) or counted
+# by the single-active-per-type index (0068 recreates ``uq_conn_active_type``).
+#
+# ``NOT_SERVING_STATUSES`` — what restore revives and the day-30 cascade destroys:
+# both a quiescing row (what delete now writes) and a revoked one (a pre-WP-5 delete).
+
+
+def serving_status(conn: InstanceConnection) -> str:
+    """The status the OUTBOUND seams should judge operability by.
+
+    A quiescing row is a live row wearing a drain marker: the credential is intact
+    (secret destruction is scheduled for the day-30 cascade) and the pre-delete status
+    sits in ``status_stashed``. The senders gate on ``connected`` / the SMS operable
+    set, so without this a quiescing row refused the very drain reply the delete owes
+    the customer. Everything else answers with its own status; a quiescing row with
+    no stash (never possible from ``delete_luciel``, defensive only) reads as
+    ``unconfigured`` — never as connected."""
+    if conn.status == QUIESCING:
+        return conn.status_stashed or "unconfigured"
+    return conn.status
 
 
 async def _get_instance(session: AsyncSession, admin_id: uuid.UUID) -> Instance:
@@ -111,10 +163,15 @@ async def delete_luciel(
     # and stash included.
     inst.embed_key_stashed = inst.embed_key_public_id
 
-    # 1. instance_connections → revoked; secret destruction is SCHEDULED for the
-    # day-30 cascade (restore must be able to revive the connection). The audit
-    # event says exactly that — `connection_secret_cleanup` is reserved for the
-    # moment a secret is actually destroyed (cascade.py / service.disconnect).
+    # 1. instance_connections → QUIESCING (round 7 WP-5, item 1); secret destruction
+    # is SCHEDULED for the day-30 cascade (restore must be able to revive the
+    # connection). The audit event says exactly that — `connection_secret_cleanup`
+    # is reserved for the moment a secret is actually destroyed (cascade.py /
+    # service.disconnect). Quiescing, not revoked: the resolver (migration 0068)
+    # keeps routing the tenant's number / address / Meta id to this instance, so
+    # the §3.6.3 drain the runtime gate serves is reachable on every channel, not
+    # only the widget. The day-30 cascade and restore treat quiescing exactly as
+    # revoked (NOT_SERVING_STATUSES).
     conns = (
         (
             await session.execute(
@@ -125,16 +182,17 @@ async def delete_luciel(
         .all()
     )
     for c in conns:
-        if c.status != "revoked":
+        if c.status not in NOT_SERVING_STATUSES:
             # Stash the pre-delete status (C8, migration 0049): §3.6.4 promises a
             # restored Luciel comes back "exactly as it was", which includes each
             # connection's honest chip — a healthy calendar restores Connected, an
             # action-needed number restores its action-needed truth. The stash is
             # what makes that possible; blanket 'unconfigured' told every restored
-            # owner to reconnect everything.
+            # owner to reconnect everything. The outbound seams read the stash
+            # through ``serving_status`` while the row drains.
             c.status_stashed = c.status
             c.status_detail_stashed = c.status_detail
-            c.status = "revoked"
+            c.status = QUIESCING
             await audit.emit(
                 session,
                 admin_id=admin_id,
@@ -199,20 +257,37 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
     # re-arms its destination claim in the inbound resolver. Two guards:
     #   1. Another tenant may have LEGITIMATELY claimed the destination during the
     #      30-day grace (the number/address was released the moment this tenant's
-    #      rows went revoked). Restoring the claim would capture their inbound —
-    #      so a foreign-held destination is STRIPPED and the row comes back
-    #      unconfigured with an honest detail, never silently re-routed.
+    #      rows went quiescing — a draining row routes inbound but holds no claim).
+    #      Restoring the claim would capture their inbound — so a foreign-held
+    #      destination is STRIPPED and the row comes back unconfigured with an
+    #      honest detail, never silently re-routed.
     #   2. If this tenant re-attached the same connection TYPE during grace (a new
-    #      non-revoked row exists), un-revoking the old row would violate the
-    #      single-active-per-type unique index — the superseded row stays revoked.
+    #      live row exists), reviving the old row would violate the
+    #      single-active-per-type unique index — the superseded row stays as it is.
+    # Both a ``quiescing`` row (what delete writes since WP-5) and a ``revoked`` one
+    # (a pre-WP-5 delete) are revived here — NOT_SERVING_STATUSES is the one set the
+    # delete, the restore and the cascade all agree on.
     from app.channels import routing  # noqa: PLC0415 — circular at module import
 
-    active_types = {c.connection_type for c in conns if c.status != "revoked"}
+    active_types = {c.connection_type for c in conns if c.status not in NOT_SERVING_STATUSES}
     for c in conns:
-        if c.status != "revoked":
+        if c.status not in NOT_SERVING_STATUSES:
             continue
         if c.connection_type in active_types:
-            continue  # superseded during grace; the newer row is the live one
+            # Superseded during grace; the newer row is the live one. A DRAINING
+            # row must not linger on an active Luciel (the resolver would keep
+            # routing on it) — it goes terminal, exactly where a pre-WP-5 delete
+            # left it. Its secret is destroyed by the tenant prefix sweep at the
+            # account cascade, as any revoked row's is. Defensive: ``uq_conn_active_type``
+            # still counts a quiescing row as the type's single active slot, so a
+            # re-attach during grace REUSES the draining row (connections.service
+            # reads any non-revoked row) rather than adding a second one; only a
+            # many-active type (knowledge_source) or hand-edited data reaches here.
+            if c.status == QUIESCING:
+                c.status = "revoked"
+                c.status_stashed = None
+                c.status_detail_stashed = None
+            continue
         cfg = dict(c.non_secret_config or {})
         destinations = [d for d in [cfg.get("destination")] if isinstance(d, str) and d]
         dest_map = cfg.get("destinations")

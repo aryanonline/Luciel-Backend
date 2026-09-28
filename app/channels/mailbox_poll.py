@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.channels import inbound_dispatch
 from app.channels.base import ChannelAdapter, InboundMessage, InstanceContext
 from app.channels.tenant_outlook import ensure_fresh_token
-from app.models.connection import InstanceConnection
+from app.models.connection import QUIESCING, InstanceConnection
 
 logger = logging.getLogger(__name__)
 
@@ -138,17 +138,24 @@ async def poll_mailbox(
     and the capped seen-ids list.
     """
     now = now or datetime.now(UTC)
+    # A QUIESCING mailbox (a Luciel in its delete drain, round 7 WP-5) is still read —
+    # judged by the status it had before the delete. The poll IS the email channel's
+    # inbound door: without this, a customer mid-thread at the delete instant never
+    # got their follow-up seen, let alone answered. The runtime drain gate downstream
+    # admits only the in-flight conversation; new threads are refused there.
+    from app.lifecycle.state_machine import serving_status  # noqa: PLC0415 — cycle
+
     conn = (
         await session.execute(
             select(InstanceConnection).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.connection_type == "email_sender",
                 InstanceConnection.provider == "outlook",
-                InstanceConnection.status == "connected",
+                InstanceConnection.status.in_(("connected", QUIESCING)),
             )
         )
     ).scalar_one_or_none()
-    if conn is None:
+    if conn is None or serving_status(conn) != "connected":
         return 0
 
     token = await ensure_fresh_token(
