@@ -57,6 +57,33 @@ _AUTH_CLASS_BY_TYPE: dict[str, str] = {
 }
 
 
+#: Statuses in which a row is SERVING — the universal gate dispatches on ``connected``
+#: (gate.CONNECTED) and ``outbound.SMS_OPERABLE_STATUSES`` lets a text leave on
+#: ``pending_carrier_registration``. A second Connect on such a row must not reset it
+#: in place (round 7 WP-4a item 8); ``swap`` is the proven-before-cutover verb.
+SERVING_STATUSES: frozenset[str] = frozenset({"connected", "pending_carrier_registration"})
+
+
+class ConnectionServing(Exception):
+    """A fresh Connect landed on a row that is currently serving (round 7 WP-4a item 8).
+
+    ``start_connection`` used to overwrite provider / auth_class / status on the
+    live row before any new credential existed — one click on Connect took a working
+    calendar offline and pointed its secret_ref at a provider whose token was never
+    going to arrive. The typed refusal names the verb that does this safely."""
+
+    code = "connection_serving_use_swap"
+
+    def __init__(self, connection: InstanceConnection) -> None:
+        self.connection_id = connection.connection_id
+        self.connection_type = connection.connection_type
+        super().__init__(
+            f"{self.code}: this {connection.connection_type.replace('_', ' ')} connection is "
+            "connected and in use. Use 'Change account' to replace it — the current account "
+            "keeps working until the new one verifies — or disconnect it first."
+        )
+
+
 class ProviderNotRegistered(ValueError):
     """The requested provider is not registered for this connection type (§3.8.2)."""
 
@@ -207,12 +234,20 @@ async def start_connection(
     user_id: uuid.UUID | None,
     phone_number: str | None = None,
     now: datetime | None = None,
+    store: SecretStore | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]]:
     """Begin a connect flow: create (or reuse) the row in ``unconfigured`` and return
     the row + StartConnectionResult (§3.8.4 lifecycle starts at unconfigured).
 
     If a non-revoked row of this type already exists we reuse it (single-active per
-    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure.
+    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure — UNLESS
+    the row is serving (round 7 WP-4a item 8): a connected calendar or a sending
+    number is refused with the typed ``ConnectionServing`` (409 on the wire) that
+    points at ``swap``, because resetting it here took it offline before any new
+    credential existed. On a non-serving row whose PROVIDER changes, the old
+    provider's secret material (live and staged) is destroyed and audited: a
+    HubSpot token left under a row that now says Salesforce would be read as a
+    Salesforce token by the probe and the tools.
 
     BYO number (§3.1.4): for an ``sms_sender`` connect the platform never provisions a
     number — the admin supplies their own E.164 number via ``phone_number``. When
@@ -314,7 +349,49 @@ async def start_connection(
             "allowance. Add a payment method to restore it — your saved "
             "configuration comes back as it was, no re-setup."
         )
+    if existing is not None and existing.status in SERVING_STATUSES:
+        # Round 7 WP-4a item 8: never reset a serving row in place — the verb for
+        # "use another account while this one keeps working" is swap.
+        raise ConnectionServing(existing)
     if existing is not None:
+        provider_changed = existing.provider != provider
+        # A stale attempt on the row (a parked OAuth state, a staged swap target, an
+        # abandoned reconnect marker) is swept exactly as disconnect sweeps it: this
+        # is a fresh start, and a late callback must not redeem the old state.
+        cfg = dict(existing.non_secret_config or {})
+        for ephemeral in (
+            "oauth_state_jti",
+            "authorize_url",
+            "pending_provider",
+            RECONNECT_PENDING_SINCE_KEY,
+        ):
+            cfg.pop(ephemeral, None)
+        existing.non_secret_config = cfg
+        if provider_changed and existing.secret_ref is not None:
+            # The old provider's material must not survive under the new provider's
+            # name: destroyed (live ref AND any staged copy), and audited with the
+            # ref + result only (§3.8.3 rule 4).
+            from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+            store = store or get_secret_store()
+            deleted = await store.delete(existing.secret_ref)
+            await store.delete(staged_secret_ref(existing.secret_ref))
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                actor_type=ActorType.admin_user,
+                actor_user_id=user_id,
+                event_type="connection_secret_cleanup",
+                payload={
+                    "connection_id": str(existing.connection_id),
+                    "secret_ref": existing.secret_ref,
+                    "deleted": deleted,
+                    "reason": "provider_changed",
+                    "old_provider": existing.provider,
+                    "new_provider": provider,
+                },
+            )
         existing.provider = provider
         existing.auth_class = auth_class
         existing.status = "unconfigured"

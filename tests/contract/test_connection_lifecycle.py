@@ -472,6 +472,41 @@ async def test_lifecycle_endpoints_require_auth(client):
 
 
 # --------------------------------------------------------------------------- #
+# Round 7 WP-4a item 8 — a second Connect never resets a serving row in place.
+# --------------------------------------------------------------------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_second_connect_on_a_connected_row_is_a_typed_409(client):
+    """POST /connections on a type whose row is serving is refused with a typed 409
+    (``connection_serving_use_swap: ...`` — the wire body carries only ``message``,
+    so the code rides its prefix) and the row, its secret and its provider are
+    exactly as they were. The safe verb is /swap (or /switch, which now delegates)."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    await _ready_account_with_luciel(client)
+    cid, admin_id, instance_id = await _connect_calendar(client)
+    ref = secret_ref_for(admin_id, instance_id, "calendar")
+
+    for provider in ("calendly", "google_calendar"):
+        r = await client.post(
+            "/api/v1/admin/connections",
+            json={"connectionType": "calendar", "provider": provider},
+        )
+        assert r.status_code == 409, provider
+        assert r.json()["message"].startswith("connection_serving_use_swap:"), provider
+        assert "cal-token-1" not in r.text
+
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["connectionId"] == cid
+    assert row["provider"] == "google_calendar"
+    assert row["status"] == "connected"
+    assert await get_secret_store().get(ref) is not None
+
+    # The same request through the proven-before-cutover verb is accepted.
+    r = await client.post(f"/api/v1/admin/connections/{cid}/swap", json={"provider": "calendly"})
+    assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
 # Decision #5c — SWITCH: use a different account and/or provider.
 #
 # Round 7 WP-4a item 7: the DEFAULT switch is proven-before-cutover (it delegates to

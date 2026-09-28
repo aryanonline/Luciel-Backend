@@ -236,6 +236,12 @@ async def start_connection(
             # Round 5B item 16: dormant is billing-suspended — Connect must not
             # re-arm it; the fix is a payment method, and the copy says so.
             raise validation_error(str(exc)) from exc
+        except service.ConnectionServing as exc:
+            # Round 7 WP-4a item 8: a serving row is never reset in place. 409, and
+            # the message is typed (``connection_serving_use_swap: ...``) because the
+            # wire error body carries only ``message`` — the client reads the code
+            # off the prefix and offers "Change account" (swap) instead.
+            raise conflict(str(exc)) from exc
         except NumberAlreadyClaimed as exc:
             # c21 (409 oracle): the refusal is audited under the CLAIMANT in its
             # own transaction (this one is about to roll back), and repeated

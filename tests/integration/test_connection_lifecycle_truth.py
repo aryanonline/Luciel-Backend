@@ -853,3 +853,195 @@ async def test_a_webhook_crm_that_refuses_the_header_on_a_push_flips_the_row(mon
                 {"email": "jane@acme.com"},
             )
     assert (await _row(admin2, cid2)).status == "connected"
+
+
+# --------------------------------------------------------------------------- #
+# Item 8 — a second Connect never resets a serving row in place
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_serving_statuses_cover_every_status_that_dispatches():
+    """The refusal boundary must not drift from the two gates that actually serve:
+    the universal gate's ``connected`` and the sms operability set."""
+    from app.channels.outbound import SMS_OPERABLE_STATUSES
+    from app.connections.gate import CONNECTED
+    from app.connections.service import SERVING_STATUSES
+
+    assert CONNECTED in SERVING_STATUSES
+    assert SMS_OPERABLE_STATUSES <= SERVING_STATUSES
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize(
+    ("connection_type", "provider", "status", "new_provider"),
+    [
+        ("crm", "hubspot", "connected", "salesforce"),
+        ("crm", "hubspot", "connected", "hubspot"),
+        ("sms_sender", "twilio", "pending_carrier_registration", "twilio"),
+    ],
+)
+async def test_a_second_connect_on_a_serving_row_is_refused_and_changes_nothing(
+    connection_type: str, provider: str, status: str, new_provider: str
+):
+    """The live condition: an owner (or a stale dashboard tab) clicks Connect on a
+    row that is serving. Before, the row was overwritten to unconfigured with the new
+    provider and the secret_ref left pointing at material that no longer matched —
+    the calendar went offline before any consent screen was even shown."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/{connection_type}"
+    await get_secret_store().put(ref, {"access_token": "live-tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type=connection_type,
+        provider=provider,
+        auth_class="oauth_token",
+        status=status,
+        cfg={"destination": "+14155550100"} if connection_type == "sms_sender" else {},
+        secret_ref=ref,
+    )
+
+    async with tenant_session(admin) as s:
+        with pytest.raises(service.ConnectionServing) as excinfo:
+            await service.start_connection(
+                s,
+                admin_id=admin,
+                instance_id=iid,
+                connection_type=connection_type,
+                provider=new_provider,
+                user_id=None,
+            )
+    assert str(excinfo.value).startswith("connection_serving_use_swap:")
+    assert excinfo.value.connection_id == cid
+
+    row = await _row(admin, cid)
+    assert row.provider == provider
+    assert row.status == status
+    assert row.auth_class == "oauth_token"
+    assert await get_secret_store().get(ref) == {"access_token": "live-tok"}
+    assert await _status_changes(admin) == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize("status", ["error", "expired", "unconfigured", "not_connected"])
+async def test_a_provider_change_on_a_non_serving_row_destroys_the_old_secret(status: str):
+    """A dead HubSpot row re-pointed at Salesforce must not carry the HubSpot token
+    under the Salesforce name: the probe and the tools would read it as a Salesforce
+    token. Live AND staged material go, and the cleanup is audited by ref only."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+    from app.knowledge.providers import staged_secret_ref
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "hubspot-tok"})
+    await get_secret_store().put(staged_secret_ref(ref), {"access_token": "half-staged"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status=status,
+        detail="reconnect_pending:prior_status=error" if status == "error" else None,
+        cfg={"pending_provider": "salesforce", "oauth_state_jti": "stale", "authorize_url": "x"},
+        secret_ref=ref,
+    )
+
+    async with tenant_session(admin) as s:
+        connection, result = await service.start_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="crm",
+            provider="salesforce",
+            user_id=None,
+        )
+        assert connection.connection_id == cid
+        assert "authorize_url" in result
+
+    row = await _row(admin, cid)
+    assert row.provider == "salesforce"
+    assert row.status == "unconfigured"
+    assert row.secret_ref == ref, "the ref is reused; only its material was destroyed"
+    assert await get_secret_store().get(ref) is None
+    assert await get_secret_store().get(staged_secret_ref(ref)) is None
+    cfg = row.non_secret_config or {}
+    assert "pending_provider" not in cfg
+    # The parked state of the abandoned attempt was swept (a fresh one is minted only
+    # once the platform OAuth app for the provider is configured).
+    assert cfg.get("oauth_state_jti") != "stale"
+
+    async with tenant_session(admin) as s:
+        cleanups = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "connection_secret_cleanup",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(cleanups) == 1
+    payload = cleanups[0].event_payload or {}
+    assert payload["reason"] == "provider_changed"
+    assert payload["deleted"] is True
+    assert payload["old_provider"] == "hubspot" and payload["new_provider"] == "salesforce"
+    assert "hubspot-tok" not in str(payload)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_same_provider_reconnect_on_a_broken_row_keeps_its_secret():
+    """Only a PROVIDER change destroys material: reconnecting the same provider on
+    an error row leaves the credential for the callback to overwrite (and for the
+    owner to cancel out of without losing anything that was there)."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "hubspot-tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="error",
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        await service.start_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_type="crm",
+            provider="hubspot",
+            user_id=None,
+        )
+    row = await _row(admin, cid)
+    assert row.status == "unconfigured" and row.provider == "hubspot"
+    assert await get_secret_store().get(ref) == {"access_token": "hubspot-tok"}
+    async with tenant_session(admin) as s:
+        cleanups = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "connection_secret_cleanup",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert cleanups == []
