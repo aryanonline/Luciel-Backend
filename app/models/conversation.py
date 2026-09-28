@@ -72,6 +72,23 @@ class Session(Base, TenantMixin, TimestampMixin):
     input_ask_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # Round 7 WP-3b (migration 0066): the reply context a later HUMAN reply needs to go
+    # out AS this conversation, persisted at ingress (app/channels/inbound_dispatch.py)
+    # rather than re-derived at reply time. Email: the customer's latest subject and
+    # provider message id (Graph id on a BYO mailbox / RFC 5322 Message-ID on the legacy
+    # SES path) so the takeover reply threads under their mail. Meta: the tenant surface
+    # the conversation arrived on (page / IG account / WhatsApp phone-number id) and the
+    # customer's platform-scoped id, so the reply is sent AS that surface TO that id.
+    # NULL on other channels and on sessions opened before the column existed.
+    inbound_subject: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    inbound_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    meta_destination_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    meta_sender_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # When the CURRENT takeover began (app/runtime/handoff.py); NULL in ai mode. The
+    # hand-back audit event reads its duration_seconds off this, not off a guess.
+    human_controlled_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Transcript(Base, TenantMixin, TimestampMixin):
@@ -116,6 +133,17 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # "not_scored_legacy" (pre-0051 rows keep the default false — no backfill can
     # honestly reconstruct their origin).
     deterministic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Round 7 WP-3b (migration 0066): what happened to a ``human_agent`` reply on the
+    # customer's transport — ``delivered`` (the provider accepted it), ``queued`` (the
+    # widget serves it on its next history fetch), ``failed`` (nothing reached the
+    # customer; ``delivery_detail`` says why, provider detail truncated). The outcome
+    # used to be returned once and audited but never persisted, so a rejected reply
+    # read like any other message when the owner reopened the conversation. NULL on
+    # every other role and on rows from before the column existed — never a fabricated
+    # ``delivered``.
+    delivery_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    delivery_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

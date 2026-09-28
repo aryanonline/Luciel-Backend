@@ -49,6 +49,8 @@ async def run_and_reply_full(msg: InboundMessage) -> RuntimeReply:
     """
     async with tenant_session(msg.admin_id) as s:
         reply = await run_inbound_message(s, msg)
+        if reply.session_id:
+            await persist_reply_context(s, msg, session_id=uuid.UUID(reply.session_id))
         if reply.reply_text and msg.channel not in outbound.INLINE_REPLY_CHANNELS:
             result = await outbound.send_outbound_reply(
                 s,
@@ -80,6 +82,80 @@ async def run_and_reply_full(msg: InboundMessage) -> RuntimeReply:
                 )
                 await _escalate_undelivered_reply(s, msg, reply, result.detail)
         return reply
+
+
+#: Session columns (migration 0066) are bounded; a provider id or subject longer than
+#: the column is truncated rather than failing the turn.
+_SUBJECT_MAX = 998
+_META_ID_MAX = 128
+
+
+def _clip(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
+async def persist_reply_context(
+    s: AsyncSession, msg: InboundMessage, *, session_id: uuid.UUID
+) -> None:
+    """Stamp on the session what a LATER human reply needs to go out AS this
+    conversation (round 7 WP-3b, items 2 and 7; migration 0066).
+
+    Luciel's own reply rides the inbound message's metadata and never needed this.
+    The owner's takeover reply arrives hours later with no inbound in hand, and used
+    to re-derive the destination from the lead record (the wrong channel after a
+    unification), send email as a fresh "Re: your inquiry" thread (no subject, no
+    message id) and resolve a Meta surface from the channel name (the wrong grant on
+    a legacy ``instagram_messenger`` row). Persisting the context at ingress makes the
+    reply-time truth a read, not a guess.
+
+    * email: the customer's latest subject and provider message id — the Graph id on
+      a BYO mailbox (the ``/messages/{id}/reply`` handle), else the RFC 5322
+      Message-ID (In-Reply-To on the legacy SES path).
+    * Meta (WhatsApp / Messenger / Instagram): the tenant surface the message arrived
+      on (page / IG account / WhatsApp phone-number id) and the customer's
+      platform-scoped id.
+
+    Always the LATEST inbound: a thread's subject can change and a reply must hang
+    under the message it answers. Other channels carry nothing here."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.conversation import Session as SessionModel  # noqa: PLC0415
+
+    meta = msg.channel_metadata or {}
+    if msg.channel == "email":
+        values = {
+            "inbound_subject": _clip(meta.get("subject"), _SUBJECT_MAX),
+            "inbound_message_id": _clip(
+                meta.get("graph_message_id") or meta.get("internet_message_id"), _SUBJECT_MAX
+            ),
+        }
+    elif msg.channel in outbound.META_CHANNELS:
+        values = {
+            "meta_destination_id": _clip(
+                meta.get("destination_id") or meta.get("phone_number_id"), _META_ID_MAX
+            ),
+            "meta_sender_id": _clip(msg.customer_identifier, _META_ID_MAX),
+        }
+    else:
+        return
+    if not any(values.values()):
+        return
+    sess = (
+        await s.execute(
+            select(SessionModel).where(
+                SessionModel.admin_id == msg.admin_id, SessionModel.id == session_id
+            )
+        )
+    ).scalar_one_or_none()
+    if sess is None:
+        return
+    for column, value in values.items():
+        if value is not None:
+            setattr(sess, column, value)
+    await s.flush()
 
 
 async def _escalate_undelivered_reply(

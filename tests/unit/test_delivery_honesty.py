@@ -178,7 +178,10 @@ async def test_email_reply_reports_an_unprovisioned_sender_rather_than_delivery(
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_meta_reply_reports_an_unprovisioned_sender_rather_than_delivery(live):
+async def test_meta_reply_reports_a_reconnect_rather_than_delivery(live):
+    """Live with no Meta grant at all: nothing can leave. Round 7 WP-3b item 7 names
+    the truth in the wire vocabulary — the owner must (re)connect Meta — instead of a
+    ``meta_sender_not_provisioned`` the dashboard collapsed into "try again"."""
     admin, instance = uuid.uuid4(), uuid.uuid4()
 
     result = await _reply(
@@ -191,7 +194,8 @@ async def test_meta_reply_reports_an_unprovisioned_sender_rather_than_delivery(l
     )
 
     assert result.delivered is False
-    assert result.detail == "meta_sender_not_provisioned"
+    assert result.detail == "meta_reconnect_needed"
+    assert result.provider_message_id is None
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
