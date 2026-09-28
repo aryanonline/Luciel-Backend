@@ -38,12 +38,18 @@ from typing import Protocol, runtime_checkable
 EXPORT_BUCKET_ENV = "LUCIEL_EXPORT_BUCKET"
 
 
+def export_prefix_for(admin_id: uuid.UUID) -> str:
+    """The tenant's bundle prefix — the hard-delete cascade's one-sweep deletion handle
+    (round 7 WP-5, item 4), mirroring ``transcript_prefix_for``."""
+    return f"vm-export-bundles/{admin_id}/"
+
+
 def export_key_for(admin_id: uuid.UUID, export_id: uuid.UUID) -> str:
-    """Build the per-admin S3 key prefix (§5.10: "a per-admin prefix").
+    """Build the per-admin S3 key (§5.10: "a per-admin prefix").
 
     Mirrors the ``secret_ref_for`` convention in ``app/connections/secrets.py``
     so the tenant-scoping shape is consistent across every AWS-backed seam."""
-    return f"vm-export-bundles/{admin_id}/{export_id}.zip"
+    return f"{export_prefix_for(admin_id)}{export_id}.zip"
 
 
 @runtime_checkable
@@ -70,6 +76,13 @@ class ExportStore(Protocol):
         for why the export flow no longer uses it)."""
         ...
 
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Delete every bundle under ``prefix``; return how many keys were removed.
+
+        The hard-delete cascade's handle (round 7 WP-5, item 4): a bundle is every
+        table the tenant owns in one object, so it cannot outlive the rows."""
+        ...
+
 
 class LocalExportStore:
     """In-process, deterministic ExportStore for dev/test (mirrors LocalSecretStore).
@@ -94,6 +107,19 @@ class LocalExportStore:
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         await self.put(key=key, data=data)
         return await self.presign(key=key, ttl_seconds=ttl_days * 24 * 60 * 60)
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        with self._lock:
+            doomed = [k for k in type(self)._store if k.startswith(prefix)]
+            for k in doomed:
+                del type(self)._store[k]
+            return len(doomed)
+
+    @classmethod
+    def keys(cls) -> list[str]:
+        """Test hook: the stored keys, for placement/isolation assertions."""
+        with cls._lock:
+            return sorted(cls._store)
 
     @classmethod
     def get_bytes(cls, key: str) -> bytes | None:
@@ -170,6 +196,31 @@ class S3ExportStore:
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         await self.put(key=key, data=data)
         return await self.presign(key=key, ttl_seconds=ttl_days * 24 * 60 * 60)
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Destroy every object under ``prefix``, every version and delete marker
+        included (the same enumeration ``S3TranscriptStore`` uses): on a versioned
+        bucket a plain delete only writes a marker and the full tenant dump persists
+        as a noncurrent version. Returns the number of distinct KEYS removed."""
+        client = self._get_client()
+        keys_removed: set[str] = set()
+        kwargs: dict[str, object] = {"Bucket": self._bucket, "Prefix": prefix}
+        while True:
+            page = client.list_object_versions(**kwargs)  # type: ignore[attr-defined]
+            doomed = [
+                {"Key": item["Key"], "VersionId": item["VersionId"]}
+                for section in ("Versions", "DeleteMarkers")
+                for item in page.get(section, [])
+            ]
+            if doomed:
+                client.delete_objects(  # type: ignore[attr-defined]
+                    Bucket=self._bucket, Delete={"Objects": doomed, "Quiet": True}
+                )
+                keys_removed.update(str(d["Key"]) for d in doomed)
+            if not page.get("IsTruncated"):
+                return len(keys_removed)
+            kwargs["KeyMarker"] = page.get("NextKeyMarker")
+            kwargs["VersionIdMarker"] = page.get("NextVersionIdMarker")
 
 
 _default: ExportStore | None = None

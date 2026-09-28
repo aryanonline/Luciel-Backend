@@ -125,6 +125,31 @@ async def test_close_account_also_uploads_export_with_context(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_export_response_reports_the_email_outcome(client, monkeypatch):
+    """Round 7 WP-5 item 4: the dispatcher's return value used to be dropped, so the
+    UI said "check your inbox" over a mail that never left. Mock/CI: the Null sender
+    records it; a sender that throws is reported as failed:<class> and the link is
+    still in the body — a mail failure never loses the export."""
+    from app.notifications import email_dispatcher
+
+    LocalExportStore.reset()
+    await _signup_verify_login(client)
+    r = await client.post("/api/v1/admin/account/export")
+    assert r.status_code == 200
+    assert r.json()["emailOutcome"] == "recorded"
+
+    class Broken:
+        async def send(self, **kwargs):
+            raise RuntimeError("ses down")
+
+    monkeypatch.setattr(email_dispatcher, "build_email_sender", lambda: Broken())
+    r = await client.post("/api/v1/admin/account/export")
+    assert r.status_code == 200, "a mail failure never loses the export"
+    assert r.json()["emailOutcome"] == "failed:RuntimeError"
+    assert "/api/v1/exports/" in r.json()["download_url"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_an_export_link_is_throttled_per_link(client):
     """Adversarial review R-WP2-2: the download door is unauthenticated by design, so
     a leaked or replayed link must not become an unbounded audit-row and presign

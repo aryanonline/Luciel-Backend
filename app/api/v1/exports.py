@@ -50,8 +50,10 @@ async def download_export(token: str) -> RedirectResponse:
     async with tenant_session(admin_id) as s:
         acct = (await s.execute(select(Account).where(Account.id == admin_id))).scalar_one_or_none()
         if acct is None:
-            # Purged tenant: the object is gone with the account; the link must not
-            # say anything more specific than "expired".
+            # Purged tenant: the day-30 cascade swept ``vm-export-bundles/{admin_id}/``
+            # along with the account row (round 7 WP-5, item 4), so there is no object
+            # to presign and no tenant to audit under. The link must not say anything
+            # more specific than "expired" — no oracle on which tenants ever existed.
             raise ApiError(410, _EXPIRED)
         url = await get_export_store().presign(
             key=export_key_for(admin_id, export_id), ttl_seconds=PRESIGN_TTL_SECONDS

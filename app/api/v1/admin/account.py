@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +25,7 @@ from app.notifications import email_dispatcher
 from app.schemas_api.common import WireModel
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
+_log = logging.getLogger(__name__)
 
 
 class CloseAccountRequest(WireModel):
@@ -42,6 +44,22 @@ class ExportResult(BaseModel):
     ok: bool = True
     download_url: str
     ttl_days: int
+    # What happened to the email carrying the same link (round 7 WP-5, item 4):
+    # ``sent`` | ``recorded`` (mock/CI: the Null sender took it, nothing left the
+    # platform) | ``no_sender`` (live with no platform sender identity bound — the
+    # link went nowhere) | ``failed:<ExceptionClass>``. The dispatcher's return value
+    # used to be dropped, so the UI said "check your inbox" over a mail that never left.
+    email_outcome: str = Field(serialization_alias="emailOutcome")
+
+
+def _email_outcome(outcome: email_dispatcher.DeliveryOutcome) -> str:
+    if outcome.status == "failed":
+        return f"failed:{outcome.reason or 'unknown'}"
+    if outcome.status == "sent":
+        return "sent"
+    # "recorded": the Null sender took it. In live that means no platform sender
+    # identity is bound (the link went nowhere); in mock/CI it is the expected posture.
+    return "no_sender" if outcome.degraded else "recorded"
 
 
 async def _build_upload_and_notify(
@@ -51,12 +69,12 @@ async def _build_upload_and_notify(
     actor_user_id: uuid.UUID | None,
     store: ExportStore,
     context: str | None = None,
-) -> str:
+) -> tuple[str, str]:
     """Build the export ZIP, upload it, and emit ``data_export_ready`` with the
     presigned link (§3.6.6 / §5.10). Shared by ``request_export`` and
     ``close_account`` so both paths persist the bundle instead of discarding it.
 
-    Returns the presigned download URL."""
+    Returns the download URL and the email outcome word (see ``ExportResult``)."""
     settings = get_settings()
     zip_bytes = await build_export_zip(s, admin_id)
     export_id = uuid.uuid4()
@@ -94,15 +112,26 @@ async def _build_upload_and_notify(
     owner_email = (
         await s.execute(select(Account.email).where(Account.id == admin_id))
     ).scalar_one_or_none()
+    email_outcome = "no_sender"
     if owner_email:
-        await email_dispatcher.send_export_ready(
+        outcome = await email_dispatcher.send_export_ready(
             s,
             admin_id=admin_id,
             to=owner_email,
             download_url=url,
             ttl_days=settings.export_link_ttl_days,
         )
-    return url
+        email_outcome = _email_outcome(outcome)
+    if email_outcome not in ("sent", "recorded"):
+        # The closure path answers 204 and has no body to carry this; the log line is
+        # what an operator sees. The owner still has the D5 re-request (item 5).
+        _log.warning(
+            "export_ready_email_not_delivered admin_id=%s context=%s outcome=%s",
+            admin_id,
+            context or "self_serve",
+            email_outcome,
+        )
+    return url, email_outcome
 
 
 @router.post("/export", response_model=ExportResult)
@@ -125,11 +154,11 @@ async def request_export(
             actor_type=ActorType.admin_user,
             event_type="data_export_self_serve",
         )
-        url = await _build_upload_and_notify(
+        url, email_outcome = await _build_upload_and_notify(
             s, admin_id=subject.admin_id, actor_user_id=subject.user_id, store=store
         )
         ttl = get_settings().export_link_ttl_days
-    return ExportResult(ok=True, download_url=url, ttl_days=ttl)
+    return ExportResult(ok=True, download_url=url, ttl_days=ttl, email_outcome=email_outcome)
 
 
 @router.post("/close", status_code=204)

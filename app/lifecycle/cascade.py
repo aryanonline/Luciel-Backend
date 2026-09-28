@@ -30,6 +30,7 @@ from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.connections.secrets import get_secret_store, tenant_secret_prefix
 from app.db.base import TenantMixin
 from app.lifecycle import state_machine
+from app.lifecycle.export_store import export_prefix_for, get_export_store
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
@@ -308,6 +309,37 @@ async def _delete_tenant_knowledge_originals(
     )
 
 
+async def _delete_tenant_export_bundles(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
+) -> None:
+    """Destroy the tenant's export ZIPs (§3.6.6 / §5.10) by prefix (round 7 WP-5,
+    item 4). A bundle is every table the tenant owns in one object; the cascade
+    below deletes those tables, and a bundle left behind would keep a full copy of
+    the data past "hard-deleted" for as long as the bucket's lifecycle backstop let
+    it. Same best-effort-with-audit posture as the three sibling sweeps above."""
+    prefix = export_prefix_for(admin_id)
+    try:
+        swept = await get_export_store().delete_prefix(prefix=prefix)
+        error: str | None = None
+    except Exception as exc:  # noqa: BLE001 — a broken store must not strand the deletion
+        swept, error = 0, type(exc).__name__
+        _log.exception("cascade: export bundle sweep failed admin_id=%s", admin_id)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="data_retention_hard_delete",
+        payload={
+            "data_class": "export_bundle_object",
+            "object_prefix": prefix,
+            "count": swept,
+            "error": error,
+            "retention_policy_applied": "luciel_hard_delete_cascade",
+        },
+    )
+
+
 async def hard_delete_cascade(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -335,6 +367,7 @@ async def hard_delete_cascade(
     await _delete_tenant_secrets(session, admin_id, iid)
     await _delete_tenant_transcript_archive(session, admin_id, iid)
     await _delete_tenant_knowledge_originals(session, admin_id, iid)
+    await _delete_tenant_export_bundles(session, admin_id, iid)
 
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted

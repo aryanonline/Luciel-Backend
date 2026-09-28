@@ -45,6 +45,72 @@ def test_local_export_store_reset_clears_state() -> None:
     assert LocalExportStore.get_bytes("k2") is None
 
 
+# --- delete_prefix (round 7 WP-5, item 4) ------------------------------------------ #
+def test_local_delete_prefix_removes_only_the_tenants_bundles() -> None:
+    """Tenant-prefix deletion (the cascade's handle) must never cross tenants."""
+    from app.lifecycle.export_store import export_prefix_for
+
+    LocalExportStore.reset()
+    store = LocalExportStore()
+    admin, other = uuid.uuid4(), uuid.uuid4()
+    mine = [export_key_for(admin, uuid.uuid4()) for _ in range(2)]
+    theirs = export_key_for(other, uuid.uuid4())
+
+    import asyncio
+
+    async def run() -> int:
+        for k in mine:
+            await store.put(key=k, data=b"zip")
+        await store.put(key=theirs, data=b"zip")
+        return await store.delete_prefix(prefix=export_prefix_for(admin))
+
+    assert asyncio.run(run()) == 2
+    assert LocalExportStore.keys() == [theirs]
+    assert export_key_for(admin, uuid.uuid4()).startswith(export_prefix_for(admin))
+
+
+class _RecordingS3Client:
+    """Stub boto3 client modeling a VERSIONED bucket's list/delete surface (mirrors
+    the transcript-store stub). Seeded with (key, version_id, is_delete_marker)."""
+
+    def __init__(self, versions: list[tuple[str, str, bool]]) -> None:
+        self._versions = list(versions)
+        self.deleted: list[dict[str, str]] = []
+
+    def list_object_versions(self, **kwargs):
+        prefix = kwargs.get("Prefix", "")
+        matching = [v for v in self._versions if v[0].startswith(prefix)]
+        return {
+            "Versions": [{"Key": k, "VersionId": v} for k, v, marker in matching if not marker],
+            "DeleteMarkers": [{"Key": k, "VersionId": v} for k, v, marker in matching if marker],
+            "IsTruncated": False,
+        }
+
+    def delete_objects(self, *, Bucket, Delete):  # noqa: N803 — boto3's casing
+        self.deleted.extend(Delete["Objects"])
+
+
+def test_s3_delete_prefix_destroys_every_version_under_the_tenant_prefix() -> None:
+    """A versioned bucket keeps a noncurrent copy of the full tenant dump behind a
+    plain delete; the sweep enumerates versions AND markers, tenant prefix only."""
+    from app.lifecycle.export_store import S3ExportStore, export_prefix_for
+
+    admin, other = uuid.uuid4(), uuid.uuid4()
+    k1, k2 = export_key_for(admin, uuid.uuid4()), export_key_for(admin, uuid.uuid4())
+    theirs = export_key_for(other, uuid.uuid4())
+    client = _RecordingS3Client(
+        [(k1, "v1", False), (k1, "v0", True), (k2, "v1", False), (theirs, "v1", False)]
+    )
+    store = S3ExportStore(bucket="b", region_name="ca-central-1")
+    store._client = client
+
+    import asyncio
+
+    assert asyncio.run(store.delete_prefix(prefix=export_prefix_for(admin))) == 2
+    assert {d["Key"] for d in client.deleted} == {k1, k2}
+    assert len(client.deleted) == 3, "both versions of k1 plus its marker"
+
+
 # --- binding (round 7 WP-5, item 3) ------------------------------------------------ #
 def _rebind(monkeypatch, *, bucket: str | None, mode: str):
     """Bind a fresh store under a given deployment shape (mirrors test_transcript_store)."""

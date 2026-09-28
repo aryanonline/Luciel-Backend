@@ -20,7 +20,7 @@ import zipfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
@@ -69,6 +69,25 @@ def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
     ]
 
 
+def transcripts_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[Transcript]]:
+    """A session's transcript rows, time-ordered — with the tenant predicate stated
+    (round 7 WP-5, item 4). RLS scopes the read already; the explicit ``admin_id`` is
+    the defence in depth every other tenant read in this module carries, so a session
+    id from anywhere can never widen the bundle."""
+    return (
+        select(Transcript)
+        .where(Transcript.admin_id == admin_id, Transcript.session_id == session_id)
+        .order_by(Transcript.at.asc())
+    )
+
+
+def summary_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[SessionSummary]]:
+    """A session's summary row, tenant predicate stated (see ``transcripts_stmt``)."""
+    return select(SessionSummary).where(
+        SessionSummary.admin_id == admin_id, SessionSummary.session_id == session_id
+    )
+
+
 async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -83,15 +102,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
         conv_rows: list[dict[str, object]] = []
         for sess in sessions:
             transcripts = (
-                (
-                    await session.execute(
-                        select(Transcript)
-                        .where(Transcript.session_id == sess.id)
-                        .order_by(Transcript.at.asc())
-                    )
-                )
-                .scalars()
-                .all()
+                (await session.execute(transcripts_stmt(admin_id, sess.id))).scalars().all()
             )
             messages = [
                 {"role": t.role, "text": t.text, "at": t.at.isoformat()} for t in transcripts
@@ -114,11 +125,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                     {"role": str(r["role"]), "text": str(r["text"]), "at": str(r["at"])}
                     for r in (archived or [])
                 ]
-            summary = (
-                await session.execute(
-                    select(SessionSummary).where(SessionSummary.session_id == sess.id)
-                )
-            ).scalar_one_or_none()
+            summary = (await session.execute(summary_stmt(admin_id, sess.id))).scalar_one_or_none()
             conv = {
                 "sessionId": str(sess.id),
                 "channel": sess.channel,
