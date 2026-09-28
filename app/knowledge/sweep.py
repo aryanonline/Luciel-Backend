@@ -26,13 +26,51 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import log as audit
 from app.connections.secrets import get_secret_store
 from app.knowledge import service, sync
 from app.knowledge.providers import ProviderUnavailable, provider_for_connection
+from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
+from app.models.instance import Instance, is_paused
 from app.models.knowledge import KnowledgeSource
 
 logger = logging.getLogger(__name__)
+
+
+async def _record_sync_failure(
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    origin: str,
+    exc: BaseException,
+) -> None:
+    """Durable evidence of a failed sync pass, in its own transaction (round 7 WP-4c #3).
+
+    The connection's live sources read ``sync_status = "error"`` and the audit log
+    carries the failure CLASS (never provider wording — that stays in the sweep log).
+    Written through a fresh ``tenant_session`` so it lands even if the caller's
+    transaction is later unwound, exactly as ``sync.sync_connection`` records a
+    refused shrink."""
+    from app.db.session import tenant_session  # noqa: PLC0415 — avoids a db↔knowledge cycle
+
+    async with tenant_session(admin_id) as evidence:
+        await sync.mark_sync_error(evidence, admin_id=admin_id, connection_id=connection_id)
+        await audit.emit(
+            evidence,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.platform,
+            event_type="knowledge_source_edited",
+            payload={
+                "action": "sync_failed",
+                "connection_id": str(connection_id),
+                "origin": origin,
+                "error": type(exc).__name__,
+            },
+        )
+
 
 # provider (brand) -> source_origin (§3.2.3 wire vocabulary). Mirrors the map the
 # manual routes use (app/api/v1/admin/knowledge.py) — hubspot/salesforce are one
@@ -64,6 +102,17 @@ async def sync_due_connections(
     number of connections synced (the sweep log's "did anything happen").
     """
     now = now or datetime.now(UTC)
+    # A paused / mid-grace / deleted Luciel is not answering anyone (§3.6.2), so
+    # nothing is gained by pulling its sources, and a deleted one must not keep
+    # ingesting into rows the cascade is about to purge (round 7 WP-4c #3; the
+    # lifecycle work relies on this sweep honouring NON_SERVING_STATES).
+    instance = (
+        (await session.execute(select(Instance).where(Instance.admin_id == admin_id)))
+        .scalars()
+        .first()
+    )
+    if instance is None or is_paused(instance):
+        return 0
     connections = (
         (
             await session.execute(
@@ -111,14 +160,22 @@ async def sync_due_connections(
                 connection_type="knowledge_source",
                 connection_id=conn.connection_id,
             )
-            await sync.sync_connection(
-                session,
-                admin_id=admin_id,
-                instance_id=conn.instance_id,
-                connection_id=conn.connection_id,
-                origin=origin,
-                provider=provider_for_connection(conn, get_secret_store()),
-            )
+            # One SAVEPOINT per connection (round 7 WP-4c #3): a failure mid-sync
+            # (embedder down, provider 500 on page 3, a DB error) used to leave the
+            # already-flushed ``pending`` KnowledgeSource row — no chunks, never
+            # finished — in the tenant transaction, and the sweep COMMITTED it: a
+            # permanent "Processing…" ghost in the raw view. The savepoint unwinds
+            # every half-written row of THIS connection and leaves the rest of the
+            # tenant's pass (earlier connections, the token refresh above) intact.
+            async with session.begin_nested():
+                await sync.sync_connection(
+                    session,
+                    admin_id=admin_id,
+                    instance_id=conn.instance_id,
+                    connection_id=conn.connection_id,
+                    origin=origin,
+                    provider=provider_for_connection(conn, get_secret_store()),
+                )
             synced += 1
         except ProviderUnavailable as exc:
             # Dead credential: pause + flag (§3.2.3) — never silently serve
@@ -140,12 +197,30 @@ async def sync_due_connections(
             logger.info(
                 "knowledge_sync_paused provider=%s error=%s", conn.provider, type(exc).__name__
             )
+        except sync.SnapshotShrunk as exc:
+            # The refusal already wrote its own durable evidence (error state + the
+            # sync_refused_shrink audit row) before raising; a second failure row
+            # here would only muddy the owner's timeline.
+            logger.warning(
+                "knowledge_sync_refused_shrink provider=%s synced=%d reported=%d",
+                conn.provider,
+                exc.existing,
+                exc.remote,
+            )
         except Exception as exc:  # noqa: BLE001 — one bad source must not stop the sweep
             # Non-credential failure (quota, parse, provider 500): the sources
             # show the honest "error" sync state instead of a quietly aging
             # "synced" (round 5B item 12); the connection row itself stays as-is
-            # (the credential is not implicated).
-            await sync.mark_sync_error(session, admin_id=admin_id, connection_id=conn.connection_id)
+            # (the credential is not implicated). The bookkeeping is written in
+            # its OWN transaction (as the shrink refusal is): it is the owner's
+            # evidence and must survive whatever else this tenant's pass does.
+            await _record_sync_failure(
+                admin_id=admin_id,
+                instance_id=conn.instance_id,
+                connection_id=conn.connection_id,
+                origin=origin,
+                exc=exc,
+            )
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )
