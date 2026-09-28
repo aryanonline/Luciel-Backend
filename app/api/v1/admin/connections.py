@@ -985,13 +985,15 @@ async def switch_connection(
     req: SwitchConnectionRequest,
     subject: Subject = Depends(current_admin),
 ) -> StartConnectionResult:
-    """Use a different account and/or provider (Decision #5c): disconnect, then begin a
-    fresh connect flow against the chosen provider.
+    """Use a different account and/or provider (Decision #5c).
 
-    Use this when the owner has decided the CURRENT account is wrong — the old credential
-    is destroyed first, so nothing keeps serving from the account being left behind. Use
-    ``/swap`` instead to re-credential an account that currently works, which keeps it
-    live until the new credential verifies (§3.8.7 rule B)."""
+    Round 7 WP-4a item 7: proven-before-cutover by default — the target provider is
+    staged beside the live credential and the cutover happens only once the new
+    consent / credential form verifies (§3.8.7 rule B, the same path as ``/swap``).
+    ``force: true`` is the explicit destroy-first path: the old credential is destroyed
+    and dependents cascade off BEFORE the new consent begins, for the owner who knows
+    the current account is wrong and that the provider will not issue a second grant
+    while the first is held."""
     async with tenant_session(subject.admin_id) as s:
         try:
             out = await service.switch(
@@ -1000,6 +1002,7 @@ async def switch_connection(
                 connection_id=connection_id,
                 provider=req.provider,
                 user_id=subject.user_id,
+                force=req.force,
             )
         except service.ProviderNotRegistered as exc:
             raise validation_error(str(exc)) from exc

@@ -1384,21 +1384,26 @@ async def switch(
     provider: str | None,
     user_id: uuid.UUID | None,
     store: SecretStore | None = None,
+    force: bool = False,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Move a connection to a different account and/or provider (Decision #5c).
 
-    SWITCH = disconnect + reconnect on one call: the old credential is destroyed first,
-    then a fresh connect flow begins against the chosen provider. That ordering is the
-    whole point of the verb — the owner asking to switch has ALREADY decided the current
-    account is wrong, and several providers only ever issue one active grant per app, so
-    holding the old token would either block the new consent or silently keep serving
-    from the account the owner is trying to leave.
+    Round 7 WP-4a item 7: switch DELEGATES TO ``swap`` — proven-before-cutover (§3.8.7
+    rule B). The target is staged beside the live credential, the owner completes the
+    new consent or credential form, and the cutover happens only when
+    ``confirm_reconnect`` / ``submit_credentials`` has verified the replacement. Before
+    this the verb was destroy-first: the secret was gone and every dependent tool and
+    channel cascaded off before the owner had even seen the consent screen, so an
+    owner who closed the tab — or whose new consent failed — was left with nothing
+    serving and a dead row.
 
-    This is deliberately a different trade-off from ``swap``, which stages the candidate
-    provider alongside a still-live connection (proven-before-cutover, §3.8.7 rule B) and
-    is the right verb for re-credentialing an account that currently WORKS. Switch is for
-    "use a different account", and it accepts a momentary not-connected window — audited,
-    with dependents disabled — rather than serving from the wrong account.
+    ``force=True`` keeps the original destroy-first ordering as an EXPLICIT opt-in for
+    the owner who has already decided the current account is wrong and knows the
+    consequence: some providers only ever issue one active grant per app, so holding
+    the old token can block the new consent. It accepts a momentary not-connected
+    window — audited, with dependents disabled — rather than serving from the wrong
+    account. It is never the default.
 
     ``provider`` may be omitted to switch accounts within the SAME provider. When given,
     it must be registered for this connection type (Decision #6) — otherwise an
@@ -1410,6 +1415,17 @@ async def switch(
         return None
 
     target = provider or connection.provider
+    if not force:
+        # Proven-before-cutover: swap validates the target the same way, stages it,
+        # and refuses a revoked row (c21: only lifecycle.restore un-revokes).
+        return await swap(
+            session,
+            admin_id=admin_id,
+            connection_id=connection_id,
+            provider=target,
+            user_id=user_id,
+            now=now,
+        )
     if not registry.is_valid_provider(connection.connection_type, target):
         raise ProviderNotRegistered(
             f"'{target}' is not an available provider for {connection.connection_type}."

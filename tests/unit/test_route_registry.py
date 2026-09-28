@@ -124,6 +124,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # connection type is connect / disconnect / switch-able through these three.
         ("GET", "/api/v1/admin/connections/providers"),
         ("POST", "/api/v1/admin/connections/{connection_id}/disconnect"),
+        # Round 7 WP-4a item 7: switch is proven-before-cutover by default (it delegates
+        # to swap); the body's ``force: true`` is the explicit destroy-first opt-in.
         ("POST", "/api/v1/admin/connections/{connection_id}/switch"),
         # Generic OAuth code-for-token callback (Decision #7): the Meta channels — and
         # every future OAuth provider on a non-knowledge connection type — complete here.
