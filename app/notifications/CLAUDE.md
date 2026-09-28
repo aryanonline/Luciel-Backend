@@ -58,3 +58,35 @@ make that state explicit and test it.
 - `SesEmailSender.send` and `TwilioSmsSender.send_sms` run the SDK call via
   `asyncio.to_thread`; the notification body also carries the row's `reasons` (email
   "Details:", SMS "Why:"), read at send time like everything else in `_build_notification`.
+
+## Escalation delivery truth (round 7 WP-4b, 2026-09-21 → 2026-09-28)
+- Contact confirmation is channel-agnostic (`escalation_contact_confirmations`, migration
+  0069): saving an SMS contact sends a 6-digit code through the tenant's own number (honest
+  `sms_channel_not_provisioned` refusal when none is connected); the owner enters it on
+  `POST /admin/luciel/escalation/contacts/confirm-sms` (rate-limited, audited) or the
+  contact texts it back. Until confirmed, every page to that number is ALSO copied to the
+  account owner's email, exactly like an unverified address. The after-hours contact runs
+  the same loop and is in contact health + resend.
+- "Delivered" means delivered: a page through a real Twilio sender asks for a DLR
+  (`/webhooks/twilio/notifications/status`, signature-verified) and the row reads `sent`
+  (`dlr_pending`) until the carrier stamps `delivered` / `failed` by
+  `delivery_provider_message_id`.
+- An inbound text from an escalation number is a contact reply ONLY when it correlates with
+  a page to that number within 24h or carries a confirmation code; otherwise it is a
+  customer and runs the runtime.
+- `malformed_contact` / `sms_channel_not_provisioned` are terminal: stamped now (never queued
+  for 24h); a malformed address is filed as a hard-bounce incident, which status.py already
+  reads as the `escalation_bouncing` need.
+- A rung that reaches the owner re-points the queued item to contacts-only; a replay that
+  finds the row at `owner_fallback` stands down from the owner.
+- The payload carries `lead.email` / `lead.phone` on top of the transport identity. A
+  moderation take-over (first reason `moderation:self_harm` / `moderation:threats_violence`,
+  or the audited `content_moderation_event`) is a SAFETY page on both channels — never
+  "asked to speak to a person"; `content_flagged` names what was flagged; the ask bound
+  lists the field names still missing.
+- Backlog visibility (`backlog.py`): `/healthz` adds `escalation_backlog:<n>` to `degraded`
+  once the queue has held pages for longer than one deferred-sweep interval (the "since"
+  is `oldestQueuedAt` from `platform_escalation_backlog()`, persisted — never a process
+  clock); the deferred sweep emits `EscalationBacklog` after its drain and the
+  ObservabilityStack alarms on ≥ 1 over the sweep's hourly period. An unknown backlog
+  emits nothing — a fabricated 0 would read as all clear.

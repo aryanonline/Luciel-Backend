@@ -69,6 +69,7 @@ from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
 from app.lifecycle import audit_retention, grace_expiry, retention, transcript_archive
 from app.lifecycle.close_purge import purge_closed_account_if_due
 from app.models.connection import InstanceConnection
+from app.notifications.backlog import emit_backlog_metric
 from app.observability.metrics import emit_metric
 from app.runtime import session_close
 
@@ -227,7 +228,12 @@ async def _drain_deferred(
 
 async def run_deferred_retry(*, now: datetime | None = None) -> list[str]:
     """Retry due deferred actions; abandon the ones past 24h with notice (§3.8.7 D)."""
-    return await _per_tenant(DEFERRED, _drain_deferred, now)
+    acted = await _per_tenant(DEFERRED, _drain_deferred, now)
+    # Round 7 WP-4b (item 8): the escalation pages this run left unheard — the datum
+    # the ObservabilityStack's EscalationBacklog alarm reads. AFTER the drain, so a
+    # page this sweep delivered is not counted against it.
+    await emit_backlog_metric()
+    return acted
 
 
 async def _check_connections(

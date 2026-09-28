@@ -148,6 +148,19 @@ export class ObservabilityStack extends Stack {
         5,
         'A turn ran with no knowledge because the embedding provider failed (quota, outage, key): every answer is a hand-off until it is fixed.',
       );
+      // Round 7 WP-4b (item 8): the deferred sweep publishes how many escalation
+      // pages it left queued (app/notifications/backlog.py). One unheard page after
+      // the sweep had its turn is worth an operator — an owner is waiting on a lead
+      // and nothing else in the product notices. The period is the sweep's hourly
+      // cadence (one datum per period, so Sum IS the count); a sweep that never runs
+      // is the SweepTask rules' job below, hence missing data stays not-breaching.
+      emfAlarm(
+        'EscalationBacklogAlarm',
+        'EscalationBacklog',
+        1,
+        60,
+        'The deferred sweep left escalation pages queued: owners have escalations nobody has heard. /healthz names the count (escalation_backlog:<n>); check the platform senders and the contacts.',
+      );
 
       // 2026-09-05 audit F034: a sweep task that exits non-zero or never starts
       // is an EventBridge task-state event straight to the operator topic —

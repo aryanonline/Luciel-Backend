@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
 from app.knowledge.pgvector import installed_version as _pgvector_installed_version
 from app.knowledge.pgvector import too_old_reason as _pgvector_too_old_reason
+from app.notifications.backlog import degraded_entry as _escalation_backlog_degraded_entry
 from app.notifications.escalation_dispatch import drain_background_work
 from app.observability.context import admin_id_var, bind_trace, new_trace_id, trace_id_var
 from app.observability.logging import install_structured_logging
@@ -253,6 +254,14 @@ def create_app() -> FastAPI:
         # ``degraded`` entry — that list gates deploys on binding truth, this is an
         # operations signal. ``None`` when the database is unreachable.
         backlog = await escalation_backlog() if database_reason is None else None
+        # Round 7 WP-4b (item 8): a backlog that has outlived one deferred-sweep
+        # interval IS a degraded state — the sweep had its turn and the pages are
+        # still unheard — so it joins the list by count (``escalation_backlog:<n>``).
+        # The "since" is the queue's own oldest row (migration 0069), never a clock
+        # kept in this process, so every task answers the same.
+        stale_backlog = _escalation_backlog_degraded_entry(backlog)
+        if stale_backlog:
+            degraded.append(stale_backlog)
         if database_reason is None:
             # Round 6 WP-G (F044): retrieval quality depends on pgvector 0.8+'s iterative
             # scans; an older extension is a binding problem this list exists to surface.
