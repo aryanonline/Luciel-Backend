@@ -16,7 +16,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -35,7 +35,24 @@ from app.models.knowledge import (
 TOTAL_QUOTA_BYTES = 5 * 1000 * 1000 * 1000  # 5 GB (Vision §7)
 PER_FILE_MAX_BYTES = 50 * 1000 * 1000  # 50 MB
 
+#: Owner decision D10 (2026-09-14): a source whose sync is paused by a revoked or
+#: expired credential keeps answering for this long, then stops until the owner
+#: reconnects. Before round 7 WP-4c a revoked source kept answering forever.
+PAUSED_SERVING_DAYS = 7
+
 logger = logging.getLogger(__name__)
+
+
+def paused_serving_cutoff(now: datetime | None = None) -> datetime:
+    """A source paused at or before this instant has stopped serving (D10)."""
+    return (now or datetime.now(UTC)) - timedelta(days=PAUSED_SERVING_DAYS)
+
+
+def stops_serving_at(paused_since: datetime) -> datetime:
+    """When a source paused at ``paused_since`` stops answering (D10)."""
+    if paused_since.tzinfo is None:
+        paused_since = paused_since.replace(tzinfo=UTC)
+    return paused_since + timedelta(days=PAUSED_SERVING_DAYS)
 
 
 class QuotaError(Exception):
@@ -675,6 +692,8 @@ async def retrieve(
 
     Filters to (admin_id, instance_id) and only sources whose ingestion is ready
     and not soft-deleted (Architecture §3.2 retrieval flow). RLS is the backstop.
+    A source paused by a revoked credential for more than PAUSED_SERVING_DAYS is
+    excluded too (D10): its content is no longer being kept true.
 
     Implements the §3.2 retrieval flow in full:
       step 2 — HNSW ANN over the embedding (ordered by cosine distance);
@@ -706,6 +725,10 @@ async def retrieve(
                 KnowledgeChunk.instance_id == instance_id,
                 KnowledgeSource.ingestion_status == "ready",
                 KnowledgeSource.soft_deleted_at.is_(None),
+                or_(
+                    KnowledgeSource.paused_since.is_(None),
+                    KnowledgeSource.paused_since > paused_serving_cutoff(),
+                ),
             )
             .order_by(distance.asc())
             .limit(max(k, k + _RERANK_OVERFETCH))

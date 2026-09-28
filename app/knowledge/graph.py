@@ -16,11 +16,17 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import DateTime, bindparam, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.knowledge.graph_extract import canonicalize
+from app.knowledge.service import paused_serving_cutoff
+
+# A source's graph is not walked once the source has stopped serving: tombstoned for
+# its undo window (§3.2.2) or paused by a revoked credential past PAUSED_SERVING_DAYS
+# (owner decision D10, ``:paused_cutoff``). The same rule service.retrieve applies to
+# the chunks. The NOT EXISTS clause is spelled out in both queries below.
 
 # Hop cap for the recursive CTE (§3.2.1). Bounds traversal cost and prevents runaway
 # cycles; 3 hops covers the relationship-traversal patterns in the §3.2.1 examples
@@ -44,19 +50,28 @@ async def find_entities_by_names(
         return []
     # A tombstoned source's graph stays for its undo window but must not be
     # traversed: the runtime stops answering from deleted knowledge at once (§3.2.2).
+    # A source paused past PAUSED_SERVING_DAYS is not traversed either (D10).
     stmt = text(
         "SELECT e.id FROM knowledge_entities e "
         "WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id "
         "AND e.canonical = ANY(:canon) "
         "AND NOT EXISTS (SELECT 1 FROM knowledge_sources ks "
-        "  WHERE ks.id = e.source_id AND ks.soft_deleted_at IS NOT NULL)"
+        "  WHERE ks.id = e.source_id "
+        "    AND (ks.soft_deleted_at IS NOT NULL OR ks.paused_since <= :paused_cutoff))"
     ).bindparams(
         bindparam("admin_id", type_=PGUUID(as_uuid=True)),
         bindparam("instance_id", type_=PGUUID(as_uuid=True)),
         bindparam("canon", expanding=False),
+        bindparam("paused_cutoff", type_=DateTime(timezone=True)),
     )
     rows = await session.execute(
-        stmt, {"admin_id": admin_id, "instance_id": instance_id, "canon": canon}
+        stmt,
+        {
+            "admin_id": admin_id,
+            "instance_id": instance_id,
+            "canon": canon,
+            "paused_cutoff": paused_serving_cutoff(),
+        },
     )
     return [r[0] for r in rows]
 
@@ -89,11 +104,14 @@ async def traverse(
         """
         WITH RECURSIVE live_edges AS (
             -- Edges of tombstoned sources exist for the undo window but are never
-            -- walked (§3.2.2: deleted knowledge stops answering immediately).
+            -- walked (§3.2.2: deleted knowledge stops answering immediately); nor
+            -- are the edges of a source paused past PAUSED_SERVING_DAYS (D10).
             SELECT e.* FROM knowledge_edges e
             WHERE e.admin_id = :admin_id AND e.instance_id = :instance_id
               AND NOT EXISTS (SELECT 1 FROM knowledge_sources ks
-                              WHERE ks.id = e.source_id AND ks.soft_deleted_at IS NOT NULL)
+                              WHERE ks.id = e.source_id
+                                AND (ks.soft_deleted_at IS NOT NULL
+                                     OR ks.paused_since <= :paused_cutoff))
         ), walk AS (
             SELECT e.src_entity_id, e.dst_entity_id, e.relationship_type,
                    1 AS depth, ARRAY[e.src_entity_id, e.dst_entity_id] AS visited
@@ -120,6 +138,7 @@ async def traverse(
         bindparam("admin_id", type_=PGUUID(as_uuid=True)),
         bindparam("instance_id", type_=PGUUID(as_uuid=True)),
         bindparam("seeds", expanding=False),
+        bindparam("paused_cutoff", type_=DateTime(timezone=True)),
     )
     rows = await session.execute(
         sql,
@@ -128,6 +147,7 @@ async def traverse(
             "instance_id": instance_id,
             "seeds": list(seed_entity_ids),
             "max_hops": hops,
+            "paused_cutoff": paused_serving_cutoff(),
         },
     )
     facts: list[str] = []

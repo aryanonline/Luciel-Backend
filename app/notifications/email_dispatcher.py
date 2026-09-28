@@ -274,6 +274,101 @@ async def send_connection_attention(
     )
 
 
+def _affected_sources(source_names: list[str], cap: int = 10) -> str:
+    shown = ", ".join(source_names[:cap])
+    more = len(source_names) - cap
+    tail = f", and {more} more" if more > 0 else ""
+    noun = "source" if len(source_names) == 1 else "sources"
+    return f"Affected {noun} ({len(source_names)}): {shown}{tail}."
+
+
+async def send_knowledge_pause_warning(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    provider_name: str,
+    source_names: list[str],
+    stops_at: datetime,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """Round 7 WP-4c #5 (owner decision D10): a knowledge connection's saved sign-in
+    was revoked or expired, so the sources synced from it are no longer being kept
+    true. They keep answering for a fixed number of days and then stop; the owner
+    hears this on day 1 (here) and again when it happens
+    (``send_knowledge_pause_stopped``). Once per incident — the knowledge_sync sweep
+    keys both on the notice_deliveries ledger."""
+    when = stops_at.strftime("%d %B %Y")
+    subject = f"Action needed: your {provider_name} knowledge will stop answering on {when}"
+    body = (
+        f"Luciel can no longer reach your {provider_name} connection: its saved sign-in "
+        "was revoked or expired, so the knowledge synced from it is no longer being kept "
+        f"up to date.\n\n{_affected_sources(source_names)}\n\n"
+        f"These sources will keep answering until {when}. After that Luciel stops using "
+        "them until you reconnect, so nobody is answered from content that may have gone "
+        "stale.\n\n"
+        "To fix it, open the Configure page of your VantageMind dashboard and use "
+        "Reconnect on that connection — one sign-in, and the next sync switches "
+        "everything back on by itself."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="knowledge_pause_warning",
+        audit_event="knowledge_pause_notice_emailed",
+        extra_payload={
+            "provider": provider_name,
+            "sources": len(source_names),
+            "stops_at": stops_at.isoformat(),
+        },
+        sender=sender,
+    )
+
+
+async def send_knowledge_pause_stopped(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    provider_name: str,
+    source_names: list[str],
+    stopped_at: datetime,
+    grace_days: int,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """The day-7 half of D10 (see ``send_knowledge_pause_warning``): the connection
+    was not reconnected in time and its sources have now stopped answering."""
+    when = stopped_at.strftime("%d %B %Y")
+    subject = f"Your {provider_name} knowledge has stopped answering — reconnect to restore it"
+    body = (
+        f"Your {provider_name} connection was not reconnected within {grace_days} days of "
+        f"its saved sign-in being revoked or expired, so as of {when} Luciel no longer "
+        "answers from the knowledge synced from it. Questions those sources used to "
+        "answer are now handed to your team instead of being guessed.\n\n"
+        f"{_affected_sources(source_names)}\n\n"
+        "To restore them, open the Configure page of your VantageMind dashboard and use "
+        "Reconnect on that connection — the next sync brings every source back."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject=subject,
+        body=body,
+        notice_type="knowledge_pause_stopped",
+        audit_event="knowledge_pause_notice_emailed",
+        extra_payload={
+            "provider": provider_name,
+            "sources": len(source_names),
+            "stopped_at": stopped_at.isoformat(),
+        },
+        sender=sender,
+    )
+
+
 async def send_crm_push_failed(
     session: AsyncSession,
     *,

@@ -172,6 +172,13 @@ async def sync_connection(
             )
         raise SnapshotShrunk(existing=len(existing_by_ext), remote=len(remote_by_id))
 
+    # The provider answered, so the credential is live: whatever revocation paused
+    # these sources is over (D10). Cleared here, inside the caller's transaction, so
+    # a reconcile that fails further down unwinds the clearing with everything else
+    # and nothing reads "serving again" that was never re-verified.
+    for src in existing:
+        src.paused_since = None
+
     # Additions + updates. Both go through the SAME ingest functions the owner's
     # upload/replace affordances use (round 7 WP-4c #2): the per-file cap, the tenant
     # total, ``size_bytes`` and the graph extraction all apply to synced content
@@ -263,13 +270,22 @@ async def sync_connection(
 
 
 async def pause_sync_on_revocation(
-    session: AsyncSession, *, admin_id: uuid.UUID, connection_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    now: datetime | None = None,
 ) -> int:
     """On revoked/expired connection, flag synced sources paused_reconnect_needed and pause.
 
     Never silently keep serving the last-synced copy (§3.2.3): the sources are
-    marked paused_reconnect_needed so the raw view shows the honest state.
+    marked paused_reconnect_needed so the raw view shows the honest state, and the
+    D10 clock starts (``paused_since``): they keep answering for
+    ``service.PAUSED_SERVING_DAYS`` and then stop until a clean sync. The clock is
+    set ONCE per incident — the health sweep and a manual re-sync both pause, and
+    the second pause must not push the stop date out.
     """
+    now = now or datetime.now(UTC)
     sources = (
         (
             await session.execute(
@@ -285,6 +301,8 @@ async def pause_sync_on_revocation(
     )
     for s in sources:
         s.sync_status = "paused_reconnect_needed"  # §3.2.3 vocabulary (Axis4-F02)
+        if s.paused_since is None:
+            s.paused_since = now
     await session.flush()
     return len(sources)
 

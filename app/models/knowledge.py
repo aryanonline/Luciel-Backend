@@ -32,6 +32,11 @@ class KnowledgeSource(Base, TenantMixin, TimestampMixin):
     connection_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sync_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # When the sync was paused by a revoked/expired credential (migration 0070, owner
+    # decision D10): the source keeps answering for service.PAUSED_SERVING_DAYS, then
+    # retrieval and graph traversal exclude it until a clean sync clears this. Set once
+    # per incident (a repeat pause keeps the original clock).
+    paused_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     soft_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Who tombstoned the row (migration 0056): "owner" (undo-able for 30 days, then
     # purged by the retention pass) or "lifecycle" (the Luciel delete; comes back with

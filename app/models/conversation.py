@@ -116,6 +116,13 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     # "not_scored_legacy" (pre-0051 rows keep the default false — no backfill can
     # honestly reconstruct their origin).
     deterministic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # The admin flagged this answer for review (§3.4.13; migration 0070, round 7
+    # WP-4c #8). The flag used to be audit-only, so the evidence read answered
+    # ``flagged_by_admin = False`` for every message — including one flagged a
+    # second earlier. NULL = never flagged.
+    flagged_by_admin_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class SessionSummary(Base, TenantMixin, TimestampMixin):

@@ -32,10 +32,152 @@ from app.knowledge import service, sync
 from app.knowledge.providers import ProviderUnavailable, provider_for_connection
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
-from app.models.instance import Instance, is_paused
+from app.models.instance import Account, Instance, is_paused
 from app.models.knowledge import KnowledgeSource
+from app.models.notice_delivery import NoticeDelivery
+from app.notifications import email_dispatcher
+from app.notifications.email_sender import EmailSender
 
 logger = logging.getLogger(__name__)
+
+#: notice_deliveries ``kind`` values for the D10 notices (round 7 WP-4c #5).
+PAUSE_WARNING_KIND = "knowledge_pause_warning"
+PAUSE_STOPPED_KIND = "knowledge_pause_stopped"
+
+# Owner-facing names for the knowledge providers the registry does not carry.
+_PROVIDER_LABELS: dict[str, str] = {
+    "website_crawl": "website crawl",
+    "crm_kb": "CRM knowledge base",
+}
+
+
+def _provider_display_name(provider: str) -> str:
+    from app.connections import registry  # noqa: PLC0415 — keeps this module import-light
+
+    spec = registry.get_provider(provider)
+    if spec is not None:
+        return spec.display_name
+    return _PROVIDER_LABELS.get(provider, provider)
+
+
+def pause_notice_id(connection_id: uuid.UUID, paused_since: datetime, kind: str) -> str:
+    """The ledger key of one D10 notice: once per (connection, incident, stage)."""
+    return f"kbpause:{connection_id}:{paused_since.isoformat()}:{kind}"
+
+
+async def notify_paused_sources(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+    sender: EmailSender | None = None,
+) -> int:
+    """Owner decision D10 (round 7 WP-4c #5): tell the owner what a revocation costs.
+
+    A connection whose credential was revoked or expired has its sources paused
+    (``paused_since`` set once per incident). They keep answering for
+    ``service.PAUSED_SERVING_DAYS`` and then retrieval excludes them. The owner is
+    emailed ONCE on day 1 ("<sources> will stop answering on <date> unless you
+    reconnect") and ONCE when it happens; the notice_deliveries ledger makes "once"
+    durable across at-least-once sweep delivery. One email per connection, not per
+    source. A sweep that first sees an incident after its stop date sends only the
+    stop notice — a warning about a date already past would be a lie. Returns the
+    number of notices sent this pass.
+    """
+    now = now or datetime.now(UTC)
+    paused = (
+        (
+            await session.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == admin_id,
+                    KnowledgeSource.soft_deleted_at.is_(None),
+                    KnowledgeSource.paused_since.is_not(None),
+                    KnowledgeSource.connection_id.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not paused:
+        return 0
+    email = (
+        await session.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    if not email:
+        return 0
+    by_connection: dict[uuid.UUID, list[KnowledgeSource]] = {}
+    stamps: dict[uuid.UUID, datetime] = {}
+    for src in paused:
+        if src.connection_id is None or src.paused_since is None:
+            continue  # filtered above; narrows the types
+        by_connection.setdefault(src.connection_id, []).append(src)
+        stamp = (
+            src.paused_since if src.paused_since.tzinfo else src.paused_since.replace(tzinfo=UTC)
+        )
+        # One incident per connection: the earliest stamp is the incident's start.
+        stamps[src.connection_id] = min(stamps.get(src.connection_id, stamp), stamp)
+
+    sent = 0
+    for connection_id, sources in by_connection.items():
+        paused_since = stamps[connection_id]
+        stops_at = service.stops_serving_at(paused_since)
+        kind = PAUSE_STOPPED_KIND if now >= stops_at else PAUSE_WARNING_KIND
+        notice_id = pause_notice_id(connection_id, paused_since, kind)
+        already = (
+            await session.execute(
+                select(NoticeDelivery.id).where(
+                    NoticeDelivery.admin_id == admin_id, NoticeDelivery.notice_id == notice_id
+                )
+            )
+        ).first()
+        if already is not None:
+            continue
+        conn = (
+            await session.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                )
+            )
+        ).scalar_one_or_none()
+        provider_name = _provider_display_name(conn.provider if conn is not None else "")
+        names = sorted(s.name for s in sources)
+        if kind == PAUSE_WARNING_KIND:
+            outcome = await email_dispatcher.send_knowledge_pause_warning(
+                session,
+                admin_id=admin_id,
+                to=email,
+                provider_name=provider_name,
+                source_names=names,
+                stops_at=stops_at,
+                sender=sender,
+            )
+        else:
+            outcome = await email_dispatcher.send_knowledge_pause_stopped(
+                session,
+                admin_id=admin_id,
+                to=email,
+                provider_name=provider_name,
+                source_names=names,
+                stopped_at=stops_at,
+                grace_days=service.PAUSED_SERVING_DAYS,
+                sender=sender,
+            )
+        if outcome.status == "failed":
+            continue  # no ledger row — the next pass retries; the audit row has the failure
+        session.add(
+            NoticeDelivery(
+                admin_id=admin_id,
+                notice_id=notice_id,
+                kind=kind,
+                delivery_status=outcome.status,
+                sent_at=now,
+            )
+        )
+        sent += 1
+    await session.flush()
+    return sent
 
 
 async def _record_sync_failure(
@@ -185,7 +327,7 @@ async def sync_due_connections(
             # email + the dashboard attention counter) — a broken sync used to
             # pause with no notification anywhere.
             await sync.pause_sync_on_revocation(
-                session, admin_id=admin_id, connection_id=conn.connection_id
+                session, admin_id=admin_id, connection_id=conn.connection_id, now=now
             )
             from app.connections.health import mark_connection_broken  # noqa: PLC0415
 
@@ -224,6 +366,14 @@ async def sync_due_connections(
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )
+    # D10: the owner hears about a revoked connection on day 1 (what will stop, when)
+    # and on day 7 (that it stopped) — once per incident, never silently.
+    try:
+        notified = await notify_paused_sources(session, admin_id=admin_id, now=now)
+        if notified:
+            logger.info("knowledge_pause_notices sent=%d", notified)
+    except Exception:  # noqa: BLE001 — never fail the sweep on the notice pass
+        logger.exception("knowledge_pause_notices_failed")
     # A changed embedding pin (F121): bring this tenant's older vectors forward in a
     # bounded batch per pass, so retrieval never scores a new-model query against
     # old-model chunks for longer than a few sweeps.
