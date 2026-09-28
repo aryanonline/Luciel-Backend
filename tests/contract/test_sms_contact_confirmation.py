@@ -268,3 +268,98 @@ async def test_a_code_for_a_number_that_is_not_a_contact_is_refused(client, twil
     assert "not currently configured" in r.text
     r = await client.post(CONFIRM, json={"number": CONTACT, "code": "12ab56"})
     assert r.status_code == 422, r.text
+
+
+TEAM = "/api/v1/admin/luciel/team-availability"
+AFTER_HOURS = "+16045557777"
+
+
+def _after_hours(channel: str, contact: str) -> dict:
+    key = "contactSms" if channel == "sms" else "contactEmail"
+    return {
+        "timezone": "UTC",
+        "enabled": True,
+        "afterHours": {"escalation": {"channel": channel, key: contact}},
+    }
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_after_hours_number_is_proven_like_any_other_contact(client, twilio):
+    """Item 2: saving the after-hours contact starts its loop, contact health lists
+    it under its own role, resend covers it, and the dashboard entry confirms it."""
+    from datetime import UTC, datetime, timedelta
+
+    admin = await _ready_account_with_luciel(client)
+    await _attach_number(admin)
+
+    r = await client.put(TEAM, json=_after_hours("sms", AFTER_HOURS))
+    assert r.status_code == 200, r.text
+    assert len(twilio) == 1
+    assert twilio[0]["from_number"] == BYO_NUMBER and twilio[0]["to"] == AFTER_HOURS
+    code = _code_in(twilio[0]["body"])
+    health = _health(r.json(), AFTER_HOURS)
+    assert health["role"] == "after_hours" and health["channel"] == "sms"
+    assert health["state"] == "pending_confirmation"
+
+    # A re-save with the same contact does not text it again.
+    r = await client.put(TEAM, json=_after_hours("sms", AFTER_HOURS))
+    assert r.status_code == 200 and len(twilio) == 1
+
+    # Resend knows the after-hours number (past the cooldown a fresh code goes out).
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(
+                select(EscalationContactConfirmation).where(
+                    EscalationContactConfirmation.admin_id == admin
+                )
+            )
+        ).scalar_one()
+        row.last_code_sent_at = datetime.now(UTC) - timedelta(minutes=6)
+    r = await client.post(RESEND, json={"address": AFTER_HOURS})
+    assert r.status_code == 200, r.text
+    assert len(twilio) == 2 and twilio[1]["to"] == AFTER_HOURS
+    fresh = _code_in(twilio[1]["body"])
+
+    r = await client.post(CONFIRM, json={"number": AFTER_HOURS, "code": fresh})
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "confirmed"
+    assert _health(r.json()["luciel"], AFTER_HOURS)["state"] == "verified"
+    assert _health((await client.get("/api/v1/admin/luciel")).json(), AFTER_HOURS)["role"] == (
+        "after_hours"
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_after_hours_address_gets_the_link_loop_and_shows_in_contact_health(
+    client, twilio
+):
+    from app.models.email_incident import EmailDeliveryIncident
+
+    admin = await _ready_account_with_luciel(client)
+    address = "night-desk@shop.com"
+    r = await client.put(TEAM, json=_after_hours("email", address))
+    assert r.status_code == 200, r.text
+    health = _health(r.json(), address)
+    assert health["role"] == "after_hours" and health["channel"] == "email"
+    assert health["state"] == "pending_confirmation"
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(
+                select(EmailDeliveryIncident).where(EmailDeliveryIncident.admin_id == admin)
+            )
+        ).scalar_one()
+        assert row.email_lower == address and row.verification_pending_jti
+        mirror = (
+            await s.execute(
+                select(EscalationContactConfirmation).where(
+                    EscalationContactConfirmation.admin_id == admin,
+                    EscalationContactConfirmation.kind == "email",
+                )
+            )
+        ).scalar_one()
+        assert mirror.value_normalized == address and mirror.confirmed_at is None
+    assert twilio == []  # an address is never texted
+
+    # Resend honours the after-hours address too (inside the cooldown: refused honestly).
+    r = await client.post(RESEND, json={"address": address})
+    assert r.status_code == 422 and "moments ago" in r.text
