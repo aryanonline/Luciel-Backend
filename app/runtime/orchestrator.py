@@ -90,6 +90,7 @@ from app.runtime.escalation import (
     evaluate_outcome,
     is_contact_details_turn,
     is_conversational_turn,
+    is_new_question,
     is_repeated_question,
 )
 from app.runtime.grounding import faithful_readback_ok, score_grounding
@@ -326,6 +327,103 @@ _LLM_FAILURE_REASONS: dict[str, tuple[str, ...]] = {
 # (round 7 WP-2, item 3; D2): the upset customer still gets their answer, and hears —
 # truthfully, the row and notification exist — that a person is now aware.
 _TEAM_TOLD_NOTE = " I've also let the team know, so a person can follow up with you."
+
+# --- one hand-off ack, one contact ask, per session (round 7 WP-2 remainder, item 1) -- #
+# Every below-floor turn used to replace the draft with the SAME full hand-off
+# paragraph and append the SAME contact ask — three uncovered questions from an
+# anonymous widget visitor read the identical block three times. The full ack and
+# the ask now go out once; later turns get a short, varied acknowledgement, and the
+# ask returns only after a respite, bounded like any other repeated ask (§3.3.7).
+# All of it is read from the session's own transcript — no new persistence.
+
+#: The code-composed contact ask for an anonymous escalated visitor (C5).
+CONTACT_ASK_LINE = (
+    "So the team can reach you, what's your name and the best email or phone number "
+    "to contact you at?"
+)
+#: Luciel turns that must pass, with still no identifier on file, before an anonymous
+#: visitor who did not answer the contact ask is asked again.
+CONTACT_ASK_RESPITE_TURNS = 4
+#: Short acknowledgements for a LATER question Luciel cannot answer, once the full
+#: hand-off line has gone out this session. Each says only what is true — the team
+#: already has the thread and this question is added to it — and promises nothing
+#: twice. Varied by position so the visitor never reads the same line twice running.
+SHORT_HANDOFF_ACKS: tuple[str, ...] = (
+    "That's another one I can't answer from what I have — I've added it to what the "
+    "team will follow up on.",
+    "I don't have that on hand either; I've noted it for the team alongside your earlier question.",
+    "I'm not able to confirm that myself, so I've passed it along with the rest for the team.",
+)
+# The full hand-off ack in any of its variants (_handoff_ack): "I've flagged this for
+# the team" / "I've passed this along to the team", with or without a follow-up time.
+_HANDOFF_ACK_MARK = re.compile(r"\b(?:flagged this for the team|passed this along to the team)\b")
+
+
+def _luciel_turns(history: list[Transcript]) -> list[str]:
+    return [t.text for t in history if t.role == "luciel"]
+
+
+def _is_short_handoff_ack(text: str) -> bool:
+    return any(text.startswith(ack) for ack in SHORT_HANDOFF_ACKS)
+
+
+def handoff_ack_sent(history: list[Transcript]) -> bool:
+    """True once this session's transcript carries the full hand-off ack."""
+    return any(_HANDOFF_ACK_MARK.search(text) for text in _luciel_turns(history))
+
+
+def short_handoff_ack(history: list[Transcript]) -> str:
+    """The short acknowledgement for this turn — the next one in the cycle, so two
+    consecutive uncovered questions never get the same sentence."""
+    already = sum(1 for text in _luciel_turns(history) if _is_short_handoff_ack(text))
+    return SHORT_HANDOFF_ACKS[already % len(SHORT_HANDOFF_ACKS)]
+
+
+def contact_ask_due(history: list[Transcript], *, anonymous: bool) -> bool:
+    """Whether the code-composed contact ask goes out on THIS turn.
+
+    Only for an anonymous visitor (no lead on file, no transport identity, widget).
+    The first escalated turn asks; after that the ask returns only once
+    ``CONTACT_ASK_RESPITE_TURNS`` Luciel turns have passed with still nothing on
+    file, and never more than ``ASK_ATTEMPT_BOUND`` times in a session — the
+    code-composed re-ask counts against the same bound as the model's (§3.3.7)."""
+    if not anonymous:
+        return False
+    turns = _luciel_turns(history)
+    asked_at = [i for i, text in enumerate(turns) if CONTACT_ASK_LINE in text]
+    if not asked_at:
+        return True
+    if len(asked_at) >= ASK_ATTEMPT_BOUND:
+        return False
+    return len(turns) - asked_at[-1] - 1 >= CONTACT_ASK_RESPITE_TURNS
+
+
+def unanswered_questions(history: list[Transcript]) -> list[str]:
+    """The customer messages this session answered with a hand-off ack (full or
+    short): the questions Luciel could not cover, in order."""
+    out: list[str] = []
+    last_lead: str | None = None
+    for turn in history:
+        if turn.role == "lead":
+            last_lead = turn.text
+        elif turn.role == "luciel" and last_lead is not None:
+            if _HANDOFF_ACK_MARK.search(turn.text) or _is_short_handoff_ack(turn.text):
+                out.append(last_lead)
+                last_lead = None
+    return out
+
+
+#: Longest excerpt of a new unanswered question carried on the row's reasons.
+_QUESTION_EXCERPT_CAP = 120
+
+
+def also_asked_reason(question: str) -> str:
+    """The owner-facing reason for a re-notification: the new question itself."""
+    excerpt = " ".join((question or "").split())
+    if len(excerpt) > _QUESTION_EXCERPT_CAP:
+        excerpt = excerpt[: _QUESTION_EXCERPT_CAP - 1].rstrip() + "…"
+    return f'also asked: "{excerpt}"'
+
 
 #: Moderation categories that do NOT take the conversation away (D2): recorded under
 #: content_flagged with the owner-facing reason, the owner is notified, and the loop
@@ -847,6 +945,14 @@ class Orchestrator:
                 handed_off=True,
             )
 
+        # The session's own transcript, loaded once for every path below: the intake
+        # gate reads the trailing lead turns from it, and the hand-off ack / contact
+        # ask decide from it whether they already went out this session (round 7
+        # WP-2 remainder, item 1) — the at-cap and moderation replies included.
+        history = await memory.load_session_history(
+            self.session, admin_id=admin_id, session_id=session_id
+        )
+
         # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
         budget_state = await budget.check_budget(
             self.session,
@@ -867,6 +973,7 @@ class Orchestrator:
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
             at_cap_row = await persist_turn(
                 self.session,
@@ -944,8 +1051,8 @@ class Orchestrator:
                     # Immediate escalation with crisis copy; no contact ask (F116).
                     ack = SELF_HARM_REPLY
                 else:
-                    ack = self._with_contact_ask(
-                        await self._handoff_ack(),
+                    ack = await self._handoff_reply(
+                        history,
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
@@ -967,9 +1074,6 @@ class Orchestrator:
             await self._audit_injection(session_id)
 
         # --- ESCALATION GATE 1 — INTAKE (§3.4.5) ----------------------------- #
-        history = await memory.load_session_history(
-            self.session, admin_id=admin_id, session_id=session_id
-        )
         trailing = [t.text for t in history if t.role == "lead"]
         intake = evaluate_intake(trailing)
         if intake.fired and intake.signal is Signal.explicit_human_request:
@@ -983,8 +1087,8 @@ class Orchestrator:
                 gate="intake",
                 score=intake.score_or_confidence,
                 reasons=intake.reasons,
-                ack=self._with_contact_ask(
-                    await self._handoff_ack(),
+                ack=await self._handoff_reply(
+                    history,
                     channel=channel,
                     resolved_lead_id=resolved_lead_id,
                     transport_identifier=transport_identifier,
@@ -1021,7 +1125,7 @@ class Orchestrator:
             # Nothing to look up (item 3): no embedding call, no Knowledge block, and
             # the row carries no attribution because no search ran (never a false
             # "searched, nothing matched").
-            raw_chunks = []
+            raw_chunks: list[str] = []
             knowledge_state = _KNOWLEDGE_NOT_SEARCHED
         else:
             if self.retriever_bundle is not None:
@@ -1116,6 +1220,7 @@ class Orchestrator:
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
             outage_row = await persist_turn(
                 self.session,
@@ -1198,8 +1303,8 @@ class Orchestrator:
                             gate=Gate.outcome.value,
                             reasons=list(stall_reasons),
                         )
-                    ack = self._with_contact_ask(
-                        await self._handoff_ack(),
+                    ack = await self._handoff_reply(
+                        history,
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
@@ -1271,12 +1376,13 @@ class Orchestrator:
                 session_id=session_id,
                 signal=fired_signal,
             )
+            row_written = False
             if not suppress:
                 # ONE row for the turn: the signal that won it, with BOTH sets of
                 # reasons when a hot lead also got an ungrounded draft (round 7
                 # WP-2, item 1) — the owner reads "named a budget; answer only 10%
                 # backed by your knowledge" on the same line.
-                await _record_escalation(
+                row_written = await _record_escalation(
                     self.session,
                     admin_id=admin_id,
                     instance_id=instance_id,
@@ -1298,7 +1404,7 @@ class Orchestrator:
                     session_id=session_id,
                     signal=Signal.cannot_answer.value,
                 ):
-                    await _record_escalation(
+                    row_written = await _record_escalation(
                         self.session,
                         admin_id=admin_id,
                         instance_id=instance_id,
@@ -1309,6 +1415,17 @@ class Orchestrator:
                         score=min(resp.confidence, grounding.score),
                         reasons=list(outcome.answer_reasons),
                     )
+            if outcome.answer_ungrounded and not row_written:
+                # The session's row already exists and THIS question is a new one
+                # Luciel cannot cover (round 7 WP-2 remainder, item 1): the owner
+                # reads it on the row and is paged again — a repeat pages nobody.
+                await self._renotify_new_question(
+                    history,
+                    inbound_text=inbound_text,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    fired_signal=fired_signal,
+                )
 
         # --- LUCIEL'S OWN HAND-OFF (round 7 WP-2, item 2; Vision §3.4) ------- #
         # The model called hand_to_team this turn: the row + notification were
@@ -1425,8 +1542,15 @@ class Orchestrator:
             # specific replacement above. The verdict is read from
             # ``answer_ungrounded``, not from the signal (round 7 WP-2, item 1): a
             # hot lead whose row says high_value_lead gets the same honest ack, not
-            # the fabricated draft that used to ship under the winning signal.
-            reply_text = await self._handoff_ack()
+            # the fabricated draft that used to ship under the winning signal. The
+            # FULL ack once per session; a later uncovered question gets a short,
+            # varied acknowledgement instead of the same paragraph again (remainder
+            # item 1).
+            reply_text = (
+                short_handoff_ack(history)
+                if handoff_ack_sent(history)
+                else await self._handoff_ack()
+            )
             deterministic_reply = True
         if team_told and not deterministic_reply:
             # The sentiment row was written THIS turn (D2): the answer stands, and the
@@ -1453,6 +1577,7 @@ class Orchestrator:
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
         # AI-identity disclosure backstop (§3.4.16): on the FIRST outbound of a new
         # conversation on a text channel, guarantee the disclosure in code rather than
@@ -1899,6 +2024,61 @@ class Orchestrator:
             }
         )
 
+    async def _renotify_new_question(
+        self,
+        history: list[Transcript],
+        *,
+        inbound_text: str,
+        session_id: uuid.UUID,
+        resolved_lead_id: uuid.UUID | None,
+        fired_signal: str,
+    ) -> bool:
+        """A DISTINCT question Luciel could not answer after the session's row already
+        exists (round 7 WP-2 remainder, item 1).
+
+        A signal's row is written once per session, so a second uncovered question
+        used to vanish: the owner was paged about the first and never heard that the
+        visitor went on to ask two more things nobody could answer. Now the new
+        question rides on the row's reasons (``also asked: "…"``) and the SAME row is
+        notified again — the row stays one business event, the page carries the
+        news. A repeat of an earlier uncovered question ("implants??" after "do you
+        do implants?") is judged by ``is_new_question`` and pages nobody. Returns
+        whether a re-notification was scheduled."""
+        if not is_new_question(inbound_text, unanswered_questions(history)):
+            return False
+        signal = (
+            Signal.cannot_answer.value
+            if await _session_already_escalated(
+                self.session,
+                admin_id=self.admin_id,
+                session_id=session_id,
+                signal=Signal.cannot_answer.value,
+            )
+            else fired_signal
+        )
+        appended = await _append_escalation_reasons(
+            self.session,
+            admin_id=self.admin_id,
+            session_id=session_id,
+            signal=signal,
+            gate=Gate.outcome.value,
+            reasons=[also_asked_reason(inbound_text)],
+        )
+        if not appended:
+            return False
+        emit_metric("EscalationRenotified", dimensions={"Signal": signal})
+        schedule_notification_after_commit(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=Gate.outcome.value,
+            score=None,
+        )
+        return True
+
     @staticmethod
     def _with_contact_ask(
         reply_text: str,
@@ -1906,6 +2086,7 @@ class Orchestrator:
         channel: str,
         resolved_lead_id: uuid.UUID | None,
         transport_identifier: str | None,
+        history: list[Transcript],
     ) -> str:
         """Append the contact ask for an anonymous escalated visitor (C5).
 
@@ -1915,13 +2096,36 @@ class Orchestrator:
         in code. Previously only the gate-2 path asked; gate-1 (the most likely
         trigger: "can I talk to a human"), moderation, at-cap, and llm_unavailable
         all escalated an anonymous widget visitor without asking. Strong channels
-        (voice/SMS/email/Meta) skip this: the transport already names the person."""
-        if resolved_lead_id is None and transport_identifier is None and channel == "widget":
-            return (
-                f"{reply_text}\n\nSo the team can reach you, what's your name and "
-                "the best email or phone number to contact you at?"
-            )
+        (voice/SMS/email/Meta) skip this: the transport already names the person.
+
+        Once per session, then a bounded, respited re-ask (round 7 WP-2 remainder,
+        item 1; see ``contact_ask_due``): every escalating turn used to nag."""
+        anonymous = (
+            resolved_lead_id is None and transport_identifier is None and channel == "widget"
+        )
+        if contact_ask_due(history, anonymous=anonymous):
+            return f"{reply_text}\n\n{CONTACT_ASK_LINE}"
         return reply_text
+
+    async def _handoff_reply(
+        self,
+        history: list[Transcript],
+        *,
+        channel: str,
+        resolved_lead_id: uuid.UUID | None,
+        transport_identifier: str | None,
+    ) -> str:
+        """The hand-off line for THIS turn (round 7 WP-2 remainder, item 1): the full
+        ack the first time this session, a short varied acknowledgement after — the
+        team already has the thread — with the contact ask only when it is due."""
+        ack = short_handoff_ack(history) if handoff_ack_sent(history) else await self._handoff_ack()
+        return self._with_contact_ask(
+            ack,
+            channel=channel,
+            resolved_lead_id=resolved_lead_id,
+            transport_identifier=transport_identifier,
+            history=history,
+        )
 
     async def _handoff_ack(self) -> str:
         """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4;

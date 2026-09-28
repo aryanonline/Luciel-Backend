@@ -114,3 +114,16 @@ make that state explicit and test it.
 - Known gap (not changed here): gate 2 records + pages `cannot_answer` for a bare
   clarifying question on the FIRST stall ("what's your email?") even though F100 lets
   the question go out; four established loop tests lean on that echo shape.
+
+## Judgment as an employee — the remainder (round 7 WP-2, built 2026-09-27)
+- One hand-off ack, one contact ask, per session (item 1): `_handoff_reply` sends the
+  full `_handoff_ack` line only while `handoff_ack_sent(history)` is False, then one of
+  `SHORT_HANDOFF_ACKS` (cycled by `short_handoff_ack`); `_with_contact_ask` appends
+  `CONTACT_ASK_LINE` only when `contact_ask_due` says so — first escalating turn, then
+  after `CONTACT_ASK_RESPITE_TURNS` Luciel turns with still nothing on file, at most
+  `ASK_ATTEMPT_BOUND` times. All read from the session transcript (no new column), so
+  the transcript order matters: entry points pass `received_at`. A DISTINCT uncovered
+  question after the row exists (`escalation.is_new_question` over
+  `unanswered_questions(history)`) appends `also asked: "…"` to the row's reasons and
+  re-notifies the same row (`_renotify_new_question`, metric `EscalationRenotified`); a
+  repeat pages nobody.

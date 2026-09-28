@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import enum
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from app.runtime.grounding import GROUNDING_FLOOR
@@ -391,6 +392,52 @@ def is_repeated_question(reply: str, previous_luciel_reply: str | None) -> bool:
         return False
     overlap = len(current & previous) / len(union)
     return overlap >= _REPEATED_QUESTION_OVERLAP
+
+
+# --- distinct unanswered questions (round 7 WP-2 remainder, item 1) ---------------- #
+# The function words every customer question shares; what is left is what the
+# question is ABOUT. "do you do implants?" and "what about implants?" both reduce
+# to {implants}: the same unanswered question, not news for the owner twice.
+_QUESTION_STOPWORDS = frozenset(
+    """a an and any are about at be but can could did do does for from have has how
+    i if in is it its me my of on or please so that the there these this those to
+    tell us was we what when where which who why will with would you your yours
+    just also still again like get got know need want one ones some more much many
+    thanks thank hi hello hey ok okay sure well u ur pls plz""".split()
+)
+# Content-token containment at or above this and the later question is the earlier one
+# in new clothes ("implants??" after "do you do implants?").
+_SAME_QUESTION_CONTAINMENT = 0.6
+
+
+def question_terms(text: str) -> frozenset[str]:
+    """The content tokens of a customer message — words minus the function words."""
+    return frozenset(
+        tok for tok in _WORD_RE.findall((text or "").lower()) if tok not in _QUESTION_STOPWORDS
+    )
+
+
+def is_same_question(text: str, previous: str) -> bool:
+    """True when ``text`` asks what ``previous`` asked: the shared content tokens cover
+    at least ``_SAME_QUESTION_CONTAINMENT`` of the shorter question. A message with
+    no content tokens at all ("hello??") is never a new question."""
+    current, earlier = question_terms(text), question_terms(previous)
+    if not current:
+        return True
+    if not earlier:
+        return False
+    shared = len(current & earlier)
+    return shared / min(len(current), len(earlier)) >= _SAME_QUESTION_CONTAINMENT
+
+
+def is_new_question(text: str, previous_questions: Iterable[str]) -> bool:
+    """A DISTINCT unanswered question (round 7 WP-2 remainder, item 1): the message
+    has content of its own and is unlike every question Luciel already could not
+    answer this session. The orchestrator re-notifies the owner on it; a repeat of
+    an earlier one ("implants??") pages nobody again."""
+    if not question_terms(text):
+        return False
+    return not any(is_same_question(text, earlier) for earlier in previous_questions)
 
 
 def negative_terms(text: str) -> list[str]:
