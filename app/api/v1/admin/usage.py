@@ -19,6 +19,7 @@ appointments-booked / response-time-percentiles / top-knowledge-sources.
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -185,6 +186,104 @@ async def usage_overview(subject: Subject = Depends(current_admin)) -> Analytics
         return out
 
 
+# A payload value is rendered into ``detail`` ONLY when it is code-shaped: a state
+# name, a policy id, a count, an ISO instant. A provider's sentence (a ``status_detail``
+# quoting the carrier, a refresh error naming the mailbox) never matches, so the detail
+# cannot carry a phone number, an address or a token by accident (§3.8.3 / §3.4.11).
+_CODE = re.compile(r"^[A-Za-z0-9_:.+-]{1,64}$")
+
+
+def _code(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and _CODE.fullmatch(value):
+        return value
+    return None
+
+
+def _transition(payload: dict[str, object], *, note_key: str) -> str | None:
+    frm, to = _code(payload, "from"), _code(payload, "to")
+    if frm is None or to is None:
+        return None
+    note = _code(payload, note_key)
+    return f"{frm} → {to}" + (f" ({note})" if note else "")
+
+
+def audit_detail(event_type: str, payload: dict[str, object]) -> str | None:
+    """The one-line, owner-readable detail for an audit row (round 7 WP-5, item 6).
+
+    The log used to surface ``event_type`` alone, so fifty ``lifecycle_transition``
+    rows were indistinguishable and a ``data_retention_hard_delete`` named neither its
+    data class nor its count. Rendered from a per-event ALLOW-LIST of code-shaped
+    values (see ``_CODE``) — never a secret, never a value that is PII; an event type
+    with no renderer has no detail whatever its payload holds."""
+    if event_type == "lifecycle_transition":
+        return _transition(payload, note_key="trigger")
+    if event_type == "dunning_state_changed":
+        return _transition(payload, note_key="reason")
+    if event_type in ("data_retention_hard_delete", "lead_pruned"):
+        policy = _code(payload, "retention_policy_applied")
+        if event_type == "lead_pruned":
+            return f"lead pruned ({policy})" if policy else None
+        data_class = _code(payload, "data_class")
+        if data_class is None:
+            return None
+        count = _code(payload, "count")
+        head = f"{data_class}: {count} deleted" if count is not None else data_class
+        return f"{head} ({policy})" if policy else head
+    if event_type == "payment_method_added":
+        brand = _code(payload, "brand")
+        return f"{brand} card added" if brand else "card added"
+    if event_type == "payment_method_removed":
+        reason = _code(payload, "reason")
+        return f"card removed ({reason})" if reason else "card removed"
+    if event_type == "invoice_paid":
+        return (
+            "billing period advanced"
+            if _code(payload, "reset") == "period_advanced"
+            else "invoice paid"
+        )
+    if event_type == "payment_failed":
+        state = _code(payload, "dunning_state")
+        return f"dunning: {state}" if state else "payment failed"
+    if event_type == "billing_closure_settled":
+        cancelled = payload.get("subscription_cancelled")
+        parts = [
+            "subscription cancelled"
+            if cancelled is True
+            else "no subscription to cancel"
+            if cancelled is None
+            else "subscription cancel failed"
+        ]
+        if payload.get("usage_owed") is True:
+            parts.append("usage owed")
+        error = _code(payload, "error")
+        if error:
+            parts.append(f"error {error}")
+        return ", ".join(parts)
+    if event_type == "billing_period_anchored":
+        frm, to = _code(payload, "from_period_start"), _code(payload, "to_period_start")
+        return f"period anchor {frm} → {to}" if frm and to else None
+    if event_type == "connection_status_changed":
+        action = _code(payload, "action")
+        if action:
+            what = _code(payload, "action_type") or "item"
+            where = _code(payload, "connection_type")
+            return f"{action}: {what}" + (f" on {where}" if where else "")
+        return _transition(
+            {
+                "from": payload.get("old_status"),
+                "to": payload.get("new_status"),
+                "reason": payload.get("reason"),
+            },
+            note_key="reason",
+        )
+    return None
+
+
 @router.get("/audit-log", response_model=list[AuditEventOut])
 async def usage_audit_log(
     limit: int = Query(200, ge=1, le=500),
@@ -193,7 +292,8 @@ async def usage_audit_log(
 ) -> list[AuditEventOut]:
     """Read-only view of the tenant's hash-chained audit log (§5.2), newest first,
     paged (2026-09-05 audit F170). Non-secret: only event metadata is surfaced; no
-    secret material is ever in event_payload (the writers enforce that). The chain
+    secret material is ever in event_payload (the writers enforce that), and ``detail``
+    is rendered by :func:`audit_detail` from code-shaped values only. The chain
     integrity is verifiable via verify_chain."""
     async with tenant_session(subject.admin_id) as s:
         rows = await _audit_rows(s, subject.admin_id, limit=limit, offset=offset)
@@ -203,6 +303,7 @@ async def usage_audit_log(
                     "eventId": str(r.event_id),
                     "eventType": r.event_type,
                     "at": r.created_at,
+                    "detail": audit_detail(r.event_type, r.event_payload or {}),
                     "actorUserId": r.actor_user_id,
                 }
             )

@@ -377,7 +377,7 @@ async def test_auto_prune_audits_by_hashed_id_and_is_idempotent():
         payload = evts[0].event_payload or {}
         assert payload["resolved_lead_id_hash"] == hash_lead_id(stale)
         assert str(stale) not in json.dumps(payload)
-        assert payload["retention_policy"] == "lead_auto_prune:30d"
+        assert payload["retention_policy_applied"] == "lead_auto_prune:30d"
         assert await verify_chain(s, admin) is True
 
 
@@ -688,7 +688,10 @@ async def test_retention_reaps_orphaned_knowledge_originals_and_keeps_owned_ones
             payloads = [e.event_payload or {} for e in evts]
             assert [p_["data_class"] for p_ in payloads] == ["knowledge_original"]
             assert payloads[0]["count"] == 1 and payloads[0]["delete_errors"] == 0
-            assert payloads[0]["retention_policy"] == "orphan_reconcile:no_knowledge_sources_row"
+            assert (
+                payloads[0]["retention_policy_applied"]
+                == "orphan_reconcile:no_knowledge_sources_row"
+            )
             assert await verify_chain(s, admin) is True
 
         # Idempotent: the second pass finds nothing orphaned and writes no audit row.

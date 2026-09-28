@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -112,7 +112,16 @@ async def _log_and_delete(
     model: type[TenantMixin],
     data_class: str,
 ) -> int:
-    """Log a data_retention_hard_delete for the class, then delete its rows."""
+    """Log a data_retention_hard_delete for the class, then delete its rows.
+
+    The count is taken before the delete so the audit row — written BEFORE the rows
+    are gone, as the module docstring promises — can still say how many (round 7
+    WP-5, item 6: the owner-facing log renders ``data_class: N deleted``)."""
+    count = (
+        await session.execute(
+            select(func.count()).select_from(model).where(model.admin_id == admin_id)
+        )
+    ).scalar_one()
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -121,6 +130,7 @@ async def _log_and_delete(
         actor_type=ActorType.platform,
         payload={
             "data_class": data_class,
+            "count": int(count),
             "retention_policy_applied": "luciel_hard_delete_cascade",
         },
     )

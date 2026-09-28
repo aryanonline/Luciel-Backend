@@ -188,7 +188,7 @@ async def prune_audit_log_if_due(
             payload={
                 "data_class": "audit_log",
                 "count": deleted,
-                "retention_policy": f"{AUDIT_RETENTION_DAYS}d",
+                "retention_policy_applied": f"{AUDIT_RETENTION_DAYS}d",
             },
         )
     return deleted
