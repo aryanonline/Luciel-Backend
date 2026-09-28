@@ -57,6 +57,41 @@ _NEXT_STEP: dict[str, str] = {
     ),
 }
 
+#: Round 7 WP-4b (item 4): the two moderation categories that take the conversation
+#: away (D2) are a SAFETY page routed to the human-request contact — never rendered as
+#: "the customer asked to speak to a person". The row names the category in its first
+#: reason (``moderation:self_harm`` / ``moderation:threats_violence``); the dispatcher
+#: also reads it back from the ``content_moderation_event`` the runtime audited.
+SAFETY_CATEGORIES: dict[str, str] = {
+    "self_harm": "a customer may be at risk of self-harm",
+    "threats_violence": "a threat of violence",
+}
+_SAFETY_NEXT_STEP: dict[str, str] = {
+    "self_harm": (
+        "A person must take this over now. Read the conversation and reach the customer "
+        "directly; if they may be in immediate danger, contact local emergency services."
+    ),
+    "threats_violence": (
+        "A person must take this over now. Read the conversation, keep your team safe, "
+        "and involve local authorities if the threat is credible."
+    ),
+}
+_MODERATION_PREFIX = "moderation:"
+
+
+def safety_category_from_reasons(reasons: tuple[str, ...]) -> str | None:
+    """``self_harm`` / ``threats_violence`` when the row's FIRST reason names one."""
+    first = reasons[0] if reasons else ""
+    if not first.startswith(_MODERATION_PREFIX):
+        return None
+    category = first[len(_MODERATION_PREFIX) :].split(":", 1)[0].strip()
+    return category if category in SAFETY_CATEGORIES else None
+
+
+def owner_facing_reasons(reasons: tuple[str, ...]) -> tuple[str, ...]:
+    """The row's reasons minus the ``moderation:`` category token (the label says it)."""
+    return tuple(r for r in reasons if not r.startswith(_MODERATION_PREFIX))
+
 
 @dataclass(frozen=True)
 class EscalationNotification:
@@ -88,6 +123,22 @@ class EscalationNotification:
     # row at send time (round 7 WP-2, item 2): for ``luciel_requested_handoff`` this is
     # the model's own reason, which is the whole point of that page.
     reasons: tuple[str, ...] = ()
+    # Round 7 WP-4b (item 3): the address / number the lead VOLUNTEERED when the
+    # transport key is something else (lead.email / lead.phone) — an SMS caller who
+    # said "email me at …" used to be paged with the number alone.
+    lead_email: str | None = None
+    lead_phone: str | None = None
+    # Item 4: set by the dispatcher when the row is a moderation take-over (self_harm /
+    # threats_violence); ``safety`` below also reads it from the reasons directly.
+    safety_category: str | None = None
+
+    @property
+    def safety(self) -> str | None:
+        return self.safety_category or safety_category_from_reasons(self.reasons)
+
+    @property
+    def safety_label(self) -> str | None:
+        return SAFETY_CATEGORIES.get(self.safety or "")
 
     @property
     def conversation_ref(self) -> str:
@@ -102,6 +153,9 @@ class EscalationNotification:
 
     @property
     def next_step(self) -> str:
+        safety = self.safety
+        if safety is not None:
+            return _SAFETY_NEXT_STEP[safety]
         return _NEXT_STEP.get(self.signal, "Review this conversation and follow up.")
 
 

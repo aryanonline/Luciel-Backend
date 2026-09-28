@@ -186,6 +186,13 @@ class EscalationContactHealthOut(WireModel):
     state: str
     verified_at: datetime | None = None
     last_bounced_at: datetime | None = None
+    # Round 7 WP-4b: SMS contacts and the after-hours contact are reported too.
+    # ``channel`` is email | sms; ``role`` is primary | secondary | after_hours;
+    # ``detail`` names an honest refusal (``sms_channel_not_provisioned``: no number
+    # is connected to send the confirmation code from).
+    channel: str = "email"
+    role: str | None = None
+    detail: str | None = None
 
 
 class TeamWindowWire(WireModel):
@@ -254,9 +261,28 @@ class LucielOut(WireModel):
 
 
 class ResendContactConfirmationRequest(WireModel):
-    """POST /admin/luciel/escalation/resend-confirmation body (round 5B item 13)."""
+    """POST /admin/luciel/escalation/resend-confirmation body (round 5B item 13).
+    ``address`` is an email address or, since round 7 WP-4b, an E.164 number — any
+    currently configured contact, including the after-hours one."""
 
     address: str = Field(min_length=3, max_length=320)
+
+
+class ConfirmSmsContactRequest(StrictWireModel):
+    """POST /admin/luciel/escalation/contacts/confirm-sms body (round 7 WP-4b): the
+    owner types the 6-digit code the contact received."""
+
+    number: str = Field(min_length=3, max_length=32)
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+class ConfirmSmsContactResult(WireModel):
+    """Outcome of a code entry: ``confirmed`` when the number is now proven; otherwise
+    ``wrong_code`` (attempts left), ``locked`` (ask for a new code), ``expired``,
+    ``no_pending`` (no code outstanding) or ``already_confirmed``."""
+
+    outcome: str
+    luciel: LucielOut
 
 
 class ConfirmEscalationContactRequest(WireModel):

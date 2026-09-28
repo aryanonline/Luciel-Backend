@@ -177,6 +177,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "email_contact_bounced",
         "escalation_contact_verification_sent",
         "escalation_contact_verified",
+        # Round 7 WP-4b: a 6-digit SMS confirmation code was entered and refused
+        # (wrong, expired, locked after five wrong entries, or none outstanding).
+        # Payload: channel + number suffix + the outcome — never the code.
+        "escalation_contact_code_rejected",
         "deferred_abandon_emailed",
         # Admin marked a lead's business outcome (Vision §7 conversion; C14).
         "lead_outcome_marked",

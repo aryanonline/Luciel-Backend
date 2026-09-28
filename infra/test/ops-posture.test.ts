@@ -73,6 +73,7 @@ describe("alarms on the app's own metrics and on sweep task failures (F032/F034)
       'SweepTenantFailure',
       'BudgetGateHit',
       'KnowledgeRetrievalDegraded',
+      'EscalationBacklog',
     ]) {
       obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
         Namespace: 'Luciel',
@@ -81,6 +82,24 @@ describe("alarms on the app's own metrics and on sweep task failures (F032/F034)
         Statistic: 'Sum',
       });
     }
+  });
+
+  test('one escalation page left queued by the deferred sweep pages an operator (round 7 WP-4b item 8)', () => {
+    // The sweep emits EscalationBacklog once per hourly run (app/jobs/sweeps.py →
+    // app/notifications/backlog.py), so the period is the sweep cadence and Sum is
+    // the count; a run that never happens is the SweepTask rules' job, not this one.
+    const { obs } = build('dev');
+    obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      Namespace: 'Luciel',
+      MetricName: 'EscalationBacklog',
+      Dimensions: [{ Name: 'Environment', Value: 'dev' }],
+      Statistic: 'Sum',
+      Threshold: 1,
+      Period: 3600,
+      EvaluationPeriods: 1,
+      TreatMissingData: 'notBreaching',
+      AlarmDescription: Match.stringLikeRegexp('escalation_backlog'),
+    });
   });
 
   test('a sweep task that exits non-zero or never starts is an EventBridge event to the topic', () => {

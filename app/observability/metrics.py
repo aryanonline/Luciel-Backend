@@ -15,6 +15,8 @@ ObservabilityStack alarms reference:
                          a turn ran with NO knowledge because the embedding
                          provider failed, or an ingest could not embed
                          (dim: Reason, prefixed ingest: for the latter)
+    EscalationBacklog    escalation pages still queued after the deferred sweep
+                         ran (round 7 WP-4b; app/notifications/backlog.py)
 
 Dimension sets (round 7 WP-8): by default a datum publishes ONE dimension set,
 ``[Environment]`` — the set every ObservabilityStack alarm reads

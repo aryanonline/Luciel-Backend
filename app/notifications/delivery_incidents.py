@@ -127,10 +127,17 @@ async def begin_verification(
     session: AsyncSession, *, admin_id: uuid.UUID, email: str, jti: str, now: datetime | None = None
 ) -> EmailDeliveryIncident:
     """Stash the confirmation link's single-use jti on the address's row."""
+    from app.notifications import contact_confirmation  # noqa: PLC0415
+
     row = await _upsert_row(session, admin_id, email)
     row.verification_pending_jti = jti
     row.verification_sent_at = now or datetime.now(UTC)
     await session.flush()
+    # Round 7 WP-4b: the channel-agnostic table mirrors the link loop so one read
+    # answers "is this contact proven?" for email and SMS alike.
+    await contact_confirmation.note_sent(
+        session, admin_id, contact_confirmation.KIND_EMAIL, email, now=row.verification_sent_at
+    )
     return row
 
 
@@ -149,7 +156,12 @@ async def confirm_verification(
     ).scalar_one_or_none()
     if row is None:
         return None
+    from app.notifications import contact_confirmation  # noqa: PLC0415
+
     row.verification_pending_jti = None
     row.verified_at = datetime.now(UTC)
     await session.flush()
+    await contact_confirmation.mark_confirmed(
+        session, admin_id, contact_confirmation.KIND_EMAIL, row.email_lower, now=row.verified_at
+    )
     return row

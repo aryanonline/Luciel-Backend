@@ -70,34 +70,82 @@ class ContactReply:
     channel: str
     contact_role: str
     body: str
+    # The contact's own number (round 7 WP-4b): what a texted-back confirmation code
+    # is checked against. ``confirmation_code`` is set when the text IS that code.
+    sender: str = ""
+    confirmation_code: str | None = None
 
 
 def _normalize_number(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit() or ch == "+")
 
 
-async def _escalation_contact_role(
-    ctx: InstanceContext, channel: str, customer_identifier: str
-) -> str | None:
-    """'primary' / 'secondary' when the sender is a configured SMS escalation contact."""
+def _configured_sms_contacts(
+    escalation: object, team_availability: object
+) -> list[tuple[str, str]]:
+    """(role, number) for every SMS contact this Luciel pages: the pillar's primary and
+    secondary slots plus the after-hours contact (round 6 WP-E)."""
+    cfg = escalation if isinstance(escalation, dict) else {}
+    out: list[tuple[str, str]] = []
+    for role, key in (("primary", "primarySms"), ("secondary", "secondarySms")):
+        number = cfg.get(key)
+        if isinstance(number, str) and number:
+            out.append((role, number))
+    blob = team_availability if isinstance(team_availability, dict) else {}
+    after_hours = blob.get("afterHours")
+    rule = after_hours.get("escalation") if isinstance(after_hours, dict) else None
+    if isinstance(rule, dict) and rule.get("channel") == "sms":
+        number = rule.get("contactSms")
+        if isinstance(number, str) and number:
+            out.append(("after_hours", number))
+    return out
+
+
+async def _classify_contact_reply(
+    ctx: InstanceContext, channel: str, customer_identifier: str, body: str
+) -> tuple[str, str | None] | None:
+    """(role, confirmation_code) when this text is a configured SMS escalation contact
+    WRITING BACK — otherwise None and the text is a customer message like any other.
+
+    Being a configured number is not enough (round 7 WP-4b, item 5): a manager who
+    texts the business from their own phone on a Tuesday is a customer, and dropping
+    their message on the floor was a silent loss. A text correlates as a reply when it
+    carries the 6-digit code that number still owes (item 1), or when that number was
+    paged inside the last 24 hours."""
     # Texts only: a contact CALLING the tenant's line is a caller like any other (the
     # voice route answers or declines on its own gates); a TEXT from the contact's
     # number is the reply to the escalation page.
     if channel != "sms" or not customer_identifier:
         return None
     from app.models.instance import Instance  # noqa: PLC0415
+    from app.notifications import contact_confirmation  # noqa: PLC0415
 
-    async with tenant_session(ctx.admin_id) as s:
-        cfg = (
-            await s.execute(select(Instance.escalation).where(Instance.id == ctx.instance_id))
-        ).scalar_one_or_none()
-    if not isinstance(cfg, dict):
-        return None
     sender = _normalize_number(customer_identifier)
-    for role, key in (("primary", "primarySms"), ("secondary", "secondarySms")):
-        number = cfg.get(key)
-        if isinstance(number, str) and number and _normalize_number(number) == sender:
-            return role
+    async with tenant_session(ctx.admin_id) as s:
+        row = (
+            await s.execute(
+                select(Instance.escalation, Instance.team_availability).where(
+                    Instance.id == ctx.instance_id
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        role = next(
+            (
+                role
+                for role, number in _configured_sms_contacts(row[0], row[1])
+                if _normalize_number(number) == sender
+            ),
+            None,
+        )
+        if role is None:
+            return None
+        code = contact_confirmation.extract_code(body)
+        if code and await contact_confirmation.code_outstanding(s, ctx.admin_id, sender):
+            return role, code
+        if await contact_confirmation.recent_page_to_number(s, ctx.admin_id, sender):
+            return role, None
     return None
 
 
@@ -120,15 +168,21 @@ async def ingest(
     source_id = msg.customer_identifier or request.get("source_ip", "unknown")
 
     # 2a. The tenant's own escalation contact writing back on the tenant's number
-    # (audit F051): the owner's side of an escalation, never a lead.
-    contact_role = await _escalation_contact_role(ctx, adapter.channel_id, msg.customer_identifier)
-    if contact_role is not None:
+    # (audit F051): the owner's side of an escalation, never a lead — when it
+    # correlates with a page or carries the number's confirmation code (WP-4b item 5).
+    contact_reply = await _classify_contact_reply(
+        ctx, adapter.channel_id, msg.customer_identifier, msg.body
+    )
+    if contact_reply is not None:
+        contact_role, confirmation_code = contact_reply
         return ContactReply(
             admin_id=ctx.admin_id,
             instance_id=ctx.instance_id,
             channel=adapter.channel_id,
             contact_role=contact_role,
             body=msg.body,
+            sender=msg.customer_identifier,
+            confirmation_code=confirmation_code,
         )
 
     # 2b. Opt-out / help keyword handling (§3.1.6) BEFORE the orchestrator/LLM. The

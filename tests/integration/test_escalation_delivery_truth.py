@@ -11,9 +11,11 @@ refusal does, and ``/healthz`` carries the backlog.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from app.connections import deferred_queue
 from app.db.session import tenant_session
@@ -24,6 +26,7 @@ from app.models.email_incident import EmailDeliveryIncident
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead
 from app.notifications import email_notifier, escalation_dispatch
+from app.notifications.backlog import DEFERRED_SWEEP_INTERVAL
 from app.notifications.escalation_dispatch import (
     ESCALATION_RETRY_ACTION,
     notify_escalation_safely,
@@ -31,7 +34,7 @@ from app.notifications.escalation_dispatch import (
 )
 from app.runtime.integration_status import escalation_backlog
 from app.runtime.orchestrator import _record_escalation
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -370,3 +373,158 @@ async def test_the_backlog_counts_queued_retries_and_terminal_misses(ses):
     assert backlog is not None
     assert backlog["queued"] >= 1
     assert backlog["failed24h"] >= 1
+
+
+# --- round 7 WP-4b item 7: the ladder and the queue never page the owner twice ------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rung_that_reaches_the_owner_repoints_the_queued_item_to_the_contact(
+    ses, monkeypatch
+):
+    """Everything refused on the turn: queued (owner included) + ladder scheduled. The
+    provider recovers for the OWNER only before the first rung, so the rung's fallback
+    lands. The queued item was filed for everyone; left alone, the hourly sweep would
+    page the owner a second time for the same escalation. The rung re-points it to the
+    configured contact alone, and the replay pages only the contact."""
+    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (0.25,))
+    ses.refuse = None
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid)
+
+    await _fire(admin, iid, sid, lead)
+    assert (await _row(admin, sid)).delivery_status == "queued"
+    (item,) = await _queued(admin)
+    assert item.payload["contacts_only"] is False
+
+    ses.refuse = {CONTACT}  # the owner is reachable again; the contact still is not
+    await escalation_dispatch.drain_background_retries()
+
+    assert ses.sent == [OWNER_EMAIL]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    (item,) = await _queued(admin)
+    assert item.payload["contacts_only"] is True
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
+
+    ses.refuse = set()
+    async with tenant_session(admin) as s:
+        assert (
+            await replay_queued_notification(
+                s, item.payload, admin_id=admin, instance_id=iid, resolved_lead_id=lead
+            )
+            is True
+        )
+    assert ses.sent == [OWNER_EMAIL, CONTACT]
+    assert (await _row(admin, sid)).delivery_status == "delivered"
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_replay_stands_down_from_the_owner_when_the_row_already_reads_owner_fallback(
+    ses,
+):
+    """The other half: whatever the queued item says, a row that reads owner_fallback
+    means the owner heard. The replay is for the configured contact alone, and while
+    the contact stays refused the owner is not paged again."""
+    ses.refuse = {CONTACT}
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid)
+
+    await _fire(admin, iid, sid, lead)
+    assert ses.sent == [OWNER_EMAIL]
+    assert (await _row(admin, sid)).delivery_status == "owner_fallback"
+    (item,) = await _queued(admin)
+
+    stale_payload = {**item.payload, "contacts_only": False}  # an item filed before the fix
+    async with tenant_session(admin) as s:
+        assert (
+            await replay_queued_notification(
+                s, stale_payload, admin_id=admin, instance_id=iid, resolved_lead_id=lead
+            )
+            is False
+        )
+    assert ses.sent == [OWNER_EMAIL]  # the contact was tried and refused; nobody else
+    assert (await _row(admin, sid)).delivery_status == "owner_fallback"
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1
+
+
+# --- round 7 WP-4b item 8: a backlog that outlives a sweep is degraded, and alarms --- #
+async def _queue_one_unheard_page(admin: uuid.UUID, iid: uuid.UUID) -> DeferredAction:
+    """One escalation nobody could hear: the owner is suppressed and SES refuses the
+    contact, so the page lands in the deferred queue."""
+    lead = await _seed(admin, iid, owner_suppressed=True)
+    await _fire(admin, iid, uuid.uuid4(), lead)
+    (item,) = await _queued(admin)
+    return item
+
+
+async def _backdate_queue(admin: uuid.UUID, *, by: timedelta) -> None:
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(DeferredAction)
+            .where(DeferredAction.admin_id == admin)
+            .values(created_at=datetime.now(UTC) - by)
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_backlog_carries_the_persisted_moment_it_began(ses):
+    """``oldestQueuedAt`` is the queue's own oldest row (migration 0069), read through
+    the SECURITY DEFINER function — no process keeps a clock."""
+    ses.refuse = None
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    item = await _queue_one_unheard_page(admin, iid)
+
+    backlog = await escalation_backlog()
+    assert backlog is not None
+    assert backlog["queued"] == 1
+    assert backlog["oldestQueuedAt"] == item.created_at
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_healthz_degrades_once_the_backlog_outlives_one_sweep_interval(ses):
+    """Young, the page is a number outside ``degraded`` (the sweep has not had its
+    turn); older than the deferred sweep's cadence it is ``escalation_backlog:1`` IN
+    ``degraded`` — the list deploys and operators read."""
+    from app.main import create_app
+
+    ses.refuse = None
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    await _queue_one_unheard_page(admin, iid)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://healthz.test") as client:
+        young = (await client.get("/healthz")).json()
+        assert young["status"] == "ok"
+        assert young["escalationBacklog"]["queued"] == 1
+        assert not [e for e in young["degraded"] if e.startswith("escalation_backlog:")]
+
+        await _backdate_queue(admin, by=DEFERRED_SWEEP_INTERVAL + timedelta(minutes=5))
+
+        stale = (await client.get("/healthz")).json()
+        assert "escalation_backlog:1" in stale["degraded"]
+        assert stale["escalationBacklog"]["queued"] == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_deferred_sweep_publishes_the_backlog_it_left_behind(ses, capsys):
+    """The EscalationBacklog datum the ObservabilityStack alarm reads is emitted AFTER
+    the drain, so it counts what this run could not deliver: SES still refuses, the
+    retry fails again, the page stays queued and the datum says 1."""
+    from app.jobs import sweeps
+
+    ses.refuse = None
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    item = await _queue_one_unheard_page(admin, iid)
+
+    acted = await sweeps.run_deferred_retry(now=item.next_attempt_at + timedelta(seconds=1))
+
+    assert acted == [str(admin)]  # the retry ran for this tenant ...
+    (still_queued,) = await _queued(admin)
+    assert still_queued.status == "queued" and still_queued.attempts == item.attempts + 1
+    data = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if "EscalationBacklog" in line
+    ]
+    assert data and data[-1]["EscalationBacklog"] == 1.0  # ... and the datum names the miss
+    assert data[-1]["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [["Environment"]]

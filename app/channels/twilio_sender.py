@@ -88,6 +88,11 @@ class TwilioSmsSender:
     api_key_sid: str = ""
     api_key_secret: str = ""
     auth_token: str = ""
+    # Round 7 WP-4b: an absolute URL Twilio posts each message's delivery receipt to
+    # (``MessageStatus`` delivered/failed/undelivered). Set by the notification leg only
+    # — a page's ``delivered`` must come from the carrier, not from the API accepting
+    # the request. None keeps the send byte-identical.
+    status_callback: str | None = None
     _client: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -115,10 +120,13 @@ class TwilioSmsSender:
         import asyncio  # noqa: PLC0415
 
         client = self._get_client()
+        extra: dict[str, str] = {}
+        if self.status_callback:
+            extra["status_callback"] = self.status_callback
         # The Twilio REST client is synchronous: off the event loop (round 7 WP-2,
         # item 5), like the tenant webhook configurator already is.
         msg = await asyncio.to_thread(
-            lambda: client.messages.create(from_=from_number, to=to, body=body)  # type: ignore[attr-defined]
+            lambda: client.messages.create(from_=from_number, to=to, body=body, **extra)  # type: ignore[attr-defined]
         )
         return str(getattr(msg, "sid", "")) or None
 

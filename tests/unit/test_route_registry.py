@@ -119,6 +119,11 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/admin/luciel/escalation/resend-confirmation"),
         # 2026-09-05 audit F084: prove an SMS escalation contact can receive a text.
         ("POST", "/api/v1/admin/luciel/escalation/test-sms"),
+        # Round 7 WP-4b: the owner enters the 6-digit code an SMS contact received;
+        # and Twilio's delivery receipt for an owner-notification text, so a page's
+        # ``delivered`` comes from the carrier, not from the API accepting it.
+        ("POST", "/api/v1/admin/luciel/escalation/contacts/confirm-sms"),
+        ("POST", "/api/v1/webhooks/twilio/notifications/status"),
         ("POST", "/api/v1/admin/connections/email/reverify"),
         # Uniform connection lifecycle + pluggable providers (Decisions #5/#6): every
         # connection type is connect / disconnect / switch-able through these three.

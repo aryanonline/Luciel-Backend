@@ -184,13 +184,17 @@ def log_resolved_bindings() -> None:
     logger.info("integration_mode=%s degraded_bindings=%s", mode, ", ".join(degraded) or "none")
 
 
-async def escalation_backlog() -> dict[str, int] | None:
+async def escalation_backlog() -> dict[str, object] | None:
     """Escalation notifications nobody has heard yet, platform-wide (audit F079).
 
     ``queued`` — retries the deferred queue still owns; ``failed24h`` — terminal misses
-    in the last day. Read through the SECURITY DEFINER ``platform_escalation_backlog()``
-    (migration 0057) so the app role never gains cross-tenant SELECT. ``None`` when the
-    count could not be taken — an unknown backlog is reported as unknown, never as 0.
+    in the last day; ``oldestQueuedAt`` — when the oldest still-queued retry was queued
+    (round 7 WP-4b item 8, migration 0069): the persisted moment the current backlog
+    began, so ``/healthz`` can say a backlog has outlived a sweep interval without a
+    per-process clock (``app.notifications.backlog.degraded_entry``). Read through the
+    SECURITY DEFINER ``platform_escalation_backlog()`` (migration 0057) so the app role
+    never gains cross-tenant SELECT. ``None`` when the count could not be taken — an
+    unknown backlog is reported as unknown, never as 0.
     """
     from sqlalchemy import text  # noqa: PLC0415
 
@@ -200,10 +204,13 @@ async def escalation_backlog() -> dict[str, int] | None:
         async with untenanted_session() as s:
             row = (
                 await s.execute(
-                    text("SELECT queued, failed_24h FROM platform_escalation_backlog()")
+                    text(
+                        "SELECT queued, failed_24h, oldest_queued_at "
+                        "FROM platform_escalation_backlog()"
+                    )
                 )
             ).one()
     except Exception:  # noqa: BLE001 — health must not raise
         logger.warning("escalation backlog could not be read", exc_info=True)
         return None
-    return {"queued": int(row[0] or 0), "failed24h": int(row[1] or 0)}
+    return {"queued": int(row[0] or 0), "failed24h": int(row[1] or 0), "oldestQueuedAt": row[2]}
