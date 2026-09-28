@@ -27,7 +27,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0070_knowledge_answer_flags"
-down_revision: str | None = "0065_embedding_verification"
+down_revision: str | None = "0069_sms_contact_confirmation"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 

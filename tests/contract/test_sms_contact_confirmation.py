@@ -296,7 +296,7 @@ async def test_the_after_hours_number_is_proven_like_any_other_contact(client, t
     assert r.status_code == 200, r.text
     assert len(twilio) == 1
     assert twilio[0]["from_number"] == BYO_NUMBER and twilio[0]["to"] == AFTER_HOURS
-    code = _code_in(twilio[0]["body"])
+    assert _code_in(twilio[0]["body"])
     health = _health(r.json(), AFTER_HOURS)
     assert health["role"] == "after_hours" and health["channel"] == "sms"
     assert health["state"] == "pending_confirmation"
