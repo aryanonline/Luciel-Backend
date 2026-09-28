@@ -19,6 +19,8 @@ pytestmark = [pytest.mark.asyncio]
 
 class _Resp:
     text = "<html><body>Pricing: from $10</body></html>"
+    status_code = 200
+    headers: dict[str, str] = {}
 
     def raise_for_status(self) -> None:
         return None
@@ -45,16 +47,18 @@ async def test_the_crawl_connects_to_the_validated_address_with_the_name_as_host
     monkeypatch,
 ):
     _Client.calls = []
-    monkeypatch.setattr(sandbox, "_resolve_ips", lambda host: ["203.0.113.9"])
+    monkeypatch.setattr(sandbox, "_resolve_ips", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
     provider = WebsiteCrawlProvider(urls=["https://acme.example/pricing"])
     body = await provider._fetch_one("https://acme.example/pricing")
     assert "Pricing" in body
     assert _Client.calls == [
         {
-            "url": "https://203.0.113.9/pricing",
-            "headers": {"Host": "acme.example"},
+            "url": "https://93.184.216.34/pricing",
+            "headers": {"Host": "acme.example", "User-Agent": providers.CRAWL_USER_AGENT},
             "extensions": {"sni_hostname": "acme.example"},
+            # Redirects are followed by hand so every hop is re-pinned (WP-4c #1).
+            "follow_redirects": False,
         }
     ]
 

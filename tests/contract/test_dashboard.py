@@ -117,6 +117,49 @@ async def test_messages_and_nested_evidence(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_answer_flag_survives_a_reload(client):
+    """Round 7 WP-4c #8: the flag was audit-only and the evidence read returned a
+    constant False — flag, reload, unflagged. Now persisted on the row (0070)."""
+    admin = await _signup_verify_login(client)
+    _iid, sid, mid = await _seed_conversation(admin)
+    evidence = f"/api/v1/dashboard/conversations/{sid}/messages/{mid}/evidence"
+    assert (await client.get(evidence)).json()["flaggedByAdmin"] is False
+
+    rf = await client.post(f"/api/v1/dashboard/conversations/{sid}/messages/{mid}/flag")
+    assert rf.status_code == 204
+    assert (await client.get(evidence)).json()["flaggedByAdmin"] is True
+
+    async with tenant_session(admin) as s:
+        row = (await s.execute(select(Transcript).where(Transcript.id == mid))).scalar_one()
+        first = row.flagged_by_admin_at
+        assert first is not None
+    # Flagging again is harmless and keeps the first timestamp.
+    assert (
+        await client.post(f"/api/v1/dashboard/conversations/{sid}/messages/{mid}/flag")
+    ).status_code == 204
+    assert (await client.get(evidence)).json()["flaggedByAdmin"] is True
+    async with tenant_session(admin) as s:
+        row = (await s.execute(select(Transcript).where(Transcript.id == mid))).scalar_one()
+        assert row.flagged_by_admin_at == first
+    # A different message in the same session is not flagged by association.
+    other = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=other,
+                admin_id=admin,
+                instance_id=_iid,
+                session_id=sid,
+                role="luciel",
+                text="Another answer",
+            )
+        )
+    assert (
+        await client.get(f"/api/v1/dashboard/conversations/{sid}/messages/{other}/evidence")
+    ).json()["flaggedByAdmin"] is False
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_evidence_deterministic_row_is_not_applicable_not_legacy(client):
     """#5c (live-caught 2026-08-23): a fresh greeting/at-cap/ack row is composed in
     code — scoring never applied to it. It used to serve not_scored_legacy and the

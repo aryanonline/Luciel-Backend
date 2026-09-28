@@ -50,6 +50,19 @@ class KnowledgeChunkOut(WireModel):
     text: str
 
 
+class KnowledgeChunkPageOut(WireModel):
+    """GET /sources/{id}/chunks — the first page of a source's chunks WITH the count.
+
+    Round 7 WP-4c #6: the route returned the default page (20 rows) and nothing else,
+    so the raw view printed "first N of <page length>" — a source with 300 chunks read
+    "first 20 of 20". ``total_chunks`` is the real count; ``page_size`` is the page the
+    ``chunks`` list is bounded by (the route does not page further yet)."""
+
+    chunks: list[KnowledgeChunkOut]
+    total_chunks: int
+    page_size: int
+
+
 class KnowledgeQuotaOut(WireModel):
     used_bytes: int
     total_bytes: int

@@ -49,6 +49,7 @@ from app.models.knowledge import KnowledgeSource
 from app.schemas_api.knowledge import (
     CreateSyncConnectionRequest,
     KnowledgeChunkOut,
+    KnowledgeChunkPageOut,
     KnowledgeQuotaOut,
     KnowledgeScopeOut,
     KnowledgeSourceOut,
@@ -147,20 +148,31 @@ async def list_sources(subject: Subject = Depends(current_admin)) -> list[Knowle
         return [_source_out(x, used.get(x.id, 0)) for x in sources]
 
 
-@router.get("/sources/{source_id}/chunks", response_model=list[KnowledgeChunkOut])
+@router.get("/sources/{source_id}/chunks", response_model=KnowledgeChunkPageOut)
 async def get_chunks(
     source_id: uuid.UUID, subject: Subject = Depends(current_admin)
-) -> list[KnowledgeChunkOut]:
+) -> KnowledgeChunkPageOut:
+    """The first page of a source's chunks plus the honest total (round 7 WP-4c #6).
+
+    The list alone made the raw view print "first 20 of 20" for a source with 300
+    chunks — the page length was standing in for the count."""
     async with tenant_session(subject.admin_id) as s:
         # view_chunks emits the knowledge_source_viewed audit event (Architecture
         # §3.2.2 "view + edit + delete history flows into admin_audit_log"; Axis4-F04).
-        chunks = await service.view_chunks(s, subject.admin_id, source_id, subject.user_id)
-        return [
-            KnowledgeChunkOut.model_validate(
-                {"chunkId": c.id, "sourceId": c.source_id, "ordinal": c.ordinal, "text": c.text}
-            )
-            for c in chunks
-        ]
+        chunks = await service.view_chunks(
+            s, subject.admin_id, source_id, subject.user_id, limit=service.CHUNK_PREVIEW_PAGE
+        )
+        total = await service.count_chunks(s, subject.admin_id, source_id)
+        return KnowledgeChunkPageOut(
+            chunks=[
+                KnowledgeChunkOut.model_validate(
+                    {"chunkId": c.id, "sourceId": c.source_id, "ordinal": c.ordinal, "text": c.text}
+                )
+                for c in chunks
+            ],
+            total_chunks=total,
+            page_size=service.CHUNK_PREVIEW_PAGE,
+        )
 
 
 @router.get("/quota", response_model=KnowledgeQuotaOut)
@@ -188,11 +200,56 @@ async def restore_source(
 ) -> KnowledgeSourceOut:
     """Undo a delete inside its 30-day window (§3.2.2, audit F109)."""
     async with tenant_session(subject.admin_id) as s:
-        src = await service.restore_source(s, subject.admin_id, source_id, subject.user_id)
+        try:
+            src = await service.restore_source(s, subject.admin_id, source_id, subject.user_id)
+        except service.RemovedAtOrigin as exc:
+            # Round 7 WP-4c #9: the sync found this item gone at its origin. That is
+            # not the owner's mis-click and the content is no longer at the source,
+            # so nothing here can bring it back — say so, not "not in its window".
+            gone = exc.source
+            raise conflict(
+                f"{gone.name} was removed at its sync source "
+                f"({gone.source_origin or gone.origin}) and cannot be restored here. "
+                "Re-add it at the source and sync again."
+            ) from exc
         if src is None:
             raise not_found("Nothing to restore: the source is not in its undo window.")
         used = await _used_by_questions_7d(s, subject.admin_id)
         return _source_out(src, used.get(src.id, 0))
+
+
+_DEAD_CREDENTIAL_DETAIL = "knowledge sync could not use the stored credential — reconnect"
+
+
+async def _flag_dead_credential(admin_id: uuid.UUID, connection_id: uuid.UUID) -> None:
+    """Bookkeeping for a grant the provider just refused (round 7 WP-4c #7), in its
+    OWN transaction.
+
+    The manual routes used to pause the sources inside the request's
+    ``tenant_session`` and then raise the 409 — which rolled that transaction back,
+    so even the pause was lost — and never touched the connection row, so the
+    Configure page kept a green "Connected" chip on a dead credential. The sweep
+    does both halves (round 5B item 12: pause + ``mark_connection_broken`` → audit +
+    once-per-incident attention email); the routes now do the same, before the 409.
+    A row the owner never connected (unconfigured / pending) is paused but NOT
+    flipped: "error" would claim a grant it never had.
+    """
+    from app.connections.health import mark_connection_broken  # noqa: PLC0415
+
+    async with tenant_session(admin_id) as s:
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if conn is None:
+            return
+        await sync.pause_sync_on_revocation(s, admin_id=admin_id, connection_id=connection_id)
+        if conn.status == "connected":
+            await mark_connection_broken(s, conn, detail=_DEAD_CREDENTIAL_DETAIL)
 
 
 @router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
@@ -208,54 +265,10 @@ async def resync_source(
     identically to the scheduled sync worker. For a one-time source (upload/paste/
     csv, no connection_id) this is a no-op refresh: there's nothing to re-pull.
     """
-    async with tenant_session(subject.admin_id) as s:
-        src = (
-            await s.execute(
-                select(KnowledgeSource).where(
-                    KnowledgeSource.admin_id == subject.admin_id,
-                    KnowledgeSource.id == source_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if src is None:
-            raise not_found("Source not found.")
-        if src.connection_id is not None:
-            conn = (
-                await s.execute(
-                    select(InstanceConnection).where(
-                        InstanceConnection.admin_id == subject.admin_id,
-                        InstanceConnection.connection_id == src.connection_id,
-                    )
-                )
-            ).scalar_one_or_none()
-            if conn is None:
-                raise not_found("Connection not found.")
-            provider = provider_for_connection(conn, get_secret_store())
-            try:
-                await sync.sync_connection(
-                    s,
-                    admin_id=subject.admin_id,
-                    instance_id=src.instance_id,
-                    connection_id=conn.connection_id,
-                    origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                    provider=provider,
-                    allow_shrink=confirm_shrink,
-                )
-            except sync.SnapshotShrunk as exc:
-                # Nothing was deleted (F107); the owner confirms with ?confirmShrink=true.
-                raise conflict(
-                    f"The source now reports {exc.remote} item(s) where {exc.existing} are "
-                    "synced, so nothing was removed. If you did remove them at the source, "
-                    "sync again and confirm the shrink."
-                ) from exc
-            except ProviderUnavailable as exc:
-                # Same clean-error rule as trigger_sync: a revoked/expired/never-
-                # connected credential surfaces a structured 409, never a crash.
-                await sync.pause_sync_on_revocation(
-                    s, admin_id=subject.admin_id, connection_id=conn.connection_id
-                )
-                raise conflict(f"Sync unavailable: {exc}") from exc
-            refreshed = (
+    dead_connection: uuid.UUID | None = None
+    try:
+        async with tenant_session(subject.admin_id) as s:
+            src = (
                 await s.execute(
                     select(KnowledgeSource).where(
                         KnowledgeSource.admin_id == subject.admin_id,
@@ -263,13 +276,61 @@ async def resync_source(
                     )
                 )
             ).scalar_one_or_none()
-            if refreshed is None:
-                # The source itself was removed by the sync (deleted at origin) —
-                # honest 404 rather than fabricating a stale response (§3.2.3).
-                raise not_found("Source no longer exists at the sync origin.")
-            return _source_out(refreshed)
-        # One-time ingest: no connector to re-pull from; nothing to do.
-        return _source_out(src)
+            if src is None:
+                raise not_found("Source not found.")
+            if src.connection_id is not None:
+                conn = (
+                    await s.execute(
+                        select(InstanceConnection).where(
+                            InstanceConnection.admin_id == subject.admin_id,
+                            InstanceConnection.connection_id == src.connection_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if conn is None:
+                    raise not_found("Connection not found.")
+                dead_connection = conn.connection_id
+                provider = provider_for_connection(conn, get_secret_store())
+                try:
+                    await sync.sync_connection(
+                        s,
+                        admin_id=subject.admin_id,
+                        instance_id=src.instance_id,
+                        connection_id=conn.connection_id,
+                        origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
+                        provider=provider,
+                        allow_shrink=confirm_shrink,
+                    )
+                except sync.SnapshotShrunk as exc:
+                    # Nothing was deleted (F107); the owner confirms with ?confirmShrink=true.
+                    raise conflict(
+                        f"The source now reports {exc.remote} item(s) where {exc.existing} are "
+                        "synced, so nothing was removed. If you did remove them at the source, "
+                        "sync again and confirm the shrink."
+                    ) from exc
+                refreshed = (
+                    await s.execute(
+                        select(KnowledgeSource).where(
+                            KnowledgeSource.admin_id == subject.admin_id,
+                            KnowledgeSource.id == source_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if refreshed is None:
+                    # The source itself was removed by the sync (deleted at origin) —
+                    # honest 404 rather than fabricating a stale response (§3.2.3).
+                    raise not_found("Source no longer exists at the sync origin.")
+                return _source_out(refreshed)
+            # One-time ingest: no connector to re-pull from; nothing to do.
+            return _source_out(src)
+    except ProviderUnavailable as exc:
+        # Same clean-error rule as trigger_sync: a revoked/expired/never-connected
+        # credential surfaces a structured 409, never a crash. Caught OUTSIDE the
+        # request transaction (which the 409 unwinds) so the pause + the honest
+        # connection state land in their own (round 7 WP-4c #7).
+        if dead_connection is not None:
+            await _flag_dead_credential(subject.admin_id, dead_connection)
+        raise conflict(f"Sync unavailable: {exc}") from exc
 
 
 @router.put("/sources/{source_id}", response_model=KnowledgeSourceOut)
@@ -536,66 +597,65 @@ async def trigger_sync(
     re-sync ... always available for immediacy"). Reconciles the FULL connected
     scope through the connection's real ``SyncProvider`` — additions, changed-
     revision updates, and source-side deletions all propagate in one call."""
-    async with tenant_session(subject.admin_id) as s:
-        conn = (
-            await s.execute(
-                select(InstanceConnection).where(
-                    InstanceConnection.admin_id == subject.admin_id,
-                    InstanceConnection.connection_id == connection_id,
-                    InstanceConnection.connection_type == "knowledge_source",
+    try:
+        async with tenant_session(subject.admin_id) as s:
+            conn = (
+                await s.execute(
+                    select(InstanceConnection).where(
+                        InstanceConnection.admin_id == subject.admin_id,
+                        InstanceConnection.connection_id == connection_id,
+                        InstanceConnection.connection_type == "knowledge_source",
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        if conn is None:
-            raise not_found("Sync connection not found.")
-        if conn.status == "revoked":
-            raise conflict("Connection is revoked; reconnect before syncing.")
-        instance_id = await _instance_id(s, subject.admin_id)
-        # Round 5B item 12: refresh at call time — the manual Re-sync button ran
-        # on the raw stored token and failed on an hour-old Google token, landing
-        # the sources in a silent pause.
-        from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+            ).scalar_one_or_none()
+            if conn is None:
+                raise not_found("Sync connection not found.")
+            if conn.status == "revoked":
+                raise conflict("Connection is revoked; reconnect before syncing.")
+            instance_id = await _instance_id(s, subject.admin_id)
+            # Round 5B item 12: refresh at call time — the manual Re-sync button ran
+            # on the raw stored token and failed on an hour-old Google token, landing
+            # the sources in a silent pause.
+            from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
 
-        await ensure_fresh_access_token(
-            s,
-            subject.admin_id,
-            instance_id,
-            connection_type="knowledge_source",
-            connection_id=conn.connection_id,
-        )
-        provider = provider_for_connection(conn, get_secret_store())
-        try:
-            result = await sync.sync_connection(
+            await ensure_fresh_access_token(
                 s,
-                admin_id=subject.admin_id,
-                instance_id=instance_id,
+                subject.admin_id,
+                instance_id,
+                connection_type="knowledge_source",
                 connection_id=conn.connection_id,
-                origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                provider=provider,
-                allow_shrink=confirm_shrink,
             )
-        except sync.SnapshotShrunk as exc:
-            # Nothing was deleted (F107). The owner confirms an intentional shrink
-            # by re-syncing with ?confirmShrink=true — the frontend offers exactly that.
-            raise conflict(
-                f"The source now reports {exc.remote} item(s) where {exc.existing} are "
-                "synced, so nothing was removed. If you did remove them at the source, "
-                "sync again and confirm the shrink."
-            ) from exc
-        except ProviderUnavailable as exc:
-            # No token on file (never connected / revoked / expired) or the
-            # provider's live call isn't reachable in this posture: surface a
-            # clean, structured error — never a 500 crash (§3.2.3 "never
-            # fabricate freshness"). Flag the connection itself so the raw
-            # knowledge view shows the honest state rather than silently
-            # reporting an empty sync result.
-            await sync.pause_sync_on_revocation(
-                s, admin_id=subject.admin_id, connection_id=conn.connection_id
+            provider = provider_for_connection(conn, get_secret_store())
+            try:
+                result = await sync.sync_connection(
+                    s,
+                    admin_id=subject.admin_id,
+                    instance_id=instance_id,
+                    connection_id=conn.connection_id,
+                    origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
+                    provider=provider,
+                    allow_shrink=confirm_shrink,
+                )
+            except sync.SnapshotShrunk as exc:
+                # Nothing was deleted (F107). The owner confirms an intentional shrink
+                # by re-syncing with ?confirmShrink=true — the frontend offers exactly that.
+                raise conflict(
+                    f"The source now reports {exc.remote} item(s) where {exc.existing} are "
+                    "synced, so nothing was removed. If you did remove them at the source, "
+                    "sync again and confirm the shrink."
+                ) from exc
+            return SyncResultOut.model_validate(
+                {"added": result.added, "updated": result.updated, "removed": result.removed}
             )
-            raise conflict(f"Sync unavailable: {exc}") from exc
-        return SyncResultOut.model_validate(
-            {"added": result.added, "updated": result.updated, "removed": result.removed}
-        )
+    except ProviderUnavailable as exc:
+        # No token on file (never connected / revoked / expired) or the provider's
+        # live call isn't reachable in this posture: surface a clean, structured
+        # error — never a 500 crash (§3.2.3 "never fabricate freshness"). The pause
+        # and the honest connection state are written in their OWN transaction,
+        # outside the request's (which this 409 unwinds) — round 7 WP-4c #7: the
+        # Configure chip stayed green on a credential the provider had refused.
+        await _flag_dead_credential(subject.admin_id, connection_id)
+        raise conflict(f"Sync unavailable: {exc}") from exc
 
 
 # --- knowledge SCOPE selection (Decision #9) ------------------------------------ #

@@ -34,14 +34,17 @@ WEBHOOK_TIMEOUT_SECONDS = 10  # Ratified §9 #10
 CIRCUIT_FAILURE_THRESHOLD = 5  # Ratified §9 #11
 CIRCUIT_COOLDOWN_SECONDS = 300
 
+# Ranges the ``ipaddress`` predicates below do NOT classify as non-public on their own
+# (round 7 WP-4c #4). The former hand-written list missed 0.0.0.0/8, fc00::/7,
+# 100.64.0.0/10 and 198.18.0.0/15 — a crawl target resolving into carrier-grade NAT
+# space or the benchmarking range reached the socket. The predicates cover the
+# RFC 1918 / loopback / link-local / multicast / reserved / unspecified / ULA /
+# documentation classes from the IANA special-purpose registries; these two are the
+# ones the registry files as "not global" without also filing them as private.
 _BLOCKED_NETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),  # link-local incl. 169.254.169.254 (metadata)
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("100.64.0.0/10"),  # shared address space (CGNAT), RFC 6598
+    ipaddress.ip_network("198.18.0.0/15"),  # benchmarking, RFC 2544
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix embeds a v4 address
 ]
 
 
@@ -54,9 +57,44 @@ def _resolve_ips(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+def _embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address an IPv6 answer carries inside it (::ffff:a.b.c.d, NAT64,
+    6to4), so the v4 classes are checked on the address a connect would reach."""
+    mapped = addr.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    if addr.sixtofour is not None:
+        return addr.sixtofour
+    if addr in _BLOCKED_NETS[2]:
+        return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+    return None
+
+
 def _is_blocked_address(ip: str) -> bool:
+    """True for any address a tenant-supplied URL must never make this process connect
+    to: every non-public class the ``ipaddress`` module knows (private, reserved,
+    loopback, link-local incl. the task-metadata endpoint, unspecified, multicast,
+    documentation) plus the explicit CGNAT / benchmarking / NAT64 ranges."""
     addr = ipaddress.ip_address(ip)
-    return any(addr.version == net.version and addr in net for net in _BLOCKED_NETS)
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(addr)
+        if embedded is not None:
+            candidates.append(embedded)
+    for candidate in candidates:
+        if (
+            candidate.is_private
+            or candidate.is_reserved
+            or candidate.is_loopback
+            or candidate.is_link_local
+            or candidate.is_unspecified
+            or candidate.is_multicast
+            or not candidate.is_global
+        ):
+            return True
+        if any(candidate.version == net.version and candidate in net for net in _BLOCKED_NETS):
+            return True
+    return False
 
 
 def pin_public_target(url: str) -> tuple[str, str]:
@@ -114,12 +152,7 @@ def resolves_to_public_host(url: str) -> bool:
         return False
     if not ips:
         return False
-    for ip in ips:
-        addr = ipaddress.ip_address(ip)
-        for net in _BLOCKED_NETS:
-            if addr.version == net.version and addr in net:
-                return False
-    return True
+    return not any(_is_blocked_address(ip) for ip in ips)
 
 
 def is_egress_allowed(url: str, allowlist: frozenset[str]) -> bool:

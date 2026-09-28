@@ -74,8 +74,21 @@ class GraphExtractor(Protocol):
 
 
 # Node:  ``Name (Type): k=v; k=v``  — the attribute tail is optional.
+#
+# Tightened in round 7 (WP-4c #10, owner decision D10): with the LLM extractor on in
+# live posture the grammar runs over PROSE too, and the old pattern read ANY
+# parenthesised aside as a node — "We are open Monday to Friday (except holidays)"
+# became an entity named "We are open Monday to Friday" of type "except holidays". A
+# node line now has:
+#   - a name of at most MAX_NODE_NAME_WORDS words / 80 chars, starting with a letter or
+#     digit and free of sentence punctuation (, ; : ! ?);
+#   - a type that is ONE word, or TWO Capitalised words, of letters/digits/_/-;
+#   - nothing after the closing paren except an optional ``: key=value; ...`` tail.
+MAX_NODE_NAME_WORDS = 5
+_NODE_NAME = r"[A-Za-z0-9][^(),;:!?\n]{0,79}?"
+_NODE_TYPE = r"(?:[A-Z][\w-]{0,31}\s+[A-Z][\w-]{0,31}|[A-Za-z][\w-]{0,31})"
 _NODE_RE = re.compile(
-    r"^\s*(?P<name>[^()\n]+?)\s*\((?P<type>[^()\n]+?)\)\s*(?::\s*(?P<attrs>.*))?$"
+    rf"^\s*(?P<name>{_NODE_NAME})\s*\((?P<type>{_NODE_TYPE})\)\s*(?::\s*(?P<attrs>[^=\n]+=.*))?$"
 )
 # Edge:  ``Source -REL-> Target``
 _EDGE_RE = re.compile(r"^\s*(?P<src>.+?)\s*-(?P<rel>[A-Za-z0-9_ ]+?)->\s*(?P<dst>.+?)\s*$")
@@ -141,7 +154,7 @@ class DeterministicGraphExtractor:
                     edges.append(ExtractedEdge(src_name=src, dst_name=dst, relationship_type=rel))
                 continue
             node_m = _NODE_RE.match(line)
-            if node_m:
+            if node_m and len(node_m.group("name").split()) <= MAX_NODE_NAME_WORDS:
                 ensure_entity(
                     node_m.group("name"),
                     node_m.group("type"),
@@ -163,9 +176,28 @@ class DeterministicGraphExtractor:
 MAX_LLM_ENTITIES = 40
 MAX_LLM_EDGES = 80
 MAX_LLM_TEXT_CHARS = 12_000
+# Per-ingest cost bound (round 7 WP-4c #10, D10 turns the pass on for every live
+# ingest): a source under MIN_LLM_TEXT_CHARS (a title, a one-line paste, a nav-only
+# crawled page) has nothing a graph call would find that the grammar does not, so it
+# costs no call; a large source is read as its first MAX_LLM_CHUNKS retrieval chunks,
+# bounded again by MAX_LLM_TEXT_CHARS — one bounded fast-model call per ingest.
+MIN_LLM_TEXT_CHARS = 80
+MAX_LLM_CHUNKS = 8
 _MAX_NAME = 200
 _MAX_TYPE = 64
 _MAX_ATTRS = 20
+
+
+def llm_input_for(text: str) -> str | None:
+    """The slice of an ingest the LLM pass reads, or ``None`` when the pass is skipped."""
+    body = (text or "").strip()
+    if len(body) < MIN_LLM_TEXT_CHARS:
+        return None
+    from app.knowledge.chunking import chunk_text  # noqa: PLC0415 — import cycle
+
+    chunks = chunk_text(body)[:MAX_LLM_CHUNKS]
+    return "\n\n".join(chunks)[:MAX_LLM_TEXT_CHARS] or None
+
 
 _LLM_SYSTEM_PROMPT = (
     "You extract a knowledge graph from a business's own text. Reply with ONE JSON object "
@@ -301,8 +333,8 @@ class LlmGraphExtractor:
         router admits it against THAT tenant's per-minute cap (§9 C9) — an owner
         pasting a large document is capped exactly like their customers' turns."""
         base = self._fallback.extract(text)
-        clipped = (text or "")[:MAX_LLM_TEXT_CHARS]
-        if not clipped.strip():
+        clipped = llm_input_for(text)
+        if clipped is None:
             return base
         try:
             resp = await self._router_or_build().complete(
@@ -342,9 +374,10 @@ _default: GraphExtractor | None = None
 def get_extractor() -> GraphExtractor:
     """Return the bound extractor (§3.2.1).
 
-    Deterministic by default. ``LUCIEL_GRAPH_EXTRACTOR=llm`` binds the LLM-backed
-    extractor — in live mode only, so mock/CI never reaches a vendor — behind this same
-    seam: the ingest path depends only on the GraphExtractor Protocol.
+    ``LUCIEL_GRAPH_EXTRACTOR`` decides: ``llm`` binds the LLM-backed extractor — in
+    live mode only, so mock/CI never reaches a vendor — behind this same seam. Unset, the
+    config resolves it by posture (D10): ``llm`` in live, ``deterministic`` elsewhere.
+    The ingest path depends only on the GraphExtractor Protocol.
     """
     global _default
     if _default is None:

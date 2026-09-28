@@ -563,6 +563,11 @@ export class ComputeStack extends Stack {
           ...(name === 'data-plane' ? { LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS: '300' } : {}),
           // Integrations remain MOCK until a gated cutover flips them (GATE 2).
           LUCIEL_INTEGRATION_MODE: integrationMode,
+          // Knowledge-graph extraction infers nodes/edges from prose through the fast
+          // model at ingest (owner decision D10, round 7 WP-4c). The app binds it in
+          // live posture only, so this is inert under a mock deploy; set explicitly
+          // so the posture is visible in the task definition rather than implied.
+          LUCIEL_GRAPH_EXTRACTOR: 'llm',
           // The Stripe seam has its OWN posture, one level down from the LLM cutover,
           // so Stripe can move to real TEST-mode calls without flipping the LLM flag.
           // Set on BOTH planes: the data plane reports usage on the conversation path
@@ -868,6 +873,9 @@ export class ComputeStack extends Stack {
         LUCIEL_PLANE: 'sweep',
         LUCIEL_LOG_FORMAT: 'json',
         LUCIEL_INTEGRATION_MODE: integrationMode,
+        // The knowledge_sync sweep ingests synced pages (parse → chunk → embed →
+        // graph), so it needs the same extractor posture as the app planes (D10).
+        LUCIEL_GRAPH_EXTRACTOR: 'llm',
         // MUST match the app planes. The usage_reconcile sweep posts meter events and
         // advances the billing watermark; if it resolved a different gateway than the
         // app, it would mark blocks reported that Stripe never received.

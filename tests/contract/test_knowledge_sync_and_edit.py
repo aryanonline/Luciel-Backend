@@ -56,7 +56,7 @@ async def test_csv_import_creates_structured_source(client):
 
     rc = await client.get(f"/api/v1/admin/knowledge/sources/{body['sourceId']}/chunks")
     assert rc.status_code == 200
-    joined = " ".join(c["text"] for c in rc.json())
+    joined = " ".join(c["text"] for c in rc.json()["chunks"])
     assert "Starter" in joined and "899" in joined
 
 
@@ -152,9 +152,29 @@ async def test_replace_source_reingests_content(client):
     assert rr.json()["sourceId"] == source_id
 
     rc = await client.get(f"/api/v1/admin/knowledge/sources/{source_id}/chunks")
-    joined = " ".join(c["text"] for c in rc.json())
+    joined = " ".join(c["text"] for c in rc.json()["chunks"])
     assert "gadgets" in joined
     assert "widgets" not in joined
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_chunk_preview_reports_the_real_total_beyond_the_page(client):
+    """Round 7 WP-4c #6: the preview returned the default 20 rows and no count, so the
+    raw view printed "first 20 of 20" for a source with far more chunks."""
+    await _ready_account_with_luciel(client)
+    # ~60 paragraphs of ~1.1 KB each → well over the 20-chunk page at 1200 chars/chunk.
+    paragraphs = [f"Paragraph {i}. " + ("lorem ipsum dolor sit amet " * 40) for i in range(60)]
+    r = await client.post(
+        "/api/v1/admin/knowledge/sources/paste",
+        json={"name": "Long handbook", "text": "\n\n".join(paragraphs)},
+    )
+    assert r.status_code == 201, r.text
+    rc = await client.get(f"/api/v1/admin/knowledge/sources/{r.json()['sourceId']}/chunks")
+    assert rc.status_code == 200
+    page = rc.json()
+    assert page["pageSize"] == 20 and len(page["chunks"]) == 20
+    assert page["totalChunks"] > 20
+    assert [c["ordinal"] for c in page["chunks"]] == list(range(20))
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

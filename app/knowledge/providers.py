@@ -910,7 +910,23 @@ def _extract_visible_text(html: str) -> str:
 
 
 CRAWL_USER_AGENT = "LucielBot"
+#: Redirect hops one page fetch may follow (round 7 WP-4c #1). An apex→www 301 is the
+#: normal shape of a small business site; five covers apex→www→https→trailing-slash
+#: with room to spare, and stops a redirect loop from spinning.
+CRAWL_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _HREF_RE = re.compile(r"""<a\s[^>]*?href\s*=\s*["']([^"'#]+)""", re.IGNORECASE)
+
+
+class CrawlFetchRefused(ProviderUnavailable):
+    """One page answered with a non-success status (carries it, so robots.txt can tell
+    a 401/403 — "keep out" under RFC 9309 — from a 404/5xx — "no rule")."""
+
+    def __init__(self, url: str, status_code: int) -> None:
+        super().__init__(f"{urlparse(url).hostname} answered {status_code} for {url}")
+        self.status_code = status_code
+
+
 _SKIP_EXTENSIONS = (
     ".pdf",
     ".jpg",
@@ -983,9 +999,15 @@ class WebsiteCrawlProvider:
         transport: HttpTransport | None = None,
         timeout_seconds: float | None = None,
         max_bytes: int | None = None,
+        httpx_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._urls = urls
         self._transport = transport
+        # The wire-level transport the REAL fetch path builds its client on (tests bind
+        # an ``httpx.MockTransport`` here so the pin / redirect / header behaviour is
+        # exercised exactly as production runs it, with no socket). ``None`` = httpx's
+        # default network transport.
+        self._httpx_transport = httpx_transport
         settings = get_settings()
         self._timeout = (
             timeout_seconds
@@ -995,38 +1017,75 @@ class WebsiteCrawlProvider:
         self._max_bytes = max_bytes if max_bytes is not None else settings.website_crawl_max_bytes
 
     async def _fetch_one(self, url: str) -> str:
+        body, _final_url = await self._fetch_page(url)
+        return body
+
+    async def _fetch_page(self, url: str) -> tuple[str, str]:
+        """Fetch one page; returns ``(body, final_url)`` — the URL the body actually
+        came from, after any redirects (so links on it resolve against the right base)."""
         if self._transport is not None:
             # An injected transport is a seam trusted code chose, not a socket this
             # process opens against a tenant-supplied host.
             resp = await self._transport.get(url)
             body = resp.text
+            final_url = url
         else:
-            # SSRF gate immediately before the real connect, and re-derived on every
-            # sync rather than trusted from create time: the DNS answer for a host the
-            # admin registered last month is not the one it gives today. The crawled
-            # body is readable back through GET /sources/{id}/chunks, so an unguarded
-            # fetch is an exfiltration channel, not a blind SSRF (P1-4).
-            # ...and CONNECT to the address that was validated (adversarial review
-            # R-WP4-1 — the F090 pin the webhook POST already had). A DNS answer that
-            # flipped between the check and the connect (rebinding) reached the task
-            # metadata endpoint with a clean bill of health, and what it returned
-            # became readable chunks. The name still travels as Host + SNI, so TLS
-            # verifies the certificate against the hostname the owner registered.
-            try:
-                pinned_url, host = sandbox.pin_public_target(url)
-            except sandbox.SsrfBlocked as exc:
-                raise ProviderUnavailable(
-                    f"crawl URL is not a public http(s) address: {url}"
-                ) from exc
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(
-                    pinned_url, headers={"Host": host}, extensions={"sni_hostname": host}
-                )
-                resp.raise_for_status()
-                body = resp.text
+            body, final_url = await self._fetch_real(url)
         if len(body.encode("utf-8")) > self._max_bytes:
             body = body.encode("utf-8")[: self._max_bytes].decode("utf-8", errors="ignore")
-        return body
+        return body, final_url
+
+    async def _fetch_real(self, url: str) -> tuple[str, str]:
+        # SSRF gate immediately before the real connect, and re-derived on every
+        # sync rather than trusted from create time: the DNS answer for a host the
+        # admin registered last month is not the one it gives today. The crawled
+        # body is readable back through GET /sources/{id}/chunks, so an unguarded
+        # fetch is an exfiltration channel, not a blind SSRF (P1-4).
+        # ...and CONNECT to the address that was validated (adversarial review
+        # R-WP4-1 — the F090 pin the webhook POST already had). A DNS answer that
+        # flipped between the check and the connect (rebinding) reached the task
+        # metadata endpoint with a clean bill of health, and what it returned
+        # became readable chunks. The name still travels as Host + SNI, so TLS
+        # verifies the certificate against the hostname the owner registered.
+        #
+        # Redirects are followed BY HAND (round 7 WP-4c #1): httpx's own follower
+        # would connect to whatever ``Location`` names without the pin, so every hop
+        # is re-resolved and re-validated exactly like the first URL. Before this the
+        # client followed nothing and ``raise_for_status`` read an apex→www 301 as a
+        # failed page — a whole crawl of a site that redirects its apex fetched no
+        # pages at all. The bot identifies itself on every request (robots.txt rules
+        # for "LucielBot" were honoured while the fetch itself was anonymous).
+        current = url
+        client_kwargs: dict[str, object] = {"timeout": self._timeout}
+        if self._httpx_transport is not None:
+            client_kwargs["transport"] = self._httpx_transport
+        async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
+            for _hop in range(CRAWL_MAX_REDIRECTS + 1):
+                try:
+                    pinned_url, host = sandbox.pin_public_target(current)
+                except sandbox.SsrfBlocked as exc:
+                    raise ProviderUnavailable(
+                        f"crawl URL is not a public http(s) address: {current}"
+                    ) from exc
+                resp = await client.get(
+                    pinned_url,
+                    headers={"Host": host, "User-Agent": CRAWL_USER_AGENT},
+                    extensions={"sni_hostname": host},
+                    follow_redirects=False,
+                )
+                location = resp.headers.get("location")
+                if resp.status_code in _REDIRECT_STATUSES and location:
+                    current = urljoin(current, location)
+                    if urlparse(current).scheme not in ("http", "https"):
+                        raise ProviderUnavailable(f"crawl redirect left http(s): {current}")
+                    continue
+                if resp.status_code >= 400:
+                    raise CrawlFetchRefused(current, resp.status_code)
+                resp.raise_for_status()
+                return resp.text, current
+        raise ProviderUnavailable(
+            f"crawl URL redirected more than {CRAWL_MAX_REDIRECTS} times: {url}"
+        )
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
         """Fetch every seed URL and the same-origin pages it links to, breadth-first,
@@ -1053,7 +1112,7 @@ class WebsiteCrawlProvider:
             if not await self._robots_allow(url, robots):
                 continue
             try:
-                html = await self._fetch_one(url)
+                html, final_url = await self._fetch_page(url)
             except (ProviderUnavailable, httpx.HTTPError, ValueError):
                 failed.append(url)
                 continue
@@ -1062,7 +1121,10 @@ class WebsiteCrawlProvider:
             items.append(RemoteItem(external_id=url, name=url, text=text, revision=revision))
             fetched_any = True
             if depth < max_depth:
-                for link in _same_origin_links(url, html):
+                # Links resolve against the page the body CAME from: after an apex→www
+                # redirect the site's relative links belong to www, and following them
+                # from the apex base would redirect every one of them again.
+                for link in _same_origin_links(final_url, html):
                     if link not in seen:
                         queue.append((link, depth + 1))
         if not fetched_any and failed:
@@ -1073,7 +1135,9 @@ class WebsiteCrawlProvider:
 
     async def _robots_allow(self, url: str, cache: dict[str, RobotFileParser | None]) -> bool:
         """robots.txt per origin, fetched once per snapshot; unreachable robots = allowed
-        (the site made no rule), a fetched one is honoured for our user agent."""
+        (the site made no rule), a fetched one is honoured for our user agent, and a
+        401/403 on robots.txt is "keep out" for the whole origin (RFC 9309 §2.3.1.3 —
+        round 7 WP-4c #1; it used to read as "no rule")."""
         origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         if origin not in cache:
             parser: RobotFileParser | None = None
@@ -1081,6 +1145,12 @@ class WebsiteCrawlProvider:
                 body = await self._fetch_one(f"{origin}/robots.txt")
                 parser = RobotFileParser()
                 parser.parse(body.splitlines())
+            except CrawlFetchRefused as exc:
+                if exc.status_code in (401, 403):
+                    parser = RobotFileParser()
+                    parser.parse(["User-agent: *", "Disallow: /"])
+                else:
+                    parser = None
             except (ProviderUnavailable, httpx.HTTPError, ValueError):
                 parser = None
             cache[origin] = parser

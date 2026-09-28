@@ -9,19 +9,20 @@ import pytest
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
 
-async def _ready_account_with_luciel(client) -> None:
+async def _ready_account_with_luciel(client) -> uuid.UUID:
     from app.auth import access
 
     email = f"kb-{uuid.uuid4().hex[:8]}@x.com"
     await client.post(
         "/api/v1/auth/signup", json={"email": email, "password": "pw-123456", "captchaToken": "t"}
     )
-    _a, token = await access.signup(email, "pw-123456")
+    acct, token = await access.signup(email, "pw-123456")
     await client.post("/api/v1/auth/verify-email", json={"token": token})
     await client.post("/api/v1/auth/login", json={"email": email, "password": "pw-123456"})
     await client.post(
         "/api/v1/admin/luciel", json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"}
     )
+    return acct.id
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -90,9 +91,12 @@ async def test_paste_ingest_then_list_and_chunks(client):
 
     rc = await client.get(f"/api/v1/admin/knowledge/sources/{source_id}/chunks")
     assert rc.status_code == 200
-    chunks = rc.json()
+    page = rc.json()
+    chunks = page["chunks"]
     assert len(chunks) >= 1
     assert "text" in chunks[0] and "ordinal" in chunks[0]
+    # Round 7 WP-4c #6: the page carries the real count, not the page length.
+    assert page["totalChunks"] == len(chunks) and page["pageSize"] == 20
 
     # quota now reflects the ingest
     rq = await client.get("/api/v1/admin/knowledge/quota")
@@ -183,3 +187,49 @@ async def test_delete_missing_source_404(client):
     await _ready_account_with_luciel(client)
     rd = await client.delete(f"/api/v1/admin/knowledge/sources/{uuid.uuid4()}")
     assert rd.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_restore_refuses_a_source_removed_at_its_origin(client):
+    """Round 7 WP-4c #9: a sync-origin tombstone is not the owner's mis-click. The
+    restore route says so — 409 naming the origin — never "not in its undo window",
+    and never a revived page the origin no longer has."""
+    from datetime import UTC, datetime
+
+    from app.db.session import tenant_session
+    from app.knowledge import service
+    from app.models.knowledge import KnowledgeSource
+    from sqlalchemy import select
+
+    admin = await _ready_account_with_luciel(client)
+    ri = await client.post(
+        "/api/v1/admin/knowledge/sources/paste",
+        json={"name": "Pricing page", "text": "a page the site has since removed"},
+    )
+    source_id = ri.json()["sourceId"]
+    # The shape the sync leaves behind when the origin no longer has the item.
+    async with tenant_session(admin) as s:
+        src = (
+            await s.execute(
+                select(KnowledgeSource).where(KnowledgeSource.id == uuid.UUID(source_id))
+            )
+        ).scalar_one()
+        src.source_origin = "website_crawl"
+        src.soft_deleted_at = datetime.now(UTC)
+        src.deleted_by = service.DELETED_BY_ORIGIN
+
+    rr = await client.post(f"/api/v1/admin/knowledge/sources/{source_id}/restore")
+    assert rr.status_code == 409, rr.text
+    message = rr.json()["message"]
+    assert "Pricing page was removed at its sync source (website_crawl)" in message
+    assert "sync again" in message and "undo window" not in message
+    # Nothing was revived.
+    rl = await client.get("/api/v1/admin/knowledge/sources")
+    assert all(x["sourceId"] != source_id for x in rl.json())
+    async with tenant_session(admin) as s:
+        src = (
+            await s.execute(
+                select(KnowledgeSource).where(KnowledgeSource.id == uuid.UUID(source_id))
+            )
+        ).scalar_one()
+        assert src.soft_deleted_at is not None and src.deleted_by == service.DELETED_BY_ORIGIN

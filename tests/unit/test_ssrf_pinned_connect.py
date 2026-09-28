@@ -23,16 +23,16 @@ def _resolver(*ips: str):
 
 
 def test_a_public_host_is_pinned_to_its_resolved_address(monkeypatch):
-    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("203.0.113.9"))
+    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("93.184.216.34"))
     pinned, host = pin_public_target("https://hooks.example.com/crm?x=1")
-    assert pinned == "https://203.0.113.9/crm?x=1"
+    assert pinned == "https://93.184.216.34/crm?x=1"
     assert host == "hooks.example.com"
 
 
 def test_an_explicit_port_and_an_ipv6_answer_survive_the_rewrite(monkeypatch):
-    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("2001:db8::10"))
+    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("2606:4700:4700::1111"))
     pinned, host = pin_public_target("https://hooks.example.com:8443/in")
-    assert pinned == "https://[2001:db8::10]:8443/in"
+    assert pinned == "https://[2606:4700:4700::1111]:8443/in"
     assert host == "hooks.example.com"
 
 
@@ -49,7 +49,7 @@ def test_a_private_or_link_local_answer_is_refused(monkeypatch, answer):
 def test_a_mixed_answer_is_refused_even_when_the_first_address_is_public(monkeypatch):
     """Which address a later connect() would pick is not ours to know — and the
     rebinding trick is exactly one public answer followed by one private one."""
-    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("203.0.113.9", "169.254.169.254"))
+    monkeypatch.setattr(sandbox, "_resolve_ips", _resolver("93.184.216.34", "169.254.169.254"))
     with pytest.raises(SsrfBlocked):
         pin_public_target("https://hooks.example.com/in")
 

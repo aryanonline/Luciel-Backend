@@ -16,7 +16,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -35,7 +35,24 @@ from app.models.knowledge import (
 TOTAL_QUOTA_BYTES = 5 * 1000 * 1000 * 1000  # 5 GB (Vision §7)
 PER_FILE_MAX_BYTES = 50 * 1000 * 1000  # 50 MB
 
+#: Owner decision D10 (2026-09-14): a source whose sync is paused by a revoked or
+#: expired credential keeps answering for this long, then stops until the owner
+#: reconnects. Before round 7 WP-4c a revoked source kept answering forever.
+PAUSED_SERVING_DAYS = 7
+
 logger = logging.getLogger(__name__)
+
+
+def paused_serving_cutoff(now: datetime | None = None) -> datetime:
+    """A source paused at or before this instant has stopped serving (D10)."""
+    return (now or datetime.now(UTC)) - timedelta(days=PAUSED_SERVING_DAYS)
+
+
+def stops_serving_at(paused_since: datetime) -> datetime:
+    """When a source paused at ``paused_since`` stops answering (D10)."""
+    if paused_since.tzinfo is None:
+        paused_since = paused_since.replace(tzinfo=UTC)
+    return paused_since + timedelta(days=PAUSED_SERVING_DAYS)
 
 
 class QuotaError(Exception):
@@ -255,8 +272,33 @@ async def sources_by_id(
     return {row[0]: row[1] for row in rows}
 
 
+#: The raw view's chunk preview page (round 7 WP-4c #6). The route returns this many
+#: chunks plus the REAL total, so the UI can say "first 20 of 300" instead of
+#: reading the page length as the count.
+CHUNK_PREVIEW_PAGE = 20
+
+
+async def count_chunks(session: AsyncSession, admin_id: uuid.UUID, source_id: uuid.UUID) -> int:
+    """How many chunks a source has — the honest denominator of the preview."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.admin_id == admin_id,
+                    KnowledgeChunk.source_id == source_id,
+                )
+            )
+        ).scalar_one()
+    )
+
+
 async def get_chunks(
-    session: AsyncSession, admin_id: uuid.UUID, source_id: uuid.UUID, limit: int = 20
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    source_id: uuid.UUID,
+    limit: int = CHUNK_PREVIEW_PAGE,
 ) -> list[KnowledgeChunk]:
     return list(
         (
@@ -280,7 +322,7 @@ async def view_chunks(
     admin_id: uuid.UUID,
     source_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
-    limit: int = 20,
+    limit: int = CHUNK_PREVIEW_PAGE,
 ) -> list[KnowledgeChunk]:
     """Return a source's chunks AND emit a ``knowledge_source_viewed`` audit event.
 
@@ -317,6 +359,21 @@ DELETE_GRACE_DAYS = 30
 #: Who tombstoned a source (``knowledge_sources.deleted_by``, migration 0056).
 DELETED_BY_OWNER = "owner"
 DELETED_BY_LIFECYCLE = "lifecycle"
+#: The item disappeared at its sync origin (Drive / Notion / the crawled site) — round 7
+#: WP-4c #9. That is not the owner's mis-click, so there is nothing to undo here: the
+#: honest way back is re-adding it at the origin and syncing. Purged at the next
+#: retention pass, not after the 30-day window (the window exists for the owner's
+#: change of mind, not for content the origin no longer has). Before #9 these were
+#: stamped ``owner`` — restorable for 30 days, reviving a page its origin had deleted.
+DELETED_BY_ORIGIN = "origin"
+
+
+class RemovedAtOrigin(Exception):
+    """``restore_source`` was asked to revive an origin tombstone (round 7 WP-4c #9)."""
+
+    def __init__(self, source: KnowledgeSource) -> None:
+        super().__init__(f"{source.name} was removed at its sync origin")
+        self.source = source
 
 
 async def delete_source(
@@ -324,6 +381,8 @@ async def delete_source(
     admin_id: uuid.UUID,
     source_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
+    *,
+    deleted_by: str = DELETED_BY_OWNER,
 ) -> bool:
     """Tombstone the source for the documented 30-day undo window (§3.2.2).
 
@@ -334,6 +393,12 @@ async def delete_source(
     the chunks hard-deleted in the same call, so the advertised grace window had
     nothing to restore and no sweep ever purged the tombstones. The hard delete now
     happens in ``purge_expired_deletions`` (the nightly retention pass).
+
+    ``deleted_by`` is ``owner`` (the default: the owner's own delete, undo-able for
+    the window) or ``origin`` (the sync found the item gone at its source — round 7
+    WP-4c #9 — not restorable, purged at the next pass). The audit payload carries
+    it, with ``grace_days`` 0 for an origin tombstone so the log never advertises a
+    window that does not exist.
     """
     source = (
         await session.execute(
@@ -345,7 +410,7 @@ async def delete_source(
     if source is None or source.soft_deleted_at is not None:
         return False
     source.soft_deleted_at = datetime.now(UTC)
-    source.deleted_by = DELETED_BY_OWNER
+    source.deleted_by = deleted_by
     await session.flush()
     await audit.emit(
         session,
@@ -354,7 +419,11 @@ async def delete_source(
         actor_user_id=actor_user_id,
         actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
         event_type="knowledge_source_deleted",
-        payload={"source_id": str(source_id), "grace_days": DELETE_GRACE_DAYS},
+        payload={
+            "source_id": str(source_id),
+            "deleted_by": deleted_by,
+            "grace_days": DELETE_GRACE_DAYS if deleted_by == DELETED_BY_OWNER else 0,
+        },
     )
     return True
 
@@ -372,6 +441,10 @@ async def restore_source(
     ``state_machine.restore`` — and never through this call, which would otherwise
     revive one source of a Luciel that is itself deleted. Returns None when there is
     nothing to restore (unknown id, not deleted, lifecycle-deleted, or already purged).
+    An ORIGIN tombstone (the item is gone at Drive / Notion / the site — round 7 WP-4c
+    #9) raises ``RemovedAtOrigin`` so the caller can say so honestly instead of
+    "not in its undo window": there never was a window, and reviving it would serve
+    a page its origin deleted.
     """
     source = (
         await session.execute(
@@ -380,7 +453,11 @@ async def restore_source(
             )
         )
     ).scalar_one_or_none()
-    if source is None or source.soft_deleted_at is None or source.deleted_by != DELETED_BY_OWNER:
+    if source is None or source.soft_deleted_at is None:
+        return None
+    if source.deleted_by == DELETED_BY_ORIGIN:
+        raise RemovedAtOrigin(source)
+    if source.deleted_by != DELETED_BY_OWNER:
         return None
     source.soft_deleted_at = None
     source.deleted_by = None
@@ -478,7 +555,9 @@ async def purge_expired_deletions(
     now: datetime | None = None,
     grace_days: int = DELETE_GRACE_DAYS,
 ) -> int:
-    """Hard-delete owner-tombstoned sources whose undo window has closed.
+    """Hard-delete owner-tombstoned sources whose undo window has closed, and every
+    origin tombstone (round 7 WP-4c #9) regardless of age — an item gone at its
+    sync origin never had a window.
 
     Returns the number of sources destroyed. Lifecycle tombstones are not touched —
     they belong to the Luciel's own grace window and its day-30 cascade. Idempotent.
@@ -490,9 +569,14 @@ async def purge_expired_deletions(
             await session.execute(
                 select(KnowledgeSource).where(
                     KnowledgeSource.admin_id == admin_id,
-                    KnowledgeSource.deleted_by == DELETED_BY_OWNER,
                     KnowledgeSource.soft_deleted_at.is_not(None),
-                    KnowledgeSource.soft_deleted_at < cutoff,
+                    or_(
+                        and_(
+                            KnowledgeSource.deleted_by == DELETED_BY_OWNER,
+                            KnowledgeSource.soft_deleted_at < cutoff,
+                        ),
+                        KnowledgeSource.deleted_by == DELETED_BY_ORIGIN,
+                    ),
                 )
             )
         )
@@ -557,6 +641,7 @@ async def replace_source(
     size_bytes: int,
     actor_user_id: uuid.UUID | None = None,
     extractor: GraphExtractor | None = None,
+    action: str = "replace",
 ) -> KnowledgeSource | None:
     """Replace affordance (Architecture §3.2.2): re-ingest a NEW file into an
     EXISTING source row. The source id/name/place-in-list is preserved but its
@@ -565,6 +650,13 @@ async def replace_source(
     updated" root-cause-fix flow (§5.2/§9). Returns None if the source does not
     exist for this tenant. Quota is re-checked against the NEW size, crediting
     back the old size first so a same-size or smaller replace never false-fails.
+
+    ``action`` labels the audit row: ``replace`` for the owner's affordance,
+    ``sync_update`` when a live-sync revision change re-ingests through this same
+    path (round 7 WP-4c #2 — the sync used to re-embed inline, skipping the quota
+    check, the size bookkeeping and the graph re-extraction this function does).
+    A ``QuotaError`` is raised BEFORE anything is wiped, so a refused replace leaves
+    the previous chunks and graph serving.
     """
     source = (
         await session.execute(
@@ -640,7 +732,7 @@ async def replace_source(
         actor_user_id=actor_user_id,
         actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
         event_type="knowledge_source_edited",
-        payload={"source_id": str(source_id), "action": "replace", "chunks": len(chunks)},
+        payload={"source_id": str(source_id), "action": action, "chunks": len(chunks)},
     )
     return source
 
@@ -667,6 +759,8 @@ async def retrieve(
 
     Filters to (admin_id, instance_id) and only sources whose ingestion is ready
     and not soft-deleted (Architecture §3.2 retrieval flow). RLS is the backstop.
+    A source paused by a revoked credential for more than PAUSED_SERVING_DAYS is
+    excluded too (D10): its content is no longer being kept true.
 
     Implements the §3.2 retrieval flow in full:
       step 2 — HNSW ANN over the embedding (ordered by cosine distance);
@@ -698,6 +792,10 @@ async def retrieve(
                 KnowledgeChunk.instance_id == instance_id,
                 KnowledgeSource.ingestion_status == "ready",
                 KnowledgeSource.soft_deleted_at.is_(None),
+                or_(
+                    KnowledgeSource.paused_since.is_(None),
+                    KnowledgeSource.paused_since > paused_serving_cutoff(),
+                ),
             )
             .order_by(distance.asc())
             .limit(max(k, k + _RERANK_OVERFETCH))

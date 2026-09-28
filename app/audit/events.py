@@ -142,6 +142,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # connection transitioned into expired/error. Payload carries the
         # delivery outcome, never credential material.
         "connection_attention_emailed",
+        # Round 7 WP-4c #5 (owner decision D10): the knowledge_sync sweep emailed the
+        # owner that a revoked/expired knowledge connection's sources will stop
+        # answering (day 1) or have stopped (day 7). Payload: provider, source count
+        # and the date — never credential material. Once per incident (ledger).
+        "knowledge_pause_notice_emailed",
         # c21: an attempt to claim a destination another tenant holds was refused.
         # Recorded under the CLAIMANT (never the holder — an attacker must not be
         # able to spam a victim's audit chain), in its own transaction because the

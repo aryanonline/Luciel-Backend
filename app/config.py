@@ -301,8 +301,11 @@ class Settings(BaseSettings):
     # Knowledge-graph extraction at ingest (round 6 WP-G, F122): "deterministic" reads
     # the explicit node/edge line grammar only; "llm" also infers nodes and edges from
     # prose through the fast model (live mode only; falls back to deterministic on any
-    # failure). LUCIEL_GRAPH_EXTRACTOR.
-    graph_extractor: str = "deterministic"
+    # failure). LUCIEL_GRAPH_EXTRACTOR. Empty = resolve by posture in model_post_init
+    # (owner decision D10, 2026-09-14): "llm" in live, "deterministic" everywhere else.
+    # Before D10 the default was "deterministic" and nothing set the variable, so the
+    # extractor that F122 built was inert in every deployment.
+    graph_extractor: str = ""
 
     # Upper bound on generated tokens per LLM call (platform cost control).
     llm_max_output_tokens: int = 1024
@@ -666,6 +669,16 @@ class Settings(BaseSettings):
                     "accept forged inbound messages; an unset sender identity drops every "
                     "platform email). Set them in the platform secret."
                 )
+
+        # Graph extractor posture default (D10): the LLM pass is ON wherever real
+        # providers are bound, and mock/CI never reaches a vendor. An explicit
+        # LUCIEL_GRAPH_EXTRACTOR still wins (the operator's off switch in live).
+        if not self.graph_extractor:
+            object.__setattr__(
+                self,
+                "graph_extractor",
+                "llm" if self.integration_mode == "live" else "deterministic",
+            )
 
         # Bool bridge (non-production seam): the platform secret may carry the
         # captcha-bypass flag as a string; coerce it. Absent -> stays False (fail-safe).
