@@ -16,8 +16,10 @@ AWS-DEFERRED SEAM discipline as the rest of the codebase:
     dict and mints a fake ``https://export.local/...`` URL — NO network call.
   * :class:`S3ExportStore` — the real ``vm-export-bundles`` S3 backend (boto3
     ``put_object`` + ``generate_presigned_url``), imported LAZILY so CI (no AWS)
-    imports this module cleanly. Bound ONLY when ``integration_mode == "live"``
-    by :func:`get_export_store`, mirroring ``get_secret_store``.
+    imports this module cleanly. Bound whenever the CDK injected a real bucket
+    (``LUCIEL_EXPORT_BUCKET``), which is every deployed environment — see
+    :func:`get_export_store` for why this seam does NOT follow the integration-mode
+    gate the sender seams use (round 7 WP-5, item 3).
 
 NEVER hardcode a secret here: the S3 backend takes only a bucket name + region
 (config, not credential material) — actual AWS credentials are resolved by the
@@ -30,6 +32,10 @@ import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
+
+#: The CDK-injected bucket variable whose PRESENCE binds the real store (the settings
+#: value ``export_bucket`` always carries a name, so it cannot say "configured").
+EXPORT_BUCKET_ENV = "LUCIEL_EXPORT_BUCKET"
 
 
 def export_key_for(admin_id: uuid.UUID, export_id: uuid.UUID) -> str:
@@ -114,8 +120,9 @@ class S3ExportStore:
     outlived its 7-day link by however long the manual bucket kept it.
 
     boto3 is imported LAZILY so CI (no AWS, boto3 may be absent) still imports this
-    module and runs the LocalExportStore tests. Only selected in ``live`` mode by
-    :func:`get_export_store`; never the default."""
+    module and runs the LocalExportStore tests, and the client is built on first use
+    so merely BINDING this store needs no credentials. Selected by
+    :func:`get_export_store` whenever a real bucket was injected; never the default."""
 
     def __init__(self, *, bucket: str, region_name: str) -> None:
         self._bucket = bucket
@@ -169,18 +176,34 @@ _default: ExportStore | None = None
 
 
 def get_export_store() -> ExportStore:
-    """Return the bound ExportStore. Defaults to the local backend (mirrors
-    ``app.connections.secrets.get_secret_store``).
+    """Return the bound ExportStore: the real bucket when the INFRASTRUCTURE gave us
+    one, the local fake when it did not (mirrors ``transcript_store.get_transcript_store``).
 
-    In ``live`` integration mode this binds the AWS ``S3ExportStore`` against the
-    ``vm-export-bundles`` bucket; in every other mode (the default ``mock``) it
-    stays ``LocalExportStore`` so all existing tests are unaffected."""
+    Deliberately NOT keyed on ``integration_mode`` (round 7 WP-5, item 3). That flag
+    means "may this process talk to third parties that cost money and reach real
+    people"; S3 is our own storage and exists in every deployed environment. Keyed on
+    the mode, every deployment running ``mock`` — dev always, production up to the
+    owner-gated live cutover — bound the in-process fake: the export "uploaded" into
+    one task's memory, the 7-day link the owner was emailed resolved to nothing from
+    any other task (or after the next deploy), and the closure's export offer was a
+    promise the platform could not keep. Every sibling object-store seam (transcripts,
+    knowledge originals, voice audio) already keys on its CDK-injected bucket variable.
+
+    The discriminator is the environment variable rather than the settings value,
+    because the setting carries a placeholder default: a bucket NAME is always present,
+    so it cannot distinguish "configured" from "defaulted". Local runs and CI set no
+    such variable and keep the fake, so the suite stays hermetic. A LIVE process with
+    no bucket is a misconfiguration ``integration_status.degraded_bindings`` names as
+    ``export_store:unbound`` rather than something this function papers over.
+    """
     global _default
     if _default is None:
+        import os  # noqa: PLC0415 — deployment shape, read at bind time
+
         from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
 
         settings = get_settings()
-        if settings.integration_mode == "live":
+        if os.environ.get(EXPORT_BUCKET_ENV):
             _default = S3ExportStore(bucket=settings.export_bucket, region_name=settings.aws_region)
         else:
             _default = LocalExportStore()

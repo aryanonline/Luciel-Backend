@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from app.config import get_settings, live_mode
+from app.lifecycle.export_store import EXPORT_BUCKET_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,13 @@ def degraded_bindings() -> list[str]:
 
         if rate_limit.store_kind() != "redis":
             degraded.append("rate_limit_store:InMemory")
+    # Round 7 WP-5 item 3: the export store binds on the CDK-injected bucket variable
+    # (like every sibling object-store seam), not on the integration mode. A live
+    # process WITHOUT one is a deployment whose export links resolve to one task's
+    # memory — named here so the gap is loud before the first owner clicks Export.
+    # Mock/CI keep the in-process fake by design, so its absence is not degraded there.
+    if live_mode() and not os.environ.get(EXPORT_BUCKET_ENV):
+        degraded.append("export_store:unbound")
     return degraded
 
 
