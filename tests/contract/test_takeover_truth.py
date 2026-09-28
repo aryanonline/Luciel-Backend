@@ -15,21 +15,29 @@ tests/integration/test_takeover_reply_context.py.
   * item 3: the reply is signed by the business, never "written by an AI assistant".
   * item 7: a Meta reply goes out AS the surface the conversation happened on TO the
     persisted sender id; an unhealthy grant is ``meta_reconnect_needed``.
+  * item 4: an ENDED session is refused for take-over and for a reply (409
+    ``session_ended``); ``endedAt`` is on the summary so the page can say why.
+  * item 5: a human reply's delivery outcome is persisted on its row and replays on
+    reopen — a Twilio-rejected reply reads ``failed`` on GET .../messages.
+  * item 6: ``countedForBilling`` on the summary — a session that never reached the
+    fire-once trigger is listed as unbilled, not beside the billed ones as one of them.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from app.connections.secrets import secret_ref_for
 from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
+from app.models.budget import CountedSession
 from app.models.connection import InstanceConnection
 from app.models.conversation import Session as SessionModel
+from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.models.lead import Lead, LeadIdentifier, LeadState
 from sqlalchemy import select
@@ -77,6 +85,7 @@ async def _seed(
     email_provider: str | None = None,
     email_status: str = "connected",
     meta_status: str | None = None,
+    mode: str = "ai",
     **session_fields: object,
 ) -> Seeded:
     """One tenant with a Luciel, a lead, a session on ``channel`` resolved to that lead,
@@ -130,7 +139,7 @@ async def _seed(
                 admin_id=admin,
                 instance_id=iid,
                 channel=channel,
-                mode="ai",
+                mode=mode,
                 resolved_lead_id=lead_id,
                 summary="Asked about a quote",
                 **session_fields,  # type: ignore[arg-type]
@@ -571,3 +580,198 @@ async def test_a_legacy_messenger_session_on_an_email_keyed_lead_is_refused_not_
     assert body["delivered"] is False
     assert body["deliveryDetail"] == "no_recipient_for_channel"
     assert meta_sender.sent == []
+
+
+# --- item 4: an ended session is not takeover-able and takes no reply --------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_take_over_on_an_ended_session_is_refused_with_session_ended(client, twilio):
+    """The sweep sealed Dana's SMS conversation last night. The take-over button used
+    to switch it to human_controlled anyway — a person "holding" a conversation whose
+    transport is no longer waiting on it, and a budget count for nothing. Refused as
+    a typed 409 the page can name; the row is untouched and reads ``endedAt``."""
+    admin = await _signup_verify_login(client)
+    ended = datetime.now(UTC) - timedelta(hours=8)
+    seeded = await _seed(
+        admin, channel="sms", contact=LEAD_PHONE, sms_status="connected", ended_at=ended
+    )
+
+    r = await client.post(f"/api/v1/dashboard/conversations/{seeded.session_id}/take-over")
+
+    assert r.status_code == 409, r.text
+    assert "session_ended" in r.json()["message"]
+    (row,) = (await client.get("/api/v1/dashboard/conversations")).json()
+    assert row["mode"] == "ai"
+    assert abs(datetime.fromisoformat(row["endedAt"]) - ended) < timedelta(seconds=1)
+    assert row["countedForBilling"] is False
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_reply_into_an_ended_session_is_refused_before_anything_is_written(client, twilio):
+    """Taken over live, then ended (the sweep sealed it while the owner had the page
+    open): the reply box is still on screen. Nothing is persisted, sent or audited —
+    a text out of nowhere hours after the conversation closed is not a takeover reply."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        sms_status="connected",
+        mode="human_controlled",
+        ended_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    r = await client.post(
+        f"/api/v1/dashboard/conversations/{seeded.session_id}/messages", json={"text": REPLY}
+    )
+
+    assert r.status_code == 409, r.text
+    assert "session_ended" in r.json()["message"]
+    assert twilio.sent == {}
+    msgs = await client.get(f"/api/v1/dashboard/conversations/{seeded.session_id}/messages")
+    assert msgs.json() == []
+    assert await _sent_audit_payloads(admin) == []
+
+
+# --- item 5: the delivery outcome lives on the row and replays on reopen ------------- #
+@pytest.fixture
+def rejecting_twilio(monkeypatch) -> FakeTwilio:
+    from app.channels import tenant_twilio
+
+    fake = FakeTwilio(accept=False)
+
+    async def _tenant_sender(*a, **kw):
+        return fake
+
+    monkeypatch.setattr(tenant_twilio, "build_tenant_sms_sender", _tenant_sender)
+    return fake
+
+
+async def _messages(client, sid: uuid.UUID) -> list[dict]:
+    r = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_twilio_rejected_reply_reads_failed_after_reopen(client, rejecting_twilio):
+    """Twilio handed back no SID. The response said so once; the row did not, so on
+    reopen the reply sat in the transcript like any delivered message. The row now
+    carries the outcome and GET .../messages replays it as failed — beside the
+    customer's own row, which carries no outcome at all (it is not a send)."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(admin, channel="sms", contact=LEAD_PHONE, sms_status="connected")
+    async with tenant_session(admin) as s:
+        s.add(
+            Transcript(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=seeded.instance_id,
+                session_id=seeded.session_id,
+                role="lead",
+                text="Can you do Tuesday?",
+            )
+        )
+        await s.flush()
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+    assert body["delivered"] is False
+    assert body["deliveryDetail"] == "send_failed"
+    assert body["message"]["deliveryStatus"] == "failed"
+
+    lead_row, reply_row = await _messages(client, seeded.session_id)
+    assert (lead_row["role"], reply_row["role"]) == ("lead", "human_agent")
+    assert lead_row["deliveryStatus"] is None
+    assert lead_row["deliveryDetail"] is None
+    assert lead_row["deliveredAt"] is None
+    assert reply_row["deliveryStatus"] == "failed"
+    assert reply_row["deliveryDetail"] == "send_failed"
+    assert reply_row["deliveredAt"] is None
+    async with tenant_session(admin) as s:
+        stored = (
+            await s.execute(
+                select(Transcript).where(Transcript.id == uuid.UUID(reply_row["messageId"]))
+            )
+        ).scalar_one()
+    # The provider's own reason stays on the row for the record; the wire stays closed.
+    assert stored.delivery_status == "failed"
+    assert stored.delivery_detail == "twilio_rejected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_delivered_reply_replays_as_delivered_with_the_time_it_left(client, twilio):
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(admin, channel="sms", contact=LEAD_PHONE, sms_status="connected")
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+    assert body["delivered"] is True
+
+    (row,) = await _messages(client, seeded.session_id)
+    assert row["deliveryStatus"] == "delivered"
+    assert row["deliveryDetail"] is None
+    assert row["deliveredAt"] is not None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_widget_reply_replays_as_queued_not_delivered(client):
+    """The widget has no push transport: the reply waits for the visitor's next
+    history fetch. Queued is the honest word — not failed (nothing went wrong) and
+    not delivered (nothing has reached them yet, so there is no delivered time)."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(admin, channel="widget", contact=LEAD_EMAIL)
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+    assert body["deliveryDetail"] == "widget_poll_only"
+
+    (row,) = await _messages(client, seeded.session_id)
+    assert row["deliveryStatus"] == "queued"
+    assert row["deliveryDetail"] == "widget_poll_only"
+    assert row["deliveredAt"] is None
+
+
+# --- item 6: the list says which sessions were billed ------------------------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_conversation_list_labels_a_never_billed_session(client):
+    """Two conversations: one reached the fire-once trigger (a ``counted_sessions``
+    row), one was refused at cap before its first model call. The list used to show
+    both the same way; the unbilled one is now labelled, so the owner does not read
+    an at-cap refusal as a conversation they paid for."""
+    admin = await _signup_verify_login(client)
+    now = datetime.now(UTC)
+    billed = await _seed(admin, channel="widget", contact=LEAD_EMAIL, last_message_at=now)
+    unbilled = await _seed(
+        admin, channel="sms", contact=LEAD_PHONE, last_message_at=now - timedelta(hours=1)
+    )
+    async with tenant_session(admin) as s:
+        s.add(
+            CountedSession(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=billed.instance_id,
+                session_id=billed.session_id,
+                billing_period_start=date.today(),
+            )
+        )
+        await s.flush()
+
+    rows = (await client.get("/api/v1/dashboard/conversations")).json()
+
+    assert [r["sessionId"] for r in rows] == [str(billed.session_id), str(unbilled.session_id)]
+    assert [r["countedForBilling"] for r in rows] == [True, False]
+    assert [r["endedAt"] for r in rows] == [None, None]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_taking_over_an_unbilled_session_counts_it_and_says_so(client):
+    """Becoming human-controlled IS the fire-once trigger (§3.4.1b): the take-over
+    response reports the session as counted, read back from the ledger after the
+    claim — never carried in from before it."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(admin, channel="widget", contact=LEAD_EMAIL)
+    (before,) = (await client.get("/api/v1/dashboard/conversations")).json()
+    assert before["countedForBilling"] is False
+
+    r = await client.post(f"/api/v1/dashboard/conversations/{seeded.session_id}/take-over")
+
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "human_controlled"
+    assert r.json()["countedForBilling"] is True

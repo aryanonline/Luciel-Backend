@@ -59,20 +59,25 @@ class ConversationSummaryOut(WireModel):
     started_at: datetime
     last_message_at: datetime
     summary: str | None = None
+    # Round 7 WP-3b item 4: when the session ENDED (§3.4.8 — never resumed). Non-null
+    # means take-over and a human reply are refused (409 ``session_ended``): nothing on
+    # the customer's transport is waiting on it, so there is nothing to hold.
+    ended_at: datetime | None = None
+    # Round 7 WP-3b item 6: whether this session was counted against the plan's
+    # conversation allowance (a ``counted_sessions`` row exists). False for a session
+    # that never reached the fire-once trigger — refused at cap, an LLM outage before
+    # the first model call — so the page can label an unbilled conversation instead of
+    # listing it beside the billed ones as if it were one.
+    counted_for_billing: bool = False
 
 
-class MessageOut(WireModel):
-    message_id: uuid.UUID
-    role: MessageRoleWire
-    text: str
-    at: datetime
-
-
-class HumanReplyRequest(WireModel):
-    """Admin-authored reply while the conversation is human_controlled (§3.4.12)."""
-
-    text: str = Field(min_length=1, max_length=4000)
-
+# Round 7 WP-3b item 5: what happened to a ``human_agent`` reply on the customer's
+# transport, PERSISTED on the row so it replays on reopen. ``delivered`` = the
+# provider accepted it; ``queued`` = the widget serves it on its next history fetch;
+# ``failed`` = nothing reached the customer (``deliveryDetail`` says why). Null on
+# every other role and on human replies from before the column existed — an unknown
+# outcome is reported as unknown, never as delivered.
+DeliveryStatusWire = Literal["delivered", "queued", "failed"]
 
 DeliveryDetailWire = Literal[
     "widget_poll_only",
@@ -97,6 +102,25 @@ DeliveryDetailWire = Literal[
     # (Used to surface as send_failed with "try again" copy.)
     "meta_reconnect_needed",
 ]
+
+
+class MessageOut(WireModel):
+    message_id: uuid.UUID
+    role: MessageRoleWire
+    text: str
+    at: datetime
+    # Round 7 WP-3b item 5 — ``human_agent`` rows only; null elsewhere. A reply Twilio
+    # rejected used to read like any other message when the owner reopened the
+    # conversation; the outcome now replays from the row.
+    delivery_status: DeliveryStatusWire | None = None
+    delivery_detail: DeliveryDetailWire | None = None
+    delivered_at: datetime | None = None
+
+
+class HumanReplyRequest(WireModel):
+    """Admin-authored reply while the conversation is human_controlled (§3.4.12)."""
+
+    text: str = Field(min_length=1, max_length=4000)
 
 
 class HumanReplyResult(WireModel):

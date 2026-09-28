@@ -19,17 +19,18 @@ from datetime import UTC, datetime
 from typing import cast
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import conflict, not_found, service_unavailable, validation_error
+from app.api.errors import ApiError, conflict, not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
 from app.lifecycle import lead_erasure
 from app.lifecycle.export_bundle import lead_export_rows, to_csv
 from app.models.audit import ActorType
+from app.models.budget import CountedSession
 from app.models.conversation import EscalationEvent, Transcript
 from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
@@ -40,12 +41,14 @@ from app.schemas_api.conversations import (
     AnswerEvidenceOut,
     ConversationSummaryOut,
     DeliveryDetailWire,
+    DeliveryStatusWire,
     EscalationEventOut,
     HumanReplyRequest,
     HumanReplyResult,
     LeadOut,
     LeadOutcomeRequest,
     MessageOut,
+    MessageRoleWire,
     PruneRequest,
     ScoringStatusWire,
     SourceChunkOut,
@@ -74,34 +77,51 @@ async def list_conversations(
     offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[ConversationSummaryOut]:
-    """The dashboard conversation list (§3.4.7) — newest activity first, paged."""
+    """The dashboard conversation list (§3.4.7) — newest activity first, paged.
+
+    Each row carries ``countedForBilling`` (round 7 WP-3b, item 6): whether the
+    session reached the fire-once budget trigger. The ledger is joined here rather
+    than re-derived from mode or message count, because the ledger IS the billing
+    truth (§3.4.1b) — a session refused at cap or lost to an outage before its first
+    model call has no row and must not be listed as if it were billed.
+    """
     limit, offset = _page(limit, offset)
     async with tenant_session(subject.admin_id) as s:
         rows = (
-            (
-                await s.execute(
-                    select(SessionModel)
-                    .where(SessionModel.admin_id == subject.admin_id)
-                    .order_by(SessionModel.last_message_at.desc(), SessionModel.id.desc())
-                    .offset(offset)
-                    .limit(limit)
-                )
+            await s.execute(
+                select(SessionModel, CountedSession.id)
+                .outerjoin(CountedSession, _counted_join(subject.admin_id))
+                .where(SessionModel.admin_id == subject.admin_id)
+                .order_by(SessionModel.last_message_at.desc(), SessionModel.id.desc())
+                .offset(offset)
+                .limit(limit)
             )
-            .scalars()
-            .all()
+        ).all()
+        return [_summary(sess, counted=counted_id is not None) for sess, counted_id in rows]
+
+
+def _counted_join(admin_id: uuid.UUID) -> ColumnElement[bool]:
+    """ON clause pairing a session with its ``counted_sessions`` row — at most one,
+    by ``uq_counted_session_once`` (admin, instance, session), so the join never
+    multiplies rows."""
+    return and_(
+        CountedSession.admin_id == admin_id,
+        CountedSession.instance_id == SessionModel.instance_id,
+        CountedSession.session_id == SessionModel.id,
+    )
+
+
+async def _counted_for_billing(
+    s: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> bool:
+    row = (
+        await s.execute(
+            select(CountedSession.id).where(
+                CountedSession.admin_id == admin_id, CountedSession.session_id == session_id
+            )
         )
-        return [
-            ConversationSummaryOut(
-                session_id=r.id,
-                lead_id=r.resolved_lead_id,
-                channel=r.channel,
-                mode=r.mode,
-                started_at=r.started_at,
-                last_message_at=r.last_message_at,
-                summary=r.summary,
-            )
-            for r in rows
-        ]
+    ).first()
+    return row is not None
 
 
 async def _require_session(
@@ -171,7 +191,24 @@ async def get_messages(
                 )
                 for r in (archived or [])
             ]
-        return [MessageOut(message_id=r.id, role=r.role, text=r.text, at=r.at) for r in rows]
+        return [_message_out(r) for r in rows]
+
+
+def _message_out(row: Transcript) -> MessageOut:
+    """One transcript row on the wire, with a human reply's PERSISTED delivery outcome
+    (round 7 WP-3b, item 5) so a rejected reply still reads as failed on reopen. The
+    stored detail may be a provider string; the wire vocabulary is closed, so it maps
+    through the same collapse the live result did (send_failed for anything else)."""
+    status = row.delivery_status
+    return MessageOut(
+        message_id=row.id,
+        role=cast("MessageRoleWire", row.role),
+        text=row.text,
+        at=row.at,
+        delivery_status=cast("DeliveryStatusWire", status) if status else None,
+        delivery_detail=_delivery_detail(row.delivery_detail) if status else None,
+        delivered_at=row.delivered_at,
+    )
 
 
 @router.post("/conversations/{session_id}/messages", response_model=HumanReplyResult)
@@ -194,6 +231,12 @@ async def send_human_message(
     """
     async with tenant_session(subject.admin_id) as s:
         sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
+        if sess.ended_at is not None:
+            # Round 7 WP-3b item 4: the conversation ENDED (§3.4.8). Nothing on the
+            # customer's transport is waiting on it; a reply persisted here would sit in
+            # a transcript nobody is reading and, on a push channel, arrive as a message
+            # out of nowhere. Refused before anything is written.
+            raise _session_ended()
         if sess.mode != "human_controlled":
             raise validation_error("Take over the conversation before replying.")
 
@@ -263,11 +306,42 @@ async def send_human_message(
         # A delivered reply may still carry a detail the owner must see (the voice→SMS
         # bridge); an undelivered one always does.
         detail = result.detail if (not result.delivered or result.detail) else None
+        # Round 7 WP-3b item 5: the outcome lives on the row, not only in this response
+        # and the audit log — so GET .../messages replays a rejected reply as failed
+        # when the owner reopens the conversation instead of listing it like any other
+        # message. The provider's own reason is kept (truncated to the column) and
+        # collapses to the wire vocabulary on the way out, as it does here.
+        _persist_delivery_outcome(row, result)
         return HumanReplyResult(
-            message=MessageOut(message_id=row.id, role="human_agent", text=row.text, at=row.at),
+            message=_message_out(row),
             delivered=result.delivered,
             delivery_detail=_delivery_detail(detail),
         )
+
+
+def _persist_delivery_outcome(row: Transcript, result: outbound.OutboundResult) -> None:
+    if result.delivered:
+        row.delivery_status = "delivered"
+        row.delivered_at = datetime.now(UTC)
+    elif result.detail == "widget_poll_only":
+        # Not a failure: the widget has no push transport and serves the reply on its
+        # next history fetch. Not a delivery either — nothing has reached the visitor
+        # yet, so delivered_at stays NULL.
+        row.delivery_status = "queued"
+    else:
+        row.delivery_status = "failed"
+    row.delivery_detail = result.detail[:64] if result.detail else None
+
+
+def _session_ended() -> ApiError:
+    """The typed refusal for a takeover action on an ENDED session (round 7 WP-3b,
+    item 4): 409 → ``conflict`` on the frontend's status map, with the wire word
+    ``session_ended`` in the message so the page can name the state rather than
+    show a generic conflict."""
+    return conflict(
+        "This conversation has ended, so there is nothing to take over or reply "
+        "into (session_ended)."
+    )
 
 
 async def _session_lead(s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel) -> Lead | None:
@@ -412,18 +486,29 @@ def _delivery_detail(detail: str | None) -> DeliveryDetailWire | None:
 async def take_over(
     session_id: uuid.UUID, subject: Subject = Depends(current_admin)
 ) -> ConversationSummaryOut:
-    """Admin live takeover → human_controlled (§3.4.12). Stops the loop for the session."""
+    """Admin live takeover → human_controlled (§3.4.12). Stops the loop for the session.
+
+    An ENDED session is refused with 409 ``session_ended`` (round 7 WP-3b, item 4):
+    the customer's transport is no longer waiting on it, so switching it to
+    human_controlled would show a person holding a conversation nobody can answer
+    into. Nothing is changed, counted or audited on the refusal."""
     async with tenant_session(subject.admin_id) as s:
         sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
-        sess = await handoff.take_over(
-            s,
-            admin_id=subject.admin_id,
-            instance_id=sess.instance_id,
-            session_id=session_id,
-            actor_user_id=subject.user_id,
-            luciel_initiated=False,
-        )
-        return _summary(sess)
+        try:
+            sess = await handoff.take_over(
+                s,
+                admin_id=subject.admin_id,
+                instance_id=sess.instance_id,
+                session_id=session_id,
+                actor_user_id=subject.user_id,
+                luciel_initiated=False,
+            )
+        except handoff.SessionEnded:
+            raise _session_ended() from None
+        # Becoming human-controlled is itself the fire-once budget trigger (§3.4.1b),
+        # so the flag is read back AFTER the takeover, not carried in from before it.
+        counted = await _counted_for_billing(s, admin_id=subject.admin_id, session_id=session_id)
+        return _summary(sess, counted=counted)
 
 
 @router.post("/conversations/{session_id}/hand-back", response_model=ConversationSummaryOut)
@@ -440,7 +525,8 @@ async def hand_back(
             session_id=session_id,
             actor_user_id=subject.user_id,
         )
-        return _summary(sess)
+        counted = await _counted_for_billing(s, admin_id=subject.admin_id, session_id=session_id)
+        return _summary(sess, counted=counted)
 
 
 @router.get(
@@ -909,7 +995,7 @@ async def mark_lead_outcome(
         return _lead_out(lead)
 
 
-def _summary(sess: SessionModel) -> ConversationSummaryOut:
+def _summary(sess: SessionModel, *, counted: bool) -> ConversationSummaryOut:
     return ConversationSummaryOut(
         session_id=sess.id,
         lead_id=sess.resolved_lead_id,
@@ -918,4 +1004,6 @@ def _summary(sess: SessionModel) -> ConversationSummaryOut:
         started_at=sess.started_at,
         last_message_at=sess.last_message_at,
         summary=sess.summary,
+        ended_at=sess.ended_at,
+        counted_for_billing=counted,
     )
