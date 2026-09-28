@@ -449,7 +449,10 @@ async def get_answer_evidence(
             scoring_status=scoring_status,
             source_chunks=source_chunks,
             attribution_status=attribution_status,
-            flagged_by_admin=False,
+            # Round 7 WP-4c #8: read from the row (migration 0070). This was a
+            # constant False — the owner flagged an answer, reloaded, and saw it
+            # unflagged.
+            flagged_by_admin=msg.flagged_by_admin_at is not None,
         )
 
 
@@ -460,7 +463,11 @@ async def flag_answer(
     response: Response,
     subject: Subject = Depends(current_admin),
 ) -> Response:
-    """Admin flags a Luciel answer for review (§3.4.13). Audit-only in Arc 14."""
+    """Admin flags a Luciel answer for review (§3.4.13).
+
+    Persisted on the row (``flagged_by_admin_at``, migration 0070 — round 7 WP-4c
+    #8) AND audited. The flag was audit-only before, so the evidence read could not
+    show it. Idempotent: flagging twice keeps the first timestamp."""
     async with tenant_session(subject.admin_id) as s:
         sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
         msg = (
@@ -474,6 +481,8 @@ async def flag_answer(
         ).scalar_one_or_none()
         if msg is None:
             raise not_found("Message not found.")
+        if msg.flagged_by_admin_at is None:
+            msg.flagged_by_admin_at = datetime.now(UTC)
         await audit.emit(
             s,
             admin_id=subject.admin_id,
