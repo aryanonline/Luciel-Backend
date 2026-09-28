@@ -627,8 +627,12 @@ async def run_health_sweep(
 # Round 6 WP-C: a live call the provider refused flips the row at once
 # --------------------------------------------------------------------------- #
 
-#: Failure-reason suffixes the tool backends use when the provider answered 401/403.
-PROVIDER_AUTH_FAILURE_SUFFIXES = ("_http_401", "_http_403")
+#: Failure-reason suffixes the tool backends use when the provider answered 401/403:
+#: the native CRM/calendar APIs' ``<call>_http_401`` and — round 7 WP-4a item 6 — the
+#: webhook sandbox's ``non_2xx:401`` (``crm_webhook_non_2xx:401`` once the CRM
+#: backend has prefixed it), so a webhook endpoint that refuses the owner's header
+#: flips its row exactly like a vendor that refuses a token.
+PROVIDER_AUTH_FAILURE_SUFFIXES = ("_http_401", "_http_403", "non_2xx:401", "non_2xx:403")
 
 
 def is_provider_auth_failure(reason: str) -> bool:

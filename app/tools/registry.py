@@ -213,9 +213,26 @@ class _TenantCrmBackend:
 
             return await SalesforceCrmBackend().upsert_lead(ctx, lead_key, fields)
         if provider == "custom_webhook":
-            from app.tools.crm_backend import WebhookCrmBackend  # noqa: PLC0415
+            from app.tools.crm_backend import CrmUnavailable, WebhookCrmBackend  # noqa: PLC0415
 
-            return await WebhookCrmBackend().upsert_lead(ctx, lead_key, fields)
+            try:
+                return await WebhookCrmBackend().upsert_lead(ctx, lead_key, fields)
+            except CrmUnavailable as exc:
+                # Round 7 WP-4a item 6: the native backends flip their row the moment
+                # the vendor refuses the token (round 6 WP-C); the webhook path raised
+                # ``crm_webhook_non_2xx:401`` and left the row reading Connected until
+                # the next sweep. Same seam, same once-per-incident transition.
+                if ctx.session is not None:
+                    from app.connections import health  # noqa: PLC0415 — import cycle
+
+                    await health.flag_if_provider_auth_failure(
+                        ctx.session,
+                        admin_id=ctx.admin_id,
+                        instance_id=ctx.instance_id,
+                        connection_type="crm",
+                        reason=str(exc),
+                    )
+                raise
         return await self._unavailable.upsert_lead(ctx, lead_key, fields)
 
 

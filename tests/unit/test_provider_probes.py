@@ -77,8 +77,12 @@ class _Client:
     async def __aexit__(self, *_exc: object) -> None:
         return None
 
-    async def get(self, url: str, *, headers: Any = None, auth: Any = None) -> _Resp:
-        type(self).calls.append({"url": url, "headers": dict(headers or {}), "auth": auth})
+    async def get(
+        self, url: str, *, headers: Any = None, auth: Any = None, extensions: Any = None
+    ) -> _Resp:
+        type(self).calls.append(
+            {"url": url, "headers": dict(headers or {}), "auth": auth, "extensions": extensions}
+        )
         status = type(self).statuses.pop(0)
         if isinstance(status, Exception):
             raise status
@@ -145,7 +149,8 @@ def test_liveness_requests_name_the_provider_identity_call():
         {"authToken": "auth"},
     )
     assert tw_token is not None and tw_token.auth == ("AC123", "auth")
-    # Nothing to ask for a provisioned sender, a bare webhook URL or a crawl target.
+    # Nothing to ask for a provisioned sender, a webhook row with no URL on file, or a
+    # crawl target.
     for provider, ctype in (
         ("csv", "record_source"),
         ("custom_webhook", "crm"),
@@ -155,6 +160,119 @@ def test_liveness_requests_name_the_provider_identity_call():
         assert liveness_request_for(_conn(provider, connection_type=ctype), {}) is None
     # A Salesforce row with no org URL cannot be probed: skipped, never guessed.
     assert liveness_request_for(_conn("salesforce"), {"access_token": "t"}) is None
+
+
+# --- Round 7 WP-4a item 6: the URL-shaped providers are probed at their own URL ----- #
+def test_url_shaped_rows_are_probed_at_the_stored_url_with_the_stored_header():
+    hook = liveness_request_for(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        ),
+        {"auth_header": "Bearer tenant-token"},
+    )
+    assert hook is not None
+    assert hook.url == "https://hooks.example.com/leads"
+    assert hook.headers["Authorization"] == "Bearer tenant-token"
+    assert hook.pin_public_host is True, "an owner URL is pinned like every other admin fetch"
+    # No header on file is a legitimate shape (the URL is the whole credential).
+    bare = liveness_request_for(
+        _conn(
+            "outbound_webhook",
+            connection_type="outbound_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/events"},
+        ),
+        {},
+    )
+    assert bare is not None and "Authorization" not in bare.headers
+    # The live connector is asked the same synthetic query as its connect-time proof.
+    live = liveness_request_for(
+        _conn(
+            "live_connector",
+            connection_type="record_source",
+            auth_class="long_lived_token",
+            cfg={"url": "https://records.example.com/lookup"},
+        ),
+        {"api_key": "k"},
+    )
+    assert live is not None
+    assert live.url == f"https://records.example.com/lookup?q={probes.LIVE_CONNECTOR_PROBE_QUERY}"
+    assert live.headers["Authorization"] == "Bearer k" and live.pin_public_host is True
+    # A row written under the superseded ``api`` id resolves the same way.
+    legacy = liveness_request_for(
+        _conn("api", connection_type="record_source", cfg={"url": "https://r.example.com/x"}), {}
+    )
+    assert legacy is not None and legacy.url.endswith(f"?q={probes.LIVE_CONNECTOR_PROBE_QUERY}")
+
+
+def _pin_to(monkeypatch, host: str = "hooks.example.com", ip: str = "203.0.113.7") -> None:
+    from app.connections import sandbox
+
+    monkeypatch.setattr(sandbox, "pin_public_target", lambda url: (url.replace(host, ip, 1), host))
+
+
+async def test_a_webhook_endpoint_that_refuses_the_header_is_a_dead_row(monkeypatch):
+    _pin_to(monkeypatch)
+    probe = ProviderLivenessProbe(
+        store=_Store({"auth_header": "Bearer stale"}),
+        transport_factory=_client(401),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        )
+    )
+    assert result.ok is False
+    assert "Custom webhook rejected the stored credential" in (result.detail or "")
+    call = _Client.calls[0]
+    # Sent to the validated address with the owner's hostname as Host + SNI (F090).
+    assert call["url"] == "https://203.0.113.7/leads"
+    assert call["headers"]["Host"] == "hooks.example.com"
+    assert call["extensions"] == {"sni_hostname": "hooks.example.com"}
+    assert call["headers"]["Authorization"] == "Bearer stale"
+
+
+@pytest.mark.parametrize("status", [200, 404, 405, 503])
+async def test_a_webhook_endpoint_that_does_not_refuse_never_flips_the_row(monkeypatch, status):
+    _pin_to(monkeypatch)
+    probe = ProviderLivenessProbe(
+        store=_Store({}), transport_factory=_client(status), refresher=_NoRefresh()
+    )
+    result = await probe.probe(
+        _conn(
+            "outbound_webhook",
+            connection_type="outbound_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/events"},
+        )
+    )
+    assert result.ok is True
+
+
+async def test_an_owner_url_that_now_resolves_privately_is_not_asked(monkeypatch):
+    from app.connections import sandbox
+
+    def _refuse(url: str) -> tuple[str, str]:
+        raise sandbox.SsrfBlocked("non_public_address")
+
+    monkeypatch.setattr(sandbox, "pin_public_target", _refuse)
+    probe = ProviderLivenessProbe(
+        store=_Store({}), transport_factory=_client(200), refresher=_NoRefresh()
+    )
+    result = await probe.probe(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        )
+    )
+    assert result.ok is True and result.detail == "probe_skipped:transport_error"
+    assert _Client.calls == [], "nothing is sent to an address the pin refused"
 
 
 async def test_a_2xx_is_healthy():

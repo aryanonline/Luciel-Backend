@@ -773,3 +773,83 @@ async def test_a_down_webhook_endpoint_fails_a_fresh_connect_without_a_connected
     row = await _row(admin, cid)
     assert row.status == "unconfigured"
     assert await get_secret_store().get(ref) is None
+
+
+# --------------------------------------------------------------------------- #
+# Item 6 — a webhook endpoint that refuses the owner's header flips the row at once
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_webhook_crm_that_refuses_the_header_on_a_push_flips_the_row(monkeypatch):
+    from app.connections import sandbox
+    from app.connections.secrets import get_secret_store
+    from app.tools import contract as c
+    from app.tools.contract import ToolContext
+    from app.tools.crm_backend import CrmUnavailable
+    from app.tools.registry import _TenantCrmBackend
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"auth_header": "Bearer revoked"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="custom_webhook",
+        auth_class="long_lived_token",
+        status="connected",
+        cfg={"url": WEBHOOK_URL, "egressAllowlist": ["hooks.acme.example"]},
+        secret_ref=ref,
+    )
+
+    async def _refused(**kwargs):  # noqa: ANN003 — mirrors run_byo_webhook's kwargs
+        return c.failed("non_2xx:401")
+
+    monkeypatch.setattr(sandbox, "run_byo_webhook", _refused)
+    # The push wrapper (runtime.crm_push) catches the failure INSIDE the turn's
+    # session and stamps the lead, so the flag commits with it — mirrored here.
+    async with tenant_session(admin) as s:
+        with pytest.raises(CrmUnavailable, match="crm_webhook_non_2xx:401"):
+            await _TenantCrmBackend().upsert_lead(
+                ToolContext(admin_id=admin, instance_id=iid, session=s),
+                "jane@acme.com",
+                {"email": "jane@acme.com"},
+            )
+    row = await _row(admin, cid)
+    assert row.status == "error"
+    assert "Custom webhook rejected the stored credential" in (row.status_detail or "")
+    assert "non_2xx:401" in (row.status_detail or "")
+    transitions = [(x["old_status"], x["new_status"]) for x in await _status_changes(admin)]
+    assert transitions == [("connected", "error")]
+    assert await _attention_emails(admin) == 1
+
+    # A plain outage (5xx) is not a refusal: the row stays connected.
+    admin2 = uuid.uuid4()
+    iid2 = await _seed_tenant(admin2)
+    ref2 = f"vm/{admin2}/{iid2}/crm"
+    await get_secret_store().put(ref2, {"auth_header": "Bearer fine"})
+    cid2 = await _seed_connection(
+        admin2,
+        iid2,
+        connection_type="crm",
+        provider="custom_webhook",
+        auth_class="long_lived_token",
+        status="connected",
+        cfg={"url": WEBHOOK_URL, "egressAllowlist": ["hooks.acme.example"]},
+        secret_ref=ref2,
+    )
+
+    async def _down(**kwargs):  # noqa: ANN003
+        return c.failed("non_2xx:503")
+
+    monkeypatch.setattr(sandbox, "run_byo_webhook", _down)
+    async with tenant_session(admin2) as s:
+        with pytest.raises(CrmUnavailable, match="crm_webhook_non_2xx:503"):
+            await _TenantCrmBackend().upsert_lead(
+                ToolContext(admin_id=admin2, instance_id=iid2, session=s),
+                "jane@acme.com",
+                {"email": "jane@acme.com"},
+            )
+    assert (await _row(admin2, cid2)).status == "connected"

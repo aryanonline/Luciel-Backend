@@ -186,17 +186,44 @@ class LivenessRequest:
     headers: dict[str, str] = field(default_factory=dict)
     # HTTP Basic credentials (Twilio API-key / auth-token tenants).
     auth: tuple[str, str] | None = None
+    # An OWNER-supplied URL (round 7 WP-4a item 6): resolved once and connected to
+    # the validated address with Host/SNI set to the name (the F090 rebinding pin
+    # every other admin-URL fetch uses), never to whatever the name resolves to at
+    # send time. A vendor identity endpoint is pinned by its hostname already.
+    pin_public_host: bool = False
 
 
 def liveness_request_for(
     connection: InstanceConnection, material: dict[str, str]
 ) -> LivenessRequest | None:
     """The identity call for this row, or None when the provider has none we can make
-    (a provisioned sender, a bare webhook URL, a website crawl)."""
+    (a provisioned sender, a webhook row with no URL on file, a website crawl)."""
     provider = registry.canonical_provider(connection.provider)
     cfg = connection.non_secret_config or {}
     token = str(material.get("access_token") or "").strip()
     bearer = {"Authorization": f"Bearer {token}"}
+    if provider in registry.URL_SHAPED_PROVIDERS or provider == "live_connector":
+        # Round 7 WP-4a item 6: the URL-shaped providers had no branch here, and
+        # ``secret_material_expected`` is (rightly) False for them — so a webhook or
+        # record endpoint that started refusing the owner's header, or vanished, read
+        # Connected forever. One GET with the stored header; the same boundary as
+        # every vendor call: only 401/403 flips the row, a 404/405 from a POST-only
+        # receiver or an outage is "could not tell".
+        url = str(cfg.get("url") or "").strip()
+        if not url:
+            return None
+        headers = {"Accept": "application/json"}
+        if provider == "live_connector":
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}q={quote(LIVE_CONNECTOR_PROBE_QUERY, safe='')}"
+            api_key = str(material.get("api_key") or "").strip()
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            auth_header = str(material.get("auth_header") or "").strip()
+            if auth_header:
+                headers["Authorization"] = auth_header
+        return LivenessRequest(url, headers, pin_public_host=True)
     if provider == "salesforce":
         base = str(material.get("instance_url") or cfg.get("instanceUrl") or "").rstrip("/")
         if not token or not base:
@@ -273,9 +300,25 @@ class ProviderLivenessProbe:
         return RegistryTokenRefresher()
 
     async def _status_of(self, request: LivenessRequest) -> int | None:
+        url, headers = request.url, dict(request.headers)
+        extensions: dict[str, Any] = {}
+        if request.pin_public_host:
+            from app.connections import sandbox  # noqa: PLC0415 — the owner-URL path only
+
+            try:
+                url, host = sandbox.pin_public_target(request.url)
+            except sandbox.SsrfBlocked as exc:
+                # A name that now resolves somewhere private is not asked at all —
+                # and not evidence about the credential either: skipped.
+                logger.info("liveness_probe_pin_refused reason=%s", exc)
+                return None
+            headers["Host"] = host
+            extensions["sni_hostname"] = host
         try:
             async with self._transport_factory() as client:
-                response = await client.get(request.url, headers=request.headers, auth=request.auth)
+                response = await client.get(
+                    url, headers=headers, auth=request.auth, extensions=extensions
+                )
         except Exception as exc:  # noqa: BLE001 — a transport failure is "could not ask"
             logger.info("liveness_probe_transport_error error=%s", type(exc).__name__)
             return None
