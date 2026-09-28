@@ -184,16 +184,19 @@ class ToolBroker:
         # point every dispatch passes through, and only on `ok` — a metric fed
         # by the same event that told the customer "booked" can never disagree
         # with what Luciel said (§3.3.4 rule 1: no success-claim without ok, and
-        # its converse: no metric without a success-claim).
-        if tool.tool_id == "book_appointment" and result.outcome is c.Outcome.ok:
+        # its converse: no metric without a success-claim). A CONFIRMED booking
+        # carries the provider's reference; Calendly's ok is a scheduling LINK with
+        # none (the time is held only once the customer completes it), and the
+        # morning brief must not say "1 appointment booked" for a link that was
+        # merely sent (round 7 WP-2 remainder, item 11).
+        booking_ref = (
+            str(result.payload.get("bookingRef") or "") if result.outcome is c.Outcome.ok else ""
+        )
+        if tool.tool_id == "book_appointment" and booking_ref:
             from app.models.booking import BookingEvent  # noqa: PLC0415
 
             self.s.add(
-                BookingEvent(
-                    admin_id=admin_id,
-                    instance_id=instance_id,
-                    booking_ref=str(result.payload.get("bookingRef") or ""),
-                )
+                BookingEvent(admin_id=admin_id, instance_id=instance_id, booking_ref=booking_ref)
             )
 
         await self._trace(

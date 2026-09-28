@@ -228,7 +228,14 @@ class CalendlyBackend:
         cred = await self._credentials(ctx)
         if booking_ref:
             event = await self._api.get_event(cred, booking_ref)
-            if event is None or event.invitee_email.lower() != email.lower():
+            # The same bar as the search path: a cancelled booking is no longer on
+            # file, so a move or a second cancel answers ``empty`` — never a
+            # ``slot_conflict`` about a time nobody holds (round 7 WP-2, item 11).
+            if (
+                event is None
+                or event.status != "active"
+                or event.invitee_email.lower() != email.lower()
+            ):
                 return []
             return [_booking(event)]
         now = datetime.now(UTC)

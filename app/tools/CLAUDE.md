@@ -63,3 +63,14 @@ make that state explicit and test it.
   in-memory trace as `filled_from_record` (field names; the durable row is unchanged).
   `ToolContext.gathered` finally has a writer. Never fill from an unconfirmed
   address — the bar is the same as sending to it.
+
+## Booking mini-audit (round 7 WP-2 remainder item 11, 2026-09-28)
+- `booking_events` (the brief's "appointments booked", the analytics card) gets a row for
+  a CONFIRMED booking only: a `book_appointment` ok that carries `bookingRef`. Calendly's
+  ok is a scheduling LINK with none (held only once the customer completes it) and writes
+  nothing; a move or a cancel never writes. `tests/integration/test_round7_booking_audit.py`
+  walks read-before-write, move, cancel and the counted row on both providers through the
+  broker over the real in-memory transports.
+- `CalendlyBackend._find_bookings` by reference requires `status == "active"` like the
+  search path, so a cancelled booking answers `empty` on a move or a second cancel —
+  never `slot_conflict` about a time nobody holds.
