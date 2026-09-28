@@ -183,11 +183,41 @@ async def _confirm_opt_keyword(outcome: pipeline.OptOutHandled) -> None:
 async def _record_contact_reply(outcome: pipeline.ContactReply) -> None:
     """An escalation CONTACT wrote back on the tenant's number (audit F051): that is the
     owner's side of the conversation, not a lead — no session, no runtime, no billing.
-    Recorded so the dashboard's escalation trail shows the acknowledgement."""
+    Recorded so the dashboard's escalation trail shows the acknowledgement. A text
+    that IS the number's confirmation code (round 7 WP-4b) consumes it: the number is
+    proven from the contact's own phone, no dashboard entry needed."""
     from app.audit import log as audit  # noqa: PLC0415
     from app.models.audit import ActorType  # noqa: PLC0415
 
     async with tenant_session(outcome.admin_id) as s:
+        if outcome.confirmation_code is not None:
+            from app.notifications import contact_confirmation  # noqa: PLC0415
+
+            result = await contact_confirmation.confirm_sms_code(
+                s,
+                admin_id=outcome.admin_id,
+                number=outcome.sender,
+                code=outcome.confirmation_code,
+            )
+            await audit.emit(
+                s,
+                admin_id=outcome.admin_id,
+                instance_id=outcome.instance_id,
+                actor_type=ActorType.platform,
+                event_type=(
+                    "escalation_contact_verified"
+                    if result == contact_confirmation.CONFIRMED
+                    else "escalation_contact_code_rejected"
+                ),
+                payload={
+                    "channel": outcome.channel,
+                    "contact_role": outcome.contact_role,
+                    "number_suffix": contact_confirmation.normalize_number(outcome.sender)[-4:],
+                    "outcome": result,
+                    "entered": "texted_back",
+                },
+            )
+            return
         await audit.emit(
             s,
             admin_id=outcome.admin_id,
