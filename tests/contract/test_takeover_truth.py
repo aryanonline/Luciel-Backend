@@ -9,6 +9,12 @@ tests/integration/test_takeover_reply_context.py.
     widget-then-SMS unification the lead record is keyed on the older email, and the
     SMS reply went there. No identifier of that kind → ``no_recipient_for_channel``,
     never a send to another channel.
+  * item 2: an email reply threads under the customer's mail — Graph's
+    ``/me/messages/{id}/reply`` on a BYO mailbox, In-Reply-To / References on the
+    legacy SES path — instead of a fresh "Re: your inquiry".
+  * item 3: the reply is signed by the business, never "written by an AI assistant".
+  * item 7: a Meta reply goes out AS the surface the conversation happened on TO the
+    persisted sender id; an unhealthy grant is ``meta_reconnect_needed``.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from app.connections.secrets import secret_ref_for
@@ -346,3 +353,221 @@ async def test_a_volunteered_phone_beside_an_email_key_reaches_the_sms_reply(cli
 
     assert body["delivered"] is True
     assert twilio.sent["to"] == LEAD_PHONE
+
+
+# --- items 2 + 3: the email reply threads and is signed by a person ------------------ #
+@pytest.fixture
+def graph(monkeypatch) -> list[dict]:
+    """A connected BYO mailbox whose Graph calls land in a fake httpx client, so the
+    endpoint and payload the reply is sent with can be asserted."""
+    import httpx
+    from app.channels import outlook_sender
+
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def post(self, url, *, json=None, headers=None):
+            calls.append({"url": url, "json": json, "headers": headers})
+            return SimpleNamespace(status_code=202)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    async def _build(session, admin_id, instance_id, *, store=None):
+        return outlook_sender.GraphMailSender("ms-tok")
+
+    monkeypatch.setattr(outlook_sender, "build_tenant_outlook_sender", _build)
+    return calls
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_byo_mailbox_reply_threads_under_the_customers_message(client, graph):
+    """The inbound Graph id persisted at ingress is the ``/messages/{id}/reply``
+    handle: the reply hangs under Dana's own mail in her client, from the owner's
+    mailbox — not a new "Re: your inquiry" thread through /me/sendMail."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="email",
+        contact=LEAD_EMAIL,
+        email_provider="outlook",
+        inbound_subject="Patio quote",
+        inbound_message_id="AAMkAGE1",
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    assert body["deliveryDetail"] is None
+    (call,) = graph
+    assert call["url"].endswith("/me/messages/AAMkAGE1/reply")
+    assert call["headers"] == {"Authorization": "Bearer ms-tok"}
+    comment = call["json"]["comment"]
+    assert comment.startswith(REPLY)
+    # Item 3: a person's words are never signed as an AI's; the opt-out promise stays.
+    assert "written by an AI assistant" not in comment
+    assert "Sent by" in comment
+    assert "Reply STOP to opt out" in comment
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_byo_mailbox_reply_with_no_inbound_context_is_a_new_mail_to_the_lead(client, graph):
+    """A session from before the reply context existed has nothing to thread under:
+    the reply is still sent, as a new mail to the lead's address, and says so
+    through the endpoint it takes — never a fabricated reply handle."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(admin, channel="email", contact=LEAD_EMAIL, email_provider="outlook")
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    (call,) = graph
+    assert call["url"].endswith("/me/sendMail")
+    message = call["json"]["message"]
+    assert message["subject"] == "Re: your inquiry"
+    assert message["toRecipients"] == [{"emailAddress": {"address": LEAD_EMAIL}}]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_legacy_ses_reply_threads_with_headers_and_is_signed_by_the_business(
+    client, platform_email
+):
+    """No BYO mailbox: the reply leaves through the platform SES sender AS the tenant's
+    provisioned address, on the customer's subject, with In-Reply-To / References
+    set to their Message-ID — and the human footer."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="email",
+        contact=LEAD_EMAIL,
+        email_provider="ses",
+        inbound_subject="Patio quote",
+        inbound_message_id="<abc123@lead.example>",
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    (sent,) = platform_email.sent
+    assert sent["to"] == LEAD_EMAIL
+    assert sent["from_address"] == TENANT_EMAIL
+    assert sent["subject"] == "Re: Patio quote"
+    assert sent["headers"] == {
+        "In-Reply-To": "<abc123@lead.example>",
+        "References": "<abc123@lead.example>",
+    }
+    text = str(sent["body"])
+    assert text.startswith(REPLY)
+    assert "written by an AI assistant" not in text
+    assert "Sent by" in text
+    assert "Reply STOP to opt out" in text
+
+
+# --- item 7: the Meta reply goes out AS the surface the conversation happened on ----- #
+class FakeMetaSender:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, str]] = []
+
+    async def send_message(self, *, channel, sender_id, recipient_id, body):
+        self.sent.append(
+            {"channel": channel, "sender_id": sender_id, "recipient_id": recipient_id, "body": body}
+        )
+        return f"mid-{len(self.sent)}"
+
+
+@pytest.fixture
+def meta_sender(monkeypatch) -> FakeMetaSender:
+    from app.channels import meta_sender as sender_mod
+
+    fake = FakeMetaSender()
+
+    async def _build(session, admin_id, instance_id, *, connection_type="channel_auth", store=None):
+        return fake
+
+    monkeypatch.setattr(sender_mod, "build_tenant_meta_sender", _build)
+    return fake
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_messenger_reply_goes_out_as_the_persisted_surface_to_the_persisted_sender(
+    client, meta_sender
+):
+    """The lead record is email-keyed (unified with an earlier email conversation);
+    the Messenger conversation's page and the customer's page-scoped id were
+    persisted at ingress. The reply is sent AS that page TO that id — not resolved
+    from the channel name, not sent to the email."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="messenger",
+        contact=LEAD_EMAIL,
+        identifiers=(("email", LEAD_EMAIL),),
+        meta_status="connected",
+        meta_destination_id=PAGE_ID,
+        meta_sender_id=PSID,
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    assert body["deliveryDetail"] is None
+    assert meta_sender.sent == [
+        {"channel": "messenger", "sender_id": PAGE_ID, "recipient_id": PSID, "body": REPLY}
+    ]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_messenger_reply_on_an_expired_grant_reads_meta_reconnect_needed(
+    client, meta_sender
+):
+    """The grant that owns the page is expired: Graph would reject its token. The
+    reply is not attempted and the owner reads the wire word that names the fix —
+    not ``send_failed`` with "try again" copy."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="messenger",
+        contact=PSID,
+        meta_status="expired",
+        meta_destination_id=PAGE_ID,
+        meta_sender_id=PSID,
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is False
+    assert body["deliveryDetail"] == "meta_reconnect_needed"
+    assert meta_sender.sent == []
+    (payload,) = await _sent_audit_payloads(admin)
+    assert payload["delivery_detail"] == "meta_reconnect_needed"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_legacy_messenger_session_on_an_email_keyed_lead_is_refused_not_rerouted(
+    client, meta_sender
+):
+    """A Messenger session from before the sender id was persisted, whose lead record
+    is keyed on an email: there is no page-scoped id to send to, and the email is
+    not one. Refused honestly rather than handed to Graph as a recipient."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="messenger",
+        contact=LEAD_EMAIL,
+        identifiers=(("email", LEAD_EMAIL),),
+        meta_status="connected",
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is False
+    assert body["deliveryDetail"] == "no_recipient_for_channel"
+    assert meta_sender.sent == []

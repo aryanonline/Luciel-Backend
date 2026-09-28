@@ -234,6 +234,15 @@ async def send_human_message(
                 channel=sess.channel,
                 to=recipient,
                 body=body.text,
+                # The reply goes out AS the conversation it answers (round 7 WP-3b): in
+                # the customer's own email thread (subject + the inbound message id the
+                # ingress persisted — Graph's /messages/{id}/reply on a BYO mailbox,
+                # In-Reply-To on SES), and on Meta AS the surface they wrote to.
+                subject=sess.inbound_subject,
+                in_reply_to=sess.inbound_message_id,
+                sender_id=sess.meta_destination_id,
+                # A person wrote this: signed by the business, never as an AI (item 3).
+                author_role=outbound.AUTHOR_HUMAN_AGENT,
             )
         await audit.emit(
             s,
@@ -385,6 +394,8 @@ _WIRE_DELIVERY_DETAILS = frozenset(
         "mailbox_reconnect_needed",
         # Round 7 WP-3b item 1: no identifier of this channel's kind on the lead.
         "no_recipient_for_channel",
+        # Round 7 WP-3b item 7: the grant owning the Meta surface cannot send.
+        "meta_reconnect_needed",
     }
 )
 

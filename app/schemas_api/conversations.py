@@ -92,6 +92,10 @@ DeliveryDetailWire = Literal[
     # channel can deliver to (an email-keyed record on an SMS conversation after a
     # unification). The reply is persisted, never re-routed to another channel.
     "no_recipient_for_channel",
+    # Round 7 WP-3b item 7: the Meta grant that owns the surface the conversation
+    # happened on is expired / errored / unbound — the owner must reconnect Meta.
+    # (Used to surface as send_failed with "try again" copy.)
+    "meta_reconnect_needed",
 ]
 
 
