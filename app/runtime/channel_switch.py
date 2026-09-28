@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.lead import LeadIdentifier
-from app.runtime.lead_capture import normalize_identifier, normalize_phone
+from app.runtime.lead_capture import identifier_kind, normalize_identifier, normalize_phone
 
 #: outbound channel -> the identifier kind it needs
 KIND_FOR_CHANNEL: dict[str, str] = {"email": "email", "sms": "phone"}
@@ -174,6 +174,39 @@ async def confirmed_identifier(
         )
     ).scalar_one_or_none()
     return str(row) if row else None
+
+
+#: The identifier kinds that double as a tool's required input of the same name
+#: (``email`` for the scheduling tools, ``phone`` for a text).
+_INPUT_KINDS = ("email", "phone")
+
+
+async def confirmed_inputs_on_file(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    lead_id: uuid.UUID | None,
+    transport_identifier: str | None = None,
+) -> dict[str, str]:
+    """The tool inputs this conversation can fill without asking (round 7 WP-2
+    remainder, item 10): the lead's CONFIRMED email and phone — confirmed at capture
+    when the transport carried them, or in conversation — and the transport
+    identifier itself when it IS one of those kinds. Never an address that was merely
+    mentioned: the same confirmation bar as sending to it."""
+    out: dict[str, str] = {}
+    for kind in _INPUT_KINDS:
+        value = await confirmed_identifier(
+            session, admin_id=admin_id, instance_id=instance_id, lead_id=lead_id, kind=kind
+        )
+        if value:
+            out[kind] = value
+    if transport_identifier:
+        key = normalize_identifier(transport_identifier)
+        kind = identifier_kind(key)
+        if kind in _INPUT_KINDS:
+            out.setdefault(kind, key)
+    return out
 
 
 async def confirm_identifier(

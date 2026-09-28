@@ -54,3 +54,12 @@ make that state explicit and test it.
   connection gate; `registry.build_tool("hand_to_team")` is None. The orchestrator
   appends it to every turn's tool defs and executes it itself as a standard escalation
   (`luciel_requested_handoff`). Do not add it to the catalog to "make it configurable".
+
+## Required inputs from the confirmed record (round 7 WP-2 remainder item 10, 2026-09-28)
+- `ToolBroker.dispatch(..., gathered=)`: the loop passes the lead's CONFIRMED
+  email/phone keyed by input name (`app/runtime/channel_switch.confirmed_inputs_on_file`);
+  a required input the model left out (absent or blank) is filled from it BEFORE the
+  missing_input check, an explicit input always wins, and the fill rides on the
+  in-memory trace as `filled_from_record` (field names; the durable row is unchanged).
+  `ToolContext.gathered` finally has a writer. Never fill from an unconfirmed
+  address — the bar is the same as sending to it.

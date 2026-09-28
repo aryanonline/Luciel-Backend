@@ -1389,6 +1389,21 @@ class Orchestrator:
         # resolver-known. The broker still enforces every gate in code at dispatch
         # (§3.4.14 Defense 1) — this only determines what the model is TOLD.
         tool_defs = await self._turn_tool_defs()
+        # --- REQUIRED INPUTS ALREADY ON FILE (round 7 WP-2 remainder, item 10) --- #
+        # The lead's CONFIRMED email/phone — or the transport identifier itself —
+        # fill a required input the model leaves out, at the broker; the stanza names
+        # the fields so the model stops asking for what the customer already gave.
+        gathered: dict[str, Any] = (
+            await channel_switch.confirmed_inputs_on_file(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                lead_id=resolved_lead_id,
+                transport_identifier=transport_identifier,
+            )
+            if tool_defs
+            else {}
+        )
         system_prompt = (
             build_system_prompt(
                 self.business_context,
@@ -1397,6 +1412,7 @@ class Orchestrator:
                 assistant_name=self.assistant_name,
                 tool_catalog=tool_defs,
                 operating_context=self.operating_context,
+                on_file=sorted(gathered),
             )
             if tool_defs
             else self.system_prompt
@@ -1414,6 +1430,7 @@ class Orchestrator:
             tool_defs=tool_defs,
             session_id=session_id,
             knowledge_state=knowledge_state,
+            gathered=gathered,
         )
 
         if used_fallback:
@@ -2010,6 +2027,7 @@ class Orchestrator:
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
         knowledge_state: str = _KNOWLEDGE_NOT_SEARCHED,
+        gathered: dict[str, Any] | None = None,
     ) -> tuple[_Reasoned, int, bool, str | None]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and why
@@ -2107,7 +2125,10 @@ class Orchestrator:
                     # tool_result turn per call (untrusted-wrapped — results embed
                     # lead/provider content).
                     results = await self._dispatch_tools(
-                        resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+                        resp.tool_calls,
+                        resolved_lead_id=resolved_lead_id,
+                        session_id=session_id,
+                        gathered=gathered,
                     )
                     dispatched.extend(results)
                     tool_outcomes.extend(r.outcome.value for _, r in results)
@@ -2155,6 +2176,7 @@ class Orchestrator:
         *,
         resolved_lead_id: uuid.UUID | None = None,
         session_id: uuid.UUID | None = None,
+        gathered: dict[str, Any] | None = None,
     ) -> list[tuple[dict[str, Any], ToolResult]]:
         """Dispatch PLAN tool intents via the Arc 12 broker, returning each proposed
         call paired with its full five-outcome result (§3.3.3/§3.3.4). The broker
@@ -2207,6 +2229,7 @@ class Orchestrator:
                 instance_id=self.instance_id,
                 resolved_lead_id=resolved_lead_id,
                 session_id=session_id,
+                gathered=gathered,  # item 10: confirmed values fill a missing input
             )
             results.append((dict(call), result))
         return results

@@ -142,3 +142,15 @@ make that state explicit and test it.
   sealed with `input_ask_attempts > 0` writes the same cannot_answer row so the owner
   learns a booking stalled. Edge kept: explicit_human_request at intake still runs
   before the decline check.
+- Voice retrieval (item 5): `voice_pipeline.handle_turn` binds `retriever_bundle=
+  make_retriever_bundle(...)` beside `retriever`/`chunk_attributor`, exactly as the
+  widget and `runtime_entry` do, so a call gets the relevance floor and the
+  EmbeddingError degraded marker (`tests/integration/test_round7_voice_retrieval.py`).
+- Required inputs on file (item 10): `channel_switch.confirmed_inputs_on_file` gathers
+  the lead's CONFIRMED email/phone (the sending bar: transport-carried or
+  `confirm_identifier`'d) plus the transport identifier itself, keyed by tool input
+  name; `run_turn` computes it once per tool-bearing turn, names the FIELDS (never
+  values) in the stanza's `On file for this customer` line, and threads it
+  `_reason` → `_dispatch_tools` → `ToolBroker.dispatch(gathered=)`, where a required
+  input the model left out is filled before the missing_input check. An unconfirmed
+  address fills nothing; T2 still has the model confirm before a write.

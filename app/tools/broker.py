@@ -101,11 +101,24 @@ class ToolBroker:
         instance_id: uuid.UUID,
         resolved_lead_id: uuid.UUID | None = None,
         session_id: uuid.UUID | None = None,
+        gathered: dict[str, Any] | None = None,
     ) -> ToolResult:
+        """``gathered`` (round 7 WP-2 remainder, item 10) holds the required inputs the
+        conversation already has CONFIRMED — the lead's confirmed email/phone — keyed
+        by input name. A required input the model left out is filled from it before
+        the missing_input check, so a customer is never asked for what they already
+        gave; an explicit input always wins, and the fill is traced by field name."""
         # Dispatch-scoped conversation handle for the durable trace rows (C6). The
         # broker is per-request and the loop awaits each dispatch, so plain instance
         # state is race-free here and keeps five _trace call sites unchanged.
         self._session_id = session_id
+        fills = {
+            f: gathered[f]
+            for f in sorted(tool.required_inputs)
+            if inputs.get(f) in (None, "") and gathered and gathered.get(f) not in (None, "")
+        }
+        self._filled_from_record = sorted(fills)
+        inputs = {**inputs, **fills}
         # Gate 1 — Authorization (default-deny).
         if not await self._authorized(admin_id, instance_id, tool.tool_id):
             result = c.failed("not_authorized")
@@ -158,6 +171,7 @@ class ToolBroker:
             admin_id=admin_id,
             instance_id=instance_id,
             connection_status=conn_status,
+            gathered=dict(gathered or {}),  # item 10: the confirmed values on file
             session=self.s,  # §3.3.5: tools that need a durable write receive the session
             resolved_lead_id=resolved_lead_id,  # §3.3.5: per-lead cap key for schedule_callback
         )
@@ -193,6 +207,7 @@ class ToolBroker:
     # request, so "every outcome is traced" was never actually persisted.
     traces: list[dict[str, Any]]
     _session_id: uuid.UUID | None
+    _filled_from_record: list[str]
 
     async def _trace(
         self,
@@ -212,6 +227,8 @@ class ToolBroker:
                 "connection": connection,
                 "missing_fields": result.missing_fields or None,
                 "reason": result.reason,  # non-secret
+                # Field NAMES the broker filled from the confirmed record (item 10).
+                "filled_from_record": getattr(self, "_filled_from_record", None) or None,
             }
         )
         # Durable trace row (C6). Field NAMES and non-secret reasons only — never

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import enum
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.employee.context import CHANNEL_PHRASES, OperatingContext
@@ -279,18 +280,33 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
     return "".join(lines)
 
 
-def compose_tool_use_stanza(tool_catalog: list[dict[str, object]] | None) -> str:
+#: The required inputs already CONFIRMED on the customer's record (round 7 WP-2
+#: remainder, item 10) — names only; the broker fills the values. Inside the tools
+#: stanza, so a prompt with no tools stays byte-identical.
+_ON_FILE_LINE = (
+    "On file for this customer, confirmed: {fields}. Leave such a field out of a tool "
+    "call and it is filled in from the record — never ask for it again; before a "
+    "write, say you will use the details they gave earlier (T2).\n"
+)
+
+
+def compose_tool_use_stanza(
+    tool_catalog: list[dict[str, object]] | None, *, on_file: Sequence[str] = ()
+) -> str:
     """The tool-use stanza for ``build_system_prompt`` — empty when no tools are wired.
 
     ``tool_catalog`` is the provider-neutral def list (app/tools/schemas.build_tool_defs);
     the stanza lists each tool's name + description so the prompt's catalog can never
-    drift from what the providers declare (one source, §3.3.1)."""
+    drift from what the providers declare (one source, §3.3.1). ``on_file`` names the
+    required inputs the conversation already holds confirmed (item 10)."""
     if not tool_catalog:
         return ""
     lines = "".join(
         f"- {t['tool_id']}: {t['description']}\n" for t in tool_catalog if t.get("tool_id")
     )
-    return _TOOL_USE_STANZA_HEADER + lines
+    fields = [f for f in on_file if f]
+    on_file_line = _ON_FILE_LINE.format(fields=", ".join(fields)) if fields else ""
+    return _TOOL_USE_STANZA_HEADER + lines + on_file_line
 
 
 # Defensive cap mirroring Vision §3.5 (the field is tweet-sized).
@@ -366,6 +382,7 @@ def build_system_prompt(
     assistant_name: str = "Luciel",
     tool_catalog: list[dict[str, object]] | None = None,
     operating_context: OperatingContext | None = None,
+    on_file: Sequence[str] = (),
 ) -> str:
     """Compose the system prompt with platform invariants at higher precedence than
     the admin's business-context field (Defense 6, §3.4.14).
@@ -406,7 +423,7 @@ def build_system_prompt(
     # Tool-use rules ride WITH the invariants (accuracy doctrine, §3.3.7) — above
     # personality/style, and far above the untrusted admin field. Empty when the
     # caller wired no tools, keeping the no-tool prompt byte-identical.
-    prompt = prompt + compose_tool_use_stanza(tool_catalog)
+    prompt = prompt + compose_tool_use_stanza(tool_catalog, on_file=on_file)
     # The employee's operating context (WP-F): platform-resolved, above personality.
     prompt = prompt + compose_operating_context_stanza(operating_context)
     prompt = prompt + compose_personality_stanza(personality)

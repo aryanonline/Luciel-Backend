@@ -60,3 +60,21 @@ def test_stanza_precedes_style_and_admin_context() -> None:
 def test_compose_tool_use_stanza_empty_for_no_tools() -> None:
     assert compose_tool_use_stanza(None) == ""
     assert compose_tool_use_stanza([]) == ""
+    # Nothing on file can conjure a stanza without tools (item 10).
+    assert compose_tool_use_stanza(None, on_file=("email",)) == ""
+
+
+def test_the_on_file_line_names_confirmed_inputs_inside_the_stanza() -> None:
+    """Round 7 WP-2 remainder, item 10: the model is told WHICH required inputs the
+    conversation already holds confirmed (names, never values) so it stops asking
+    for them; the broker fills the values. Nothing on file → no line."""
+    plain = build_system_prompt(None, tool_catalog=CATALOG)
+    assert "On file for this customer" not in plain
+    prompt = build_system_prompt(None, tool_catalog=CATALOG, on_file=("email", "phone"))
+    assert "On file for this customer, confirmed: email, phone." in prompt
+    assert "never ask for it again" in prompt
+    assert "(T2)" in prompt
+    assert prompt.index("- lookup_record:") < prompt.index("On file for this customer")
+    assert prompt.index("On file for this customer") < prompt.index("--- Answer style")
+    # Outside the tools stanza the prompt is untouched: no tools, no line.
+    assert build_system_prompt("ctx", on_file=("email",)) == build_system_prompt("ctx")
