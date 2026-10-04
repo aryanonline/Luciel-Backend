@@ -323,6 +323,8 @@ async def test_inbound_email_answer_is_pushed_back_to_the_lead(email_sender, mon
 
     class Reply:
         reply_text = "We open at 9."
+        # RuntimeReply.session_id: empty = no session to pin reply context on.
+        session_id = ""
 
     async def fake_run(session, msg):
         return Reply()

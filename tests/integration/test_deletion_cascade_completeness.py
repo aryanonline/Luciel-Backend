@@ -191,7 +191,11 @@ def _value_for(column, *, admin_id: uuid.UUID, instance_id: uuid.UUID) -> object
     if isinstance(kind, Integer):
         return 1
     if isinstance(kind, String | Text):
-        return f"seed-{uuid.uuid4().hex[:8]}"
+        value = f"seed-{uuid.uuid4().hex[:8]}"
+        # A short column (escalation_contact_confirmations.kind is varchar(8), round 7)
+        # gets a value that fits rather than a truncation error from Postgres.
+        length = getattr(kind, "length", None)
+        return value if not length or len(value) <= length else uuid.uuid4().hex[:length]
     raise AssertionError(
         f"{column.table.name}.{column.name} has type {type(kind).__name__}, which this "
         "seeder cannot fill — teach it rather than dropping the column from coverage."

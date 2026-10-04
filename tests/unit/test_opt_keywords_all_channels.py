@@ -26,7 +26,7 @@ CTX = InstanceContext(admin_id=uuid.uuid4(), instance_id=uuid.uuid4())
 
 
 class _Sender:
-    async def send_email(self, sender, to, subject, body):
+    async def send_email(self, sender, to, subject, body, headers=None):
         return "msg-1"
 
 

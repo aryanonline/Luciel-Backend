@@ -21,7 +21,14 @@ class _CapturingSender:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str, str]] = []
 
-    async def send_email(self, sender: str, to: str, subject: str, body: str) -> str | None:
+    async def send_email(
+        self,
+        sender: str,
+        to: str,
+        subject: str,
+        body: str,
+        headers: dict[str, str] | None = None,
+    ) -> str | None:
         self.sent.append((sender, to, subject, body))
         return f"msg-{len(self.sent)}"
 

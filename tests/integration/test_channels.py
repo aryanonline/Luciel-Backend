@@ -40,7 +40,7 @@ class FakeTwilio:
 
 
 class FakeSes:
-    async def send_email(self, sender, to, subject, body):
+    async def send_email(self, sender, to, subject, body, headers=None):
         return "ses-msg-1"
 
 
