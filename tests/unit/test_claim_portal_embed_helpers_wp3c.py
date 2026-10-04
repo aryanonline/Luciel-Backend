@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import uuid
 
-import pytest
 from app.api.v1.admin import connections as connections_api
 from app.api.v1.admin.connections import (
     PORTAL_SHARED_NOTE,
@@ -29,9 +28,6 @@ from app.api.v1.webhooks.channels import _parse_ses_inbound
 from app.audit.events import EVENT_TYPES
 from app.lifecycle import embed_keys
 from sqlalchemy.exc import IntegrityError
-
-pytestmark = [pytest.mark.asyncio]
-
 
 # --- item 10 ----------------------------------------------------------------------- #
 

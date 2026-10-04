@@ -47,6 +47,16 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
   under the claimant + rate-limit (`destination_claim` bucket) against
   enumeration. Revoked rows cannot re-enter service outside `lifecycle.restore`,
   which strips destinations another tenant claimed during grace.
+- One asset, one account (round 7 WP-3c): email claims are CASE-INSENSITIVE — every
+  producer stores `routing.normalize_email_destination(...)`, the ownership gate and
+  the resolver case-fold the value they look up, and the 0067 partial unique index on
+  `lower(destination)` makes a duplicate live mailbox claim structurally impossible.
+  A Meta id is routable only when a lister PROVED it on the grant; where Meta cannot
+  be asked it is parked under `pending_destination(s)` — never routable, never a
+  claim — and promoted by a later proven bind. The Meta bind and the OAuth mailbox
+  bind refuse through the same audit + `destination_claim` bucket as the SMS attach.
+  A CRM portal shared by two accounts is ALLOWED: an informational status note and
+  `crm_portal_shared`, never a refusal.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
