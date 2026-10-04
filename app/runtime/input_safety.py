@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import enum
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.employee.context import CHANNEL_PHRASES, OperatingContext
@@ -220,6 +221,11 @@ _TOOL_USE_STANZA_HEADER = (
     "fields. Never present an action as done when it is not.\n"
     "T4. CHECK BEFORE BOOKING: offer only times check_availability confirmed open, and "
     "book only one of those.\n"
+    "T5. TAKE NO FOR AN ANSWER (§3.3.7 rule 4): when the customer declines to give a "
+    'detail you asked for — "I\'d rather not", "no thanks", "skip that" — do not ask '
+    "for it again, in any wording. Say you understand and carry on without it; if the "
+    "action cannot go ahead without that detail, say so plainly and that the team can "
+    "pick it up. Never invent the value and never re-ask.\n"
     "Available tools:\n"
 )
 
@@ -248,6 +254,28 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
         f"- When you pass something to the team they are notified by {notify}. A person "
         "replies when they see it — never promise an immediate or real-time human reply.\n",
     ]
+    if ctx.timezone:
+        # Round 7 WP-2 remainder, item 11: the business's clock. A customer's "3pm"
+        # is in this zone, the appointment tools read and return times in it (offset
+        # on the string), and the time the customer hears is in it — never UTC. Until
+        # this line the prompt carried no date at all, so "Tuesday" had no anchor.
+        today = f"; today there is {ctx.local_today}" if ctx.local_today else ""
+        lines.append(
+            f"- The business keeps time in {ctx.timezone}{today}. A time a customer gives "
+            "is in that zone unless they name another. The appointment tools work on the "
+            "business's clock: a date or time you pass without a UTC offset is read in "
+            "that zone, and every time they return is in it (the string carries the "
+            "offset). Pass a slot exactly as check_availability returned it, and tell "
+            "the customer times in the business's local time — never as UTC.\n"
+        )
+    elif ctx.local_today:
+        # No zone on file: the tools keep UTC, and saying so is the honest reading —
+        # a UTC hour presented as a local one books the wrong time silently.
+        lines.append(
+            f"- Today's date is {ctx.local_today} (UTC). The business has not set a time "
+            "zone, so the appointment tools read and return times in UTC: when you state "
+            "or confirm an appointment time, say that it is UTC.\n"
+        )
     if ctx.team_reachable_now is True:
         lines.append("- Someone on the team is reachable right now.\n")
     elif ctx.team_reachable_now is False:
@@ -274,18 +302,33 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
     return "".join(lines)
 
 
-def compose_tool_use_stanza(tool_catalog: list[dict[str, object]] | None) -> str:
+#: The required inputs already CONFIRMED on the customer's record (round 7 WP-2
+#: remainder, item 10) — names only; the broker fills the values. Inside the tools
+#: stanza, so a prompt with no tools stays byte-identical.
+_ON_FILE_LINE = (
+    "On file for this customer, confirmed: {fields}. Leave such a field out of a tool "
+    "call and it is filled in from the record — never ask for it again; before a "
+    "write, say you will use the details they gave earlier (T2).\n"
+)
+
+
+def compose_tool_use_stanza(
+    tool_catalog: list[dict[str, object]] | None, *, on_file: Sequence[str] = ()
+) -> str:
     """The tool-use stanza for ``build_system_prompt`` — empty when no tools are wired.
 
     ``tool_catalog`` is the provider-neutral def list (app/tools/schemas.build_tool_defs);
     the stanza lists each tool's name + description so the prompt's catalog can never
-    drift from what the providers declare (one source, §3.3.1)."""
+    drift from what the providers declare (one source, §3.3.1). ``on_file`` names the
+    required inputs the conversation already holds confirmed (item 10)."""
     if not tool_catalog:
         return ""
     lines = "".join(
         f"- {t['tool_id']}: {t['description']}\n" for t in tool_catalog if t.get("tool_id")
     )
-    return _TOOL_USE_STANZA_HEADER + lines
+    fields = [f for f in on_file if f]
+    on_file_line = _ON_FILE_LINE.format(fields=", ".join(fields)) if fields else ""
+    return _TOOL_USE_STANZA_HEADER + lines + on_file_line
 
 
 # Defensive cap mirroring Vision §3.5 (the field is tweet-sized).
@@ -361,6 +404,7 @@ def build_system_prompt(
     assistant_name: str = "Luciel",
     tool_catalog: list[dict[str, object]] | None = None,
     operating_context: OperatingContext | None = None,
+    on_file: Sequence[str] = (),
 ) -> str:
     """Compose the system prompt with platform invariants at higher precedence than
     the admin's business-context field (Defense 6, §3.4.14).
@@ -401,7 +445,7 @@ def build_system_prompt(
     # Tool-use rules ride WITH the invariants (accuracy doctrine, §3.3.7) — above
     # personality/style, and far above the untrusted admin field. Empty when the
     # caller wired no tools, keeping the no-tool prompt byte-identical.
-    prompt = prompt + compose_tool_use_stanza(tool_catalog)
+    prompt = prompt + compose_tool_use_stanza(tool_catalog, on_file=on_file)
     # The employee's operating context (WP-F): platform-resolved, above personality.
     prompt = prompt + compose_operating_context_stanza(operating_context)
     prompt = prompt + compose_personality_stanza(personality)

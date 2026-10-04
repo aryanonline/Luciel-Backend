@@ -77,7 +77,9 @@ class EchoModel:
             raise ProviderError(f"{self.name}_unavailable")
         last_user = ""
         for m in reversed(messages):
-            if m.get("role") == "user":
+            # A platform-composed note (the knowledge-search status, round 7 WP-2
+            # item 4) is not the customer's message: the echo stays on THEIR words.
+            if m.get("role") == "user" and not m.get("platform_note"):
                 last_user = str(m.get("content", ""))
                 break
         text = self._fixed_reply if self._fixed_reply is not None else f"Echo: {last_user}"

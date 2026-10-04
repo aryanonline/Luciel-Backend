@@ -114,3 +114,51 @@ make that state explicit and test it.
 - Known gap (not changed here): gate 2 records + pages `cannot_answer` for a bare
   clarifying question on the FIRST stall ("what's your email?") even though F100 lets
   the question go out; four established loop tests lean on that echo shape.
+
+## Judgment as an employee — the remainder (round 7 WP-2, built 2026-09-27)
+- One hand-off ack, one contact ask, per session (item 1): `_handoff_reply` sends the
+  full `_handoff_ack` line only while `handoff_ack_sent(history)` is False, then one of
+  `SHORT_HANDOFF_ACKS` (cycled by `short_handoff_ack`); `_with_contact_ask` appends
+  `CONTACT_ASK_LINE` only when `contact_ask_due` says so — first escalating turn, then
+  after `CONTACT_ASK_RESPITE_TURNS` Luciel turns with still nothing on file, at most
+  `ASK_ATTEMPT_BOUND` times. All read from the session transcript (no new column), so
+  the transcript order matters: entry points pass `received_at`. A DISTINCT uncovered
+  question after the row exists (`escalation.is_new_question` over
+  `unanswered_questions(history)`) appends `also asked: "…"` to the row's reasons and
+  re-notifies the same row (`_renotify_new_question`, metric `EscalationRenotified`); a
+  repeat pages nobody.
+- Taking no for an answer (item 2, §3.3.7 rule 4 / stanza rule T5): `escalation.
+  is_decline_turn` (deterministic, negation-aware, a supplied value always wins) is
+  consulted ONLY while `sessions.input_ask_attempts > 0`. On a decline the counter
+  resets and the ask stops in code: `pending_gather` reads the latest turn's durable
+  tool traces — a `missing_input` there (or an unresolved `ambiguous`) means the action
+  is blocked, so `declined_input_reply` goes out with a REAL cannot_answer row naming
+  the field (`record_or_extend_escalation`: new row, or the session's existing row
+  extended and re-paged) and no model call; a prose stall gets
+  `DECLINED_INPUT_CONTINUE`; a decline carrying a question is answered by the loop,
+  opened by `DECLINED_INPUT_LINE`. That line in a Luciel turn switches
+  `contact_ask_due` off for the rest of the session (the contact ask names the very
+  identifiers a gather asks for). `session_close._escalate_unfinished_gather`: a session
+  sealed with `input_ask_attempts > 0` writes the same cannot_answer row so the owner
+  learns a booking stalled. Edge kept: explicit_human_request at intake still runs
+  before the decline check.
+- Voice retrieval (item 5): `voice_pipeline.handle_turn` binds `retriever_bundle=
+  make_retriever_bundle(...)` beside `retriever`/`chunk_attributor`, exactly as the
+  widget and `runtime_entry` do, so a call gets the relevance floor and the
+  EmbeddingError degraded marker (`tests/integration/test_round7_voice_retrieval.py`).
+- Required inputs on file (item 10): `channel_switch.confirmed_inputs_on_file` gathers
+  the lead's CONFIRMED email/phone (the sending bar: transport-carried or
+  `confirm_identifier`'d) plus the transport identifier itself, keyed by tool input
+  name; `run_turn` computes it once per tool-bearing turn, names the FIELDS (never
+  values) in the stanza's `On file for this customer` line, and threads it
+  `_reason` → `_dispatch_tools` → `ToolBroker.dispatch(gathered=)`, where a required
+  input the model left out is filled before the missing_input check. An unconfirmed
+  address fills nothing; T2 still has the model confirm before a write.
+- The business's clock (item 11, 2026-10-04): the prompt carried no date and no zone.
+  `OperatingContext.timezone` / `local_today` (`app/employee/context.py`, from
+  `instances.timezone`) add one operating-context line — the zone and today's date
+  there, "a time a customer gives is in that zone", tell the customer local time never
+  UTC; with no zone on file the line gives UTC's date and says appointment times are
+  UTC. A context constructed without the two fields adds no line. `_dispatch_tools`
+  passes the same zone to `ToolBroker.dispatch(timezone=)`, so the model and the
+  appointment tools always agree on the clock (see app/tools/CLAUDE.md).

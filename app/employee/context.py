@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +43,28 @@ class OperatingContext:
     escalation_configured: bool
     team_reachable_now: bool | None
     next_reachable_phrase: str | None
+    # Round 7 WP-2 remainder, item 11: the business's IANA zone (instances.timezone,
+    # WP-E) when set and valid, and today's date on that clock (UTC's date when no
+    # zone is set) — so the model reads a customer's "3pm Tuesday" on the business's
+    # clock and says it back the same way, and the appointment tools
+    # (ToolContext.timezone) do the same in code. A context built without them keeps
+    # the prompt byte-identical; no zone keeps the tools on UTC, as before.
+    timezone: str | None = None
+    local_today: str | None = None
+
+
+def business_timezone(name: str | None) -> str | None:
+    """The instance's zone name when it is a real IANA zone, else None."""
+    cleaned = (name or "").strip()
+    return cleaned if cleaned and team_hours.valid_timezone(cleaned) else None
+
+
+def local_today_phrase(zone: str | None, now: datetime | None) -> str:
+    """'Tuesday 06 October 2026' on the business's clock — UTC's date without a zone."""
+    moment = now if now is not None else datetime.now(UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(ZoneInfo(zone) if zone else UTC).strftime("%A %d %B %Y")
 
 
 async def build_operating_context(
@@ -70,6 +93,7 @@ async def build_operating_context(
     if hours is not None:
         reachable = team_hours.team_reachable_now(hours, now)
         phrase = None if reachable else team_hours.describe_next_window(hours, now)
+    zone = business_timezone(inst.timezone)
     return OperatingContext(
         business_short_name=(inst.business_short_name or "").strip() or None,
         live_channels=tuple(live),
@@ -77,4 +101,6 @@ async def build_operating_context(
         escalation_configured=has_configured_escalation_contact(inst.escalation),
         team_reachable_now=reachable,
         next_reachable_phrase=phrase,
+        timezone=zone,
+        local_today=local_today_phrase(zone, now),
     )

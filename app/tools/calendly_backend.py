@@ -22,19 +22,29 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, Protocol, TypeVar
 
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.models.connection import InstanceConnection
-from app.tools.calendar_backend import BOOKING_SEARCH_DAYS, parse_interval
+from app.tools import calendar_backend
+from app.tools.calendar_backend import (
+    BOOKING_SEARCH_DAYS,
+    business_zone,
+    parse_interval,
+    stamp_zone,
+)
 from app.tools.contract import ToolContext
 
 CALENDLY_API = "https://api.calendly.com"
 #: Calendly limits an available-times query to a 7-day range.
 AVAILABILITY_MAX_DAYS = 7
+#: Calendly refuses an available-times query whose start_time is not in the future
+#: (HTTP 400). A window that began earlier — "today" is one from midnight on — is
+#: asked from this far ahead of now instead (round 7 WP-2 remainder, item 11).
+AVAILABILITY_LEAD = timedelta(minutes=1)
 
 _T = TypeVar("_T")
 
@@ -108,14 +118,19 @@ def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _booking(event: CalendlyEvent) -> dict[str, Any]:
-    return {
-        "bookingRef": event.event_uuid,
-        "start": event.start.isoformat(),
-        "end": event.end.isoformat(),
-        "email": event.invitee_email,
-        "name": event.name,
-    }
+def _booking(event: CalendlyEvent, tz: tzinfo = UTC) -> dict[str, Any]:
+    """The booking as the customer should hear it: on the business's clock, the zone
+    named when there is one (round 7 WP-2 remainder, item 11)."""
+    return stamp_zone(
+        {
+            "bookingRef": event.event_uuid,
+            "start": _as_utc(event.start).astimezone(tz).isoformat(),
+            "end": _as_utc(event.end).astimezone(tz).isoformat(),
+            "email": event.invitee_email,
+            "name": event.name,
+        },
+        tz,
+    )
 
 
 BOOKING_LINK_NOTE = (
@@ -189,31 +204,47 @@ class CalendlyBackend:
 
     async def _free_busy(self, ctx: ToolContext, window: str) -> list[str]:
         cred = await self._credentials(ctx)
-        start, end = parse_interval(window)
+        tz = business_zone(ctx.timezone)
+        start, end = parse_interval(window, tz=tz)
+        # A window that has begun is asked from now on: Calendly answers a past
+        # start_time with a 400, which would read to the customer as "the calendar is
+        # down" every time they ask about today.
+        start = max(start, calendar_backend.now_utc() + AVAILABILITY_LEAD)
         end = min(end, start + timedelta(days=AVAILABILITY_MAX_DAYS))
+        if end <= start:
+            return []  # the whole window has passed -> empty, honestly
         times = await self._api.available_times(cred, cred.event_type_uri, start, end)
-        return [t.isoformat() for t, _url in sorted(times, key=lambda pair: pair[0])]
+        return [
+            _as_utc(t).astimezone(tz).isoformat()
+            for t, _url in sorted(times, key=lambda pair: pair[0])
+        ]
 
     async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         return await self._guarded(ctx, self._book(ctx, slot, email))
 
     async def _book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
-        start, end = parse_interval(slot)
+        tz = business_zone(ctx.timezone)
+        start, end = parse_interval(slot, tz=tz)
+        if start <= calendar_backend.now_utc():
+            return None  # already started: not a time anyone can still take
         times = await self._api.available_times(
             cred, cred.event_type_uri, start, start + timedelta(minutes=1)
         )
         match = next((url for t, url in times if _as_utc(t) == start), None)
         if match is None:
             return None  # the slot is no longer offered -> failed("slot_conflict")
-        return {
-            "state": "scheduling_link",
-            "schedulingLink": match,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "email": email,
-            "note": BOOKING_LINK_NOTE,
-        }
+        return stamp_zone(
+            {
+                "state": "scheduling_link",
+                "schedulingLink": match,
+                "start": start.astimezone(tz).isoformat(),
+                "end": end.astimezone(tz).isoformat(),
+                "email": email,
+                "note": BOOKING_LINK_NOTE,
+            },
+            tz,
+        )
 
     async def find_bookings(
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
@@ -226,12 +257,20 @@ class CalendlyBackend:
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
     ) -> list[dict[str, Any]]:
         cred = await self._credentials(ctx)
+        tz = business_zone(ctx.timezone)
         if booking_ref:
             event = await self._api.get_event(cred, booking_ref)
-            if event is None or event.invitee_email.lower() != email.lower():
+            # The same bar as the search path: a cancelled booking is no longer on
+            # file, so a move or a second cancel answers ``empty`` — never a
+            # ``slot_conflict`` about a time nobody holds (round 7 WP-2, item 11).
+            if (
+                event is None
+                or event.status != "active"
+                or event.invitee_email.lower() != email.lower()
+            ):
                 return []
-            return [_booking(event)]
-        now = datetime.now(UTC)
+            return [_booking(event, tz)]
+        now = calendar_backend.now_utc()
         events = await self._api.scheduled_events(
             cred,
             cred.user_uri,
@@ -239,7 +278,7 @@ class CalendlyBackend:
             start=now,
             end=now + timedelta(days=BOOKING_SEARCH_DAYS),
         )
-        return [_booking(e) for e in events if e.status == "active"]
+        return [_booking(e, tz) for e in events if e.status == "active"]
 
     async def reschedule(
         self, ctx: ToolContext, booking_ref: str, slot: str
@@ -253,13 +292,14 @@ class CalendlyBackend:
         event = await self._api.get_event(cred, booking_ref)
         if event is None or event.status != "active":
             return None
-        start, end = parse_interval(slot)
+        tz = business_zone(ctx.timezone)
+        start, end = parse_interval(slot, tz=tz)
         return {
-            **_booking(event),
+            **_booking(event, tz),
             "state": "reschedule_link",
             "rescheduleLink": event.reschedule_url,
-            "requestedStart": start.isoformat(),
-            "requestedEnd": end.isoformat(),
+            "requestedStart": start.astimezone(tz).isoformat(),
+            "requestedEnd": end.astimezone(tz).isoformat(),
             "note": RESCHEDULE_LINK_NOTE,
         }
 
@@ -273,7 +313,7 @@ class CalendlyBackend:
             return None
         if not await self._api.cancel_event(cred, booking_ref, "Cancelled via the assistant"):
             return None
-        return {**_booking(event), "status": "cancelled"}
+        return {**_booking(event, business_zone(ctx.timezone)), "status": "cancelled"}
 
 
 # --------------------------------------------------------------------------- #

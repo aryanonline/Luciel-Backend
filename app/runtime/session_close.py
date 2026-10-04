@@ -34,6 +34,7 @@ from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.conversation import Session
 from app.runtime import memory
+from app.runtime.handoff import takeover_duration_seconds
 from app.runtime.sessions import INACTIVITY_TIMEOUT
 
 # No session is due before the SHORTEST channel window has passed; pre-filtering on it
@@ -45,6 +46,40 @@ _MIN_TIMEOUT = min([*INACTIVITY_TIMEOUT.values(), _DEFAULT_TIMEOUT])
 
 def _timeout_for(channel: str) -> timedelta:
     return INACTIVITY_TIMEOUT.get(channel, _DEFAULT_TIMEOUT)
+
+
+async def _escalate_unfinished_gather(session: AsyncSession, sess: Session) -> None:
+    """The session ends while Luciel was still waiting for a required input (round 7
+    WP-2 remainder, item 2; §3.3.7 rule 4): the customer's last turn stalled a tool
+    gather (``input_ask_attempts > 0``) and nothing resolved it before they left. The
+    owner learns that a booking stalled — a ``cannot_answer`` row (or the session's
+    existing one, extended and re-paged) naming the field still missing, read from
+    the durable tool traces; a prose stall says the question went unanswered."""
+    from app.runtime.escalation import Gate, Signal  # noqa: PLC0415
+    from app.runtime.orchestrator import (  # noqa: PLC0415 — the loop imports nothing from here
+        pending_gather,
+        record_or_extend_escalation,
+    )
+
+    gather = await pending_gather(session, admin_id=sess.admin_id, session_id=sess.id)
+    if gather.blocks_action:
+        reasons = [
+            gather.field_reason(),
+            f"the conversation ended before {gather.what} could be completed",
+        ]
+    else:
+        reasons = ["the customer never answered Luciel's last question", "the conversation ended"]
+    await record_or_extend_escalation(
+        session,
+        admin_id=sess.admin_id,
+        instance_id=sess.instance_id,
+        session_id=sess.id,
+        resolved_lead_id=sess.resolved_lead_id,
+        signal=Signal.cannot_answer.value,
+        gate=Gate.outcome.value,
+        score=None,
+        reasons=reasons,
+    )
 
 
 async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at: datetime) -> None:
@@ -60,7 +95,10 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
         # The takeover ended with the session, not with a hand-back (§3.4.12 — "if
         # the admin never hands back, the session ends via the inactivity timeout").
         # Audit F078: this end was never recorded, so the takeover audit trail had a
-        # start for every timeout and no end.
+        # start for every timeout and no end. Round 7 WP-2 item 9: the end carries
+        # how long the person held it, and the sealed row returns to ai mode —
+        # hand-back was the only writer, so a stale human_controlled outlived the
+        # session and read as an open take-over on every dashboard that lists it.
         await audit.emit(
             session,
             admin_id=sess.admin_id,
@@ -75,8 +113,18 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
                     audit.hash_lead_id(sess.resolved_lead_id) if sess.resolved_lead_id else None
                 ),
                 "ended_at": ended_at.isoformat(),
+                # The same measure a hand-back reports, off the same persisted start
+                # (``sessions.human_controlled_since``); None when the take-over
+                # predates that column — unknown is reported as unknown.
+                "duration_seconds": takeover_duration_seconds(
+                    sess.human_controlled_since, now=ended_at
+                ),
             },
         )
+        sess.mode = "ai"
+        sess.human_controlled_since = None
+    if sess.input_ask_attempts > 0:
+        await _escalate_unfinished_gather(session, sess)
     history = await memory.load_session_history(session, admin_id=sess.admin_id, session_id=sess.id)
     if not history:
         await session.flush()

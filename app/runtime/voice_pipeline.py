@@ -48,7 +48,11 @@ from app.employee.context import build_operating_context
 from app.models.audit import ActorType
 from app.models.instance import Instance, is_paused
 from app.models.voice import VoiceCallRecord
-from app.runtime.knowledge_retrieval import make_chunk_attributor, make_retriever
+from app.runtime.knowledge_retrieval import (
+    make_chunk_attributor,
+    make_retriever,
+    make_retriever_bundle,
+)
 from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import AT_CAP_REPLY, Orchestrator
 from app.runtime.sessions import (
@@ -282,6 +286,11 @@ async def handle_turn(
         router=router,
         retriever=retriever,
         chunk_attributor=chunk_attributor,
+        # The single-pass bundle, exactly as the widget and the text channels bind
+        # it (round 7 WP-2 remainder, item 5): voice used to run the two-seam path,
+        # which skips the relevance floor and the EmbeddingError degraded marker —
+        # an unrelated chunk could be spoken, and a provider outage was a crash.
+        retriever_bundle=make_retriever_bundle(session, admin_id=admin_id, instance_id=instance_id),
         admin_id=admin_id,
         instance_id=instance_id,
         enabled_channels=effective.enabled_channels,

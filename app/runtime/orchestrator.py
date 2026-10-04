@@ -88,7 +88,10 @@ from app.runtime.escalation import (
     Signal,
     evaluate_intake,
     evaluate_outcome,
+    is_contact_details_turn,
     is_conversational_turn,
+    is_decline_turn,
+    is_new_question,
     is_repeated_question,
 )
 from app.runtime.grounding import faithful_readback_ok, score_grounding
@@ -101,7 +104,7 @@ from app.runtime.input_safety import (
     pre_send_check,
     wrap_untrusted,
 )
-from app.runtime.knowledge_retrieval import RetrieverBundle
+from app.runtime.knowledge_retrieval import RetrieverBundle, is_retrieval_unavailable
 from app.runtime.lead_capture import capture_or_update_lead
 from app.runtime.llm_cap import LLMCapExceeded
 from app.runtime.llm_router import LLMResponse, LLMRouter, ProviderError
@@ -230,6 +233,49 @@ def is_clarifying_question(text: str) -> bool:
     return sum(body.count(ch) for ch in ".!?") == 1
 
 
+# A question mark or an interrogative anywhere means the message SEEKS something,
+# whatever else it is ("thanks — and do you open Saturdays?"): retrieval must run.
+_CARRIES_QUESTION = re.compile(
+    r"\?|\b(what|how|when|where|why|which|who|whether"
+    r"|do you|can you|could you|would you|are you|is there|does it|did you)\b",
+    re.IGNORECASE,
+)
+
+
+def retrieval_skippable(inbound_text: str, *, gather_pending: bool) -> bool:
+    """True when this turn has nothing to look up (round 7 WP-2 item 3, cost).
+
+    The retriever used to embed and search EVERY turn although the turn classifiers
+    had already decided "thanks!" or "here's my email" carries no question. A social
+    or contact-details turn with no question mark / interrogative, while no tool
+    gather is pending, skips the embedding call and the Knowledge block. Gate 2 is
+    untouched: it already exempts these turns from the floor, and a question in the
+    same breath keeps both the search and the floor."""
+    if gather_pending:
+        return False
+    if _CARRIES_QUESTION.search(inbound_text or ""):
+        return False
+    return is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)
+
+
+#: What the model is told about the knowledge search on a turn with NO chunks
+#: (round 7 WP-2, item 4). Without these it could not tell "nothing matched" from
+#: "the knowledge was never consulted": an absent block now means the search was
+#: skipped (a social turn), and each of the other two states is said in so many
+#: words. Both are deterministic platform notes, never a knowledge claim.
+KNOWLEDGE_NONE_MATCHED = "The business's knowledge was searched and nothing matched this question."
+KNOWLEDGE_UNAVAILABLE = "The knowledge could not be searched right now."
+
+#: ``knowledge_state`` values ``_reason`` composes the prompt from.
+_KNOWLEDGE_FOUND = "found"
+_KNOWLEDGE_NONE_MATCHED = "none_matched"
+_KNOWLEDGE_UNAVAILABLE = "unavailable"
+_KNOWLEDGE_NOT_SEARCHED = "not_searched"
+#: The key a platform-composed note carries on its message so a provider double
+#: (EchoModel) can tell it from the customer's own words. Live providers ignore it.
+PLATFORM_NOTE_KEY = "platform_note"
+
+
 #: Tools whose ``ok`` result the reply READS BACK — a booking, a free/busy answer, a
 #: record lookup — and that therefore ground it (2026-09-05 audit F119). A CRM push or
 #: a queued callback succeeding says nothing about whether the words are true.
@@ -283,14 +329,280 @@ _LLM_FAILURE_REASONS: dict[str, tuple[str, ...]] = {
 # truthfully, the row and notification exist — that a person is now aware.
 _TEAM_TOLD_NOTE = " I've also let the team know, so a person can follow up with you."
 
+# --- one hand-off ack, one contact ask, per session (round 7 WP-2 remainder, item 1) -- #
+# Every below-floor turn used to replace the draft with the SAME full hand-off
+# paragraph and append the SAME contact ask — three uncovered questions from an
+# anonymous widget visitor read the identical block three times. The full ack and
+# the ask now go out once; later turns get a short, varied acknowledgement, and the
+# ask returns only after a respite, bounded like any other repeated ask (§3.3.7).
+# All of it is read from the session's own transcript — no new persistence.
+
+#: The code-composed contact ask for an anonymous escalated visitor (C5).
+CONTACT_ASK_LINE = (
+    "So the team can reach you, what's your name and the best email or phone number "
+    "to contact you at?"
+)
+#: Luciel turns that must pass, with still no identifier on file, before an anonymous
+#: visitor who did not answer the contact ask is asked again.
+CONTACT_ASK_RESPITE_TURNS = 4
+#: Short acknowledgements for a LATER question Luciel cannot answer, once the full
+#: hand-off line has gone out this session. Each says only what is true — the team
+#: already has the thread and this question is added to it — and promises nothing
+#: twice. Varied by position so the visitor never reads the same line twice running.
+SHORT_HANDOFF_ACKS: tuple[str, ...] = (
+    "That's another one I can't answer from what I have — I've added it to what the "
+    "team will follow up on.",
+    "I don't have that on hand either; I've noted it for the team alongside your earlier question.",
+    "I'm not able to confirm that myself, so I've passed it along with the rest for the team.",
+)
+# The full hand-off ack in any of its variants (_handoff_ack): "I've flagged this for
+# the team" / "I've passed this along to the team", with or without a follow-up time.
+_HANDOFF_ACK_MARK = re.compile(r"\b(?:flagged this for the team|passed this along to the team)\b")
+
+
+def _luciel_turns(history: list[Transcript]) -> list[str]:
+    return [t.text for t in history if t.role == "luciel"]
+
+
+def _is_short_handoff_ack(text: str) -> bool:
+    return any(text.startswith(ack) for ack in SHORT_HANDOFF_ACKS)
+
+
+def handoff_ack_sent(history: list[Transcript]) -> bool:
+    """True once this session's transcript carries the full hand-off ack."""
+    return any(_HANDOFF_ACK_MARK.search(text) for text in _luciel_turns(history))
+
+
+def short_handoff_ack(history: list[Transcript]) -> str:
+    """The short acknowledgement for this turn — the next one in the cycle, so two
+    consecutive uncovered questions never get the same sentence."""
+    already = sum(1 for text in _luciel_turns(history) if _is_short_handoff_ack(text))
+    return SHORT_HANDOFF_ACKS[already % len(SHORT_HANDOFF_ACKS)]
+
+
+def contact_ask_due(history: list[Transcript], *, anonymous: bool) -> bool:
+    """Whether the code-composed contact ask goes out on THIS turn.
+
+    Only for an anonymous visitor (no lead on file, no transport identity, widget).
+    The first escalated turn asks; after that the ask returns only once
+    ``CONTACT_ASK_RESPITE_TURNS`` Luciel turns have passed with still nothing on
+    file, and never more than ``ASK_ATTEMPT_BOUND`` times in a session — the
+    code-composed re-ask counts against the same bound as the model's (§3.3.7).
+
+    Never once the customer has declined a detail this session (item 2, rule 4):
+    Luciel said "I won't ask for that again", and the contact ask names the very
+    identifiers a booking gather asks for."""
+    if not anonymous:
+        return False
+    turns = _luciel_turns(history)
+    if any(DECLINED_INPUT_LINE in text for text in turns):
+        return False
+    asked_at = [i for i, text in enumerate(turns) if CONTACT_ASK_LINE in text]
+    if not asked_at:
+        return True
+    if len(asked_at) >= ASK_ATTEMPT_BOUND:
+        return False
+    return len(turns) - asked_at[-1] - 1 >= CONTACT_ASK_RESPITE_TURNS
+
+
+def unanswered_questions(history: list[Transcript]) -> list[str]:
+    """The customer messages this session answered with a hand-off ack (full or
+    short): the questions Luciel could not cover, in order."""
+    out: list[str] = []
+    last_lead: str | None = None
+    for turn in history:
+        if turn.role == "lead":
+            last_lead = turn.text
+        elif turn.role == "luciel" and last_lead is not None:
+            if _HANDOFF_ACK_MARK.search(turn.text) or _is_short_handoff_ack(turn.text):
+                out.append(last_lead)
+                last_lead = None
+    return out
+
+
+# --- declining a required input (round 7 WP-2 remainder, item 2; §3.3.7 rule 4) ----- #
+#: What a stalled tool was trying to do, in the customer's words — for the decline
+#: reply ("I can't complete the booking without it") and the owner's reasons.
+GATHER_WHAT: dict[str, str] = {
+    "book_appointment": "the booking",
+    "reschedule_appointment": "the change to your booking",
+    "cancel_appointment": "the cancellation",
+    "check_availability": "the availability check",
+    "send_email": "sending that email",
+    "send_sms": "sending that text",
+    "schedule_callback": "the follow-up",
+    "push_to_crm": "the update",
+    "lookup_record": "the lookup",
+}
+#: Said once, in code, the moment a customer declines a detail: the ask stops here.
+DECLINED_INPUT_LINE = "No problem — I won't ask for that again."
+#: The decline reply when the conversation simply goes on (nothing was blocked on it).
+DECLINED_INPUT_CONTINUE = f"{DECLINED_INPUT_LINE} Is there anything else I can help you with?"
+
+
+@dataclass(frozen=True)
+class PendingGather:
+    """What the session's last stalled tool dispatch was waiting for: the field names
+    the broker refused on, or an ambiguity the customer never resolved. Empty when
+    the stall was a prose re-ask with no tool behind it (nothing is blocked)."""
+
+    tool_id: str | None = None
+    missing_fields: tuple[str, ...] = ()
+    ambiguous: bool = False
+
+    @property
+    def blocks_action(self) -> bool:
+        return bool(self.missing_fields) or self.ambiguous
+
+    @property
+    def what(self) -> str:
+        return GATHER_WHAT.get(self.tool_id or "", "that")
+
+    def field_reason(self) -> str:
+        """The owner-facing reason naming what is still missing."""
+        if self.missing_fields:
+            return f"still missing {', '.join(self.missing_fields)}"
+        return "could not tell which one the customer meant"
+
+
+async def pending_gather(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> PendingGather:
+    """Read the pending gather from the session's durable tool traces (§3.3.4 rule 3):
+    the dispatches of the LATEST turn (those sharing the newest ``at``), a missing_input
+    among them naming the fields, an ambiguous one the unresolved choice. Field NAMES
+    only — the traces never carry the customer's values."""
+    from app.models.trace import ToolTraceEvent  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(ToolTraceEvent)
+                .where(ToolTraceEvent.admin_id == admin_id, ToolTraceEvent.session_id == session_id)
+                .order_by(ToolTraceEvent.at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return PendingGather()
+    latest = [r for r in rows if r.at == rows[0].at]
+    missing: list[str] = []
+    tool_id: str | None = None
+    for row in latest:
+        if row.outcome == tool_contract.Outcome.missing_input.value:
+            tool_id = tool_id or row.tool_id
+            missing.extend(f for f in (row.missing_fields or []) if f not in missing)
+    if missing:
+        return PendingGather(tool_id, tuple(missing))
+    ambiguous = next(
+        (r for r in latest if r.outcome == tool_contract.Outcome.ambiguous.value), None
+    )
+    if ambiguous is not None:
+        return PendingGather(ambiguous.tool_id, (), True)
+    return PendingGather(latest[0].tool_id)
+
+
+def declined_input_reply(gather: PendingGather) -> str:
+    """The reply when the customer declined a detail the action cannot go without: the
+    ask stops, the limit is said plainly, and the hand-off is REAL (the row and the
+    owner page are written before this is sent). No time is promised."""
+    return (
+        f"{DECLINED_INPUT_LINE} I can't complete {gather.what} without it myself, so I've "
+        "passed this along to the team — a person can pick it up from here."
+    )
+
+
+async def record_or_extend_escalation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    reasons: list[str],
+) -> bool:
+    """Write the signal's row for this session — or, when the session already carries
+    one, add these reasons to it and page the owner AGAIN with them (round 7 WP-2
+    remainder). The row stays one business event; the page carries the news. False
+    when nothing new reached the row (every reason was already on it)."""
+    if await _record_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+        reasons=reasons,
+    ):
+        return True
+    if not await _append_escalation_reasons(
+        session,
+        admin_id=admin_id,
+        session_id=session_id,
+        signal=signal,
+        gate=gate,
+        reasons=reasons,
+    ):
+        return False
+    emit_metric("EscalationRenotified", dimensions={"Signal": signal})
+    schedule_notification_after_commit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+    )
+    return True
+
+
+#: Longest excerpt of a new unanswered question carried on the row's reasons.
+_QUESTION_EXCERPT_CAP = 120
+
+
+def also_asked_reason(question: str) -> str:
+    """The owner-facing reason for a re-notification: the new question itself."""
+    excerpt = " ".join((question or "").split())
+    if len(excerpt) > _QUESTION_EXCERPT_CAP:
+        excerpt = excerpt[: _QUESTION_EXCERPT_CAP - 1].rstrip() + "…"
+    return f'also asked: "{excerpt}"'
+
+
 #: Moderation categories that do NOT take the conversation away (D2): recorded under
 #: content_flagged with the owner-facing reason, the owner is notified, and the loop
 #: runs — the MODERATION stanza keeps the model professional. Threats and self-harm
 #: are absent on purpose: they keep the take-over path.
-_MODERATION_KEEP_ANSWERING: dict[ModerationCategory, tuple[str, ...]] = {
-    ModerationCategory.abuse_harassment: ("abusive language toward the assistant or business",),
-    ModerationCategory.illegal_solicitation: ("asked for something illegal",),
+_MODERATION_KEEP_ANSWERING: frozenset[ModerationCategory] = frozenset(
+    {ModerationCategory.abuse_harassment, ModerationCategory.illegal_solicitation}
+)
+
+#: The owner-facing phrase for each moderation category (round 7 WP-2, item 7).
+_MODERATION_REASON: dict[ModerationCategory, str] = {
+    ModerationCategory.threats_violence: "threatened violence",
+    ModerationCategory.self_harm: "said they may harm themselves",
+    ModerationCategory.abuse_harassment: "abusive language toward the assistant or business",
+    ModerationCategory.illegal_solicitation: "asked for something illegal",
 }
+
+
+def moderation_reasons(category: ModerationCategory) -> tuple[str, ...]:
+    """The reasons every moderation escalation row carries (round 7 WP-2, item 7):
+    FIRST a stable ``moderation:<category>`` entry the delivery layer routes and
+    labels on, then the owner-facing phrase. Threats/self-harm rows (which take the
+    conversation away under explicit_human_request, D2) used to carry no reasons at
+    all, so the owner could not tell a threat from a polite request for a person."""
+    return (f"moderation:{category.value}", _MODERATION_REASON[category])
+
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
 # graph/hybrid Arc 16 (§3.2). Injected so the loop is testable now.
@@ -525,6 +837,7 @@ async def _record_escalation(
     gate: str,
     score: float | None,
     reasons: list[str] | None = None,
+    audit_detail: dict[str, object] | None = None,
 ) -> bool:
     """Write the escalation_events row + the audit event, then notify (§3.5.2 / §5.2).
 
@@ -537,7 +850,10 @@ async def _record_escalation(
     ONCE per (session, signal, gate): the insert itself is the arbiter (unique index
     ``uq_escalation_once``, 2026-09-05 audit F053/F061) — a pre-check-then-insert let
     two turns racing on the same session page the owner twice. Returns whether this
-    call wrote the row; a loser writes nothing and notifies nobody."""
+    call wrote the row; a loser writes nothing and notifies nobody.
+
+    ``audit_detail`` rides on the ``escalation_fired`` audit payload only (round 7
+    WP-2, item 7: the moderation category) — non-identifying keys, never lead PII."""
     inserted = await session.execute(
         pg_insert(EscalationEvent)
         .values(
@@ -566,8 +882,14 @@ async def _record_escalation(
         instance_id=instance_id,
         event_type="escalation_fired",
         actor_type=ActorType.luciel_runtime,
-        # No raw lead PII in the payload (§3.4.11) — signal + session id only.
-        payload={"signal": signal, "gate": gate, "session_id": str(session_id)},
+        # No raw lead PII in the payload (§3.4.11) — signal + session id (+ the
+        # moderation category when one applies), never the customer's words.
+        payload={
+            "signal": signal,
+            "gate": gate,
+            "session_id": str(session_id),
+            **(audit_detail or {}),
+        },
     )
     await session.flush()
     # Delivery starts AFTER this transaction commits, off the customer's turn (§3.5.4;
@@ -694,25 +1016,6 @@ class Orchestrator:
         timestamp (live-caught 2026-08-17: every widget turn read 0s)."""
         admin_id, instance_id = self.admin_id, self.instance_id
 
-        # Human-controlled sessions STOP the loop (§3.4.12): persist the inbound for
-        # the dashboard live feed, make no LLM call.
-        if not handoff.loop_should_run(mode):
-            await persist_turn(
-                self.session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                session_id=session_id,
-                role="lead",
-                text=inbound_text,
-                at=received_at,
-            )
-            return LoopResult(
-                reply_text="",
-                outbound_channel=channel,
-                counted=False,
-                handed_off=True,
-            )
-
         await persist_turn(
             self.session,
             admin_id=admin_id,
@@ -731,7 +1034,10 @@ class Orchestrator:
         # Runs BEFORE the budget gate (C5 — audit round 3): capture is deterministic
         # cognition with no LLM call, and the docs promise "leads still captured +
         # escalated" AT CAP — the at-cap escalation row used to carry no lead id
-        # because capture only ran after the gate.
+        # because capture only ran after the gate. It also runs BEFORE the
+        # human-controlled early return below (round 7 WP-2, item 8): a visitor who
+        # types their email while a person holds the session used to have it dropped
+        # on the floor, because the take-over return sat above this block.
         sess_obj = (
             await self.session.execute(
                 select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
@@ -781,6 +1087,25 @@ class Orchestrator:
                     session_id=session_id,
                 )
 
+        # Human-controlled sessions STOP the loop (§3.4.12): the inbound is persisted
+        # for the dashboard live feed and the lead record was maintained above (item
+        # 8); no LLM call is made and nothing is said.
+        if not handoff.loop_should_run(mode):
+            return LoopResult(
+                reply_text="",
+                outbound_channel=channel,
+                counted=False,
+                handed_off=True,
+            )
+
+        # The session's own transcript, loaded once for every path below: the intake
+        # gate reads the trailing lead turns from it, and the hand-off ack / contact
+        # ask decide from it whether they already went out this session (round 7
+        # WP-2 remainder, item 1) — the at-cap and moderation replies included.
+        history = await memory.load_session_history(
+            self.session, admin_id=admin_id, session_id=session_id
+        )
+
         # --- CONVERSATION BUDGET GATE (§3.4.1b) — before PLAN ----------------- #
         budget_state = await budget.check_budget(
             self.session,
@@ -801,6 +1126,7 @@ class Orchestrator:
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
             at_cap_row = await persist_turn(
                 self.session,
@@ -850,10 +1176,13 @@ class Orchestrator:
         mod = moderate(inbound_text)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
+            # Every moderation row: "moderation:<category>" first, then the owner's
+            # phrase (item 7); the category also reaches the escalation_fired audit.
+            reasons = moderation_reasons(mod.category)
+            audit_detail: dict[str, object] = {"moderation_category": mod.category.value}
             if mod.category in _MODERATION_KEEP_ANSWERING:
                 # D2: abuse / an illegal ask are told to the owner; Luciel stays
                 # professional (MODERATION stanza) and keeps answering — no take-over.
-                reasons = _MODERATION_KEEP_ANSWERING[mod.category]
                 await _record_escalation(
                     self.session,
                     admin_id=admin_id,
@@ -864,6 +1193,7 @@ class Orchestrator:
                     gate=Gate.intake.value,
                     score=None,
                     reasons=list(reasons),
+                    audit_detail=audit_detail,
                 )
                 standing = EscalationDecision(
                     True, Signal.content_flagged, Gate.intake, None, reasons
@@ -874,8 +1204,8 @@ class Orchestrator:
                     # Immediate escalation with crisis copy; no contact ask (F116).
                     ack = SELF_HARM_REPLY
                 else:
-                    ack = self._with_contact_ask(
-                        await self._handoff_ack(),
+                    ack = await self._handoff_reply(
+                        history,
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
@@ -888,6 +1218,8 @@ class Orchestrator:
                     gate="intake",
                     score=None,
                     ack=ack,
+                    reasons=reasons,
+                    audit_detail=audit_detail,
                 )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -895,9 +1227,6 @@ class Orchestrator:
             await self._audit_injection(session_id)
 
         # --- ESCALATION GATE 1 — INTAKE (§3.4.5) ----------------------------- #
-        history = await memory.load_session_history(
-            self.session, admin_id=admin_id, session_id=session_id
-        )
         trailing = [t.text for t in history if t.role == "lead"]
         intake = evaluate_intake(trailing)
         if intake.fired and intake.signal is Signal.explicit_human_request:
@@ -911,8 +1240,8 @@ class Orchestrator:
                 gate="intake",
                 score=intake.score_or_confidence,
                 reasons=intake.reasons,
-                ack=self._with_contact_ask(
-                    await self._handoff_ack(),
+                ack=await self._handoff_reply(
+                    history,
                     channel=channel,
                     resolved_lead_id=resolved_lead_id,
                     transport_identifier=transport_identifier,
@@ -944,12 +1273,100 @@ class Orchestrator:
         # fabricated. When bound, an empty list here is a REAL "retrieval found
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
-        if self.retriever_bundle is not None:
-            raw_chunks, attributed_chunks = await self.retriever_bundle(inbound_text)
+        gather_pending = sess_obj is not None and sess_obj.input_ask_attempts > 0
+
+        # --- DECLINED INPUT (§3.3.7 rule 4; round 7 WP-2 remainder, item 2) --- #
+        # The last turn stalled asking for a detail and the customer now declines
+        # to give it: the ask stops HERE, in code — never a re-ask in fresh words.
+        # A tool that cannot run without it makes this a real hand-off (row, owner
+        # page naming the field, the honest line); a prose stall just moves on.
+        declined_prefix = ""
+        if sess_obj is not None and gather_pending and is_decline_turn(inbound_text):
+            sess_obj.input_ask_attempts = 0
+            gather_pending = False
+            gather = await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            if gather.blocks_action:
+                emit_metric("GatherDeclined", dimensions={"Channel": channel})
+                decline_reasons = [
+                    f"customer declined to give {', '.join(gather.missing_fields)}"
+                    if gather.missing_fields
+                    else "customer declined to say which one they meant",
+                    f"{gather.what} cannot go ahead without it",
+                ]
+                await record_or_extend_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=Signal.cannot_answer.value,
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=decline_reasons,
+                )
+                declined_text = declined_input_reply(gather)
+                declined_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=declined_text,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=declined_row.id,
+                    reply_text=declined_text,
+                    outbound_channel=channel,
+                    counted=False,
+                    escalation=EscalationDecision(
+                        True, Signal.cannot_answer, Gate.outcome, None, tuple(decline_reasons)
+                    ),
+                )
+            if not _CARRIES_QUESTION.search(inbound_text):
+                # Nothing was blocked and nothing was asked: acknowledge and move on,
+                # with no model call to tempt a re-ask.
+                declined_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=DECLINED_INPUT_CONTINUE,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=declined_row.id,
+                    reply_text=DECLINED_INPUT_CONTINUE,
+                    outbound_channel=channel,
+                    counted=False,
+                    escalation=standing,
+                )
+            # The decline came with a question: the loop answers it, and the reply
+            # opens by taking no for an answer.
+            declined_prefix = f"{DECLINED_INPUT_LINE} "
+
+        if retrieval_skippable(inbound_text, gather_pending=gather_pending):
+            # Nothing to look up (item 3): no embedding call, no Knowledge block, and
+            # the row carries no attribution because no search ran (never a false
+            # "searched, nothing matched").
+            raw_chunks: list[str] = []
+            knowledge_state = _KNOWLEDGE_NOT_SEARCHED
         else:
-            raw_chunks = await self.retriever(inbound_text)
-            if self.chunk_attributor is not None:
-                attributed_chunks = await self.chunk_attributor(inbound_text)
+            if self.retriever_bundle is not None:
+                raw_chunks, attributed_chunks = await self.retriever_bundle(inbound_text)
+            else:
+                raw_chunks = await self.retriever(inbound_text)
+                if self.chunk_attributor is not None:
+                    attributed_chunks = await self.chunk_attributor(inbound_text)
+            if is_retrieval_unavailable(attributed_chunks):
+                knowledge_state = _KNOWLEDGE_UNAVAILABLE
+            elif raw_chunks:
+                knowledge_state = _KNOWLEDGE_FOUND
+            else:
+                knowledge_state = _KNOWLEDGE_NONE_MATCHED
         wrapped_chunks = [wrap_untrusted(c) for c in raw_chunks]
 
         # --- CROSS-SESSION MEMORY (§3.4.6) ----------------------------------- #
@@ -972,6 +1389,21 @@ class Orchestrator:
         # resolver-known. The broker still enforces every gate in code at dispatch
         # (§3.4.14 Defense 1) — this only determines what the model is TOLD.
         tool_defs = await self._turn_tool_defs()
+        # --- REQUIRED INPUTS ALREADY ON FILE (round 7 WP-2 remainder, item 10) --- #
+        # The lead's CONFIRMED email/phone — or the transport identifier itself —
+        # fill a required input the model leaves out, at the broker; the stanza names
+        # the fields so the model stops asking for what the customer already gave.
+        gathered: dict[str, Any] = (
+            await channel_switch.confirmed_inputs_on_file(
+                self.session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                lead_id=resolved_lead_id,
+                transport_identifier=transport_identifier,
+            )
+            if tool_defs
+            else {}
+        )
         system_prompt = (
             build_system_prompt(
                 self.business_context,
@@ -980,6 +1412,7 @@ class Orchestrator:
                 assistant_name=self.assistant_name,
                 tool_catalog=tool_defs,
                 operating_context=self.operating_context,
+                on_file=sorted(gathered),
             )
             if tool_defs
             else self.system_prompt
@@ -996,6 +1429,8 @@ class Orchestrator:
             system_prompt=system_prompt,
             tool_defs=tool_defs,
             session_id=session_id,
+            knowledge_state=knowledge_state,
+            gathered=gathered,
         )
 
         if used_fallback:
@@ -1029,6 +1464,7 @@ class Orchestrator:
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
             outage_row = await persist_turn(
                 self.session,
@@ -1111,8 +1547,8 @@ class Orchestrator:
                             gate=Gate.outcome.value,
                             reasons=list(stall_reasons),
                         )
-                    ack = self._with_contact_ask(
-                        await self._handoff_ack(),
+                    ack = await self._handoff_reply(
+                        history,
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
@@ -1184,12 +1620,13 @@ class Orchestrator:
                 session_id=session_id,
                 signal=fired_signal,
             )
+            row_written = False
             if not suppress:
                 # ONE row for the turn: the signal that won it, with BOTH sets of
                 # reasons when a hot lead also got an ungrounded draft (round 7
                 # WP-2, item 1) — the owner reads "named a budget; answer only 10%
                 # backed by your knowledge" on the same line.
-                await _record_escalation(
+                row_written = await _record_escalation(
                     self.session,
                     admin_id=admin_id,
                     instance_id=instance_id,
@@ -1211,7 +1648,7 @@ class Orchestrator:
                     session_id=session_id,
                     signal=Signal.cannot_answer.value,
                 ):
-                    await _record_escalation(
+                    row_written = await _record_escalation(
                         self.session,
                         admin_id=admin_id,
                         instance_id=instance_id,
@@ -1222,6 +1659,17 @@ class Orchestrator:
                         score=min(resp.confidence, grounding.score),
                         reasons=list(outcome.answer_reasons),
                     )
+            if outcome.answer_ungrounded and not row_written:
+                # The session's row already exists and THIS question is a new one
+                # Luciel cannot cover (round 7 WP-2 remainder, item 1): the owner
+                # reads it on the row and is paged again — a repeat pages nobody.
+                await self._renotify_new_question(
+                    history,
+                    inbound_text=inbound_text,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    fired_signal=fired_signal,
+                )
 
         # --- LUCIEL'S OWN HAND-OFF (round 7 WP-2, item 2; Vision §3.4) ------- #
         # The model called hand_to_team this turn: the row + notification were
@@ -1338,9 +1786,22 @@ class Orchestrator:
             # specific replacement above. The verdict is read from
             # ``answer_ungrounded``, not from the signal (round 7 WP-2, item 1): a
             # hot lead whose row says high_value_lead gets the same honest ack, not
-            # the fabricated draft that used to ship under the winning signal.
-            reply_text = await self._handoff_ack()
+            # the fabricated draft that used to ship under the winning signal. The
+            # FULL ack once per session; a later uncovered question gets a short,
+            # varied acknowledgement instead of the same paragraph again (remainder
+            # item 1).
+            reply_text = (
+                short_handoff_ack(history)
+                if handoff_ack_sent(history)
+                else await self._handoff_ack()
+            )
             deterministic_reply = True
+        if declined_prefix:
+            # The customer declined a detail and asked something in the same breath
+            # (item 2): whatever answers the question — the model's grounded reply
+            # or the honest hand-off line for an uncovered one — opens by taking no
+            # for an answer.
+            reply_text = declined_prefix + reply_text
         if team_told and not deterministic_reply:
             # The sentiment row was written THIS turn (D2): the answer stands, and the
             # customer hears that a person is aware — a canned hand-off line already
@@ -1348,13 +1809,27 @@ class Orchestrator:
             reply_text = reply_text.rstrip() + _TEAM_TOLD_NOTE
         if escalation is None:
             escalation = standing
+        # The customer asked for this answer on another channel (round 6 WP-H, F060).
+        # Decided BEFORE the contact ask: when the switch below will itself ask for an
+        # address, the escalation-time contact ask is not doubled on top of it.
+        requested_channel = channel_switch.detect_requested_channel(inbound_text)
+        switch_will_ask = (
+            requested_channel is not None
+            and requested_channel != channel
+            and requested_channel in channel_switch.KIND_FOR_CHANNEL
+            and requested_channel in (self.enabled_channels or {channel})
+            and sess_obj is not None
+        )
         # Escalation-time contact ask — shared helper since C5; see _with_contact_ask.
-        if escalation is not None:
+        # Never on the turn the customer declined a detail (item 2): "I won't ask for
+        # that again" followed by "what's the best email" is the re-ask rule 4 forbids.
+        if escalation is not None and not switch_will_ask and not declined_prefix:
             reply_text = self._with_contact_ask(
                 reply_text,
                 channel=channel,
                 resolved_lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                history=history,
             )
         # AI-identity disclosure backstop (§3.4.16): on the FIRST outbound of a new
         # conversation on a text channel, guarantee the disclosure in code rather than
@@ -1367,7 +1842,6 @@ class Orchestrator:
                 business_name=self.business_name,
                 assistant_name=self.assistant_name,
             )
-        requested_channel = channel_switch.detect_requested_channel(inbound_text)
         outbound = choose_outbound_channel(
             inbound_channel=channel,
             enabled_channels=self.enabled_channels or {channel},
@@ -1377,14 +1851,13 @@ class Orchestrator:
             # a promised hand-off made real — is the urgent case the arbiter weighs.
             is_urgent_escalation=escalation is not None,
         )
-        if (
-            outbound != channel
-            and escalation is None
-            and outbound in channel_switch.KIND_FOR_CHANNEL
-        ):
+        if outbound != channel and outbound in channel_switch.KIND_FOR_CHANNEL:
             if requested_channel == outbound and sess_obj is not None:
                 # The customer ASKED for it there (round 6 WP-H, F060): a confirmed
-                # address gets it now; otherwise ask where and park the answer.
+                # address gets it now; otherwise ask where and park the answer. This
+                # runs whether or not the turn escalated (round 7 WP-2, item 6):
+                # "email me your prices, I'd like to book this week" is a hot lead AND
+                # a request for an address — it used to be neither asked nor sent.
                 reply_text = await self._switch_or_ask(
                     sess_obj,
                     outbound=outbound,
@@ -1392,7 +1865,7 @@ class Orchestrator:
                     inbound_text=inbound_text,
                     resolved_lead_id=resolved_lead_id,
                 )
-            elif outbound in _CHANNEL_OFFER:
+            elif escalation is None and outbound in _CHANNEL_OFFER:
                 # The arbiter would rather answer elsewhere (a long answer on SMS,
                 # §3.4.2). Nothing is sent uninvited: the reply stays on the channel
                 # the lead wrote on and OFFERS the switch.
@@ -1553,11 +2026,17 @@ class Orchestrator:
         system_prompt: str | None = None,
         tool_defs: list[dict[str, Any]] | None = None,
         session_id: uuid.UUID | None = None,
+        knowledge_state: str = _KNOWLEDGE_NOT_SEARCHED,
+        gathered: dict[str, Any] | None = None,
     ) -> tuple[_Reasoned, int, bool, str | None]:
         """PLAN→ACT→REFLECT up to MAX_ITERATIONS (§3.4.1). Returns the final reasoned
         answer, the iteration count, whether the fallback provider was used, and why
         no model served the turn: None, ``_LLM_FAILURE_PROVIDER`` (BOTH providers
         failed) or ``_LLM_FAILURE_CAP`` (the tenant's per-minute cap refused it).
+
+        ``knowledge_state`` (item 4) says what the Knowledge block's absence means:
+        chunks found → the block; searched and nothing matched, or the search could
+        not run → the matching deterministic note; not searched → nothing at all.
 
         The cap is admitted ONCE at the turn boundary (``router.turn()``, round 7
         WP-2 item 4): the iterations inside share that admission, so a tool-using
@@ -1593,6 +2072,19 @@ class Orchestrator:
             messages.append({"role": role, "content": t.text})
         if wrapped_chunks:
             messages.append({"role": "user", "content": "Knowledge:\n" + "\n".join(wrapped_chunks)})
+        elif knowledge_state == _KNOWLEDGE_NONE_MATCHED:
+            # Searched, nothing matched (item 4): said in so many words, so the model
+            # answers from what it was given — or says it does not know — instead of
+            # reading an absent block as "I was never told anything about this".
+            messages.append(
+                {"role": "user", "content": KNOWLEDGE_NONE_MATCHED, PLATFORM_NOTE_KEY: True}
+            )
+        elif knowledge_state == _KNOWLEDGE_UNAVAILABLE:
+            # The embedding provider was down (the bundle persisted its marker): a
+            # different truth from "nothing matched", and the model is told which.
+            messages.append(
+                {"role": "user", "content": KNOWLEDGE_UNAVAILABLE, PLATFORM_NOTE_KEY: True}
+            )
 
         prompt = system_prompt if system_prompt is not None else self.system_prompt
         used_fallback = False
@@ -1633,7 +2125,10 @@ class Orchestrator:
                     # tool_result turn per call (untrusted-wrapped — results embed
                     # lead/provider content).
                     results = await self._dispatch_tools(
-                        resp.tool_calls, resolved_lead_id=resolved_lead_id, session_id=session_id
+                        resp.tool_calls,
+                        resolved_lead_id=resolved_lead_id,
+                        session_id=session_id,
+                        gathered=gathered,
                     )
                     dispatched.extend(results)
                     tool_outcomes.extend(r.outcome.value for _, r in results)
@@ -1681,6 +2176,7 @@ class Orchestrator:
         *,
         resolved_lead_id: uuid.UUID | None = None,
         session_id: uuid.UUID | None = None,
+        gathered: dict[str, Any] | None = None,
     ) -> list[tuple[dict[str, Any], ToolResult]]:
         """Dispatch PLAN tool intents via the Arc 12 broker, returning each proposed
         call paired with its full five-outcome result (§3.3.3/§3.3.4). The broker
@@ -1694,6 +2190,10 @@ class Orchestrator:
         from app.tools.broker import ToolBroker
 
         broker = ToolBroker(self.session)
+        # The business's clock (round 7 WP-2 remainder, item 11): the scheduling tools
+        # read an offset-less time in it and render every time they return in it — the
+        # same zone the operating-context stanza told the model about this turn.
+        timezone = self.operating_context.timezone if self.operating_context else None
         results: list[tuple[dict[str, Any], ToolResult]] = []
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
@@ -1733,6 +2233,8 @@ class Orchestrator:
                 instance_id=self.instance_id,
                 resolved_lead_id=resolved_lead_id,
                 session_id=session_id,
+                gathered=gathered,  # item 10: confirmed values fill a missing input
+                timezone=timezone,  # item 11: the business's clock for the tools
             )
             results.append((dict(call), result))
         return results
@@ -1785,6 +2287,51 @@ class Orchestrator:
             }
         )
 
+    async def _renotify_new_question(
+        self,
+        history: list[Transcript],
+        *,
+        inbound_text: str,
+        session_id: uuid.UUID,
+        resolved_lead_id: uuid.UUID | None,
+        fired_signal: str,
+    ) -> bool:
+        """A DISTINCT question Luciel could not answer after the session's row already
+        exists (round 7 WP-2 remainder, item 1).
+
+        A signal's row is written once per session, so a second uncovered question
+        used to vanish: the owner was paged about the first and never heard that the
+        visitor went on to ask two more things nobody could answer. Now the new
+        question rides on the row's reasons (``also asked: "…"``) and the SAME row is
+        notified again — the row stays one business event, the page carries the
+        news. A repeat of an earlier uncovered question ("implants??" after "do you
+        do implants?") is judged by ``is_new_question`` and pages nobody. Returns
+        whether a re-notification was scheduled."""
+        if not is_new_question(inbound_text, unanswered_questions(history)):
+            return False
+        signal = (
+            Signal.cannot_answer.value
+            if await _session_already_escalated(
+                self.session,
+                admin_id=self.admin_id,
+                session_id=session_id,
+                signal=Signal.cannot_answer.value,
+            )
+            else fired_signal
+        )
+        # The row exists (the caller checked), so this extends it and re-pages.
+        return await record_or_extend_escalation(
+            self.session,
+            admin_id=self.admin_id,
+            instance_id=self.instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=Gate.outcome.value,
+            score=None,
+            reasons=[also_asked_reason(inbound_text)],
+        )
+
     @staticmethod
     def _with_contact_ask(
         reply_text: str,
@@ -1792,6 +2339,7 @@ class Orchestrator:
         channel: str,
         resolved_lead_id: uuid.UUID | None,
         transport_identifier: str | None,
+        history: list[Transcript],
     ) -> str:
         """Append the contact ask for an anonymous escalated visitor (C5).
 
@@ -1801,13 +2349,36 @@ class Orchestrator:
         in code. Previously only the gate-2 path asked; gate-1 (the most likely
         trigger: "can I talk to a human"), moderation, at-cap, and llm_unavailable
         all escalated an anonymous widget visitor without asking. Strong channels
-        (voice/SMS/email/Meta) skip this: the transport already names the person."""
-        if resolved_lead_id is None and transport_identifier is None and channel == "widget":
-            return (
-                f"{reply_text}\n\nSo the team can reach you, what's your name and "
-                "the best email or phone number to contact you at?"
-            )
+        (voice/SMS/email/Meta) skip this: the transport already names the person.
+
+        Once per session, then a bounded, respited re-ask (round 7 WP-2 remainder,
+        item 1; see ``contact_ask_due``): every escalating turn used to nag."""
+        anonymous = (
+            resolved_lead_id is None and transport_identifier is None and channel == "widget"
+        )
+        if contact_ask_due(history, anonymous=anonymous):
+            return f"{reply_text}\n\n{CONTACT_ASK_LINE}"
         return reply_text
+
+    async def _handoff_reply(
+        self,
+        history: list[Transcript],
+        *,
+        channel: str,
+        resolved_lead_id: uuid.UUID | None,
+        transport_identifier: str | None,
+    ) -> str:
+        """The hand-off line for THIS turn (round 7 WP-2 remainder, item 1): the full
+        ack the first time this session, a short varied acknowledgement after — the
+        team already has the thread — with the contact ask only when it is due."""
+        ack = short_handoff_ack(history) if handoff_ack_sent(history) else await self._handoff_ack()
+        return self._with_contact_ask(
+            ack,
+            channel=channel,
+            resolved_lead_id=resolved_lead_id,
+            transport_identifier=transport_identifier,
+            history=history,
+        )
 
     async def _handoff_ack(self) -> str:
         """The customer-facing handoff acknowledgement (harmony fix 2026-08-04 item 4;
@@ -1863,6 +2434,7 @@ class Orchestrator:
         score: float | None,
         ack: str,
         reasons: tuple[str, ...] = (),
+        audit_detail: dict[str, object] | None = None,
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
@@ -1882,6 +2454,7 @@ class Orchestrator:
             gate=gate,
             score=score,
             reasons=list(reasons),
+            audit_detail=audit_detail,
         )
         ack_row = await persist_turn(
             self.session,
@@ -1907,7 +2480,7 @@ class Orchestrator:
             outbound_channel=channel,
             counted=True,
             handed_off=True,
-            escalation=EscalationDecision(True, signal, None, score),
+            escalation=EscalationDecision(True, signal, None, score, reasons),
         )
 
     async def _count_served_turn(self, session_id: uuid.UUID) -> bool:

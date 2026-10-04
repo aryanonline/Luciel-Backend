@@ -38,8 +38,10 @@ ACTION_TOOLS = frozenset(
 )
 
 _WINDOW_DESC = (
-    "UTC ISO-8601 window to check: a bare date YYYY-MM-DD for that whole day, a "
-    "single instant, or 'start/end' (e.g. 2026-08-25T14:00:00/2026-08-25T17:00:00)."
+    "ISO-8601 window to check: a bare date YYYY-MM-DD for that whole day, a "
+    "single instant, or 'start/end' (e.g. 2026-08-25T14:00:00/2026-08-25T17:00:00). "
+    "A date or time without a UTC offset is read on the business's clock when your "
+    "operating context names its time zone, and as UTC otherwise."
 )
 _SLOT_DESC = (
     "The exact slot to book, as one of the ISO start times check_availability "
