@@ -49,10 +49,11 @@ _SUPERUSER_PW = os.environ.get("PGPASSWORD", "postgres")
 _PSQL = os.environ.get("LUCIEL_PSQL", "psql")
 
 
-def _admin_psql(sql: str, db: str = "postgres") -> None:
+def _admin_psql(sql: str, db: str = "postgres") -> str:
+    """Run ``sql`` as the superuser; returns psql's stdout (decoded)."""
     if _CI_PG:
         env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
-        subprocess.run(
+        done = subprocess.run(
             [
                 _PSQL,
                 "-h",
@@ -73,11 +74,12 @@ def _admin_psql(sql: str, db: str = "postgres") -> None:
             env=env,
         )
     else:
-        subprocess.run(
+        done = subprocess.run(
             ["sudo", "-u", "postgres", "psql", "-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql],
             check=True,
             capture_output=True,
         )
+    return done.stdout.decode("utf-8", "replace") if done.stdout else ""
 
 
 def superuser_exec(sql: str) -> None:
@@ -276,34 +278,69 @@ async def _fresh_engine_per_test() -> AsyncIterator[None]:
     yield
 
 
+_TRUNCATE_LOCK_TIMEOUT = "30s"
+_TENANT_TABLES = (
+    "leads, instances, accounts, admin_audit_log, knowledge_sources, "
+    "knowledge_chunks, knowledge_entities, knowledge_edges, sessions, transcripts, "
+    "session_summaries, instance_connections, escalation_events, "
+    "instance_tool_authorizations, conversation_budgets, voice_call_records, "
+    "deferred_actions, billing_accounts, counted_sessions, processed_stripe_events, "
+    # Not tenant-scoped, but it accumulates across tests just the same.
+    "contact_submission"
+)
+
+
+def _truncate_tenant_tables() -> None:
+    """The between-tests wipe, as a superuser (bypasses RLS). Runs on a worker thread.
+
+    admin_audit_log carries a statement-level BEFORE TRUNCATE guard (§5.3, migration
+    0019) that does not exempt superusers — wiping an audit table is meant to require
+    an explicit, visible act. Disabling the guard around the fixture's own TRUNCATE is
+    that act, and mirrors what the tamper tests do with the row-level guard.
+
+    TRUNCATE takes an ACCESS EXCLUSIVE lock on every table listed. It waits at most
+    ``_TRUNCATE_LOCK_TIMEOUT`` for whoever still holds a row or table lock; past that
+    it fails with the list of sessions in the way instead of waiting forever.
+    """
+    _admin_psql("ALTER TABLE admin_audit_log DISABLE TRIGGER trg_audit_no_truncate", db=TEST_DB)
+    try:
+        _admin_psql(
+            f"SET lock_timeout = '{_TRUNCATE_LOCK_TIMEOUT}'; "
+            f"TRUNCATE {_TENANT_TABLES} RESTART IDENTITY CASCADE",
+            db=TEST_DB,
+        )
+    except subprocess.CalledProcessError as exc:
+        blockers = _admin_psql(
+            "SELECT pid, usename, state, wait_event_type, "
+            "now() - xact_start AS xact_age, left(query, 160) AS query "
+            "FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "ORDER BY xact_start NULLS LAST",
+            db=TEST_DB,
+        )
+        stderr = exc.stderr.decode("utf-8", "replace") if exc.stderr else ""
+        raise RuntimeError(
+            "the between-tests TRUNCATE could not take its locks within "
+            f"{_TRUNCATE_LOCK_TIMEOUT} — a transaction from the test that just ran is "
+            f"still open.\npsql: {stderr.strip()}\nsessions on the test database:\n{blockers}"
+        ) from exc
+    finally:
+        _admin_psql("ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate", db=TEST_DB)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables() -> AsyncIterator[None]:
-    """Truncate tenant tables between tests using a superuser path (bypasses RLS)."""
+    """Truncate tenant tables between tests using a superuser path (bypasses RLS).
+
+    The wipe runs on a WORKER THREAD, never on the event loop. It used to be a
+    synchronous ``psql`` call inside this async fixture: TRUNCATE then waited for any
+    transaction a coroutine of this same loop still had open, while blocking the very
+    loop that coroutine needed to commit — a self-deadlock with no timeout, which hung
+    two full-suite CI runs for over half an hour each (round 7, 2026-10-04). Off the
+    loop, a straggling coroutine finishes and the wipe proceeds.
+    """
     yield
-    # Cleanup after each test. Use the postgres superuser to truncate regardless of RLS.
-    # admin_audit_log carries a statement-level BEFORE TRUNCATE guard (§5.3, migration
-    # 0019) that does not exempt superusers — wiping an audit table is meant to require
-    # an explicit, visible act. Disabling the guard around the fixture's own TRUNCATE is
-    # that act, and mirrors what the tamper tests do with the row-level guard.
-    _admin_psql(
-        "ALTER TABLE admin_audit_log DISABLE TRIGGER trg_audit_no_truncate",
-        db=TEST_DB,
-    )
-    _admin_psql(
-        "TRUNCATE leads, instances, accounts, admin_audit_log, knowledge_sources, "
-        "knowledge_chunks, knowledge_entities, knowledge_edges, sessions, transcripts, "
-        "session_summaries, instance_connections, escalation_events, "
-        "instance_tool_authorizations, conversation_budgets, voice_call_records, "
-        "deferred_actions, billing_accounts, counted_sessions, processed_stripe_events, "
-        # Not tenant-scoped, but it accumulates across tests just the same.
-        "contact_submission "
-        "RESTART IDENTITY CASCADE",
-        db=TEST_DB,
-    )
-    _admin_psql(
-        "ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate",
-        db=TEST_DB,
-    )
+    await asyncio.to_thread(_truncate_tenant_tables)
 
 
 @pytest_asyncio.fixture(autouse=True)
