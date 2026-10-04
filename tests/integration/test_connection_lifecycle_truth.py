@@ -1692,3 +1692,77 @@ async def test_a_mailbox_claimed_under_other_casing_is_the_same_claim():
                 instance_name="Other",
                 user_id=None,
             )
+
+
+# --------------------------------------------------------------------------- #
+# Item 2 follow-up — own keys submitted over an OAuth row drop the OAuth stamps
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_own_keys_over_an_oauth_twilio_row_stay_api_key_through_attach_and_sweep():
+    """The live condition item 2's derivation opened: a tenant who connected Twilio
+    one-click and later pasted their own API keys kept ``mode: oauth`` and the old
+    ``token_expires_at`` on the row. The next number attach read the stale mode,
+    re-stamped ``oauth_token`` over API-key material, and the sweep then tried to
+    refresh a token that does not exist — a working credential went ``expired``
+    with an attention email. The form submit now drops the OAuth stamps."""
+    from datetime import timedelta
+
+    from app.channels.phone_lifecycle import attach_sms_number
+    from app.connections import service as conn_service
+    from app.connections.health import ProbeResult
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/sms_sender"
+    await get_secret_store().put(ref, {"access_token": "tw-bearer", "refresh_token": "r"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="oauth_token",
+        status="unconfigured",
+        cfg={
+            "accountSid": ACCOUNT_SID,
+            "accountName": "Acme",
+            "mode": "oauth",
+            "connectedAs": f"Acme ({ACCOUNT_SID})",
+            "token_expires_at": (NOW - timedelta(hours=1)).isoformat(),
+        },
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        await conn_service.submit_credentials(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            fields={"accountSid": ACCOUNT_SID, "apiKeySid": "SK" + "1" * 32, "apiKeySecret": "s3"},
+            user_id=admin,
+        )
+    row = await _row(admin, cid)
+    assert row.auth_class == "api_key"
+    cfg = row.non_secret_config or {}
+    assert cfg["accountSid"] == ACCOUNT_SID
+    for stamp in ("mode", "token_expires_at", "accountName", "connectedAs"):
+        assert stamp not in cfg, stamp
+    assert await get_secret_store().get(ref) == {"apiKeySid": "SK" + "1" * 32, "apiKeySecret": "s3"}
+
+    async with tenant_session(admin) as s:
+        conn = await attach_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            e164_number=NUMBER,
+            probe=_FixedProbe(OperabilityResult.OPERABLE),
+        )
+        assert conn.auth_class == "api_key", "the attach must not resurrect the OAuth class"
+        assert conn.status == "pending_carrier_registration"
+
+    # The sweep probes it as the API-key row it is — no refresh, no false expiry.
+    healthy = _AnswersProbe(ProbeResult(ok=True))
+    assert await _sweep_with(admin, healthy, NOW) == {str(cid): "pending_carrier_registration"}
+    assert healthy.calls == 1
+    assert await _attention_emails(admin) == 0

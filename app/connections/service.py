@@ -714,10 +714,18 @@ async def submit_credentials(
     cfg_after = dict(connection.non_secret_config or {})
     # Item 10: a rate-limit backoff was earned by the credential just replaced; the
     # one that was proven a moment ago must not inherit the wait.
-    backoff_spent = cfg_after.pop(NEXT_PROBE_AT_KEY, None) is not None
+    cfg_after.pop(NEXT_PROBE_AT_KEY, None)
     staged_swap = cfg_after.pop("pending_provider", None) is not None
-    if backoff_spent or staged_swap:
-        connection.non_secret_config = cfg_after
+    if twilio_creds is not None:
+        # The row now holds the customer's OWN keys: whatever the one-click OAuth
+        # verify stamped describes a grant that is no longer the credential. Left
+        # behind, ``mode: oauth`` made the next number attach re-derive the OAuth
+        # class (item 2 reads it) over API-key material, and the stale
+        # ``token_expires_at`` then sent the sweep to refresh a token that is not
+        # there — a working key flipped to expired with an attention email.
+        for stamp in _TWILIO_OAUTH_STAMPS:
+            cfg_after.pop(stamp, None)
+    connection.non_secret_config = cfg_after
     if staged_swap and effective_provider != connection.provider:
         connection.provider = effective_provider
     # The verified submit decides the row's behavior class — for most providers
@@ -885,6 +893,11 @@ _ATTEMPT_STATE_KEYS: tuple[str, ...] = (
 #: owner's own value kept on file so a reconnect can offer it back. Getting it back
 #: goes through the normal attach / verify path, which re-runs the ownership gate.
 RELEASED_DESTINATION_KEY = "released_destination"
+
+#: non_secret_config keys the Twilio one-click OAuth verify stamps (verify.py). A
+#: credential-form submit on the same row replaces that grant with the customer's
+#: own keys, so they are dropped at the cutover (see submit_credentials).
+_TWILIO_OAUTH_STAMPS: tuple[str, ...] = ("mode", "token_expires_at", "accountName", "connectedAs")
 
 #: The connection types whose row holds a number / mailbox routing claim.
 _CLAIM_HOLDING_TYPES: frozenset[str] = frozenset({"sms_sender", "email_sender"})
