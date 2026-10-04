@@ -66,7 +66,16 @@ if mode == "mock":
     }
 if stripe_posture != "test":
     expected.add("stripe_gateway:FakeStripeGateway")
-got = set(degraded or [])
+# `escalation_backlog:<n>` (round 7 WP-4b) is an OPERATIONS signal — some tenant has
+# an escalation page still undelivered after a sweep — not a binding fault of this
+# build. It alarms through CloudWatch (EscalationBacklogAlarm); letting it fail this
+# probe would roll back a healthy release because one owner's contact is unreachable.
+# It is reported here and left out of the set equality.
+all_degraded = set(degraded or [])
+operational = {d for d in all_degraded if d.startswith("escalation_backlog:")}
+got = all_degraded - operational
+if operational:
+    print(f"[smoke] operations signal (not gating the deploy): {sorted(operational)}")
 print(f"[smoke] healthz status={status} integrationMode={got_mode} degraded={sorted(got)} expected={sorted(expected)}")
 sys.exit(0 if (status == "ok" and got_mode == mode and got == expected) else 1)
 PY
