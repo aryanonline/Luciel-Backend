@@ -32,7 +32,10 @@ from tests.conftest import APP_USER, superuser_exec
 pytestmark = [pytest.mark.asyncio]
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PREVIOUS = "0065_embedding_verification"
+# 0067's own down_revision since the round-7 Phase 2 chain was linearised
+# (0065 -> 0066 -> 0067 -> 0068 -> 0069 -> 0070): the downgrade also unwinds the
+# migrations chained after it.
+PREVIOUS = "0066_takeover_delivery_truth"
 REVISION = "0067_lead_claims_and_identity"
 MAILBOX_CAPS = "Owner@Fabrikam.Example"
 MAILBOX = "owner@fabrikam.example"
@@ -181,6 +184,17 @@ async def test_0067_refuses_duplicates_loudly_then_upgrades_and_downgrades_clean
     a, b, solo, c, d = (uuid.uuid4() for _ in range(5))
     admins = [a, b, solo, c, d]
     try:
+        # Tenants are seeded at HEAD: the ORM models describe the head schema
+        # (``accounts.closed_at`` belongs to 0068, later in the chain), so an Account
+        # cannot be inserted through them once the downgrade below has run. The bad
+        # data is then shaped with UPDATEs and connection rows, which touch only
+        # columns that exist at every revision involved.
+        a_iid = await _seed(a, embed_key=f"vm_live_{a.hex[:10]}")
+        b_iid = await _seed(b, embed_key=f"vm_live_{b.hex[:10]}")
+        solo_iid = await _seed(solo, embed_key=f"vm_live_{solo.hex[:10]}")
+        await _seed(c, embed_key=f"vm_live_{c.hex[:10]}")
+        await _seed(d, embed_key=f"vm_live_{d.hex[:10]}")
+
         # --- downgrade: the structures the migration adds are gone --------------- #
         down = await _alembic("downgrade", PREVIOUS)
         assert down.returncode == 0, down.stderr
@@ -190,11 +204,13 @@ async def test_0067_refuses_duplicates_loudly_then_upgrades_and_downgrades_clean
         assert not await _function_exists("connection_config_holders")
 
         # --- the bad data the sweep exists to clear ------------------------------ #
-        a_iid = await _seed(a, embed_key=f"vm_live_{a.hex[:10]}")
-        b_iid = await _seed(b, embed_key=f"vm_live_{b.hex[:10]}")
-        solo_iid = await _seed(solo, embed_key=f"vm_live_{solo.hex[:10]}")
-        await _seed(c, embed_key=SHARED_KEY)  # two instances, one embed key
-        await _seed(d, embed_key=SHARED_KEY)
+        for tenant in (c, d):  # two instances, one embed key
+            async with tenant_session(tenant) as s:
+                await s.execute(
+                    update(Instance)
+                    .where(Instance.admin_id == tenant)
+                    .values(embed_key_public_id=SHARED_KEY)
+                )
         await _mailbox_row(a, a_iid, MAILBOX_CAPS)  # one mailbox, two live claims,
         await _mailbox_row(b, b_iid, MAILBOX)  # differing only in case
         await _mailbox_row(solo, solo_iid, SOLO_CAPS)  # unique, but typed with capitals
