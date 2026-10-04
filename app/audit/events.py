@@ -187,6 +187,12 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # identifier an anonymous lead had only typed; the row moved to the proven
         # owner and the typed claim became a mention. Payload: kind + hashed ids.
         "lead_identifier_rehomed",
+        # Round 7 WP-3c item 13 (owner ruling 2026-09-14): the CRM portal this
+        # account just connected (HubSpot hubId / Salesforce orgId) is also held by
+        # another account — ALLOWED, informational. Payload: provider, the key name,
+        # the portal id's last four characters and how many other accounts; never
+        # which ones.
+        "crm_portal_shared",
         # Round 7 WP-3c item 5: one bounded pass of the one-time CRM backfill
         # (leads captured before a CRM connected). Payload: provider + counts only.
         "crm_backfill_run",

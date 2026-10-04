@@ -26,7 +26,7 @@ from app.audit import log as audit
 from app.connections import gate
 from app.db.session import tenant_session
 from app.employee.status import build_employee_status
-from app.lifecycle import state_machine
+from app.lifecycle import embed_keys, state_machine
 from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
 from app.models.instance import Instance, LucielState
@@ -267,13 +267,15 @@ async def create_luciel(
             website_url=req.website_url,
             business_one_liner=req.business_one_liner,
             state=LucielState.active,
-            embed_key_public_id=f"vm_live_{uuid.uuid4().hex[:12]}",
             channels=DEFAULT_CHANNELS,
             tools=DEFAULT_TOOLS,
             escalation={},
             personality={"preset": "warm_concierge"},
         )
         s.add(inst)
+        # Round 7 WP-3c item 14: the key is unique by the 0067 index; the mint
+        # re-tries on a conflict instead of failing the owner's first-run.
+        await embed_keys.assign_fresh_embed_key(s, inst)
         await s.flush()
         # First Luciel completes first-run.
         from app.models.instance import Account
@@ -819,7 +821,7 @@ async def rotate_embed_key(subject: Subject = Depends(current_admin)) -> LucielO
             raise not_found("No Luciel.")
         ensure_config_editable(inst)
         old_key = inst.embed_key_public_id
-        inst.embed_key_public_id = f"vm_live_{uuid.uuid4().hex[:12]}"
+        await embed_keys.assign_fresh_embed_key(s, inst)  # item 14: unique, retried
         await s.flush()
         await audit.emit(
             s,
