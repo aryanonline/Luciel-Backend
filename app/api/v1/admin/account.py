@@ -1,27 +1,37 @@
-"""/api/v1/admin/account/* — export + close (Architecture §3.6.6, §5.10)."""
+"""/api/v1/admin/account/* — status, export, close (Architecture §3.6.6, §5.10).
+
+Owner decision D5 (2026-09-14): for 30 days after closure the owner can sign in to a
+REDUCED surface — read the account status, reopen it, re-request the export; nothing
+else. Those routes depend on ``current_account_owner``; ``close`` (like every other
+admin route) stays on ``current_admin`` and refuses a closed account with the typed
+403 ``account_closed``.
+"""
 
 from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Subject, current_admin
+from app.api.deps import Subject, current_account_owner, current_admin
 from app.api.errors import conflict, unauthorized
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
 from app.lifecycle import cascade
+from app.lifecycle.close_purge import closure_started_at, reopen_deadline
 from app.lifecycle.export_bundle import build_export_zip, hold_export_lock
 from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
 from app.models.audit import ActorType
-from app.models.instance import Account, Instance, LucielState
+from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import email_dispatcher
+from app.schemas_api.account import AccountStatusOut
 from app.schemas_api.common import WireModel
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
@@ -139,6 +149,37 @@ async def _build_upload_and_notify(
             email_outcome,
         )
     return url, email_outcome
+
+
+@router.get("", response_model=AccountStatusOut)
+async def get_account(subject: Subject = Depends(current_account_owner)) -> AccountStatusOut:
+    """The account's lifecycle status — the one READ a closed account may make (D5).
+
+    For a closed account: when it closed, until when it can be reopened (the same
+    deadline the day-30 purge uses), and whether reopening brings the Luciel back.
+    For an open account the instants are null — the frontend asks one place either way.
+    """
+    async with tenant_session(subject.admin_id) as s:
+        acct = (await s.execute(select(Account).where(Account.id == subject.admin_id))).scalar_one()
+        if acct.state != AccountState.closed:
+            return AccountStatusOut(state=acct.state.value)
+        closed_at = await closure_started_at(s, subject.admin_id, account=acct)
+        reopen_until = reopen_deadline(closed_at) if closed_at is not None else None
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        record = await cascade.closure_record(s, subject.admin_id)
+    return AccountStatusOut(
+        state=acct.state.value,
+        closed_at=closed_at,
+        reopen_until=reopen_until,
+        can_reopen=reopen_until is not None and datetime.now(UTC) < reopen_until,
+        luciel_restored_on_reopen=(
+            record.get("luciel_deleted_by_closure") is True
+            and inst is not None
+            and inst.state == LucielState.luciel_grace_window
+        ),
+    )
 
 
 @router.post("/export", response_model=ExportResult)

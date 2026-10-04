@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +34,7 @@ from app.lifecycle import state_machine
 from app.lifecycle.export_bundle import hold_export_lock
 from app.lifecycle.export_store import export_prefix_for, get_export_store
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
-from app.models.audit import ActorType
+from app.models.audit import ActorType, AdminAuditLog
 from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.booking import BookingEvent
 from app.models.budget import ConversationBudget, CountedSession
@@ -483,6 +484,28 @@ async def settle_billing_at_closure(
     return outcome
 
 
+async def closure_record(session: AsyncSession, admin_id: uuid.UUID) -> dict[str, object]:
+    """What the CURRENT closure did, from its ``account_closure_initiated`` audit row
+    (the latest one — an account can close more than once since D5).
+
+    Carries ``luciel_state_before`` and ``luciel_deleted_by_closure``. Empty for a
+    closure recorded before those keys existed: the reopen then restores nothing it
+    cannot prove the closure took, and the Luciel's own Restore (same 30-day window)
+    is still there for the owner."""
+    payload = (
+        await session.execute(
+            select(AdminAuditLog.event_payload)
+            .where(
+                AdminAuditLog.admin_id == admin_id,
+                AdminAuditLog.event_type == "account_closure_initiated",
+            )
+            .order_by(AdminAuditLog.seq.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 async def close_account(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -502,11 +525,23 @@ async def close_account(
 
     Outstanding pay-as-you-go usage is settled at closure while the card is still on
     file (Legal §A4). Audit tombstones are retained.
+
+    Owner decision D5 (2026-09-14): the closure can be REOPENED for 30 days. Two things
+    are recorded here for that: ``accounts.closed_at`` (the reopen / purge clock — an
+    account can now close more than once, so the first-ever closure audit row is no
+    longer a usable clock) and, on the ``account_closure_initiated`` audit row, what
+    the closure did to the Luciel (``luciel_state_before`` + ``luciel_deleted_by_closure``)
+    so the reopen restores exactly that and nothing the owner had deleted on purpose.
     """
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()
-    if inst is not None and inst.state in (LucielState.active, LucielState.paused):
+    luciel_state_before = inst.state.value if inst is not None else None
+    deleted_by_closure = inst is not None and inst.state in (
+        LucielState.active,
+        LucielState.paused,
+    )
+    if deleted_by_closure:
         await state_machine.delete_luciel(session, admin_id, actor_user_id)
     # Already in the grace window or hard-deleted: nothing more to quiesce.
 
@@ -518,11 +553,18 @@ async def close_account(
         event_type="account_closure_initiated",
         actor_type=ActorType.admin_user,
         actor_user_id=actor_user_id,
+        payload={
+            "luciel_state_before": luciel_state_before,
+            "luciel_deleted_by_closure": deleted_by_closure,
+        },
     )
     acct = (
         await session.execute(select(Account).where(Account.id == admin_id))
     ).scalar_one_or_none()
     if acct is not None:
+        if acct.state != AccountState.closed:
+            # A repeated close must not restart the 30-day clock.
+            acct.closed_at = datetime.now(UTC)
         acct.state = AccountState.closed
         # Revoke every live session (P1-5). The account row outlives closure by 30 days
         # (§3.6.6), so without the bump a cookie minted before closure stays valid against
