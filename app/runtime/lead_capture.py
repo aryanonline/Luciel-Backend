@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -72,6 +72,11 @@ def normalize_identifier(value: str) -> str:
     """Emails case-fold; phones and transport ids are compared verbatim."""
     text = value.strip()
     return text.lower() if "@" in text else text
+
+
+def is_email_address(value: str) -> bool:
+    """Whole-string email shape (the owner-edit validator, round 7 WP-3c item 6)."""
+    return _EMAIL_RE.fullmatch(value.strip()) is not None
 
 
 def crm_phone_key(lead: Lead) -> str | None:
@@ -181,7 +186,13 @@ def _extract_name(text: str) -> str | None:
 
 @dataclass(frozen=True)
 class LeadSignals:
-    """What a message revealed about the visitor as a sales-qualified lead."""
+    """What a message revealed about the visitor as a sales-qualified lead.
+
+    ``email`` / ``phone`` are identifiers the customer claimed as THEIR OWN (round 7
+    WP-3c item 2): the first address/number in the message that is not framed as
+    somebody else's or as a reference. Everything else the message carried that
+    looks like an address or a number is a ``mention`` — kept for the record, never
+    the lead's identity, never a CRM key."""
 
     email: str | None
     phone: str | None
@@ -190,6 +201,9 @@ class LeadSignals:
     # Self-introduced name ("I'm Jane Miller") — fill-when-absent only; a
     # conservative miss is None (#5d).
     name: str | None = None
+    # Addresses / E.164 numbers the customer MENTIONED without claiming (a
+    # colleague's address, an invoice number), normalised (item 2).
+    mentions: tuple[str, ...] = ()
 
     @property
     def strong_identifier(self) -> str | None:
@@ -204,19 +218,84 @@ class LeadSignals:
         return bool(self.strong_identifier) or self.has_intent or self.has_budget
 
 
+# --- own vs mentioned (round 7 WP-3c item 2) ------------------------------------ #
+# The customer's OWN identifier is one they claim ("my email is", "call me at",
+# "it's jane@…", or a bare address typed as the answer to "where can we reach
+# you?"); a MENTIONED one is framed as somebody else's ("copy my colleague
+# sarah@…", "reach her at …") or as a reference ("invoice 4165550143", "order #…").
+# The nearest marker before the identifier decides, within a short window; a tie
+# goes to the self-claim ("my number" contains "number"); no marker at all is a
+# claim — the bare-answer shape is how most visitors give their address. Mirrors
+# channel_switch's "typed into the same message as the request is theirs by
+# construction" and keeps the extractor deterministic (the production extractor
+# binds behind extract_lead_signals unchanged).
+_CLAIM_WINDOW = 48
+_SELF_CLAIM_RE = re.compile(
+    r"\b(?:my (?:e-?mail|address|number|phone|cell|mobile|digits|contact)"
+    r"|(?:e-?mail|call|text|reach|contact|message|ring|phone|copy|cc) me"
+    r"|you can (?:reach|contact|call|text|e-?mail) me"
+    r"|i can be reached|i'?m|i am|it'?s|it is|this is|here'?s my|here is my)\b",
+    re.IGNORECASE,
+)
+_THIRD_PARTY_RE = re.compile(
+    r"(?:\b(?:colleague|co-?worker|coworker|boss|manager|assistant|partner|husband|wife"
+    r"|spouse|friend|brother|sister|mother|father|mom|dad|son|daughter|parent"
+    r"|client|customer|tenant|landlord|accountant|lawyer|doctor|secretary|office"
+    r"|cc|copy|forward(?:ed)?|also (?:send|e-?mail|text|copy)|instead(?: of me)?"
+    r"|rather than me|his|hers?|their|them|theirs"
+    r"|invoice|order|ref(?:erence)?|ticket|account|confirmation|tracking|po"
+    r"|policy|claim|serial|member(?:ship)?|booking|receipt|transaction|no\.)"
+    r"(?=[\s:#.-]|$)|#)",
+    re.IGNORECASE,
+)
+
+
+def _nearest_end(pattern: re.Pattern[str], prefix: str) -> int:
+    """End offset of the LAST match of ``pattern`` in ``prefix``, or -1."""
+    end = -1
+    for m in pattern.finditer(prefix):
+        end = m.end()
+    return end
+
+
+def _is_own_claim(text: str, start: int) -> bool:
+    prefix = text[max(0, start - _CLAIM_WINDOW) : start]
+    own_at = _nearest_end(_SELF_CLAIM_RE, prefix)
+    other_at = _nearest_end(_THIRD_PARTY_RE, prefix)
+    if other_at < 0:
+        return True
+    return own_at >= other_at
+
+
 def extract_lead_signals(text: str) -> LeadSignals:
     t = text or ""
-    email_m = _EMAIL_RE.search(t)
-    phone_m = _PHONE_RE.search(t)
-    return LeadSignals(
-        email=email_m.group(0) if email_m else None,
+    email: str | None = None
+    phone: str | None = None
+    mentions: list[str] = []
+    for m in _EMAIL_RE.finditer(t):
+        if email is None and _is_own_claim(t, m.start()):
+            email = m.group(0)
+        else:
+            mentions.append(normalize_identifier(m.group(0)))
+    for m in _PHONE_RE.finditer(t):
         # E.164 from the first turn (F111/F127): the widget visitor who types
         # 416-555-0143 and the SMS sender +14165550143 are one person, and only a
         # normalised key lets the lookup see that.
-        phone=normalize_phone(phone_m.group(0)) if phone_m else None,
+        candidate = normalize_phone(m.group(0))
+        if candidate is None:
+            continue
+        if phone is None and _is_own_claim(t, m.start()):
+            phone = candidate
+        else:
+            mentions.append(candidate)
+    own = {normalize_identifier(v) for v in (email, phone) if v}
+    return LeadSignals(
+        email=email,
+        phone=phone,
         has_intent=bool(_INTENT_RE.search(t)),
         has_budget=bool(_BUDGET_RE.search(t)),
         name=_extract_name(t),
+        mentions=tuple(dict.fromkeys(v for v in mentions if v not in own)),
     )
 
 
@@ -232,16 +311,42 @@ def _lead_identifier_values(lead: Lead) -> set[str]:
     return {normalize_identifier(v) for v in (lead.contact_identifier, lead.email, lead.phone) if v}
 
 
+#: Identifier-row kinds that RESOLVE a lead. ``mention`` (round 7 WP-3c item 2: an
+#: address the customer mentioned without claiming it) and ``superseded`` (item 6: a
+#: value an owner edit replaced) are kept for the record and never resolve a
+#: conversation, never key a CRM push, and never receive a delivery.
+RESOLVING_KINDS: frozenset[str] = frozenset({"email", "phone", "transport"})
+MENTION_KIND = "mention"
+SUPERSEDED_KIND = "superseded"
+
+#: Where an identifier row came from (round 7 WP-3c item 7). ``transport`` — the
+#: channel itself carried it (SMS From, email From, a Meta id): PROVEN, the only
+#: source that wins an ownership contest. ``typed`` — the customer wrote it in
+#: conversation; ``volunteered`` — confirmed in a channel-switch exchange (F060);
+#: ``owner`` — entered on the dashboard (item 6). NULL is a legacy row written before
+#: sources were recorded: it can never be told apart from a transport claim, so it
+#: is never demoted (a returning legacy customer must not be split in two).
+TRANSPORT_SOURCE = "transport"
+TYPED_SOURCE = "typed"
+CONTESTABLE_SOURCES: frozenset[str] = frozenset({TYPED_SOURCE, "volunteered", "owner"})
+
+
 async def record_identifiers(
     session: AsyncSession, lead: Lead, *, confirmed_transport: str | None = None
 ) -> None:
     """Make sure every identifier the row carries has its ``lead_identifiers`` row.
 
-    Idempotent (unique on tenant+kind+value, conflicts ignored). A value already
-    owned by ANOTHER lead is left alone — that is the unification signal, not ours."""
+    Idempotent (unique on tenant+kind+value, conflicts ignored). A typed value
+    already owned by ANOTHER lead is left alone — that is the unification signal,
+    not ours. The identifier the transport carried is CLAIMED for this lead
+    (:func:`claim_transport_identifier`): confirmed at capture (F060), and taking
+    the row over from an anonymous typed claim (item 7)."""
     from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
 
+    transport_key = normalize_identifier(confirmed_transport) if confirmed_transport else None
     for value in _lead_identifier_values(lead):
+        if value == transport_key:
+            continue
         await session.execute(
             pg_insert(LeadIdentifier)
             .values(
@@ -251,24 +356,268 @@ async def record_identifiers(
                 lead_id=lead.id,
                 kind=identifier_kind(value),
                 value=value,
+                source=TYPED_SOURCE,
             )
             .on_conflict_do_nothing(constraint="uq_lead_identifier")
         )
-    if confirmed_transport:
-        # Round 6 WP-H (F060): the channel itself named the person — that identifier
-        # is confirmed at capture, so a later "email me" on SMS can go to their
-        # number without asking, and never to an address they did not confirm.
-        from app.runtime.channel_switch import confirm_identifier  # noqa: PLC0415
+    if transport_key:
+        await claim_transport_identifier(session, lead, transport_key)
 
-        key = normalize_identifier(confirmed_transport)
-        await confirm_identifier(
-            session,
-            admin_id=lead.admin_id,
-            instance_id=lead.instance_id,
-            lead_id=lead.id,
-            kind=identifier_kind(key),
-            value=key,
-            source="transport",
+
+async def record_mentions(session: AsyncSession, lead: Lead, mentions: tuple[str, ...]) -> None:
+    """Keep what the customer MENTIONED beside the lead as ``mention`` rows (item 2).
+
+    A colleague's address or an invoice number is part of the conversation's record
+    but never the lead's identity: the row never resolves a conversation, never keys
+    a CRM push and never receives a delivery. A value the lead actually owns is not
+    a mention of it."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    own = _lead_identifier_values(lead)
+    for value in mentions:
+        if value in own:
+            continue
+        await session.execute(
+            pg_insert(LeadIdentifier)
+            .values(
+                id=uuid.uuid4(),
+                admin_id=lead.admin_id,
+                instance_id=lead.instance_id,
+                lead_id=lead.id,
+                kind=MENTION_KIND,
+                value=value,
+                source=TYPED_SOURCE,
+            )
+            .on_conflict_do_nothing(constraint="uq_lead_identifier")
+        )
+
+
+async def _resolving_row(
+    session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID, key: str
+) -> LeadIdentifier | None:
+    """The one resolving row for ``key`` (unique on tenant + kind + value), or None."""
+    return (
+        await session.execute(
+            select(LeadIdentifier).where(
+                LeadIdentifier.admin_id == admin_id,
+                LeadIdentifier.instance_id == instance_id,
+                LeadIdentifier.kind == identifier_kind(key),
+                LeadIdentifier.value == key,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+def _is_proven(row: LeadIdentifier | None) -> bool:
+    return row is not None and row.source == TRANSPORT_SOURCE and row.confirmed_at is not None
+
+
+async def lead_has_transport_proof(session: AsyncSession, lead_id: uuid.UUID) -> bool:
+    """Has a channel ever proven ANY of this lead's identifiers (item 7)?
+
+    A lead the platform has actually reached through a transport is a real,
+    reachable person, and the further identifiers they typed are honoured (F125: an
+    absorbed typed address keeps resolving to the survivor). A lead known ONLY by
+    what it typed — the anonymous widget visitor — holds its claims until a transport
+    proves someone else owns one of them."""
+    row = (
+        await session.execute(
+            select(LeadIdentifier.id)
+            .where(
+                LeadIdentifier.lead_id == lead_id,
+                LeadIdentifier.source == TRANSPORT_SOURCE,
+                LeadIdentifier.confirmed_at.is_not(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
+async def _contestable(session: AsyncSession, row: LeadIdentifier) -> bool:
+    """Can a transport proof take this claim over? Only a typed/volunteered/owner
+    claim held by a lead with NO transport proof of its own (item 7)."""
+    if _is_proven(row) or row.source not in CONTESTABLE_SOURCES:
+        return False
+    return not await lead_has_transport_proof(session, row.lead_id)
+
+
+async def _demote_claim(
+    session: AsyncSession, row: LeadIdentifier, *, new_owner: Lead | None
+) -> None:
+    """A transport proved ``row.value`` belongs to someone else (item 7).
+
+    The earlier holder's claim becomes a ``mention`` — the record still says they
+    once gave that value — and the value leaves their own columns so it can never
+    again resolve a conversation to them or key their CRM record. With a
+    ``new_owner`` the row itself is re-homed (confirmed, ``transport``); without one
+    (the unbound path, whose lead is created right after) the resolving slot is
+    simply freed. Audited with hashed lead ids and the kind — never the value."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    holder = (
+        await session.execute(
+            select(Lead).where(Lead.admin_id == row.admin_id, Lead.id == row.lead_id)
+        )
+    ).scalar_one_or_none()
+    value, kind, old_source = row.value, row.kind, row.source
+    if holder is not None:
+        for column in ("contact_identifier", "email", "phone"):
+            current = getattr(holder, column)
+            if current and normalize_identifier(current) == value:
+                setattr(holder, column, None)
+    mention_taken = (
+        await session.execute(
+            select(LeadIdentifier.id).where(
+                LeadIdentifier.admin_id == row.admin_id,
+                LeadIdentifier.instance_id == row.instance_id,
+                LeadIdentifier.kind == MENTION_KIND,
+                LeadIdentifier.value == value,
+            )
+        )
+    ).scalar_one_or_none() is not None
+    if new_owner is not None:
+        row.lead_id = new_owner.id
+        row.confirmed_at = datetime.now(UTC)
+        row.source = TRANSPORT_SOURCE
+        await session.flush()
+        if holder is not None and not mention_taken:
+            await session.execute(
+                pg_insert(LeadIdentifier)
+                .values(
+                    id=uuid.uuid4(),
+                    admin_id=row.admin_id,
+                    instance_id=row.instance_id,
+                    lead_id=holder.id,
+                    kind=MENTION_KIND,
+                    value=value,
+                    source=old_source,
+                )
+                .on_conflict_do_nothing(constraint="uq_lead_identifier")
+            )
+    elif holder is None or mention_taken:
+        await session.delete(row)
+    else:
+        row.kind = MENTION_KIND
+        row.confirmed_at = None
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=row.admin_id,
+        instance_id=row.instance_id,
+        actor_type=ActorType.luciel_runtime,
+        event_type="lead_identifier_rehomed",
+        payload={
+            "kind": kind,
+            "from_lead_id_hash": audit.hash_lead_id(holder.id) if holder is not None else None,
+            "to_lead_id_hash": audit.hash_lead_id(new_owner.id) if new_owner is not None else None,
+            "reason": "transport_proof",
+        },
+    )
+
+
+async def claim_transport_identifier(session: AsyncSession, lead: Lead, key: str) -> None:
+    """The channel itself carried ``key`` for ``lead``: confirm it as theirs (F060),
+    and — item 7 — take the row over from an earlier anonymous typed claim.
+
+    Idempotent. A row another lead holds PROVEN (two transports for one value) or by
+    a legacy/uncontestable claim is left where it is: the unbound path resolves the
+    transport to its proven holder before a session is ever bound, so this branch
+    is the bound-session backstop, not the primary resolution."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    row = await _resolving_row(
+        session, admin_id=lead.admin_id, instance_id=lead.instance_id, key=key
+    )
+    if row is None:
+        await session.execute(
+            pg_insert(LeadIdentifier)
+            .values(
+                id=uuid.uuid4(),
+                admin_id=lead.admin_id,
+                instance_id=lead.instance_id,
+                lead_id=lead.id,
+                kind=identifier_kind(key),
+                value=key,
+                confirmed_at=now,
+                source=TRANSPORT_SOURCE,
+            )
+            .on_conflict_do_nothing(constraint="uq_lead_identifier")
+        )
+        return
+    if row.lead_id == lead.id:
+        if row.confirmed_at is None:
+            row.confirmed_at = now
+        row.source = TRANSPORT_SOURCE
+        return
+    if await _contestable(session, row):
+        await _demote_claim(session, row, new_owner=lead)
+
+
+async def supersede_identifier(
+    session: AsyncSession,
+    lead: Lead,
+    *,
+    kind: str,
+    old: str | None,
+    new: str | None,
+) -> None:
+    """An owner edit replaced ``old`` with ``new`` on the lead (round 7 WP-3c item 6).
+
+    The replaced value is re-kinded to ``superseded`` rather than dropped — the
+    record still says the person was once known by it — and it stops resolving
+    anything from this moment. The new value gets its own resolving row, recorded
+    as owner-entered and NOT confirmed: only the customer can confirm an address
+    (F060), so a channel switch will still ask before sending there."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    if old:
+        old_key = normalize_identifier(old)
+        already = (
+            await session.execute(
+                select(LeadIdentifier.id).where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.instance_id == lead.instance_id,
+                    LeadIdentifier.kind == SUPERSEDED_KIND,
+                    LeadIdentifier.value == old_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if already is None:
+            await session.execute(
+                update(LeadIdentifier)
+                .where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.instance_id == lead.instance_id,
+                    LeadIdentifier.lead_id == lead.id,
+                    LeadIdentifier.kind == kind,
+                    LeadIdentifier.value == old_key,
+                )
+                .values(kind=SUPERSEDED_KIND, confirmed_at=None, source="owner")
+            )
+        else:
+            await session.execute(
+                delete(LeadIdentifier).where(
+                    LeadIdentifier.admin_id == lead.admin_id,
+                    LeadIdentifier.lead_id == lead.id,
+                    LeadIdentifier.kind == kind,
+                    LeadIdentifier.value == old_key,
+                )
+            )
+    if new:
+        await session.execute(
+            pg_insert(LeadIdentifier)
+            .values(
+                id=uuid.uuid4(),
+                admin_id=lead.admin_id,
+                instance_id=lead.instance_id,
+                lead_id=lead.id,
+                kind=kind,
+                value=normalize_identifier(new),
+                source="owner",
+            )
+            .on_conflict_do_nothing(constraint="uq_lead_identifier")
         )
 
 
@@ -280,11 +629,22 @@ async def find_lead_by_identifier(
     value: str,
     exclude_id: uuid.UUID | None = None,
 ) -> Lead | None:
-    """The oldest lead known by ``value`` — on its own columns OR in the identifier
-    table (an identity absorbed by a merge). Emails case-fold; phones must already
-    be E.164 (callers normalise). Deterministic: oldest row wins."""
+    """The lead known by ``value`` — on its own columns OR in the identifier table
+    (an identity absorbed by a merge). Emails case-fold; phones must already be
+    E.164 (callers normalise). Deterministic: the lead a TRANSPORT proved owns the
+    value wins (round 7 WP-3c item 7 — a typed or mistyped claim never outranks the
+    channel's own evidence); otherwise the oldest row."""
     key = normalize_identifier(value)
     kind = identifier_kind(key)
+    proven = await _resolving_row(session, admin_id=admin_id, instance_id=instance_id, key=key)
+    if _is_proven(proven) and proven is not None and proven.lead_id != exclude_id:
+        owner = (
+            await session.execute(
+                select(Lead).where(Lead.admin_id == admin_id, Lead.id == proven.lead_id)
+            )
+        ).scalar_one_or_none()
+        if owner is not None:
+            return owner
     if kind == "email":
         own = [func.lower(Lead.contact_identifier) == key, Lead.email == key]
     else:
@@ -420,6 +780,7 @@ async def capture_or_update_lead(
                         await record_identifiers(
                             session, lead, confirmed_transport=transport_confirmed
                         )
+                        await record_mentions(session, lead, signals.mentions)
                         return CaptureResult(
                             lead_id=lead.id,
                             changed=changed,
@@ -435,6 +796,7 @@ async def capture_or_update_lead(
             await _reactivate_if_archived(session, lead)
             await session.flush()
             await record_identifiers(session, lead, confirmed_transport=transport_confirmed)
+            await record_mentions(session, lead, signals.mentions)
             return CaptureResult(
                 lead_id=lead.id,
                 changed=changed,
@@ -468,9 +830,59 @@ async def capture_or_update_lead(
     existing = await find_lead_by_identifier(
         session, admin_id=admin_id, instance_id=instance_id, value=contact_key
     )
+    if (
+        existing is not None
+        and transport_confirmed
+        and normalize_identifier(transport_confirmed) == normalize_identifier(contact_key)
+    ):
+        # Round 7 WP-3c item 7: the channel PROVES this identifier belongs to the
+        # person writing. An anonymous widget visitor who typed (or mistyped) the
+        # same number never outranks that — their claim demotes to a mention and
+        # the texter resolves to their own lead. A holder some transport has already
+        # reached keeps its typed claims (F125), and a legacy row is never split.
+        existing = await _settle_transport_contest(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            key=normalize_identifier(contact_key),
+            existing=existing,
+        )
+    # Round 7 WP-3c item 1: every identifier the customer claimed as their own on
+    # this turn is resolved too — unification used to run only once a session was
+    # bound, and every session starts unbound, so "it's Jane — jane@acme.com" from
+    # a new number duplicated Jane instead of continuing her record. The older row
+    # survives, exactly as on the bound path.
+    merged_facts: dict[str, str] = {}
+    for volunteered in _own_identifiers(signals):
+        if volunteered == normalize_identifier(contact_key):
+            continue
+        other = await find_lead_by_identifier(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            value=volunteered,
+            exclude_id=existing.id if existing is not None else None,
+        )
+        if other is None:
+            continue
+        if existing is None:
+            existing = other
+            continue
+        keep, absorb = (
+            (other, existing) if other.created_at <= existing.created_at else (existing, other)
+        )
+        merged_facts.update(
+            await _unify_leads(session, admin_id=admin_id, keep=keep, absorb=absorb)
+        )
+        existing = keep
 
     if existing is not None:
         changed = _apply_signals(existing, signals, inbound_text, score)
+        changed.update(merged_facts)
+        # A transport identifier that reached a lead known under another key (item
+        # 1: the SMS number of the widget lead who typed their email) is stored, so
+        # the CRM hears it and a later "text me" can go there without asking.
+        _absorb_transport(existing, transport_confirmed, changed)
         existing.last_activity_at = datetime.now(UTC)  # item 4: real inactivity
         await _reactivate_if_archived(session, existing)
         lead_id = existing.id
@@ -530,12 +942,63 @@ async def capture_or_update_lead(
     captured_row = existing if existing is not None else lead
     if captured_row is not None:
         await record_identifiers(session, captured_row, confirmed_transport=transport_confirmed)
+        await record_mentions(session, captured_row, signals.mentions)
     return CaptureResult(
         lead_id=lead_id,
         changed=changed,
         lead_key=lead_key,
         known_name=known_name,
         known_intent=known_intent,
+    )
+
+
+def _own_identifiers(signals: LeadSignals) -> list[str]:
+    """The identifiers this turn's customer claimed as THEIR OWN, normalised."""
+    return [normalize_identifier(v) for v in (signals.email, signals.phone) if v]
+
+
+def _absorb_transport(lead: Lead, transport: str | None, changed: dict[str, str]) -> None:
+    """Fill-when-absent: store the channel-carried identifier on a lead resolved
+    under another key (item 1). A platform-scoped id (a Meta PSID) with no free
+    column lives in the identifier table alone — never in a phone/email column."""
+    if not transport:
+        return
+    key = normalize_identifier(transport)
+    if key in _lead_identifier_values(lead):
+        return
+    kind = identifier_kind(key)
+    if lead.contact_identifier is None:
+        lead.contact_identifier = key
+        changed["contact"] = key
+    elif kind == "phone" and lead.phone is None:
+        lead.phone = key
+        changed["phone"] = key
+    elif kind == "email" and lead.email is None:
+        lead.email = key
+        changed["email"] = key
+
+
+async def _settle_transport_contest(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    key: str,
+    existing: Lead,
+) -> Lead | None:
+    """Who does a transport-carried ``key`` resolve to (item 7)?
+
+    ``existing`` is the resolver's answer (proven holder first, else oldest). It
+    stands unless the ONLY resolving row for the key is a contestable claim — typed
+    by a lead no transport has ever reached — in which case that claim is demoted
+    and the key resolves afresh (to a remaining column-only holder, or to nobody:
+    the caller then creates the texter's own lead)."""
+    row = await _resolving_row(session, admin_id=admin_id, instance_id=instance_id, key=key)
+    if row is None or not await _contestable(session, row):
+        return existing
+    await _demote_claim(session, row, new_owner=None)
+    return await find_lead_by_identifier(
+        session, admin_id=admin_id, instance_id=instance_id, value=key
     )
 
 

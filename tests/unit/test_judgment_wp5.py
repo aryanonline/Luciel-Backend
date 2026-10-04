@@ -138,7 +138,8 @@ def test_the_summary_keeps_the_leads_facts_and_notes_a_person_joined():
     summary = memory.summarize(history)
     assert summary.startswith("Intent: Hi, I'm looking for a deck quote")
     assert "| Turns: 4" in summary
-    assert "email dana@lead.example" in summary
+    # Round 7 WP-3c item 4 (§3.4.11): the address is a presence flag, never a value.
+    assert "email on file" in summary and "dana@lead.example" not in summary
     assert "budget $5,000" in summary
     assert "timing this week" in summary
     assert "A person joined this conversation" in summary
@@ -152,8 +153,10 @@ def test_the_summary_never_lifts_a_fact_luciel_stated():
     ]
     summary = memory.summarize(history)
     assert "| Facts:" not in summary  # nothing Luciel said becomes a lead fact
+    # The echoed line is minimized too (round 7 WP-3c item 4, §3.4.11): an address
+    # Luciel spoke is as absent from the persisted record as one the lead typed.
     expected = (
         "Intent: how much is a deck? | Last response: Decks start at $4,000 — email us at "
-        "sales@acme.example. | Turns: 2"
+        "email on file. | Turns: 2"
     )
     assert summary == expected

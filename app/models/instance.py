@@ -16,7 +16,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Integer, String, text
+from sqlalchemy import Boolean, DateTime, Enum, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -117,6 +117,7 @@ class Instance(Base, TenantMixin, TimestampMixin):
     """The one Luciel per account."""
 
     __tablename__ = "instances"
+    __table_args__ = (Index("ix_instances_embed_key", "embed_key_public_id", unique=True),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -127,7 +128,12 @@ class Instance(Base, TenantMixin, TimestampMixin):
     state: Mapped[LucielState] = mapped_column(
         Enum(LucielState, name="luciel_state"), default=LucielState.active, nullable=False
     )
-    embed_key_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # UNIQUE across every instance (round 7 WP-3c item 14, migration 0067): the widget
+    # resolves its tenant by this key alone, so two instances sharing one would be a
+    # routing ambiguity. The mint sites (create / rotate / restore-without-stash) go
+    # through ``app.lifecycle.embed_keys.assign_fresh_embed_key``, which re-mints on a
+    # conflict instead of surfacing it.
+    embed_key_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # The key's value while the Luciel sits in the delete grace window (§3.6.3
     # quiesce): resolution keys on embed_key_public_id, so a stashed key accepts
     # no inbound — but restore revives the SAME key, keeping the customer's

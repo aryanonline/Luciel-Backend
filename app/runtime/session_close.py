@@ -87,7 +87,9 @@ async def _summarize_and_stamp(session: AsyncSession, sess: Session, *, ended_at
         instance_id=sess.instance_id,
         session_id=sess.id,
         resolved_lead_id=sess.resolved_lead_id,
-        summary=memory.summarize(history),
+        # Round 7 WP-3c item 4: the fast model writes the §3.4.7 shape in live
+        # posture; the deterministic structurer is the mock path and the fallback.
+        summary=await memory.summarize_session(history, admin_id=sess.admin_id),
     )
 
 

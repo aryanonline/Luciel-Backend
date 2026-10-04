@@ -1048,6 +1048,25 @@ async def _resolves_to(admin_id: uuid.UUID, destination: str) -> uuid.UUID | Non
         return await routing.owner_of_destination(s, "channel_auth", destination)
 
 
+class _EveryId(set):
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+def _meta_proves_every_id(monkeypatch) -> None:
+    """Round 7 WP-3c item 11: a bind is ROUTABLE only when a lister proves the id;
+    in mock posture (no Meta to ask) it is parked under pending_destination(s). The
+    binding tests below are about routing semantics, not posture, so they run under
+    a lister that vouches for every id (test_meta_bind_posture_wp3c.py pins the
+    parked path)."""
+    from app.connections import meta_assets
+
+    async def _lister(*, material, connection_type, transport):
+        return _EveryId()
+
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: _lister)
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_binding_the_destination_is_what_makes_an_inbound_meta_message_routable(
     client, monkeypatch
@@ -1055,6 +1074,7 @@ async def test_binding_the_destination_is_what_makes_an_inbound_meta_message_rou
     """A token alone cannot deliver a message: routing needs the destination id."""
     await _ready_account_with_luciel(client)
     admin_id = _admin_id(client)
+    _meta_proves_every_id(monkeypatch)
     cid = await _connected_meta(client, monkeypatch)
 
     phone_number_id = f"pnid-{uuid.uuid4().hex[:10]}"
@@ -1081,6 +1101,7 @@ async def test_a_destination_another_account_already_holds_is_refused(client, mo
     race — one tenant could capture another's inbound messages. The claim is refused."""
     await _ready_account_with_luciel(client)
     first_admin = _admin_id(client)
+    _meta_proves_every_id(monkeypatch)
     first_cid = await _connected_meta(client, monkeypatch)
     shared = f"pnid-{uuid.uuid4().hex[:10]}"
     assert (
@@ -1130,6 +1151,7 @@ async def test_rebinding_to_a_different_number_is_audited_with_both_values(clien
 
     await _ready_account_with_luciel(client)
     admin_id = _admin_id(client)
+    _meta_proves_every_id(monkeypatch)
     cid = await _connected_meta(client, monkeypatch)
     first, second = f"pnid-a-{uuid.uuid4().hex[:6]}", f"pnid-b-{uuid.uuid4().hex[:6]}"
     path = f"/api/v1/admin/connections/{cid}/destination"

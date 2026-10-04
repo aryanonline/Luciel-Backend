@@ -32,7 +32,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CLOSED_ACCOUNT_STATES, Subject, current_admin
-from app.api.errors import conflict, not_found, service_unavailable, validation_error
+from app.api.errors import (
+    ApiError,
+    conflict,
+    not_found,
+    rate_limited,
+    service_unavailable,
+    validation_error,
+)
 from app.audit import log as audit
 from app.channels import routing
 from app.connections import meta_assets, oauth_flow, registry, service
@@ -266,10 +273,21 @@ async def start_connection(
         return StartConnectionResult.model_validate(result)
 
 
-async def _record_claim_rejection(admin_id: uuid.UUID, number: str) -> None:
+async def _record_claim_rejection(
+    admin_id: uuid.UUID, destination: str, *, connection_type: str = "sms_sender"
+) -> None:
     """Audit a refused destination claim in its OWN transaction (the request's is
-    rolling back with the 409). No holder information and no full number in the
-    payload — the event records THAT this admin was refused, not whose number it is."""
+    rolling back with the 409). No holder information and no full destination in
+    the payload — the event records THAT this admin was refused, not whose asset it
+    is. Round 7 WP-3c item 12 generalised it past the SMS number: a Meta asset id
+    and a mailbox address refuse through the same event (``connection_type`` says
+    which; ``number_suffix`` is kept for the SMS readers that predate it)."""
+    payload: dict[str, object] = {
+        "connection_type": connection_type,
+        "destination_suffix": destination[-4:],
+    }
+    if connection_type == "sms_sender":
+        payload["number_suffix"] = destination[-4:]
     async with tenant_session(admin_id) as s:
         instance_id = (
             await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
@@ -280,8 +298,109 @@ async def _record_claim_rejection(admin_id: uuid.UUID, number: str) -> None:
             instance_id=instance_id,
             actor_type=ActorType.platform,
             event_type="destination_claim_rejected",
-            payload={"connection_type": "sms_sender", "number_suffix": number[-4:]},
+            payload=payload,
         )
+
+
+CLAIM_RATE_LIMITED_MESSAGE = (
+    "Too many attempts to connect destinations that belong to other accounts. "
+    "Please wait a minute before trying again."
+)
+
+
+async def _claim_rate_exhausted(admin_id: uuid.UUID) -> bool:
+    """Charge the claimant's ``destination_claim`` bucket; True when it is spent.
+
+    The 409 is otherwise an enumeration oracle for which numbers, mailboxes and
+    Meta ids other accounts hold (c21); every refusal site pays into ONE bucket."""
+    from app.channels import rate_limit  # noqa: PLC0415
+
+    decision = rate_limit.get_store().check_source("destination_claim", str(admin_id))
+    return not decision.allowed
+
+
+async def _refuse_claim(
+    admin_id: uuid.UUID, *, connection_type: str, destination: str, message: str
+) -> ApiError:
+    """Audit + rate-bucket a refused destination claim; the error to raise (409, or
+    429 once the claimant's bucket is spent). Round 7 WP-3c item 12."""
+    await _record_claim_rejection(admin_id, destination, connection_type=connection_type)
+    if await _claim_rate_exhausted(admin_id):
+        return rate_limited(CLAIM_RATE_LIMITED_MESSAGE, retry_after_seconds=60)
+    return conflict(message)
+
+
+# --- shared CRM portal (round 7 WP-3c item 13, owner ruling 2026-09-14) ------------- #
+#: Which verified non-secret field identifies the tenant's CRM portal, per provider.
+_PORTAL_KEYS: dict[str, tuple[str, str]] = {
+    "hubspot": ("hubId", "HubSpot portal"),
+    "salesforce": ("orgId", "Salesforce org"),
+}
+PORTAL_SHARED_NOTE = (
+    "Note: this {label} is also connected to another VantageMind account; both push "
+    "leads into the same CRM."
+)
+
+
+def portal_identity(
+    provider: str, verify_updates: dict[str, object]
+) -> tuple[str, str, str] | None:
+    """``(key, value, label)`` naming the portal the verifier reported, or None when
+    this provider has no portal identity (or the verifier reported none)."""
+    spec = _PORTAL_KEYS.get(provider)
+    if spec is None:
+        return None
+    key, label = spec
+    value = str(verify_updates.get(key) or "").strip()
+    return (key, value, label) if value else None
+
+
+def _with_note(current: str | None, note: str) -> str:
+    base = (current or "").rstrip()
+    if note in base:
+        return base
+    return f"{base} {note}".strip()
+
+
+async def _portal_sharing_note(
+    s: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None,
+    connection_type: str,
+    provider: str,
+    verify_updates: dict[str, object],
+) -> str | None:
+    """An INFORMATIONAL note when another account already holds this CRM portal.
+
+    Allowed by owner ruling (a franchise or an agency legitimately runs two Luciels
+    into one CRM); the owner sees it on the row, the platform audits
+    ``crm_portal_shared`` (counts and a suffix, never the other account). This
+    function never refuses and never raises past a lookup failure."""
+    identity = portal_identity(provider, verify_updates)
+    if identity is None:
+        return None
+    key, value, label = identity
+    holders = await routing.holders_of_connection_config(s, connection_type, key, value)
+    others = [holder for holder in holders if holder != admin_id]
+    if not others:
+        return None
+    await audit.emit(
+        s,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.admin_user,
+        actor_user_id=actor_user_id,
+        event_type="crm_portal_shared",
+        payload={
+            "provider": provider,
+            "portal_key": key,
+            "portal_id_suffix": value[-4:],
+            "other_account_count": len(others),
+        },
+    )
+    return PORTAL_SHARED_NOTE.format(label=label)
 
 
 @router.post("/{connection_id}/credentials", response_model=ConnectionOut)
@@ -1026,6 +1145,12 @@ class OAuthExchangeRejected(Exception):
     """The provider refused the code, or its token endpoint was unreachable."""
 
 
+class OAuthClaimRateLimited(OAuthExchangeRejected):
+    """A destination conflict on the OAuth bind, once the claimant's
+    ``destination_claim`` bucket is spent (round 7 WP-3c item 12): the admin-authed
+    callback answers 429, the browser callback still lands on ``exchange_failed``."""
+
+
 async def complete_oauth_connect(
     *,
     admin_id: uuid.UUID,
@@ -1160,6 +1285,8 @@ async def complete_oauth_connect(
                 raise OAuthExchangeRejected(str(exc)) from exc
 
     conflict_reason: str | None = None
+    claimed_destination = ""
+    shared_note: str | None = None
     async with tenant_session(admin_id) as s:
         conn = await _tenant_connection(s, admin_id, connection_id)
         if verify_updates is not None:
@@ -1169,11 +1296,23 @@ async def complete_oauth_connect(
             # foreign claims from an ordinary query (routing.owner_of_destination).
             destination = str(verify_updates.get("destination", ""))
             if destination:
+                claimed_destination = destination
                 await routing.lock_destination_claim(s, destination)  # c21 TOCTOU guard
                 holder = await routing.owner_of_destination(s, connection_type, destination)
                 if holder is not None and holder != admin_id:
                     conflict_reason = f"{destination} is already connected to a different account"
             if conflict_reason is None:
+                # Item 13: a CRM portal another account also holds is allowed — the
+                # owner is told, the platform records it, nothing is refused.
+                shared_note = await _portal_sharing_note(
+                    s,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    actor_user_id=actor_user_id,
+                    connection_type=connection_type,
+                    provider=provider,
+                    verify_updates=verify_updates,
+                )
                 cfg = dict(conn.non_secret_config or {})
                 cfg.update(verify_updates)
                 conn.non_secret_config = cfg
@@ -1258,6 +1397,9 @@ async def complete_oauth_connect(
                         "reason": "oauth_callback_token_exchanged",
                     },
                 )
+            if shared_note:
+                conn.status_detail = _with_note(conn.status_detail, shared_note)
+                await s.flush()
             return _connection_out(conn)
 
     # Destination conflict: fail exactly like a failed verify — previous sender stays
@@ -1267,6 +1409,12 @@ async def complete_oauth_connect(
         secret_store, admin_id=admin_id, instance_id=instance_id, connection_type=connection_type
     )
     await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, conflict_reason)
+    # Item 12: the mailbox bind is a claim point like the SMS attach — audited under
+    # the claimant and rate-bucketed, so the 409 cannot enumerate other accounts'
+    # mailboxes. Recorded AFTER the failure is persisted, in their own transactions.
+    await _record_claim_rejection(admin_id, claimed_destination, connection_type=connection_type)
+    if await _claim_rate_exhausted(admin_id):
+        raise OAuthClaimRateLimited(conflict_reason)
     raise OAuthExchangeRejected(conflict_reason)
 
 
@@ -1319,6 +1467,8 @@ async def oauth_callback(
         )
     except OAuthStateRejected as exc:
         raise validation_error(str(exc)) from exc
+    except OAuthClaimRateLimited as exc:
+        raise rate_limited(CLAIM_RATE_LIMITED_MESSAGE, retry_after_seconds=60) from exc
     except OAuthExchangeRejected as exc:
         raise conflict(str(exc)) from exc
 
@@ -1333,18 +1483,20 @@ _BINDABLE_CHANNELS: dict[str, frozenset[str]] = {
 
 async def _require_asset_on_grant(
     *, admin_id: uuid.UUID, instance_id: uuid.UUID, connection_type: str, destination: str
-) -> None:
+) -> bool:
     """Refuse a Meta asset id the authorized grant does not actually cover (F082).
 
     A mistyped Page / phone-number / IG-account id used to bind cleanly and produce a
     channel that read "Answering on …" while every inbound resolved to no tenant. Meta
-    is asked what the grant owns; in a posture with no Meta to ask (``lister_for_posture``
-    returns None) the check is skipped explicitly. "Could not ask" is a 503, never a
+    is asked what the grant owns. Returns True when a lister PROVED the id; False in a
+    posture with no Meta to ask (``lister_for_posture`` returns None) — round 7 WP-3c
+    item 11: that is no longer a pass, the caller parks the id as pending instead of
+    writing a routable claim it cannot vouch for. "Could not ask" is a 503, never a
     pass — the owner is told to retry rather than handed a silent dead channel.
     """
     lister = meta_assets.lister_for_posture()
     if lister is None:
-        return
+        return False
     material = await get_secret_store().get(secret_ref_for(admin_id, instance_id, connection_type))
     if not material:
         raise validation_error(
@@ -1367,6 +1519,24 @@ async def _require_asset_on_grant(
             "WhatsApp phone-number or Instagram account id, or re-authorize with an "
             "account that manages it."
         )
+    return True
+
+
+#: Round 7 WP-3c item 11 — the honest state of a Meta id bound where Meta could not
+#: be asked: parked under ``pending_destination(s)``, NOT routable, promoted only by
+#: a bind that a lister proves. Mirrors phone_lifecycle.attach_sms_number's
+#: ``pending_destination`` for a number whose operability was not confirmed.
+META_UNPROVEN_DETAIL = (
+    "Ownership of that Meta id could not be confirmed with Meta in this deployment, so it "
+    "is parked and not answering yet. Bind it again once Meta can be asked."
+)
+
+
+def _meta_bind_detail(current: str | None, *, proven: bool) -> str | None:
+    if not proven:
+        return META_UNPROVEN_DETAIL
+    # A proven bind clears OUR parked notice and leaves any other detail alone.
+    return None if current == META_UNPROVEN_DETAIL else current
 
 
 @router.put("/{connection_id}/destination", response_model=ConnectionOut)
@@ -1422,29 +1592,58 @@ async def bind_destination(
         # claim on the other or one tenant's messages land on another's Luciel.
         owner = await routing.owner_of_meta_destination(s, req.destination)
         if owner is not None and owner != subject.admin_id:
-            raise conflict(
-                "That Meta destination is already connected to another account. "
-                "Disconnect it there first."
+            # Item 12: audited under the claimant + the destination_claim bucket, so
+            # the 409 is not an oracle for which Meta ids other accounts hold.
+            raise await _refuse_claim(
+                subject.admin_id,
+                connection_type=conn.connection_type,
+                destination=req.destination,
+                message=(
+                    "That Meta destination is already connected to another account. "
+                    "Disconnect it there first."
+                ),
             )
-        await _require_asset_on_grant(
+        proven = await _require_asset_on_grant(
             admin_id=subject.admin_id,
             instance_id=instance_id,
             connection_type=conn.connection_type,
             destination=req.destination,
         )
+        # Item 11: only an id a lister PROVED becomes the routable claim. Where Meta
+        # could not be asked the id is parked under pending_destination(s) — honest
+        # status_detail, no routing, no claim another tenant has to fight — and the
+        # channel's previous routable id is released (a re-point is a re-point,
+        # exactly as a number change re-runs the SMS gate from scratch).
         cfg = dict(conn.non_secret_config or {})
         if req.channel:
             existing_map = cfg.get("destinations")
-            destinations = dict(existing_map) if isinstance(existing_map, dict) else {}
-            previous = destinations.get(req.channel)
-            destinations[req.channel] = req.destination
-            cfg["destinations"] = destinations
+            routable = dict(existing_map) if isinstance(existing_map, dict) else {}
+            parked_map = cfg.get("pending_destinations")
+            parked = dict(parked_map) if isinstance(parked_map, dict) else {}
+            previous = routable.get(req.channel) or parked.get(req.channel)
+            if proven:
+                routable[req.channel] = req.destination
+                parked.pop(req.channel, None)
+            else:
+                parked[req.channel] = req.destination
+                routable.pop(req.channel, None)
+            cfg["destinations"] = routable
+            if parked:
+                cfg["pending_destinations"] = parked
+            else:
+                cfg.pop("pending_destinations", None)
         else:
-            previous = cfg.get("destination")
-            cfg["destination"] = req.destination
+            previous = cfg.get("destination") or cfg.get("pending_destination")
+            if proven:
+                cfg["destination"] = req.destination
+                cfg.pop("pending_destination", None)
+            else:
+                cfg["pending_destination"] = req.destination
+                cfg.pop("destination", None)
         # New dict, not an in-place edit: the JSONB column is not a MutableDict, so
         # mutating the existing one would not be flushed.
         conn.non_secret_config = cfg
+        conn.status_detail = _meta_bind_detail(conn.status_detail, proven=proven)
         await s.flush()
         await audit.emit(
             s,
@@ -1461,6 +1660,7 @@ async def bind_destination(
                 "channel": req.channel,
                 "old_destination": previous,
                 "new_destination": req.destination,
+                "proven": proven,
             },
         )
         return _connection_out(conn)

@@ -224,10 +224,15 @@ class LeadOut(WireModel):
     outcome: Literal["in_progress", "converted", "lost"] = "in_progress"
     last_activity_at: datetime
     created_at: datetime
-    # 2026-09-05 audit F134: the honest CRM state. null = never attempted (no CRM,
-    # tool off, or no key the CRM accepts); synced / failed otherwise, with the
-    # non-secret reason and the time of the last successful push.
-    crm_status: Literal["synced", "failed"] | None = None
+    # 2026-09-05 audit F134: the honest CRM state — synced / failed, with the
+    # non-secret reason and the time of the last successful push. Round 7 WP-3c
+    # item 5: a lead nothing ever pushed is an EXPLICIT ``never_attempted`` with
+    # the reason in ``crm_detail`` (``schemas_api.leads.NeverAttemptedReason``),
+    # derived from the tenant's current posture — the old null hid a lead captured
+    # before the CRM connected behind the same value as "no CRM key", so the
+    # dashboard could never offer the one-time backfill. null only for legacy
+    # readers that predate the state.
+    crm_status: Literal["synced", "failed", "never_attempted"] | None = None
     crm_detail: str | None = None
     crm_pushed_at: datetime | None = None
 

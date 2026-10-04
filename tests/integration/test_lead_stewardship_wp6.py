@@ -186,7 +186,14 @@ async def _audit_count(admin: uuid.UUID, event_type: str) -> int:
 
 # --- F111 / F127 --------------------------------------------------------------- #
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_a_typed_phone_and_a_later_text_from_it_are_one_lead():
+async def test_a_typed_phone_is_e164_and_a_text_from_a_proven_number_is_recognised():
+    """F111/F127 as amended by round 7 WP-3c item 7 (owner ruling 2026-09-14): a
+    typed number is E.164 from the first turn and remembered in the identifier
+    table — but a text FROM a number an ANONYMOUS visitor merely typed no longer
+    resolves into that visitor's record (the transport is the proof of ownership;
+    the typed claim demotes to a mention — tests/integration/
+    test_lead_identity_wp3c.py). What IS recognised, not duplicated, is a later
+    text from a number the channel itself has proven."""
     admin = uuid.uuid4()
     iid = await _seed_tenant(admin, provider=None)
     widget = await _session(admin, iid)
@@ -205,11 +212,20 @@ async def test_a_typed_phone_and_a_later_text_from_it_are_one_lead():
         transport="+16045550100",
         push=False,
     )
-    leads = await _leads(admin)
-    assert [le.id for le in leads] == [lead.id]  # recognised, not duplicated
+    texter = next(le for le in await _leads(admin) if le.id != lead.id)
     async with tenant_session(admin) as s:
         bound = (await s.execute(select(SessionModel).where(SessionModel.id == sms))).scalar_one()
-        assert bound.resolved_lead_id == lead.id
+        assert bound.resolved_lead_id == texter.id
+
+    # A second text from the now-PROVEN number is the same lead — no duplicate.
+    later = await _session(admin, iid, channel="sms")
+    await _capture(
+        admin, iid, later, "any update?", channel="sms", transport="+16045550100", push=False
+    )
+    assert len(await _leads(admin)) == 2
+    async with tenant_session(admin) as s:
+        bound = (await s.execute(select(SessionModel).where(SessionModel.id == later))).scalar_one()
+        assert bound.resolved_lead_id == texter.id
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

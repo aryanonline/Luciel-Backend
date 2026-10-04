@@ -360,7 +360,12 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
     # §3.6.4): the snippet already deployed on the customer's site starts
     # working again with no re-edit. Minting fresh is only the fallback for a
     # legacy row that entered grace before the stash column existed.
-    inst.embed_key_public_id = inst.embed_key_stashed or f"vm_live_{uuid.uuid4().hex[:12]}"
+    if inst.embed_key_stashed:
+        inst.embed_key_public_id = inst.embed_key_stashed
+    else:
+        from app.lifecycle.embed_keys import assign_fresh_embed_key  # noqa: PLC0415
+
+        await assign_fresh_embed_key(session, inst)  # item 14: unique, retried
     inst.embed_key_stashed = None
     conns = (
         (

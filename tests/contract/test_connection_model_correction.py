@@ -510,6 +510,25 @@ async def _connected_instagram(client, monkeypatch) -> str:
     return await _connect_oauth(client, monkeypatch, "instagram_auth", "instagram")
 
 
+class _EveryId(set):
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+def _meta_proves_every_id(monkeypatch) -> None:
+    """Round 7 WP-3c item 11: a bind is ROUTABLE only when a lister proves the id;
+    in mock posture (no Meta to ask) it is parked under pending_destinations. The
+    tests below are about binding semantics, not posture, so they run under a
+    lister that vouches for every id (tests/contract/test_meta_bind_posture_wp3c.py
+    pins the parked path)."""
+    from app.connections import meta_assets
+
+    async def _lister(*, material, connection_type, transport):
+        return _EveryId()
+
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: _lister)
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_one_meta_connection_binds_both_facebook_channels_without_evicting_each_other(
     client, monkeypatch
@@ -518,6 +537,7 @@ async def test_one_meta_connection_binds_both_facebook_channels_without_evicting
     same single-active type, so connecting the second REVOKED the first — an owner who
     turned on Messenger silently lost WhatsApp. One Facebook grant, both destinations."""
     await _ready_account_with_luciel(client)
+    _meta_proves_every_id(monkeypatch)
     cid = await _connected_meta(client, monkeypatch)
 
     bound = {}
@@ -556,6 +576,7 @@ async def test_instagram_binds_on_its_own_grant_and_the_two_coexist(client, monk
     connection would store a destination whose token lives on the other app, and the send
     would fail at Graph long after the owner was told it was connected."""
     await _ready_account_with_luciel(client)
+    _meta_proves_every_id(monkeypatch)
     meta_cid = await _connected_meta(client, monkeypatch)
     wa = f"pnid-{uuid.uuid4().hex[:8]}"
     assert (
@@ -603,6 +624,7 @@ async def test_inbound_routing_resolves_each_meta_channel_by_its_own_destination
 
     await _ready_account_with_luciel(client)
     admin_id = _admin_id(client)
+    _meta_proves_every_id(monkeypatch)
     cid = await _connected_meta(client, monkeypatch)
     ig_cid = await _connected_instagram(client, monkeypatch)
     wa = f"pnid-{uuid.uuid4().hex[:8]}"
@@ -641,6 +663,7 @@ async def test_each_meta_channel_replies_from_its_own_sender_identity(client, mo
     await _ready_account_with_luciel(client)
     admin_id = _admin_id(client)
     instance_id = await _instance_id(admin_id)
+    _meta_proves_every_id(monkeypatch)
     cid = await _connected_meta(client, monkeypatch)
     wa = f"pnid-{uuid.uuid4().hex[:8]}"
     page = f"pgid-{uuid.uuid4().hex[:8]}"

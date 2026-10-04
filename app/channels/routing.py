@@ -43,6 +43,15 @@ async def resolve_widget(session: AsyncSession, embed_key: str) -> InstanceConte
     return InstanceContext(admin_id=row.admin_id, instance_id=row.instance_id)
 
 
+def normalize_email_destination(value: str) -> str:
+    """An email destination's canonical spelling (round 7 WP-3c item 10, owner ruling
+    2026-09-14: email claims are case-insensitive). Every producer stores this form,
+    migration 0067 rewrote the rows that predate it, and the 0067 partial unique
+    index is on ``lower(destination)`` — so the byte-exact resolver only ever meets
+    one spelling, provided the value being looked up is spelled the same way."""
+    return value.strip().lower()
+
+
 async def _resolve(
     session: AsyncSession, connection_type: str, destination: str, *, include_quiescing: bool
 ) -> InstanceContext:
@@ -69,8 +78,11 @@ async def resolve_destination(
     given connection_type, over non-revoked rows, via a SECURITY DEFINER function.
     A ``quiescing`` row (a Luciel in its delete drain, round 7 WP-5) IS admitted here:
     the customer mid-conversation at the delete instant must keep reaching the tenant
-    so the §3.6.3 drain can finish on their channel.
+    so the §3.6.3 drain can finish on their channel. An email destination is
+    case-folded first (round 7 WP-3c item 10).
     """
+    if connection_type == "email_sender":
+        destination = normalize_email_destination(destination)
     return await _resolve(session, connection_type, destination, include_quiescing=True)
 
 
@@ -87,7 +99,13 @@ async def owner_of_destination(
     deliberate difference: a ``quiescing`` row routes inbound (the drain) but holds no
     claim, so a deleted Luciel releases its number/address for the grace window exactly
     as a revoked one did (c21), and the newest live claim wins from that moment on.
+
+    An email claim is case-folded BEFORE the holder check (round 7 WP-3c item 10):
+    ``Owner@Fabrikam.Example`` and ``owner@fabrikam.example`` are one mailbox, and a
+    claim that differed only in case used to slip past the gate.
     """
+    if connection_type == "email_sender":
+        destination = normalize_email_destination(destination)
     try:
         return (
             await _resolve(session, connection_type, destination, include_quiescing=False)
@@ -134,3 +152,26 @@ async def lock_destination_claim(session: AsyncSession, destination: str) -> Non
     k1 = zlib.crc32(b"dest_claim") - 2**31
     k2 = zlib.crc32(destination.strip().lower().encode()) - 2**31
     await session.execute(text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": k1, "k2": k2})
+
+
+async def holders_of_connection_config(
+    session: AsyncSession, connection_type: str, key: str, value: str
+) -> list[uuid.UUID]:
+    """Every tenant whose non-revoked ``connection_type`` row carries ``key = value``
+    in its non-secret config (round 7 WP-3c item 13).
+
+    A shared CRM portal (the same HubSpot ``hubId`` / Salesforce ``orgId`` connected
+    by two accounts) is ALLOWED — owner ruling 2026-09-14 — with an informational
+    warning, and RLS hides the other account's row from an ordinary query, so this
+    goes through the narrow SECURITY DEFINER lookup migration 0067 added. It reads
+    tenant ids only; the caller decides what (if anything) to tell the owner.
+    """
+    if not value:
+        return []
+    rows = (
+        await session.execute(
+            text("SELECT admin_id FROM connection_config_holders(:ct, :key, :value)"),
+            {"ct": connection_type, "key": key, "value": value},
+        )
+    ).all()
+    return [row.admin_id for row in rows]
