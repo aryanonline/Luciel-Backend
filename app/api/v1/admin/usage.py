@@ -264,6 +264,11 @@ def audit_detail(event_type: str, payload: dict[str, object]) -> str | None:
         if error:
             parts.append(f"error {error}")
         return ", ".join(parts)
+    if event_type == "account_reopened":
+        state = _code(payload, "luciel_state")
+        if payload.get("luciel_restored") is True:
+            return f"Luciel restored ({state})" if state else "Luciel restored"
+        return f"Luciel left as it was ({state})" if state else "no Luciel to restore"
     if event_type == "billing_period_anchored":
         frm, to = _code(payload, "from_period_start"), _code(payload, "to_period_start")
         return f"period anchor {frm} → {to}" if frm and to else None

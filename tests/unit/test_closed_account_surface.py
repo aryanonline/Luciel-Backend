@@ -32,6 +32,8 @@ from fastapi.testclient import TestClient
 REDUCED_SURFACE = frozenset(
     {
         ("GET", "/api/v1/admin/account"),
+        ("POST", "/api/v1/admin/account/reopen"),
+        ("POST", "/api/v1/admin/account/export"),
     }
 )
 

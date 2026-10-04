@@ -23,15 +23,16 @@ from app.api.errors import conflict, unauthorized
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
-from app.lifecycle import cascade
+from app.lifecycle import cascade, reopen
 from app.lifecycle.close_purge import closure_started_at, reopen_deadline
 from app.lifecycle.export_bundle import build_export_zip, hold_export_lock
 from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
+from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import email_dispatcher
-from app.schemas_api.account import AccountStatusOut
+from app.schemas_api.account import AccountStatusOut, ReopenResult
 from app.schemas_api.common import WireModel
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
@@ -182,9 +183,34 @@ async def get_account(subject: Subject = Depends(current_account_owner)) -> Acco
     )
 
 
+@router.post("/reopen", response_model=ReopenResult)
+async def reopen_account(subject: Subject = Depends(current_account_owner)) -> ReopenResult:
+    """Reopen a closed account inside its 30-day window (owner decision D5).
+
+    Restores the account to the state before closure: open again, the Luciel back from
+    its grace window if the closure is what deleted it (paused again if it was
+    paused), billing on the arrangement it had. 409 when the account is not closed;
+    past day 30 the dependency has already answered the typed 403 ``account_closed``.
+    The session stays valid — it was minted after the closure's epoch bump."""
+    async with tenant_session(subject.admin_id) as s:
+        try:
+            outcome = await reopen.reopen_account(s, subject.admin_id, subject.user_id)
+        except LifecycleError as exc:
+            if str(exc) == "account_not_closed":
+                raise conflict("This account is not closed.") from exc
+            # The window closed between the dependency's check and this transaction.
+            raise conflict("This account can no longer be reopened.") from exc
+    return ReopenResult(
+        state=AccountState.verified.value,
+        luciel_restored=outcome.luciel_restored,
+        luciel_state=outcome.luciel_state,
+        billing_state=outcome.billing_state,
+    )
+
+
 @router.post("/export", response_model=ExportResult)
 async def request_export(
-    subject: Subject = Depends(current_admin),
+    subject: Subject = Depends(current_account_owner),
     store: ExportStore = Depends(get_export_store),
 ) -> ExportResult:
     """Self-serve export (all accounts, any time — §5.10).
@@ -193,8 +219,16 @@ async def request_export(
     live mode), and issues a 7-day presigned URL (§3.6.6 ``export_link_ttl_days``).
     Logs the request AND the ready event (with the link) — previously the ZIP was
     built and discarded; now it is actually persisted and reachable.
+
+    Also the RE-REQUEST on the closed-account surface (D5): the closure emailed one
+    7-day link, and an owner who missed it had no way to ask again. A closed account
+    inside its window gets the same bundle, the same 7-day link and the same email;
+    the ready event carries ``context: account_closed_reexport``.
     """
     async with tenant_session(subject.admin_id) as s:
+        state = (
+            await s.execute(select(Account.state).where(Account.id == subject.admin_id))
+        ).scalar_one_or_none()
         await audit.emit(
             s,
             admin_id=subject.admin_id,
@@ -203,7 +237,11 @@ async def request_export(
             event_type="data_export_self_serve",
         )
         url, email_outcome = await _build_upload_and_notify(
-            s, admin_id=subject.admin_id, actor_user_id=subject.user_id, store=store
+            s,
+            admin_id=subject.admin_id,
+            actor_user_id=subject.user_id,
+            store=store,
+            context="account_closed_reexport" if state == AccountState.closed else None,
         )
         ttl = get_settings().export_link_ttl_days
     return ExportResult(ok=True, download_url=url, ttl_days=ttl, email_outcome=email_outcome)

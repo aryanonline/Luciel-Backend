@@ -541,8 +541,14 @@ async def close_account(
         LucielState.active,
         LucielState.paused,
     )
+    closed_at = datetime.now(UTC)
     if deleted_by_closure:
-        await state_machine.delete_luciel(session, admin_id, actor_user_id)
+        deleted = await state_machine.delete_luciel(session, admin_id, actor_user_id)
+        # ONE instant for both clocks. The Luciel's grace window and the account's
+        # reopen window must end together: a grace window stamped a moment earlier
+        # would let the grace-expiry sweep destroy the Luciel while the reopen that
+        # promises to bring it back is still on offer.
+        closed_at = deleted.grace_window_started_at or closed_at
     # Already in the grace window or hard-deleted: nothing more to quiesce.
 
     await settle_billing_at_closure(session, admin_id, gateway=gateway)
@@ -564,7 +570,7 @@ async def close_account(
     if acct is not None:
         if acct.state != AccountState.closed:
             # A repeated close must not restart the 30-day clock.
-            acct.closed_at = datetime.now(UTC)
+            acct.closed_at = closed_at
         acct.state = AccountState.closed
         # Revoke every live session (P1-5). The account row outlives closure by 30 days
         # (§3.6.6), so without the bump a cookie minted before closure stays valid against

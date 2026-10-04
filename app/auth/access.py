@@ -63,8 +63,13 @@ async def signup(email: str, password: str) -> tuple[Account, str]:
     async with untenanted_session() as s:
         found = await lookup_account_by_email(s, email)
 
-    if found is not None and found.state == "verified":
+    if found is not None and found.state in ("verified", "closed", "pending_deletion"):
         # Verified owner — return existing account without overwrite or reissue.
+        # A CLOSED account is the same case (round 7 WP-5 / D5): its email is not
+        # released for signup until the day-30 purge deletes the row. Falling through
+        # to the overwrite below let anyone who knew the address replace the owner's
+        # password and flip the account to ``unverified`` — which locked the owner out
+        # of the reopen / re-export surface and took the row out of the purge's reach.
         async with tenant_session(found.account_id) as s:
             acct = (
                 await s.execute(select(Account).where(Account.id == found.account_id))

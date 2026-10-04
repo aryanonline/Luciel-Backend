@@ -95,6 +95,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # closed account may make during its 30-day reopen window.
         ("GET", "/api/v1/admin/account"),
         ("POST", "/api/v1/admin/account/close"),
+        # D5: reopen a closed account inside its 30-day window.
+        ("POST", "/api/v1/admin/account/reopen"),
         ("POST", "/api/v1/admin/account/export"),
         # admin/connections
         ("GET", "/api/v1/admin/connections"),

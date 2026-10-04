@@ -90,10 +90,13 @@ def serving_status(conn: InstanceConnection) -> str:
     return conn.status
 
 
-async def _get_instance(session: AsyncSession, admin_id: uuid.UUID) -> Instance:
-    inst = (
-        await session.execute(select(Instance).where(Instance.admin_id == admin_id))
-    ).scalar_one_or_none()
+async def _get_instance(
+    session: AsyncSession, admin_id: uuid.UUID, *, for_update: bool = False
+) -> Instance:
+    stmt = select(Instance).where(Instance.admin_id == admin_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    inst = (await session.execute(stmt)).scalar_one_or_none()
     if inst is None:
         raise LifecycleError("no_luciel")
     return inst
@@ -342,8 +345,12 @@ async def _remove_grace_window_duplicates(
 
 
 async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uuid.UUID) -> Instance:
-    """Restore within grace → ACTIVE (not paused) (Architecture §3.6.4)."""
-    inst = await _get_instance(session, admin_id)
+    """Restore within grace → ACTIVE (not paused) (Architecture §3.6.4).
+
+    The instance row is locked for the transaction: the day-30 grace-expiry sweep
+    takes the same lock, so a restore on the last day and the sweep cannot both act
+    on a Luciel each read as "still in its grace window"."""
+    inst = await _get_instance(session, admin_id, for_update=True)
     if inst.state != LucielState.luciel_grace_window:
         raise LifecycleError("not_in_grace_window")
     inst.state = LucielState.active

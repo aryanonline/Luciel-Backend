@@ -94,8 +94,13 @@ async def purge_closed_account_if_due(
     for ``admin_id`` so RLS scopes the audit read, the cascade, and the delete.
     """
     now = now or datetime.now(UTC)
+    # Row-locked (D5): the owner's reopen takes the same lock first. Whichever commits
+    # first wins cleanly — a reopen that lands a breath before this sweep is re-read
+    # here as ``verified`` and nothing is purged; a purge that lands first leaves the
+    # reopen no row to act on. Without the lock the sweep could read ``closed``,
+    # lose the race, and destroy an account its owner had just got back.
     acct = (
-        await session.execute(select(Account).where(Account.admin_id == admin_id))
+        await session.execute(select(Account).where(Account.admin_id == admin_id).with_for_update())
     ).scalar_one_or_none()
     if acct is None or acct.state != AccountState.closed:
         return False

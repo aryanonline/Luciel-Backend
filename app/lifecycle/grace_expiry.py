@@ -54,8 +54,13 @@ async def expire_grace_window_if_due(
     for ``admin_id`` so the cascade's tenant queries are correctly scoped.
     """
     now = now or datetime.now(UTC)
+    # Row-locked, as ``state_machine.restore`` is (round 7 WP-5): a restore — the
+    # owner's own, or the one an account reopen performs (D5) — that commits a breath
+    # before this sweep is re-read here as ``active`` and nothing is destroyed.
     inst = (
-        await session.execute(select(Instance).where(Instance.admin_id == admin_id))
+        await session.execute(
+            select(Instance).where(Instance.admin_id == admin_id).with_for_update()
+        )
     ).scalar_one_or_none()
     if inst is None or inst.state != LucielState.luciel_grace_window:
         return None
