@@ -33,7 +33,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0069_sms_contact_confirmation"
-down_revision: str | None = "0066_takeover_delivery_truth"
+down_revision: str | None = "0068_quiescing_and_export_sweep"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 

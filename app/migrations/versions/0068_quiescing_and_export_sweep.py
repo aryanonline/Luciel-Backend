@@ -62,7 +62,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0068_quiescing_and_export_sweep"
-down_revision: str | None = "0065_embedding_verification"
+down_revision: str | None = "0067_lead_claims_and_identity"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 

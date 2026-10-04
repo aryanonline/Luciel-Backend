@@ -54,7 +54,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0067_lead_claims_and_identity"
-down_revision: str | None = "0065_embedding_verification"
+down_revision: str | None = "0066_takeover_delivery_truth"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 
