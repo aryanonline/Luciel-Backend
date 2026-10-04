@@ -154,3 +154,11 @@ make that state explicit and test it.
   `_reason` → `_dispatch_tools` → `ToolBroker.dispatch(gathered=)`, where a required
   input the model left out is filled before the missing_input check. An unconfirmed
   address fills nothing; T2 still has the model confirm before a write.
+- The business's clock (item 11, 2026-10-04): the prompt carried no date and no zone.
+  `OperatingContext.timezone` / `local_today` (`app/employee/context.py`, from
+  `instances.timezone`) add one operating-context line — the zone and today's date
+  there, "a time a customer gives is in that zone", tell the customer local time never
+  UTC; with no zone on file the line gives UTC's date and says appointment times are
+  UTC. A context constructed without the two fields adds no line. `_dispatch_tools`
+  passes the same zone to `ToolBroker.dispatch(timezone=)`, so the model and the
+  appointment tools always agree on the clock (see app/tools/CLAUDE.md).

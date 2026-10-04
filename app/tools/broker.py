@@ -102,12 +102,17 @@ class ToolBroker:
         resolved_lead_id: uuid.UUID | None = None,
         session_id: uuid.UUID | None = None,
         gathered: dict[str, Any] | None = None,
+        timezone: str | None = None,
     ) -> ToolResult:
         """``gathered`` (round 7 WP-2 remainder, item 10) holds the required inputs the
         conversation already has CONFIRMED — the lead's confirmed email/phone — keyed
         by input name. A required input the model left out is filled from it before
         the missing_input check, so a customer is never asked for what they already
-        gave; an explicit input always wins, and the fill is traced by field name."""
+        gave; an explicit input always wins, and the fill is traced by field name.
+
+        ``timezone`` (item 11) is the business's IANA zone as the turn's operating
+        context resolved it — the clock the scheduling tools read and answer on. None
+        (no zone set, or a caller with no operating context) keeps them on UTC."""
         # Dispatch-scoped conversation handle for the durable trace rows (C6). The
         # broker is per-request and the loop awaits each dispatch, so plain instance
         # state is race-free here and keeps five _trace call sites unchanged.
@@ -172,6 +177,7 @@ class ToolBroker:
             instance_id=instance_id,
             connection_status=conn_status,
             gathered=dict(gathered or {}),  # item 10: the confirmed values on file
+            timezone=timezone,  # item 11: the business's clock for the scheduling tools
             session=self.s,  # §3.3.5: tools that need a durable write receive the session
             resolved_lead_id=resolved_lead_id,  # §3.3.5: per-lead cap key for schedule_callback
         )

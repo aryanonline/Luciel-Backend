@@ -254,6 +254,28 @@ def compose_operating_context_stanza(ctx: OperatingContext | None) -> str:
         f"- When you pass something to the team they are notified by {notify}. A person "
         "replies when they see it — never promise an immediate or real-time human reply.\n",
     ]
+    if ctx.timezone:
+        # Round 7 WP-2 remainder, item 11: the business's clock. A customer's "3pm"
+        # is in this zone, the appointment tools read and return times in it (offset
+        # on the string), and the time the customer hears is in it — never UTC. Until
+        # this line the prompt carried no date at all, so "Tuesday" had no anchor.
+        today = f"; today there is {ctx.local_today}" if ctx.local_today else ""
+        lines.append(
+            f"- The business keeps time in {ctx.timezone}{today}. A time a customer gives "
+            "is in that zone unless they name another. The appointment tools work on the "
+            "business's clock: a date or time you pass without a UTC offset is read in "
+            "that zone, and every time they return is in it (the string carries the "
+            "offset). Pass a slot exactly as check_availability returned it, and tell "
+            "the customer times in the business's local time — never as UTC.\n"
+        )
+    elif ctx.local_today:
+        # No zone on file: the tools keep UTC, and saying so is the honest reading —
+        # a UTC hour presented as a local one books the wrong time silently.
+        lines.append(
+            f"- Today's date is {ctx.local_today} (UTC). The business has not set a time "
+            "zone, so the appointment tools read and return times in UTC: when you state "
+            "or confirm an appointment time, say that it is UTC.\n"
+        )
     if ctx.team_reachable_now is True:
         lines.append("- Someone on the team is reachable right now.\n")
     elif ctx.team_reachable_now is False:

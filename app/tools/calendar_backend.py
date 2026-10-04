@@ -35,8 +35,9 @@ import threading
 import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any, Protocol, TypeVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import get_settings
 from app.connections.secrets import get_secret_store, secret_ref_for
@@ -106,33 +107,73 @@ class CalendarApi(Protocol):
 # --------------------------------------------------------------------------- #
 # time helpers
 # --------------------------------------------------------------------------- #
-def _as_utc(value: datetime) -> datetime:
-    """Naive input is read as UTC — a floating local time has no meaning across a
-    tenant boundary, and guessing a zone would book the wrong hour."""
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+def now_utc() -> datetime:
+    """The wall clock, as ONE seam (round 7 WP-2 remainder, item 11): a time that has
+    already started is neither offered nor written, on either provider."""
+    return datetime.now(UTC)
 
 
-def _parse_instant(text: str) -> datetime:
-    return _as_utc(datetime.fromisoformat(text.strip()))
+def business_zone(name: str | None) -> tzinfo:
+    """The clock the tools read and render times on (round 7 WP-2 remainder, item 11):
+    ``instances.timezone`` (``ToolContext.timezone``) when it is a real IANA name, else
+    UTC — the behaviour every tenant had before a zone could be set."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return UTC
+    try:
+        return ZoneInfo(cleaned)
+    except (ZoneInfoNotFoundError, ValueError):
+        return UTC
 
 
-def parse_interval(text: str, *, default_minutes: int = SLOT_MINUTES) -> tuple[datetime, datetime]:
-    """``"<start>/<end>"`` or a bare ISO instant (given ``default_minutes`` of length).
+def zone_name(tz: tzinfo) -> str | None:
+    """The IANA name of a business zone; None for UTC (nothing to tell the model)."""
+    return getattr(tz, "key", None)
 
-    Also accepts a bare ``YYYY-MM-DD`` as that whole UTC day, which is what a caller
-    asking to "check Tuesday" produces. Raises ``ValueError`` on anything else; the
-    catalog maps that to ``failed`` rather than guessing a window."""
+
+def stamp_zone(payload: dict[str, Any], tz: tzinfo) -> dict[str, Any]:
+    """Name the business's zone on a confirming payload; UTC (no zone) adds nothing."""
+    name = zone_name(tz)
+    return {**payload, "timezone": name} if name else payload
+
+
+def _as_utc(value: datetime, tz: tzinfo = UTC) -> datetime:
+    """An offset-less input is read in ``tz`` — the business's zone, which is what a
+    time stated in a conversation with the business means. Without a zone it is UTC:
+    a floating local time has no meaning across a tenant boundary, and guessing one
+    would book the wrong hour. An explicit offset is honoured as given."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=tz)
+    return value.astimezone(UTC)
+
+
+def _parse_instant(text: str, tz: tzinfo = UTC) -> datetime:
+    return _as_utc(datetime.fromisoformat(text.strip()), tz)
+
+
+def parse_interval(
+    text: str, *, default_minutes: int = SLOT_MINUTES, tz: tzinfo = UTC
+) -> tuple[datetime, datetime]:
+    """``"<start>/<end>"`` or a bare ISO instant (given ``default_minutes`` of length),
+    as UTC instants; an offset-less time is read in ``tz`` (see ``_as_utc``).
+
+    Also accepts a bare ``YYYY-MM-DD`` as that whole day ON THE BUSINESS'S CLOCK —
+    midnight to midnight in ``tz`` — which is what a caller asking to "check Tuesday"
+    means. Raises ``ValueError`` on anything else; the catalog maps that to ``failed``
+    rather than guessing a window."""
     raw = text.strip()
     if "/" in raw:
         start_text, _, end_text = raw.partition("/")
-        start, end = _parse_instant(start_text), _parse_instant(end_text)
+        start, end = _parse_instant(start_text, tz), _parse_instant(end_text, tz)
         if end <= start:
             raise ValueError(f"window ends before it starts: {raw!r}")
         return start, end
-    if len(raw) == 10:  # bare calendar date
-        start = _parse_instant(raw)
-        return start, start + timedelta(days=1)
-    start = _parse_instant(raw)
+    if len(raw) == 10:  # bare calendar date: the local day, DST-safe at both ends
+        day = date.fromisoformat(raw)
+        start = datetime.combine(day, time.min, tzinfo=tz).astimezone(UTC)
+        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz).astimezone(UTC)
+        return start, end
+    start = _parse_instant(raw, tz)
     return start, start + timedelta(minutes=default_minutes)
 
 
@@ -147,28 +188,41 @@ def open_slots(
     window_start: datetime,
     window_end: datetime,
     minutes: int = SLOT_MINUTES,
+    tz: tzinfo = UTC,
+    not_before: datetime | None = None,
 ) -> list[str]:
-    """Fixed-width candidate slots in the window that no busy interval overlaps."""
+    """Fixed-width candidate slots in the window that no busy interval overlaps,
+    rendered on the business's clock (``tz``; the offset rides on each string).
+
+    A slot that starts before ``not_before`` is left out: "any time today?" asked at
+    2 pm must not offer 9 am (round 7 WP-2 remainder, item 11)."""
     step = timedelta(minutes=minutes)
     out: list[str] = []
     cursor = window_start
     while cursor + step <= window_end:
         slot_end = cursor + step
-        if not any(_overlaps(cursor, slot_end, b_start, b_end) for b_start, b_end in busy):
-            out.append(cursor.isoformat())
+        elapsed = not_before is not None and cursor < not_before
+        if not elapsed and not any(
+            _overlaps(cursor, slot_end, b_start, b_end) for b_start, b_end in busy
+        ):
+            out.append(cursor.astimezone(tz).isoformat())
         cursor = slot_end
     return out
 
 
-def _booking(event: CalendarEvent) -> dict[str, Any]:
+def _booking(event: CalendarEvent, tz: tzinfo = UTC) -> dict[str, Any]:
     """The confirming payload for an ``ok`` result — the exact time that was written,
-    never the time that was requested (§3.3.4 rule 1)."""
-    return {
-        "bookingRef": event.event_id,
-        "start": event.start.isoformat(),
-        "end": event.end.isoformat(),
-        "email": event.email,
-    }
+    never the time that was requested (§3.3.4 rule 1) — on the business's clock, with
+    the zone named when there is one, so the customer is never read a UTC hour."""
+    return stamp_zone(
+        {
+            "bookingRef": event.event_id,
+            "start": event.start.astimezone(tz).isoformat(),
+            "end": event.end.astimezone(tz).isoformat(),
+            "email": event.email,
+        },
+        tz,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -255,19 +309,25 @@ class GoogleCalendarBackend:
 
     async def _free_busy(self, ctx: ToolContext, window: str) -> list[str]:
         cred = await self._credentials(ctx)
-        window_start, window_end = parse_interval(window, default_minutes=SLOT_MINUTES)
+        tz = business_zone(ctx.timezone)
+        window_start, window_end = parse_interval(window, default_minutes=SLOT_MINUTES, tz=tz)
         busy = await self._api.busy(cred, window_start, window_end)
-        return open_slots(busy, window_start=window_start, window_end=window_end)
+        return open_slots(
+            busy, window_start=window_start, window_end=window_end, tz=tz, not_before=now_utc()
+        )
 
     async def book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         return await self._guarded(ctx, self._book(ctx, slot, email))
 
     async def _book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
-        start, end = parse_interval(slot)
+        tz = business_zone(ctx.timezone)
+        start, end = parse_interval(slot, tz=tz)
+        if start < now_utc():
+            return None  # already started: nobody can still hold it -> failed("slot_conflict")
         if not await self._is_free(cred, start, end):
             return None  # -> failed("slot_conflict")
-        return _booking(await self._api.insert_event(cred, start=start, end=end, email=email))
+        return _booking(await self._api.insert_event(cred, start=start, end=end, email=email), tz)
 
     async def find_bookings(
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
@@ -280,13 +340,14 @@ class GoogleCalendarBackend:
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
     ) -> list[dict[str, Any]]:
         cred = await self._credentials(ctx)
+        tz = business_zone(ctx.timezone)
         if booking_ref:
             event = await self._api.get_event(cred, booking_ref)
             # An id that belongs to someone else is not this lead's booking to move.
-            return [_booking(event)] if event is not None and event.email == email else []
-        now = datetime.now(UTC)
+            return [_booking(event, tz)] if event is not None and event.email == email else []
+        now = now_utc()
         events = await self._api.events_in(cred, now, now + timedelta(days=BOOKING_SEARCH_DAYS))
-        return [_booking(event) for event in events if event.email == email]
+        return [_booking(event, tz) for event in events if event.email == email]
 
     async def reschedule(
         self, ctx: ToolContext, booking_ref: str, slot: str
@@ -297,14 +358,17 @@ class GoogleCalendarBackend:
         self, ctx: ToolContext, booking_ref: str, slot: str
     ) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
-        start, end = parse_interval(slot)
+        tz = business_zone(ctx.timezone)
+        start, end = parse_interval(slot, tz=tz)
         existing = await self._api.get_event(cred, booking_ref)
         if existing is None:
             return None  # gone since the read -> failed, never a fabricated move
+        if start < now_utc():
+            return None  # a move into the past is not a move -> failed("slot_conflict")
         if not await self._is_free(cred, start, end, ignore_event_id=booking_ref):
             return None  # -> failed("slot_conflict")
         moved = await self._api.patch_event(cred, booking_ref, start=start, end=end)
-        return _booking(moved) if moved is not None else None
+        return _booking(moved, tz) if moved is not None else None
 
     async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
         return await self._guarded(ctx, self._cancel(ctx, booking_ref))
@@ -314,7 +378,7 @@ class GoogleCalendarBackend:
         event = await self._api.get_event(cred, booking_ref)
         if event is None or not await self._api.delete_event(cred, booking_ref):
             return None  # -> failed("cancel_rejected")
-        return {**_booking(event), "status": "cancelled"}
+        return {**_booking(event, business_zone(ctx.timezone)), "status": "cancelled"}
 
 
 # --------------------------------------------------------------------------- #

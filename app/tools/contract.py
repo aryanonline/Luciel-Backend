@@ -82,6 +82,11 @@ class ToolContext:
     # sessions whose identity is not yet resolved (e.g. anonymous widget) — the per-lead
     # cap only applies when a lead key is present; the per-tenant cap always applies.
     resolved_lead_id: Any = None
+    # The business's IANA timezone (instances.timezone) when set and valid, else None
+    # (round 7 WP-2 remainder, item 11). The scheduling tools read a time given
+    # without a UTC offset in this zone and render every time they return in it —
+    # the clock the customer and the business share. None keeps them on UTC.
+    timezone: str | None = None
 
 
 class Tool(Protocol):

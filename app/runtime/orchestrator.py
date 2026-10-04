@@ -2190,6 +2190,10 @@ class Orchestrator:
         from app.tools.broker import ToolBroker
 
         broker = ToolBroker(self.session)
+        # The business's clock (round 7 WP-2 remainder, item 11): the scheduling tools
+        # read an offset-less time in it and render every time they return in it — the
+        # same zone the operating-context stanza told the model about this turn.
+        timezone = self.operating_context.timezone if self.operating_context else None
         results: list[tuple[dict[str, Any], ToolResult]] = []
         for call in tool_calls:
             tool_id = str(call.get("tool_id", ""))
@@ -2230,6 +2234,7 @@ class Orchestrator:
                 resolved_lead_id=resolved_lead_id,
                 session_id=session_id,
                 gathered=gathered,  # item 10: confirmed values fill a missing input
+                timezone=timezone,  # item 11: the business's clock for the tools
             )
             results.append((dict(call), result))
         return results
