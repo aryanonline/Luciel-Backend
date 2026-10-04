@@ -15,7 +15,14 @@ from typing import Any
 import pytest
 from app.connections import probes
 from app.connections.health import ProbeResult
-from app.connections.probes import DispatchingProbe, ProviderLivenessProbe, liveness_request_for
+from app.connections.probes import (
+    RATE_LIMIT_BACKOFF_DEFAULT,
+    RATE_LIMIT_BACKOFF_MAX,
+    RATE_LIMIT_BACKOFF_MIN,
+    DispatchingProbe,
+    ProviderLivenessProbe,
+    liveness_request_for,
+)
 from app.models.connection import InstanceConnection
 
 pytestmark = [pytest.mark.asyncio]
@@ -86,6 +93,8 @@ class _Client:
         status = type(self).statuses.pop(0)
         if isinstance(status, Exception):
             raise status
+        if isinstance(status, _Resp):
+            return status  # a prepared response (headers and all)
         return _Resp(status)
 
 
@@ -414,3 +423,55 @@ async def test_a_webhook_proof_without_a_header_sends_none():
         url="https://hooks.example.com/x", auth_header=None, transport=transport
     )
     assert "Authorization" not in transport.calls[0]["headers"]
+
+
+# --------------------------------------------------------------------------- #
+# Round 7 WP-4a item 10 — a 429 carries the provider's backoff, bounded
+# --------------------------------------------------------------------------- #
+
+
+class _RateLimited(_Resp):
+    def __init__(self, retry_after: str | None) -> None:
+        super().__init__(429)
+        self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("120", timedelta(seconds=120)),
+        (None, RATE_LIMIT_BACKOFF_DEFAULT),
+        ("garbage", RATE_LIMIT_BACKOFF_DEFAULT),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", RATE_LIMIT_BACKOFF_DEFAULT),
+        ("0", RATE_LIMIT_BACKOFF_MIN),
+        ("-5", RATE_LIMIT_BACKOFF_MIN),
+        (str(10 * 24 * 3600), RATE_LIMIT_BACKOFF_MAX),
+    ],
+)
+async def test_a_429_is_skipped_with_the_providers_backoff_within_bounds(header, expected):
+    """The live condition: HubSpot answers 429 with ``Retry-After: 120``. Before, the
+    sweep read it as a plain skip and asked again next pass. The backoff rides the
+    result so the sweep can persist ``next_probe_at``; an absent or unparseable
+    header (an HTTP-date form is not honoured — a clock skew must not park a row
+    for days) falls back to the default, and every value is clamped."""
+    probe = ProviderLivenessProbe(
+        store=_Store({"access_token": "t"}),
+        transport_factory=_client(_RateLimited(header)),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(_conn("hubspot"))
+    assert result.ok is True
+    assert result.detail == "probe_skipped:http_429"
+    assert result.retry_after == expected
+
+
+@pytest.mark.parametrize("status", [503, 404])
+async def test_a_non_429_skip_carries_no_backoff(status):
+    probe = ProviderLivenessProbe(
+        store=_Store({"access_token": "t"}),
+        transport_factory=_client(status),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(_conn("hubspot"))
+    assert result.detail == f"probe_skipped:http_{status}"
+    assert result.retry_after is None

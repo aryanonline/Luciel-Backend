@@ -10,6 +10,9 @@ connection", §3.8.5). It:
     refresh path); on refresh failure → status='expired' + status_detail + audit;
   * transitions status (connected / error / expired) and stamps
     ``last_health_check_at`` + ``status_detail`` (§3.8.4 lifecycle);
+  * honours a provider's rate limit: a 429 on the liveness call persists the
+    provider's Retry-After as ``next_probe_at`` (round 7 WP-4a item 10) and the row
+    is not asked again — nor stamped as checked — until it passes;
   * for a revoked/expired knowledge_source connection, pauses the sync and flags
     the source paused_reconnect_needed — reusing the Arc 11b mechanism
     (app/knowledge/sync.pause_sync_on_revocation, §3.2.3) rather than a parallel one.
@@ -92,6 +95,16 @@ HEALTH_SWEPT_STATUSES: frozenset[str] = HEALTH_OWNED_STATUSES | HEALTH_PROBE_ONL
 # consent screen and shorter than the sweep's own cadence.
 RECONNECT_ABANDON_AFTER = timedelta(minutes=15)
 RECONNECT_MARKER_PREFIX = "reconnect_pending:prior_status="
+
+#: Round 7 WP-4a item 10: non_secret_config key holding the ISO timestamp before
+#: which the sweep must NOT probe the row again. Written when the provider answered
+#: the liveness call with 429 (``ProbeResult.retry_after`` carries its Retry-After,
+#: bounded in probes.py); honoured by ``check_connection``; cleared by the first
+#: probe the provider answers afterwards, and by the connect / disconnect sweeps of
+#: attempt state. Before this a 429 was a plain ``probe_skipped``: the row was
+#: stamped as checked, nothing remembered the provider's backoff, and a tenant
+#: behind a rate limit was asked again on every pass and never actually verified.
+NEXT_PROBE_AT_KEY = "next_probe_at"
 
 
 def _mid_reconnect(connection: InstanceConnection) -> bool:
@@ -225,6 +238,35 @@ class ProbeResult:
     ok: bool
     # Optional detail surfaced to the admin on error/expired (never a secret, §3.8.3).
     detail: str | None = None
+    # Item 10: set ONLY when the provider rate-limited the probe (429) — how long it
+    # asked us to wait, already bounded. ``ok`` is True (a 429 is not evidence the
+    # grant is dead) and the sweep persists ``now + retry_after`` as the row's
+    # ``NEXT_PROBE_AT_KEY`` instead of stamping a check that never happened.
+    retry_after: timedelta | None = None
+
+
+def _next_probe_at(connection: InstanceConnection) -> datetime | None:
+    """The row's persisted backoff hint, or None when absent or malformed — a hint
+    that cannot be read never shields a row."""
+    raw = (connection.non_secret_config or {}).get(NEXT_PROBE_AT_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _clear_probe_backoff(connection: InstanceConnection) -> None:
+    """Forget the backoff hint: the provider answered (or the row was decided
+    authoritatively), so whatever wait it asked for is over."""
+    cfg = connection.non_secret_config or {}
+    if NEXT_PROBE_AT_KEY not in cfg:
+        return
+    cfg = dict(cfg)
+    cfg.pop(NEXT_PROBE_AT_KEY, None)
+    connection.non_secret_config = cfg
 
 
 class ConnectionProbe(Protocol):
@@ -375,8 +417,25 @@ async def check_connection(
             cfg["token_expires_at"] = new_expiry.isoformat()
             connection.non_secret_config = cfg
 
-    # (2) Provider liveness probe.
+    # (2) Provider liveness probe — unless the provider asked us to wait (item 10):
+    # inside a persisted backoff the row is not asked at all, not stamped, and not
+    # transitioned; the credential that was serving keeps serving until the
+    # provider will answer again.
+    next_at = _next_probe_at(connection)
+    if next_at is not None and now < next_at:
+        return connection.status
     result = await probe.probe(connection)
+    if result.ok and result.retry_after is not None:
+        # A 429 is not a check: persist the provider's backoff (bounded by the
+        # probe) and leave last_health_check_at alone so the dashboard never says
+        # the credential was verified when the provider refused to answer.
+        cfg = dict(connection.non_secret_config or {})
+        cfg[NEXT_PROBE_AT_KEY] = (now + result.retry_after).isoformat()
+        connection.non_secret_config = cfg
+        return connection.status
+    # The provider answered (or the probe could not ask — a lapsed or malformed
+    # hint is spent either way): the backoff is over.
+    _clear_probe_backoff(connection)
     if not result.ok:
         await _transition(
             session, connection, "error", result.detail or "health check failed", now, old_status
@@ -407,7 +466,9 @@ async def mark_connection_broken(
     machinery the sweep uses — audit + once-per-incident attention email (round
     5B item 12: a live-call failure discovered outside the sweep, e.g. a
     knowledge sync whose token the provider rejected, must surface exactly like
-    a sweep-detected one instead of pausing silently)."""
+    a sweep-detected one instead of pausing silently). The provider answered, so a
+    rate-limit backoff the sweep was honouring (item 10) is over."""
+    _clear_probe_backoff(connection)
     await _transition(
         session, connection, status, detail, now or datetime.now(UTC), connection.status
     )

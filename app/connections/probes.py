@@ -13,6 +13,8 @@ with one cheap identity call per connection per sweep and an honest boundary:
   * anything else (5xx, 429, timeouts, a 404 from an endpoint that moved) →
     ``probe_skipped`` — an outage at the provider is not evidence the grant is dead,
     and the sweep must never flip every tenant to ``error`` because a provider blinked.
+    A 429 additionally carries the provider's Retry-After (bounded, round 7 WP-4a
+    item 10) so the sweep persists a backoff instead of asking again next pass.
 
 Mock posture and providers with no identity call keep the stored-credential answer
 exactly (``DispatchingProbe``).
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -48,6 +51,41 @@ LIVENESS_TIMEOUT_SECONDS = 10.0
 TWILIO_ACCOUNT_ENDPOINT = "https://api.twilio.com/2010-04-01/Accounts/{sid}.json"
 #: Statuses that mean "the provider answered and refused THIS credential".
 AUTH_REFUSED_STATUSES = frozenset({401, 403})
+#: Round 7 WP-4a item 10: how long a 429 parks the row's probe. The provider's
+#: Retry-After (delta-seconds form only — the HTTP-date form is not honoured, since a
+#: skewed clock must not park a row for days) is clamped between MIN and MAX; an
+#: absent or unparseable header falls back to DEFAULT. MAX is four sweep passes: a
+#: provider that keeps rate-limiting us is re-asked, never forgotten.
+RATE_LIMIT_BACKOFF_MIN = timedelta(minutes=1)
+RATE_LIMIT_BACKOFF_DEFAULT = timedelta(hours=1)
+RATE_LIMIT_BACKOFF_MAX = timedelta(hours=24)
+
+
+def parse_retry_after(value: str | None) -> timedelta:
+    """The bounded backoff a 429's ``Retry-After`` asks for (see the constants)."""
+    if value is None:
+        return RATE_LIMIT_BACKOFF_DEFAULT
+    try:
+        seconds = int(value.strip())
+    except (TypeError, ValueError):
+        return RATE_LIMIT_BACKOFF_DEFAULT
+    return max(RATE_LIMIT_BACKOFF_MIN, min(timedelta(seconds=seconds), RATE_LIMIT_BACKOFF_MAX))
+
+
+def _retry_after_of(response: Any) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    for name in ("Retry-After", "retry-after"):
+        try:
+            raw = headers.get(name)
+        except Exception:  # noqa: BLE001 — a transport's header object is not ours
+            return None
+        if raw is not None:
+            return str(raw)
+    return None
+
+
 #: The synthetic lookup key the record-source live connector is asked for — at
 #: connect time and by the sweep. Never a real customer query: the proof is that the
 #: endpoint is reachable and accepts the key, not that any record exists.
@@ -300,6 +338,12 @@ class ProviderLivenessProbe:
         return RegistryTokenRefresher()
 
     async def _status_of(self, request: LivenessRequest) -> int | None:
+        status, _retry_after = await self._answer_of(request)
+        return status
+
+    async def _answer_of(self, request: LivenessRequest) -> tuple[int | None, str | None]:
+        """(status, Retry-After header) of the one GET, or (None, None) when the
+        provider could not be asked."""
         url, headers = request.url, dict(request.headers)
         extensions: dict[str, Any] = {}
         if request.pin_public_host:
@@ -311,7 +355,7 @@ class ProviderLivenessProbe:
                 # A name that now resolves somewhere private is not asked at all —
                 # and not evidence about the credential either: skipped.
                 logger.info("liveness_probe_pin_refused reason=%s", exc)
-                return None
+                return None, None
             headers["Host"] = host
             extensions["sni_hostname"] = host
         try:
@@ -321,9 +365,11 @@ class ProviderLivenessProbe:
                 )
         except Exception as exc:  # noqa: BLE001 — a transport failure is "could not ask"
             logger.info("liveness_probe_transport_error error=%s", type(exc).__name__)
-            return None
+            return None, None
         status = getattr(response, "status_code", None)
-        return status if isinstance(status, int) else None
+        if not isinstance(status, int):
+            return None, None
+        return status, _retry_after_of(response)
 
     async def probe(self, connection: InstanceConnection) -> ProbeResult:
         store = self._store or get_secret_store()
@@ -336,7 +382,7 @@ class ProviderLivenessProbe:
         request = liveness_request_for(connection, material)
         if request is None:
             return ProbeResult(ok=True, detail="probe_skipped:no_liveness_probe")
-        status = await self._status_of(request)
+        status, retry_after = await self._answer_of(request)
         if status in AUTH_REFUSED_STATUSES:
             # The token may merely have aged out between sweeps: one refresh, one
             # re-probe, before the row is declared dead.
@@ -363,7 +409,16 @@ class ProviderLivenessProbe:
             return ProbeResult(ok=True, detail="probe_skipped:transport_error")
         if 200 <= status < 300:
             return ProbeResult(ok=True)
-        # 5xx, 429, a moved endpoint: the provider did not say the grant is dead.
+        if status == 429:
+            # Item 10: the provider asked us to wait. Not evidence about the grant —
+            # but the sweep must remember the wait, or it hammers the tenant's rate
+            # limit every pass and never gets an answer.
+            return ProbeResult(
+                ok=True,
+                detail="probe_skipped:http_429",
+                retry_after=parse_retry_after(retry_after),
+            )
+        # 5xx, a moved endpoint: the provider did not say the grant is dead.
         return ProbeResult(ok=True, detail=f"probe_skipped:http_{status}")
 
 

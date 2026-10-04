@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.channels.email_routing import MxDelegationProbe, MxDelegationResult
 from app.connections import registry
+from app.connections.health import NEXT_PROBE_AT_KEY
 from app.connections.secrets import (
     SecretStore,
     get_secret_store,
@@ -356,15 +357,11 @@ async def start_connection(
     if existing is not None:
         provider_changed = existing.provider != provider
         # A stale attempt on the row (a parked OAuth state, a staged swap target, an
-        # abandoned reconnect marker) is swept exactly as disconnect sweeps it: this
-        # is a fresh start, and a late callback must not redeem the old state.
+        # abandoned reconnect marker, a rate-limit backoff the old credential earned)
+        # is swept exactly as disconnect sweeps it: this is a fresh start, and a late
+        # callback must not redeem the old state.
         cfg = dict(existing.non_secret_config or {})
-        for ephemeral in (
-            "oauth_state_jti",
-            "authorize_url",
-            "pending_provider",
-            RECONNECT_PENDING_SINCE_KEY,
-        ):
+        for ephemeral in _ATTEMPT_STATE_KEYS:
             cfg.pop(ephemeral, None)
         existing.non_secret_config = cfg
         if provider_changed and existing.secret_ref is not None:
@@ -715,10 +712,14 @@ async def submit_credentials(
     # (§3.8.7 rule B): the provider/auth_class flip is the LAST step, and the stale
     # stage marker never outlives the submit either way.
     cfg_after = dict(connection.non_secret_config or {})
-    if cfg_after.pop("pending_provider", None) is not None:
+    # Item 10: a rate-limit backoff was earned by the credential just replaced; the
+    # one that was proven a moment ago must not inherit the wait.
+    backoff_spent = cfg_after.pop(NEXT_PROBE_AT_KEY, None) is not None
+    staged_swap = cfg_after.pop("pending_provider", None) is not None
+    if backoff_spent or staged_swap:
         connection.non_secret_config = cfg_after
-        if effective_provider != connection.provider:
-            connection.provider = effective_provider
+    if staged_swap and effective_provider != connection.provider:
+        connection.provider = effective_provider
     # The verified submit decides the row's behavior class — for most providers
     # that is the spec's class (a no-op), but a Twilio form submit stamps
     # api_key over the OAuth-primary default, including when an OAuth tenant
@@ -863,6 +864,20 @@ async def reconnect(
 #: non_secret_config key: ISO timestamp of when the current reconnect/swap attempt
 #: began (round 7 WP-4a item 5). Read by the health sweep's abandonment rule.
 RECONNECT_PENDING_SINCE_KEY = "reconnect_pending_since"
+
+#: Every non_secret_config key that belongs to an ATTEMPT on the row rather than to
+#: the owner's configuration: a parked OAuth state, a staged swap target, the
+#: reconnect marker's timestamp, and the health sweep's rate-limit backoff hint
+#: (item 10 — earned by the credential being replaced, meaningless to the next one).
+#: A fresh Connect and a disconnect both sweep them; a late callback must not
+#: redeem the old state and a new credential must not inherit an old wait.
+_ATTEMPT_STATE_KEYS: tuple[str, ...] = (
+    "oauth_state_jti",
+    "authorize_url",
+    "pending_provider",
+    RECONNECT_PENDING_SINCE_KEY,
+    NEXT_PROBE_AT_KEY,
+)
 
 
 def _stage_reconnect_marker(
@@ -1021,6 +1036,9 @@ async def confirm_reconnect(
     if probe_ok:
         # New credential confirmed healthy — cut over now (proven-before-cutover).
         # This is the ONLY place a swap's staged provider becomes authoritative.
+        # A rate-limit backoff the OLD credential earned goes with it (item 10); on
+        # the failure branch below the old credential keeps serving and keeps its wait.
+        config.pop(NEXT_PROBE_AT_KEY, None)
         if pending_provider is not None:
             connection.provider = str(pending_provider)
             # The behavior key follows the provider (§3.8.5): a cross-class swap
@@ -1367,12 +1385,7 @@ async def disconnect(
 
     old_status = connection.status
     cfg = dict(connection.non_secret_config or {})
-    for ephemeral in (
-        "oauth_state_jti",
-        "authorize_url",
-        "pending_provider",
-        RECONNECT_PENDING_SINCE_KEY,
-    ):
+    for ephemeral in _ATTEMPT_STATE_KEYS:
         cfg.pop(ephemeral, None)
     # A disconnected OUTLOOK mailbox releases its routing claim. Unlike a BYO phone
     # number (kept — it is the owner's own asset to re-link), the mailbox address was

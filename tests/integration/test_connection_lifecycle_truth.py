@@ -1045,3 +1045,216 @@ async def test_a_same_provider_reconnect_on_a_broken_row_keeps_its_secret():
             .all()
         )
     assert cleanups == []
+
+
+# --------------------------------------------------------------------------- #
+# Item 10 — a 429 from the provider is a backoff the next sweep honours
+# --------------------------------------------------------------------------- #
+
+
+class _AnswersProbe:
+    def __init__(self, *results: object) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def probe(self, connection: InstanceConnection) -> object:
+        self.calls += 1
+        return self._results.pop(0)
+
+
+async def _sweep_with(admin: uuid.UUID, probe: object, now: datetime) -> dict[str, str]:
+    from app.connections.health import ReconnectOnExpiry, run_health_sweep
+
+    async with tenant_session(admin) as s:
+        return await run_health_sweep(
+            s, admin_id=admin, probe=probe, refresher=ReconnectOnExpiry(), now=now
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rate_limited_probe_persists_a_backoff_the_sweep_honours():
+    """The live condition: HubSpot answers 429 to the identity call. Before, the
+    sweep logged probe_skipped, stamped the row as checked, and asked again next
+    sweep — nothing remembered the provider's Retry-After, so a tenant behind a
+    rate limit was hammered on every pass and never actually verified. Now the
+    backoff is persisted as ``next_probe_at`` and the sweep skips the row until it
+    passes; the first answered probe afterwards clears it."""
+    from datetime import timedelta
+
+    from app.connections.health import NEXT_PROBE_AT_KEY, ProbeResult
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        secret_ref=ref,
+    )
+
+    limited = _AnswersProbe(
+        ProbeResult(ok=True, detail="probe_skipped:http_429", retry_after=timedelta(hours=2))
+    )
+    assert await _sweep_with(admin, limited, NOW) == {str(cid): "connected"}
+    row = await _row(admin, cid)
+    assert row.status == "connected"
+    assert (row.non_secret_config or {})[NEXT_PROBE_AT_KEY] == (
+        NOW + timedelta(hours=2)
+    ).isoformat()
+    assert row.last_health_check_at is None, "a probe the provider refused to answer is not a check"
+
+    # Inside the backoff the row is not asked at all — even a probe that would
+    # declare it dead never runs.
+    dead = _AnswersProbe(ProbeResult(ok=False, detail="dead"))
+    assert await _sweep_with(admin, dead, NOW + timedelta(hours=1)) == {str(cid): "connected"}
+    assert dead.calls == 0
+    assert (await _row(admin, cid)).status == "connected"
+    assert await _status_changes(admin) == []
+
+    # Once the backoff passes the row is probed like any other: the hint is cleared
+    # and the dead credential is caught with the usual audit + one attention email.
+    assert await _sweep_with(admin, dead, NOW + timedelta(hours=3)) == {str(cid): "error"}
+    assert dead.calls == 1
+    row = await _row(admin, cid)
+    assert row.status == "error"
+    assert NEXT_PROBE_AT_KEY not in (row.non_secret_config or {})
+    assert row.last_health_check_at == NOW + timedelta(hours=3)
+    changes = await _status_changes(admin)
+    assert [(c["old_status"], c["new_status"]) for c in changes] == [("connected", "error")]
+    assert await _attention_emails(admin) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_answered_probe_clears_a_stale_backoff_hint():
+    from datetime import timedelta
+
+    from app.connections.health import NEXT_PROBE_AT_KEY, ProbeResult
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        cfg={NEXT_PROBE_AT_KEY: (NOW - timedelta(minutes=1)).isoformat(), "keep": "me"},
+        secret_ref=ref,
+    )
+    healthy = _AnswersProbe(ProbeResult(ok=True))
+    assert await _sweep_with(admin, healthy, NOW) == {str(cid): "connected"}
+    assert healthy.calls == 1
+    row = await _row(admin, cid)
+    assert NEXT_PROBE_AT_KEY not in (row.non_secret_config or {})
+    assert (row.non_secret_config or {}).get("keep") == "me"
+    assert row.last_health_check_at == NOW
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_malformed_backoff_hint_never_shields_a_row():
+    from app.connections.health import NEXT_PROBE_AT_KEY, ProbeResult
+    from app.connections.secrets import get_secret_store
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        cfg={NEXT_PROBE_AT_KEY: "not-a-timestamp"},
+        secret_ref=ref,
+    )
+    dead = _AnswersProbe(ProbeResult(ok=False, detail="dead"))
+    assert await _sweep_with(admin, dead, NOW) == {str(cid): "error"}
+    assert NEXT_PROBE_AT_KEY not in ((await _row(admin, cid)).non_secret_config or {})
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_replaced_credential_does_not_pass_its_backoff_to_the_new_one(_record_transport):
+    """The wait was earned by the credential the provider rate-limited. A swap that
+    is confirmed, or a credential form that is proven and promoted, starts the new
+    credential with no wait — while a FAILED confirm leaves the old credential
+    serving with its backoff intact."""
+    from datetime import timedelta
+
+    from app.connections import service as conn_service
+    from app.connections.health import NEXT_PROBE_AT_KEY
+    from app.connections.secrets import get_secret_store
+
+    hint = (NOW + timedelta(hours=6)).isoformat()
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        cfg={NEXT_PROBE_AT_KEY: hint},
+        secret_ref=ref,
+    )
+
+    # A reconnect whose new credential fails its check: the old one keeps its wait.
+    async with tenant_session(admin) as s:
+        await conn_service.swap(
+            s, admin_id=admin, connection_id=cid, provider="salesforce", user_id=admin, now=NOW
+        )
+        ok, _ = await conn_service.confirm_reconnect(
+            s, admin_id=admin, connection_id=cid, user_id=admin, probe_ok=False
+        )
+        assert ok is False
+    row = await _row(admin, cid)
+    assert row.provider == "hubspot"
+    assert (row.non_secret_config or {})[NEXT_PROBE_AT_KEY] == hint
+
+    # A confirmed swap: the new credential starts clean.
+    async with tenant_session(admin) as s:
+        await conn_service.swap(
+            s, admin_id=admin, connection_id=cid, provider="salesforce", user_id=admin, now=NOW
+        )
+        ok, _ = await conn_service.confirm_reconnect(
+            s, admin_id=admin, connection_id=cid, user_id=admin, probe_ok=True
+        )
+        assert ok is True
+    row = await _row(admin, cid)
+    assert row.provider == "salesforce"
+    assert NEXT_PROBE_AT_KEY not in (row.non_secret_config or {})
+
+    # A proven credential-form submit on a row carrying a hint: same.
+    hook_ref = f"vm/{admin}/{iid}/outbound_webhook"
+    hook = await _seed_connection(
+        admin,
+        iid,
+        connection_type="outbound_webhook",
+        provider="outbound_webhook",
+        auth_class="long_lived_token",
+        status="error",
+        cfg={NEXT_PROBE_AT_KEY: hint, "url": WEBHOOK_URL},
+        secret_ref=hook_ref,
+    )
+    _record_transport.seed(WEBHOOK_URL, 200)
+    async with tenant_session(admin) as s:
+        await conn_service.submit_credentials(
+            s, admin_id=admin, connection_id=hook, fields={"url": WEBHOOK_URL}, user_id=admin
+        )
+    row = await _row(admin, hook)
+    assert row.status == "connected"
+    assert NEXT_PROBE_AT_KEY not in (row.non_secret_config or {})
