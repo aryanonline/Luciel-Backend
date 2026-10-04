@@ -11,6 +11,7 @@ oracle on which tokens exist — invalid and expired read the same).
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
@@ -26,6 +27,7 @@ from app.models.audit import ActorType
 from app.models.instance import Account
 
 router = APIRouter(prefix="/api/v1/exports", tags=["exports"])
+_log = logging.getLogger(__name__)
 
 _EXPIRED = (
     "This export link has expired or is not valid. Request a new export from the "
@@ -55,9 +57,22 @@ async def download_export(token: str) -> RedirectResponse:
             # to presign and no tenant to audit under. The link must not say anything
             # more specific than "expired" — no oracle on which tenants ever existed.
             raise ApiError(410, _EXPIRED)
-        url = await get_export_store().presign(
-            key=export_key_for(admin_id, export_id), ttl_seconds=PRESIGN_TTL_SECONDS
-        )
+        store = get_export_store()
+        key = export_key_for(admin_id, export_id)
+        try:
+            present = await store.exists(key=key)
+        except Exception:  # noqa: BLE001 — a store that cannot answer is not "gone"
+            # Fall through to the presign, as before this check existed: the object
+            # is very likely there and the redirect is what tells the owner the truth.
+            _log.warning("export_exists_check_failed admin_id=%s", admin_id, exc_info=True)
+            present = True
+        if not present:
+            # The account outlived its bundle: a Luciel hard delete (day 30 of the
+            # grace window) sweeps ``vm-export-bundles/{admin_id}/`` and leaves the
+            # account shell. The token still verifies, but a presign would redirect
+            # to the bucket's raw NoSuchKey page (round 7 WP-5, item 8).
+            raise ApiError(410, _EXPIRED)
+        url = await store.presign(key=key, ttl_seconds=PRESIGN_TTL_SECONDS)
         await audit.emit(
             s,
             admin_id=admin_id,

@@ -30,6 +30,7 @@ from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.connections.secrets import get_secret_store, tenant_secret_prefix
 from app.db.base import TenantMixin
 from app.lifecycle import state_machine
+from app.lifecycle.export_bundle import hold_export_lock
 from app.lifecycle.export_store import export_prefix_for, get_export_store
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
 from app.models.audit import ActorType
@@ -370,6 +371,10 @@ async def hard_delete_cascade(
     would ever remove those rows. Bailing early left them — and live OAuth credentials —
     under an admin_id no query would ever name again.
     """
+    # FIRST, before any read or write: wait out an export that is still uploading, so
+    # the bundle sweep below destroys what it wrote instead of running a moment too
+    # early and leaving a full copy of the tenant behind (round 7 WP-5, item 8).
+    await hold_export_lock(session, admin_id)
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()

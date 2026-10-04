@@ -71,6 +71,16 @@ class ExportStore(Protocol):
         """A GET URL for ``key`` valid for ``ttl_seconds`` (short: minutes)."""
         ...
 
+    async def exists(self, *, key: str) -> bool:
+        """Whether ``key`` is still in the store. ``False`` ONLY when the store
+        answered that it is absent; a store that could not answer raises.
+
+        The download door asks before it presigns (round 7 WP-5, item 8): a presign
+        is computed locally and "succeeds" for an object the hard-delete cascade
+        swept, so a still-valid 7-day link redirected the owner to the bucket's raw
+        error page instead of the honest "this link is no longer valid"."""
+        ...
+
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         """Legacy one-shot: upload then presign for ``ttl_days`` (see class docstring
         for why the export flow no longer uses it)."""
@@ -103,6 +113,10 @@ class LocalExportStore:
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
         # Deterministic fake URL shape: tests assert the host + key + the expiry.
         return f"https://export.local/{key}?expires={int(expires_at.timestamp())}"
+
+    async def exists(self, *, key: str) -> bool:
+        with self._lock:
+            return key in type(self)._store
 
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         await self.put(key=key, data=data)
@@ -192,6 +206,25 @@ class S3ExportStore:
             ExpiresIn=ttl_seconds,
         )
         return str(url)
+
+    async def exists(self, *, key: str) -> bool:
+        """HeadObject. Absent is S3's own no-such-object answer (404 / NotFound /
+        NoSuchKey — the task role holds ListBucket, so a missing key is a 404 and not
+        a 403); anything else is the store failing to answer and is raised, never read
+        as "gone"."""
+        from app.lifecycle.transcript_store import (  # noqa: PLC0415 — one S3 dialect
+            _is_absent as s3_says_absent,
+        )
+
+        try:
+            self._get_client().head_object(  # type: ignore[attr-defined]
+                Bucket=self._bucket, Key=key
+            )
+        except Exception as exc:
+            if s3_says_absent(exc):
+                return False
+            raise
+        return True
 
     async def put_and_presign(self, *, key: str, data: bytes, ttl_days: int) -> str:
         await self.put(key=key, data=data)

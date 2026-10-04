@@ -19,14 +19,15 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
 from app.models.connection import NOT_SERVING_STATUSES, QUIESCING, InstanceConnection
+from app.models.crm_link import CrmLeadLink
 from app.models.instance import Instance, LucielState
-from app.models.knowledge import KnowledgeSource
+from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
 
 __all__ = [
     "NOT_SERVING_STATUSES",
@@ -230,6 +231,116 @@ async def delete_luciel(
     return inst
 
 
+async def _requalify_crm_links(
+    session: AsyncSession,
+    inst: Instance,
+    *,
+    conns: list[InstanceConnection],
+    intact_providers: set[str],
+    actor_user_id: uuid.UUID | None,
+) -> int:
+    """Forget the CRM link rows that no longer name a record in the tenant's CRM
+    (round 7 WP-5, item 8).
+
+    ``crm_lead_links`` pins lead → CRM record id, and a record id belongs to ONE CRM
+    account. The links ride through the grace window untouched (the day-30 cascade
+    destroys them, restore needs them), so restore is where they must be re-qualified
+    against the connection that actually came back. They stay ONLY for a provider
+    whose CRM connection is revived on the credential the delete put away
+    (``intact_providers``). Everything else is a possibly-different account — the
+    owner reconnected the CRM during grace (a fresh consent on the draining row, or a
+    new row that superseded it), or the row restores ``unconfigured`` and must be
+    reconnected — and a stale id there does not merely 404-heal: it PATCHes whatever
+    contact carries that id in the other portal. Cleared exactly as a disconnect or a
+    swap clears them (``connections.service.clear_crm_links``); the next push relinks
+    by the documented search-by-key step. Audited with a count, never a lead key."""
+    stmt = delete(CrmLeadLink).where(
+        CrmLeadLink.admin_id == inst.admin_id, CrmLeadLink.instance_id == inst.id
+    )
+    if intact_providers:
+        stmt = stmt.where(CrmLeadLink.provider.not_in(sorted(intact_providers)))
+    result = await session.execute(stmt)
+    cleared = int(getattr(result, "rowcount", 0) or 0)
+    if cleared:
+        current = next(
+            (
+                c
+                for c in conns
+                if c.connection_type == "crm" and c.status not in NOT_SERVING_STATUSES
+            ),
+            None,
+        )
+        await audit.emit(
+            session,
+            admin_id=inst.admin_id,
+            instance_id=inst.id,
+            actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+            actor_user_id=actor_user_id,
+            event_type="crm_links_cleared",
+            payload={
+                "connection_id": str(current.connection_id) if current else None,
+                "provider": current.provider if current else None,
+                "count": cleared,
+                "reason": "restore_crm_connection_changed",
+            },
+        )
+    return cleared
+
+
+async def _remove_grace_window_duplicates(
+    session: AsyncSession,
+    inst: Instance,
+    sources: list[KnowledgeSource],
+) -> int:
+    """Destroy the second copy of a synced document that a sync wrote DURING the
+    delete (round 7 WP-5, item 8).
+
+    A knowledge sync whose provider fetch is on the wire when the owner deletes the
+    Luciel finishes against sources the delete tombstoned a moment earlier. It reads
+    "nothing is synced yet" and ingests every document again — live rows on a deleted
+    Luciel, same ``(connection_id, external_id)`` as the tombstoned originals. Restore
+    revives the originals ("exactly as it was", §3.6.4: their ids are what traces and
+    the dashboard know), so the grace-window copy must go, or every document exists
+    twice and the sync engine — which keys on ``external_id`` — tracks one and leaves
+    the other serving stale content forever. Hard-deleted rather than tombstoned: the
+    owner never had it, so there is no undo to offer. Call BEFORE the originals are
+    revived. Returns how many copies were removed."""
+    coming_back = {
+        (s.connection_id, s.external_id)
+        for s in sources
+        if s.deleted_by == "lifecycle" and s.connection_id is not None and s.external_id
+    }
+    duplicates = [
+        s
+        for s in sources
+        if s.soft_deleted_at is None and (s.connection_id, s.external_id) in coming_back
+    ]
+    if not duplicates:
+        return 0
+    ids = [s.id for s in duplicates]
+    # Edges before entities (they reference them, §3.2.1 rule 5); chunks any time.
+    for model in (KnowledgeChunk, KnowledgeEdge, KnowledgeEntity):
+        await session.execute(
+            delete(model).where(model.admin_id == inst.admin_id, model.source_id.in_(ids))
+        )
+    for dup in duplicates:
+        await session.delete(dup)
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=inst.admin_id,
+        instance_id=inst.id,
+        actor_type=ActorType.platform,
+        event_type="knowledge_source_edited",
+        payload={
+            "action": "restore_duplicates_removed",
+            "count": len(duplicates),
+            "connection_ids": sorted({str(s.connection_id) for s in duplicates}),
+        },
+    )
+    return len(duplicates)
+
+
 async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uuid.UUID) -> Instance:
     """Restore within grace → ACTIVE (not paused) (Architecture §3.6.4)."""
     inst = await _get_instance(session, admin_id)
@@ -270,6 +381,9 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
     from app.channels import routing  # noqa: PLC0415 — circular at module import
 
     active_types = {c.connection_type for c in conns if c.status not in NOT_SERVING_STATUSES}
+    # CRM providers whose connection comes back on the credential the delete put away
+    # — the only ones whose ``crm_lead_links`` still name records in the right account.
+    intact_crm_providers: set[str] = set()
     for c in conns:
         if c.status not in NOT_SERVING_STATUSES:
             continue
@@ -317,15 +431,25 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
             # chip (§3.8.5) rather than everything restoring as "reconnect all".
             # Legacy rows that entered grace before 0049 have no stash → the old
             # conservative 'unconfigured'.
+            if c.connection_type == "crm" and c.status_stashed:
+                intact_crm_providers.add(c.provider)
             c.status = c.status_stashed or "unconfigured"
             c.status_detail = c.status_detail_stashed
         c.status_stashed = None
         c.status_detail_stashed = None
-    sources = (
+    await _requalify_crm_links(
+        session,
+        inst,
+        conns=list(conns),
+        intact_providers=intact_crm_providers,
+        actor_user_id=actor_user_id,
+    )
+    sources = list(
         (await session.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)))
         .scalars()
         .all()
     )
+    await _remove_grace_window_duplicates(session, inst, sources)
     for src in sources:
         # Only what the Luciel delete tombstoned comes back with it. A source the
         # owner deleted deliberately stays deleted (its own undo window and purge

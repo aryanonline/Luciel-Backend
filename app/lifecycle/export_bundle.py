@@ -17,10 +17,11 @@ import io
 import json
 import uuid
 import zipfile
+import zlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
@@ -44,6 +45,37 @@ Layout:
                       Secret material (OAuth tokens, API keys) is NEVER included.
   audit_log.jsonl     your audit log within the retention window.
 """
+
+
+#: The advisory-lock namespace an export build and the hard-delete cascade share.
+_EXPORT_LOCK_KIND = "export_bundle"
+
+
+async def hold_export_lock(session: AsyncSession, admin_id: uuid.UUID) -> None:
+    """Serialize THIS transaction with every other export build / hard-delete cascade
+    for the tenant (round 7 WP-5, item 8).
+
+    A bundle is every table the tenant owns in one object, and the cascade destroys
+    the tenant's bundles by prefix. Unserialized, the two interleave badly: the sweep
+    runs while an upload is still on the wire, finds nothing, and the bundle lands a
+    moment later under a prefix nothing will ever sweep again — a full copy of the
+    data outliving "hard-deleted". Both sides take this lock first: a cascade waits
+    for the in-flight export to commit and then sweeps what it wrote; an export waits
+    for the cascade and then builds against what is left (or, when the account itself
+    was purged, refuses — see ``admin/account._build_upload_and_notify``).
+
+    Transaction-scoped (released on commit OR rollback, so a crashed request cannot
+    wedge the tenant) and BLOCKING, unlike ``claim_sweep_lock``: the loser here has
+    real work to do once the winner is done. Keys are derived in Python the same way
+    ``db.session._lock_keys`` derives them, so the pair is stable across releases.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+        {
+            "k1": zlib.crc32(_EXPORT_LOCK_KIND.encode()) - 2**31,
+            "k2": int.from_bytes(admin_id.bytes[:4], "big") - 2**31,
+        },
+    )
 
 
 def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:

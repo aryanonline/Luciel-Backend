@@ -111,6 +111,67 @@ def test_s3_delete_prefix_destroys_every_version_under_the_tenant_prefix() -> No
     assert len(client.deleted) == 3, "both versions of k1 plus its marker"
 
 
+# --- exists (round 7 WP-5, item 8) ------------------------------------------------- #
+def test_local_exists_follows_the_store() -> None:
+    LocalExportStore.reset()
+    store = LocalExportStore()
+
+    import asyncio
+
+    async def run() -> tuple[bool, bool, bool]:
+        before = await store.exists(key="vm-export-bundles/a/1.zip")
+        await store.put(key="vm-export-bundles/a/1.zip", data=b"zip")
+        present = await store.exists(key="vm-export-bundles/a/1.zip")
+        await store.delete_prefix(prefix="vm-export-bundles/a/")
+        return before, present, await store.exists(key="vm-export-bundles/a/1.zip")
+
+    assert asyncio.run(run()) == (False, True, False)
+    LocalExportStore.reset()
+
+
+class _S3Error(Exception):
+    """Shaped like botocore's ClientError (``.response``), without importing botocore."""
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}
+
+
+class _HeadClient:
+    def __init__(self, outcome: Exception | None) -> None:
+        self._outcome = outcome
+        self.heads: list[tuple[str, str]] = []
+
+    def head_object(self, *, Bucket, Key):  # noqa: N803 — boto3's casing
+        self.heads.append((Bucket, Key))
+        if self._outcome is not None:
+            raise self._outcome
+        return {"ContentLength": 3}
+
+
+def test_s3_exists_is_false_only_for_s3s_own_absent_answer() -> None:
+    """HeadObject answers a bare 404 for a swept bundle. A refused credential or a
+    timeout is the store failing to answer — raised, never read as "gone" (the door
+    would tell an owner whose bundle is sitting right there that the link expired)."""
+    import asyncio
+
+    import pytest
+    from app.lifecycle.export_store import S3ExportStore
+
+    def _store(outcome: Exception | None) -> S3ExportStore:
+        store = S3ExportStore(bucket="b", region_name="ca-central-1")
+        store._client = _HeadClient(outcome)
+        return store
+
+    assert asyncio.run(_store(None).exists(key="k")) is True
+    assert asyncio.run(_store(_S3Error("404", 404)).exists(key="k")) is False
+    assert asyncio.run(_store(_S3Error("NoSuchKey", 404)).exists(key="k")) is False
+    with pytest.raises(_S3Error):
+        asyncio.run(_store(_S3Error("AccessDenied", 403)).exists(key="k"))
+    with pytest.raises(TimeoutError):
+        asyncio.run(_store(TimeoutError("read timed out")).exists(key="k"))
+
+
 # --- binding (round 7 WP-5, item 3) ------------------------------------------------ #
 def _rebind(monkeypatch, *, bucket: str | None, mode: str):
     """Bind a fresh store under a given deployment shape (mirrors test_transcript_store)."""

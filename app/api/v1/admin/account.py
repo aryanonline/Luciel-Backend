@@ -11,12 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import conflict
+from app.api.errors import conflict, unauthorized
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
 from app.lifecycle import cascade
-from app.lifecycle.export_bundle import build_export_zip
+from app.lifecycle.export_bundle import build_export_zip, hold_export_lock
 from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
 from app.models.audit import ActorType
@@ -74,8 +74,20 @@ async def _build_upload_and_notify(
     presigned link (§3.6.6 / §5.10). Shared by ``request_export`` and
     ``close_account`` so both paths persist the bundle instead of discarding it.
 
-    Returns the download URL and the email outcome word (see ``ExportResult``)."""
+    Returns the download URL and the email outcome word (see ``ExportResult``).
+
+    Serialized with the hard-delete cascade (round 7 WP-5, item 8): the lock is taken
+    before the build, so a day-30 purge either waits for this bundle and sweeps it, or
+    finishes first — and then the account is re-read, because a purged tenant has
+    nothing to export and nobody to hand a link to. That refusal is a 401 (the session
+    names an account that no longer exists), never a "ready" over an empty bundle."""
     settings = get_settings()
+    await hold_export_lock(s, admin_id)
+    owner_email = (
+        await s.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    if owner_email is None:
+        raise unauthorized("Account not found.")
     zip_bytes = await build_export_zip(s, admin_id)
     export_id = uuid.uuid4()
     key = export_key_for(admin_id, export_id)
@@ -109,19 +121,14 @@ async def _build_upload_and_notify(
     )
     # Deliver the link to the account owner by email (§5.10 — the admin receives the
     # time-limited link). Degrades to audit-only if email isn't configured.
-    owner_email = (
-        await s.execute(select(Account.email).where(Account.id == admin_id))
-    ).scalar_one_or_none()
-    email_outcome = "no_sender"
-    if owner_email:
-        outcome = await email_dispatcher.send_export_ready(
-            s,
-            admin_id=admin_id,
-            to=owner_email,
-            download_url=url,
-            ttl_days=settings.export_link_ttl_days,
-        )
-        email_outcome = _email_outcome(outcome)
+    outcome = await email_dispatcher.send_export_ready(
+        s,
+        admin_id=admin_id,
+        to=owner_email,
+        download_url=url,
+        ttl_days=settings.export_link_ttl_days,
+    )
+    email_outcome = _email_outcome(outcome)
     if email_outcome not in ("sent", "recorded"):
         # The closure path answers 204 and has no body to carry this; the log line is
         # what an operator sees. The owner still has the D5 re-request (item 5).
