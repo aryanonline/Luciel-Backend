@@ -645,7 +645,8 @@ def _parse_ses_inbound(sns_message: dict[str, Any]) -> dict[str, Any]:
     destination = mail.get("destination") or []
     from_header = (headers.get("from") or [None])[0] or mail.get("source") or ""
     return {
-        "recipient": str(destination[0]) if destination else "",
+        # Case-folded (round 7 WP-3c item 10): the routing claim is stored lower-case.
+        "recipient": str(destination[0]).strip().lower() if destination else "",
         "from_address": parseaddr(str(from_header))[1],
         "subject": headers.get("subject"),
         "text": _plain_text_body(inner.get("content")),
