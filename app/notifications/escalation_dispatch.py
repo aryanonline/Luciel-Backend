@@ -372,10 +372,31 @@ async def _background_retry(
             )
 
 
+def _awaitable_here(tasks: set[asyncio.Task[None]]) -> list[asyncio.Task[None]]:
+    """The tasks in ``tasks`` that the RUNNING loop can await, dropping the rest.
+
+    A task belongs to the loop that created it. One left behind by a loop that has
+    since stopped (a test client's own loop, a worker being torn down) can never
+    finish, and ``asyncio.gather`` on it from another loop waits forever — which is
+    how a full-suite CI run sat for 34 minutes in a drain (round 7, 2026-10-04). Such
+    a task is abandoned work, not pending work: it is dropped from the registry and
+    logged, so a drain is always bounded by tasks that can actually complete.
+    """
+    loop = asyncio.get_running_loop()
+    here: list[asyncio.Task[None]] = []
+    for task in list(tasks):
+        if task.get_loop() is loop:
+            here.append(task)
+        else:
+            tasks.discard(task)
+            _LOG.error("abandoned background escalation task from another event loop: %r", task)
+    return here
+
+
 async def drain_background_retries() -> None:
     """Await every in-process retry ladder currently running (tests / shutdown)."""
-    while _BACKGROUND_RETRIES:
-        await asyncio.gather(*list(_BACKGROUND_RETRIES), return_exceptions=True)
+    while pending := _awaitable_here(_BACKGROUND_RETRIES):
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 # --- delivery OFF the customer's turn (round 7 WP-2, item 5; §3.5.4) ---------------- #
@@ -475,8 +496,8 @@ async def _notify_in_own_session(
 
 async def drain_background_notifications() -> None:
     """Await every off-turn notification currently running (tests / shutdown)."""
-    while _BACKGROUND_NOTIFICATIONS:
-        await asyncio.gather(*list(_BACKGROUND_NOTIFICATIONS), return_exceptions=True)
+    while pending := _awaitable_here(_BACKGROUND_NOTIFICATIONS):
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def drain_background_work() -> None:

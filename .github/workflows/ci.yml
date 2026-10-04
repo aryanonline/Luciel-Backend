@@ -20,6 +20,9 @@ on:
 jobs:
   quality-gate:
     runs-on: ubuntu-latest
+    # A normal run is ~12 minutes. Without a ceiling a hung test holds the runner for
+    # GitHub's 6-hour default and reports nothing (round 7, 2026-10-04).
+    timeout-minutes: 35
 
     services:
       postgres:

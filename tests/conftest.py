@@ -8,6 +8,8 @@ and asserts the connection role cannot bypass RLS before any test runs.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import os
 import subprocess
 import uuid
@@ -314,4 +316,21 @@ async def _drain_offturn_notifications() -> AsyncIterator[None]:
     from app.notifications import escalation_dispatch
 
     yield
-    await escalation_dispatch.drain_background_notifications()
+    # Bounded, and self-diagnosing: a stuck task used to hang the whole job with no
+    # output (a CI run sat here for 34 minutes on 2026-10-04). Now it fails THIS
+    # test and prints where each stuck task is suspended.
+    try:
+        await asyncio.wait_for(escalation_dispatch.drain_background_notifications(), timeout=60)
+    except TimeoutError:
+        stuck = list(escalation_dispatch._BACKGROUND_NOTIFICATIONS)
+        report: list[str] = []
+        for task in stuck:
+            buffer = io.StringIO()
+            task.print_stack(file=buffer)
+            report.append(f"{task!r}\n{buffer.getvalue()}")
+            task.cancel()
+        escalation_dispatch._BACKGROUND_NOTIFICATIONS.clear()
+        pytest.fail(
+            "off-turn escalation notification task(s) did not finish within 60 s:\n"
+            + "\n".join(report)
+        )
