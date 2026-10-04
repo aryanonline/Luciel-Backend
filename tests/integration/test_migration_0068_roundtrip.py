@@ -91,6 +91,18 @@ async def _sms_index_def(s) -> str:
     )
 
 
+async def _email_index_def(s) -> str:
+    """``uq_email_destination`` is written by 0067 and re-stated here: chained after
+    it at merge, 0068 must make a draining mailbox release its structural claim too."""
+    return str(
+        (
+            await s.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_email_destination'")
+            )
+        ).scalar_one()
+    )
+
+
 async def _closed_at_exists(s) -> bool:
     return (
         await s.execute(
@@ -161,6 +173,7 @@ async def test_0068_downgrades_and_upgrades_again():
     async with tenant_session(admin) as s:
         assert "p_include_quiescing boolean DEFAULT true" in (await _resolver_arguments(s))[0]
         assert "'quiescing'" in await _sms_index_def(s)
+        assert "'quiescing'" in await _email_index_def(s)
         assert await _closed_at_exists(s)
 
     _alembic("downgrade", _down_revision())
@@ -170,6 +183,8 @@ async def test_0068_downgrades_and_upgrades_again():
             assert (await _resolver_arguments(s)) == ["p_ct text, p_dest text"]
             index_def = await _sms_index_def(s)
             assert "'quiescing'" not in index_def and "'revoked'" in index_def
+            email_def = await _email_index_def(s)
+            assert "'quiescing'" not in email_def and "'revoked'" in email_def
             assert not await _closed_at_exists(s)
     finally:
         _alembic("upgrade", "head")
@@ -178,6 +193,7 @@ async def test_0068_downgrades_and_upgrades_again():
         args = await _resolver_arguments(s)
         assert len(args) == 1 and "p_include_quiescing boolean DEFAULT true" in args[0]
         assert "'quiescing'" in await _sms_index_def(s)
+        assert "'quiescing'" in await _email_index_def(s)
         assert await _closed_at_exists(s)
         # The app's 3-arg call works again, and the row the downgrade retired stays
         # retired (revoked is terminal; nothing re-derives a drain from it).

@@ -26,7 +26,10 @@ Round 7 WP-5 (lifecycle, export and closure truth). Three persistence changes:
 2. ``uq_sms_destination`` (0045) is recreated to exclude ``quiescing`` rows as well as
    ``revoked`` ones, so a legitimate claim by another tenant during a deleted
    Luciel's grace window is structurally possible again (the claim gate says
-   "unclaimed", the index must agree).
+   "unclaimed", the index must agree). ``uq_email_destination`` (0067, the email
+   claim index written in parallel with this migration) is recreated the same way:
+   chained after 0067 at merge, it would otherwise keep counting a draining mailbox
+   as a live claim and answer a legitimate reclaim with a unique violation.
 
 3. ``accounts.closed_at`` — when the owner closed the account (§3.6.6). The purge sweep
    used to read the FIRST ``account_closure_initiated`` audit row as its clock; with
@@ -125,6 +128,20 @@ _INDEX_0068 = (
     "AND non_secret_config->>'destination' IS NOT NULL"
 )
 
+_EMAIL_INDEX_0068 = (
+    "CREATE UNIQUE INDEX uq_email_destination ON instance_connections "
+    "((lower(non_secret_config->>'destination'))) "
+    "WHERE connection_type = 'email_sender' AND status NOT IN ('revoked', 'quiescing') "
+    "AND non_secret_config->>'destination' IS NOT NULL"
+)
+
+_EMAIL_INDEX_0067 = (
+    "CREATE UNIQUE INDEX uq_email_destination ON instance_connections "
+    "((lower(non_secret_config->>'destination'))) "
+    "WHERE connection_type = 'email_sender' AND status <> 'revoked' "
+    "AND non_secret_config->>'destination' IS NOT NULL"
+)
+
 _INDEX_0045 = (
     "CREATE UNIQUE INDEX uq_sms_destination ON instance_connections "
     "((non_secret_config->>'destination')) "
@@ -145,6 +162,8 @@ def upgrade() -> None:
 
     op.execute("DROP INDEX IF EXISTS uq_sms_destination")
     op.execute(_INDEX_0068)
+    op.execute("DROP INDEX IF EXISTS uq_email_destination")
+    op.execute(_EMAIL_INDEX_0068)
 
     op.add_column("accounts", sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True))
 
@@ -164,6 +183,8 @@ def downgrade() -> None:
     op.execute("REVOKE UPDATE ON instance_connections FROM luciel_auth")
     op.execute("DROP INDEX IF EXISTS uq_sms_destination")
     op.execute(_INDEX_0045)
+    op.execute("DROP INDEX IF EXISTS uq_email_destination")
+    op.execute(_EMAIL_INDEX_0067)
 
     op.execute("DROP FUNCTION IF EXISTS channel_resolve_destination(text, text, boolean)")
     op.execute(_RESOLVER_0044)
