@@ -879,6 +879,46 @@ _ATTEMPT_STATE_KEYS: tuple[str, ...] = (
     NEXT_PROBE_AT_KEY,
 )
 
+#: Round 7 WP-4a item 12 (owner ruling 2026-09-14): where a disconnect parks the
+#: number / mailbox address the row was routing on. It is NOT a claim — inbound
+#: routing and the cross-tenant uniqueness gate read ``destination`` only — just the
+#: owner's own value kept on file so a reconnect can offer it back. Getting it back
+#: goes through the normal attach / verify path, which re-runs the ownership gate.
+RELEASED_DESTINATION_KEY = "released_destination"
+
+#: The connection types whose row holds a number / mailbox routing claim.
+_CLAIM_HOLDING_TYPES: frozenset[str] = frozenset({"sms_sender", "email_sender"})
+
+
+def _release_routing_claim(connection: InstanceConnection, cfg: dict[str, object]) -> str | None:
+    """Take the number / mailbox off a disconnected row's routing keys (item 12).
+
+    Mutates ``cfg``; returns the CLAIM that was released (``destination``), or None
+    when the row held none. Before this, ``destination`` survived a disconnect on
+    every sms row and every platform email row, so a churned account held the number
+    or address forever: inbound to it still resolved to the dead tenant, and its
+    real owner was refused as "already connected to a different account".
+
+    Whatever was on file — the confirmed claim, a number parked under
+    ``pending_destination`` (never a claim, c21), a legacy address with no
+    destination — is kept under ``RELEASED_DESTINATION_KEY`` and nowhere else, so
+    every reconnect path lands the row on the same honest "add your number" /
+    "connect your mailbox" state instead of resuming a claim nobody re-proved. An
+    email row's ``address`` and ``mode`` go with the claim: the address is the FROM
+    identity and the re-verify key, and a row that no longer owns it must not keep
+    sending as it or re-verify its way back to connected around the claim check."""
+    if connection.connection_type not in _CLAIM_HOLDING_TYPES:
+        return None
+    claim = cfg.pop("destination", None)
+    on_file: list[object] = [claim, cfg.pop("pending_destination", None)]
+    if connection.connection_type == "email_sender":
+        on_file.append(cfg.pop("address", None))
+        cfg.pop("mode", None)
+    kept = next((v for v in on_file if isinstance(v, str) and v), None)
+    if kept is not None:
+        cfg[RELEASED_DESTINATION_KEY] = kept
+    return claim if isinstance(claim, str) and claim else None
+
 
 def _stage_reconnect_marker(
     connection: InstanceConnection, prior_status: str, now: datetime
@@ -1325,10 +1365,20 @@ async def clear_crm_links(
     Record ids belong to ONE CRM account. After a disconnect — or a swap, which
     is a reconnect against a possibly different account — a stale id would
     silently 404-heal into a duplicate record there. The next push relinks by
-    the documented search-by-key step. Audited with the count, never lead PII."""
+    the documented search-by-key step. Audited with the count, never lead PII.
+
+    The per-lead push state goes with the links (round 7 WP-4a item 12): a lead
+    stamped ``synced`` kept reading "in your CRM" on the Leads page after the CRM
+    was disconnected — or swapped for an account it was never pushed to — and a
+    ``failed`` one kept counting as a broken push against a connection that no
+    longer exists. Every stamp returns to NULL ("nothing was ever attempted"),
+    including the once-per-lead failure notice, so the next connection starts
+    clean and its first failure is reported."""
     from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+    from sqlalchemy import update as sa_update  # noqa: PLC0415
 
     from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
+    from app.models.lead import Lead  # noqa: PLC0415
 
     cleared_result = await session.execute(
         sa_delete(CrmLeadLink).where(
@@ -1337,6 +1387,21 @@ async def clear_crm_links(
         )
     )
     cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
+    reset_result = await session.execute(
+        sa_update(Lead)
+        .where(
+            Lead.admin_id == admin_id,
+            Lead.instance_id == connection.instance_id,
+            Lead.crm_push_status.is_not(None),
+        )
+        .values(
+            crm_push_status=None,
+            crm_push_detail=None,
+            crm_pushed_at=None,
+            crm_failure_notified_at=None,
+        )
+    )
+    leads_reset = int(getattr(reset_result, "rowcount", 0) or 0)
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -1348,6 +1413,7 @@ async def clear_crm_links(
             "connection_id": str(connection.connection_id),
             "provider": connection.provider,
             "count": cleared_count,
+            "leads_reset": leads_reset,
             "reason": reason,
         },
     )
@@ -1372,10 +1438,16 @@ async def disconnect(
     still in flight re-credential a connection the owner just disconnected, and a staged
     ``pending_provider`` would silently resurrect on the next confirm.
 
-    Non-secret operational config (a BYO phone number, a provisioned email address) is
-    KEPT: it is not credential material, and making the owner retype their own number to
-    re-link a calendar-adjacent channel is the "demo, not a product" feeling this pass
-    exists to remove. Scope selections are kept for the same reason.
+    Non-secret operational config (the Twilio account id, scope selections, the
+    carrier attestation) is KEPT: it is not credential material, and making the owner
+    retype it is the "demo, not a product" feeling this pass exists to remove.
+
+    The routing CLAIM is not kept (owner ruling 2026-09-14, round 7 WP-4a item 12): a
+    BYO number or a mailbox address moves from ``destination`` to
+    ``released_destination`` — still on file for the owner, no longer resolving
+    inbound and no longer blocking another account from connecting it. A reconnect
+    re-proves ownership through the normal attach / verify path, which re-runs the
+    cross-tenant claim check; nothing resumes a claim on the strength of the copy.
 
     Returns a summary dict, or None if no such connection for this tenant."""
     store = store or get_secret_store()
@@ -1387,18 +1459,17 @@ async def disconnect(
     cfg = dict(connection.non_secret_config or {})
     for ephemeral in _ATTEMPT_STATE_KEYS:
         cfg.pop(ephemeral, None)
-    # A disconnected OUTLOOK mailbox releases its routing claim. Unlike a BYO phone
-    # number (kept — it is the owner's own asset to re-link), the mailbox address was
-    # bound BY the verify step as this tenant's inbound-routing destination and holds
-    # the cross-tenant uniqueness claim; a dead row must neither keep routing inbound
-    # mail nor block the mailbox's real owner from connecting it elsewhere. The poll
-    # cursor and dedupe window go with it — a future reconnect re-baselines from
-    # scratch (the baseline rule), which is exactly what a fresh consent means.
+    # A disconnected channel connection releases its routing claim (owner ruling
+    # 2026-09-14, item 12) — the number or mailbox address stops resolving inbound
+    # to this tenant and stops blocking its real owner from connecting it elsewhere.
+    # This used to hold for an Outlook mailbox only; a BYO number and a platform
+    # address kept their claim forever.
+    released_claim = _release_routing_claim(connection, cfg)
     if connection.provider == "outlook":
+        # The mailbox's expiry hint, poll cursor and dedupe window go with it — a
+        # future reconnect re-baselines from scratch (the baseline rule), which is
+        # exactly what a fresh consent means.
         for mailbox_state in (
-            "destination",
-            "address",
-            "mode",
             "token_expires_at",
             "mailbox_delta_link",
             "mailbox_seen_ids",
@@ -1431,6 +1502,10 @@ async def disconnect(
             "reason": "disconnect",
             "disabled_tools": cascaded["tools"],
             "disabled_channels": cascaded["channels"],
+            # Item 12: whether this disconnect gave up a number / mailbox claim, and
+            # which (non-secret config, §3.8.3 — the owner's own number or address).
+            "routing_claim_released": released_claim is not None,
+            **({"released_destination": released_claim} if released_claim else {}),
         },
     )
     # §3.8.3 rule 4: cleanup audit carries NO secret material — only the ref + result.
@@ -1628,7 +1703,11 @@ async def provision_email(
     in non_secret_config; NO secret material is written here (§3.8.3)."""
     now = now or datetime.now(UTC)
     if mode == "own_domain":
-        address = (email_address or "").strip()
+        # Case-folded (item 12): the address IS the inbound-routing key and every
+        # other producer of one lowercases it — a "Sales@Example.COM" stored as
+        # typed resolved no tenant for mail addressed to the lowercase form, and
+        # let a second tenant claim the same mailbox under a different casing.
+        address = (email_address or "").strip().lower()
         if not address:
             raise ValueError("own_domain requires an email address")
         status = "pending_email_routing"

@@ -337,7 +337,14 @@ async def test_disconnect_sweeps_the_pending_connect_attempt(client):
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_disconnect_keeps_non_secret_operational_config(client):
     """Disconnect destroys CREDENTIALS, not the owner's own data: a BYO phone number is
-    non-secret operational config, and making them retype it would be gratuitous."""
+    non-secret operational config, and making them retype it would be gratuitous.
+
+    Owner ruling 2026-09-14 (round 7 WP-4a item 12): what a disconnect DOES release
+    is the routing CLAIM — a confirmed number moves from ``destination`` (the key
+    inbound routing resolves and the cross-tenant uniqueness gate checks) to
+    ``released_destination`` (a convenience copy; reconnect re-proves ownership
+    through the normal attach path). A number that never confirmed operable sits
+    under ``pending_destination`` (c21 anti-squatting) and was never a claim."""
     await _ready_account_with_luciel(client)
     await client.post(
         "/api/v1/admin/connections",
@@ -353,10 +360,10 @@ async def test_disconnect_keeps_non_secret_operational_config(client):
     r = await client.post(f"/api/v1/admin/connections/{sms['connectionId']}/disconnect")
     assert r.status_code == 200
     cfg = r.json()["connection"]["nonSecretConfig"]
+    assert "destination" not in cfg, "a disconnected row holds no routing claim"
     # In mock mode the operability probe never confirms, so the number sits under
-    # pending_destination (c21 anti-squatting: only a CONFIRMED-operable number is
-    # the routable claim). Either way, disconnect keeps the owner's number on file.
-    assert (cfg.get("destination") or cfg.get("pending_destination")) == "+14155550111"
+    # pending_destination. Either way, disconnect keeps the owner's number on file.
+    assert (cfg.get("released_destination") or cfg.get("pending_destination")) == "+14155550111"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

@@ -1258,3 +1258,437 @@ async def test_a_replaced_credential_does_not_pass_its_backoff_to_the_new_one(_r
     row = await _row(admin, hook)
     assert row.status == "connected"
     assert NEXT_PROBE_AT_KEY not in (row.non_secret_config or {})
+
+
+# --------------------------------------------------------------------------- #
+# Item 12 — a disconnect releases the routing claim and forgets CRM state
+# --------------------------------------------------------------------------- #
+
+NUMBER = "+14155550123"
+OTHER_NUMBER = "+14155550124"
+
+
+async def _seed_serving_number(admin: uuid.UUID, iid: uuid.UUID, cfg_extra: dict | None = None):
+    from app.connections.secrets import get_secret_store
+
+    ref = f"vm/{admin}/{iid}/sms_sender"
+    await get_secret_store().put(ref, {"authToken": "tok"})
+    return await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="connected",
+        cfg={"destination": NUMBER, "accountSid": ACCOUNT_SID, **(cfg_extra or {})},
+        secret_ref=ref,
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_disconnected_number_releases_its_claim_and_reconnect_re_proves_ownership():
+    """Owner ruling 2026-09-14: disconnecting a channel connection RELEASES its
+    number routing claim. Before, ``destination`` survived the disconnect, so a
+    churned account held the number forever — its real owner could never connect
+    it elsewhere, and inbound texts to it still resolved to the dead tenant. The
+    number is kept under ``released_destination`` for the owner's convenience only;
+    ownership is re-proven through the normal attach path, which re-runs the
+    cross-tenant claim check."""
+    from app.channels import routing
+    from app.channels.phone_lifecycle import NumberAlreadyClaimed, attach_sms_number
+    from app.connections import service
+    from app.connections.service import RELEASED_DESTINATION_KEY
+
+    owner = uuid.uuid4()
+    owner_iid = await _seed_tenant(owner)
+    cid = await _seed_serving_number(owner, owner_iid)
+    async with tenant_session(owner) as s:
+        assert await routing.owner_of_destination(s, "sms_sender", NUMBER) == owner
+        out = await service.disconnect(s, admin_id=owner, connection_id=cid, user_id=None)
+    assert out is not None and out["secret_deleted"] is True
+
+    row = await _row(owner, cid)
+    cfg = row.non_secret_config or {}
+    assert "destination" not in cfg
+    assert cfg[RELEASED_DESTINATION_KEY] == NUMBER
+    assert cfg["accountSid"] == ACCOUNT_SID, "the owner's own account id is not a claim"
+    async with tenant_session(owner) as s:
+        assert await routing.owner_of_destination(s, "sms_sender", NUMBER) is None
+    disconnects = [c for c in await _status_changes(owner) if c.get("reason") == "disconnect"]
+    assert len(disconnects) == 1 and disconnects[0]["routing_claim_released"] is True
+
+    # The number's next owner can now claim it through the normal attach path.
+    newcomer = uuid.uuid4()
+    newcomer_iid = await _seed_tenant(newcomer)
+    async with tenant_session(newcomer) as s:
+        claimed = await attach_sms_number(
+            s,
+            admin_id=newcomer,
+            instance_id=newcomer_iid,
+            e164_number=NUMBER,
+            probe=_FixedProbe(OperabilityResult.OPERABLE),
+        )
+        assert claimed.status == "pending_carrier_registration"
+        assert (claimed.non_secret_config or {})["destination"] == NUMBER
+
+    # The churned account cannot silently take it back: the convenience copy is not
+    # a claim, and re-attaching runs the same cross-tenant gate as any first attach.
+    async with tenant_session(owner) as s:
+        with pytest.raises(NumberAlreadyClaimed):
+            await attach_sms_number(
+                s,
+                admin_id=owner,
+                instance_id=owner_iid,
+                e164_number=NUMBER,
+                probe=_FixedProbe(OperabilityResult.OPERABLE),
+            )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_owner_re_attaching_a_released_number_reclaims_it_and_a_new_number_re_derives():
+    from app.channels.phone_lifecycle import attach_sms_number
+    from app.connections import service
+    from app.connections.service import RELEASED_DESTINATION_KEY
+
+    owner = uuid.uuid4()
+    iid = await _seed_tenant(owner)
+    attested = {
+        "carrier_registration_attested_at": NOW.isoformat(),
+        "carrier_registration_attested_by": str(owner),
+    }
+    cid = await _seed_serving_number(owner, iid, attested)
+    async with tenant_session(owner) as s:
+        await service.disconnect(s, admin_id=owner, connection_id=cid, user_id=None)
+
+    # Same number back: the claim is re-proven, the convenience copy is consumed and
+    # the attestation of THAT number is kept.
+    async with tenant_session(owner) as s:
+        again = await attach_sms_number(
+            s,
+            admin_id=owner,
+            instance_id=iid,
+            e164_number=NUMBER,
+            probe=_FixedProbe(OperabilityResult.OPERABLE),
+        )
+        cfg = dict(again.non_secret_config or {})
+    assert cfg["destination"] == NUMBER
+    assert RELEASED_DESTINATION_KEY not in cfg
+    assert cfg["carrier_registration_attested_at"] == NOW.isoformat()
+
+    # A DIFFERENT number after a disconnect re-derives from scratch: the attestation
+    # was about the released number (number-change invalidation must still see it).
+    async with tenant_session(owner) as s:
+        await service.disconnect(s, admin_id=owner, connection_id=cid, user_id=None)
+    async with tenant_session(owner) as s:
+        changed = await attach_sms_number(
+            s,
+            admin_id=owner,
+            instance_id=iid,
+            e164_number=OTHER_NUMBER,
+            probe=_FixedProbe(OperabilityResult.OPERABLE),
+        )
+        cfg = dict(changed.non_secret_config or {})
+    assert cfg["destination"] == OTHER_NUMBER
+    assert RELEASED_DESTINATION_KEY not in cfg
+    assert "carrier_registration_attested_at" not in cfg
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_disconnected_mailbox_keeps_its_address_only_as_a_released_copy():
+    from app.channels import routing
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+    from app.connections.service import RELEASED_DESTINATION_KEY
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/email_sender"
+    await get_secret_store().put(ref, {"access_token": "tok", "refresh_token": "r"})
+    mailbox = "owner@acme.example"
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="email_sender",
+        provider="outlook",
+        auth_class="oauth_token",
+        status="connected",
+        cfg={"destination": mailbox, "address": mailbox, "mode": "byo_mailbox"},
+        secret_ref=ref,
+    )
+    async with tenant_session(admin) as s:
+        await service.disconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+    cfg = (await _row(admin, cid)).non_secret_config or {}
+    assert "destination" not in cfg and "address" not in cfg
+    assert cfg[RELEASED_DESTINATION_KEY] == mailbox
+    async with tenant_session(admin) as s:
+        assert await routing.owner_of_destination(s, "email_sender", mailbox) is None
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_disconnected_crm_forgets_where_the_leads_were_pushed():
+    """After a CRM disconnect the Leads page still read "in your CRM" for every
+    synced lead — the record ids were forgotten (round 5A) but the per-lead push
+    state was not. The state is reset with the links, audited by count only."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+    from app.models.lead import Lead
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/crm"
+    await get_secret_store().put(ref, {"access_token": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="crm",
+        provider="hubspot",
+        auth_class="oauth_token",
+        status="connected",
+        secret_ref=ref,
+    )
+    synced, failed, untouched = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Lead(
+                id=synced,
+                admin_id=admin,
+                instance_id=iid,
+                name="S",
+                contact_identifier="s@lead.example",
+                crm_push_status="synced",
+                crm_pushed_at=NOW,
+            )
+        )
+        s.add(
+            Lead(
+                id=failed,
+                admin_id=admin,
+                instance_id=iid,
+                name="F",
+                contact_identifier="f@lead.example",
+                crm_push_status="failed",
+                crm_push_detail="crm_http_500",
+                crm_failure_notified_at=NOW,
+            )
+        )
+        s.add(
+            Lead(
+                id=untouched,
+                admin_id=admin,
+                instance_id=iid,
+                name="U",
+                contact_identifier="u@lead.example",
+            )
+        )
+
+    async with tenant_session(admin) as s:
+        await service.disconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+
+    async with tenant_session(admin) as s:
+        leads = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalars().all()
+        assert len(leads) == 3
+        for lead in leads:
+            assert lead.crm_push_status is None, lead.name
+            assert lead.crm_push_detail is None, lead.name
+            assert lead.crm_pushed_at is None, lead.name
+        cleared = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "crm_links_cleared",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(cleared) == 1
+    payload = cleared[0].event_payload or {}
+    assert payload["reason"] == "disconnect"
+    assert payload["leads_reset"] == 2
+    assert "lead.example" not in str(payload)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_provisioned_mailbox_address_is_lowercased():
+    """Every other producer of a routable address case-folds it; the platform
+    email provision was the one that stored the owner's capitals, so inbound mail
+    to the lowercased form resolved no tenant."""
+    from app.connections import service
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    async with tenant_session(admin) as s:
+        conn = await service.provision_email(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            mode="own_domain",
+            email_address="  Sales@Example.COM ",
+            instance_name="Acme",
+            user_id=None,
+        )
+        cfg = dict(conn.non_secret_config or {})
+    assert cfg["address"] == "sales@example.com"
+    assert cfg["destination"] == "sales@example.com"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_disconnected_parked_number_reconnects_to_add_your_number_not_a_dead_end():
+    """A number that never confirmed operable sits under ``pending_destination``.
+    Kept there through a disconnect, the credential reconnect found "a number
+    pending", wrote no status at all, and the row stayed ``not_connected`` with new
+    credentials on file. It is folded into the released copy like a confirmed
+    number, so the reconnect lands on the honest "add your number" state — and a
+    second disconnect of the already-released row keeps the copy."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store
+    from app.connections.service import RELEASED_DESTINATION_KEY, SMS_NEEDS_NUMBER_DETAIL
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    ref = f"vm/{admin}/{iid}/sms_sender"
+    await get_secret_store().put(ref, {"authToken": "tok"})
+    cid = await _seed_connection(
+        admin,
+        iid,
+        connection_type="sms_sender",
+        provider="twilio",
+        auth_class="api_key",
+        status="not_operable_hosting_required",
+        cfg={"pending_destination": NUMBER, "accountSid": ACCOUNT_SID},
+        secret_ref=ref,
+    )
+    for _ in range(2):
+        async with tenant_session(admin) as s:
+            await service.disconnect(s, admin_id=admin, connection_id=cid, user_id=None)
+        cfg = (await _row(admin, cid)).non_secret_config or {}
+        assert "pending_destination" not in cfg and "destination" not in cfg
+        assert cfg[RELEASED_DESTINATION_KEY] == NUMBER
+    # A parked number was never a claim, so nothing was "released".
+    disconnects = [c for c in await _status_changes(admin) if c.get("reason") == "disconnect"]
+    assert [d["routing_claim_released"] for d in disconnects] == [False, False]
+    assert all("released_destination" not in d for d in disconnects)
+
+    async with tenant_session(admin) as s:
+        conn = await service.submit_credentials(
+            s,
+            admin_id=admin,
+            connection_id=cid,
+            fields={"accountSid": ACCOUNT_SID, "authToken": "new-token"},
+            user_id=admin,
+        )
+        assert conn is not None
+    row = await _row(admin, cid)
+    assert row.status == "unconfigured"
+    assert row.status_detail == SMS_NEEDS_NUMBER_DETAIL
+    assert (row.non_secret_config or {})[RELEASED_DESTINATION_KEY] == NUMBER
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_disconnected_platform_address_is_released_and_cannot_re_verify_its_way_back():
+    """A platform (ses) email row kept ``destination`` AND ``address`` through a
+    disconnect "by design": the address stayed routable to the dead tenant, another
+    account could never claim it, and Re-verify on the disconnected own-domain row
+    flipped it straight back to connected without any claim check."""
+    from app.channels import routing
+    from app.channels.email_routing import MxDelegationResult
+    from app.connections import service
+    from app.connections.service import RELEASED_DESTINATION_KEY
+
+    class _Delegated:
+        async def check(self, domain: str, expected_mx: str) -> MxDelegationResult:
+            return MxDelegationResult.DELEGATED
+
+    address = "sales@acme.example"
+    owner = uuid.uuid4()
+    owner_iid = await _seed_tenant(owner)
+    async with tenant_session(owner) as s:
+        conn = await service.provision_email(
+            s,
+            admin_id=owner,
+            instance_id=owner_iid,
+            mode="own_domain",
+            email_address=address,
+            instance_name="Acme",
+            user_id=None,
+        )
+        cid = conn.connection_id
+        await service.reverify_email_routing(
+            s, admin_id=owner, instance_id=owner_iid, probe=_Delegated()
+        )
+        assert conn.status == "connected"
+        assert await routing.owner_of_destination(s, "email_sender", address) == owner
+
+    async with tenant_session(owner) as s:
+        await service.disconnect(s, admin_id=owner, connection_id=cid, user_id=None)
+    cfg = (await _row(owner, cid)).non_secret_config or {}
+    assert "destination" not in cfg and "address" not in cfg and "mode" not in cfg
+    assert cfg[RELEASED_DESTINATION_KEY] == address
+    disconnects = [c for c in await _status_changes(owner) if c.get("reason") == "disconnect"]
+    assert disconnects[-1]["routing_claim_released"] is True
+    assert disconnects[-1]["released_destination"] == address
+
+    async with tenant_session(owner) as s:
+        assert await service.resolve_email_address(s, owner, owner_iid) is None
+        again = await service.reverify_email_routing(
+            s, admin_id=owner, instance_id=owner_iid, probe=_Delegated()
+        )
+        assert again is not None and again.status == "not_connected"
+
+    # The address's next owner can claim it; the churned row no longer blocks them.
+    newcomer = uuid.uuid4()
+    newcomer_iid = await _seed_tenant(newcomer)
+    async with tenant_session(newcomer) as s:
+        claimed = await service.provision_email(
+            s,
+            admin_id=newcomer,
+            instance_id=newcomer_iid,
+            mode="own_domain",
+            email_address=address,
+            instance_name="Newco",
+            user_id=None,
+        )
+        assert (claimed.non_secret_config or {})["destination"] == address
+    async with tenant_session(owner) as s:
+        with pytest.raises(service.EmailAddressTaken):
+            await service.provision_email(
+                s,
+                admin_id=owner,
+                instance_id=owner_iid,
+                mode="own_domain",
+                email_address=address,
+                instance_name="Acme",
+                user_id=None,
+            )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_mailbox_claimed_under_other_casing_is_the_same_claim():
+    from app.connections import service
+
+    first, second = uuid.uuid4(), uuid.uuid4()
+    first_iid = await _seed_tenant(first)
+    second_iid = await _seed_tenant(second)
+    async with tenant_session(first) as s:
+        await service.provision_email(
+            s,
+            admin_id=first,
+            instance_id=first_iid,
+            mode="own_domain",
+            email_address="sales@casing.example",
+            instance_name="Acme",
+            user_id=None,
+        )
+    async with tenant_session(second) as s:
+        with pytest.raises(service.EmailAddressTaken):
+            await service.provision_email(
+                s,
+                admin_id=second,
+                instance_id=second_iid,
+                mode="own_domain",
+                email_address="Sales@Casing.Example",
+                instance_name="Other",
+                user_id=None,
+            )

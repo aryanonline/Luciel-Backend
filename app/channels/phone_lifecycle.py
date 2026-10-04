@@ -34,7 +34,10 @@ with the deployment's API-key auth). Carrier registration remains the tenant's, 
 as such rather than falsely verified.
 
 Disabling does NOT release the number — the connection row is retained so re-enabling
-needs no re-setup (§3.7.1 / §3.8.7 B).
+needs no re-setup (§3.7.1 / §3.8.7 B). DISCONNECTING does (owner ruling 2026-09-14,
+round 7 WP-4a item 12): ``service.disconnect`` moves the number to
+``released_destination`` — on file, not a claim — and ``attach_sms_number`` is how it
+comes back, through the same ownership gate and probe as a first attach.
 """
 
 from __future__ import annotations
@@ -247,10 +250,22 @@ async def attach_sms_number(
         prior_cfg = existing.non_secret_config or {}
         merged = {**prior_cfg, **cfg_update}
         merged.pop(cfg_pop, None)
+        # Round 7 WP-4a item 12: a disconnect parked the row's number under the
+        # released copy (not a claim). This attach is the re-proof — the ownership
+        # gate above and the probe just ran against the number being attached — so
+        # the copy is consumed either way; it still counts as the PRIOR number, so
+        # an attestation of the released number never carries to a different one.
+        from app.connections.service import RELEASED_DESTINATION_KEY  # noqa: PLC0415
+
+        merged.pop(RELEASED_DESTINATION_KEY, None)
         # Number-change invalidation extends to the attestation (round 5B item
         # 10): the owner attested THAT number's registration, so a different
         # number re-derives from scratch. A same-number re-attach keeps it.
-        prior_number = prior_cfg.get("destination") or prior_cfg.get("pending_destination")
+        prior_number = (
+            prior_cfg.get("destination")
+            or prior_cfg.get("pending_destination")
+            or prior_cfg.get(RELEASED_DESTINATION_KEY)
+        )
         if prior_number and prior_number != number:
             merged.pop(_ATTESTED_AT_KEY, None)
             merged.pop(_ATTESTED_BY_KEY, None)
