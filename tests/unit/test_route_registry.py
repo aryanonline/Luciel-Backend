@@ -91,7 +91,12 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/api/v1/admin/knowledge/sync-connections/{connection_id}/scope"),
         ("GET", "/api/v1/admin/knowledge/sync-connections/{connection_id}/scope/candidates"),
         # admin/account
+        # Round 7 WP-5 / owner decision D5: the account status read — the one GET a
+        # closed account may make during its 30-day reopen window.
+        ("GET", "/api/v1/admin/account"),
         ("POST", "/api/v1/admin/account/close"),
+        # D5: reopen a closed account inside its 30-day window.
+        ("POST", "/api/v1/admin/account/reopen"),
         ("POST", "/api/v1/admin/account/export"),
         # admin/connections
         ("GET", "/api/v1/admin/connections"),

@@ -107,6 +107,33 @@ def disclosure_business_name(inst: Instance) -> str:
     return (inst.business_short_name or "").strip() or "this business"
 
 
+def drain_refused() -> RuntimeReply:
+    """The honest drain reply for a NEW conversation on a non-serving Luciel or a
+    switched-off channel (§3.6.2 / §3.6.3 step 0): no session, no LLM, nothing said.
+
+    Empty text is deliberate — the channel webhooks 200-no-op it (the doc's "channel
+    webhooks return HTTP 200 with a no-op body"), so the provider does not retry and
+    nothing is fabricated on the tenant's number or address. ``render_state`` says
+    WHY the reply is empty, so an edge that needs to (the widget) can render the quiet
+    paused directive instead of an error, and a test can tell this refusal from an
+    LLM that happened to say nothing."""
+    return RuntimeReply(reply_text="", render_state="paused", session_id="")
+
+
+async def _in_flight(session: AsyncSession, msg: InboundMessage) -> bool:
+    """Does this inbound belong to a conversation that was already open when the
+    gate closed? Read-only — the drain admits, it never opens."""
+    draining = await find_open_session(
+        session,
+        admin_id=msg.admin_id,
+        instance_id=msg.instance_id,
+        channel=msg.channel,
+        session_id=msg.session_id,
+        participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
+    )
+    return draining is not None
+
+
 async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> RuntimeReply:
     """Run an admitted InboundMessage through the agentic loop; return the reply.
 
@@ -120,38 +147,25 @@ async def run_inbound_message(session: AsyncSession, msg: InboundMessage) -> Run
         # Should not happen post-resolution, but never route into a missing instance.
         return RuntimeReply(reply_text="", render_state="paused", session_id="")
 
-    # Paused → no NEW session, no LLM (§3.6.2). Same predicate the widget and voice
-    # paths use: an owner who pauses Luciel must be paused on every channel, not just
-    # the web. The §3.6.2 carve-out (C8): a conversation already in flight at the
-    # pause/delete instant finishes on its channel — the drain gate below admits ONLY
-    # an existing live in-window session, never opens one.
-    if is_paused(inst):
-        draining = await find_open_session(
-            session,
-            admin_id=msg.admin_id,
-            instance_id=msg.instance_id,
-            channel=msg.channel,
-            session_id=msg.session_id,
-            participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
-        )
-        if draining is None:
-            return RuntimeReply(reply_text="", render_state="paused", session_id="")
+    # Paused / deleting → no NEW session, no LLM (§3.6.2 / §3.6.3). Same predicate the
+    # widget and voice paths use: an owner who pauses or deletes Luciel must be paused
+    # on every channel, not just the web. The carve-out (C8): a conversation already
+    # in flight at the pause/delete instant finishes on its channel — the drain gate
+    # admits ONLY an existing live in-window session, never opens one. Reaching this
+    # gate at all on a non-widget channel needs the inbound resolver to still route
+    # the tenant's number / address / Meta id here — which is why a delete writes
+    # ``quiescing`` (routable, draining) on every connection rather than ``revoked``
+    # (unroutable): before that, the drain on every channel but the widget was
+    # silence forever for a customer who was mid-text (round 7 WP-5, item 1).
+    if is_paused(inst) and not await _in_flight(session, msg):
+        return drain_refused()
 
     # A channel the owner switched OFF admits no NEW conversation (audit F058); a
     # conversation already in flight when it was switched off finishes on its channel
     # (§3.8.7 rule E.1 — the safety half of a config change never cuts a lead off
     # mid-sentence). Same drain gate as pause: an existing live session only.
-    if not channel_enabled(inst, msg.channel):
-        draining = await find_open_session(
-            session,
-            admin_id=msg.admin_id,
-            instance_id=msg.instance_id,
-            channel=msg.channel,
-            session_id=msg.session_id,
-            participant_key=participant_key_for(msg.admin_id, msg.channel, msg.customer_identifier),
-        )
-        if draining is None:
-            return RuntimeReply(reply_text="", render_state="paused", session_id="")
+    if not channel_enabled(inst, msg.channel) and not await _in_flight(session, msg):
+        return drain_refused()
 
     # Conversation = ONE billed session (§3.4.8). The transport identifier the adapter
     # already resolved (From number / from_address / Meta-scoped id) is the session key,

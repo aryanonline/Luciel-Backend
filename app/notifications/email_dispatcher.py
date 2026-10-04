@@ -45,6 +45,10 @@ class DeliveryOutcome:
 
     status: DeliveryStatus
     message_id: str | None = None
+    #: The exception CLASS name behind a ``failed`` status (never the message: a
+    #: provider's text can carry the recipient or the sender identity). Lets a caller
+    #: say "failed:<reason>" on the wire instead of a bare "failed" (round 7 WP-5, item 4).
+    reason: str | None = None
 
     @property
     def degraded(self) -> bool:
@@ -176,10 +180,15 @@ async def send_export_ready(
     download_url: str,
     ttl_days: int,
     sender: EmailSender | None = None,
-) -> str | None:
+) -> DeliveryOutcome:
     """Email the data-export download link (§5.10). Delivery-ONLY: the caller (export
-    flow) already emits the ``data_export_ready`` audit event with the link, so this
-    must NOT emit a second one — it just sends the email."""
+    flow) already emits the ``data_export_ready`` audit event, so this must NOT emit a
+    second one — it just sends the email.
+
+    Returns the outcome rather than a bare message id (round 7 WP-5, item 4): the
+    export response tells the owner whether the link actually went out, so a mail
+    failure is "failed:<reason>" on the wire and never a silent 200. A failure never
+    breaks the export flow — the link is in the response body regardless."""
     body = (
         "Your VantageMind data export is ready.\n\n"
         f"Download it here (link valid for {ttl_days} days):\n\n{download_url}\n\n"
@@ -187,9 +196,14 @@ async def send_export_ready(
     )
     sender = sender or build_email_sender()
     try:
-        return await sender.send(to=to, subject="Your data export is ready", body_text=body)
-    except Exception:  # noqa: BLE001 — delivery failure never breaks the export flow
-        return None
+        message_id = await sender.send(to=to, subject="Your data export is ready", body_text=body)
+    except Exception as exc:  # noqa: BLE001 — delivery failure never breaks the export flow
+        logging.getLogger(__name__).exception(
+            "email delivery failed: notice_type=export_ready recipient=%s error=%s", to, exc
+        )
+        return DeliveryOutcome(status="failed", reason=type(exc).__name__)
+    status: DeliveryStatus = "sent" if not isinstance(sender, NullEmailSender) else "recorded"
+    return DeliveryOutcome(status=status, message_id=message_id)
 
 
 async def send_account_notice(

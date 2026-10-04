@@ -32,6 +32,17 @@ Defines FastAPI v1 routes, dependencies, error behavior, and the control/data-pl
   /admin/account/close needs `confirmDeleteLuciel: true` while a Luciel is live (F156).
   POST /knowledge/sync-connections returns the existing crawl row (200) for the same URLs.
 
+## The closed-account surface (round 7 WP-5, owner decision D5)
+- Three gates in `deps.py`: `current_session_subject` (any valid session), `current_account_owner`
+  (verified; open, or closed inside the 30-day reopen window), `current_admin` (verified and open).
+- ONLY `GET /admin/account`, `POST /admin/account/reopen` and `POST /admin/account/export` depend
+  on `current_account_owner`. Every other owner route stays on `current_admin`, which refuses a
+  closed account with the typed 403 `{"message", "code": "account_closed", "detail": {"closedAt",
+  "reopenUntil"}}` — the frontend renders the reduced page from it. `ApiError.code/detail` are
+  optional; an untyped error's body is unchanged.
+- `tests/unit/test_closed_account_surface.py` walks every registered route and pins those sets by
+  dependency: putting a new route on the wrong gate fails there, by name.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.

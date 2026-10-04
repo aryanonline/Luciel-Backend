@@ -14,7 +14,7 @@ import pytest
 from app.db.session import tenant_session
 from app.lifecycle import transcript_store as store_mod
 from app.lifecycle.transcript_archive import archive_aged_transcripts
-from app.lifecycle.transcript_store import LocalTranscriptStore
+from app.lifecycle.transcript_store import LocalTranscriptStore, TranscriptStoreUnavailable
 from app.models.conversation import Session as ConvSession
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
@@ -29,6 +29,13 @@ class DurableLocalStore(LocalTranscriptStore):
     actually move (the sweep refuses non-durable stores — see the archive tests)."""
 
     durable = True
+
+
+class OutageStore(DurableLocalStore):
+    """S3 during an outage: the objects are all still there, the store cannot answer."""
+
+    async def get(self, *, key: str) -> bytes | None:
+        raise TranscriptStoreUnavailable("ClientError:SlowDown")
 
 
 @pytest.fixture(autouse=True)
@@ -148,18 +155,45 @@ async def test_an_unreadable_archive_is_reported_not_rendered_as_an_empty_conver
     list, so a conversation we could not read back displayed as a conversation in which
     the customer had said nothing. That is a false claim about content, and the owner
     has no way to tell it from the truth.
+
+    Round 7 WP-5, item 7: the store could not ANSWER (an outage, a refused credential)
+    — the object is still there, so the copy says "could not be read right now" and
+    may honestly promise that nothing has been lost.
     """
     _admin_id, sid = await _seed_archived(client)
-    # The object goes missing (bucket outage, wrong binding, a key that never landed)
-    # while the session still points at it — the only case this endpoint must not fake.
-    LocalTranscriptStore.reset()
+    store_mod.set_transcript_store(OutageStore())
 
     response = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
 
     assert response.status_code == 503
     body = response.json()["message"].lower()
     assert "long-term storage" in body
+    assert "could not be read right now" in body
     assert "nothing has been lost" in body
+    assert "no longer available" not in body
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_absent_archive_object_is_reported_as_gone_not_as_a_hiccup(client):
+    """The store ANSWERED: the key resolves to nothing (round 7 WP-5, item 7).
+
+    This used to render the same 503 as an outage, with copy swearing "nothing has
+    been lost; please try again shortly" — a promise the platform could not keep,
+    because the object was gone and no retry would bring it back. The owner is told
+    the true thing, and is not told to wait for a recovery that will not come.
+    """
+    _admin_id, sid = await _seed_archived(client)
+    # The object is gone while the session still points at it.
+    LocalTranscriptStore.reset()
+
+    response = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
+
+    assert response.status_code == 404
+    body = response.json()["message"].lower()
+    assert "long-term storage" in body
+    assert "no longer available" in body
+    assert "nothing has been lost" not in body
+    assert "try again" not in body
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -171,6 +205,7 @@ async def test_the_read_through_raises_rather_than_returning_an_empty_transcript
     told the bundle is all of their data.
     """
     from app.lifecycle.transcript_archive import (
+        ArchivedTranscriptAbsent,
         ArchivedTranscriptUnavailable,
         load_archived_transcripts,
     )
@@ -179,8 +214,17 @@ async def test_the_read_through_raises_rather_than_returning_an_empty_transcript
     LocalTranscriptStore.reset()
 
     async with tenant_session(admin_id) as s:
-        with pytest.raises(ArchivedTranscriptUnavailable):
+        # Absent is the SUBCLASS: every caller that refuses to fake an empty
+        # conversation keeps refusing, and a caller that wants to say which can.
+        with pytest.raises(ArchivedTranscriptAbsent):
             await load_archived_transcripts(s, admin_id=admin_id, session_id=sid)
+        assert issubclass(ArchivedTranscriptAbsent, ArchivedTranscriptUnavailable)
+
+        store_mod.set_transcript_store(OutageStore())
+        with pytest.raises(ArchivedTranscriptUnavailable) as info:
+            await load_archived_transcripts(s, admin_id=admin_id, session_id=sid)
+        assert not isinstance(info.value, ArchivedTranscriptAbsent)
+        assert isinstance(info.value.__cause__, TranscriptStoreUnavailable)
 
         # A session that was never archived is still an ordinary None, not an error.
         never_archived = await load_archived_transcripts(

@@ -8,9 +8,13 @@ password hash) permanently deleted, which is also what releases the email addres
 for signup again. This sweep is where the Luciel cascade, the billing identity
 (Stripe customer retired first) and the account row all go.
 
-This module is the "and then permanently deleted" half. There is no ``closed_at``
-column; the closure instant is read from the tenant's ``account_closure_initiated``
-audit event, which is append-only and therefore a trustworthy clock (§5.3). Audit
+This module is the "and then permanently deleted" half. The closure instant is
+``accounts.closed_at`` (migration 0068), stamped by ``cascade.close_account`` and
+cleared by the D5 reopen. Rows closed before that column existed carry NULL and fall
+back to the tenant's ``account_closure_initiated`` audit event, which is append-only
+and therefore a trustworthy clock (§5.3). The audit row alone stopped being enough
+with owner decision D5 (2026-09-14): a closed account can be reopened and closed
+again, and the FIRST closure row would purge a re-closed account on the spot. Audit
 tombstones survive the purge — the log is owned by ``luciel_audit_owner`` and is not
 tenant-cascade material (§3.6.6).
 
@@ -35,11 +39,30 @@ from app.models.instance import Account, AccountState
 CLOSURE_EVENT = "account_closure_initiated"
 
 
-async def closure_started_at(session: AsyncSession, admin_id: uuid.UUID) -> datetime | None:
-    """Return when closure was initiated for this tenant, from the audit chain.
+def reopen_deadline(closed_at: datetime) -> datetime:
+    """The instant the 30-day window ends: the last moment the owner can reopen or
+    re-request the export (D5), and the first moment the purge may run (§B5). One
+    function so the reduced surface and the purge can never disagree by a day."""
+    return closed_at + timedelta(days=get_settings().grace_window_days)
 
-    The FIRST ``account_closure_initiated`` row is authoritative: a repeated close
-    call must not restart the 30-day clock."""
+
+async def closure_started_at(
+    session: AsyncSession, admin_id: uuid.UUID, *, account: Account | None = None
+) -> datetime | None:
+    """Return when the CURRENT closure began for this tenant.
+
+    ``accounts.closed_at`` when it is stamped (every closure since migration 0068).
+    Otherwise — a row closed before the column existed — the FIRST
+    ``account_closure_initiated`` audit row: such a tenant has closed exactly once
+    (reopen did not exist), and a repeated close call must not restart the clock.
+    Pass ``account`` when the row is already loaded to save the read."""
+    if account is None:
+        account = (
+            await session.execute(select(Account).where(Account.admin_id == admin_id))
+        ).scalar_one_or_none()
+    if account is not None and account.closed_at is not None:
+        stamped = account.closed_at
+        return stamped if stamped.tzinfo else stamped.replace(tzinfo=UTC)
     row = (
         await session.execute(
             select(AdminAuditLog.created_at)
@@ -71,18 +94,23 @@ async def purge_closed_account_if_due(
     for ``admin_id`` so RLS scopes the audit read, the cascade, and the delete.
     """
     now = now or datetime.now(UTC)
+    # Row-locked (D5): the owner's reopen takes the same lock first. Whichever commits
+    # first wins cleanly — a reopen that lands a breath before this sweep is re-read
+    # here as ``verified`` and nothing is purged; a purge that lands first leaves the
+    # reopen no row to act on. Without the lock the sweep could read ``closed``,
+    # lose the race, and destroy an account its owner had just got back.
     acct = (
-        await session.execute(select(Account).where(Account.admin_id == admin_id))
+        await session.execute(select(Account).where(Account.admin_id == admin_id).with_for_update())
     ).scalar_one_or_none()
     if acct is None or acct.state != AccountState.closed:
         return False
 
-    started = await closure_started_at(session, admin_id)
+    started = await closure_started_at(session, admin_id, account=acct)
     if started is None:
         # Closed without a closure event is a data-integrity anomaly; do NOT destroy
         # credentials on a guess (same posture as an unstamped grace window).
         return False
-    if now < started + timedelta(days=get_settings().grace_window_days):
+    if now < reopen_deadline(started):
         return False
 
     # The whole tenant goes here: the Luciel (if the grace-expiry sweep has not already

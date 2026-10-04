@@ -125,7 +125,8 @@ async def expire_aged_data(
 
     Rows whose ``created_at`` is older than ``now - retention_days`` are permanently
     deleted; a ``data_retention_hard_delete`` audit event is emitted per data class
-    BEFORE its rows are removed (payload: data_class, count, retention_policy) —
+    BEFORE its rows are removed (payload: data_class, count, retention_policy_applied
+    — the key ``cascade.py`` writes, so the owner-facing log reads one vocabulary) —
     and ONLY when the class actually has aged rows. A zero-count run emits nothing:
     the unconditional variant appended ~3 rows per tenant per night to the very
     1-year-retained table this sweep exists to bound — the exact write-amplification
@@ -192,7 +193,7 @@ async def expire_aged_data(
                 "data_class": "transcript_archive_object",
                 "count": objects_deleted,
                 "delete_errors": object_delete_errors,
-                "retention_policy": f"age_based_sweep:{retention_days}d",
+                "retention_policy_applied": f"age_based_sweep:{retention_days}d",
             },
         )
         counts["transcript_archive_object"] = objects_deleted
@@ -219,7 +220,7 @@ async def expire_aged_data(
             payload={
                 "data_class": data_class,
                 "count": aged,
-                "retention_policy": f"age_based_sweep:{retention_days}d",
+                "retention_policy_applied": f"age_based_sweep:{retention_days}d",
             },
         )
         result = await session.execute(
@@ -245,7 +246,9 @@ async def expire_aged_data(
             payload={
                 "data_class": "knowledge_source_grace_expired",
                 "count": purged_sources,
-                "retention_policy": f"owner_delete_grace:{knowledge_service.DELETE_GRACE_DAYS}d",
+                "retention_policy_applied": (
+                    f"owner_delete_grace:{knowledge_service.DELETE_GRACE_DAYS}d"
+                ),
             },
         )
     counts["knowledge_source_grace_expired"] = purged_sources
@@ -282,7 +285,7 @@ async def expire_aged_data(
             payload={
                 "data_class": "deferred_action_terminal",
                 "count": deferred_pruned,
-                "retention_policy": f"age_based_sweep:{DEFERRED_TERMINAL_RETENTION_DAYS}d",
+                "retention_policy_applied": f"age_based_sweep:{DEFERRED_TERMINAL_RETENTION_DAYS}d",
             },
         )
     counts["deferred_action_terminal"] = deferred_pruned
@@ -402,7 +405,7 @@ async def reap_orphaned_originals(
             "data_class": "knowledge_original",
             "count": deleted,
             "delete_errors": delete_errors,
-            "retention_policy": "orphan_reconcile:no_knowledge_sources_row",
+            "retention_policy_applied": "orphan_reconcile:no_knowledge_sources_row",
         },
     )
     return deleted
@@ -462,7 +465,9 @@ async def prune_stale_leads(
             lead=lead,
             event_type="lead_pruned",
             actor_type=ActorType.platform,
-            extra_payload={"retention_policy": f"lead_auto_prune:{inst.lead_retention_days}d"},
+            extra_payload={
+                "retention_policy_applied": f"lead_auto_prune:{inst.lead_retention_days}d"
+            },
         )
     await session.flush()
     return len(stale)

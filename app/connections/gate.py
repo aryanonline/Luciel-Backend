@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connections import registry
-from app.models.connection import InstanceConnection
+from app.models.connection import NOT_SERVING_STATUSES, InstanceConnection
 
 # The single value that satisfies the connection gate (§3.8.4: only `connected`
 # dispatches; revoked rows are not even broker-visible).
@@ -61,15 +61,19 @@ async def connection_status(
 
     Tenant-scoped (admin_id + instance_id); RLS is the backstop. Revoked rows are
     excluded so the broker only ever sees a live connection (§3.8.4: revoked rows
-    are retained but "not queryable by broker"). Reading live on every call is what
-    makes the mid-conversation revoke immediate (§3.8.7 rule E safety side)."""
+    are retained but "not queryable by broker"). A ``quiescing`` row (a Luciel in
+    its delete drain, round 7 WP-5) is excluded the same way: the drain answers the
+    in-flight customer on their channel, it does not dispatch tools on a deleted
+    Luciel — exactly what the row's old ``revoked`` value gave. Reading live on every
+    call is what makes the mid-conversation revoke immediate (§3.8.7 rule E safety
+    side)."""
     return (
         await session.execute(
             select(InstanceConnection.status).where(
                 InstanceConnection.admin_id == admin_id,
                 InstanceConnection.instance_id == instance_id,
                 InstanceConnection.connection_type == connection_type,
-                InstanceConnection.status != "revoked",
+                InstanceConnection.status.not_in(NOT_SERVING_STATUSES),
             )
         )
     ).scalar_one_or_none()
@@ -140,6 +144,13 @@ def _to_wire_status(raw: str | None) -> str:
     KeyError)."""
     if raw is None:
         return "unconfigured"
+    if raw == "quiescing":
+        # A Luciel in its delete drain (round 7 WP-5, ``models.connection.QUIESCING``).
+        # ``connection_status`` never returns it (a draining row is hidden exactly as
+        # a revoked one), so this is defensive: a caller that reads the raw column
+        # gets the wire value a deleted Luciel's connection always had — the frozen
+        # enum has no drain value, and "error" would be a lie.
+        return "revoked"
     if raw in _WIRE_SAFE_STATUSES:
         return raw
     return "error"

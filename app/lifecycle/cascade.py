@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -30,8 +31,10 @@ from app.billing.stripe_gateway import StripeGateway, get_stripe_gateway
 from app.connections.secrets import get_secret_store, tenant_secret_prefix
 from app.db.base import TenantMixin
 from app.lifecycle import state_machine
+from app.lifecycle.export_bundle import hold_export_lock
+from app.lifecycle.export_store import export_prefix_for, get_export_store
 from app.lifecycle.transcript_store import get_transcript_store, transcript_prefix_for
-from app.models.audit import ActorType
+from app.models.audit import ActorType, AdminAuditLog
 from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.booking import BookingEvent
 from app.models.budget import ConversationBudget, CountedSession
@@ -112,7 +115,16 @@ async def _log_and_delete(
     model: type[TenantMixin],
     data_class: str,
 ) -> int:
-    """Log a data_retention_hard_delete for the class, then delete its rows."""
+    """Log a data_retention_hard_delete for the class, then delete its rows.
+
+    The count is taken before the delete so the audit row — written BEFORE the rows
+    are gone, as the module docstring promises — can still say how many (round 7
+    WP-5, item 6: the owner-facing log renders ``data_class: N deleted``)."""
+    count = (
+        await session.execute(
+            select(func.count()).select_from(model).where(model.admin_id == admin_id)
+        )
+    ).scalar_one()
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -121,6 +133,7 @@ async def _log_and_delete(
         actor_type=ActorType.platform,
         payload={
             "data_class": data_class,
+            "count": int(count),
             "retention_policy_applied": "luciel_hard_delete_cascade",
         },
     )
@@ -309,6 +322,37 @@ async def _delete_tenant_knowledge_originals(
     )
 
 
+async def _delete_tenant_export_bundles(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
+) -> None:
+    """Destroy the tenant's export ZIPs (§3.6.6 / §5.10) by prefix (round 7 WP-5,
+    item 4). A bundle is every table the tenant owns in one object; the cascade
+    below deletes those tables, and a bundle left behind would keep a full copy of
+    the data past "hard-deleted" for as long as the bucket's lifecycle backstop let
+    it. Same best-effort-with-audit posture as the three sibling sweeps above."""
+    prefix = export_prefix_for(admin_id)
+    try:
+        swept = await get_export_store().delete_prefix(prefix=prefix)
+        error: str | None = None
+    except Exception as exc:  # noqa: BLE001 — a broken store must not strand the deletion
+        swept, error = 0, type(exc).__name__
+        _log.exception("cascade: export bundle sweep failed admin_id=%s", admin_id)
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        actor_type=ActorType.platform,
+        event_type="data_retention_hard_delete",
+        payload={
+            "data_class": "export_bundle_object",
+            "object_prefix": prefix,
+            "count": swept,
+            "error": error,
+            "retention_policy_applied": "luciel_hard_delete_cascade",
+        },
+    )
+
+
 async def hard_delete_cascade(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -329,6 +373,10 @@ async def hard_delete_cascade(
     would ever remove those rows. Bailing early left them — and live OAuth credentials —
     under an admin_id no query would ever name again.
     """
+    # FIRST, before any read or write: wait out an export that is still uploading, so
+    # the bundle sweep below destroys what it wrote instead of running a moment too
+    # early and leaving a full copy of the tenant behind (round 7 WP-5, item 8).
+    await hold_export_lock(session, admin_id)
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()
@@ -336,6 +384,7 @@ async def hard_delete_cascade(
     await _delete_tenant_secrets(session, admin_id, iid)
     await _delete_tenant_transcript_archive(session, admin_id, iid)
     await _delete_tenant_knowledge_originals(session, admin_id, iid)
+    await _delete_tenant_export_bundles(session, admin_id, iid)
 
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted
@@ -436,6 +485,28 @@ async def settle_billing_at_closure(
     return outcome
 
 
+async def closure_record(session: AsyncSession, admin_id: uuid.UUID) -> dict[str, object]:
+    """What the CURRENT closure did, from its ``account_closure_initiated`` audit row
+    (the latest one — an account can close more than once since D5).
+
+    Carries ``luciel_state_before`` and ``luciel_deleted_by_closure``. Empty for a
+    closure recorded before those keys existed: the reopen then restores nothing it
+    cannot prove the closure took, and the Luciel's own Restore (same 30-day window)
+    is still there for the owner."""
+    payload = (
+        await session.execute(
+            select(AdminAuditLog.event_payload)
+            .where(
+                AdminAuditLog.admin_id == admin_id,
+                AdminAuditLog.event_type == "account_closure_initiated",
+            )
+            .order_by(AdminAuditLog.seq.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 async def close_account(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -455,12 +526,30 @@ async def close_account(
 
     Outstanding pay-as-you-go usage is settled at closure while the card is still on
     file (Legal §A4). Audit tombstones are retained.
+
+    Owner decision D5 (2026-09-14): the closure can be REOPENED for 30 days. Two things
+    are recorded here for that: ``accounts.closed_at`` (the reopen / purge clock — an
+    account can now close more than once, so the first-ever closure audit row is no
+    longer a usable clock) and, on the ``account_closure_initiated`` audit row, what
+    the closure did to the Luciel (``luciel_state_before`` + ``luciel_deleted_by_closure``)
+    so the reopen restores exactly that and nothing the owner had deleted on purpose.
     """
     inst = (
         await session.execute(select(Instance).where(Instance.admin_id == admin_id))
     ).scalar_one_or_none()
-    if inst is not None and inst.state in (LucielState.active, LucielState.paused):
-        await state_machine.delete_luciel(session, admin_id, actor_user_id)
+    luciel_state_before = inst.state.value if inst is not None else None
+    deleted_by_closure = inst is not None and inst.state in (
+        LucielState.active,
+        LucielState.paused,
+    )
+    closed_at = datetime.now(UTC)
+    if deleted_by_closure:
+        deleted = await state_machine.delete_luciel(session, admin_id, actor_user_id)
+        # ONE instant for both clocks. The Luciel's grace window and the account's
+        # reopen window must end together: a grace window stamped a moment earlier
+        # would let the grace-expiry sweep destroy the Luciel while the reopen that
+        # promises to bring it back is still on offer.
+        closed_at = deleted.grace_window_started_at or closed_at
     # Already in the grace window or hard-deleted: nothing more to quiesce.
 
     await settle_billing_at_closure(session, admin_id, gateway=gateway)
@@ -471,11 +560,18 @@ async def close_account(
         event_type="account_closure_initiated",
         actor_type=ActorType.admin_user,
         actor_user_id=actor_user_id,
+        payload={
+            "luciel_state_before": luciel_state_before,
+            "luciel_deleted_by_closure": deleted_by_closure,
+        },
     )
     acct = (
         await session.execute(select(Account).where(Account.id == admin_id))
     ).scalar_one_or_none()
     if acct is not None:
+        if acct.state != AccountState.closed:
+            # A repeated close must not restart the 30-day clock.
+            acct.closed_at = closed_at
         acct.state = AccountState.closed
         # Revoke every live session (P1-5). The account row outlives closure by 30 days
         # (§3.6.6), so without the bump a cookie minted before closure stays valid against

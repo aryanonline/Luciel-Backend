@@ -319,6 +319,28 @@ def test_degraded_bindings_names_an_unbound_portal_configuration_in_a_real_postu
     assert "stripe_portal_configuration:unset" not in degraded_bindings()
 
 
+def test_degraded_bindings_names_an_unbound_export_store_in_live_mode(live, monkeypatch):
+    """Round 7 WP-5 item 3: the export store binds on the CDK-injected bucket variable,
+    so a live process without one writes exports into its own memory. Named
+    ``export_store:unbound`` so /healthz shows it; a bound bucket clears it."""
+    monkeypatch.delenv("LUCIEL_EXPORT_BUCKET", raising=False)
+    assert "export_store:unbound" in degraded_bindings()
+
+    monkeypatch.setenv("LUCIEL_EXPORT_BUCKET", "luciel-prod-export-bundles-000")
+    assert "export_store:unbound" not in degraded_bindings()
+
+
+def test_degraded_bindings_does_not_name_the_export_store_in_mock_mode(monkeypatch):
+    """Mock/CI keep the in-process fake by design: not a degraded binding there."""
+    monkeypatch.delenv("LUCIEL_EXPORT_BUCKET", raising=False)
+    monkeypatch.setenv("LUCIEL_INTEGRATION_MODE", "mock")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    try:
+        assert "export_store:unbound" not in degraded_bindings()
+    finally:
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
 def test_degraded_bindings_never_leaks_a_secret_value(live):
     rendered = " ".join(degraded_bindings())
     for value in REQUIRED_IN_LIVE_MODE.values():

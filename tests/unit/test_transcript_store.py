@@ -7,6 +7,7 @@ import uuid
 import pytest
 from app.lifecycle.transcript_store import (
     LocalTranscriptStore,
+    TranscriptStoreUnavailable,
     transcript_key_for,
     transcript_prefix_for,
 )
@@ -178,6 +179,73 @@ async def test_delete_never_touches_sibling_keys_sharing_the_prefix():
     await store.delete(key=key)
 
     assert [d["Key"] for d in client.deleted] == [key]
+
+
+class _FailingGetClient:
+    """Stub boto3 client whose get_object raises what the test hands it."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def get_object(self, **_kwargs):
+        raise self._exc
+
+
+def _client_error(code: str, *, http_status: int, operation: str = "GetObject"):
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {
+            "Error": {"Code": code, "Message": f"{code} for the key"},
+            "ResponseMetadata": {"HTTPStatusCode": http_status, "RequestId": "req-1"},
+        },
+        operation,
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _client_error("NoSuchKey", http_status=404),
+        _client_error("NotFound", http_status=404, operation="HeadObject"),
+        _client_error("404", http_status=404, operation="HeadObject"),
+    ],
+    ids=["NoSuchKey", "NotFound", "bare-404"],
+)
+async def test_get_reads_s3s_own_no_such_object_answer_as_absent(exc):
+    """The store ANSWERED: the key resolves to nothing. That — and only that — is None."""
+    store = _s3_store_with(_FailingGetClient(exc))
+
+    assert await store.get(key="vm/a/transcripts/i/s.jsonl") is None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _client_error("AccessDenied", http_status=403),
+        _client_error("NoSuchBucket", http_status=404),
+        _client_error("InternalError", http_status=500),
+        _client_error("SlowDown", http_status=503),
+        ConnectionError("Could not connect to the endpoint URL"),
+        TimeoutError("read timed out"),
+    ],
+    ids=["AccessDenied", "NoSuchBucket", "InternalError", "SlowDown", "transport", "timeout"],
+)
+async def test_get_raises_unavailable_when_the_store_could_not_answer(exc):
+    """Round 7 WP-5, item 7: every one of these used to return None, so a five-second
+    S3 hiccup rendered as "this customer said nothing" and the dashboard's copy swore
+    nothing had been lost. NoSuchBucket is a binding fault, not an absent transcript:
+    the object is sitting in the bucket we were NOT pointed at."""
+    store = _s3_store_with(_FailingGetClient(exc))
+
+    with pytest.raises(TranscriptStoreUnavailable) as info:
+        await store.get(key="vm/a/transcripts/i/s.jsonl")
+
+    assert info.value.__cause__ is exc
+    # The reason names the failure class and S3 code only — never the message, which
+    # can quote the bucket, the key or the request id.
+    assert "for the key" not in str(info.value)
+    assert "req-1" not in str(info.value)
 
 
 async def test_delete_prefix_takes_all_versions_and_counts_distinct_keys():

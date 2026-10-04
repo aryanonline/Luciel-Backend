@@ -16,6 +16,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TenantMixin, TimestampMixin
 
+#: The status a Luciel delete writes on every connection (round 7 WP-5, item 1). A row
+#: in this state is DRAINING: the inbound resolver still routes its destination to the
+#: tenant (migration 0068) so a customer mid-conversation at the delete instant keeps
+#: getting answers on their channel, and the outbound seams judge it by the pre-delete
+#: status kept in ``status_stashed`` — but the tool broker, the health sweep, the claim
+#: gate and the single-active index all treat it exactly as ``revoked``. Defined here,
+#: on the model, so every module that keys on it (lifecycle, gate, outbound, the
+#: mailbox poll) can import it without a cycle; ``lifecycle.state_machine`` carries the
+#: full rationale.
+QUIESCING = "quiescing"
+
+#: Statuses that mean "not a live connection": ``revoked`` (terminal — a disconnect, a
+#: pre-WP-5 delete, or a superseded drain) and ``quiescing`` (a delete drain in
+#: progress). Restore revives both; the day-30 cascade destroys both alike.
+NOT_SERVING_STATUSES = frozenset({"revoked", QUIESCING})
+
 
 class InstanceConnection(Base, TenantMixin, TimestampMixin):
     __tablename__ = "instance_connections"
@@ -38,8 +54,10 @@ class InstanceConnection(Base, TenantMixin, TimestampMixin):
     )
     status_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     # §3.6.4 restore-to-pre-delete-status (C8, migration 0049): delete_luciel stashes
-    # the live status/detail here before overwriting with 'revoked'; restore puts them
-    # back (minus foreign-claimed destinations) and clears the stash. NULL outside a
-    # grace window and on legacy rows that entered grace before the column existed.
+    # the live status/detail here before overwriting with QUIESCING (was 'revoked'
+    # before round 7 WP-5); restore puts them back (minus foreign-claimed destinations)
+    # and clears the stash. While the row drains, the outbound seams read the stash
+    # through ``state_machine.serving_status``. NULL outside a grace window and on
+    # legacy rows that entered grace before the column existed.
     status_stashed: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status_detail_stashed: Mapped[str | None] = mapped_column(Text, nullable=True)

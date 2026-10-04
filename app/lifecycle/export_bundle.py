@@ -17,10 +17,11 @@ import io
 import json
 import uuid
 import zipfile
+import zlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import Select, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AdminAuditLog
@@ -46,6 +47,37 @@ Layout:
 """
 
 
+#: The advisory-lock namespace an export build and the hard-delete cascade share.
+_EXPORT_LOCK_KIND = "export_bundle"
+
+
+async def hold_export_lock(session: AsyncSession, admin_id: uuid.UUID) -> None:
+    """Serialize THIS transaction with every other export build / hard-delete cascade
+    for the tenant (round 7 WP-5, item 8).
+
+    A bundle is every table the tenant owns in one object, and the cascade destroys
+    the tenant's bundles by prefix. Unserialized, the two interleave badly: the sweep
+    runs while an upload is still on the wire, finds nothing, and the bundle lands a
+    moment later under a prefix nothing will ever sweep again — a full copy of the
+    data outliving "hard-deleted". Both sides take this lock first: a cascade waits
+    for the in-flight export to commit and then sweeps what it wrote; an export waits
+    for the cascade and then builds against what is left (or, when the account itself
+    was purged, refuses — see ``admin/account._build_upload_and_notify``).
+
+    Transaction-scoped (released on commit OR rollback, so a crashed request cannot
+    wedge the tenant) and BLOCKING, unlike ``claim_sweep_lock``: the loser here has
+    real work to do once the winner is done. Keys are derived in Python the same way
+    ``db.session._lock_keys`` derives them, so the pair is stable across releases.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+        {
+            "k1": zlib.crc32(_EXPORT_LOCK_KIND.encode()) - 2**31,
+            "k2": int.from_bytes(admin_id.bytes[:4], "big") - 2**31,
+        },
+    )
+
+
 def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
     """The wire shape for an exported lead record, shared by the full account bundle and
     the standalone lead export (§3.4.10a "exportable"), so the two cannot drift apart.
@@ -69,6 +101,25 @@ def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
     ]
 
 
+def transcripts_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[Transcript]]:
+    """A session's transcript rows, time-ordered — with the tenant predicate stated
+    (round 7 WP-5, item 4). RLS scopes the read already; the explicit ``admin_id`` is
+    the defence in depth every other tenant read in this module carries, so a session
+    id from anywhere can never widen the bundle."""
+    return (
+        select(Transcript)
+        .where(Transcript.admin_id == admin_id, Transcript.session_id == session_id)
+        .order_by(Transcript.at.asc())
+    )
+
+
+def summary_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[SessionSummary]]:
+    """A session's summary row, tenant predicate stated (see ``transcripts_stmt``)."""
+    return select(SessionSummary).where(
+        SessionSummary.admin_id == admin_id, SessionSummary.session_id == session_id
+    )
+
+
 async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -83,15 +134,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
         conv_rows: list[dict[str, object]] = []
         for sess in sessions:
             transcripts = (
-                (
-                    await session.execute(
-                        select(Transcript)
-                        .where(Transcript.session_id == sess.id)
-                        .order_by(Transcript.at.asc())
-                    )
-                )
-                .scalars()
-                .all()
+                (await session.execute(transcripts_stmt(admin_id, sess.id))).scalars().all()
             )
             messages = [
                 {"role": t.role, "text": t.text, "at": t.at.isoformat()} for t in transcripts
@@ -114,11 +157,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                     {"role": str(r["role"]), "text": str(r["text"]), "at": str(r["at"])}
                     for r in (archived or [])
                 ]
-            summary = (
-                await session.execute(
-                    select(SessionSummary).where(SessionSummary.session_id == sess.id)
-                )
-            ).scalar_one_or_none()
+            summary = (await session.execute(summary_stmt(admin_id, sess.id))).scalar_one_or_none()
             conv = {
                 "sessionId": str(sess.id),
                 "channel": sess.channel,

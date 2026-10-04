@@ -242,7 +242,7 @@ async def test_auto_prune_runs_the_same_cascade(cold_store) -> None:
                 )
             )
         ).scalar_one()
-    assert event.event_payload["retention_policy"] == "lead_auto_prune:90d"
+    assert event.event_payload["retention_policy_applied"] == "lead_auto_prune:90d"
     assert event.event_payload["transcripts_deleted"] == 1
 
 

@@ -19,14 +19,26 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.models.audit import ActorType
-from app.models.connection import InstanceConnection
+from app.models.connection import NOT_SERVING_STATUSES, QUIESCING, InstanceConnection
+from app.models.crm_link import CrmLeadLink
 from app.models.instance import Instance, LucielState
-from app.models.knowledge import KnowledgeSource
+from app.models.knowledge import KnowledgeChunk, KnowledgeEdge, KnowledgeEntity, KnowledgeSource
+
+__all__ = [
+    "NOT_SERVING_STATUSES",
+    "QUIESCING",
+    "LifecycleError",
+    "delete_luciel",
+    "pause",
+    "restore",
+    "resume",
+    "serving_status",
+]
 
 
 def _now() -> datetime:
@@ -37,10 +49,54 @@ class LifecycleError(Exception):
     """Illegal transition (mapped to 409 conflict at the API edge)."""
 
 
-async def _get_instance(session: AsyncSession, admin_id: uuid.UUID) -> Instance:
-    inst = (
-        await session.execute(select(Instance).where(Instance.admin_id == admin_id))
-    ).scalar_one_or_none()
+# ``QUIESCING`` — the connection status a Luciel delete writes (round 7 WP-5, item 1;
+# the constant lives on ``app.models.connection`` so the gate, the outbound seams and
+# the mailbox poll import it without a cycle). A row in this state is DRAINING: the
+# inbound resolver still routes its destination to this tenant
+# (``channel_resolve_destination``, migration 0068, admits ``quiescing`` rows for
+# inbound routing) so a customer mid-conversation at the delete instant keeps getting
+# answers on their channel, and the outbound seams may still send on it — but only
+# for the in-flight session the runtime drain gate admits; every NEW conversation is
+# refused with the honest drain reply. Before this status existed the delete wrote
+# ``revoked``, the resolver dropped every non-widget inbound as
+# ``unresolvable_destination``, and the "drain" was silence forever for anyone who
+# was mid-text.
+#
+# A quiescing row does NOT hold its destination claim (c21): the claim gate asks the
+# resolver with ``p_include_quiescing = false`` and the 0045 uniqueness index excludes
+# quiescing rows, so another tenant may legitimately claim the number/address during
+# the grace window exactly as before — and restore strips a foreign-held destination.
+# The resolver's newest-claim-wins ordering routes inbound to the live claimant from
+# that moment on. Nor is it broker-visible (``gate.connection_status`` excludes it
+# exactly as it excludes revoked), health-swept (not a health-owned status) or counted
+# by the single-active-per-type index (0068 recreates ``uq_conn_active_type``).
+#
+# ``NOT_SERVING_STATUSES`` — what restore revives and the day-30 cascade destroys:
+# both a quiescing row (what delete now writes) and a revoked one (a pre-WP-5 delete).
+
+
+def serving_status(conn: InstanceConnection) -> str:
+    """The status the OUTBOUND seams should judge operability by.
+
+    A quiescing row is a live row wearing a drain marker: the credential is intact
+    (secret destruction is scheduled for the day-30 cascade) and the pre-delete status
+    sits in ``status_stashed``. The senders gate on ``connected`` / the SMS operable
+    set, so without this a quiescing row refused the very drain reply the delete owes
+    the customer. Everything else answers with its own status; a quiescing row with
+    no stash (never possible from ``delete_luciel``, defensive only) reads as
+    ``unconfigured`` — never as connected."""
+    if conn.status == QUIESCING:
+        return conn.status_stashed or "unconfigured"
+    return conn.status
+
+
+async def _get_instance(
+    session: AsyncSession, admin_id: uuid.UUID, *, for_update: bool = False
+) -> Instance:
+    stmt = select(Instance).where(Instance.admin_id == admin_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    inst = (await session.execute(stmt)).scalar_one_or_none()
     if inst is None:
         raise LifecycleError("no_luciel")
     return inst
@@ -111,10 +167,15 @@ async def delete_luciel(
     # and stash included.
     inst.embed_key_stashed = inst.embed_key_public_id
 
-    # 1. instance_connections → revoked; secret destruction is SCHEDULED for the
-    # day-30 cascade (restore must be able to revive the connection). The audit
-    # event says exactly that — `connection_secret_cleanup` is reserved for the
-    # moment a secret is actually destroyed (cascade.py / service.disconnect).
+    # 1. instance_connections → QUIESCING (round 7 WP-5, item 1); secret destruction
+    # is SCHEDULED for the day-30 cascade (restore must be able to revive the
+    # connection). The audit event says exactly that — `connection_secret_cleanup`
+    # is reserved for the moment a secret is actually destroyed (cascade.py /
+    # service.disconnect). Quiescing, not revoked: the resolver (migration 0068)
+    # keeps routing the tenant's number / address / Meta id to this instance, so
+    # the §3.6.3 drain the runtime gate serves is reachable on every channel, not
+    # only the widget. The day-30 cascade and restore treat quiescing exactly as
+    # revoked (NOT_SERVING_STATUSES).
     conns = (
         (
             await session.execute(
@@ -125,16 +186,17 @@ async def delete_luciel(
         .all()
     )
     for c in conns:
-        if c.status != "revoked":
+        if c.status not in NOT_SERVING_STATUSES:
             # Stash the pre-delete status (C8, migration 0049): §3.6.4 promises a
             # restored Luciel comes back "exactly as it was", which includes each
             # connection's honest chip — a healthy calendar restores Connected, an
             # action-needed number restores its action-needed truth. The stash is
             # what makes that possible; blanket 'unconfigured' told every restored
-            # owner to reconnect everything.
+            # owner to reconnect everything. The outbound seams read the stash
+            # through ``serving_status`` while the row drains.
             c.status_stashed = c.status
             c.status_detail_stashed = c.status_detail
-            c.status = "revoked"
+            c.status = QUIESCING
             await audit.emit(
                 session,
                 admin_id=admin_id,
@@ -172,9 +234,123 @@ async def delete_luciel(
     return inst
 
 
+async def _requalify_crm_links(
+    session: AsyncSession,
+    inst: Instance,
+    *,
+    conns: list[InstanceConnection],
+    intact_providers: set[str],
+    actor_user_id: uuid.UUID | None,
+) -> int:
+    """Forget the CRM link rows that no longer name a record in the tenant's CRM
+    (round 7 WP-5, item 8).
+
+    ``crm_lead_links`` pins lead → CRM record id, and a record id belongs to ONE CRM
+    account. The links ride through the grace window untouched (the day-30 cascade
+    destroys them, restore needs them), so restore is where they must be re-qualified
+    against the connection that actually came back. They stay ONLY for a provider
+    whose CRM connection is revived on the credential the delete put away
+    (``intact_providers``). Everything else is a possibly-different account — the
+    owner reconnected the CRM during grace (a fresh consent on the draining row, or a
+    new row that superseded it), or the row restores ``unconfigured`` and must be
+    reconnected — and a stale id there does not merely 404-heal: it PATCHes whatever
+    contact carries that id in the other portal. Cleared exactly as a disconnect or a
+    swap clears them (``connections.service.clear_crm_links``); the next push relinks
+    by the documented search-by-key step. Audited with a count, never a lead key."""
+    stmt = delete(CrmLeadLink).where(
+        CrmLeadLink.admin_id == inst.admin_id, CrmLeadLink.instance_id == inst.id
+    )
+    if intact_providers:
+        stmt = stmt.where(CrmLeadLink.provider.not_in(sorted(intact_providers)))
+    result = await session.execute(stmt)
+    cleared = int(getattr(result, "rowcount", 0) or 0)
+    if cleared:
+        current = next(
+            (
+                c
+                for c in conns
+                if c.connection_type == "crm" and c.status not in NOT_SERVING_STATUSES
+            ),
+            None,
+        )
+        await audit.emit(
+            session,
+            admin_id=inst.admin_id,
+            instance_id=inst.id,
+            actor_type=ActorType.admin_user if actor_user_id else ActorType.platform,
+            actor_user_id=actor_user_id,
+            event_type="crm_links_cleared",
+            payload={
+                "connection_id": str(current.connection_id) if current else None,
+                "provider": current.provider if current else None,
+                "count": cleared,
+                "reason": "restore_crm_connection_changed",
+            },
+        )
+    return cleared
+
+
+async def _remove_grace_window_duplicates(
+    session: AsyncSession,
+    inst: Instance,
+    sources: list[KnowledgeSource],
+) -> int:
+    """Destroy the second copy of a synced document that a sync wrote DURING the
+    delete (round 7 WP-5, item 8).
+
+    A knowledge sync whose provider fetch is on the wire when the owner deletes the
+    Luciel finishes against sources the delete tombstoned a moment earlier. It reads
+    "nothing is synced yet" and ingests every document again — live rows on a deleted
+    Luciel, same ``(connection_id, external_id)`` as the tombstoned originals. Restore
+    revives the originals ("exactly as it was", §3.6.4: their ids are what traces and
+    the dashboard know), so the grace-window copy must go, or every document exists
+    twice and the sync engine — which keys on ``external_id`` — tracks one and leaves
+    the other serving stale content forever. Hard-deleted rather than tombstoned: the
+    owner never had it, so there is no undo to offer. Call BEFORE the originals are
+    revived. Returns how many copies were removed."""
+    coming_back = {
+        (s.connection_id, s.external_id)
+        for s in sources
+        if s.deleted_by == "lifecycle" and s.connection_id is not None and s.external_id
+    }
+    duplicates = [
+        s
+        for s in sources
+        if s.soft_deleted_at is None and (s.connection_id, s.external_id) in coming_back
+    ]
+    if not duplicates:
+        return 0
+    ids = [s.id for s in duplicates]
+    # Edges before entities (they reference them, §3.2.1 rule 5); chunks any time.
+    for model in (KnowledgeChunk, KnowledgeEdge, KnowledgeEntity):
+        await session.execute(
+            delete(model).where(model.admin_id == inst.admin_id, model.source_id.in_(ids))
+        )
+    for dup in duplicates:
+        await session.delete(dup)
+    await session.flush()
+    await audit.emit(
+        session,
+        admin_id=inst.admin_id,
+        instance_id=inst.id,
+        actor_type=ActorType.platform,
+        event_type="knowledge_source_edited",
+        payload={
+            "action": "restore_duplicates_removed",
+            "count": len(duplicates),
+            "connection_ids": sorted({str(s.connection_id) for s in duplicates}),
+        },
+    )
+    return len(duplicates)
+
+
 async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uuid.UUID) -> Instance:
-    """Restore within grace → ACTIVE (not paused) (Architecture §3.6.4)."""
-    inst = await _get_instance(session, admin_id)
+    """Restore within grace → ACTIVE (not paused) (Architecture §3.6.4).
+
+    The instance row is locked for the transaction: the day-30 grace-expiry sweep
+    takes the same lock, so a restore on the last day and the sweep cannot both act
+    on a Luciel each read as "still in its grace window"."""
+    inst = await _get_instance(session, admin_id, for_update=True)
     if inst.state != LucielState.luciel_grace_window:
         raise LifecycleError("not_in_grace_window")
     inst.state = LucielState.active
@@ -199,20 +375,40 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
     # re-arms its destination claim in the inbound resolver. Two guards:
     #   1. Another tenant may have LEGITIMATELY claimed the destination during the
     #      30-day grace (the number/address was released the moment this tenant's
-    #      rows went revoked). Restoring the claim would capture their inbound —
-    #      so a foreign-held destination is STRIPPED and the row comes back
-    #      unconfigured with an honest detail, never silently re-routed.
+    #      rows went quiescing — a draining row routes inbound but holds no claim).
+    #      Restoring the claim would capture their inbound — so a foreign-held
+    #      destination is STRIPPED and the row comes back unconfigured with an
+    #      honest detail, never silently re-routed.
     #   2. If this tenant re-attached the same connection TYPE during grace (a new
-    #      non-revoked row exists), un-revoking the old row would violate the
-    #      single-active-per-type unique index — the superseded row stays revoked.
+    #      live row exists), reviving the old row would violate the
+    #      single-active-per-type unique index — the superseded row stays as it is.
+    # Both a ``quiescing`` row (what delete writes since WP-5) and a ``revoked`` one
+    # (a pre-WP-5 delete) are revived here — NOT_SERVING_STATUSES is the one set the
+    # delete, the restore and the cascade all agree on.
     from app.channels import routing  # noqa: PLC0415 — circular at module import
 
-    active_types = {c.connection_type for c in conns if c.status != "revoked"}
+    active_types = {c.connection_type for c in conns if c.status not in NOT_SERVING_STATUSES}
+    # CRM providers whose connection comes back on the credential the delete put away
+    # — the only ones whose ``crm_lead_links`` still name records in the right account.
+    intact_crm_providers: set[str] = set()
     for c in conns:
-        if c.status != "revoked":
+        if c.status not in NOT_SERVING_STATUSES:
             continue
         if c.connection_type in active_types:
-            continue  # superseded during grace; the newer row is the live one
+            # Superseded during grace; the newer row is the live one. A DRAINING
+            # row must not linger on an active Luciel (the resolver would keep
+            # routing on it) — it goes terminal, exactly where a pre-WP-5 delete
+            # left it. Its secret is destroyed by the tenant prefix sweep at the
+            # account cascade, as any revoked row's is. Defensive: ``uq_conn_active_type``
+            # still counts a quiescing row as the type's single active slot, so a
+            # re-attach during grace REUSES the draining row (connections.service
+            # reads any non-revoked row) rather than adding a second one; only a
+            # many-active type (knowledge_source) or hand-edited data reaches here.
+            if c.status == QUIESCING:
+                c.status = "revoked"
+                c.status_stashed = None
+                c.status_detail_stashed = None
+            continue
         cfg = dict(c.non_secret_config or {})
         destinations = [d for d in [cfg.get("destination")] if isinstance(d, str) and d]
         dest_map = cfg.get("destinations")
@@ -242,15 +438,25 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
             # chip (§3.8.5) rather than everything restoring as "reconnect all".
             # Legacy rows that entered grace before 0049 have no stash → the old
             # conservative 'unconfigured'.
+            if c.connection_type == "crm" and c.status_stashed:
+                intact_crm_providers.add(c.provider)
             c.status = c.status_stashed or "unconfigured"
             c.status_detail = c.status_detail_stashed
         c.status_stashed = None
         c.status_detail_stashed = None
-    sources = (
+    await _requalify_crm_links(
+        session,
+        inst,
+        conns=list(conns),
+        intact_providers=intact_crm_providers,
+        actor_user_id=actor_user_id,
+    )
+    sources = list(
         (await session.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)))
         .scalars()
         .all()
     )
+    await _remove_grace_window_duplicates(session, inst, sources)
     for src in sources:
         # Only what the Luciel delete tombstoned comes back with it. A source the
         # owner deleted deliberately stays deleted (its own undo window and purge

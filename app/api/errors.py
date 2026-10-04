@@ -15,6 +15,13 @@ FLAGGED (BUILD_SPEC §4): there is no status that maps to ``verification_require
 or ``at_cap``. Unverified gating is expressed as documented: ``me()`` returns 200
 with state='unverified' + nextRoute='verify_wall', and gated writes return 403
 (-> unauthorized, which routes to login). ``at_cap`` is surfaced as billing data.
+
+TYPED REFUSALS (round 7 WP-5 / owner decision D5): a refusal the frontend must tell
+apart from its status-mates carries two OPTIONAL extra keys — ``code`` (a stable
+machine word) and ``detail`` (code-shaped values only: instants, counts, state names).
+The one user today is ``account_closed``: a 403 whose ``detail.reopenUntil`` lets the
+frontend render the reduced closed-account page instead of bouncing to login. A
+client that reads only ``message`` sees exactly what it saw before.
 """
 
 from __future__ import annotations
@@ -27,10 +34,20 @@ from fastapi.responses import JSONResponse
 class ApiError(Exception):
     """Raised by handlers; rendered to the frozen wire error shape."""
 
-    def __init__(self, status_code: int, message: str, retry_after_seconds: int | None = None):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retry_after_seconds: int | None = None,
+        *,
+        code: str | None = None,
+        detail: dict[str, object] | None = None,
+    ):
         self.status_code = status_code
         self.message = message
         self.retry_after_seconds = retry_after_seconds
+        self.code = code
+        self.detail = detail
         super().__init__(message)
 
 
@@ -42,6 +59,26 @@ def unauthorized(message: str = "Session invalid or expired.") -> ApiError:
 def forbidden(message: str = "Not permitted.") -> ApiError:
     # 403 also maps to 'unauthorized' on the frontend (transport.ts).
     return ApiError(403, message)
+
+
+#: The typed-refusal word for a closed account (D5). The frontend keys on it.
+ACCOUNT_CLOSED = "account_closed"
+
+
+def account_closed(*, closed_at: str | None, reopen_until: str | None) -> ApiError:
+    """403 for every route a closed account may not reach (owner decision D5).
+
+    ``detail.reopenUntil`` is the instant the 30-day reopen window ends (ISO-8601,
+    UTC) — in the future while the owner can still reopen or re-request the export,
+    in the past once the window has closed, ``null`` when the closure instant is not
+    on record. Still a 403, so a client that knows nothing of ``code`` behaves as
+    before."""
+    return ApiError(
+        403,
+        "Account closed.",
+        code=ACCOUNT_CLOSED,
+        detail={"closedAt": closed_at, "reopenUntil": reopen_until},
+    )
 
 
 def payment_required(message: str = "Payment method required.") -> ApiError:
@@ -78,6 +115,10 @@ def _body(err: ApiError) -> dict[str, object]:
     body: dict[str, object] = {"message": err.message}
     if err.retry_after_seconds is not None:
         body["retryAfterSeconds"] = err.retry_after_seconds
+    if err.code is not None:
+        body["code"] = err.code
+    if err.detail is not None:
+        body["detail"] = err.detail
     return body
 
 

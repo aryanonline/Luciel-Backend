@@ -37,7 +37,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
-from app.lifecycle.transcript_store import get_transcript_store, transcript_key_for
+from app.lifecycle.transcript_store import (
+    TranscriptStoreUnavailable,
+    get_transcript_store,
+    transcript_key_for,
+)
 from app.models.audit import ActorType
 from app.models.conversation import Session, Transcript
 
@@ -159,7 +163,7 @@ async def archive_aged_transcripts(
 
 
 class ArchivedTranscriptUnavailable(Exception):
-    """The session IS archived, but cold storage did not return its object.
+    """The session IS archived, but cold storage could not hand back its object.
 
     Deliberately distinct from "not archived" (``None``). Collapsing the two is what
     let an unreadable archive render as a conversation with NO MESSAGES: the dashboard
@@ -167,7 +171,20 @@ class ArchivedTranscriptUnavailable(Exception):
     owner their customer had said nothing when the truth was that we moved the
     transcript and could not read it back. An empty conversation and an unavailable
     one look identical to the reader and mean opposite things.
+
+    Raised as this class when the store failed to ANSWER (the transport case — the
+    object is very likely still there); as :class:`ArchivedTranscriptAbsent` when the
+    store answered that there is no such object.
     """
+
+
+class ArchivedTranscriptAbsent(ArchivedTranscriptUnavailable):
+    """The session IS archived and cold storage ANSWERED: there is no such object.
+
+    A subclass, so every caller that refuses to fake an empty conversation keeps
+    refusing; a distinct class, so the dashboard can say the true thing — "no longer
+    available" — instead of "nothing has been lost, try again shortly", which is only
+    true of the transport case (round 7 WP-5, item 7)."""
 
 
 async def load_archived_transcripts(
@@ -180,8 +197,9 @@ async def load_archived_transcripts(
     the day its hot rows moved.
 
     Raises :class:`ArchivedTranscriptUnavailable` when the session carries an archive
-    key but the object does not come back — the caller must surface that, never
-    present it as an empty transcript."""
+    key but the store could not answer, and its subclass
+    :class:`ArchivedTranscriptAbsent` when the store answered that the object is gone
+    — the caller must surface either, never present it as an empty transcript."""
     sess = (
         await session.execute(
             select(Session).where(Session.admin_id == admin_id, Session.id == session_id)
@@ -189,7 +207,10 @@ async def load_archived_transcripts(
     ).scalar_one_or_none()
     if sess is None or not sess.archive_object_key:
         return None
-    data = await get_transcript_store().get(key=sess.archive_object_key)
+    try:
+        data = await get_transcript_store().get(key=sess.archive_object_key)
+    except TranscriptStoreUnavailable as exc:
+        raise ArchivedTranscriptUnavailable(str(session_id)) from exc
     if data is None:
-        raise ArchivedTranscriptUnavailable(str(session_id))
+        raise ArchivedTranscriptAbsent(str(session_id))
     return deserialize_transcripts(data)

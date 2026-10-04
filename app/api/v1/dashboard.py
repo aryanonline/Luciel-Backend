@@ -167,6 +167,7 @@ async def get_messages(
         )
         if not rows and sess.archive_object_key:
             from app.lifecycle.transcript_archive import (
+                ArchivedTranscriptAbsent,
                 ArchivedTranscriptUnavailable,
                 load_archived_transcripts,
             )
@@ -175,12 +176,19 @@ async def get_messages(
                 archived = await load_archived_transcripts(
                     s, admin_id=subject.admin_id, session_id=session_id
                 )
-            except ArchivedTranscriptUnavailable:
-                # Say so. Returning [] here renders as a conversation the customer
-                # never wrote anything in, which is a different — and false — claim.
+            except ArchivedTranscriptUnavailable as exc:
+                # Say so — and say WHICH. Returning [] renders as a conversation the
+                # customer never wrote anything in (a false claim), and "nothing has
+                # been lost" is only true when the store failed to ANSWER, not when it
+                # answered that the object is gone (round 7 WP-5, item 7).
+                if isinstance(exc, ArchivedTranscriptAbsent):
+                    raise not_found(
+                        "This conversation's transcript is no longer available in "
+                        "long-term storage."
+                    ) from None
                 raise service_unavailable(
                     "This conversation is in long-term storage and could not be "
-                    "loaded right now. Nothing has been lost; please try again shortly."
+                    "read right now. Nothing has been lost; please try again shortly."
                 ) from None
             return [
                 MessageOut(

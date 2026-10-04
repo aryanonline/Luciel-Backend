@@ -125,15 +125,43 @@ async def test_close_account_also_uploads_export_with_context(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_export_response_reports_the_email_outcome(client, monkeypatch):
+    """Round 7 WP-5 item 4: the dispatcher's return value used to be dropped, so the
+    UI said "check your inbox" over a mail that never left. Mock/CI: the Null sender
+    records it; a sender that throws is reported as failed:<class> and the link is
+    still in the body — a mail failure never loses the export."""
+    from app.notifications import email_dispatcher
+
+    LocalExportStore.reset()
+    await _signup_verify_login(client)
+    r = await client.post("/api/v1/admin/account/export")
+    assert r.status_code == 200
+    assert r.json()["emailOutcome"] == "recorded"
+
+    class Broken:
+        async def send(self, **kwargs):
+            raise RuntimeError("ses down")
+
+    monkeypatch.setattr(email_dispatcher, "build_email_sender", lambda: Broken())
+    r = await client.post("/api/v1/admin/account/export")
+    assert r.status_code == 200, "a mail failure never loses the export"
+    assert r.json()["emailOutcome"] == "failed:RuntimeError"
+    assert "/api/v1/exports/" in r.json()["download_url"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_an_export_link_is_throttled_per_link(client):
     """Adversarial review R-WP2-2: the download door is unauthenticated by design, so
     a leaked or replayed link must not become an unbounded audit-row and presign
     mill. The burst covers a browser that retries; a loop gets 429s."""
     from app.lifecycle.export_link import mint_export_token
+    from app.lifecycle.export_store import export_key_for
 
     LocalExportStore.reset()
     admin_id = await _signup_verify_login(client)
-    token = mint_export_token(admin_id, uuid.uuid4(), ttl_days=7)
+    export_id = uuid.uuid4()
+    await LocalExportStore().put(key=export_key_for(admin_id, export_id), data=b"zip")
+    token = mint_export_token(admin_id, export_id, ttl_days=7)
     statuses = [
         (await client.get(f"/api/v1/exports/{token}", follow_redirects=False)).status_code
         for _ in range(8)
@@ -154,6 +182,55 @@ async def test_an_export_link_is_throttled_per_link(client):
             .all()
         )
     assert len(rows) == 5, "a throttled visit writes no audit row"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_valid_link_to_a_swept_bundle_is_a_410_not_a_redirect_to_nothing(client):
+    """Round 7 WP-5 item 8: a Luciel hard delete sweeps the tenant's bundles and
+    leaves the account, so the 7-day token still verifies. The presign is computed
+    locally and "succeeded" for the missing object — the owner was redirected to the
+    bucket's raw NoSuchKey page. The door now asks the store first; a store that
+    cannot answer is NOT read as gone (the redirect goes ahead, as before)."""
+    from app.lifecycle.export_link import mint_export_token
+    from app.lifecycle.export_store import export_key_for, export_prefix_for, set_export_store
+
+    LocalExportStore.reset()
+    admin_id = await _signup_verify_login(client)
+    export_id = uuid.uuid4()
+    store = LocalExportStore()
+    await store.put(key=export_key_for(admin_id, export_id), data=b"zip")
+    token = mint_export_token(admin_id, export_id, ttl_days=7)
+    assert (await client.get(f"/api/v1/exports/{token}", follow_redirects=False)).status_code == 302
+
+    await store.delete_prefix(prefix=export_prefix_for(admin_id))  # what the cascade does
+    gone = await client.get(f"/api/v1/exports/{token}", follow_redirects=False)
+    assert gone.status_code == 410
+    assert "expired" in gone.text
+    async with tenant_session(admin_id) as s:
+        downloads = (
+            (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin_id,
+                        AdminAuditLog.event_type == "data_export_downloaded",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(downloads) == 1, "a refused visit is not recorded as a download"
+
+    class Unreachable(LocalExportStore):
+        async def exists(self, *, key: str) -> bool:
+            raise TimeoutError("head timed out")
+
+    set_export_store(Unreachable())
+    try:
+        unknown = await client.get(f"/api/v1/exports/{token}", follow_redirects=False)
+    finally:
+        set_export_store(None)
+    assert unknown.status_code == 302, "an unanswered existence check is not 'gone'"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

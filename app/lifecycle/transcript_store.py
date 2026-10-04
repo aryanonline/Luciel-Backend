@@ -39,6 +39,18 @@ def transcript_key_for(admin_id: uuid.UUID, instance_id: uuid.UUID, session_id: 
     return f"{transcript_prefix_for(admin_id)}{instance_id}/{session_id}.jsonl"
 
 
+class TranscriptStoreUnavailable(Exception):
+    """The store could not ANSWER — a transport failure, a refused credential, a
+    bucket outage, a bucket that does not exist. Deliberately distinct from ``get``
+    returning ``None``, which means the store answered and the object is not there.
+
+    The two used to collapse into one ``None`` (round 7 WP-5, item 7): the dashboard
+    promised "nothing has been lost" over an object that was gone, and a five-second
+    S3 hiccup read as a transcript that had never been archived. An absent object and
+    an unreachable store call for opposite copy, so they must arrive as different
+    outcomes."""
+
+
 @runtime_checkable
 class TranscriptStore(Protocol):
     """Persist / read / delete archived-transcript JSONL objects (Commitment #38)."""
@@ -55,7 +67,9 @@ class TranscriptStore(Protocol):
         ...
 
     async def get(self, *, key: str) -> bytes | None:
-        """Read the object back, or None if absent."""
+        """Read the object back: the bytes, or ``None`` when the store ANSWERED that
+        the key is absent (NoSuchKey / 404). Raises :class:`TranscriptStoreUnavailable`
+        when the store could not answer at all — never to be read as absent."""
         ...
 
     async def delete(self, *, key: str) -> None:
@@ -157,8 +171,14 @@ class S3TranscriptStore:
         client = self._get_client()
         try:
             resp = client.get_object(Bucket=self._bucket, Key=key)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 — NoSuchKey and transport errors both read as absent
-            return None
+        except Exception as exc:  # noqa: BLE001 — every failure is classified, none swallowed
+            # Only S3's own "there is no such object" answer is an absence. A refused
+            # credential, a missing bucket, a timeout — anything else — is the store
+            # failing to answer, and reading that as absent is how a transient outage
+            # became "this customer said nothing" (round 7 WP-5, item 7).
+            if _is_absent(exc):
+                return None
+            raise TranscriptStoreUnavailable(_describe(exc)) from exc
         body = resp["Body"].read()
         return bytes(body)
 
@@ -209,6 +229,38 @@ class S3TranscriptStore:
                 return len(keys_removed)
             kwargs["KeyMarker"] = page.get("NextKeyMarker")
             kwargs["VersionIdMarker"] = page.get("NextVersionIdMarker")
+
+
+#: S3's ways of saying "the key resolves to nothing": GetObject answers NoSuchKey,
+#: HeadObject-shaped errors carry NotFound / a bare 404. NoSuchBucket is NOT here — a
+#: bucket that does not exist is a binding fault, not an absent transcript.
+_ABSENT_CODES: frozenset[str] = frozenset({"NoSuchKey", "NotFound", "404"})
+
+
+def _error_code(exc: BaseException) -> str | None:
+    """botocore's ClientError carries the S3 error code on ``.response``; duck-typed so
+    this module never imports botocore at load (CI has no AWS)."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    error = response.get("Error")
+    code = error.get("Code") if isinstance(error, dict) else None
+    if isinstance(code, str) and code:
+        return code
+    meta = response.get("ResponseMetadata")
+    status = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
+    return str(status) if status is not None else None
+
+
+def _is_absent(exc: BaseException) -> bool:
+    return _error_code(exc) in _ABSENT_CODES
+
+
+def _describe(exc: BaseException) -> str:
+    """The failure's class and S3 code only — never the message, which can quote the
+    bucket, the key or the request id."""
+    code = _error_code(exc)
+    return f"{type(exc).__name__}:{code}" if code else type(exc).__name__
 
 
 _default: TranscriptStore | None = None

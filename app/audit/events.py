@@ -82,6 +82,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # The owner opened their export link (a fresh short presign was minted).
         "data_export_downloaded",
         "account_closure_initiated",
+        # Owner decision D5 (round 7 WP-5): the owner reopened a closed account inside
+        # its 30-day window. Carries what came back (the Luciel, its state) and the
+        # billing arrangement the account resumes on — never a credential.
+        "account_reopened",
         "llm_unavailable_escalation",
         "widget_abuse_blocked",
         # A page outside the owner's allowed origins tried to load the chat (WP-I).

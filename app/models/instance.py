@@ -105,6 +105,12 @@ class Account(Base, TenantMixin, TimestampMixin):
     resend_window_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # When the owner closed the account (§3.6.6; migration 0068, round 7 WP-5 / D5).
+    # Stamped by ``cascade.close_account``, cleared by the D5 reopen; the day-30 purge
+    # clock and the reduced closed-account surface (reopenUntil) both read it. NULL on
+    # an open account and on rows closed before the column existed (the purge falls
+    # back to the audit chain for those).
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Instance(Base, TenantMixin, TimestampMixin):

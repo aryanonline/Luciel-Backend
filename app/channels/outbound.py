@@ -164,8 +164,11 @@ async def _send_sms(
     # flagged (hosting required / action needed / expired / dormant) still "sent" and
     # Twilio dropped it. Pending carrier registration IS operable — 10DLC is the
     # tenant's business (§3.1.4) and the number can send meanwhile.
+    # A QUIESCING row (a Luciel in its delete drain, round 7 WP-5) is judged by the
+    # status it had before the delete: the credential is intact and the drain reply
+    # to the in-flight customer is exactly what this send is.
     row = await _connection_row(session, admin_id, instance_id, "sms_sender")
-    if row is None or row.status not in SMS_OPERABLE_STATUSES:
+    if row is None or _serving_status(row) not in SMS_OPERABLE_STATUSES:
         return DeliveryReceipt(accepted=False, detail="sms_sender_not_operable")
     # BYO (§3.1.4): send through the tenant's OWN Twilio, never the platform's.
     sender = await build_tenant_sms_sender(session, admin_id, instance_id)
@@ -204,7 +207,7 @@ async def _send_email(
     if conn is not None and conn.provider == "outlook":
         from app.channels.outlook_sender import build_tenant_outlook_sender
 
-        if conn.status != "connected":
+        if _serving_status(conn) != "connected":
             return DeliveryReceipt(accepted=False, detail="mailbox_reconnect_needed")
         sender = await build_tenant_outlook_sender(session, admin_id, instance_id)
         if null_in_live(sender):
@@ -225,7 +228,7 @@ async def _send_email(
     address = await resolve_email_address(session, admin_id, instance_id)
     if not address:
         return _NOT_PROVISIONED
-    if conn is not None and conn.status != "connected":
+    if conn is not None and _serving_status(conn) != "connected":
         # The legacy SES row honours the same health gate the mailbox branch does (F070).
         return DeliveryReceipt(accepted=False, detail="email_sender_not_connected")
     email_sender = build_email_sender()
@@ -270,6 +273,14 @@ async def _email_sender_row(
     session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID
 ) -> Any:  # InstanceConnection | None (lazy import keeps module import light)
     return await _connection_row(session, admin_id, instance_id, "email_sender")
+
+
+def _serving_status(row: Any) -> str:
+    """The status an outbound gate judges a row by — a quiescing row's PRE-DELETE
+    status (round 7 WP-5: the delete drain must be able to answer on the channel)."""
+    from app.lifecycle.state_machine import serving_status
+
+    return serving_status(row)
 
 
 async def _connection_row(

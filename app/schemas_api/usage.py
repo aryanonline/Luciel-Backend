@@ -111,6 +111,10 @@ class AuditEventOut(WireModel):
     event_id: str
     event_type: str
     at: datetime
+    # Owner-readable one-liner rendered by ``admin/usage.audit_detail`` from an
+    # allow-list of code-shaped payload values (round 7 WP-5, item 6): a state
+    # transition, a data class + count + policy, a billing move, a connection status
+    # change. Never a secret, never PII; null for event types with no renderer.
     detail: str | None = None
     actor_user_id: uuid.UUID | None = None
 

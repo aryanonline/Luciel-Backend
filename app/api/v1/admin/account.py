@@ -1,29 +1,42 @@
-"""/api/v1/admin/account/* — export + close (Architecture §3.6.6, §5.10)."""
+"""/api/v1/admin/account/* — status, export, close (Architecture §3.6.6, §5.10).
+
+Owner decision D5 (2026-09-14): for 30 days after closure the owner can sign in to a
+REDUCED surface — read the account status, reopen it, re-request the export; nothing
+else. Those routes depend on ``current_account_owner``; ``close`` (like every other
+admin route) stays on ``current_admin`` and refuses a closed account with the typed
+403 ``account_closed``.
+"""
 
 from __future__ import annotations
 
+import logging
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Subject, current_admin
-from app.api.errors import conflict
+from app.api.deps import Subject, current_account_owner, current_admin
+from app.api.errors import conflict, unauthorized
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
-from app.lifecycle import cascade
-from app.lifecycle.export_bundle import build_export_zip
+from app.lifecycle import cascade, reopen
+from app.lifecycle.close_purge import closure_started_at, reopen_deadline
+from app.lifecycle.export_bundle import build_export_zip, hold_export_lock
 from app.lifecycle.export_link import export_download_url
 from app.lifecycle.export_store import ExportStore, export_key_for, get_export_store
+from app.lifecycle.state_machine import LifecycleError
 from app.models.audit import ActorType
-from app.models.instance import Account, Instance, LucielState
+from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import email_dispatcher
+from app.schemas_api.account import AccountStatusOut, ReopenResult
 from app.schemas_api.common import WireModel
 
 router = APIRouter(prefix="/api/v1/admin/account", tags=["account"])
+_log = logging.getLogger(__name__)
 
 
 class CloseAccountRequest(WireModel):
@@ -42,6 +55,22 @@ class ExportResult(BaseModel):
     ok: bool = True
     download_url: str
     ttl_days: int
+    # What happened to the email carrying the same link (round 7 WP-5, item 4):
+    # ``sent`` | ``recorded`` (mock/CI: the Null sender took it, nothing left the
+    # platform) | ``no_sender`` (live with no platform sender identity bound — the
+    # link went nowhere) | ``failed:<ExceptionClass>``. The dispatcher's return value
+    # used to be dropped, so the UI said "check your inbox" over a mail that never left.
+    email_outcome: str = Field(serialization_alias="emailOutcome")
+
+
+def _email_outcome(outcome: email_dispatcher.DeliveryOutcome) -> str:
+    if outcome.status == "failed":
+        return f"failed:{outcome.reason or 'unknown'}"
+    if outcome.status == "sent":
+        return "sent"
+    # "recorded": the Null sender took it. In live that means no platform sender
+    # identity is bound (the link went nowhere); in mock/CI it is the expected posture.
+    return "no_sender" if outcome.degraded else "recorded"
 
 
 async def _build_upload_and_notify(
@@ -51,13 +80,25 @@ async def _build_upload_and_notify(
     actor_user_id: uuid.UUID | None,
     store: ExportStore,
     context: str | None = None,
-) -> str:
+) -> tuple[str, str]:
     """Build the export ZIP, upload it, and emit ``data_export_ready`` with the
     presigned link (§3.6.6 / §5.10). Shared by ``request_export`` and
     ``close_account`` so both paths persist the bundle instead of discarding it.
 
-    Returns the presigned download URL."""
+    Returns the download URL and the email outcome word (see ``ExportResult``).
+
+    Serialized with the hard-delete cascade (round 7 WP-5, item 8): the lock is taken
+    before the build, so a day-30 purge either waits for this bundle and sweeps it, or
+    finishes first — and then the account is re-read, because a purged tenant has
+    nothing to export and nobody to hand a link to. That refusal is a 401 (the session
+    names an account that no longer exists), never a "ready" over an empty bundle."""
     settings = get_settings()
+    await hold_export_lock(s, admin_id)
+    owner_email = (
+        await s.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    if owner_email is None:
+        raise unauthorized("Account not found.")
     zip_bytes = await build_export_zip(s, admin_id)
     export_id = uuid.uuid4()
     key = export_key_for(admin_id, export_id)
@@ -91,23 +132,85 @@ async def _build_upload_and_notify(
     )
     # Deliver the link to the account owner by email (§5.10 — the admin receives the
     # time-limited link). Degrades to audit-only if email isn't configured.
-    owner_email = (
-        await s.execute(select(Account.email).where(Account.id == admin_id))
-    ).scalar_one_or_none()
-    if owner_email:
-        await email_dispatcher.send_export_ready(
-            s,
-            admin_id=admin_id,
-            to=owner_email,
-            download_url=url,
-            ttl_days=settings.export_link_ttl_days,
+    outcome = await email_dispatcher.send_export_ready(
+        s,
+        admin_id=admin_id,
+        to=owner_email,
+        download_url=url,
+        ttl_days=settings.export_link_ttl_days,
+    )
+    email_outcome = _email_outcome(outcome)
+    if email_outcome not in ("sent", "recorded"):
+        # The closure path answers 204 and has no body to carry this; the log line is
+        # what an operator sees. The owner still has the D5 re-request (item 5).
+        _log.warning(
+            "export_ready_email_not_delivered admin_id=%s context=%s outcome=%s",
+            admin_id,
+            context or "self_serve",
+            email_outcome,
         )
-    return url
+    return url, email_outcome
+
+
+@router.get("", response_model=AccountStatusOut)
+async def get_account(subject: Subject = Depends(current_account_owner)) -> AccountStatusOut:
+    """The account's lifecycle status — the one READ a closed account may make (D5).
+
+    For a closed account: when it closed, until when it can be reopened (the same
+    deadline the day-30 purge uses), and whether reopening brings the Luciel back.
+    For an open account the instants are null — the frontend asks one place either way.
+    """
+    async with tenant_session(subject.admin_id) as s:
+        acct = (await s.execute(select(Account).where(Account.id == subject.admin_id))).scalar_one()
+        if acct.state != AccountState.closed:
+            return AccountStatusOut(state=acct.state.value)
+        closed_at = await closure_started_at(s, subject.admin_id, account=acct)
+        reopen_until = reopen_deadline(closed_at) if closed_at is not None else None
+        inst = (
+            await s.execute(select(Instance).where(Instance.admin_id == subject.admin_id))
+        ).scalar_one_or_none()
+        record = await cascade.closure_record(s, subject.admin_id)
+    return AccountStatusOut(
+        state=acct.state.value,
+        closed_at=closed_at,
+        reopen_until=reopen_until,
+        can_reopen=reopen_until is not None and datetime.now(UTC) < reopen_until,
+        luciel_restored_on_reopen=(
+            record.get("luciel_deleted_by_closure") is True
+            and inst is not None
+            and inst.state == LucielState.luciel_grace_window
+        ),
+    )
+
+
+@router.post("/reopen", response_model=ReopenResult)
+async def reopen_account(subject: Subject = Depends(current_account_owner)) -> ReopenResult:
+    """Reopen a closed account inside its 30-day window (owner decision D5).
+
+    Restores the account to the state before closure: open again, the Luciel back from
+    its grace window if the closure is what deleted it (paused again if it was
+    paused), billing on the arrangement it had. 409 when the account is not closed;
+    past day 30 the dependency has already answered the typed 403 ``account_closed``.
+    The session stays valid — it was minted after the closure's epoch bump."""
+    async with tenant_session(subject.admin_id) as s:
+        try:
+            outcome = await reopen.reopen_account(s, subject.admin_id, subject.user_id)
+        except LifecycleError as exc:
+            if str(exc) == "account_not_closed":
+                raise conflict("This account is not closed.") from exc
+            # The window closed between the dependency's check and this transaction.
+            raise conflict("This account can no longer be reopened.") from exc
+    return ReopenResult(
+        state=AccountState.verified.value,
+        luciel_restored=outcome.luciel_restored,
+        luciel_state=outcome.luciel_state,
+        billing_state=outcome.billing_state,
+    )
 
 
 @router.post("/export", response_model=ExportResult)
 async def request_export(
-    subject: Subject = Depends(current_admin),
+    subject: Subject = Depends(current_account_owner),
     store: ExportStore = Depends(get_export_store),
 ) -> ExportResult:
     """Self-serve export (all accounts, any time — §5.10).
@@ -116,8 +219,16 @@ async def request_export(
     live mode), and issues a 7-day presigned URL (§3.6.6 ``export_link_ttl_days``).
     Logs the request AND the ready event (with the link) — previously the ZIP was
     built and discarded; now it is actually persisted and reachable.
+
+    Also the RE-REQUEST on the closed-account surface (D5): the closure emailed one
+    7-day link, and an owner who missed it had no way to ask again. A closed account
+    inside its window gets the same bundle, the same 7-day link and the same email;
+    the ready event carries ``context: account_closed_reexport``.
     """
     async with tenant_session(subject.admin_id) as s:
+        state = (
+            await s.execute(select(Account.state).where(Account.id == subject.admin_id))
+        ).scalar_one_or_none()
         await audit.emit(
             s,
             admin_id=subject.admin_id,
@@ -125,11 +236,15 @@ async def request_export(
             actor_type=ActorType.admin_user,
             event_type="data_export_self_serve",
         )
-        url = await _build_upload_and_notify(
-            s, admin_id=subject.admin_id, actor_user_id=subject.user_id, store=store
+        url, email_outcome = await _build_upload_and_notify(
+            s,
+            admin_id=subject.admin_id,
+            actor_user_id=subject.user_id,
+            store=store,
+            context="account_closed_reexport" if state == AccountState.closed else None,
         )
         ttl = get_settings().export_link_ttl_days
-    return ExportResult(ok=True, download_url=url, ttl_days=ttl)
+    return ExportResult(ok=True, download_url=url, ttl_days=ttl, email_outcome=email_outcome)
 
 
 @router.post("/close", status_code=204)

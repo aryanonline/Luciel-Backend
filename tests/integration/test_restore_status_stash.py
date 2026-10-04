@@ -82,7 +82,8 @@ async def test_restore_returns_pre_delete_statuses():
             .scalars()
             .all()
         )
-        assert all(r.status == "revoked" for r in rows)
+        # Round 7 WP-5: the delete writes QUIESCING (routable, draining), not revoked.
+        assert all(r.status == state_machine.QUIESCING for r in rows)
         assert {r.status_stashed for r in rows} == {"connected", "expired"}
 
         await state_machine.restore(s, admin, actor_user_id=admin)

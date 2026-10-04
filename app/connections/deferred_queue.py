@@ -34,6 +34,7 @@ from app.channels.outbound import send_outbound_reply
 from app.connections import gate
 from app.models.audit import ActorType
 from app.models.deferred import DeferredAction
+from app.models.instance import NON_SERVING_STATES, Instance, LucielState
 from app.models.lead import Lead
 from app.notifications import escalation_dispatch
 
@@ -46,6 +47,18 @@ MAX_AGE = timedelta(hours=24)
 # capped at BACKOFF_CAP. Deterministic so the sweep is testable without wall-clock sleeps.
 BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
+# How soon a HELD item (round 7 WP-5, item 2) is looked at again. A paused Luciel
+# resumes on an owner click, not a schedule, so the hold is re-checked on a short
+# cadence rather than the retry backoff — a resumed Luciel drains within this window.
+HOLD_RECHECK = timedelta(minutes=15)
+
+#: ``last_error`` on an item the Luciel's deletion aged out: the abandon is audited
+#: like any other, but the owner email is suppressed — they deleted the Luciel, and a
+#: "your follow-up could not be completed" notice for each queued callback is noise
+#: the 48h catch-up pass must not resurrect either.
+LUCIEL_DELETED = "luciel_deleted"
+#: ``last_error`` on a lead-facing item held while the Luciel is not serving.
+LUCIEL_NOT_SERVING = "luciel_not_serving"
 
 #: ``connection_type`` for work that rides a PLATFORM binding rather than one of the
 #: tenant's own connections — a retried escalation notification goes out over the
@@ -138,6 +151,23 @@ def _backoff(attempts: int) -> timedelta:
     return min(delay, BACKOFF_CAP)
 
 
+def _lead_facing(action: DeferredAction) -> bool:
+    """Does delivering this item put words in front of a CUSTOMER on the tenant's
+    channel? A ``schedule_callback`` does; an escalation retry pages the OWNER, and the
+    owner of a paused Luciel still wants to hear about the lead it escalated before
+    the pause (round 7 WP-5, item 2)."""
+    return (
+        action.action_type != escalation_dispatch.ESCALATION_RETRY_ACTION
+        and action.connection_type != PLATFORM_NOTIFICATION
+    )
+
+
+async def _luciel_state(session: AsyncSession, admin_id: uuid.UUID) -> LucielState | None:
+    return (
+        await session.execute(select(Instance.state).where(Instance.admin_id == admin_id))
+    ).scalar_one_or_none()
+
+
 def _not_before(payload: dict[str, object], now: datetime) -> datetime:
     """The earliest moment this item may be attempted.
 
@@ -221,10 +251,25 @@ async def run_sweep(
       * if the connection is still unhealthy → bump attempts + backoff (do not
         deliver blind, §3.8.7 rule C).
 
+    The Luciel's own state gates the LEAD-FACING items (round 7 WP-5, item 2 — the
+    queue used to speak for a paused Luciel: "Pausing the Luciel pauses every
+    channel", and a scheduled callback fired by the sweep is a channel send):
+      * PAUSED → the item is HELD: not attempted, not aged. Its TTL is re-anchored
+        so the 24h retry window runs from when delivery becomes possible again, and
+        the next sweep after the owner resumes drains it.
+      * DELETED (grace window / hard-deleted) → the item is never attempted and ages
+        out to its TTL. The abandon is audited as always, but the owner email is
+        suppressed (``LUCIEL_DELETED``): they deleted the Luciel.
+    Owner-facing items (escalation retries) are unaffected — the owner of a paused
+    Luciel still hears about the lead it escalated before the pause.
+
     Returns counts for observability/tests. Invocable directly as a one-shot sweep —
     a real background loop simply calls this on the worker cadence (no loop in CI)."""
     now = now or datetime.now(UTC)
-    counts = {"delivered": 0, "abandoned": 0, "retried": 0}
+    counts = {"delivered": 0, "abandoned": 0, "retried": 0, "held": 0}
+    luciel_state = await _luciel_state(session, admin_id)
+    paused = luciel_state == LucielState.paused
+    deleted = luciel_state in NON_SERVING_STATES and not paused
 
     due = (
         (
@@ -275,13 +320,33 @@ async def run_sweep(
                 counts["abandoned"] += 1
                 continue
 
+        if paused and _lead_facing(action):
+            # Held, not aged: the TTL runs from when the Luciel can speak again.
+            action.last_error = LUCIEL_NOT_SERVING
+            action.next_attempt_at = now + HOLD_RECHECK
+            action.expires_at = max(action.expires_at, now + MAX_AGE)
+            counts["held"] += 1
+            continue
+
         # TTL check FIRST: a customer's follow-up that has been undeliverable > 24h is
         # abandoned with an owner notification, not retried forever (§3.8.7 rule D).
         if now >= action.expires_at:
             action.status = "abandoned"
-            action.last_error = "ttl_exceeded"
-            await _notify_owner_abandoned(session, action)
+            if deleted and _lead_facing(action):
+                action.last_error = LUCIEL_DELETED
+                await _notify_owner_abandoned(session, action, notify_owner=False)
+            else:
+                action.last_error = "ttl_exceeded"
+                await _notify_owner_abandoned(session, action)
             counts["abandoned"] += 1
+            continue
+
+        if deleted and _lead_facing(action):
+            # A deleted Luciel says nothing new to anyone (§3.6.3 drains only the
+            # sessions already in flight); the item simply ages out to its TTL.
+            action.last_error = LUCIEL_NOT_SERVING
+            action.next_attempt_at = now + HOLD_RECHECK
+            counts["held"] += 1
             continue
 
         healthy = action.connection_type == PLATFORM_NOTIFICATION or await gate.connection_healthy(
@@ -328,13 +393,17 @@ async def run_sweep(
         .all()
     )
     for action in recent_abandoned:
+        if action.last_error == LUCIEL_DELETED:
+            continue  # aged out by the deletion: no owner email, then or now
         await _send_abandon_notice_once(session, action)
 
     await session.flush()
     return counts
 
 
-async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction) -> None:
+async def _notify_owner_abandoned(
+    session: AsyncSession, action: DeferredAction, *, notify_owner: bool = True
+) -> None:
     """On TTL-abandon, notify the owner + write the audit row (§3.8.7 rule D).
 
     The audit event is the durable, tamper-evident record the spec mandates
@@ -345,7 +414,10 @@ async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction)
     An abandoned escalation retry is filed under ``escalation_delivery_failed`` instead
     (P1-6): that is the event name the escalation surface already means by "the owner
     was never told", and burying the terminal miss inside a generic connection event
-    would leave it findable only by someone who already knew to look."""
+    would leave it findable only by someone who already knew to look.
+
+    ``notify_owner=False`` keeps the audit row and skips the email: the item aged out
+    because the owner deleted the Luciel (round 7 WP-5, item 2)."""
     escalation = action.action_type == escalation_dispatch.ESCALATION_RETRY_ACTION
     if escalation:
         # The row's delivery truth turns terminal with the abandon (F079).
@@ -363,10 +435,15 @@ async def _notify_owner_abandoned(session: AsyncSession, action: DeferredAction)
             "deferred_action_id": str(action.id),
             "action_type": action.action_type,
             "connection_type": action.connection_type,
-            "reason": "undeliverable > 24h TTL",
+            "reason": (
+                "luciel deleted before delivery; aged out at 24h TTL"
+                if not notify_owner
+                else "undeliverable > 24h TTL"
+            ),
         },
     )
-    await _send_abandon_notice_once(session, action)
+    if notify_owner:
+        await _send_abandon_notice_once(session, action)
 
 
 async def _send_abandon_notice_once(session: AsyncSession, action: DeferredAction) -> None:
