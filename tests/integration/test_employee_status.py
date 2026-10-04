@@ -12,7 +12,7 @@ test that seeded it proved nothing about what the owner sees)."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.db.session import tenant_session
@@ -28,12 +28,20 @@ from app.runtime.budget import count_session_once
 
 pytestmark = [pytest.mark.asyncio]
 
-# Tuesday 2026-09-08 15:00 UTC = 11:00 EDT in Toronto.
-NOW = datetime(2026, 9, 8, 15, 0, tzinfo=UTC)
-# Yesterday (Monday) 20:00 EDT = Tuesday 00:00 UTC — a UTC "today" row that is a
+# The clock is TODAY's date, not a fixed one. ``count_session_once`` counts into the
+# billing period the WALL CLOCK is in, while the status read takes ``now`` — with a
+# hard-coded September date the two agreed only during September 2026, and the
+# nightly went red on 2026-10-01 with "0 conversations used" (round 7). Same UTC date
+# as the wall clock = same billing period, on any day the suite runs.
+_TODAY = datetime.now(UTC).date()
+_YESTERDAY = _TODAY - timedelta(days=1)
+# 15:00 UTC = 11:00 EDT / 10:00 EST in Toronto — mid-morning local either way.
+NOW = datetime(_TODAY.year, _TODAY.month, _TODAY.day, 15, 0, tzinfo=UTC)
+# 00:00 UTC today = 20:00 EDT / 19:00 EST YESTERDAY — a UTC "today" row that is a
 # LOCAL "yesterday" row: the day boundary must be the owner's, not the server's.
-LAST_NIGHT_LOCAL = datetime(2026, 9, 8, 0, 0, tzinfo=UTC)
-THIS_MORNING = datetime(2026, 9, 8, 13, 30, tzinfo=UTC)  # 09:30 EDT today
+LAST_NIGHT_LOCAL = datetime(_TODAY.year, _TODAY.month, _TODAY.day, 0, 0, tzinfo=UTC)
+# 13:30 UTC = 09:30 EDT / 08:30 EST today.
+THIS_MORNING = datetime(_TODAY.year, _TODAY.month, _TODAY.day, 13, 30, tzinfo=UTC)
 
 
 async def _seed(s, admin, iid, *, channels, tools, connections=(), timezone="America/Toronto"):
@@ -134,12 +142,12 @@ async def test_counts_follow_the_owners_local_day_and_only_counted_sessions():
     assert status is not None
     assert status.on_duty == "around the clock"
     assert status.business_short_name == "Acme"
-    assert status.yesterday.date == "2026-09-07"
+    assert status.yesterday.date == _YESTERDAY.isoformat()
     assert status.yesterday.conversations == 2
     assert status.yesterday.by_channel == {"widget": 1, "sms": 1}
     assert status.yesterday.leads == 1 and status.yesterday.leads_to_crm == 1
     assert status.yesterday.escalations == 1 and status.yesterday.escalations_reached == 1
-    assert status.today.date == "2026-09-08"
+    assert status.today.date == _TODAY.isoformat()
     assert status.today.conversations == 1
     assert status.today.human_takeovers == 1
     assert status.today.leads == 0
@@ -147,9 +155,7 @@ async def test_counts_follow_the_owners_local_day_and_only_counted_sessions():
     # a conversation means the same thing everywhere).
     assert status.conversations_used == 3
     # And the 7am brief reports the day instead of "A quiet day" (round 7 WP-3a).
-    subject, body = render_daily_brief(
-        status, local_date=datetime(2026, 9, 8).date(), due_callbacks_today=0
-    )
+    subject, body = render_daily_brief(status, local_date=_TODAY, due_callbacks_today=0)
     assert subject == "Yesterday at Acme: 2 conversations, 1 lead — Aurora's brief"
     # Equal counts tie, and the mix order then follows the GROUP BY — pin the facts,
     # not the tie-break.

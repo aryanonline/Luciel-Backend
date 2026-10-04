@@ -70,6 +70,21 @@ async def _seed_tenant(admin: uuid.UUID, counted: int = 0) -> uuid.UUID:
     return iid
 
 
+def _settled_calendar_period() -> dict[str, int]:
+    """The period an ``invoice.paid`` settles, stated the way Stripe states it.
+
+    The counter rows these tests seed are keyed on the calendar-month fallback, so the
+    invoice that settles them covers that month and the NEXT period starts on the next
+    month's first day. A period-less event falls back to "the next period starts now",
+    whose date equals the fallback key on the 1st of a month — the reset asserted here
+    then reads the very row it seeded (the nightly went red on 2026-10-01, round 7).
+    """
+    now = datetime.now(UTC)
+    start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    end = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
+    return {"period_start": int(start.timestamp()), "period_end": int(end.timestamp())}
+
+
 @pytest.mark.usefixtures("db_engine_reset")
 async def test_free_cap_below_50_not_at_cap() -> None:
     admin = uuid.uuid4()
@@ -602,7 +617,7 @@ async def test_an_a_b_a_redelivery_does_not_reprocess_a() -> None:
     """
     admin = uuid.uuid4()
     iid = await _seed_tenant(admin, counted=180)
-    paid = StripeEvent(event_id="evt_A", type="invoice.paid", data={})
+    paid = StripeEvent(event_id="evt_A", type="invoice.paid", data=_settled_calendar_period())
     other = StripeEvent(event_id="evt_B", type="invoice.payment_failed", data={})
 
     async with tenant_session(admin) as s:

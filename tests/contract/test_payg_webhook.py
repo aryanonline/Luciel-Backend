@@ -205,12 +205,29 @@ async def test_unsigned_webhook_cannot_reset_budget(client) -> None:
 # --- tenant resolution (P1-11) ----------------------------------------------- #
 
 
-def _customer_webhook(*, event_id: str, event_type: str, customer: str) -> bytes:
+def _settled_calendar_period() -> dict[str, int]:
+    """The period an ``invoice.paid`` settles, stated the way Stripe states it.
+
+    The counter rows these tests seed are keyed on the calendar-month fallback, so the
+    invoice that settles them covers that month and the NEXT period starts on the next
+    month's first day. A period-less event falls back to "the next period starts now",
+    whose date equals the fallback key on the 1st of a month — the reset asserted here
+    then reads the very row it seeded (the nightly went red on 2026-10-01, round 7).
+    """
+    now = datetime.now(UTC)
+    start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    end = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
+    return {"period_start": int(start.timestamp()), "period_end": int(end.timestamp())}
+
+
+def _customer_webhook(
+    *, event_id: str, event_type: str, customer: str, period: dict[str, int] | None = None
+) -> bytes:
     """A Stripe-generated event: it carries ``customer`` and NO metadata, which is
-    exactly the shape the route used to answer "ignored" to."""
-    return json.dumps(
-        {"id": event_id, "type": event_type, "data": {"object": {"customer": customer}}}
-    ).encode()
+    exactly the shape the route used to answer "ignored" to. ``period`` adds the
+    invoice's period_start / period_end, as every real Stripe invoice carries."""
+    obj: dict[str, object] = {"customer": customer, **(period or {})}
+    return json.dumps({"id": event_id, "type": event_type, "data": {"object": obj}}).encode()
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -231,7 +248,10 @@ async def test_a_stripe_generated_invoice_paid_resolves_its_tenant_by_customer_i
     set_stripe_gateway(gw)
     try:
         payload = _customer_webhook(
-            event_id="evt_by_customer", event_type="invoice.paid", customer="cus_resolve_me"
+            event_id="evt_by_customer",
+            event_type="invoice.paid",
+            customer="cus_resolve_me",
+            period=_settled_calendar_period(),
         )
         r = await client.post(
             "/api/v1/webhooks/stripe",

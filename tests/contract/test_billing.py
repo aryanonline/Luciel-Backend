@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from app.billing import metering
@@ -68,6 +69,21 @@ async def _seed_instance(admin: uuid.UUID, counted: int = 0) -> uuid.UUID:
 
 # Tokens that must never appear in any billing response (no card data, §3.4.1b).
 _FORBIDDEN_TOKENS = ("pan", "cardnumber", "card_number", "cvv", "cvc", "number")
+
+
+def _settled_calendar_period() -> dict[str, int]:
+    """The period an ``invoice.paid`` settles, stated the way Stripe states it.
+
+    The counter rows these tests seed are keyed on the calendar-month fallback, so the
+    invoice that settles them covers that month and the NEXT period starts on the next
+    month's first day. A period-less event falls back to "the next period starts now",
+    whose date equals the fallback key on the 1st of a month — the reset asserted here
+    then reads the very row it seeded (the nightly went red on 2026-10-01, round 7).
+    """
+    now = datetime.now(UTC)
+    start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    end = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
+    return {"period_start": int(start.timestamp()), "period_end": int(end.timestamp())}
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -351,7 +367,9 @@ async def test_webhook_verified_invoice_paid_processed(client) -> None:
             {
                 "id": "evt_paid",
                 "type": "invoice.paid",
-                "data": {"object": {"metadata": {"admin_id": str(admin)}}},
+                "data": {
+                    "object": {"metadata": {"admin_id": str(admin)}, **_settled_calendar_period()}
+                },
             }
         ).encode()
         header = build_signature_header(gw.WEBHOOK_SECRET, payload)
