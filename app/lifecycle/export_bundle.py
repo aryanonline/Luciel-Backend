@@ -20,6 +20,7 @@ import zipfile
 import zlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import Select, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,7 +102,10 @@ def lead_export_rows(leads: Sequence[Lead]) -> list[dict[str, object]]:
     ]
 
 
-def transcripts_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[Transcript]]:
+# ``Select[Any]``: SQLAlchemy 2.0 types ``select(Model)`` as ``Select[tuple[Model]]``
+# and 2.1 as ``Select[Model]``; the lockfile-less install resolves either, so the
+# statement type stays open and the row type is stated where the rows are read.
+def transcripts_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[Any]:
     """A session's transcript rows, time-ordered — with the tenant predicate stated
     (round 7 WP-5, item 4). RLS scopes the read already; the explicit ``admin_id`` is
     the defence in depth every other tenant read in this module carries, so a session
@@ -113,7 +117,7 @@ def transcripts_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple
     )
 
 
-def summary_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[tuple[SessionSummary]]:
+def summary_stmt(admin_id: uuid.UUID, session_id: uuid.UUID) -> Select[Any]:
     """A session's summary row, tenant predicate stated (see ``transcripts_stmt``)."""
     return select(SessionSummary).where(
         SessionSummary.admin_id == admin_id, SessionSummary.session_id == session_id
@@ -133,7 +137,7 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
         )
         conv_rows: list[dict[str, object]] = []
         for sess in sessions:
-            transcripts = (
+            transcripts: Sequence[Transcript] = (
                 (await session.execute(transcripts_stmt(admin_id, sess.id))).scalars().all()
             )
             messages = [
@@ -157,7 +161,9 @@ async def build_export_zip(session: AsyncSession, admin_id: uuid.UUID) -> bytes:
                     {"role": str(r["role"]), "text": str(r["text"]), "at": str(r["at"])}
                     for r in (archived or [])
                 ]
-            summary = (await session.execute(summary_stmt(admin_id, sess.id))).scalar_one_or_none()
+            summary: SessionSummary | None = (
+                await session.execute(summary_stmt(admin_id, sess.id))
+            ).scalar_one_or_none()
             conv = {
                 "sessionId": str(sess.id),
                 "channel": sess.channel,
