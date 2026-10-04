@@ -3,12 +3,16 @@
 Runs per connection in ``instance_connections`` and applies UNIFORMLY to every
 connection type — tool, channel, and knowledge-sync alike ("a connection is a
 connection", §3.8.5). It:
-  * health-probes the connection on a cadence keyed to ``auth_class`` (NOT provider
-    brand, §3.8.5) — so a new provider inherits the right behavior automatically;
+  * health-probes the connection on ONE 6-hour cron (the ``health`` EventBridge
+    sweep in ``app/jobs/sweeps.py``) — the same pass for every auth class; the
+    behavior that differs per class is what a probe/refresh does, not when it runs;
   * proactively refreshes OAuth/long-lived tokens ~30 min before expiry (§3.8.5
     refresh path); on refresh failure → status='expired' + status_detail + audit;
   * transitions status (connected / error / expired) and stamps
     ``last_health_check_at`` + ``status_detail`` (§3.8.4 lifecycle);
+  * honours a provider's rate limit: a 429 on the liveness call persists the
+    provider's Retry-After as ``next_probe_at`` (round 7 WP-4a item 10) and the row
+    is not asked again — nor stamped as checked — until it passes;
   * for a revoked/expired knowledge_source connection, pauses the sync and flags
     the source paused_reconnect_needed — reusing the Arc 11b mechanism
     (app/knowledge/sync.pause_sync_on_revocation, §3.2.3) rather than a parallel one.
@@ -53,16 +57,6 @@ from app.models.connection import InstanceConnection
 
 _log = logging.getLogger(__name__)
 
-# §3.8.5 TARGET cadence per auth_class. Honesty note (round 5B): the deployed
-# scheduler runs ONE 6-hour EventBridge cron for every class — this table is the
-# design target a per-class scheduler would read, not a description of what runs
-# today. Kept because the sweep entrypoint is cadence-agnostic either way.
-HEALTH_CADENCE: dict[str, timedelta] = {
-    "oauth_token": timedelta(minutes=15),
-    "long_lived_token": timedelta(minutes=60),
-    "api_key": timedelta(minutes=60),
-    "provisioned_resource": timedelta(hours=4),
-}
 # §3.8.5 refresh path: refresh proactively ~30 min before known expiry.
 REFRESH_LEAD = timedelta(minutes=30)
 
@@ -76,6 +70,147 @@ REFRESH_LEAD = timedelta(minutes=30)
 # rows to a false "error" with a false attention email.
 HEALTH_OWNED_STATUSES: frozenset[str] = frozenset({"connected", "expired", "error"})
 
+# Round 7 WP-4a item 3: statuses the sweep PROBES but never promotes. An sms row in
+# pending_carrier_registration is SENDING (outbound.SMS_OPERABLE_STATUSES lets a text
+# leave on it) with a credential the sweep never re-checked — a Twilio grant revoked
+# at the provider stayed "pending registration" forever while every send failed in
+# front of a customer. A not_operable_hosting_required row holds the same credential
+# behind a number that is not yet usable. Both keep their setup-owned status and
+# guidance when healthy (a probe passing is not carrier registration, and not a
+# hosted number); a dead or expired credential still flips them to error/expired
+# through the same transition — audit row, one attention email — as any other row.
+HEALTH_PROBE_ONLY_STATUSES: frozenset[str] = frozenset(
+    {"pending_carrier_registration", "not_operable_hosting_required"}
+)
+#: Everything the sweep selects: the rows it owns plus the rows it only probes.
+HEALTH_SWEPT_STATUSES: frozenset[str] = HEALTH_OWNED_STATUSES | HEALTH_PROBE_ONLY_STATUSES
+
+
+# Round 7 WP-4a item 5: a proven-before-cutover marker (service.py rule B) parks the
+# row outside the sweep while the owner completes the new consent. An owner who
+# closed the tab left the marker forever — and the row outside health forever, so a
+# credential that died a month later still read Connected. An attempt older than
+# this is abandoned: the sweep clears the marker, restores the prior status and
+# audits it, then probes the row like any other. Fifteen minutes is longer than any
+# consent screen and shorter than the sweep's own cadence.
+RECONNECT_ABANDON_AFTER = timedelta(minutes=15)
+RECONNECT_MARKER_PREFIX = "reconnect_pending:prior_status="
+
+#: Round 7 WP-4a item 10: non_secret_config key holding the ISO timestamp before
+#: which the sweep must NOT probe the row again. Written when the provider answered
+#: the liveness call with 429 (``ProbeResult.retry_after`` carries its Retry-After,
+#: bounded in probes.py); honoured by ``check_connection``; cleared by the first
+#: probe the provider answers afterwards, and by the connect / disconnect sweeps of
+#: attempt state. Before this a 429 was a plain ``probe_skipped``: the row was
+#: stamped as checked, nothing remembered the provider's backoff, and a tenant
+#: behind a rate limit was asked again on every pass and never actually verified.
+NEXT_PROBE_AT_KEY = "next_probe_at"
+
+
+def _mid_reconnect(connection: InstanceConnection) -> bool:
+    return (connection.status_detail or "").startswith("reconnect_pending:")
+
+
+def _reconnect_since(connection: InstanceConnection) -> datetime | None:
+    from app.connections.service import RECONNECT_PENDING_SINCE_KEY  # noqa: PLC0415
+
+    raw = (connection.non_secret_config or {}).get(RECONNECT_PENDING_SINCE_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def reconnect_abandoned(connection: InstanceConnection, now: datetime) -> bool:
+    """True iff the row carries a staged-swap marker whose attempt is older than
+    ``RECONNECT_ABANDON_AFTER``. A marker with NO timestamp (written before item 5)
+    is abandoned by definition: nothing could ever have cleared it."""
+    if not _mid_reconnect(connection):
+        return False
+    since = _reconnect_since(connection)
+    return since is None or now - since >= RECONNECT_ABANDON_AFTER
+
+
+async def clear_abandoned_reconnect(
+    session: AsyncSession, connection: InstanceConnection, *, now: datetime
+) -> str:
+    """Give up on an abandoned reconnect/swap attempt (round 7 WP-4a item 5).
+
+    The prior status the marker preserved is restored (the live credential never
+    stopped serving — this is bookkeeping, not a cutover), every trace of the
+    attempt goes with it (the staged provider, the parked OAuth state so a late
+    callback cannot redeem it, the staged secret), and the row is audited so the
+    owner's history says the attempt lapsed. Returns the restored status."""
+    from app.connections.service import RECONNECT_PENDING_SINCE_KEY  # noqa: PLC0415
+    from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+    detail = connection.status_detail or ""
+    prior_status = (
+        detail[len(RECONNECT_MARKER_PREFIX) :]
+        if detail.startswith(RECONNECT_MARKER_PREFIX)
+        else connection.status
+    ) or connection.status
+    old_status = connection.status
+    cfg = dict(connection.non_secret_config or {})
+    for key in (
+        "pending_provider",
+        "oauth_state_jti",
+        "authorize_url",
+        RECONNECT_PENDING_SINCE_KEY,
+    ):
+        cfg.pop(key, None)
+    connection.non_secret_config = cfg
+    if connection.secret_ref:
+        try:
+            await get_secret_store().delete(staged_secret_ref(connection.secret_ref))
+        except Exception:  # noqa: BLE001 — a store blip must not wedge the sweep
+            _log.exception("staged secret could not be discarded for an abandoned reconnect")
+    connection.status, connection.status_detail = _status_after_abandoned_reconnect(
+        connection, prior_status
+    )
+    await audit.emit(
+        session,
+        admin_id=connection.admin_id,
+        instance_id=connection.instance_id,
+        actor_type=ActorType.platform,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": connection.status,
+            "reason": "reconnect_abandoned",
+        },
+    )
+    await session.flush()
+    return connection.status
+
+
+def _status_after_abandoned_reconnect(
+    connection: InstanceConnection, prior_status: str
+) -> tuple[str, str | None]:
+    """The honest (status, detail) once an attempt lapses: the prior status for every
+    row, with an sms row's number guidance re-derived (the marker had overwritten it)
+    rather than a blank detail over a pending or not-operable number."""
+    if connection.connection_type != "sms_sender":
+        return prior_status, None
+    from app.channels.phone_lifecycle import (  # noqa: PLC0415
+        status_for_confirmed_number,
+        status_for_pending_number,
+    )
+    from app.connections.service import SMS_NEEDS_NUMBER_DETAIL  # noqa: PLC0415
+
+    cfg = connection.non_secret_config or {}
+    if prior_status in ("error", "expired"):
+        return prior_status, None  # the sweep re-probes it in this same pass
+    if cfg.get("destination"):
+        return status_for_confirmed_number(cfg)
+    if cfg.get("pending_destination"):
+        return status_for_pending_number()
+    return "unconfigured", SMS_NEEDS_NUMBER_DETAIL
+
 
 def health_owned(connection: InstanceConnection) -> bool:
     """True iff the health worker may transition this row (§3.8.4 taxonomy).
@@ -85,7 +220,15 @@ def health_owned(connection: InstanceConnection) -> bool:
     target ``confirm_reconnect`` needs."""
     if connection.status not in HEALTH_OWNED_STATUSES:
         return False
-    return not (connection.status_detail or "").startswith("reconnect_pending:")
+    return not _mid_reconnect(connection)
+
+
+def health_probed(connection: InstanceConnection) -> bool:
+    """True iff the sweep PROBES this row: health-owned, or probe-only (item 3). The
+    staged-swap marker is respected for both."""
+    if connection.status not in HEALTH_SWEPT_STATUSES:
+        return False
+    return not _mid_reconnect(connection)
 
 
 @dataclass
@@ -95,6 +238,35 @@ class ProbeResult:
     ok: bool
     # Optional detail surfaced to the admin on error/expired (never a secret, §3.8.3).
     detail: str | None = None
+    # Item 10: set ONLY when the provider rate-limited the probe (429) — how long it
+    # asked us to wait, already bounded. ``ok`` is True (a 429 is not evidence the
+    # grant is dead) and the sweep persists ``now + retry_after`` as the row's
+    # ``NEXT_PROBE_AT_KEY`` instead of stamping a check that never happened.
+    retry_after: timedelta | None = None
+
+
+def _next_probe_at(connection: InstanceConnection) -> datetime | None:
+    """The row's persisted backoff hint, or None when absent or malformed — a hint
+    that cannot be read never shields a row."""
+    raw = (connection.non_secret_config or {}).get(NEXT_PROBE_AT_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _clear_probe_backoff(connection: InstanceConnection) -> None:
+    """Forget the backoff hint: the provider answered (or the row was decided
+    authoritatively), so whatever wait it asked for is over."""
+    cfg = connection.non_secret_config or {}
+    if NEXT_PROBE_AT_KEY not in cfg:
+        return
+    cfg = dict(cfg)
+    cfg.pop(NEXT_PROBE_AT_KEY, None)
+    connection.non_secret_config = cfg
 
 
 class ConnectionProbe(Protocol):
@@ -214,10 +386,12 @@ async def check_connection(
     liveness. Always stamps last_health_check_at; emits connection_status_changed
     on a real transition. ``dormant`` rows never reach here (the sweep excludes
     them — billing owns that state, module docstring), and setup-owned rows
-    (``health_owned`` False) are returned untouched even when a caller hands one
-    in directly — no stamp, no transition, no email (round 5B item 10)."""
+    (``health_probed`` False) are returned untouched even when a caller hands one
+    in directly — no stamp, no transition, no email (round 5B item 10). A
+    probe-only row (item 3) is probed and may go expired/error, but a passing
+    probe only stamps the check: its status and setup guidance stay."""
     now = now or datetime.now(UTC)
-    if not health_owned(connection):
+    if not health_probed(connection):
         return connection.status
     old_status = connection.status
 
@@ -243,8 +417,25 @@ async def check_connection(
             cfg["token_expires_at"] = new_expiry.isoformat()
             connection.non_secret_config = cfg
 
-    # (2) Provider liveness probe.
+    # (2) Provider liveness probe — unless the provider asked us to wait (item 10):
+    # inside a persisted backoff the row is not asked at all, not stamped, and not
+    # transitioned; the credential that was serving keeps serving until the
+    # provider will answer again.
+    next_at = _next_probe_at(connection)
+    if next_at is not None and now < next_at:
+        return connection.status
     result = await probe.probe(connection)
+    if result.ok and result.retry_after is not None:
+        # A 429 is not a check: persist the provider's backoff (bounded by the
+        # probe) and leave last_health_check_at alone so the dashboard never says
+        # the credential was verified when the provider refused to answer.
+        cfg = dict(connection.non_secret_config or {})
+        cfg[NEXT_PROBE_AT_KEY] = (now + result.retry_after).isoformat()
+        connection.non_secret_config = cfg
+        return connection.status
+    # The provider answered (or the probe could not ask — a lapsed or malformed
+    # hint is spent either way): the backoff is over.
+    _clear_probe_backoff(connection)
     if not result.ok:
         await _transition(
             session, connection, "error", result.detail or "health check failed", now, old_status
@@ -252,7 +443,13 @@ async def check_connection(
         await _propagate_knowledge_pause(session, connection)
         return connection.status
 
-    # (3) Healthy → connected.
+    # (3) Healthy → connected — unless the row is probe-only (item 3): a credential
+    # the provider still accepts is not carrier registration and not a hosted
+    # number, so the setup-owned status and its guidance stay; only the check is
+    # stamped so the dashboard can say WHEN it was last verified.
+    if old_status in HEALTH_PROBE_ONLY_STATUSES:
+        connection.last_health_check_at = now
+        return connection.status
     await _transition(session, connection, "connected", None, now, old_status)
     return connection.status
 
@@ -269,7 +466,9 @@ async def mark_connection_broken(
     machinery the sweep uses — audit + once-per-incident attention email (round
     5B item 12: a live-call failure discovered outside the sweep, e.g. a
     knowledge sync whose token the provider rejected, must surface exactly like
-    a sweep-detected one instead of pausing silently)."""
+    a sweep-detected one instead of pausing silently). The provider answered, so a
+    rate-limit backoff the sweep was honouring (item 10) is over."""
+    _clear_probe_backoff(connection)
     await _transition(
         session, connection, status, detail, now or datetime.now(UTC), connection.status
     )
@@ -288,20 +487,13 @@ async def _transition(
     connection.status_detail = detail
     connection.last_health_check_at = now
     if new_status != old_status:
-        # §3.8.4: status changes → admin_audit_log connection_status_changed with
-        # old/new status + reason. NEVER any secret material (§3.8.3 rule 4).
-        await audit.emit(
+        await _audit_status_change(
             session,
-            admin_id=connection.admin_id,
-            instance_id=connection.instance_id,
+            connection,
+            old_status=old_status,
+            new_status=new_status,
+            reason=detail or "health_check",
             actor_type=ActorType.platform,
-            event_type="connection_status_changed",
-            payload={
-                "connection_id": str(connection.connection_id),
-                "old_status": old_status,
-                "new_status": new_status,
-                "reason": detail or "health_check",
-            },
         )
         # §3.8.5's second half (Phase 6.6): the TRANSITION into a broken state is
         # the once-per-incident boundary — a still-broken row on the next sweep
@@ -312,6 +504,70 @@ async def _transition(
         broken = ("expired", "error")
         if new_status in broken and old_status not in broken:
             await _notify_owner_attention(session, connection, new_status, detail)
+
+
+async def transition_by_owner(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    new_status: str,
+    detail: str | None,
+    *,
+    reason: str,
+    user_id: uuid.UUID | None = None,
+) -> bool:
+    """An OWNER-initiated status write through the sweep's audit half (round 7 WP-4a
+    item 9): the same status + detail write and the same ``connection_status_changed``
+    row on a real transition as ``_transition`` — under the acting admin, never the
+    platform — and NEVER the attention email (the owner is looking at the result).
+    The health-check stamp stays with the sweep: a number re-verify or a number
+    attach is not a credential check. Returns whether the status changed.
+
+    Before this, ``phone_lifecycle`` assigned ``status`` directly, so a re-verify
+    that demoted a connected number to not_operable_hosting_required — texting
+    switched off — left no audit row at all."""
+    old_status = connection.status
+    connection.status = new_status
+    connection.status_detail = detail
+    if new_status == old_status:
+        return False
+    await _audit_status_change(
+        session,
+        connection,
+        old_status=old_status,
+        new_status=new_status,
+        reason=reason,
+        actor_type=ActorType.admin_user,
+        actor_user_id=user_id,
+    )
+    return True
+
+
+async def _audit_status_change(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    *,
+    old_status: str,
+    new_status: str,
+    reason: str,
+    actor_type: ActorType,
+    actor_user_id: uuid.UUID | None = None,
+) -> None:
+    # §3.8.4: status changes → admin_audit_log connection_status_changed with
+    # old/new status + reason. NEVER any secret material (§3.8.3 rule 4).
+    await audit.emit(
+        session,
+        admin_id=connection.admin_id,
+        instance_id=connection.instance_id,
+        actor_type=actor_type,
+        actor_user_id=actor_user_id,
+        event_type="connection_status_changed",
+        payload={
+            "connection_id": str(connection.connection_id),
+            "old_status": old_status,
+            "new_status": new_status,
+            "reason": reason,
+        },
+    )
 
 
 # Owner-facing surface names for the attention email (never raw enums).
@@ -382,9 +638,9 @@ async def run_health_sweep(
 ) -> dict[str, str]:
     """One-shot sweep over every non-revoked connection for a tenant (§3.8.5).
 
-    Returns {connection_id: resulting_status} for tests/observability. A real
-    background worker calls this on the auth-class cadence; CI calls it directly as a
-    one-shot so no live loop is required."""
+    Returns {connection_id: resulting_status} for tests/observability. The 6-hour
+    ``health`` cron calls this per tenant; CI calls it directly as a one-shot so no
+    live loop is required."""
     store = store or get_secret_store()
     now = now or datetime.now(UTC)
     connections = (
@@ -400,9 +656,10 @@ async def run_health_sweep(
                     # (live-caught 2026-08-24). revoked stays terminal; dormant
                     # is billing-suspended (Legal §A3) and only the payment
                     # webhooks may leave it; a future unknown status is now safe
-                    # by default. The staged-swap marker is guarded per-row in
-                    # health_owned (it rides status_detail, not status).
-                    InstanceConnection.status.in_(HEALTH_OWNED_STATUSES),
+                    # by default. The probe-only pair (item 3) is selected too
+                    # — probed, never promoted. The staged-swap marker is
+                    # guarded per-row in health_probed (it rides status_detail).
+                    InstanceConnection.status.in_(HEALTH_SWEPT_STATUSES),
                 )
             )
         )
@@ -411,6 +668,10 @@ async def run_health_sweep(
     )
     out: dict[str, str] = {}
     for connection in connections:
+        if reconnect_abandoned(connection, now):
+            # Item 5: an attempt nobody finished stops shielding the row; it is
+            # then probed in this same pass like any other.
+            await clear_abandoned_reconnect(session, connection, now=now)
         status = await check_connection(
             session,
             connection=connection,
@@ -427,8 +688,12 @@ async def run_health_sweep(
 # Round 6 WP-C: a live call the provider refused flips the row at once
 # --------------------------------------------------------------------------- #
 
-#: Failure-reason suffixes the tool backends use when the provider answered 401/403.
-PROVIDER_AUTH_FAILURE_SUFFIXES = ("_http_401", "_http_403")
+#: Failure-reason suffixes the tool backends use when the provider answered 401/403:
+#: the native CRM/calendar APIs' ``<call>_http_401`` and — round 7 WP-4a item 6 — the
+#: webhook sandbox's ``non_2xx:401`` (``crm_webhook_non_2xx:401`` once the CRM
+#: backend has prefixed it), so a webhook endpoint that refuses the owner's header
+#: flips its row exactly like a vendor that refuses a token.
+PROVIDER_AUTH_FAILURE_SUFFIXES = ("_http_401", "_http_403", "non_2xx:401", "non_2xx:403")
 
 
 def is_provider_auth_failure(reason: str) -> bool:
@@ -448,9 +713,9 @@ async def flag_provider_auth_failure(
     """A provider refused the stored credential on a LIVE call: flip the row to
     ``error`` through the sweep's own transition — audit row, one attention email —
     right now, instead of letting it read Connected until the next sweep while every
-    push or booking fails in front of a customer (round 6 WP-C, F081). Health-owned
-    rows only; a row mid-swap or setup-owned is left to its owner. Returns whether a
-    row was flipped."""
+    push or booking fails in front of a customer (round 6 WP-C, F081). Rows the sweep
+    probes only (health-owned or probe-only, item 3); a row mid-swap or setup-owned
+    is left to its owner. Returns whether a row was flipped."""
     stmt = select(InstanceConnection).where(
         InstanceConnection.admin_id == admin_id,
         InstanceConnection.instance_id == instance_id,
@@ -464,7 +729,7 @@ async def flag_provider_auth_failure(
         .scalars()
         .first()
     )
-    if row is None or not health_owned(row):
+    if row is None or not health_probed(row):
         return False
     from app.connections import registry  # noqa: PLC0415 — avoids an import cycle
 

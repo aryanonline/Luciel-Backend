@@ -236,6 +236,12 @@ async def start_connection(
             # Round 5B item 16: dormant is billing-suspended — Connect must not
             # re-arm it; the fix is a payment method, and the copy says so.
             raise validation_error(str(exc)) from exc
+        except service.ConnectionServing as exc:
+            # Round 7 WP-4a item 8: a serving row is never reset in place. 409, and
+            # the message is typed (``connection_serving_use_swap: ...``) because the
+            # wire error body carries only ``message`` — the client reads the code
+            # off the prefix and offers "Change account" (swap) instead.
+            raise conflict(str(exc)) from exc
         except NumberAlreadyClaimed as exc:
             # c21 (409 oracle): the refusal is audited under the CLAIMANT in its
             # own transaction (this one is about to roll back), and repeated
@@ -340,7 +346,9 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
         try:
-            conn = await _reverify(s, admin_id=subject.admin_id, instance_id=instance_id)
+            conn = await _reverify(
+                s, admin_id=subject.admin_id, instance_id=instance_id, user_id=subject.user_id
+            )
         except _Claimed as exc:
             # c21: promoting a pending number is a claim point — another tenant may
             # have claimed it while this one was still hosting/registering. Audited
@@ -983,13 +991,15 @@ async def switch_connection(
     req: SwitchConnectionRequest,
     subject: Subject = Depends(current_admin),
 ) -> StartConnectionResult:
-    """Use a different account and/or provider (Decision #5c): disconnect, then begin a
-    fresh connect flow against the chosen provider.
+    """Use a different account and/or provider (Decision #5c).
 
-    Use this when the owner has decided the CURRENT account is wrong — the old credential
-    is destroyed first, so nothing keeps serving from the account being left behind. Use
-    ``/swap`` instead to re-credential an account that currently works, which keeps it
-    live until the new credential verifies (§3.8.7 rule B)."""
+    Round 7 WP-4a item 7: proven-before-cutover by default — the target provider is
+    staged beside the live credential and the cutover happens only once the new
+    consent / credential form verifies (§3.8.7 rule B, the same path as ``/swap``).
+    ``force: true`` is the explicit destroy-first path: the old credential is destroyed
+    and dependents cascade off BEFORE the new consent begins, for the owner who knows
+    the current account is wrong and that the provider will not issue a second grant
+    while the first is held."""
     async with tenant_session(subject.admin_id) as s:
         try:
             out = await service.switch(
@@ -998,6 +1008,7 @@ async def switch_connection(
                 connection_id=connection_id,
                 provider=req.provider,
                 user_id=subject.user_id,
+                force=req.force,
             )
         except service.ProviderNotRegistered as exc:
             raise validation_error(str(exc)) from exc

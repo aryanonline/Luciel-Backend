@@ -119,7 +119,7 @@ async def _seed(
                     # The live connector (WP-H) reads its endpoint from the row.
                     non_secret_config=(
                         {"url": LIVE_RECORD_URL, "egressAllowlist": ["records.acme.example"]}
-                        if record_provider == "api"
+                        if record_provider in ("live_connector", "api")
                         else None
                     ),
                 )
@@ -273,13 +273,17 @@ async def test_lookup_record_reads_the_uploaded_rows_live():
     assert len(ambiguous.payload["candidates"]) == 2
 
 
-async def test_lookup_record_on_a_live_api_connector_reads_the_owners_endpoint():
+@pytest.mark.parametrize("provider", ["live_connector", "api"])
+async def test_lookup_record_on_a_live_connector_reads_the_owners_endpoint(provider):
     """Round 6 WP-H (F062): the live connector is real — the owner's endpoint answers
-    the query through the egress seam, and the outcomes follow the same vocabulary."""
+    the query through the egress seam, and the outcomes follow the same vocabulary.
+    Round 7 WP-4a item 1: dispatched under the REGISTERED id (``live_connector``, what
+    the connect flow writes); a row written under the superseded ``api`` id resolves
+    through the registry alias instead of falling through to unavailable."""
     from app.tools.record_backend import MockRecordTransport
 
     MockRecordTransport.reset()
-    seeded = await _seed(crm_provider=None, record_provider="api", authorize=("lookup_record",))
+    seeded = await _seed(crm_provider=None, record_provider=provider, authorize=("lookup_record",))
     MockRecordTransport.seed(LIVE_RECORD_URL, [{"order": "A-100", "status": "shipped"}])
     res = await _lookup(seeded, "A-100")
     assert res.outcome is Outcome.ok, res.reason

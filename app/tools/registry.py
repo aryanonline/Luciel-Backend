@@ -213,28 +213,53 @@ class _TenantCrmBackend:
 
             return await SalesforceCrmBackend().upsert_lead(ctx, lead_key, fields)
         if provider == "custom_webhook":
-            from app.tools.crm_backend import WebhookCrmBackend  # noqa: PLC0415
+            from app.tools.crm_backend import CrmUnavailable, WebhookCrmBackend  # noqa: PLC0415
 
-            return await WebhookCrmBackend().upsert_lead(ctx, lead_key, fields)
+            try:
+                return await WebhookCrmBackend().upsert_lead(ctx, lead_key, fields)
+            except CrmUnavailable as exc:
+                # Round 7 WP-4a item 6: the native backends flip their row the moment
+                # the vendor refuses the token (round 6 WP-C); the webhook path raised
+                # ``crm_webhook_non_2xx:401`` and left the row reading Connected until
+                # the next sweep. Same seam, same once-per-incident transition.
+                if ctx.session is not None:
+                    from app.connections import health  # noqa: PLC0415 — import cycle
+
+                    await health.flag_if_provider_auth_failure(
+                        ctx.session,
+                        admin_id=ctx.admin_id,
+                        instance_id=ctx.instance_id,
+                        connection_type="crm",
+                        reason=str(exc),
+                    )
+                raise
         return await self._unavailable.upsert_lead(ctx, lead_key, fields)
 
 
 class _TenantRecordBackend:
     """Dispatches ``lookup_record`` on the connected record-source provider:
-    ``csv`` reads the uploaded rows live at call time; a live-API connector has
-    no effect layer yet and stays honestly unavailable."""
+    ``csv`` reads the uploaded rows live at call time; ``live_connector`` reads the
+    owner's own endpoint through the SSRF seam (round 6 WP-H, F062)."""
 
     def __init__(self) -> None:
         self._unavailable = _UnavailableExternalBackend()
 
     async def lookup(self, ctx: ToolContext, query: str) -> list[dict[str, Any]]:
+        from app.connections import registry as provider_registry  # noqa: PLC0415
+
         provider = await _connection_provider(ctx, "record_source")
         if provider == "csv":
             from app.tools.record_backend import CsvRecordBackend  # noqa: PLC0415
 
             return await CsvRecordBackend().lookup(ctx, query)
-        if provider == "api":
-            # Round 6 WP-H (F062): the owner's own endpoint, through the SSRF seam.
+        # Round 7 WP-4a item 1: dispatch on the id the CONNECT FLOW writes
+        # (``live_connector``, the registered provider). WP-H keyed this on "api",
+        # which the registry never offered, so every live connector read "connected"
+        # and every lookup fell through to unavailable. ``canonical_provider`` keeps a
+        # row written under the old id resolving.
+        if provider is not None and provider_registry.canonical_provider(provider) == (
+            "live_connector"
+        ):
             from app.tools.record_backend import LiveRecordBackend  # noqa: PLC0415
 
             return await LiveRecordBackend().lookup(ctx, query)

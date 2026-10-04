@@ -34,7 +34,10 @@ with the deployment's API-key auth). Carrier registration remains the tenant's, 
 as such rather than falsely verified.
 
 Disabling does NOT release the number — the connection row is retained so re-enabling
-needs no re-setup (§3.7.1 / §3.8.7 B).
+needs no re-setup (§3.7.1 / §3.8.7 B). DISCONNECTING does (owner ruling 2026-09-14,
+round 7 WP-4a item 12): ``service.disconnect`` moves the number to
+``released_destination`` — on file, not a claim — and ``attach_sms_number`` is how it
+comes back, through the same ownership gate and probe as a first attach.
 """
 
 from __future__ import annotations
@@ -134,6 +137,32 @@ def _status_for(result: OperabilityResult, cfg: dict[str, object] | None = None)
     return STATUS_NOT_OPERABLE, _DETAIL_UNKNOWN
 
 
+def auth_class_for_credential_on_file(existing: InstanceConnection) -> str:
+    """The behavior class an sms row keeps through a number attach (round 7 WP-4a item 2).
+
+    A number designation says nothing about HOW the account is authenticated, so it
+    must not re-stamp the class: attach used to write ``api_key`` unconditionally, and
+    an OAuth tenant's row (bearer grant on file, ``mode`` ``oauth``) stopped being
+    probed — the sweep's bearer liveness call and the refresh path both key on
+    ``oauth_token`` — the moment they designated a number. Derived from the credential
+    shape on file: the OAuth class (or the OAuth ``mode`` the verify step stamped)
+    stays; everything else is the API-key class the credential form writes."""
+    cfg = existing.non_secret_config or {}
+    if existing.auth_class == "oauth_token" or cfg.get("mode") == "oauth":
+        return "oauth_token"
+    return "api_key"
+
+
+def status_for_pending_number() -> tuple[str, str]:
+    """(status, detail) for an sms row whose number is parked under
+    ``pending_destination`` (never confirmed operable): the honest not-operable
+    state with the hosting guidance. Used when a credential repair lands on a row
+    the sweep had flipped to error/expired (round 7 WP-4a item 3) — the number's
+    truth is unchanged, and leaving the row in error would read as a credential
+    problem the owner just fixed."""
+    return STATUS_NOT_OPERABLE, _DETAIL_NOT_OPERABLE
+
+
 def status_for_confirmed_number(cfg: dict[str, object]) -> tuple[str, str]:
     """(status, detail) for an sms row whose ``destination`` is already the
     confirmed-operable claim: connected iff attested, else pending (§3.1.4).
@@ -170,6 +199,7 @@ async def attach_sms_number(
     e164_number: str,
     probe: NumberOperabilityProbe | None = None,
     webhook_config: TwilioWebhookConfigurator | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> InstanceConnection:
     """Attach (or change) the tenant's BYO SMS number, gated on live operability.
 
@@ -178,6 +208,7 @@ async def attach_sms_number(
     required`` with guidance. NO number provisioning happens (BYO, §3.1.4). Changing
     the number re-runs the gate from scratch (number-change invalidation), so a new
     number never inherits the old number's status. Idempotent per tenant/instance.
+    A status change on an EXISTING row is audited under ``user_id`` (item 9).
     """
     number = _validate_e164(e164_number)
     # Cross-tenant uniqueness (§3.1.3) BEFORE the operability probe: every other
@@ -211,23 +242,43 @@ async def attach_sms_number(
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is not None:
         existing.provider = "twilio"
-        existing.auth_class = "api_key"
+        # The class follows the CREDENTIAL on file, not the attach (item 2): an OAuth
+        # row keeps oauth_token so the bearer probe and refresh keep running.
+        existing.auth_class = auth_class_for_credential_on_file(existing)
         # Merge, don't replace: the BYO Twilio account id (§3.1.4) also lives here, and
         # designating a number must not silently unbind the account it belongs to.
         prior_cfg = existing.non_secret_config or {}
         merged = {**prior_cfg, **cfg_update}
         merged.pop(cfg_pop, None)
+        # Round 7 WP-4a item 12: a disconnect parked the row's number under the
+        # released copy (not a claim). This attach is the re-proof — the ownership
+        # gate above and the probe just ran against the number being attached — so
+        # the copy is consumed either way; it still counts as the PRIOR number, so
+        # an attestation of the released number never carries to a different one.
+        from app.connections.service import RELEASED_DESTINATION_KEY  # noqa: PLC0415
+
+        merged.pop(RELEASED_DESTINATION_KEY, None)
         # Number-change invalidation extends to the attestation (round 5B item
         # 10): the owner attested THAT number's registration, so a different
         # number re-derives from scratch. A same-number re-attach keeps it.
-        prior_number = prior_cfg.get("destination") or prior_cfg.get("pending_destination")
+        prior_number = (
+            prior_cfg.get("destination")
+            or prior_cfg.get("pending_destination")
+            or prior_cfg.get(RELEASED_DESTINATION_KEY)
+        )
         if prior_number and prior_number != number:
             merged.pop(_ATTESTED_AT_KEY, None)
             merged.pop(_ATTESTED_BY_KEY, None)
         status, detail = _status_for(result, merged)
         existing.non_secret_config = merged
-        existing.status = status
-        existing.status_detail = detail
+        # Round 7 WP-4a item 9: the status write goes through the shared owner
+        # transition so a number change that demotes a serving row (connected →
+        # not_operable on a number the account cannot operate) leaves an audit row.
+        from app.connections import health  # noqa: PLC0415 — circular at module import
+
+        await health.transition_by_owner(
+            session, existing, status, detail, reason="sms_number_attached", user_id=user_id
+        )
         conn = existing
     else:
         status, detail = _status_for(result, dict(cfg_update))
@@ -362,6 +413,7 @@ async def reverify_sms_number(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     probe: NumberOperabilityProbe | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> InstanceConnection | None:
     """Re-run the operability probe against the CURRENTLY attached number (§3.1.4).
 
@@ -369,7 +421,10 @@ async def reverify_sms_number(
     swapped-in number is what gets checked, never a remembered value) and re-derives the
     status from a fresh Twilio probe. No background poller, no expiry — the tenant clicks
     this after hosting/registering their number. Returns the updated row, or None if no
-    number has been attached yet (nothing to re-verify)."""
+    number has been attached yet (nothing to re-verify). A real status change (a
+    promotion, or a demotion that switches texting off) is audited under ``user_id``
+    through the shared owner transition (round 7 WP-4a item 9); a re-verify that
+    changes nothing writes no audit row."""
     existing = await _find_sms_sender(session, admin_id, instance_id)
     if existing is None:
         return None
@@ -401,8 +456,11 @@ async def reverify_sms_number(
     # a failed probe demotes honestly but RETAINS the attestation keys (a Twilio
     # outage must not erase the owner's attestation — round 5B item 10).
     status, detail = _status_for(result, existing.non_secret_config or {})
-    existing.status = status
-    existing.status_detail = detail
+    from app.connections import health  # noqa: PLC0415 — circular at module import
+
+    await health.transition_by_owner(
+        session, existing, status, detail, reason="sms_number_reverified", user_id=user_id
+    )
     await session.flush()
 
     # Round 5B item 15 — webhook drift repair: Re-verify is the customer's "make

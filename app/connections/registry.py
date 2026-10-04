@@ -127,8 +127,9 @@ class ProviderSpec:
     redirect_uri_setting: str | None = None
     # Non-OAuth providers: the fields their connect form collects.
     credential_fields: tuple[CredentialField, ...] = ()
-    # §3.8.5 health cadence is keyed on auth_class; this is the behavior key the
-    # connection row inherits, so a new provider in an existing class needs no code.
+    # §3.8.5: auth_class is the behavior key the connection row inherits (what the
+    # health probe and the token refresh DO for it — the sweep itself is one 6-hour
+    # cron for every class), so a new provider in an existing class needs no code.
     auth_class: str = "oauth_token"
     # Knowledge sources: the scope the owner may select (Decision #9). None = no scope.
     scope_kind: str | None = None
@@ -524,10 +525,18 @@ _ORDER: dict[str, tuple[str, ...]] = {
     "email_sender": ("outlook",),
 }
 
-# Provider ids that were split before the single-Meta correction. Rows already written
-# under them keep resolving (and normalize to ``meta`` on the next connect) instead of
-# turning into an unregistered provider with no OAuth config.
-_ALIASES: dict[str, str] = {"meta_whatsapp": "meta", "meta_instagram": "meta"}
+# Superseded provider ids. Rows already written under them keep resolving (and
+# normalize to the registered id on the next connect) instead of turning into an
+# unregistered provider with no config:
+#   * ``meta_whatsapp`` / ``meta_instagram`` — split before the single-Meta correction;
+#   * ``api`` — what the round 6 WP-H record-source dispatch and connect-time proof
+#     keyed on, while the registry only ever offered ``live_connector`` (round 7
+#     WP-4a item 1: the live connector was permanently green and permanently dead).
+_ALIASES: dict[str, str] = {
+    "meta_whatsapp": "meta",
+    "meta_instagram": "meta",
+    "api": "live_connector",
+}
 
 
 def canonical_provider(provider: str) -> str:
@@ -537,6 +546,12 @@ def canonical_provider(provider: str) -> str:
 
 # The connection types that present the owner a provider choice (Decision #6).
 CHOICE_TYPES: frozenset[str] = frozenset(_ORDER)
+
+# Providers whose whole credential is an https URL plus an OPTIONAL Authorization
+# header (round 7 WP-4a items 4/6): proven at connect time by a GET the endpoint must
+# not refuse, and probed by the sweep the same way. ``live_connector`` is URL-shaped
+# too but carries its own record-array proof (item 1).
+URL_SHAPED_PROVIDERS: frozenset[str] = frozenset({"custom_webhook", "outbound_webhook"})
 
 # Providers ACCEPTED for a connection type but deliberately absent from its owner-facing
 # choice list. Knowledge sync (§3.2.3) rides ``knowledge_source`` connections for two cases

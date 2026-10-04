@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.channels.email_routing import MxDelegationProbe, MxDelegationResult
 from app.connections import registry
+from app.connections.health import NEXT_PROBE_AT_KEY
 from app.connections.secrets import (
     SecretStore,
     get_secret_store,
@@ -36,8 +38,12 @@ from app.connections.secrets import (
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 
-# §3.8.2: auth_class is the behavior key (drives §3.8.5 health cadence + refresh),
-# defaulted from connection_type. The provider brand never reaches this table's
+if TYPE_CHECKING:
+    from app.channels.tenant_twilio import TwilioCredentials
+
+# §3.8.2: auth_class is the behavior key (drives what the §3.8.5 health probe and
+# token refresh do for the row — the sweep is one 6-hour cron), defaulted from
+# connection_type. The provider brand never reaches this table's
 # logic — a new provider in an existing class inherits behavior automatically.
 _AUTH_CLASS_BY_TYPE: dict[str, str] = {
     "calendar": "oauth_token",
@@ -52,6 +58,33 @@ _AUTH_CLASS_BY_TYPE: dict[str, str] = {
 }
 
 
+#: Statuses in which a row is SERVING — the universal gate dispatches on ``connected``
+#: (gate.CONNECTED) and ``outbound.SMS_OPERABLE_STATUSES`` lets a text leave on
+#: ``pending_carrier_registration``. A second Connect on such a row must not reset it
+#: in place (round 7 WP-4a item 8); ``swap`` is the proven-before-cutover verb.
+SERVING_STATUSES: frozenset[str] = frozenset({"connected", "pending_carrier_registration"})
+
+
+class ConnectionServing(Exception):
+    """A fresh Connect landed on a row that is currently serving (round 7 WP-4a item 8).
+
+    ``start_connection`` used to overwrite provider / auth_class / status on the
+    live row before any new credential existed — one click on Connect took a working
+    calendar offline and pointed its secret_ref at a provider whose token was never
+    going to arrive. The typed refusal names the verb that does this safely."""
+
+    code = "connection_serving_use_swap"
+
+    def __init__(self, connection: InstanceConnection) -> None:
+        self.connection_id = connection.connection_id
+        self.connection_type = connection.connection_type
+        super().__init__(
+            f"{self.code}: this {connection.connection_type.replace('_', ' ')} connection is "
+            "connected and in use. Use 'Change account' to replace it — the current account "
+            "keeps working until the new one verifies — or disconnect it first."
+        )
+
+
 class ProviderNotRegistered(ValueError):
     """The requested provider is not registered for this connection type (§3.8.2)."""
 
@@ -62,14 +95,14 @@ _OAUTH_CLASSES = frozenset({"oauth_token"})
 
 
 def _auth_class_for(connection_type: str, provider: str | None = None) -> str:
-    """The behavior key for this connection (§3.8.5 health cadence + refresh).
+    """The behavior key for this connection (§3.8.5 health probe + refresh).
 
     The registered PROVIDER wins when there is one, because the auth class is a property
     of the integration and not of the slot it fills: a CRM connection is oauth_token via
     HubSpot but long_lived_token via a custom webhook (Decision #6), and giving both the
-    type's default would put the webhook on a token-refresh cadence it has no token for.
-    Unknown types fall back to api_key (safe, 60-min cadence) rather than erroring, so the
-    catalog can add a type before this map is updated."""
+    type's default would put the webhook on a token-refresh path it has no token for.
+    Unknown types fall back to api_key (safe: no refresh attempted) rather than erroring,
+    so the catalog can add a type before this map is updated."""
     spec = registry.get_provider(provider) if provider else None
     if spec is not None and spec.connection_type == connection_type:
         return spec.auth_class
@@ -202,12 +235,20 @@ async def start_connection(
     user_id: uuid.UUID | None,
     phone_number: str | None = None,
     now: datetime | None = None,
+    store: SecretStore | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]]:
     """Begin a connect flow: create (or reuse) the row in ``unconfigured`` and return
     the row + StartConnectionResult (§3.8.4 lifecycle starts at unconfigured).
 
     If a non-revoked row of this type already exists we reuse it (single-active per
-    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure.
+    type, §3.8.2) and reset it to unconfigured so the admin can reconfigure — UNLESS
+    the row is serving (round 7 WP-4a item 8): a connected calendar or a sending
+    number is refused with the typed ``ConnectionServing`` (409 on the wire) that
+    points at ``swap``, because resetting it here took it offline before any new
+    credential existed. On a non-serving row whose PROVIDER changes, the old
+    provider's secret material (live and staged) is destroyed and audited: a
+    HubSpot token left under a row that now says Salesforce would be read as a
+    Salesforce token by the probe and the tools.
 
     BYO number (§3.1.4): for an ``sms_sender`` connect the platform never provisions a
     number — the admin supplies their own E.164 number via ``phone_number``. When
@@ -250,6 +291,7 @@ async def start_connection(
             admin_id=admin_id,
             instance_id=instance_id,
             e164_number=phone_number,
+            user_id=user_id,
         )
         await audit.emit(
             session,
@@ -308,7 +350,45 @@ async def start_connection(
             "allowance. Add a payment method to restore it — your saved "
             "configuration comes back as it was, no re-setup."
         )
+    if existing is not None and existing.status in SERVING_STATUSES:
+        # Round 7 WP-4a item 8: never reset a serving row in place — the verb for
+        # "use another account while this one keeps working" is swap.
+        raise ConnectionServing(existing)
     if existing is not None:
+        provider_changed = existing.provider != provider
+        # A stale attempt on the row (a parked OAuth state, a staged swap target, an
+        # abandoned reconnect marker, a rate-limit backoff the old credential earned)
+        # is swept exactly as disconnect sweeps it: this is a fresh start, and a late
+        # callback must not redeem the old state.
+        cfg = dict(existing.non_secret_config or {})
+        for ephemeral in _ATTEMPT_STATE_KEYS:
+            cfg.pop(ephemeral, None)
+        existing.non_secret_config = cfg
+        if provider_changed and existing.secret_ref is not None:
+            # The old provider's material must not survive under the new provider's
+            # name: destroyed (live ref AND any staged copy), and audited with the
+            # ref + result only (§3.8.3 rule 4).
+            from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+            store = store or get_secret_store()
+            deleted = await store.delete(existing.secret_ref)
+            await store.delete(staged_secret_ref(existing.secret_ref))
+            await audit.emit(
+                session,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                actor_type=ActorType.admin_user,
+                actor_user_id=user_id,
+                event_type="connection_secret_cleanup",
+                payload={
+                    "connection_id": str(existing.connection_id),
+                    "secret_ref": existing.secret_ref,
+                    "deleted": deleted,
+                    "reason": "provider_changed",
+                    "old_provider": existing.provider,
+                    "new_provider": provider,
+                },
+            )
         existing.provider = provider
         existing.auth_class = auth_class
         existing.status = "unconfigured"
@@ -408,6 +488,64 @@ class CredentialRejected(ValueError):
     """The submitted connect-form credential is missing, malformed, or refused."""
 
 
+async def _prove_submitted_credential(
+    *,
+    provider: str,
+    url: str | None,
+    material: dict[str, str],
+    twilio_creds: TwilioCredentials | None,
+) -> None:
+    """The TARGET proof of a credential-form submit (round 7 WP-4a item 4): what must
+    be true of the submitted credential before it may replace whatever serves today.
+
+    Twilio's live verify (a no-op outside live mode, disclosed in
+    ``tenant_twilio.verify_credentials``); the live connector's authenticated
+    record-array GET (item 1); the webhook GET a URL-shaped endpoint must not refuse.
+    Raises ``CredentialRejected`` with the owner-facing reason — the caller discards
+    the staged copy and the live credential never moved."""
+    if provider == "twilio":
+        from app.channels.tenant_twilio import (  # noqa: PLC0415
+            InvalidTwilioCredentials,
+            verify_credentials,
+        )
+
+        if twilio_creds is None:  # pragma: no cover — the twilio branch always shapes creds
+            raise CredentialRejected("Twilio credentials could not be read.")
+        try:
+            await verify_credentials(twilio_creds)
+        except InvalidTwilioCredentials as exc:
+            raise CredentialRejected(str(exc)) from exc
+        return
+    if not url:
+        return
+    if provider == "live_connector":
+        # Round 6 WP-H (F062) / round 7 WP-4a item 1: a URL that returns HTML, refuses
+        # the key, or is down would otherwise produce a healthy-looking row and a tool
+        # that fails on every lookup. Keyed on the id the connect flow writes.
+        from app.connections.probes import (  # noqa: PLC0415
+            LiveConnectorProofFailed,
+            prove_live_connector,
+        )
+
+        try:
+            await prove_live_connector(url=url, api_key=str(material.get("api_key") or "") or None)
+        except LiveConnectorProofFailed as exc:
+            raise CredentialRejected(str(exc)) from exc
+        return
+    if provider in registry.URL_SHAPED_PROVIDERS:
+        from app.connections.probes import (  # noqa: PLC0415
+            WebhookProofFailed,
+            prove_webhook_endpoint,
+        )
+
+        try:
+            await prove_webhook_endpoint(
+                url=url, auth_header=str(material.get("auth_header") or "") or None
+            )
+        except WebhookProofFailed as exc:
+            raise CredentialRejected(str(exc)) from exc
+
+
 # The "add your number" state (§3.1.4): the Twilio account is connected but Luciel has
 # no number to send FROM, so the channel is not live and says so. Public name because
 # the OAuth-callback completion (C10) lands on the same state for a numberless account.
@@ -488,21 +626,20 @@ async def submit_credentials(
     if missing:
         raise CredentialRejected(f"Missing required field(s): {', '.join(missing)}.")
 
+    twilio_creds: TwilioCredentials | None = None
     if spec.provider == "twilio":
         from app.channels.tenant_twilio import (
             InvalidTwilioCredentials,
             secret_material,
             validate_submitted_credentials,
-            verify_credentials,
         )
 
         try:
-            creds = validate_submitted_credentials(fields)
-            await verify_credentials(creds)
+            twilio_creds = validate_submitted_credentials(fields)
         except InvalidTwilioCredentials as exc:
             raise CredentialRejected(str(exc)) from exc
-        material = secret_material(creds)
-        non_secret: dict[str, object] = {"accountSid": creds.account_sid}
+        material = secret_material(twilio_creds)
+        non_secret: dict[str, object] = {"accountSid": twilio_creds.account_sid}
         # The FORM path is the API-key class even though the twilio spec is
         # OAuth-primary (C10): this row now holds the customer's own keys, so
         # health/refresh must treat it as api_key, not chase a refresh token
@@ -539,43 +676,58 @@ async def submit_credentials(
                 )
         non_secret["egressAllowlist"] = [parsed.hostname]
 
-    if connection.connection_type == "record_source" and spec.provider == "api" and raw_url:
-        # Round 6 WP-H (F062): prove the endpoint answers a test query BEFORE the row
-        # claims to be connected — a URL that 404s or returns HTML would otherwise
-        # produce a healthy-looking row and a tool that fails on every lookup.
-        from app.tools.record_backend import (  # noqa: PLC0415
-            RecordSourceUnavailable,
-            build_record_transport,
-            query_live_records,
-        )
-
-        try:
-            await query_live_records(
-                url=str(raw_url),
-                query="ping",
-                api_key=str(material.get("api_key") or "") or None,
-                allowlist=frozenset(),
-                transport=build_record_transport(),
-            )
-        except RecordSourceUnavailable as exc:
-            raise CredentialRejected(
-                "Your record lookup URL did not answer a test query with a JSON array "
-                f"of records ({exc}). Check the address and the API key."
-            ) from exc
     if not connection.secret_ref:
         connection.secret_ref = secret_ref_for(
             admin_id, connection.instance_id, connection.connection_type
         )
-    await (store or get_secret_store()).put(connection.secret_ref, material)
+    # Round 7 WP-4a item 4: PROVEN BEFORE THE LIVE SECRET MOVES. The submitted
+    # material is parked under the staged ref (the same slot the OAuth callback
+    # stages under, so the item-5 abandonment sweep and the cascade prefix sweep
+    # both cover it), the target proof runs against it — Twilio's live verify, the
+    # live connector's record-array GET (item 1), the webhook GET the endpoint must
+    # not refuse — and only a passing proof promotes it over the live ref. A failed
+    # proof discards the staged copy and raises: whatever served before this submit
+    # (a HubSpot token under a HubSpot→webhook swap, a working Twilio key under a
+    # re-credential) keeps serving untouched. Before this the material was written
+    # straight over the live ref and the row flipped to connected unproven.
+    from app.knowledge.providers import staged_secret_ref  # noqa: PLC0415
+
+    secret_store = store or get_secret_store()
+    staged_ref = staged_secret_ref(connection.secret_ref)
+    await secret_store.put(staged_ref, material)
+    try:
+        await _prove_submitted_credential(
+            provider=spec.provider,
+            url=str(raw_url) if raw_url else None,
+            material=material,
+            twilio_creds=twilio_creds,
+        )
+    except Exception:
+        await secret_store.delete(staged_ref)
+        raise
+    await secret_store.put(connection.secret_ref, material)
+    await secret_store.delete(staged_ref)
     connection.non_secret_config = {**(connection.non_secret_config or {}), **non_secret}
     # Complete the staged swap only now that the replacement is verified + stored
     # (§3.8.7 rule B): the provider/auth_class flip is the LAST step, and the stale
     # stage marker never outlives the submit either way.
     cfg_after = dict(connection.non_secret_config or {})
-    if cfg_after.pop("pending_provider", None) is not None:
-        connection.non_secret_config = cfg_after
-        if effective_provider != connection.provider:
-            connection.provider = effective_provider
+    # Item 10: a rate-limit backoff was earned by the credential just replaced; the
+    # one that was proven a moment ago must not inherit the wait.
+    cfg_after.pop(NEXT_PROBE_AT_KEY, None)
+    staged_swap = cfg_after.pop("pending_provider", None) is not None
+    if twilio_creds is not None:
+        # The row now holds the customer's OWN keys: whatever the one-click OAuth
+        # verify stamped describes a grant that is no longer the credential. Left
+        # behind, ``mode: oauth`` made the next number attach re-derive the OAuth
+        # class (item 2 reads it) over API-key material, and the stale
+        # ``token_expires_at`` then sent the sweep to refresh a token that is not
+        # there — a working key flipped to expired with an attention email.
+        for stamp in _TWILIO_OAUTH_STAMPS:
+            cfg_after.pop(stamp, None)
+    connection.non_secret_config = cfg_after
+    if staged_swap and effective_provider != connection.provider:
+        connection.provider = effective_provider
     # The verified submit decides the row's behavior class — for most providers
     # that is the spec's class (a no-op), but a Twilio form submit stamps
     # api_key over the OAuth-primary default, including when an OAuth tenant
@@ -600,7 +752,15 @@ async def submit_credentials(
         connection.status = "unconfigured"
         connection.status_detail = _SMS_NEEDS_NUMBER
     elif number_pending:
-        pass  # keep the not-operable status + guidance the attach wrote
+        if old_status in ("error", "expired"):
+            # Round 7 WP-4a item 3: the sweep probes not-operable rows too, so a
+            # dead credential lands here as error. The repaired credential returns
+            # the row to the number's honest state (still not operable) instead of
+            # leaving it in the error the owner just fixed.
+            from app.channels.phone_lifecycle import status_for_pending_number  # noqa: PLC0415
+
+            connection.status, connection.status_detail = status_for_pending_number()
+        # else keep the not-operable status + guidance the attach wrote
     elif is_sms:
         # Round 5B item 10: a credential (re)submit on a confirmed number must
         # not blanket-promote past the carrier-registration gate — connected iff
@@ -654,6 +814,7 @@ async def reconnect(
     admin_id: uuid.UUID,
     connection_id: uuid.UUID,
     user_id: uuid.UUID | None,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Re-initiate a connect flow: proven-before-cutover (Decision §45 / §3.8.7 rule B).
 
@@ -662,7 +823,11 @@ async def reconnect(
     dependency offline before the new credential is confirmed healthy.  Instead:
 
       1. ``status_detail`` records ``reconnect_pending:prior_status=<old>`` so the
-         confirm step (and the health worker) can roll back if the probe fails.
+         confirm step (and the health worker) can roll back if the probe fails, and
+         ``non_secret_config['reconnect_pending_since']`` records WHEN the attempt
+         began (round 7 WP-4a item 5) — the sweep treats a marker older than
+         ``health.RECONNECT_ABANDON_AFTER`` as abandoned and clears it, instead of
+         excluding the row from health forever because the owner closed the tab.
       2. When the OAuth callback / credential submission arrives, the caller invokes
          ``confirm_reconnect()`` which health-checks the new credential and only then
          cuts over to ``connected`` (or restores the prior status on failure).
@@ -684,7 +849,7 @@ async def reconnect(
 
     # Proven-before-cutover: record intent without taking the live connection offline.
     old_status = connection.status
-    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
+    _stage_reconnect_marker(connection, old_status, now or datetime.now(UTC))
     await session.flush()
 
     await audit.emit(
@@ -704,6 +869,81 @@ async def reconnect(
     return connection, _start_result(connection.auth_class, connection, admin_id=admin_id)
 
 
+#: non_secret_config key: ISO timestamp of when the current reconnect/swap attempt
+#: began (round 7 WP-4a item 5). Read by the health sweep's abandonment rule.
+RECONNECT_PENDING_SINCE_KEY = "reconnect_pending_since"
+
+#: Every non_secret_config key that belongs to an ATTEMPT on the row rather than to
+#: the owner's configuration: a parked OAuth state, a staged swap target, the
+#: reconnect marker's timestamp, and the health sweep's rate-limit backoff hint
+#: (item 10 — earned by the credential being replaced, meaningless to the next one).
+#: A fresh Connect and a disconnect both sweep them; a late callback must not
+#: redeem the old state and a new credential must not inherit an old wait.
+_ATTEMPT_STATE_KEYS: tuple[str, ...] = (
+    "oauth_state_jti",
+    "authorize_url",
+    "pending_provider",
+    RECONNECT_PENDING_SINCE_KEY,
+    NEXT_PROBE_AT_KEY,
+)
+
+#: Round 7 WP-4a item 12 (owner ruling 2026-09-14): where a disconnect parks the
+#: number / mailbox address the row was routing on. It is NOT a claim — inbound
+#: routing and the cross-tenant uniqueness gate read ``destination`` only — just the
+#: owner's own value kept on file so a reconnect can offer it back. Getting it back
+#: goes through the normal attach / verify path, which re-runs the ownership gate.
+RELEASED_DESTINATION_KEY = "released_destination"
+
+#: non_secret_config keys the Twilio one-click OAuth verify stamps (verify.py). A
+#: credential-form submit on the same row replaces that grant with the customer's
+#: own keys, so they are dropped at the cutover (see submit_credentials).
+_TWILIO_OAUTH_STAMPS: tuple[str, ...] = ("mode", "token_expires_at", "accountName", "connectedAs")
+
+#: The connection types whose row holds a number / mailbox routing claim.
+_CLAIM_HOLDING_TYPES: frozenset[str] = frozenset({"sms_sender", "email_sender"})
+
+
+def _release_routing_claim(connection: InstanceConnection, cfg: dict[str, object]) -> str | None:
+    """Take the number / mailbox off a disconnected row's routing keys (item 12).
+
+    Mutates ``cfg``; returns the CLAIM that was released (``destination``), or None
+    when the row held none. Before this, ``destination`` survived a disconnect on
+    every sms row and every platform email row, so a churned account held the number
+    or address forever: inbound to it still resolved to the dead tenant, and its
+    real owner was refused as "already connected to a different account".
+
+    Whatever was on file — the confirmed claim, a number parked under
+    ``pending_destination`` (never a claim, c21), a legacy address with no
+    destination — is kept under ``RELEASED_DESTINATION_KEY`` and nowhere else, so
+    every reconnect path lands the row on the same honest "add your number" /
+    "connect your mailbox" state instead of resuming a claim nobody re-proved. An
+    email row's ``address`` and ``mode`` go with the claim: the address is the FROM
+    identity and the re-verify key, and a row that no longer owns it must not keep
+    sending as it or re-verify its way back to connected around the claim check."""
+    if connection.connection_type not in _CLAIM_HOLDING_TYPES:
+        return None
+    claim = cfg.pop("destination", None)
+    on_file: list[object] = [claim, cfg.pop("pending_destination", None)]
+    if connection.connection_type == "email_sender":
+        on_file.append(cfg.pop("address", None))
+        cfg.pop("mode", None)
+    kept = next((v for v in on_file if isinstance(v, str) and v), None)
+    if kept is not None:
+        cfg[RELEASED_DESTINATION_KEY] = kept
+    return claim if isinstance(claim, str) and claim else None
+
+
+def _stage_reconnect_marker(
+    connection: InstanceConnection, prior_status: str, now: datetime
+) -> None:
+    """Write the proven-before-cutover marker (status_detail) and its attempt
+    timestamp (non_secret_config) together, so neither can exist without the other."""
+    connection.status_detail = f"reconnect_pending:prior_status={prior_status}"
+    cfg = dict(connection.non_secret_config or {})
+    cfg[RECONNECT_PENDING_SINCE_KEY] = now.isoformat()
+    connection.non_secret_config = cfg
+
+
 async def swap(
     session: AsyncSession,
     *,
@@ -711,6 +951,7 @@ async def swap(
     connection_id: uuid.UUID,
     provider: str,
     user_id: uuid.UUID | None,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Change the connected account: re-initiate a connect flow against a (possibly
     different) provider WITHOUT taking the current connection offline (§3.8.7 rule B,
@@ -772,7 +1013,7 @@ async def swap(
     existing_config = dict(connection.non_secret_config or {})
     existing_config["pending_provider"] = provider
     connection.non_secret_config = existing_config
-    connection.status_detail = f"reconnect_pending:prior_status={old_status}"
+    _stage_reconnect_marker(connection, old_status, now or datetime.now(UTC))
     await session.flush()
 
     await audit.emit(
@@ -843,15 +1084,19 @@ async def confirm_reconnect(
     # config; only apply it to `connection.provider` on a confirmed-healthy probe.
     config = dict(connection.non_secret_config or {})
     pending_provider = config.pop("pending_provider", None)
+    config.pop(RECONNECT_PENDING_SINCE_KEY, None)  # the attempt is over either way (item 5)
 
     if probe_ok:
         # New credential confirmed healthy — cut over now (proven-before-cutover).
         # This is the ONLY place a swap's staged provider becomes authoritative.
+        # A rate-limit backoff the OLD credential earned goes with it (item 10); on
+        # the failure branch below the old credential keeps serving and keeps its wait.
+        config.pop(NEXT_PROBE_AT_KEY, None)
         if pending_provider is not None:
             connection.provider = str(pending_provider)
             # The behavior key follows the provider (§3.8.5): a cross-class swap
             # (provisioned ses → oauth_token outlook) that kept the old class would
-            # put the new credential on a cadence with no refresh and no expiry.
+            # leave the new credential with no refresh path and no expiry hint.
             connection.auth_class = _auth_class_for(
                 connection.connection_type, str(pending_provider)
             )
@@ -873,10 +1118,15 @@ async def confirm_reconnect(
             # yet means the honest "add your number" state.
             from app.channels.phone_lifecycle import (  # noqa: PLC0415
                 status_for_confirmed_number,
+                status_for_pending_number,
             )
 
             if config.get("destination"):
                 connection.status, connection.status_detail = status_for_confirmed_number(config)
+            elif config.get("pending_destination"):
+                # A parked (never confirmed operable) number keeps its honest
+                # not-operable state through a reconnect (item 3).
+                connection.status, connection.status_detail = status_for_pending_number()
             else:
                 connection.status = "unconfigured"
                 connection.status_detail = _SMS_NEEDS_NUMBER
@@ -1128,10 +1378,20 @@ async def clear_crm_links(
     Record ids belong to ONE CRM account. After a disconnect — or a swap, which
     is a reconnect against a possibly different account — a stale id would
     silently 404-heal into a duplicate record there. The next push relinks by
-    the documented search-by-key step. Audited with the count, never lead PII."""
+    the documented search-by-key step. Audited with the count, never lead PII.
+
+    The per-lead push state goes with the links (round 7 WP-4a item 12): a lead
+    stamped ``synced`` kept reading "in your CRM" on the Leads page after the CRM
+    was disconnected — or swapped for an account it was never pushed to — and a
+    ``failed`` one kept counting as a broken push against a connection that no
+    longer exists. Every stamp returns to NULL ("nothing was ever attempted"),
+    including the once-per-lead failure notice, so the next connection starts
+    clean and its first failure is reported."""
     from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+    from sqlalchemy import update as sa_update  # noqa: PLC0415
 
     from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
+    from app.models.lead import Lead  # noqa: PLC0415
 
     cleared_result = await session.execute(
         sa_delete(CrmLeadLink).where(
@@ -1140,6 +1400,21 @@ async def clear_crm_links(
         )
     )
     cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
+    reset_result = await session.execute(
+        sa_update(Lead)
+        .where(
+            Lead.admin_id == admin_id,
+            Lead.instance_id == connection.instance_id,
+            Lead.crm_push_status.is_not(None),
+        )
+        .values(
+            crm_push_status=None,
+            crm_push_detail=None,
+            crm_pushed_at=None,
+            crm_failure_notified_at=None,
+        )
+    )
+    leads_reset = int(getattr(reset_result, "rowcount", 0) or 0)
     await audit.emit(
         session,
         admin_id=admin_id,
@@ -1151,6 +1426,7 @@ async def clear_crm_links(
             "connection_id": str(connection.connection_id),
             "provider": connection.provider,
             "count": cleared_count,
+            "leads_reset": leads_reset,
             "reason": reason,
         },
     )
@@ -1175,10 +1451,16 @@ async def disconnect(
     still in flight re-credential a connection the owner just disconnected, and a staged
     ``pending_provider`` would silently resurrect on the next confirm.
 
-    Non-secret operational config (a BYO phone number, a provisioned email address) is
-    KEPT: it is not credential material, and making the owner retype their own number to
-    re-link a calendar-adjacent channel is the "demo, not a product" feeling this pass
-    exists to remove. Scope selections are kept for the same reason.
+    Non-secret operational config (the Twilio account id, scope selections, the
+    carrier attestation) is KEPT: it is not credential material, and making the owner
+    retype it is the "demo, not a product" feeling this pass exists to remove.
+
+    The routing CLAIM is not kept (owner ruling 2026-09-14, round 7 WP-4a item 12): a
+    BYO number or a mailbox address moves from ``destination`` to
+    ``released_destination`` — still on file for the owner, no longer resolving
+    inbound and no longer blocking another account from connecting it. A reconnect
+    re-proves ownership through the normal attach / verify path, which re-runs the
+    cross-tenant claim check; nothing resumes a claim on the strength of the copy.
 
     Returns a summary dict, or None if no such connection for this tenant."""
     store = store or get_secret_store()
@@ -1188,20 +1470,19 @@ async def disconnect(
 
     old_status = connection.status
     cfg = dict(connection.non_secret_config or {})
-    for ephemeral in ("oauth_state_jti", "authorize_url", "pending_provider"):
+    for ephemeral in _ATTEMPT_STATE_KEYS:
         cfg.pop(ephemeral, None)
-    # A disconnected OUTLOOK mailbox releases its routing claim. Unlike a BYO phone
-    # number (kept — it is the owner's own asset to re-link), the mailbox address was
-    # bound BY the verify step as this tenant's inbound-routing destination and holds
-    # the cross-tenant uniqueness claim; a dead row must neither keep routing inbound
-    # mail nor block the mailbox's real owner from connecting it elsewhere. The poll
-    # cursor and dedupe window go with it — a future reconnect re-baselines from
-    # scratch (the baseline rule), which is exactly what a fresh consent means.
+    # A disconnected channel connection releases its routing claim (owner ruling
+    # 2026-09-14, item 12) — the number or mailbox address stops resolving inbound
+    # to this tenant and stops blocking its real owner from connecting it elsewhere.
+    # This used to hold for an Outlook mailbox only; a BYO number and a platform
+    # address kept their claim forever.
+    released_claim = _release_routing_claim(connection, cfg)
     if connection.provider == "outlook":
+        # The mailbox's expiry hint, poll cursor and dedupe window go with it — a
+        # future reconnect re-baselines from scratch (the baseline rule), which is
+        # exactly what a fresh consent means.
         for mailbox_state in (
-            "destination",
-            "address",
-            "mode",
             "token_expires_at",
             "mailbox_delta_link",
             "mailbox_seen_ids",
@@ -1234,6 +1515,10 @@ async def disconnect(
             "reason": "disconnect",
             "disabled_tools": cascaded["tools"],
             "disabled_channels": cascaded["channels"],
+            # Item 12: whether this disconnect gave up a number / mailbox claim, and
+            # which (non-secret config, §3.8.3 — the owner's own number or address).
+            "routing_claim_released": released_claim is not None,
+            **({"released_destination": released_claim} if released_claim else {}),
         },
     )
     # §3.8.3 rule 4: cleanup audit carries NO secret material — only the ref + result.
@@ -1277,21 +1562,26 @@ async def switch(
     provider: str | None,
     user_id: uuid.UUID | None,
     store: SecretStore | None = None,
+    force: bool = False,
+    now: datetime | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]] | None:
     """Move a connection to a different account and/or provider (Decision #5c).
 
-    SWITCH = disconnect + reconnect on one call: the old credential is destroyed first,
-    then a fresh connect flow begins against the chosen provider. That ordering is the
-    whole point of the verb — the owner asking to switch has ALREADY decided the current
-    account is wrong, and several providers only ever issue one active grant per app, so
-    holding the old token would either block the new consent or silently keep serving
-    from the account the owner is trying to leave.
+    Round 7 WP-4a item 7: switch DELEGATES TO ``swap`` — proven-before-cutover (§3.8.7
+    rule B). The target is staged beside the live credential, the owner completes the
+    new consent or credential form, and the cutover happens only when
+    ``confirm_reconnect`` / ``submit_credentials`` has verified the replacement. Before
+    this the verb was destroy-first: the secret was gone and every dependent tool and
+    channel cascaded off before the owner had even seen the consent screen, so an
+    owner who closed the tab — or whose new consent failed — was left with nothing
+    serving and a dead row.
 
-    This is deliberately a different trade-off from ``swap``, which stages the candidate
-    provider alongside a still-live connection (proven-before-cutover, §3.8.7 rule B) and
-    is the right verb for re-credentialing an account that currently WORKS. Switch is for
-    "use a different account", and it accepts a momentary not-connected window — audited,
-    with dependents disabled — rather than serving from the wrong account.
+    ``force=True`` keeps the original destroy-first ordering as an EXPLICIT opt-in for
+    the owner who has already decided the current account is wrong and knows the
+    consequence: some providers only ever issue one active grant per app, so holding
+    the old token can block the new consent. It accepts a momentary not-connected
+    window — audited, with dependents disabled — rather than serving from the wrong
+    account. It is never the default.
 
     ``provider`` may be omitted to switch accounts within the SAME provider. When given,
     it must be registered for this connection type (Decision #6) — otherwise an
@@ -1303,6 +1593,17 @@ async def switch(
         return None
 
     target = provider or connection.provider
+    if not force:
+        # Proven-before-cutover: swap validates the target the same way, stages it,
+        # and refuses a revoked row (c21: only lifecycle.restore un-revokes).
+        return await swap(
+            session,
+            admin_id=admin_id,
+            connection_id=connection_id,
+            provider=target,
+            user_id=user_id,
+            now=now,
+        )
     if not registry.is_valid_provider(connection.connection_type, target):
         raise ProviderNotRegistered(
             f"'{target}' is not an available provider for {connection.connection_type}."
@@ -1415,7 +1716,11 @@ async def provision_email(
     in non_secret_config; NO secret material is written here (§3.8.3)."""
     now = now or datetime.now(UTC)
     if mode == "own_domain":
-        address = (email_address or "").strip()
+        # Case-folded (item 12): the address IS the inbound-routing key and every
+        # other producer of one lowercases it — a "Sales@Example.COM" stored as
+        # typed resolved no tenant for mail addressed to the lowercase form, and
+        # let a second tenant claim the same mailbox under a different casing.
+        address = (email_address or "").strip().lower()
         if not address:
             raise ValueError("own_domain requires an email address")
         status = "pending_email_routing"

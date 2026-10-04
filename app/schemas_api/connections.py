@@ -148,9 +148,17 @@ class SwapConnectionRequest(WireModel):
 class SwitchConnectionRequest(WireModel):
     """POST body for "Use a different account" (Decision #5c). ``provider`` may be
     omitted to switch accounts within the same provider; when given it must be one the
-    registry offers for this connection type (Decision #6)."""
+    registry offers for this connection type (Decision #6).
+
+    ``force`` (round 7 WP-4a item 7): the default switch is proven-before-cutover —
+    the current credential keeps serving until the replacement verifies, exactly like
+    ``/swap``. ``force: true`` is the explicit destroy-first path (the old credential is
+    destroyed and dependents cascade off BEFORE the new consent begins) for the owner
+    who knows the current account is wrong and that the provider will not issue a
+    second grant while the first is held. Never the default."""
 
     provider: str | None = None
+    force: bool = False
 
 
 class BindDestinationRequest(WireModel):

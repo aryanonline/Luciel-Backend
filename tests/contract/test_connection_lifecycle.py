@@ -337,7 +337,14 @@ async def test_disconnect_sweeps_the_pending_connect_attempt(client):
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_disconnect_keeps_non_secret_operational_config(client):
     """Disconnect destroys CREDENTIALS, not the owner's own data: a BYO phone number is
-    non-secret operational config, and making them retype it would be gratuitous."""
+    non-secret operational config, and making them retype it would be gratuitous.
+
+    Owner ruling 2026-09-14 (round 7 WP-4a item 12): what a disconnect DOES release
+    is the routing CLAIM — a confirmed number moves from ``destination`` (the key
+    inbound routing resolves and the cross-tenant uniqueness gate checks) to
+    ``released_destination`` (a convenience copy; reconnect re-proves ownership
+    through the normal attach path). A number that never confirmed operable sits
+    under ``pending_destination`` (c21 anti-squatting) and was never a claim."""
     await _ready_account_with_luciel(client)
     await client.post(
         "/api/v1/admin/connections",
@@ -353,10 +360,10 @@ async def test_disconnect_keeps_non_secret_operational_config(client):
     r = await client.post(f"/api/v1/admin/connections/{sms['connectionId']}/disconnect")
     assert r.status_code == 200
     cfg = r.json()["connection"]["nonSecretConfig"]
+    assert "destination" not in cfg, "a disconnected row holds no routing claim"
     # In mock mode the operability probe never confirms, so the number sits under
-    # pending_destination (c21 anti-squatting: only a CONFIRMED-operable number is
-    # the routable claim). Either way, disconnect keeps the owner's number on file.
-    assert (cfg.get("destination") or cfg.get("pending_destination")) == "+14155550111"
+    # pending_destination. Either way, disconnect keeps the owner's number on file.
+    assert (cfg.get("released_destination") or cfg.get("pending_destination")) == "+14155550111"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -472,12 +479,132 @@ async def test_lifecycle_endpoints_require_auth(client):
 
 
 # --------------------------------------------------------------------------- #
-# Decision #5c — SWITCH: disconnect + reconnect against a different provider.
+# Round 7 WP-4a item 8 — a second Connect never resets a serving row in place.
 # --------------------------------------------------------------------------- #
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_switch_destroys_old_credential_and_repoints_provider(client):
-    """Switch is for 'this is the wrong account'. The old credential goes FIRST — holding
-    it would either block the new consent or keep serving from the account being left."""
+async def test_a_second_connect_on_a_connected_row_is_a_typed_409(client):
+    """POST /connections on a type whose row is serving is refused with a typed 409
+    (``connection_serving_use_swap: ...`` — the wire body carries only ``message``,
+    so the code rides its prefix) and the row, its secret and its provider are
+    exactly as they were. The safe verb is /swap (or /switch, which now delegates)."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    await _ready_account_with_luciel(client)
+    cid, admin_id, instance_id = await _connect_calendar(client)
+    ref = secret_ref_for(admin_id, instance_id, "calendar")
+
+    for provider in ("calendly", "google_calendar"):
+        r = await client.post(
+            "/api/v1/admin/connections",
+            json={"connectionType": "calendar", "provider": provider},
+        )
+        assert r.status_code == 409, provider
+        assert r.json()["message"].startswith("connection_serving_use_swap:"), provider
+        assert "cal-token-1" not in r.text
+
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["connectionId"] == cid
+    assert row["provider"] == "google_calendar"
+    assert row["status"] == "connected"
+    assert await get_secret_store().get(ref) is not None
+
+    # The same request through the proven-before-cutover verb is accepted.
+    r = await client.post(f"/api/v1/admin/connections/{cid}/swap", json={"provider": "calendly"})
+    assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Decision #5c — SWITCH: use a different account and/or provider.
+#
+# Round 7 WP-4a item 7: the DEFAULT switch is proven-before-cutover (it delegates to
+# swap, §3.8.7 rule B) — the old credential keeps serving until the new consent /
+# credential verifies. Destroy-first survives only behind an explicit ``force: true``.
+# --------------------------------------------------------------------------- #
+async def _connection_row(admin_id: uuid.UUID, cid: str):
+    from app.db.session import tenant_session
+    from app.models.connection import InstanceConnection
+    from sqlalchemy import select
+
+    async with tenant_session(admin_id) as s:
+        return (
+            await s.execute(
+                select(InstanceConnection).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == uuid.UUID(cid),
+                )
+            )
+        ).scalar_one()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_switch_keeps_the_old_credential_serving_until_the_new_one_verifies(client):
+    """The live condition (item 7): an owner clicks "use a different account", is sent
+    to the consent screen and closes the tab — or the new consent fails. Before, the
+    old secret was already destroyed and every dependent cascaded off, so nothing was
+    serving. Now the row is STAGED beside the live credential: provider, status and
+    the secret are untouched until confirm_reconnect proves the replacement."""
+    from app.connections import service
+    from app.connections.secrets import get_secret_store, secret_ref_for
+    from app.db.session import tenant_session
+
+    await _ready_account_with_luciel(client)
+    cid, admin_id, instance_id = await _connect_calendar(client)
+    ref = secret_ref_for(admin_id, instance_id, "calendar")
+
+    r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly"})
+    assert r.status_code == 200
+    assert "authorizeUrl" in r.json(), "consent is sought from the provider being moved TO"
+
+    assert await get_secret_store().get(ref) is not None, "the old credential still serves"
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["provider"] == "google_calendar", "cutover happens only on confirm"
+    assert row["status"] == "connected"
+    assert row["statusDetail"].startswith("reconnect_pending:prior_status=connected")
+    assert row["nonSecretConfig"]["pending_provider"] == "calendly"
+
+    # The new consent fails: the old account is still the one serving, nothing to
+    # roll back, and the secret was never touched.
+    async with tenant_session(admin_id) as s:
+        ok, reason = await service.confirm_reconnect(
+            s,
+            admin_id=admin_id,
+            connection_id=uuid.UUID(cid),
+            user_id=None,
+            probe_ok=False,
+            probe_detail="consent_denied",
+        )
+    assert not ok and reason == "consent_denied"
+    assert await get_secret_store().get(ref) is not None
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["provider"] == "google_calendar"
+    assert row["status"] == "connected"
+    assert "pending_provider" not in (row["nonSecretConfig"] or {})
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_switch_cuts_over_only_once_the_new_account_verifies(client):
+    from app.connections import service
+    from app.db.session import tenant_session
+
+    await _ready_account_with_luciel(client)
+    cid, admin_id, _instance_id = await _connect_calendar(client)
+    await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly"})
+
+    async with tenant_session(admin_id) as s:
+        ok, status = await service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=uuid.UUID(cid), user_id=None, probe_ok=True
+        )
+    assert ok and status == "connected"
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["provider"] == "calendly"
+    assert row["status"] == "connected"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_switch_force_destroys_old_credential_and_repoints_provider(client):
+    """``force: true`` is the explicit destroy-first opt-in for 'this is the wrong
+    account': the old credential goes FIRST — holding it would either block the new
+    consent (one-grant-per-app providers) or keep serving from the account being left."""
     from app.connections.secrets import get_secret_store, secret_ref_for
 
     await _ready_account_with_luciel(client)
@@ -485,15 +612,36 @@ async def test_switch_destroys_old_credential_and_repoints_provider(client):
     ref = secret_ref_for(admin_id, instance_id, "calendar")
     assert await get_secret_store().get(ref) is not None
 
-    r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly"})
+    r = await client.post(
+        f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly", "force": True}
+    )
     assert r.status_code == 200
     assert "authorizeUrl" in r.json()
 
-    assert await get_secret_store().get(ref) is None, "old credential must not survive a switch"
+    assert await get_secret_store().get(ref) is None, "a forced switch destroys the credential"
     row = (await client.get("/api/v1/admin/connections")).json()[0]
     assert row["provider"] == "calendly"
     # Awaiting the new consent — honestly NOT connected, never a stale `connected`.
     assert row["status"] == "unconfigured"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_switch_force_is_never_the_default(client):
+    """The wire default is the safe path: an omitted ``force`` (and an explicit
+    ``false``) both stage; only a literal ``true`` destroys."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
+
+    await _ready_account_with_luciel(client)
+    cid, admin_id, instance_id = await _connect_calendar(client)
+    ref = secret_ref_for(admin_id, instance_id, "calendar")
+
+    for body in ({"provider": "calendly"}, {"provider": "calendly", "force": False}):
+        r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json=body)
+        assert r.status_code == 200, body
+        assert await get_secret_store().get(ref) is not None, body
+        row = await _connection_row(admin_id, cid)
+        assert row.provider == "google_calendar", body
+        assert row.status == "connected", body
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -503,6 +651,16 @@ async def test_switch_without_provider_changes_account_on_same_provider(client):
 
     r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json={})
     assert r.status_code == 200
+    assert "authorizeUrl" in r.json()
+    row = (await client.get("/api/v1/admin/connections")).json()[0]
+    assert row["provider"] == "google_calendar"
+    # Same provider, different account: staged like any swap — the current account
+    # keeps serving until the new consent verifies.
+    assert row["status"] == "connected"
+    assert row["nonSecretConfig"]["pending_provider"] == "google_calendar"
+
+    r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"force": True})
+    assert r.status_code == 200
     row = (await client.get("/api/v1/admin/connections")).json()[0]
     assert row["provider"] == "google_calendar"
     assert row["status"] == "unconfigured"
@@ -511,42 +669,65 @@ async def test_switch_without_provider_changes_account_on_same_provider(client):
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_switch_rejects_a_provider_from_another_connection_type(client):
     """The registry is per-type: a CRM provider is not a valid calendar, and accepting one
-    would build an authorize URL against the wrong vendor's scopes."""
-    await _ready_account_with_luciel(client)
-    cid, _admin_id, _instance_id = await _connect_calendar(client)
+    would build an authorize URL against the wrong vendor's scopes. Both paths refuse
+    BEFORE anything is staged or destroyed."""
+    from app.connections.secrets import get_secret_store, secret_ref_for
 
-    r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"provider": "hubspot"})
-    assert r.status_code == 422
-    row = (await client.get("/api/v1/admin/connections")).json()[0]
-    assert row["provider"] == "google_calendar", "a rejected switch must change nothing"
-    assert row["status"] == "connected"
+    await _ready_account_with_luciel(client)
+    cid, admin_id, instance_id = await _connect_calendar(client)
+    ref = secret_ref_for(admin_id, instance_id, "calendar")
+
+    for body in ({"provider": "hubspot"}, {"provider": "hubspot", "force": True}):
+        r = await client.post(f"/api/v1/admin/connections/{cid}/switch", json=body)
+        assert r.status_code == 422, body
+        row = (await client.get("/api/v1/admin/connections")).json()[0]
+        assert row["provider"] == "google_calendar", "a rejected switch must change nothing"
+        assert row["status"] == "connected"
+        assert "pending_provider" not in (row["nonSecretConfig"] or {})
+        assert await get_secret_store().get(ref) is not None, body
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_switch_audits_the_provider_change(client):
+    """Default: the staged intent is audited as ``swap_pending`` with both providers
+    (status preserved). Forced: the destroy-first cutover is audited as ``switch``."""
     from app.db.session import tenant_session
     from app.models.audit import AdminAuditLog
     from sqlalchemy import select
+
+    async def _status_changes(admin_id: uuid.UUID, reason: str) -> list[dict]:
+        async with tenant_session(admin_id) as s:
+            events = (
+                (await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin_id)))
+                .scalars()
+                .all()
+            )
+        return [
+            e.event_payload or {}
+            for e in events
+            if e.event_type == "connection_status_changed"
+            and (e.event_payload or {}).get("reason") == reason
+        ]
 
     await _ready_account_with_luciel(client)
     cid, admin_id, _instance_id = await _connect_calendar(client)
     await client.post(f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly"})
 
-    async with tenant_session(admin_id) as s:
-        events = (
-            (await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin_id)))
-            .scalars()
-            .all()
-        )
-    switches = [
-        e
-        for e in events
-        if e.event_type == "connection_status_changed"
-        and (e.event_payload or {}).get("reason") == "switch"
-    ]
-    assert len(switches) == 1
-    assert switches[0].event_payload["old_provider"] == "google_calendar"
-    assert switches[0].event_payload["new_provider"] == "calendly"
+    staged = await _status_changes(admin_id, "swap_pending")
+    assert len(staged) == 1
+    assert staged[0]["old_provider"] == "google_calendar"
+    assert staged[0]["new_provider"] == "calendly"
+    assert staged[0]["old_status"] == staged[0]["new_status"] == "connected"
+    assert await _status_changes(admin_id, "switch") == [], "nothing was destroyed"
+
+    await client.post(
+        f"/api/v1/admin/connections/{cid}/switch", json={"provider": "calendly", "force": True}
+    )
+    forced = await _status_changes(admin_id, "switch")
+    assert len(forced) == 1
+    assert forced[0]["old_provider"] == "google_calendar"
+    assert forced[0]["new_provider"] == "calendly"
+    assert forced[0]["new_status"] == "unconfigured"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

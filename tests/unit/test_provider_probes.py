@@ -15,7 +15,14 @@ from typing import Any
 import pytest
 from app.connections import probes
 from app.connections.health import ProbeResult
-from app.connections.probes import DispatchingProbe, ProviderLivenessProbe, liveness_request_for
+from app.connections.probes import (
+    RATE_LIMIT_BACKOFF_DEFAULT,
+    RATE_LIMIT_BACKOFF_MAX,
+    RATE_LIMIT_BACKOFF_MIN,
+    DispatchingProbe,
+    ProviderLivenessProbe,
+    liveness_request_for,
+)
 from app.models.connection import InstanceConnection
 
 pytestmark = [pytest.mark.asyncio]
@@ -77,11 +84,17 @@ class _Client:
     async def __aexit__(self, *_exc: object) -> None:
         return None
 
-    async def get(self, url: str, *, headers: Any = None, auth: Any = None) -> _Resp:
-        type(self).calls.append({"url": url, "headers": dict(headers or {}), "auth": auth})
+    async def get(
+        self, url: str, *, headers: Any = None, auth: Any = None, extensions: Any = None
+    ) -> _Resp:
+        type(self).calls.append(
+            {"url": url, "headers": dict(headers or {}), "auth": auth, "extensions": extensions}
+        )
         status = type(self).statuses.pop(0)
         if isinstance(status, Exception):
             raise status
+        if isinstance(status, _Resp):
+            return status  # a prepared response (headers and all)
         return _Resp(status)
 
 
@@ -145,7 +158,8 @@ def test_liveness_requests_name_the_provider_identity_call():
         {"authToken": "auth"},
     )
     assert tw_token is not None and tw_token.auth == ("AC123", "auth")
-    # Nothing to ask for a provisioned sender, a bare webhook URL or a crawl target.
+    # Nothing to ask for a provisioned sender, a webhook row with no URL on file, or a
+    # crawl target.
     for provider, ctype in (
         ("csv", "record_source"),
         ("custom_webhook", "crm"),
@@ -155,6 +169,119 @@ def test_liveness_requests_name_the_provider_identity_call():
         assert liveness_request_for(_conn(provider, connection_type=ctype), {}) is None
     # A Salesforce row with no org URL cannot be probed: skipped, never guessed.
     assert liveness_request_for(_conn("salesforce"), {"access_token": "t"}) is None
+
+
+# --- Round 7 WP-4a item 6: the URL-shaped providers are probed at their own URL ----- #
+def test_url_shaped_rows_are_probed_at_the_stored_url_with_the_stored_header():
+    hook = liveness_request_for(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        ),
+        {"auth_header": "Bearer tenant-token"},
+    )
+    assert hook is not None
+    assert hook.url == "https://hooks.example.com/leads"
+    assert hook.headers["Authorization"] == "Bearer tenant-token"
+    assert hook.pin_public_host is True, "an owner URL is pinned like every other admin fetch"
+    # No header on file is a legitimate shape (the URL is the whole credential).
+    bare = liveness_request_for(
+        _conn(
+            "outbound_webhook",
+            connection_type="outbound_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/events"},
+        ),
+        {},
+    )
+    assert bare is not None and "Authorization" not in bare.headers
+    # The live connector is asked the same synthetic query as its connect-time proof.
+    live = liveness_request_for(
+        _conn(
+            "live_connector",
+            connection_type="record_source",
+            auth_class="long_lived_token",
+            cfg={"url": "https://records.example.com/lookup"},
+        ),
+        {"api_key": "k"},
+    )
+    assert live is not None
+    assert live.url == f"https://records.example.com/lookup?q={probes.LIVE_CONNECTOR_PROBE_QUERY}"
+    assert live.headers["Authorization"] == "Bearer k" and live.pin_public_host is True
+    # A row written under the superseded ``api`` id resolves the same way.
+    legacy = liveness_request_for(
+        _conn("api", connection_type="record_source", cfg={"url": "https://r.example.com/x"}), {}
+    )
+    assert legacy is not None and legacy.url.endswith(f"?q={probes.LIVE_CONNECTOR_PROBE_QUERY}")
+
+
+def _pin_to(monkeypatch, host: str = "hooks.example.com", ip: str = "203.0.113.7") -> None:
+    from app.connections import sandbox
+
+    monkeypatch.setattr(sandbox, "pin_public_target", lambda url: (url.replace(host, ip, 1), host))
+
+
+async def test_a_webhook_endpoint_that_refuses_the_header_is_a_dead_row(monkeypatch):
+    _pin_to(monkeypatch)
+    probe = ProviderLivenessProbe(
+        store=_Store({"auth_header": "Bearer stale"}),
+        transport_factory=_client(401),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        )
+    )
+    assert result.ok is False
+    assert "Custom webhook rejected the stored credential" in (result.detail or "")
+    call = _Client.calls[0]
+    # Sent to the validated address with the owner's hostname as Host + SNI (F090).
+    assert call["url"] == "https://203.0.113.7/leads"
+    assert call["headers"]["Host"] == "hooks.example.com"
+    assert call["extensions"] == {"sni_hostname": "hooks.example.com"}
+    assert call["headers"]["Authorization"] == "Bearer stale"
+
+
+@pytest.mark.parametrize("status", [200, 404, 405, 503])
+async def test_a_webhook_endpoint_that_does_not_refuse_never_flips_the_row(monkeypatch, status):
+    _pin_to(monkeypatch)
+    probe = ProviderLivenessProbe(
+        store=_Store({}), transport_factory=_client(status), refresher=_NoRefresh()
+    )
+    result = await probe.probe(
+        _conn(
+            "outbound_webhook",
+            connection_type="outbound_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/events"},
+        )
+    )
+    assert result.ok is True
+
+
+async def test_an_owner_url_that_now_resolves_privately_is_not_asked(monkeypatch):
+    from app.connections import sandbox
+
+    def _refuse(url: str) -> tuple[str, str]:
+        raise sandbox.SsrfBlocked("non_public_address")
+
+    monkeypatch.setattr(sandbox, "pin_public_target", _refuse)
+    probe = ProviderLivenessProbe(
+        store=_Store({}), transport_factory=_client(200), refresher=_NoRefresh()
+    )
+    result = await probe.probe(
+        _conn(
+            "custom_webhook",
+            auth_class="long_lived_token",
+            cfg={"url": "https://hooks.example.com/leads"},
+        )
+    )
+    assert result.ok is True and result.detail == "probe_skipped:transport_error"
+    assert _Client.calls == [], "nothing is sent to an address the pin refused"
 
 
 async def test_a_2xx_is_healthy():
@@ -248,3 +375,103 @@ async def test_the_dispatching_probe_asks_the_provider_in_live(monkeypatch):
         _conn("hubspot")
     )
     assert result == missing
+
+
+# --- Round 7 WP-4a item 4: the connect-time proof for URL-shaped providers --------- #
+class _ProofTransport:
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[dict[str, Any]] = []
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> tuple[int, bytes]:
+        self.calls.append({"url": url, "headers": dict(headers)})
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer, b""
+
+
+@pytest.mark.parametrize("status", [200, 204, 404, 405, 410])
+async def test_a_reachable_webhook_endpoint_that_accepts_the_header_proves(status):
+    transport = _ProofTransport(status)
+    await probes.prove_webhook_endpoint(
+        url="https://hooks.example.com/x", auth_header="Bearer t", transport=transport
+    )
+    assert transport.calls[0]["headers"]["Authorization"] == "Bearer t"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_webhook_endpoint_that_refuses_the_header_fails_the_proof(status):
+    with pytest.raises(probes.WebhookProofFailed, match="refused the Authorization header"):
+        await probes.prove_webhook_endpoint(
+            url="https://hooks.example.com/x",
+            auth_header="Bearer t",
+            transport=_ProofTransport(status),
+        )
+
+
+@pytest.mark.parametrize("answer", [500, 503, OSError("no route"), TimeoutError()])
+async def test_a_webhook_endpoint_that_does_not_answer_fails_the_proof(answer):
+    with pytest.raises(probes.WebhookProofFailed, match="did not answer"):
+        await probes.prove_webhook_endpoint(
+            url="https://hooks.example.com/x", auth_header=None, transport=_ProofTransport(answer)
+        )
+
+
+async def test_a_webhook_proof_without_a_header_sends_none():
+    transport = _ProofTransport(200)
+    await probes.prove_webhook_endpoint(
+        url="https://hooks.example.com/x", auth_header=None, transport=transport
+    )
+    assert "Authorization" not in transport.calls[0]["headers"]
+
+
+# --------------------------------------------------------------------------- #
+# Round 7 WP-4a item 10 — a 429 carries the provider's backoff, bounded
+# --------------------------------------------------------------------------- #
+
+
+class _RateLimited(_Resp):
+    def __init__(self, retry_after: str | None) -> None:
+        super().__init__(429)
+        self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("120", timedelta(seconds=120)),
+        (None, RATE_LIMIT_BACKOFF_DEFAULT),
+        ("garbage", RATE_LIMIT_BACKOFF_DEFAULT),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", RATE_LIMIT_BACKOFF_DEFAULT),
+        ("0", RATE_LIMIT_BACKOFF_MIN),
+        ("-5", RATE_LIMIT_BACKOFF_MIN),
+        (str(10 * 24 * 3600), RATE_LIMIT_BACKOFF_MAX),
+    ],
+)
+async def test_a_429_is_skipped_with_the_providers_backoff_within_bounds(header, expected):
+    """The live condition: HubSpot answers 429 with ``Retry-After: 120``. Before, the
+    sweep read it as a plain skip and asked again next pass. The backoff rides the
+    result so the sweep can persist ``next_probe_at``; an absent or unparseable
+    header (an HTTP-date form is not honoured — a clock skew must not park a row
+    for days) falls back to the default, and every value is clamped."""
+    probe = ProviderLivenessProbe(
+        store=_Store({"access_token": "t"}),
+        transport_factory=_client(_RateLimited(header)),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(_conn("hubspot"))
+    assert result.ok is True
+    assert result.detail == "probe_skipped:http_429"
+    assert result.retry_after == expected
+
+
+@pytest.mark.parametrize("status", [503, 404])
+async def test_a_non_429_skip_carries_no_backoff(status):
+    probe = ProviderLivenessProbe(
+        store=_Store({"access_token": "t"}),
+        transport_factory=_client(status),
+        refresher=_NoRefresh(),
+    )
+    result = await probe.probe(_conn("hubspot"))
+    assert result.detail == f"probe_skipped:http_{status}"
+    assert result.retry_after is None
