@@ -87,6 +87,13 @@ DELIVERY_SENT = "sent"
 #: Statuses under which nothing may page the configured contact again.
 _SETTLED = frozenset({DELIVERY_DELIVERED, DELIVERY_SENT})
 
+#: ``deferred_actions.last_error`` on a queued retry the dispatcher completed WITHOUT a
+#: send: the owner had already heard and nothing retryable was left for the configured
+#: contact (round 7 delivery hardening). The item reads ``delivered`` — the queue's
+#: "nothing more is owed" — and this says how; the escalation row keeps saying
+#: ``owner_fallback``, never ``delivered``.
+SETTLED_OWNER_HEARD = "settled:owner_heard"
+
 #: Refusals that look exactly the same tomorrow (round 7 WP-4b, item 6): a contact
 #: that could never be an address or a number, and an SMS contact with no number
 #: connected to send from. Reported once and stamped terminal — never queued for 24h.
@@ -670,6 +677,12 @@ async def notify_escalation(
     new 24h TTL on every pass and never abandon. ``contacts_only`` is the replay of a
     notification the OWNER already received as a fallback (F083): the configured
     contact is tried again, the owner is never paged a second time for it.
+
+    A contacts-only pass with nothing retryable left — no contact configured (any
+    more), or every one refused terminally — STANDS DOWN: it completes the row's queued
+    retry itself (``SETTLED_OWNER_HEARD``) and returns True, "settled", so neither
+    the ladder nor the sweep replays an item that can never do anything. The row keeps
+    reading ``owner_fallback``.
     """
     notification, inst, owner_email = await _build_notification(
         session,
@@ -823,6 +836,15 @@ async def notify_escalation(
     if contacts_only:
         # The owner already heard (fallback); this replay is for the configured
         # contact alone. Nothing below may page the owner again.
+        if not delivered and last_refusal is None:
+            # Nothing a retry could change: there is no contact to try, or every one
+            # refused terminally. Left queued, this item was replayed for 24h doing
+            # nothing, counted in the backlog the whole time, and then abandoned with
+            # a "could not deliver" email to an owner who had heard within a minute.
+            await _settle_queued_retry(
+                session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+            )
+            return True
         return delivered
 
     # cc-owner-email is fan-out, not fallback: it goes out even on a successful primary.
@@ -934,6 +956,14 @@ async def notify_escalation(
                 # row must not page the owner again on its next pass — re-point it to
                 # the configured contact alone (round 7 WP-4b, item 7).
                 await _repoint_queued_to_contacts_only(
+                    session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+                )
+            if not queue_retry and last_refusal is None:
+                # A replay reached the owner and no configured contact is waiting on a
+                # retry (none configured, or all terminal): the queued item filed when
+                # the owner's email blipped has nothing left to do. Completed here,
+                # once — not left for the sweep to replay into a 24h abandon.
+                await _settle_queued_retry(
                     session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
                 )
             if queue_retry and last_refusal is not None:
@@ -1190,6 +1220,51 @@ async def _repoint_queued_to_contacts_only(
     if changed:
         await session.flush()
     return changed
+
+
+async def _settle_queued_retry(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    outcome: str = SETTLED_OWNER_HEARD,
+) -> int:
+    """Complete this row's still-queued retry without a send: the owner heard and
+    nothing retryable is left. Only ``queued`` items are touched, so an item completes
+    exactly once whichever pass (ladder rung, sweep replay) gets there first. Returns
+    the number completed."""
+    from app.models.deferred import DeferredAction  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(DeferredAction).where(
+                    DeferredAction.admin_id == admin_id,
+                    DeferredAction.action_type == ESCALATION_RETRY_ACTION,
+                    DeferredAction.status == "queued",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    settled = 0
+    for action in rows:
+        payload = action.payload or {}
+        if (
+            payload.get("session_id") != str(session_id)
+            or payload.get("signal") != signal
+            or payload.get("gate") != gate
+        ):
+            continue
+        action.status = "delivered"
+        action.last_error = outcome
+        settled += 1
+    if settled:
+        await session.flush()
+    return settled
 
 
 #: Twilio ``MessageStatus`` values a delivery receipt settles a row with.
