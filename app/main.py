@@ -250,15 +250,19 @@ def create_app() -> FastAPI:
         # deployment circuit breaker roll back a perfectly good release because a
         # dependency blipped. Restarting a task has never fixed an unreachable
         # database. So liveness keeps its 200 and the BODY carries the truth.
-        # Escalation notifications nobody has heard yet (audit F079): a number, not a
-        # ``degraded`` entry — that list gates deploys on binding truth, this is an
-        # operations signal. ``None`` when the database is unreachable.
+        # Escalation notifications nobody has heard yet (audit F079), always reported
+        # as a number in ``escalationBacklog``. ``None`` when the database is
+        # unreachable.
         backlog = await escalation_backlog() if database_reason is None else None
         # Round 7 WP-4b (item 8): a backlog that has outlived one deferred-sweep
         # interval IS a degraded state — the sweep had its turn and the pages are
-        # still unheard — so it joins the list by count (``escalation_backlog:<n>``).
-        # The "since" is the queue's own oldest row (migration 0069), never a clock
-        # kept in this process, so every task answers the same.
+        # still unheard — so it ALSO joins the list by count
+        # (``escalation_backlog:<n>``). The "since" is the queue's own oldest row
+        # (migration 0069), never a clock kept in this process, so every task answers
+        # the same. It is an operations signal, not a binding fault of this build:
+        # scripts/smoke_probe.sh reports it and leaves it out of the deploy gate's set
+        # equality (tests/unit/test_smoke_probe_degraded_set.py), and the
+        # EscalationBacklog alarm is what pages an operator.
         stale_backlog = _escalation_backlog_degraded_entry(backlog)
         if stale_backlog:
             degraded.append(stale_backlog)
