@@ -27,6 +27,15 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
   delivered is not counted; nothing is emitted when the count could not be taken.
   `DEFERRED_SWEEP_INTERVAL` there is a copy of this sweep's cron and a unit test refuses drift.
 
+## The process drains what it scheduled (round 7 phase 2 review, 2026-10-04)
+- A sweep that writes an escalation row only QUEUES the owner notification (a background task
+  started after the tenant's commit). `__main__._run_sweep` awaits
+  `escalation_dispatch.drain_background_notifications()` for at most 60 s after the sweep, in a
+  `finally`; under the old bare `asyncio.run(sweep())` the page was cancelled at process exit and
+  the row read `pending` forever. A timeout logs `sweep_notification_drain_timeout` at ERROR
+  (SweepErrors alarms) and keeps the exit code. Notifications only — never the retry ladder, and
+  never inside `_per_tenant` (the API process's in-process mailbox poller shares it).
+
 ## daily_brief (round 6 WP-F, 2026-09-07)
 - Hourly sweep; a tenant is due once its LOCAL clock (instances.timezone, UTC when unset)
   passes 07:00 and no `brief:<date>` row exists in `notice_deliveries`. Body from
