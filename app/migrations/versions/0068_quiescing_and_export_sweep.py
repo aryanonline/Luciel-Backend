@@ -93,7 +93,12 @@ _RESOLVER_0068 = """
               WHERE d.value = p_dest
             )
           )
-        ORDER BY created_at DESC, connection_id DESC
+        -- A LIVE claim outranks a draining one whatever the two rows' ages: a
+        -- quiescing row "routes inbound but holds no claim" (routing.py), so once
+        -- another tenant holds the destination, inbound is theirs. Ordering by
+        -- created_at alone let a draining row win whenever its connection row was
+        -- the younger of the two (a claimant's row can long predate its attach).
+        ORDER BY (status = 'quiescing'), created_at DESC, connection_id DESC
         LIMIT 1
     $$;
 """

@@ -784,6 +784,7 @@ async def test_a_down_webhook_endpoint_fails_a_fresh_connect_without_a_connected
 async def test_a_webhook_crm_that_refuses_the_header_on_a_push_flips_the_row(monkeypatch):
     from app.connections import sandbox
     from app.connections.secrets import get_secret_store
+    from app.models.lead import Lead
     from app.tools import contract as c
     from app.tools.contract import ToolContext
     from app.tools.crm_backend import CrmUnavailable
@@ -808,12 +809,25 @@ async def test_a_webhook_crm_that_refuses_the_header_on_a_push_flips_the_row(mon
         return c.failed("non_2xx:401")
 
     monkeypatch.setattr(sandbox, "run_byo_webhook", _refused)
+    # A push names the conversation's resolved lead, which must own the key (round 7
+    # WP-3c item 8: a push with no resolved lead is refused before any transport).
+    lead_id = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        s.add(
+            Lead(
+                id=lead_id,
+                admin_id=admin,
+                instance_id=iid,
+                name="Jane",
+                contact_identifier="jane@acme.com",
+            )
+        )
     # The push wrapper (runtime.crm_push) catches the failure INSIDE the turn's
     # session and stamps the lead, so the flag commits with it — mirrored here.
     async with tenant_session(admin) as s:
         with pytest.raises(CrmUnavailable, match="crm_webhook_non_2xx:401"):
             await _TenantCrmBackend().upsert_lead(
-                ToolContext(admin_id=admin, instance_id=iid, session=s),
+                ToolContext(admin_id=admin, instance_id=iid, session=s, resolved_lead_id=lead_id),
                 "jane@acme.com",
                 {"email": "jane@acme.com"},
             )
@@ -845,10 +859,23 @@ async def test_a_webhook_crm_that_refuses_the_header_on_a_push_flips_the_row(mon
         return c.failed("non_2xx:503")
 
     monkeypatch.setattr(sandbox, "run_byo_webhook", _down)
+    lead_id2 = uuid.uuid4()
+    async with tenant_session(admin2) as s:
+        s.add(
+            Lead(
+                id=lead_id2,
+                admin_id=admin2,
+                instance_id=iid2,
+                name="Jane",
+                contact_identifier="jane@acme.com",
+            )
+        )
     async with tenant_session(admin2) as s:
         with pytest.raises(CrmUnavailable, match="crm_webhook_non_2xx:503"):
             await _TenantCrmBackend().upsert_lead(
-                ToolContext(admin_id=admin2, instance_id=iid2, session=s),
+                ToolContext(
+                    admin_id=admin2, instance_id=iid2, session=s, resolved_lead_id=lead_id2
+                ),
                 "jane@acme.com",
                 {"email": "jane@acme.com"},
             )

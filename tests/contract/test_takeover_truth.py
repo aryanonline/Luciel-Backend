@@ -103,7 +103,9 @@ async def _seed(
                 admin_id=admin,
                 name="Acme Patios",
                 state=LucielState.active,
-                embed_key_public_id=f"vm_live_{admin.hex[:8]}",
+                # Unique per call: embed keys are structurally unique since 0067, and
+                # some tests seed twice for one tenant to get two conversations.
+                embed_key_public_id=f"vm_live_{iid.hex[:12]}",
                 channels=[{"id": c, "enabled": True} for c in ALL_CHANNELS],
                 tools=[],
                 escalation={},

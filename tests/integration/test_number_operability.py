@@ -255,59 +255,121 @@ async def test_a_number_held_by_another_tenant_cannot_be_claimed():
         assert again.status == STATUS_PENDING_REGISTRATION
 
 
+async def _resolve(connection_type: str, destination: str):
+    async with untenanted_session() as s:
+        return (
+            await s.execute(
+                text("SELECT admin_id, instance_id FROM channel_resolve_destination(:ct, :d)"),
+                {"ct": connection_type, "d": destination},
+            )
+        ).one()
+
+
+async def _claim_row(
+    admin: uuid.UUID,
+    iid: uuid.UUID,
+    *,
+    connection_type: str,
+    provider: str,
+    status: str,
+    config: dict[str, object],
+    created_at: datetime,
+) -> None:
+    """A claim written directly, with an explicit created_at (rows flushed in one
+    transaction share now() and would tie)."""
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type=connection_type,
+                auth_class="oauth_token",
+                provider=provider,
+                status=status,
+                non_secret_config=config,
+                created_at=created_at,
+            )
+        )
+        await s.flush()
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_legacy_duplicate_claims_resolve_to_the_newest():
-    """Rows claimed BEFORE the uniqueness gate existed can still collide. For those
-    legacy duplicates ``channel_resolve_destination`` must be deterministic — the
-    newest claim wins — not an arbitrary ``LIMIT 1`` pick, which live-routed a
-    tenant's voice calls to a stale claimant on 2026-08-17. Pinned on email_sender
-    rows since 0045: the partial unique index makes sms_sender duplicates
-    structurally impossible, while email_sender scalar duplicates remain possible
-    by design (a disconnected platform address keeps its claim)."""
+    """Two live claims on one destination must resolve deterministically — the newest
+    wins — not by an arbitrary ``LIMIT 1`` pick, which live-routed a tenant's voice
+    calls to a stale claimant on 2026-08-17.
+
+    Pinned on a Meta destination: since 0045 (sms) and 0067 (email) a scalar duplicate
+    among live rows is structurally impossible, while Meta's per-channel
+    ``destinations`` map is not expressible as a unique index and stays gate-enforced,
+    so a pre-gate duplicate can still exist there."""
     old_admin, new_admin = uuid.uuid4(), uuid.uuid4()
     old_iid = await _seed(old_admin)
     new_iid = await _seed(new_admin)
-    # Simulate the pre-gate state with direct row writes: explicit created_at values,
-    # because rows flushed in one transaction share now() and would tie.
-    async with tenant_session(old_admin) as s:
-        s.add(
-            InstanceConnection(
-                connection_id=uuid.uuid4(),
-                admin_id=old_admin,
-                instance_id=old_iid,
-                connection_type="email_sender",
-                auth_class="api_key",
-                provider="ses",
-                status="connected",
-                non_secret_config={"destination": "dup@reply.vantagemind.ai"},
-                created_at=datetime(2026, 7, 28, tzinfo=UTC),
-            )
-        )
-        await s.flush()
-    async with tenant_session(new_admin) as s:
-        s.add(
-            InstanceConnection(
-                connection_id=uuid.uuid4(),
-                admin_id=new_admin,
-                instance_id=new_iid,
-                connection_type="email_sender",
-                auth_class="api_key",
-                provider="ses",
-                status="connected",
-                non_secret_config={"destination": "dup@reply.vantagemind.ai"},
-                created_at=datetime(2026, 8, 17, tzinfo=UTC),
-            )
-        )
-        await s.flush()
-    async with untenanted_session() as s:
-        row = (
-            await s.execute(
-                text(
-                    "SELECT admin_id, instance_id"
-                    " FROM channel_resolve_destination('email_sender', :d)"
-                ),
-                {"d": "dup@reply.vantagemind.ai"},
-            )
-        ).one()
+    page = "page-1029384756"
+    await _claim_row(
+        old_admin,
+        old_iid,
+        connection_type="channel_auth",
+        provider="meta",
+        status="connected",
+        config={"destinations": {"messenger": page}},
+        created_at=datetime(2026, 7, 28, tzinfo=UTC),
+    )
+    await _claim_row(
+        new_admin,
+        new_iid,
+        connection_type="channel_auth",
+        provider="meta",
+        status="connected",
+        config={"destinations": {"messenger": page}},
+        created_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+    row = await _resolve("channel_auth", page)
     assert row.admin_id == new_admin
     assert row.instance_id == new_iid
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_live_claim_outranks_a_draining_row_whatever_their_ages():
+    """A deleted Luciel's connection drains as ``quiescing``: it still routes inbound
+    for the conversation in flight, but holds no claim (round 7 WP-5). Once another
+    tenant holds the mailbox live, inbound is theirs — even when the draining row is
+    the YOUNGER of the two, which is ordinary: a claimant's connection row can long
+    predate the day it attached the address. Ordering by row age alone handed the
+    new owner's mail to the deleted Luciel."""
+    draining_admin, live_admin = uuid.uuid4(), uuid.uuid4()
+    draining_iid = await _seed(draining_admin)
+    live_iid = await _seed(live_admin)
+    mailbox = "shared@reply.vantagemind.ai"
+    await _claim_row(
+        live_admin,
+        live_iid,
+        connection_type="email_sender",
+        provider="outlook",
+        status="connected",
+        config={"destination": mailbox},
+        created_at=datetime(2026, 7, 28, tzinfo=UTC),
+    )
+    await _claim_row(
+        draining_admin,
+        draining_iid,
+        connection_type="email_sender",
+        provider="outlook",
+        status="quiescing",
+        config={"destination": mailbox},
+        created_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+    row = await _resolve("email_sender", mailbox)
+    assert row.admin_id == live_admin
+    assert row.instance_id == live_iid
+
+    # With no live claimant the draining row still routes: the drain itself.
+    async with tenant_session(live_admin) as s:
+        await s.execute(
+            text("UPDATE instance_connections SET status = 'revoked' WHERE admin_id = :a"),
+            {"a": live_admin},
+        )
+    row = await _resolve("email_sender", mailbox)
+    assert row.admin_id == draining_admin
