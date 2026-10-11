@@ -37,6 +37,13 @@ def upgrade() -> None:
         "knowledge_sources",
         sa.Column("paused_since", sa.DateTime(timezone=True), nullable=True),
     )
+    # knowledge_sources is FORCE RLS and alembic runs as luciel_app with no tenant
+    # pinned: a plain UPDATE here matches ZERO rows and the backfill is a silent no-op
+    # (round 7 review; 0067 and 0068 avoid the same hazard the same way). The narrow
+    # BYPASSRLS role does the write (SELECT too: the WHERE reads columns), under a grant
+    # that lasts only for this statement.
+    op.execute("GRANT SELECT, UPDATE ON knowledge_sources TO luciel_auth")
+    op.execute("SET LOCAL ROLE luciel_auth")
     op.execute(
         """
         UPDATE knowledge_sources
@@ -46,6 +53,8 @@ def upgrade() -> None:
            AND paused_since IS NULL
         """
     )
+    op.execute("RESET ROLE")
+    op.execute("REVOKE SELECT, UPDATE ON knowledge_sources FROM luciel_auth")
     op.add_column(
         "transcripts",
         sa.Column("flagged_by_admin_at", sa.DateTime(timezone=True), nullable=True),

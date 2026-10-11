@@ -217,7 +217,12 @@ jobs:
 
       # Skipped when pausing: a pause run is taking the environment DOWN, so there is
       # nothing to migrate and a migration task would be the only thing still running.
+      # The migration runs AFTER the Compute stack has rolled the services (the
+      # migration task definition lives in that stack and carries the new image), so a
+      # refused migration (0067 refuses on duplicate claims by design) leaves the NEW
+      # code serving the OLD schema. That is the rollback case too (round 7 review).
       - name: Run DB migrations as a one-off ECS task (inside the VPC)
+        id: migrate
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh dev
 
@@ -235,7 +240,7 @@ jobs:
         run: bash scripts/run-verify-task.sh dev
 
       - name: Roll the app services back to the previous task definitions
-        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
         run: |
           cluster='${{ steps.previous.outputs.cluster }}'
           python3 - "$cluster" <<'PY'
@@ -247,7 +252,7 @@ jobs:
                               '--task-definition', svc['td'], '--force-new-deployment',
                               '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
           PY
-          echo "::error::post-deploy probe failed; app services rolled back to the previous task definitions"
+          echo "::error::the migration or a post-deploy probe failed; app services rolled back to the previous task definitions (the schema stays where the migration left it)"
           exit 1
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----

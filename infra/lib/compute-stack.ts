@@ -659,7 +659,10 @@ export class ComputeStack extends Stack {
         });
     }
 
-    // One-off MIGRATION task definition (run by the pipeline before app deploy).
+    // One-off MIGRATION task definition. The pipeline runs it AFTER this stack has
+    // rolled the services (it carries the new image, so it cannot exist before the
+    // stack deploys): a failed migration therefore rolls the services back
+    // (deploy.yml), and every migration must be expand-first for that window.
     // Same image; entrypoint overridden to scripts/migrate.sh. Gets master creds +
     // app password from Secrets Manager. Run inside the VPC (RDS is private).
     const migrationTask = new ecs.FargateTaskDefinition(this, 'MigrationTask', {

@@ -36,10 +36,20 @@ PY
 # postgresql-client (which dragged in perl + CVE-2026-12087).
 MASTER_DSN="host=$PGHOST port=${PGPORT:-5432} dbname=$PGDATABASE user=$MASTER_USER password=$MASTER_PASSWORD"
 
-echo "[migrate] 1/3 bootstrap roles (master)"
+echo "[migrate] 1/4 bootstrap roles (master)"
 python3 scripts/run_sql.py --dsn "$MASTER_DSN" --file scripts/bootstrap_roles.sql --app-password "$APP_PASSWORD"
 
-echo "[migrate] 2/3 alembic upgrade head (as luciel_app)"
+# bootstrap_roles.sql grants luciel_app membership in the BYPASSRLS luciel_auth role
+# for the migration only (ownership transfers need it); lock_audit_log.sql revokes it
+# in step 3. With set -e, a refused migration used to exit BEFORE that revoke, leaving
+# the live app role able to SET ROLE past RLS (round 7 review). The revoke now runs
+# on every exit path, and step 4 verifies it.
+revoke_migration_role() {
+  python3 scripts/run_sql.py --dsn "$MASTER_DSN" --file scripts/revoke_migration_role.sql || echo "[migrate] WARNING: could not revoke luciel_auth from luciel_app" >&2
+}
+trap revoke_migration_role EXIT
+
+echo "[migrate] 2/4 alembic upgrade head (as luciel_app)"
 export LUCIEL_DATABASE_URL_SYNC="postgresql+psycopg://luciel_app:${APP_PASSWORD}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE}"
 export LUCIEL_DATABASE_URL="postgresql+asyncpg://luciel_app:${APP_PASSWORD}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE}"
 alembic upgrade head
