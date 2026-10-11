@@ -167,13 +167,22 @@ class TwilioBearerSmsSender:
     account_sid: str
     access_token: str
     transport: _BearerTransport | None = None
+    # The same seam ``TwilioSmsSender.status_callback`` is (round 7 delivery
+    # hardening): an absolute URL Twilio posts the message's delivery receipt to. Set
+    # by the notification leg only; None keeps the send byte-identical. An OAuth
+    # tenant's page used to go out with no receipt requested at all, so it was
+    # stamped delivered the moment the API accepted it.
+    status_callback: str | None = None
 
     async def send_sms(self, from_number: str, to: str, body: str) -> str | None:
+        data = {"From": from_number, "To": to, "Body": body}
+        if self.status_callback:
+            data["StatusCallback"] = self.status_callback
         payload = await _request(
             "POST",
             f"{TWILIO_API_BASE}/Accounts/{self.account_sid}/Messages.json",
             access_token=self.access_token,
-            data={"From": from_number, "To": to, "Body": body},
+            data=data,
             transport=self.transport,
         )
         if not isinstance(payload, dict):

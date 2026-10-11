@@ -245,3 +245,99 @@ async def test_a_forged_cap_403s_and_is_audited_under_the_tenant(client, ses):
     assert forged.status_code == 403
     assert len(await _audit(admin, "inbound_capability_rejected")) == 1
     assert (await _row(admin, session_id)).delivery_status == "sent"
+
+
+class _Resp:
+    def __init__(self, status_code: int, body: dict[str, object]) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict[str, object]:
+        return self._body
+
+
+class _FakeTwilioRest:
+    """Twilio's REST API as the bearer surface sees it: records each Messages POST."""
+
+    def __init__(self, sid: str) -> None:
+        self.sid = sid
+        self.posts: list[dict[str, str]] = []
+
+    async def post(self, url: str, *, headers: dict[str, str], data: dict[str, str]) -> _Resp:
+        self.posts.append(dict(data))
+        return _Resp(201, {"sid": self.sid, "status": "queued"})
+
+    async def get(self, url: str, *, headers: dict[str, str], params: dict[str, str]) -> _Resp:
+        raise AssertionError("no GET expected")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_oauth_tenants_page_reads_sent_until_the_receipt_it_asked_for_arrives(
+    client, ses, monkeypatch
+):
+    """Round 7 delivery hardening. A tenant connected with the one-click OAuth grant
+    sends through the bearer sender, which requested no delivery receipt at all: the
+    page read ``delivered`` the moment Twilio's API accepted it, and a carrier failure
+    never reached anyone. Now the bearer send carries the same signed callback URL
+    (the tenant's capability token — Twilio signs with an account auth token an OAuth
+    tenant never gave us), the row reads ``sent``, and only the receipt Twilio posts
+    to that URL makes it ``delivered``."""
+    from urllib.parse import urlsplit
+
+    from app.channels.twilio_bearer import TwilioBearerSmsSender
+    from app.config import get_settings
+    from app.notifications import escalation_dispatch, sms_notifier
+
+    number, sid = "+16045550186", "SM" + "f" * 32
+    admin, session_id = await _seed(number, sid="SM" + "9" * 32)
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(select(EscalationEvent).where(EscalationEvent.admin_id == admin))
+        ).scalar_one()
+        row.delivery_status = "pending"
+        row.delivery_detail = None
+        row.delivery_provider_message_id = None
+        iid = row.instance_id
+
+    rest = _FakeTwilioRest(sid)
+
+    async def _oauth_sender(*a, **kw):
+        return TwilioBearerSmsSender(
+            account_sid="AC" + "5" * 32,
+            access_token="bearer-tok",  # noqa: S106
+            transport=rest,
+        )
+
+    monkeypatch.setattr(sms_notifier, "build_tenant_sms_sender", _oauth_sender)
+    monkeypatch.setattr(get_settings(), "public_api_base_url", "https://api.example")
+
+    async with tenant_session(admin) as s:
+        assert await escalation_dispatch.notify_escalation(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            session_id=session_id,
+            resolved_lead_id=None,
+            signal="high_value_lead",
+            gate="outcome",
+            score=0.9,
+        )
+
+    (post,) = rest.posts
+    assert post["From"] == number and post["To"] == CONTACT
+    callback = post["StatusCallback"]
+    assert callback == f"https://api.example{ROUTE}?cap=status-cap"
+    row = await _row(admin, session_id)
+    assert row.delivery_status == "sent"  # accepted by the API — nobody has heard yet
+    assert row.delivered_at is None
+    assert row.delivery_provider_message_id == sid
+
+    # Twilio posts the receipt to the URL the send asked for.
+    target = urlsplit(callback)
+    ok = await client.post(
+        f"{target.path}?{target.query}", data=_receipt(number, sid=sid, status="delivered")
+    )
+    assert ok.status_code == 200
+    row = await _row(admin, session_id)
+    assert row.delivery_status == "delivered"
+    assert row.delivered_at is not None

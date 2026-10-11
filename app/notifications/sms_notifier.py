@@ -9,11 +9,19 @@ actionable failure rather than a silent drop, so the routing layer can fall back
 owner's email (§3.5.4) instead of leaving the escalation undelivered.
 
 Round 7 WP-4b: Twilio accepting a request is not the contact hearing. A page sent
-through the live sender asks Twilio for a delivery receipt (``status_callback`` →
+through a live sender asks Twilio for a delivery receipt (``status_callback`` →
 ``/api/v1/webhooks/twilio/notifications/status``) and reports ``detail="dlr_pending"``,
 so the dispatcher stamps the row ``sent`` and lets the carrier's word make it
-``delivered`` or ``failed``. Where no receipt can come (mock/Null sender, no public
-API origin) the receipt is what it always was.
+``delivered`` or ``failed``.
+
+Round 7 delivery hardening: that holds for BOTH credential shapes — the SDK sender
+(auth token / API key) and the bearer sender of a one-click OAuth tenant, which used
+to send with no receipt requested and was therefore stamped ``delivered`` on API
+accept. And every accepted send through a real provider sender is ``dlr_pending``,
+whether or not a callback could be requested (no public API origin, or a tenant whose
+receipts could never be verified): ``delivered`` is the carrier's word — the receipt,
+or the deferred sweep's one status fetch for a page whose receipt never came — never
+the API's. Only the mock/Null sender reports what it always did (``recorded``).
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.base import DeliveryReceipt
 from app.channels.tenant_twilio import build_tenant_sms_sender
+from app.channels.twilio_bearer import TwilioBearerSmsSender
 from app.channels.twilio_sender import NullSmsSender, TwilioSmsSender
 from app.config import get_settings
 from app.connections.service import resolve_sms_number
@@ -35,7 +44,8 @@ from app.notifications.base import EscalationNotification, owner_facing_reasons
 # whole point of paging someone.
 _MAX_INTENT = 80
 
-#: ``DeliveryReceipt.detail`` when the carrier will report the real outcome later.
+#: ``DeliveryReceipt.detail`` for a send a real provider sender accepted: the carrier's
+#: word (a delivery receipt, or the sweep's status fetch) is still to come.
 DLR_PENDING = "dlr_pending"
 NOTIFICATION_STATUS_PATH = "/api/v1/webhooks/twilio/notifications/status"
 
@@ -45,8 +55,16 @@ async def notification_status_callback_url(
 ) -> str | None:
     """Where Twilio should post this tenant's notification delivery receipts, or None
     when the deployment has no public API origin (mock/CI). Tenants whose auth token
-    the platform never holds (C11) get their capability token on the URL, exactly as
-    the auto-configured inbound webhooks do, so the receipt verifies."""
+    the platform never holds (C11: the one-click OAuth grant, API-key-only forms) get
+    their capability token on the URL, exactly as the auto-configured inbound webhooks
+    do, so the receipt verifies — Twilio signs a status callback with the ACCOUNT auth
+    token however the send was authenticated, and that token is exactly what those
+    tenants never gave us.
+
+    None, too, for a tenant we hold NEITHER proof for (no auth token and no capability
+    token minted yet): every receipt would be a 403 here and an error in the customer's
+    own Twilio console, and accepting it unverified is not an option. Their page stays
+    ``sent`` until the deferred sweep asks Twilio for the message's status."""
     from urllib.parse import quote  # noqa: PLC0415
 
     from app.channels.tenant_twilio import tenant_inbound_verification  # noqa: PLC0415
@@ -54,7 +72,9 @@ async def notification_status_callback_url(
     base = (get_settings().public_api_base_url or "").rstrip("/")
     if not base:
         return None
-    _auth_token, capability = await tenant_inbound_verification(session, admin_id, instance_id)
+    auth_token, capability = await tenant_inbound_verification(session, admin_id, instance_id)
+    if not auth_token and not capability:
+        return None
     suffix = f"?cap={quote(capability, safe='')}" if capability else ""
     return f"{base}{NOTIFICATION_STATUS_PATH}{suffix}"
 
@@ -135,9 +155,10 @@ class SmsNotifier:
         ``sms_channel_not_provisioned``; a live deployment whose sender resolved to the
         Null stand-in → ``sms_sender_not_provisioned`` (nothing left the system);
         outside live mode the Null sender's fake sid is reported with
-        ``detail="recorded"`` so a caller can audit it as recorded, not sent. With
-        ``status_callback`` and a real Twilio sender the receipt says ``dlr_pending``:
-        accepted by the API, delivery still to be reported by the carrier.
+        ``detail="recorded"`` so a caller can audit it as recorded, not sent. Through a
+        real provider sender the receipt says ``dlr_pending``: accepted by the API,
+        delivery still to be reported by the carrier. ``status_callback`` is where
+        Twilio is asked to report it, on either credential shape.
         """
         from_number = await resolve_sms_number(session, admin_id, instance_id)
         if not from_number:
@@ -145,10 +166,9 @@ class SmsNotifier:
         # BYO (§3.1.4): the page goes out through the tenant's OWN Twilio account, the
         # same one their customer SMS rides — the platform is not in the billing path.
         sender = await build_tenant_sms_sender(session, admin_id, instance_id)
-        dlr_requested = False
-        if status_callback and isinstance(sender, TwilioSmsSender):
+        if status_callback and isinstance(sender, TwilioSmsSender | TwilioBearerSmsSender):
+            # A copy: the tenant's own sender object is never mutated.
             sender = replace(sender, status_callback=status_callback)
-            dlr_requested = True
         try:
             sid = await sender.send_sms(from_number, to, body)
         except Exception as exc:  # noqa: BLE001 — a send failure is data, not a raise
@@ -161,6 +181,6 @@ class SmsNotifier:
             return DeliveryReceipt(accepted=True, provider_message_id=sid, detail="recorded")
         if sid is None:
             return DeliveryReceipt(accepted=False, detail="twilio_rejected")
-        return DeliveryReceipt(
-            accepted=True, provider_message_id=sid, detail=DLR_PENDING if dlr_requested else None
-        )
+        # Accepted by the provider's API — which is not the contact hearing, with or
+        # without a callback requested.
+        return DeliveryReceipt(accepted=True, provider_message_id=sid, detail=DLR_PENDING)
