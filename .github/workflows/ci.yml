@@ -146,6 +146,9 @@ jobs:
       - name: Unit + integration + contract suites
         env:
           LUCIEL_PG_HOST: localhost
+          # The test currently running is in the log the moment it starts, so a hang
+          # is attributable from the log alone (output was block-buffered before).
+          PYTHONUNBUFFERED: "1"
         run: |
           . .venv/bin/activate
           python -m pytest tests/unit tests/integration tests/contract tests/migrations -v
