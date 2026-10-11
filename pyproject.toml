@@ -113,6 +113,10 @@ exclude = ["app/migrations/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# A test that runs this long gets every thread stack dumped to stderr (pytest built-in);
+# tests/conftest.py adds the watchdog that then fails the run with the asyncio tasks
+# and database sessions, instead of letting CI cancel a silent job after 35 minutes.
+faulthandler_timeout = 300
 testpaths = ["tests"]
 filterwarnings = [
     # Benign Pydantic false-positive from `type X = Literal[...]` aliases interacting
