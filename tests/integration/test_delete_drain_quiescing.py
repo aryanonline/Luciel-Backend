@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from app.channels import outbound, routing
+from app.channels import inbound_dispatch, outbound, routing
 from app.channels.base import InboundMessage, InboundRejected
 from app.channels.mailbox_poll import poll_mailbox
 from app.channels.runtime_entry import run_inbound_message
@@ -31,8 +31,10 @@ from app.connections.secrets import LocalSecretStore, secret_ref_for
 from app.db.session import tenant_session
 from app.lifecycle import cascade, state_machine
 from app.models.connection import InstanceConnection
+from app.models.conversation import EscalationEvent
 from app.models.conversation import Session as ConvSession
 from app.models.instance import Account, AccountState, Instance, LucielState
+from app.notifications import escalation_dispatch
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
@@ -466,6 +468,189 @@ async def test_an_email_drain_reply_leaves_on_a_quiescing_address(email_sender):
         )
     assert result.delivered is True
     assert email_sender.sent[0]["to"] == "dana@lead.example"
+
+
+# --------------------------------------------------------------------------- #
+# Meta (WhatsApp / Messenger / Instagram): the grant that owns the surface is judged
+# by its pre-delete status too. The gate was written on a parallel branch and read the
+# raw status, so the drain reply was refused with meta_reconnect_needed on all three
+# channels and the owner was paged to reconnect a healthy grant.
+# --------------------------------------------------------------------------- #
+
+#: channel -> (the grant's connection type, its provider, the customer's identifier).
+_META_GRANT = {
+    "whatsapp": ("channel_auth", "meta", "15557778888"),
+    "messenger": ("channel_auth", "meta", "PSID_1"),
+    "instagram": ("instagram_auth", "instagram", "IGSID_1"),
+}
+META_CHANNELS = sorted(_META_GRANT)
+SURFACE_ID = "surface-4411"
+
+
+class _FakeMetaSender:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, str]] = []
+        self.grants: list[str] = []
+
+    async def send_message(self, *, channel, sender_id, recipient_id, body):
+        self.sent.append({"channel": channel, "sender_id": sender_id, "recipient_id": recipient_id})
+        return f"mid-{len(self.sent)}"
+
+
+@pytest.fixture
+def meta_sender(monkeypatch) -> _FakeMetaSender:
+    from app.channels import meta_sender as sender_mod
+
+    fake = _FakeMetaSender()
+
+    async def _build(session, admin_id, instance_id, *, connection_type="channel_auth", store=None):
+        fake.grants.append(connection_type)
+        return fake
+
+    monkeypatch.setattr(sender_mod, "build_tenant_meta_sender", _build)
+    return fake
+
+
+async def _add_meta_grant(
+    admin: uuid.UUID, iid: uuid.UUID, channel: str, *, status: str, status_stashed: str | None
+) -> None:
+    """The grant that OWNS ``SURFACE_ID`` for ``channel``. The ``destinations`` map is
+    what pairs the surface with its grant: without it the Instagram case would fall
+    back to a ``channel_auth`` row that does not exist and skip the gate vacuously."""
+    connection_type, provider, _ = _META_GRANT[channel]
+    async with tenant_session(admin) as s:
+        s.add(
+            InstanceConnection(
+                connection_id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                connection_type=connection_type,
+                auth_class="oauth_token",
+                provider=provider,
+                status=status,
+                status_stashed=status_stashed,
+                secret_ref=secret_ref_for(admin, iid, connection_type),
+                non_secret_config={"destinations": {channel: SURFACE_ID}},
+            )
+        )
+        await s.flush()
+
+
+@pytest.mark.parametrize("channel", META_CHANNELS)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_meta_drain_reply_leaves_on_a_quiescing_grant(channel, meta_sender):
+    admin = uuid.uuid4()
+    iid = await _seed(admin, state=LucielState.luciel_grace_window)
+    await _add_meta_grant(
+        admin, iid, channel, status=state_machine.QUIESCING, status_stashed="connected"
+    )
+    connection_type, _, customer = _META_GRANT[channel]
+    async with tenant_session(admin) as s:
+        result = await outbound.send_outbound_reply(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            channel=channel,
+            to=customer,
+            body="We open at 9.",
+            sender_id=SURFACE_ID,
+        )
+    assert result.delivered is True, result.detail
+    assert meta_sender.sent == [
+        {"channel": channel, "sender_id": SURFACE_ID, "recipient_id": customer}
+    ]
+    assert meta_sender.grants == [connection_type], "sent with the grant that owns the surface"
+
+
+@pytest.mark.parametrize("stashed", [None, "expired", "error", "pending_destination"])
+@pytest.mark.parametrize("channel", META_CHANNELS)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_quiescing_meta_grant_that_could_not_send_before_the_delete_still_refuses(
+    channel, stashed, meta_sender
+):
+    """No stash (never written by ``delete_luciel``; defensive) and a stashed
+    not-connected status both stay refused: the drain does not turn a broken grant
+    into a sending one."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin, state=LucielState.luciel_grace_window)
+    await _add_meta_grant(
+        admin, iid, channel, status=state_machine.QUIESCING, status_stashed=stashed
+    )
+    async with tenant_session(admin) as s:
+        result = await outbound.send_outbound_reply(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            channel=channel,
+            to=_META_GRANT[channel][2],
+            body="We open at 9.",
+            sender_id=SURFACE_ID,
+        )
+    assert result.delivered is False
+    assert result.detail == "meta_reconnect_needed"
+    assert meta_sender.sent == []
+
+
+def _meta_inbound(admin: uuid.UUID, iid: uuid.UUID, channel: str, body: str) -> InboundMessage:
+    surface_key = "phone_number_id" if channel == "whatsapp" else "destination_id"
+    return InboundMessage(
+        admin_id=admin,
+        instance_id=iid,
+        channel=channel,
+        session_id=None,
+        customer_identifier=_META_GRANT[channel][2],
+        body=body,
+        channel_metadata={surface_key: SURFACE_ID},
+    )
+
+
+@pytest.mark.parametrize("channel", META_CHANNELS)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_customer_mid_conversation_on_meta_is_answered_after_the_delete(
+    channel, meta_sender
+):
+    """The reported sequence end to end: the customer is mid-conversation, the owner
+    deletes the Luciel, the customer writes again. The answer reaches them on their
+    channel and the owner is NOT paged about a reply that could not be delivered."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    await _add_meta_grant(admin, iid, channel, status="connected", status_stashed=None)
+
+    opened = await inbound_dispatch.run_and_reply_full(
+        _meta_inbound(admin, iid, channel, "Are you open on Sunday?")
+    )
+    assert opened.is_new_session and opened.reply_text
+    assert len(meta_sender.sent) == 1
+
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, actor_user_id=admin)
+    grant = next(iter((await _rows(admin)).values()))
+    assert (grant.status, grant.status_stashed) == (state_machine.QUIESCING, "connected")
+
+    follow_up = await inbound_dispatch.run_and_reply_full(
+        _meta_inbound(admin, iid, channel, "And what time do you close?")
+    )
+    await escalation_dispatch.drain_background_notifications()
+    assert follow_up.session_id == opened.session_id
+    assert follow_up.reply_text, "the drain answered the in-flight customer"
+    assert len(meta_sender.sent) == 2, "and the answer left on their channel"
+    assert meta_sender.sent[1] == {
+        "channel": channel,
+        "sender_id": SURFACE_ID,
+        "recipient_id": _META_GRANT[channel][2],
+    }
+    async with tenant_session(admin) as s:
+        undeliverable = (
+            await s.scalar(
+                select(func.count())
+                .select_from(EscalationEvent)
+                .where(
+                    EscalationEvent.admin_id == admin,
+                    EscalationEvent.signal == "reply_undeliverable",
+                )
+            )
+        ) or 0
+    assert undeliverable == 0, "no page telling the owner to reconnect a healthy grant"
 
 
 # --------------------------------------------------------------------------- #
