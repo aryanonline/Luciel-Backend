@@ -1221,6 +1221,7 @@ class Orchestrator:
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
+                        take_over=True,
                     )
                 return await self._hand_off_with_ack(
                     session_id=session_id,
@@ -1257,6 +1258,7 @@ class Orchestrator:
                     channel=channel,
                     resolved_lead_id=resolved_lead_id,
                     transport_identifier=transport_identifier,
+                    take_over=True,
                 ),
             )
         if intake.fired:
@@ -2379,11 +2381,23 @@ class Orchestrator:
         channel: str,
         resolved_lead_id: uuid.UUID | None,
         transport_identifier: str | None,
+        take_over: bool = False,
     ) -> str:
         """The hand-off line for THIS turn (round 7 WP-2 remainder, item 1): the full
         ack the first time this session, a short varied acknowledgement after — the
-        team already has the thread — with the contact ask only when it is due."""
-        ack = short_handoff_ack(history) if handoff_ack_sent(history) else await self._handoff_ack()
+        team already has the thread — with the contact ask only when it is due.
+
+        ``take_over`` (round 7 judgment hardening): a turn that hands the WHOLE
+        conversation to a person — an explicit request for one, a threat — always
+        gets the full, honest line. The short cycle is for a later question Luciel
+        cannot answer while it keeps answering; "That's another one I can't answer
+        from what I have" to "can I talk to a real person please" read as Luciel not
+        understanding, right before every later message went unanswered."""
+        ack = (
+            await self._handoff_ack()
+            if take_over or not handoff_ack_sent(history)
+            else short_handoff_ack(history)
+        )
         return self._with_contact_ask(
             ack,
             channel=channel,
