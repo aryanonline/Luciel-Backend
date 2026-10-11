@@ -9,11 +9,18 @@ and asserts the connection role cannot bypass RLS before any test runs.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import io
+import json
 import os
 import subprocess
+import sys
+import threading
+import time
+import traceback
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -47,38 +54,32 @@ _SUPERUSER_PW = os.environ.get("PGPASSWORD", "postgres")
 # dev box driving the docker-compose db through a `docker exec` shim script) — the
 # same environment-portability seam as _CI_PG above. CI/default is plain "psql".
 _PSQL = os.environ.get("LUCIEL_PSQL", "psql")
+# No superuser psql call may wait forever: a statement that blocks on a lock with no
+# lock_timeout (the old between-tests wipe did) hung whole CI jobs. This is the hard
+# backstop behind the per-statement timeouts below.
+_PSQL_TIMEOUT_SECONDS = 120
 
 
-def _admin_psql(sql: str, db: str = "postgres") -> str:
-    """Run ``sql`` as the superuser; returns psql's stdout (decoded)."""
+def _admin_psql(sql: str, db: str = "postgres", *, tuples_only: bool = False) -> str:
+    """Run ``sql`` as the superuser; returns psql's stdout (decoded).
+
+    ``tuples_only`` returns bare, unaligned rows (``-t -A``) for machine parsing.
+    """
+    flags = ["-v", "ON_ERROR_STOP=1"] + (["-t", "-A"] if tuples_only else []) + ["-c", sql]
     if _CI_PG:
         env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
-        done = subprocess.run(
-            [
-                _PSQL,
-                "-h",
-                PG_HOST,
-                "-p",
-                PG_PORT,
-                "-U",
-                _SUPERUSER,
-                "-d",
-                db,
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                sql,
-            ],
-            check=True,
-            capture_output=True,
-            env=env,
-        )
+        argv = [_PSQL, "-h", PG_HOST, "-p", PG_PORT, "-U", _SUPERUSER, "-d", db, *flags]
     else:
+        env = None
+        argv = ["sudo", "-u", "postgres", "psql", "-d", db, *flags]
+    try:
         done = subprocess.run(
-            ["sudo", "-u", "postgres", "psql", "-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql],
-            check=True,
-            capture_output=True,
+            argv, check=True, capture_output=True, env=env, timeout=_PSQL_TIMEOUT_SECONDS
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"superuser psql did not return within {_PSQL_TIMEOUT_SECONDS} s: {sql[:200]}"
+        ) from exc
     return done.stdout.decode("utf-8", "replace") if done.stdout else ""
 
 
@@ -90,34 +91,101 @@ def superuser_exec(sql: str) -> None:
     deliberate tamper for a tamper-evidence test must take the superuser path
     rather than the old self-grant loophole.
     """
-    if _CI_PG:
-        env = dict(os.environ, PGPASSWORD=_SUPERUSER_PW)
-        subprocess.run(
-            [
-                _PSQL,
-                "-h",
-                PG_HOST,
-                "-p",
-                PG_PORT,
-                "-U",
-                _SUPERUSER,
-                "-d",
-                TEST_DB,
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                sql,
-            ],
-            check=True,
-            capture_output=True,
-            env=env,
+    _admin_psql(sql, db=TEST_DB)
+
+
+# --------------------------------------------------------------------------- #
+# Hang insurance: a test that never finishes must fail the job with a diagnosis,
+# not sit until the CI timeout cancels the job with no output (three runs did,
+# 2026-10-04/05).
+# --------------------------------------------------------------------------- #
+
+_WATCHDOG_SECONDS = int(os.environ.get("LUCIEL_TEST_WATCHDOG_SECONDS", "600"))
+_CURRENT_TEST: str | None = None
+_TEST_LOOP: asyncio.AbstractEventLoop | None = None
+_REAL_STDERR_FD: int | None = None
+# Transactions the between-tests wipe had to terminate, as "<test> -> <session>".
+_LEAKED_TRANSACTIONS: list[str] = []
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Capture is suspended while plugins configure, so fd 2 is the real stderr here;
+    # keep a duplicate the watchdog can write to from any thread later on.
+    global _REAL_STDERR_FD
+    try:
+        _REAL_STDERR_FD = os.dup(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError):
+        _REAL_STDERR_FD = None
+
+
+def _watchdog_fire(nodeid: str) -> None:
+    """Dump every thread, every asyncio task of the test loop and the database's
+    sessions, then end the process: the job fails NOW, with the evidence."""
+    lines = [
+        "",
+        "=" * 78,
+        f"LUCIEL TEST WATCHDOG: {nodeid} has run for more than {_WATCHDOG_SECONDS} s.",
+        "=" * 78,
+    ]
+    loop = _TEST_LOOP
+    if loop is not None:
+        try:
+            tasks = asyncio.all_tasks(loop)
+        except RuntimeError:
+            tasks = set()
+        lines.append(f"asyncio tasks on the test loop: {len(tasks)}")
+        for task in tasks:
+            lines.append(f"-- {task!r}")
+            for frame in task.get_stack(limit=12):
+                lines.extend(traceback.format_stack(frame, limit=1))
+    try:
+        lines.append("sessions on the test database:")
+        lines.append(_blocking_sessions_report())
+    except Exception as exc:  # noqa: BLE001 — diagnostics must not mask the hang
+        lines.append(f"(pg_stat_activity unavailable: {exc!r})")
+    report = "\n".join(lines) + "\n"
+    with open(f"test-hang-{os.getpid()}.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+    fd = _REAL_STDERR_FD if _REAL_STDERR_FD is not None else 2
+    try:
+        os.write(fd, report.encode("utf-8", "replace"))
+        faulthandler.dump_traceback(file=fd, all_threads=True)
+    finally:
+        os._exit(70)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    global _CURRENT_TEST
+    _CURRENT_TEST = item.nodeid
+    timer = threading.Timer(_WATCHDOG_SECONDS, _watchdog_fire, args=(item.nodeid,))
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        _CURRENT_TEST = None
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:
+    if _LEAKED_TRANSACTIONS:
+        terminalreporter.section("leaked transactions terminated by the between-tests wipe")
+        for line in _LEAKED_TRANSACTIONS:
+            terminalreporter.line(line)
+        terminalreporter.line(
+            "Each test above left a transaction open after it finished (a task outliving "
+            "its test, or a session not closed). The wipe terminated it so the run could "
+            "go on; the test still owns the leak."
         )
-    else:
-        subprocess.run(
-            ["sudo", "-u", "postgres", "psql", "-d", TEST_DB, "-v", "ON_ERROR_STOP=1", "-c", sql],
-            check=True,
-            capture_output=True,
-        )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _record_test_loop() -> None:
+    # Kept after the test too: a hang in a later fixture's teardown (the wipe, the
+    # notification drain) must still be able to dump this loop's tasks.
+    global _TEST_LOOP
+    _TEST_LOOP = asyncio.get_running_loop()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -278,7 +346,11 @@ async def _fresh_engine_per_test() -> AsyncIterator[None]:
     yield
 
 
-_TRUNCATE_LOCK_TIMEOUT = "30s"
+# Per attempt. Short on purpose: a transaction that is merely finishing releases its
+# locks within a second or two; anything still holding them after a few attempts is
+# a leak, and the wipe deals with it (see _truncate_tenant_tables).
+_TRUNCATE_LOCK_TIMEOUT = "5s"
+_TRUNCATE_ATTEMPTS = 6
 _TENANT_TABLES = (
     "leads, instances, accounts, admin_audit_log, knowledge_sources, "
     "knowledge_chunks, knowledge_entities, knowledge_edges, sessions, transcripts, "
@@ -290,6 +362,49 @@ _TENANT_TABLES = (
 )
 
 
+_SESSIONS_SQL = (
+    "SELECT pid, usename, state, wait_event_type, "
+    "extract(epoch FROM now() - xact_start) AS xact_age_s, "
+    "extract(epoch FROM now() - state_change) AS idle_s, left(query, 160) AS query "
+    "FROM pg_stat_activity "
+    "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+    "ORDER BY xact_start NULLS LAST"
+)
+
+
+def _db_sessions() -> list[dict[str, Any]]:
+    raw = _admin_psql(
+        f"SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM ({_SESSIONS_SQL}) t",
+        db=TEST_DB,
+        tuples_only=True,
+    ).strip()
+    rows: list[dict[str, Any]] = json.loads(raw or "[]")
+    return rows
+
+
+def _blocking_sessions_report() -> str:
+    return (
+        "\n".join(
+            f"  pid={r['pid']} user={r['usename']} state={r['state']} "
+            f"wait={r['wait_event_type']} xact_age={r['xact_age_s']} query={r['query']!r}"
+            for r in _db_sessions()
+        )
+        or "  (none)"
+    )
+
+
+def _wipe_sql(lock_timeout: str) -> str:
+    """One statement string = one transaction: the audit guard is disabled, the tables
+    truncated and the guard re-enabled atomically, so a lock timeout anywhere rolls the
+    guard back into place and leaves nothing half-done."""
+    return (
+        f"SET lock_timeout = '{lock_timeout}'; "
+        "ALTER TABLE admin_audit_log DISABLE TRIGGER trg_audit_no_truncate; "
+        f"TRUNCATE {_TENANT_TABLES} RESTART IDENTITY CASCADE; "
+        "ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate"
+    )
+
+
 def _truncate_tenant_tables() -> None:
     """The between-tests wipe, as a superuser (bypasses RLS). Runs on a worker thread.
 
@@ -298,34 +413,53 @@ def _truncate_tenant_tables() -> None:
     an explicit, visible act. Disabling the guard around the fixture's own TRUNCATE is
     that act, and mirrors what the tamper tests do with the row-level guard.
 
-    TRUNCATE takes an ACCESS EXCLUSIVE lock on every table listed. It waits at most
-    ``_TRUNCATE_LOCK_TIMEOUT`` for whoever still holds a row or table lock; past that
-    it fails with the list of sessions in the way instead of waiting forever.
+    Every statement here takes a strong lock: the ALTER TABLE a SHARE ROW EXCLUSIVE
+    lock on the audit table, the TRUNCATE an ACCESS EXCLUSIVE lock on every table
+    listed. A transaction the test left open blocks them — and an uncommitted AUDIT
+    ROW was enough, because the trigger ALTER used to run with no lock timeout at
+    all (the third CI hang, 2026-10-05: a 33-minute wait on exactly that lock).
+    Now every statement waits at most ``_TRUNCATE_LOCK_TIMEOUT`` per attempt:
+
+    * a transaction that is still finishing (a task wrapping up just after its test)
+      releases its locks and the next attempt succeeds;
+    * a transaction that is IDLE after two attempts can never commit — its test is
+      over — so the wipe terminates that app session, records the leak against the
+      test (printed in the run summary) and goes on;
+    * a session that is still ACTIVE after every attempt (a runaway statement) fails
+      the wipe with the list of sessions in the way instead of waiting forever.
     """
-    _admin_psql("ALTER TABLE admin_audit_log DISABLE TRIGGER trg_audit_no_truncate", db=TEST_DB)
-    try:
-        _admin_psql(
-            f"SET lock_timeout = '{_TRUNCATE_LOCK_TIMEOUT}'; "
-            f"TRUNCATE {_TENANT_TABLES} RESTART IDENTITY CASCADE",
-            db=TEST_DB,
-        )
-    except subprocess.CalledProcessError as exc:
-        blockers = _admin_psql(
-            "SELECT pid, usename, state, wait_event_type, "
-            "now() - xact_start AS xact_age, left(query, 160) AS query "
-            "FROM pg_stat_activity "
-            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
-            "ORDER BY xact_start NULLS LAST",
-            db=TEST_DB,
-        )
-        stderr = exc.stderr.decode("utf-8", "replace") if exc.stderr else ""
-        raise RuntimeError(
-            "the between-tests TRUNCATE could not take its locks within "
-            f"{_TRUNCATE_LOCK_TIMEOUT} — a transaction from the test that just ran is "
-            f"still open.\npsql: {stderr.strip()}\nsessions on the test database:\n{blockers}"
-        ) from exc
-    finally:
-        _admin_psql("ALTER TABLE admin_audit_log ENABLE TRIGGER trg_audit_no_truncate", db=TEST_DB)
+    attempts = _TRUNCATE_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        try:
+            _admin_psql(_wipe_sql(_TRUNCATE_LOCK_TIMEOUT), db=TEST_DB)
+            return
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", "replace") if exc.stderr else ""
+            if "lock timeout" not in stderr:
+                raise
+            sessions = _db_sessions()
+            if attempt >= attempts:
+                blockers = "\n".join(
+                    f"  pid={r['pid']} user={r['usename']} state={r['state']} "
+                    f"wait={r['wait_event_type']} xact_age={r['xact_age_s']} "
+                    f"query={r['query']!r}"
+                    for r in sessions
+                )
+                raise RuntimeError(
+                    "the between-tests wipe could not take its locks within "
+                    f"{_TRUNCATE_LOCK_TIMEOUT} on {attempts} attempts — a transaction "
+                    "from the test that just ran is still open and still active.\n"
+                    f"psql: {stderr.strip()}\nsessions on the test database:\n{blockers}"
+                ) from exc
+            if attempt >= 2:
+                for row in sessions:
+                    if row["usename"] == APP_USER and row["state"] == "idle in transaction":
+                        _admin_psql(f"SELECT pg_terminate_backend({int(row['pid'])})")
+                        _LEAKED_TRANSACTIONS.append(
+                            f"{_CURRENT_TEST or '?'} -> pid={row['pid']} idle for "
+                            f"{float(row['idle_s'] or 0):.1f}s, last query {row['query']!r}"
+                        )
+            time.sleep(1.0)
 
 
 @pytest_asyncio.fixture(autouse=True)
