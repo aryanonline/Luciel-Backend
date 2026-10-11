@@ -108,6 +108,13 @@ async def _luciel_rows(s, sid: uuid.UUID) -> list[Transcript]:
         ("thanks, what time do you close", True),
         ("jane@example.com — when could you fit me in?", True),
         ("do you open Saturdays?", True),
+        # Round 7 judgment hardening: a real request that merely OPENS with a greeting
+        # or an acknowledgement, or rides beside a contact detail — no question mark,
+        # no interrogative — used to skip the search too.
+        ("Hi, opening hours on Saturday please", True),
+        ("ok and the address", True),
+        ("Delivery to Mississauga, thanks", True),
+        ("My number is 416-555-0143. Wondering if you service Oakville", True),
     ],
 )
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -149,6 +156,43 @@ async def test_a_pending_tool_gather_keeps_the_search_even_on_a_social_turn():
             inbound_text="ok thanks",
         )
         assert bundle.calls == ["ok thanks"]
+
+
+HOURS_CHUNK = "Opening hours: we open 9am to 5pm Monday to Friday and 10am to 2pm on Saturdays."
+HOURS_ANSWER = "We open 10am to 2pm on Saturdays."
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_covered_request_that_opens_with_a_greeting_is_answered_from_the_knowledge():
+    """The live shape of the review finding: a visitor's FIRST message is "Hi, opening
+    hours on Saturday please" and the hours are in the knowledge base. The greeting
+    made the turn "social", the search was skipped, and the model got no Knowledge
+    block and no note — it answered from nothing. The search now runs, the model reads
+    the chunk, and the grounded answer ships with its attribution."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    source_id = str(uuid.uuid4())
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        bundle = _RecordingBundle(
+            texts=[HOURS_CHUNK],
+            attributed=[{"source_id": source_id, "source_name": "Hours", "text": HOURS_CHUNK}],
+        )
+        primary = _RecordingEcho(confidence=1.0, fixed_reply=HOURS_ANSWER)
+        result = await _orch(s, admin, iid, bundle=bundle, primary=primary).run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text="Hi, opening hours on Saturday please",
+        )
+        assert bundle.calls == ["Hi, opening hours on Saturday please"]
+        _, messages, _ = primary.turns[0]
+        assert _has_block(messages) and _notes(messages) == []  # the model SAW the hours
+        assert HOURS_ANSWER in result.reply_text
+        assert result.escalation is None and result.handed_off is False
+        (row,) = await _luciel_rows(s, sid)
+        assert row.source_chunks and row.source_chunks[0]["source_id"] == source_id
+        assert row.grounding_score is not None and row.grounding_score >= 0.5
 
 
 # --- item 4 ------------------------------------------------------------------------ #

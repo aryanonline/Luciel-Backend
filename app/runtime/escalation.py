@@ -505,6 +505,79 @@ def is_new_question(text: str, previous_questions: Iterable[str]) -> bool:
     return not any(is_same_question(text, earlier) for earlier in previous_questions)
 
 
+# --- is the WHOLE message a pleasantry / a contact detail? (round 7 hardening) ------- #
+# ``is_conversational_turn`` and ``is_contact_details_turn`` read how a message OPENS
+# or what it CONTAINS: "Hi, opening hours on Saturday please" opens with a greeting,
+# "My number is 416-555-0143. Wondering if you service Oakville" contains a phone
+# number. Neither is ONLY that — each carries a request as a noun phrase, with no
+# question mark and no interrogative for the seeking guards to catch. Skipping the
+# knowledge search on such a turn drops a covered answer (a wrong refusal), so the
+# skip asks the stricter question: once the pleasantries and the contact details are
+# taken out, is anything left? Any content word left over means "look it up" — a
+# wasted embedding call is cheap, a dropped answer is not.
+_SOCIAL_PHRASES = re.compile(
+    r"\bgood (?:morning|afternoon|evening|night|day)\b"
+    r"|\bhave a (?:good|great|nice|lovely|wonderful) (?:day|night|evening|weekend|one)\b"
+    r"|\b(?:take care|talk (?:soon|later)|see (?:you|ya)(?: (?:soon|later|then))?)\b"
+    r"|\bthat(?:'s| is| was)? (?:all|it|everything)\b"
+    r"|\b(?:sounds|looks|all) good\b|\bgot it\b|\ball right\b|\bwill do\b|\bmakes sense\b"
+    r"|\bnothing else\b|\bno (?:problem|worries)\b|\byou(?:'re| are) welcome\b"
+    r"|\bappreciate (?:it|that|you)\b"
+    r"|\b(?:that|this|it) (?:works|helps)(?: for me)?\b"
+    r"|\bfor (?:your|the|all your|all the) (?:help|time|patience)\b",
+    re.IGNORECASE,
+)
+# The words a customer wraps AROUND their own address or number: "you can reach me
+# at …", "my number is …", "… works best". Removed with the detail itself.
+_CONTACT_FRAMING = re.compile(
+    r"\b(?:you can |feel free to )?(?:reach|contact|call|text|e-?mail|message|ring|phone) me"
+    r"(?: back)?(?: (?:at|on|via|by))?\b"
+    r"|\bi can be reached(?: (?:at|on|via|by))?\b"
+    # "my" only: "ok and the phone number" asks for the BUSINESS's number.
+    r"|\bmy(?: best)? (?:e-?mail|number|phone|cell|mobile|contact|name)"
+    r"(?: address| number| details| info)?(?: is|'s)?(?=[\s:,.!-]|$)"
+    r"|\bhere(?:'s| is| are) my (?:e-?mail|number|phone|cell|mobile|details|contact)"
+    r"(?: address| number| details| info)?\b"
+    r"|\b(?:is|works|would be) (?:best|fine|good)\b|\bworks\b",
+    re.IGNORECASE,
+)
+# Words that carry no request of their own beside a greeting, an acknowledgement or
+# a contact detail. Deliberately NOT day/time/thing words: "one night please" and
+# "Saturday morning" are requests.
+_REMAINDER_FILLER = frozenset(
+    """hiya greetings howdy yo thankyou thx ty cheers appreciated
+    no nope nah yes yep yeah yup k kk alright fine good great perfect understood
+    cool nice lovely awesome wonderful brilliant excellent fantastic
+    bye goodbye goodnight cya
+    very really lot lots all too then now there here
+    everyone guys team folks mate sir madam
+    oh ah um hmm right exactly indeed absolutely definitely certainly noted
+    it's its that's thats i'm im i'll am or name best""".split()
+)
+
+
+def substantive_remainder(text: str) -> frozenset[str]:
+    """The content words left in a message once its pleasantries, its contact details
+    and the customer's own name are removed. Empty means the WHOLE message was social
+    or contact-only — there is nothing to look up. Deterministic and hermetic."""
+    from app.runtime.lead_capture import extract_lead_signals  # noqa: PLC0415 — import cycle
+
+    body = (text or "").replace("’", "'")
+    # The customer's own name is not a request: a self-introduction ("I'm Jane
+    # Miller") and the words of their own address ("Jane Miller, jane.miller@…").
+    own_name = set(_WORD_RE.findall((extract_lead_signals(body).name or "").lower()))
+    lowered = body.lower()
+    for match in _EMAIL_RE.finditer(lowered):
+        own_name.update(re.findall(r"[a-z]+", match.group(0).split("@", 1)[0]))
+    for pattern in (_EMAIL_RE, _PHONE_RE, _SOCIAL_PHRASES, _CONTACT_FRAMING):
+        lowered = pattern.sub(" ", lowered)
+    return frozenset(
+        tok
+        for tok in question_terms(lowered)
+        if tok not in _REMAINDER_FILLER and tok not in own_name
+    )
+
+
 def negative_terms(text: str) -> list[str]:
     """The complaint terms in ``text`` that are NOT negated (round 6 WP-G, F124).
 

@@ -93,6 +93,7 @@ from app.runtime.escalation import (
     is_decline_turn,
     is_new_question,
     is_repeated_question,
+    substantive_remainder,
 )
 from app.runtime.grounding import faithful_readback_ok, score_grounding
 from app.runtime.input_safety import (
@@ -250,12 +251,23 @@ def retrieval_skippable(inbound_text: str, *, gather_pending: bool) -> bool:
     or contact-details turn with no question mark / interrogative, while no tool
     gather is pending, skips the embedding call and the Knowledge block. Gate 2 is
     untouched: it already exempts these turns from the floor, and a question in the
-    same breath keeps both the search and the floor."""
+    same breath keeps both the search and the floor.
+
+    Only when the WHOLE message is that pleasantry or that contact detail (round 7
+    judgment hardening): the classifiers read how a message opens or what it
+    contains, so "Hi, opening hours on Saturday please", "ok and the address" and
+    "My number is 416-555-0143. Wondering if you service Oakville" all passed for
+    turns with nothing to look up — the search was skipped and a covered question
+    was answered from nothing. Anything substantive left once the greeting, the
+    acknowledgement and the contact detail are removed keeps the search. When
+    unsure, retrieve."""
     if gather_pending:
         return False
     if _CARRIES_QUESTION.search(inbound_text or ""):
         return False
-    return is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)
+    if not (is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)):
+        return False
+    return not substantive_remainder(inbound_text)
 
 
 #: What the model is told about the knowledge search on a turn with NO chunks
@@ -2749,9 +2761,11 @@ def routing_hints(
     and the orchestrator never passed any, so the bound fast provider was dead weight
     (cost, 2026-09-05 audit). A social turn (thanks / goodbye / a bare greeting) has
     no factual claim to ground and nothing for a tool to do: that is the honest fast
-    lane. Everything else keeps the primary model.
+    lane. Everything else keeps the primary model — including a request that merely
+    OPENS with a greeting ("Hi, opening hours on Saturday please"): the whole message
+    must be the pleasantry, exactly as for the retrieval skip.
     """
-    social = is_conversational_turn(inbound_text)
+    social = is_conversational_turn(inbound_text) and not substantive_remainder(inbound_text)
     chars = len(prompt) + sum(len(str(m.get("content", ""))) for m in messages)
     return {
         "requires_tools": bool(tool_defs) and not social,
