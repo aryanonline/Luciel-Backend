@@ -372,11 +372,14 @@ async def _poll_mailboxes(session: AsyncSession, *, admin_id: uuid.UUID, now: da
 
 
 async def run_mailbox_poll(*, now: datetime | None = None) -> list[str]:
-    """Pull new mail from every connected BYO Outlook mailbox (§3.1.6a).
+    """Pull new mail from every serving BYO Outlook mailbox (§3.1.6a).
 
     Every 5 minutes — the email channel's inbound transport for mailbox tenants, not
-    a compliance sweep. Candidates are only tenants with a CONNECTED outlook row
-    (migration 0038), so the run is a no-op scan on a platform with none."""
+    a compliance sweep. Candidates are tenants with a CONNECTED outlook row, or a
+    QUIESCING one whose stashed status is connected (migration 0038, widened by 0071
+    so a Luciel in its delete drain still has its in-flight thread read — this poll
+    is the only inbound door a mailbox has), so the run is a no-op scan on a
+    platform with none."""
     return await _per_tenant(MAILBOX_POLL, _poll_mailboxes, now)
 
 

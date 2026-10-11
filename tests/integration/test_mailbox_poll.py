@@ -271,7 +271,9 @@ async def test_tenants_without_a_connected_mailbox_are_never_polled():
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_sweep_registration_is_complete():
     """mailbox_poll is a real sweep: kind registered, entrypoint wired, and the
-    candidates function returns only CONNECTED outlook tenants (migration 0038)."""
+    candidates function returns CONNECTED outlook tenants (migration 0038; a
+    QUIESCING row stashed as connected is listed too since 0071 — pinned per status
+    in tests/integration/test_delete_drain_quiescing.py)."""
     from app.jobs import sweeps
 
     assert "mailbox_poll" in sweeps.SWEEP_KINDS

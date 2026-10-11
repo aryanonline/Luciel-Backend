@@ -23,12 +23,14 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from app.channels import inbound_dispatch, outbound, routing
+from app.channels import mailbox_poll as mailbox_poll_mod
 from app.channels.base import InboundMessage, InboundRejected
 from app.channels.mailbox_poll import poll_mailbox
 from app.channels.runtime_entry import run_inbound_message
 from app.connections import gate
 from app.connections.secrets import LocalSecretStore, secret_ref_for
 from app.db.session import tenant_session
+from app.jobs import sweeps
 from app.lifecycle import cascade, state_machine
 from app.models.connection import InstanceConnection
 from app.models.conversation import EscalationEvent
@@ -784,6 +786,122 @@ async def test_the_mailbox_poll_skips_a_quiescing_mailbox_that_was_not_connected
         processed = await poll_mailbox(s, admin_id=admin, now=now, transport=graph)
     assert processed == 0
     assert graph.fetched == []
+    LocalSecretStore.reset()
+
+
+# --------------------------------------------------------------------------- #
+# ...and the sweep that is the poll's ONLY production caller still lists the
+# draining tenant. The candidate function (SECURITY DEFINER, migration 0038) admitted
+# status = 'connected' alone, so the tenant fell out of the list the moment the delete
+# landed and poll_mailbox — however willing — was never called for it again. Migration
+# 0071 judges a quiescing row by its stashed status, as serving_status does.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("status", "stashed", "polled"),
+    [
+        ("connected", None, True),
+        (state_machine.QUIESCING, "connected", True),
+        (state_machine.QUIESCING, "expired", False),
+        (state_machine.QUIESCING, "error", False),
+        (state_machine.QUIESCING, None, False),
+        ("expired", None, False),
+        ("revoked", None, False),
+    ],
+)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_mailbox_poll_candidates_judge_a_draining_row_by_its_stashed_status(
+    status, stashed, polled
+):
+    """Exactly ``serving_status`` in SQL: a draining mailbox that was connected before
+    the delete is polled; one that could not be polled before it is left alone, so the
+    sweep never wakes a task for a mailbox it cannot read (0038's intent, kept)."""
+    LocalSecretStore.reset()
+    now = datetime.now(UTC)
+    admin = uuid.uuid4()
+    iid = await _seed(admin, state=LucielState.luciel_grace_window)
+    await _seed_outlook_mailbox(admin, iid, status=status, status_stashed=stashed, now=now)
+    assert (admin in await sweeps.sweep_candidates(sweeps.MAILBOX_POLL)) is polled
+    LocalSecretStore.reset()
+
+
+def _graph_page_of(*messages: tuple[str, str, datetime]) -> dict:
+    """A delta page of (graph id, sender, received) messages, each a fresh question."""
+    return {
+        "value": [
+            {
+                "id": graph_id,
+                "subject": "Sunday?",
+                "from": {"emailAddress": {"address": sender}},
+                "receivedDateTime": received.isoformat().replace("+00:00", "Z"),
+                "internetMessageId": f"<{graph_id}@lead.example>",
+                "body": {"contentType": "text", "content": "And what time do you open?"},
+                "bodyPreview": "And what time do you open?",
+                "isDraft": False,
+            }
+            for graph_id, sender, received in messages
+        ],
+        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-next",
+    }
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_mailbox_sweep_reaches_a_draining_mailbox_and_drains_it(monkeypatch):
+    """The live path end to end: ``run_mailbox_poll`` (what the 5-minute loop and the
+    hourly backstop both call) finds the deleted Luciel's mailbox, reads it, answers
+    Dana mid-thread, and refuses Eve's NEW thread exactly as the drain intends. Before
+    0071 the first assertion failed: the tenant was not a candidate, so nothing below
+    it ever ran in production."""
+    LocalSecretStore.reset()
+    now = datetime.now(UTC)
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    await _seed_outlook_mailbox(admin, iid, status="connected", status_stashed=None, now=now)
+    async with tenant_session(admin) as s:
+        opened = await run_inbound_message(s, _inbound(admin, iid, "email", "dana@lead.example"))
+    assert opened.is_new_session
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, actor_user_id=admin)
+    grant = next(iter((await _rows(admin)).values()))
+    assert (grant.status, grant.status_stashed) == (state_machine.QUIESCING, "connected")
+
+    assert admin in await sweeps.sweep_candidates(sweeps.MAILBOX_POLL), (
+        "the draining mailbox is still a sweep candidate (migration 0071)"
+    )
+
+    sent: list[dict] = []
+    real_send = outbound.send_outbound_reply
+
+    async def capture(session, **kwargs):
+        sent.append(kwargs)
+        return await real_send(session, **kwargs)
+
+    monkeypatch.setattr(outbound, "send_outbound_reply", capture)
+    graph = _FakeGraph(
+        {
+            DELTA_FINAL: _graph_page_of(
+                ("msg-dana", "dana@lead.example", now + timedelta(minutes=30)),
+                ("msg-eve", "eve@lead.example", now + timedelta(minutes=31)),
+            )
+        }
+    )
+    # The sweep passes no transport; this is the seam the live Graph client enters by.
+    monkeypatch.setattr(mailbox_poll_mod, "_default_transport", lambda: graph)
+
+    acted = await sweeps.run_mailbox_poll(now=now + timedelta(minutes=35))
+    await escalation_dispatch.drain_background_notifications()
+
+    assert acted == [str(admin)], "the sweep visited the draining tenant and did work"
+    assert graph.fetched == [DELTA_FINAL], "the draining mailbox was read"
+    assert [m["to"] for m in sent] == ["dana@lead.example"], (
+        "Dana's follow-up was answered; Eve's new thread was refused, not answered"
+    )
+    assert await _session_count(admin) == 1, "the drain admitted Dana's thread, opened none"
+    grant = next(iter((await _rows(admin)).values()))
+    assert grant.non_secret_config.get("mailbox_delta_link") == (
+        "https://graph.microsoft.com/v1.0/delta-next"
+    ), "the delta cursor advanced, so a restore does not replay grace-window mail"
     LocalSecretStore.reset()
 
 

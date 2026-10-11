@@ -17,7 +17,7 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
 - `tests/unit/test_sweep_scheduling.py`.
 
 ## Gotchas from the 2026-08-06 truth delta
-- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), the 90-day transcript hot→cold archive (Commitment #38), and the 5-minute BYO-mailbox delta poll (`mailbox_poll` — a TRANSPORT, not a compliance sweep; candidates are only CONNECTED outlook rows, migration 0038).
+- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), the 90-day transcript hot→cold archive (Commitment #38), and the 5-minute BYO-mailbox delta poll (`mailbox_poll` — a TRANSPORT, not a compliance sweep; candidates are CONNECTED outlook rows plus QUIESCING ones stashed as connected, migrations 0038 + 0071 — the poll is the only inbound door a draining mailbox has, so the delete drain is unreachable on email without it).
 - “Freed” pages may be reused; files shrink only after explicit `VACUUM FULL`.
 
 ## deferred (round 7 WP-4b item 8, 2026-09-28)
