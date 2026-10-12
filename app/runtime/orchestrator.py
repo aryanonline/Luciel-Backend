@@ -1110,6 +1110,21 @@ class Orchestrator:
                 handed_off=True,
             )
 
+        # --- CONSECUTIVE STALLS (round 7 judgment hardening, finding 5) -------- #
+        # ``sessions.input_ask_attempts`` means "how many turns IN A ROW Luciel ended
+        # by asking for a detail a tool could not run without". It used to reset only
+        # on a tool ok, the ask bound or a decline, so one stall followed by any
+        # ordinary turn (a free/busy check that came back empty, a price answered from
+        # the knowledge, a take-over, an outage ack) left it at 1 — and an ordinary
+        # "no" turns later was read as refusing the long-settled detail, the session
+        # was escalated at close as an unfinished gather. Every served turn now
+        # starts from 0; the stall accounting below re-counts from the previous value
+        # only when THIS turn stalls too, so the decline check applies exactly while
+        # the previous Luciel turn was that ask.
+        prior_ask_attempts = sess_obj.input_ask_attempts if sess_obj is not None else 0
+        if sess_obj is not None and prior_ask_attempts:
+            sess_obj.input_ask_attempts = 0
+
         # The session's own transcript, loaded once for every path below: the intake
         # gate reads the trailing lead turns from it, and the hand-off ack / contact
         # ask decide from it whether they already went out this session (round 7
@@ -1287,7 +1302,7 @@ class Orchestrator:
         # fabricated. When bound, an empty list here is a REAL "retrieval found
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
-        gather_pending = sess_obj is not None and sess_obj.input_ask_attempts > 0
+        gather_pending = prior_ask_attempts > 0
 
         # --- DECLINED INPUT (§3.3.7 rule 4; round 7 WP-2 remainder, item 2) --- #
         # The last turn stalled asking for a detail and the customer now declines
@@ -1296,7 +1311,6 @@ class Orchestrator:
         # page naming the field, the honest line); a prose stall just moves on.
         declined_prefix = ""
         if sess_obj is not None and gather_pending and is_decline_turn(inbound_text):
-            sess_obj.input_ask_attempts = 0
             gather_pending = False
             gather = await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
             if gather.blocks_action:
@@ -1515,7 +1529,8 @@ class Orchestrator:
         # model's reply is (per the T1/T3 stanzas) a question back to the customer.
         # Asking is bounded, not infinite — after ASK_ATTEMPT_BOUND consecutive
         # stalled turns, Luciel stops re-asking and hands off with the context
-        # (§3.3.7 rule 4). An `ok` outcome resets the counter: the gather worked.
+        # (§3.3.7 rule 4). Any turn that does not stall leaves the counter at the 0
+        # it was cleared to on entry (finding 5): the gather worked, or moved on.
         any_ok = any(r.outcome is tool_contract.Outcome.ok for _, r in resp.dispatched)
         stalled = not any_ok and any(
             r.outcome in (tool_contract.Outcome.missing_input, tool_contract.Outcome.ambiguous)
@@ -1529,68 +1544,68 @@ class Orchestrator:
         if not stalled and not resp.dispatched:
             previous_luciel = next((t.text for t in reversed(history) if t.role == "luciel"), None)
             stalled = is_repeated_question(resp.text, previous_luciel)
-        if sess_obj is not None:
-            if stalled:
-                sess_obj.input_ask_attempts += 1
-                if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
-                    # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
-                    # still missing, send the honest hand-off line instead of the
-                    # re-ask — and stay in ai mode. The next turn is answered.
-                    sess_obj.input_ask_attempts = 0
-                    stall_reasons = _stalled_gather_reasons(resp)
-                    written = await _record_escalation(
+        if sess_obj is not None and stalled:
+            # One more stall IN A ROW: counted from the previous turn's value, which
+            # this turn cleared on entry (finding 5). A turn that did not stall keeps
+            # the 0 — there is no reset branch to forget.
+            sess_obj.input_ask_attempts = prior_ask_attempts + 1
+            if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
+                # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
+                # still missing, send the honest hand-off line instead of the
+                # re-ask — and stay in ai mode. The next turn is answered.
+                sess_obj.input_ask_attempts = 0
+                stall_reasons = _stalled_gather_reasons(resp)
+                written = await _record_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=Signal.cannot_answer.value,
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=list(stall_reasons),
+                )
+                if not written:
+                    # The session's one cannot_answer row already exists (an
+                    # earlier below-floor turn): the owner still reads WHICH
+                    # fields the gather stalled on.
+                    await _append_escalation_reasons(
                         self.session,
                         admin_id=admin_id,
-                        instance_id=instance_id,
                         session_id=session_id,
-                        resolved_lead_id=resolved_lead_id,
                         signal=Signal.cannot_answer.value,
                         gate=Gate.outcome.value,
-                        score=None,
                         reasons=list(stall_reasons),
                     )
-                    if not written:
-                        # The session's one cannot_answer row already exists (an
-                        # earlier below-floor turn): the owner still reads WHICH
-                        # fields the gather stalled on.
-                        await _append_escalation_reasons(
-                            self.session,
-                            admin_id=admin_id,
-                            session_id=session_id,
-                            signal=Signal.cannot_answer.value,
-                            gate=Gate.outcome.value,
-                            reasons=list(stall_reasons),
-                        )
-                    ack = await self._handoff_reply(
-                        history,
-                        channel=channel,
-                        resolved_lead_id=resolved_lead_id,
-                        transport_identifier=transport_identifier,
-                    )
-                    ack_row = await persist_turn(
-                        self.session,
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        role="luciel",
-                        text=ack,
-                        at=datetime.now(UTC),
-                        deterministic=True,
-                    )
-                    return LoopResult(
-                        reply_message_id=ack_row.id,
-                        reply_text=ack,
-                        outbound_channel=channel,
-                        counted=counted,
-                        escalation=EscalationDecision(
-                            True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
-                        ),
-                        used_fallback=used_fallback,
-                        iterations=iterations,
-                        tool_outcomes=resp.tool_outcomes,
-                    )
-            elif any_ok and sess_obj.input_ask_attempts:
-                sess_obj.input_ask_attempts = 0
+                ack = await self._handoff_reply(
+                    history,
+                    channel=channel,
+                    resolved_lead_id=resolved_lead_id,
+                    transport_identifier=transport_identifier,
+                )
+                ack_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=ack,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=ack_row.id,
+                    reply_text=ack,
+                    outbound_channel=channel,
+                    counted=counted,
+                    escalation=EscalationDecision(
+                        True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
+                    ),
+                    used_fallback=used_fallback,
+                    iterations=iterations,
+                    tool_outcomes=resp.tool_outcomes,
+                )
 
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
         # Only an ANSWER-BEARING tool grounds the words (F119): a CRM push or a queued

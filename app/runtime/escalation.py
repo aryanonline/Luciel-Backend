@@ -442,6 +442,20 @@ _ANSWERS_WITH_A_VALUE = re.compile(
     r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|(?<![a-z0-9])\+?\(?\d[\d\s().-]{6,}\d(?![a-z0-9])",
     re.IGNORECASE,
 )
+# A CHOICE in the same breath is an answer too (round 7 judgment hardening, finding
+# 5): a gather that stalled on an ambiguity asks "which one did you mean?", and the
+# customer answers "drop the Tuesday one" or "never mind, Thursday at 3 works". A
+# weekday, a clock time, a relative day or an ordinal names what they chose — the
+# words "drop" / "never mind" are the choice's framing, not a refusal to say.
+_ANSWERS_WITH_A_CHOICE = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
+    r"|\b(?:today|tomorrow|tonight|this (?:week|weekend|morning|afternoon|evening)"
+    r"|next (?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b"
+    r"|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|o'?clock)\b|\bat \d{1,2}(?::\d{2})?\b|\b(?:noon|midday)\b"
+    r"|\b(?:the )?(?:first|second|third|last|earlier|later|other|morning|afternoon|evening) one\b",
+    re.IGNORECASE,
+)
 
 
 def is_decline_turn(text: str) -> bool:
@@ -451,10 +465,11 @@ def is_decline_turn(text: str) -> bool:
     "skip that", "not comfortable sharing my number", "can you book it without my
     email?". Negatives: declining an OPTION ("I don't want the 3pm slot"), a
     preference ("I'd rather not do mornings"), a message that supplies the value
-    after all, and "no thanks, 2pm works" (a choice, not a refusal).
+    after all, "no thanks, 2pm works" (a choice, not a refusal) and a choice framed
+    as a drop ("drop the Tuesday one", "never mind, Thursday at 3 works").
     """
     body = (text or "").strip()
-    if not body or _ANSWERS_WITH_A_VALUE.search(body):
+    if not body or _ANSWERS_WITH_A_VALUE.search(body) or _ANSWERS_WITH_A_CHOICE.search(body):
         return False
     return bool(_BARE_NO.match(body) or _DECLINE_PATTERNS.search(body))
 
