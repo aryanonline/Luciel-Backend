@@ -8,7 +8,13 @@ most ~9 further months of JSONL objects.
 
 Mechanics (per session, one transaction):
   1. Serialize the session's transcript rows to JSONL (id, role, text, at,
-     grounding_score, source_chunks — everything the dashboard evidence view needs).
+     grounding_score, source_chunks, deterministic, the human reply's delivery
+     outcome — delivery_status / delivery_detail / delivered_at — and
+     flagged_by_admin_at: everything the dashboard messages and evidence views
+     read off a hot row. The archive is the ONLY copy once step 3 runs, so a column
+     the read paths show must be carried here; tests/unit/
+     test_transcript_archive_serializer.py walks the model and fails on a column
+     nobody classified).
   2. ``store.put`` the object (overwrite-idempotent on the session-keyed name).
   3. Only after the put returns: stamp ``transcripts_archived_at`` +
      ``archive_object_key`` and DELETE the hot rows. A put failure aborts before any
@@ -53,7 +59,16 @@ def serialize_transcripts(rows: list[Transcript]) -> bytes:
     """JSONL, one row per line, ordered by time — the archive's on-disk shape.
 
     Carries every field the read paths need (dashboard messages + evidence states),
-    so serving an archived conversation is lossless vs. the hot rows."""
+    so serving an archived conversation is lossless vs. the hot rows. Timestamps are
+    ISO-8601 strings with their offset; nullable columns are written as null, never
+    omitted, so a reader can tell "none" from "archived before the key existed".
+
+    Round 7 phase 2 (seams 6): the delivery outcome of a human reply (migration
+    0066), the owner's answer flag (0070) and the ``deterministic`` marker (0051) were
+    not carried, so a rejected takeover reply read as an ordinary sent message and the
+    flag was gone the day the 90-day sweep deleted the hot rows — the archive being the
+    only copy left. Objects written before this change lack the keys; the dashboard's
+    archived read branch tolerates that (``dict.get``) and shows them as null."""
     lines = [
         json.dumps(
             {
@@ -64,6 +79,13 @@ def serialize_transcripts(rows: list[Transcript]) -> bytes:
                 "at": r.at.isoformat(),
                 "grounding_score": r.grounding_score,
                 "source_chunks": r.source_chunks,
+                "deterministic": r.deterministic,
+                "delivery_status": r.delivery_status,
+                "delivery_detail": r.delivery_detail,
+                "delivered_at": r.delivered_at.isoformat() if r.delivered_at else None,
+                "flagged_by_admin_at": (
+                    r.flagged_by_admin_at.isoformat() if r.flagged_by_admin_at else None
+                ),
             },
             ensure_ascii=False,
         )

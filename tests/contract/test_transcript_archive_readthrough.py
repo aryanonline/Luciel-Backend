@@ -7,6 +7,7 @@ archive, so the owner's conversation view never goes blank the day the rows move
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -18,6 +19,7 @@ from app.lifecycle.transcript_store import LocalTranscriptStore, TranscriptStore
 from app.models.conversation import Session as ConvSession
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
+from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -231,3 +233,205 @@ async def test_the_read_through_raises_rather_than_returning_an_empty_transcript
             s, admin_id=admin_id, session_id=uuid.uuid4()
         )
         assert never_archived is None
+
+
+# --------------------------------------------------------------------------- #
+# Round 7 phase 2 (seams 6): the delivery outcome and the owner's flag survive  #
+# the move. Both were dropped by the serializer and by the archived read branch, #
+# so a reply the provider REJECTED read as an ordinary sent message once the     #
+# 90-day sweep deleted the hot rows, and the flag was simply gone.               #
+# --------------------------------------------------------------------------- #
+
+
+async def _seed_takeover_conversation(client) -> tuple[uuid.UUID, uuid.UUID, dict[str, uuid.UUID]]:
+    """An ended SMS conversation, 120 days cold, holding every row shape the owner can
+    reopen: the lead's turn, a scored + flagged answer, a code-composed (deterministic)
+    ack, a human reply the provider rejected and one it accepted."""
+    admin_id = await _login(client)
+    iid, sid = uuid.uuid4(), uuid.uuid4()
+    last = NOW - timedelta(days=120)
+    ids = {
+        "lead": uuid.uuid4(),
+        "answer": uuid.uuid4(),
+        "ack": uuid.uuid4(),
+        "rejected": uuid.uuid4(),
+        "accepted": uuid.uuid4(),
+    }
+    common = {"admin_id": admin_id, "instance_id": iid, "session_id": sid}
+    async with tenant_session(admin_id) as s:
+        s.add(Instance(id=iid, admin_id=admin_id, name="Acme", state=LucielState.active))
+        s.add(
+            ConvSession(
+                id=sid,
+                admin_id=admin_id,
+                instance_id=iid,
+                channel="sms",
+                mode="ai",
+                counted=False,
+                started_at=last - timedelta(minutes=10),
+                last_message_at=last,
+                ended_at=last + timedelta(hours=4),
+            )
+        )
+        s.add(
+            Transcript(
+                id=ids["lead"],
+                role="lead",
+                text="Sunday hours?",
+                at=last - timedelta(minutes=4),
+                **common,
+            )
+        )
+        s.add(
+            Transcript(
+                id=ids["answer"],
+                role="luciel",
+                text="We open 10 to 4 on Sundays.",
+                at=last - timedelta(minutes=3),
+                grounding_score=0.83,
+                source_chunks=[
+                    {"source_id": str(uuid.uuid4()), "source_name": "Hours", "text": "Sun 10-4"}
+                ],
+                deterministic=False,
+                flagged_by_admin_at=last - timedelta(minutes=2, seconds=30),
+                **common,
+            )
+        )
+        s.add(
+            Transcript(
+                id=ids["ack"],
+                role="luciel",
+                text="I've passed this to the team.",
+                at=last - timedelta(minutes=2),
+                deterministic=True,
+                **common,
+            )
+        )
+        s.add(
+            Transcript(
+                id=ids["rejected"],
+                role="human_agent",
+                text="Also, we're closed Easter Sunday.",
+                at=last - timedelta(minutes=1),
+                delivery_status="failed",
+                delivery_detail="send_failed",
+                **common,
+            )
+        )
+        s.add(
+            Transcript(
+                id=ids["accepted"],
+                role="human_agent",
+                text="Sorry, resending: closed Easter Sunday.",
+                at=last,
+                delivery_status="delivered",
+                delivered_at=last + timedelta(seconds=2),
+                **common,
+            )
+        )
+        await s.flush()
+    return admin_id, sid, ids
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_rejected_reply_and_a_flagged_answer_read_the_same_after_the_move(client):
+    """The whole wire body is identical either side of the 90-day boundary, not just
+    the text: the rejected reply still reads ``failed`` (and the accepted one
+    ``delivered`` with its timestamp), the flagged answer is still flagged with its
+    score and sources, and the deterministic ack is still "not_applicable". Before
+    this fix the archived branch returned text/role/at only and the serializer never
+    wrote the outcome or the flag, so none of this survived the sweep."""
+    admin_id, sid, ids = await _seed_takeover_conversation(client)
+    messages_url = f"/api/v1/dashboard/conversations/{sid}/messages"
+
+    before_messages = await client.get(messages_url)
+    before_evidence = {
+        name: await client.get(f"{messages_url}/{ids[name]}/evidence") for name in ("answer", "ack")
+    }
+    assert before_messages.status_code == 200
+    assert all(r.status_code == 200 for r in before_evidence.values())
+    by_id = {m["messageId"]: m for m in before_messages.json()}
+    # The seed is what the fix is about; pin it so a silent seeding drift cannot
+    # turn the equality below into a vacuous pass.
+    assert by_id[str(ids["rejected"])]["deliveryStatus"] == "failed"
+    assert by_id[str(ids["rejected"])]["deliveryDetail"] == "send_failed"
+    assert by_id[str(ids["accepted"])]["deliveryStatus"] == "delivered"
+    assert by_id[str(ids["accepted"])]["deliveredAt"] is not None
+    assert by_id[str(ids["lead"])]["deliveryStatus"] is None
+    assert before_evidence["answer"].json()["flaggedByAdmin"] is True
+    assert before_evidence["answer"].json()["scoringStatus"] == "scored"
+    assert before_evidence["answer"].json()["attributionStatus"] == "has_sources"
+    assert before_evidence["ack"].json()["scoringStatus"] == "not_applicable"
+
+    async with tenant_session(admin_id) as s:
+        assert await archive_aged_transcripts(s, admin_id=admin_id, now=NOW) == 1
+        assert (
+            await s.execute(select(Transcript).where(Transcript.session_id == sid))
+        ).first() is None, "the hot rows are gone: the archive is the only copy"
+
+    after_messages = await client.get(messages_url)
+    assert after_messages.status_code == 200
+    assert after_messages.json() == before_messages.json()
+    for name, before in before_evidence.items():
+        after = await client.get(f"{messages_url}/{ids[name]}/evidence")
+        assert after.status_code == 200, name
+        assert after.json() == before.json(), name
+
+    # A message that was never in the conversation is still a 404, not an archive
+    # error — the archive answered; it just has no such row.
+    missing = await client.get(f"{messages_url}/{uuid.uuid4()}/evidence")
+    assert missing.status_code == 404
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_archive_written_before_the_outcome_was_carried_still_serves(client):
+    """Objects archived before this change have no delivery / flag / deterministic
+    keys. They read as null (the truth a pre-0066 hot row carries) and as unflagged,
+    "not_scored_legacy" evidence — never as delivered, never as flagged, and never
+    as a 500 — so the fix cannot strand the conversations already in cold storage."""
+    admin_id, sid, ids = await _seed_takeover_conversation(client)
+    async with tenant_session(admin_id) as s:
+        assert await archive_aged_transcripts(s, admin_id=admin_id, now=NOW) == 1
+        key = (
+            await s.execute(select(ConvSession.archive_object_key).where(ConvSession.id == sid))
+        ).scalar_one()
+    assert key
+    last = NOW - timedelta(days=120)
+    # Exactly the pre-change on-disk shape: the seven keys the serializer wrote then.
+    old_shape = "".join(
+        json.dumps(
+            {
+                "id": str(ids[name]),
+                "session_id": str(sid),
+                "role": role,
+                "text": text,
+                "at": (last - timedelta(minutes=minutes)).isoformat(),
+                "grounding_score": None,
+                "source_chunks": None,
+            }
+        )
+        + "\n"
+        for name, role, text, minutes in (
+            ("lead", "lead", "Sunday hours?", 4),
+            ("answer", "luciel", "We open 10 to 4 on Sundays.", 3),
+            ("rejected", "human_agent", "Also, we're closed Easter Sunday.", 1),
+        )
+    )
+    await store_mod.get_transcript_store().put(key=key, data=old_shape.encode())
+
+    messages_url = f"/api/v1/dashboard/conversations/{sid}/messages"
+    response = await client.get(messages_url)
+    assert response.status_code == 200
+    rows = {m["messageId"]: m for m in response.json()}
+    assert set(rows) == {str(ids["lead"]), str(ids["answer"]), str(ids["rejected"])}
+    for row in rows.values():
+        assert (row["deliveryStatus"], row["deliveryDetail"], row["deliveredAt"]) == (
+            None,
+            None,
+            None,
+        )
+    evidence = await client.get(f"{messages_url}/{ids['answer']}/evidence")
+    assert evidence.status_code == 200
+    assert evidence.json()["flaggedByAdmin"] is False
+    assert evidence.json()["scoringStatus"] == "not_scored_legacy"
+    assert evidence.json()["attributionStatus"] == "attribution_unavailable"

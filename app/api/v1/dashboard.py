@@ -169,40 +169,39 @@ async def get_messages(
             .all()
         )
         if not rows and sess.archive_object_key:
-            from app.lifecycle.transcript_archive import (
-                ArchivedTranscriptAbsent,
-                ArchivedTranscriptUnavailable,
-                load_archived_transcripts,
-            )
-
-            try:
-                archived = await load_archived_transcripts(
-                    s, admin_id=subject.admin_id, session_id=session_id
-                )
-            except ArchivedTranscriptUnavailable as exc:
-                # Say so — and say WHICH. Returning [] renders as a conversation the
-                # customer never wrote anything in (a false claim), and "nothing has
-                # been lost" is only true when the store failed to ANSWER, not when it
-                # answered that the object is gone (round 7 WP-5, item 7).
-                if isinstance(exc, ArchivedTranscriptAbsent):
-                    raise not_found(
-                        "This conversation's transcript is no longer available in "
-                        "long-term storage."
-                    ) from None
-                raise service_unavailable(
-                    "This conversation is in long-term storage and could not be "
-                    "read right now. Nothing has been lost; please try again shortly."
-                ) from None
-            return [
-                MessageOut(
-                    message_id=uuid.UUID(str(r["id"])),
-                    role=str(r["role"]),
-                    text=str(r["text"]),
-                    at=datetime.fromisoformat(str(r["at"])),
-                )
-                for r in (archived or [])
-            ]
+            archived = await _archived_rows(s, admin_id=subject.admin_id, session_id=session_id)
+            return [_archived_message_out(r) for r in archived]
         return [_message_out(r) for r in rows]
+
+
+async def _archived_rows(
+    s: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> list[dict[str, object]]:
+    """The archived transcript of a session past the 90-day boundary, or the HTTP
+    truth about why it cannot be served. Shared by every archived read branch so the
+    messages view and the evidence view cannot disagree about the same object."""
+    from app.lifecycle.transcript_archive import (  # noqa: PLC0415
+        ArchivedTranscriptAbsent,
+        ArchivedTranscriptUnavailable,
+        load_archived_transcripts,
+    )
+
+    try:
+        archived = await load_archived_transcripts(s, admin_id=admin_id, session_id=session_id)
+    except ArchivedTranscriptUnavailable as exc:
+        # Say so — and say WHICH. Returning [] renders as a conversation the
+        # customer never wrote anything in (a false claim), and "nothing has
+        # been lost" is only true when the store failed to ANSWER, not when it
+        # answered that the object is gone (round 7 WP-5, item 7).
+        if isinstance(exc, ArchivedTranscriptAbsent):
+            raise not_found(
+                "This conversation's transcript is no longer available in long-term storage."
+            ) from None
+        raise service_unavailable(
+            "This conversation is in long-term storage and could not be "
+            "read right now. Nothing has been lost; please try again shortly."
+        ) from None
+    return archived or []
 
 
 def _message_out(row: Transcript) -> MessageOut:
@@ -210,15 +209,55 @@ def _message_out(row: Transcript) -> MessageOut:
     (round 7 WP-3b, item 5) so a rejected reply still reads as failed on reopen. The
     stored detail may be a provider string; the wire vocabulary is closed, so it maps
     through the same collapse the live result did (send_failed for anything else)."""
-    status = row.delivery_status
-    return MessageOut(
+    return _message_out_from(
         message_id=row.id,
-        role=cast("MessageRoleWire", row.role),
+        role=row.role,
         text=row.text,
         at=row.at,
-        delivery_status=cast("DeliveryStatusWire", status) if status else None,
-        delivery_detail=_delivery_detail(row.delivery_detail) if status else None,
+        delivery_status=row.delivery_status,
+        delivery_detail=row.delivery_detail,
         delivered_at=row.delivered_at,
+    )
+
+
+def _archived_message_out(r: dict[str, object]) -> MessageOut:
+    """An archived row on the wire, through the SAME collapse as a hot one (round 7
+    phase 2, seams 6): the delivery outcome used to be dropped at the 90-day move, so a
+    reply the provider rejected read as an ordinary sent message once the hot rows were
+    gone. Objects archived before the outcome was serialized have no such keys; they
+    read as null — the truth a pre-0066 hot row carries too — never as delivered."""
+    status = r.get("delivery_status")
+    detail = r.get("delivery_detail")
+    delivered_at = r.get("delivered_at")
+    return _message_out_from(
+        message_id=uuid.UUID(str(r["id"])),
+        role=str(r["role"]),
+        text=str(r["text"]),
+        at=datetime.fromisoformat(str(r["at"])),
+        delivery_status=str(status) if status else None,
+        delivery_detail=str(detail) if detail is not None else None,
+        delivered_at=datetime.fromisoformat(str(delivered_at)) if delivered_at else None,
+    )
+
+
+def _message_out_from(
+    *,
+    message_id: uuid.UUID,
+    role: str,
+    text: str,
+    at: datetime,
+    delivery_status: str | None,
+    delivery_detail: str | None,
+    delivered_at: datetime | None,
+) -> MessageOut:
+    return MessageOut(
+        message_id=message_id,
+        role=cast("MessageRoleWire", role),
+        text=text,
+        at=at,
+        delivery_status=cast("DeliveryStatusWire", delivery_status) if delivery_status else None,
+        delivery_detail=_delivery_detail(delivery_detail) if delivery_status else None,
+        delivered_at=delivered_at,
     )
 
 
@@ -575,7 +614,7 @@ async def get_answer_evidence(
     is only correct for "no_sources_retrieved", not for "attribution_unavailable".
     """
     async with tenant_session(subject.admin_id) as s:
-        await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
+        sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
         msg = (
             await s.execute(
                 select(Transcript).where(
@@ -585,54 +624,92 @@ async def get_answer_evidence(
                 )
             )
         ).scalar_one_or_none()
-        if msg is None:
+        if msg is not None:
+            return _evidence_out(
+                message_id=msg.id,
+                grounding_score=msg.grounding_score,
+                source_chunks=msg.source_chunks,
+                deterministic=msg.deterministic,
+                # Round 7 WP-4c #8: read from the row (migration 0070). This was a
+                # constant False — the owner flagged an answer, reloaded, and saw it
+                # unflagged.
+                flagged=msg.flagged_by_admin_at is not None,
+            )
+        if not sess.archive_object_key:
             raise not_found("Message not found.")
-
-        scored = msg.grounding_score is not None
-        source_chunks_raw = msg.source_chunks
-        if source_chunks_raw is None:
-            attribution_status = "attribution_unavailable"
-            source_chunks: list[SourceChunkOut] = []
-        elif len(source_chunks_raw) == 0:
-            attribution_status = "no_sources_retrieved"
-            source_chunks = []
-        elif is_retrieval_unavailable(source_chunks_raw):
-            # 2026-09-06 E2E walk: the embedding provider failed, so retrieval never
-            # ran — the marker is NOT an empty result and must not read as one.
-            attribution_status = "retrieval_unavailable"
-            source_chunks = []
-        else:
-            attribution_status = "has_sources"
-            source_chunks = [
-                SourceChunkOut(
-                    source_id=uuid.UUID(str(c["source_id"])),
-                    source_name=str(c["source_name"]),
-                    text=str(c["text"]),
-                )
-                for c in source_chunks_raw
-            ]
-
-        # #5c (live-caught 2026-08-23): a deterministic code-composed reply (greeting,
-        # at-cap notice, escalation ack) is "not_applicable" — scoring never applied —
-        # not "not_scored_legacy", which claims the row predates scoring. Unscored
-        # rows without the 0051 marker keep the legacy status honestly.
-        if scored:
-            scoring_status: ScoringStatusWire = "scored"
-        elif msg.deterministic:
-            scoring_status = "not_applicable"
-        else:
-            scoring_status = "not_scored_legacy"
-        return AnswerEvidenceOut(
-            message_id=msg.id,
-            grounding_score=msg.grounding_score if scored else None,
-            scoring_status=scoring_status,
-            source_chunks=source_chunks,
-            attribution_status=attribution_status,
-            # Round 7 WP-4c #8: read from the row (migration 0070). This was a
-            # constant False — the owner flagged an answer, reloaded, and saw it
-            # unflagged.
-            flagged_by_admin=msg.flagged_by_admin_at is not None,
+        # Past the 90-day boundary the row lives in cold storage (Commitment #38): the
+        # evidence is served from the archive exactly as the messages view is, so the
+        # score, the sources and the owner's flag outlive the hot rows (round 7 phase
+        # 2, seams 6 — the flag and the ``deterministic`` marker were not even
+        # serialized before). An object archived before they were reads as unflagged
+        # and, when unscored, "not_scored_legacy": the honest pre-0051 truth, never a
+        # fabricated flag or a fabricated "not_applicable".
+        archived = await _archived_rows(s, admin_id=subject.admin_id, session_id=session_id)
+        row = next((r for r in archived if str(r.get("id")) == str(message_id)), None)
+        if row is None:
+            raise not_found("Message not found.")
+        score = row.get("grounding_score")
+        chunks = row.get("source_chunks")
+        return _evidence_out(
+            message_id=message_id,
+            grounding_score=float(score) if isinstance(score, int | float) else None,
+            source_chunks=chunks if isinstance(chunks, list) else None,
+            deterministic=bool(row.get("deterministic", False)),
+            flagged=row.get("flagged_by_admin_at") is not None,
         )
+
+
+def _evidence_out(
+    *,
+    message_id: uuid.UUID,
+    grounding_score: float | None,
+    source_chunks: list[dict[str, object]] | None,
+    deterministic: bool,
+    flagged: bool,
+) -> AnswerEvidenceOut:
+    """The evidence states for one answer, from a hot row's columns or the archive's
+    copy of them — one mapping, so the two storage tiers cannot disagree."""
+    scored = grounding_score is not None
+    if source_chunks is None:
+        attribution_status = "attribution_unavailable"
+        chunks_out: list[SourceChunkOut] = []
+    elif len(source_chunks) == 0:
+        attribution_status = "no_sources_retrieved"
+        chunks_out = []
+    elif is_retrieval_unavailable(source_chunks):
+        # 2026-09-06 E2E walk: the embedding provider failed, so retrieval never
+        # ran — the marker is NOT an empty result and must not read as one.
+        attribution_status = "retrieval_unavailable"
+        chunks_out = []
+    else:
+        attribution_status = "has_sources"
+        chunks_out = [
+            SourceChunkOut(
+                source_id=uuid.UUID(str(c["source_id"])),
+                source_name=str(c["source_name"]),
+                text=str(c["text"]),
+            )
+            for c in source_chunks
+        ]
+
+    # #5c (live-caught 2026-08-23): a deterministic code-composed reply (greeting,
+    # at-cap notice, escalation ack) is "not_applicable" — scoring never applied —
+    # not "not_scored_legacy", which claims the row predates scoring. Unscored
+    # rows without the 0051 marker keep the legacy status honestly.
+    if scored:
+        scoring_status: ScoringStatusWire = "scored"
+    elif deterministic:
+        scoring_status = "not_applicable"
+    else:
+        scoring_status = "not_scored_legacy"
+    return AnswerEvidenceOut(
+        message_id=message_id,
+        grounding_score=grounding_score if scored else None,
+        scoring_status=scoring_status,
+        source_chunks=chunks_out,
+        attribution_status=attribution_status,
+        flagged_by_admin=flagged,
+    )
 
 
 @router.post("/conversations/{session_id}/messages/{message_id}/flag", status_code=204)
