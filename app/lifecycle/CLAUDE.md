@@ -38,8 +38,11 @@ Owns account/Luciel state transitions, delete grace, cascade cleanup, retention,
   the account row; restore and grace expiry on the instance row; an export build and the
   hard-delete cascade share `export_bundle.hold_export_lock` (the cascade takes it FIRST).
 - Restore re-qualifies what rode through the grace window: `crm_lead_links` survive only for a
-  CRM connection revived on its stashed credential, and a synced document re-ingested by a sync
-  that was in flight at the delete is removed before the original comes back.
+  CRM connection revived on its stashed credential — and the leads' `crm_*` push stamps go with
+  them (`connections.service.reset_crm_push_state`, the same helper disconnect and swap use;
+  a lead left stamped `synced` was skipped by the backfill into the new account) — and a synced
+  document re-ingested by a sync that was in flight at the delete is removed before the original
+  comes back.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

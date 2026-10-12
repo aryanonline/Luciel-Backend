@@ -49,6 +49,7 @@ from app.models.connection import QUIESCING, InstanceConnection
 from app.models.crm_link import CrmLeadLink
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeSource
+from app.models.lead import Lead
 from sqlalchemy import select
 
 pytestmark = [pytest.mark.asyncio]
@@ -436,14 +437,67 @@ async def _links(admin: uuid.UUID) -> list[CrmLeadLink]:
         return list((await s.execute(select(CrmLeadLink))).scalars().all())
 
 
+async def _seed_leads(admin: uuid.UUID, iid: uuid.UUID) -> None:
+    """One lead per CRM push state: synced, failed (and notified), never attempted."""
+    now = datetime.now(UTC)
+    async with tenant_session(admin) as s:
+        s.add(
+            Lead(
+                admin_id=admin,
+                instance_id=iid,
+                name="S",
+                contact_identifier="s@lead.example",
+                crm_push_status="synced",
+                crm_pushed_at=now,
+            )
+        )
+        s.add(
+            Lead(
+                admin_id=admin,
+                instance_id=iid,
+                name="F",
+                contact_identifier="f@lead.example",
+                crm_push_status="failed",
+                crm_push_detail="crm_http_500",
+                crm_failure_notified_at=now,
+            )
+        )
+        s.add(Lead(admin_id=admin, instance_id=iid, name="U", contact_identifier="u@lead.example"))
+
+
+async def _crm_stamps(admin: uuid.UUID) -> dict[str, tuple[object, ...]]:
+    """lead name → (crm_push_status, crm_push_detail, crm_pushed_at, crm_failure_notified_at)."""
+    async with tenant_session(admin) as s:
+        leads = (await s.execute(select(Lead).where(Lead.admin_id == admin))).scalars().all()
+        return {
+            str(lead.name): (
+                lead.crm_push_status,
+                lead.crm_push_detail,
+                lead.crm_pushed_at,
+                lead.crm_failure_notified_at,
+            )
+            for lead in leads
+        }
+
+
+_NEVER_ATTEMPTED: dict[str, tuple[object, ...]] = {
+    name: (None, None, None, None) for name in ("S", "F", "U")
+}
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_restore_keeps_crm_links_when_the_same_crm_connection_comes_back():
     """The credential survived the grace window untouched, so the record ids still name
-    records in the same CRM account: the next push updates in place, no duplicate."""
+    records in the same CRM account: the next push updates in place, no duplicate — and
+    the leads' push stamps still describe the account that is connected, so a synced
+    lead stays synced (the reset of seams 7 must not over-reach)."""
     admin, iid = await _seed()
     async with tenant_session(admin) as s:
         s.add(_conn(admin, iid, "crm", "hubspot", "connected"))
     await _seed_links(admin, iid, "hubspot")
+    await _seed_leads(admin, iid)
+    stamps = await _crm_stamps(admin)
+    assert stamps != _NEVER_ATTEMPTED
 
     async with tenant_session(admin) as s:
         await state_machine.delete_luciel(s, admin, admin)
@@ -455,6 +509,79 @@ async def test_restore_keeps_crm_links_when_the_same_crm_connection_comes_back()
         "hubspot-rec-0",
         "hubspot-rec-1",
     }
+    assert await _crm_stamps(admin) == stamps, "an intact CRM keeps every lead's stamps"
+    assert await _events(admin, "crm_links_cleared") == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_restore_resets_the_leads_crm_stamps_when_the_crm_was_reconnected_during_grace():
+    """Round 7 phase 2 review, seams 7: restore cleared the link rows but left every
+    lead stamped. A lead stamped ``synced`` read "in your CRM" on the Leads page
+    against a portal it was never pushed to, was skipped by the one-time backfill into
+    the new portal (it selects ``crm_push_status IS NULL``) and still counted in the
+    "leads to CRM" numbers; a ``failed`` one kept its one-time failure notice, so a
+    failure against the new portal would never have been reported."""
+    admin, iid = await _seed()
+    conn = _conn(admin, iid, "crm", "hubspot", "connected")
+    async with tenant_session(admin) as s:
+        s.add(conn)
+    await _seed_links(admin, iid, "hubspot")
+    await _seed_leads(admin, iid)
+
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+    assert await _crm_stamps(admin) != _NEVER_ATTEMPTED, (
+        "the grace window keeps the stamps: a restore on the same account needs them"
+    )
+    async with tenant_session(admin) as s:
+        # What a connect during grace does: the draining row is the type's single
+        # active slot, so the new credential lands on it and it leaves the drain.
+        row = (await s.execute(select(InstanceConnection))).scalar_one()
+        row.status = "connected"
+    async with tenant_session(admin) as s:
+        await state_machine.restore(s, admin, admin)
+
+    assert await _links(admin) == []
+    assert await _crm_stamps(admin) == _NEVER_ATTEMPTED
+    (cleared,) = await _events(admin, "crm_links_cleared")
+    assert (cleared["count"], cleared["leads_reset"]) == (2, 2)
+    assert cleared["reason"] == "restore_crm_connection_changed"
+    assert cleared["connection_id"] == str(conn.connection_id)
+    assert "lead.example" not in str(cleared), "the audit row carries counts, never a key"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_restore_resets_the_leads_crm_stamps_when_no_crm_connection_comes_back_intact():
+    """A pre-0049 delete left no stash: the row restores ``unconfigured``. No link row
+    exists here at all — the reset is keyed on the connection that did not come back,
+    not on how many links there happened to be, so the stamps still go and the audit
+    row still says so."""
+    legacy, iid = await _seed(luciel_state=LucielState.luciel_grace_window)
+    async with tenant_session(legacy) as s:
+        s.add(_conn(legacy, iid, "crm", "hubspot", "revoked"))
+    await _seed_leads(legacy, iid)
+
+    async with tenant_session(legacy) as s:
+        await state_machine.restore(s, legacy, legacy)
+
+    assert await _crm_stamps(legacy) == _NEVER_ATTEMPTED
+    (cleared,) = await _events(legacy, "crm_links_cleared")
+    assert (cleared["count"], cleared["leads_reset"]) == (0, 2)
+    assert cleared["reason"] == "restore_crm_connection_changed"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_restore_without_a_crm_and_with_nothing_stamped_audits_nothing():
+    """A tenant that never had a CRM has nothing to forget: no link, no stamp, no
+    ``crm_links_cleared`` row claiming otherwise."""
+    admin, iid = await _seed()
+    async with tenant_session(admin) as s:
+        s.add(Lead(admin_id=admin, instance_id=iid, name="U", contact_identifier="u@lead.example"))
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+    async with tenant_session(admin) as s:
+        await state_machine.restore(s, admin, admin)
+    assert await _crm_stamps(admin) == {"U": (None, None, None, None)}
     assert await _events(admin, "crm_links_cleared") == []
 
 
