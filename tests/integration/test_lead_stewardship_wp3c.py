@@ -375,3 +375,68 @@ async def test_the_single_lead_retry_accepts_a_never_attempted_row(fresh_mock_cr
     out = await dashboard.retry_crm_push(lid, subject=_subject(admin))
     assert out.crm_status == "synced" and out.crm_detail is None
     assert len(fresh_mock_crm.records) == 1
+
+
+# --- round 7 phase 2 review, seams 7: a restore that changed the CRM ---------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_after_a_restore_onto_a_changed_crm_the_leads_are_offered_to_the_backfill(
+    fresh_mock_crm,
+):
+    """The Leads page and the one-time backfill read the per-lead stamp, not the link
+    rows: restore cleared the links of a CRM reconnected during grace but left every
+    lead stamped, so a lead pushed into the OLD portal read "in your CRM" and the
+    backfill into the new one (``crm_push_status IS NULL``) skipped it. After the
+    restore every lead reads ``never_attempted`` / ``not_yet_pushed`` and the backfill
+    pushes each of them into the portal that is actually connected."""
+    from datetime import UTC, datetime
+
+    from app.lifecycle import state_machine
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, provider="hubspot")
+    synced = await _seed_lead(admin, iid, contact="jane@acme.com", name="Jane")
+    failed = await _seed_lead(admin, iid, contact="bob@acme.com", name="Bob")
+    async with tenant_session(admin) as s:
+        for lid, stamp in ((synced, "synced"), (failed, "failed")):
+            lead = (await s.execute(select(Lead).where(Lead.id == lid))).scalar_one()
+            lead.crm_push_status = stamp
+            lead.crm_pushed_at = datetime.now(UTC) if stamp == "synced" else None
+            lead.crm_push_detail = "crm_http_500" if stamp == "failed" else None
+            lead.crm_failure_notified_at = datetime.now(UTC) if stamp == "failed" else None
+    before = {
+        r.lead_id: r
+        for r in await dashboard.list_leads(limit=10, offset=0, subject=_subject(admin))
+    }
+    assert (before[synced].crm_status, before[failed].crm_status) == ("synced", "failed")
+
+    async with tenant_session(admin) as s:
+        await state_machine.delete_luciel(s, admin, admin)
+    # A connect during grace lands the new portal's credential on the draining row
+    # (the type's single active slot), which leaves the drain as ``connected``.
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_type == "crm")
+            )
+        ).scalar_one()
+        row.status = "connected"
+    async with tenant_session(admin) as s:
+        await state_machine.restore(s, admin, admin)
+
+    rows = {
+        r.lead_id: r
+        for r in await dashboard.list_leads(limit=10, offset=0, subject=_subject(admin))
+    }
+    for lid in (synced, failed):
+        assert (rows[lid].crm_status, rows[lid].crm_detail, rows[lid].crm_pushed_at) == (
+            "never_attempted",
+            "not_yet_pushed",
+            None,
+        ), "the new portal never saw this lead"
+
+    result = await dashboard.backfill_crm(subject=_subject(admin))
+    assert (result.attempted, result.synced, result.failed) == (2, 2, 0)
+    assert {r["lead_key"] for r in fresh_mock_crm.records.values()} == {
+        "jane@acme.com",
+        "bob@acme.com",
+    }
