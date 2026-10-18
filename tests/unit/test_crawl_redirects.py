@@ -263,3 +263,23 @@ async def test_a_fetched_robots_txt_is_honoured_for_our_user_agent():
         "https://acme.example/public",
     }
     assert "/private" not in [r.url.path for r in site.requests]
+
+
+async def test_a_crawl_that_reaches_no_page_raises_crawl_unreachable_not_a_credential_error():
+    """Round 7 Phase 2 review, knowledge #2: a maintenance page (503 everywhere) is an
+    unreachable SITE. The typed failure lets the sweep and the manual routes keep it off
+    the revoked-credential path; it stays a ProviderUnavailable for every other caller."""
+    from app.knowledge.providers import CrawlUnreachable
+
+    site = _Site(
+        {
+            ("acme.example", "/robots.txt"): lambda: httpx.Response(503, text="maintenance"),
+            ("acme.example", "/"): lambda: httpx.Response(503, text="maintenance"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    with pytest.raises(CrawlUnreachable, match="crawl fetched no pages") as caught:
+        await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert isinstance(caught.value, ProviderUnavailable)

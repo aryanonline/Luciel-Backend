@@ -14,7 +14,10 @@ Manual re-sync from the dashboard remains available for immediacy.
 
 A ``ProviderUnavailable`` (revoked/expired credential) pauses the connection's
 sources via the existing §3.2.3 mechanism — the sweep never lets a dead
-credential silently serve stale content, and never crashes the tenant loop.
+credential silently serve stale content, and never crashes the tenant loop. A
+``CrawlUnreachable`` (a website that answered no page) is NOT a credential: it is an
+ordinary failed sync (sources read "error"; no pause, no stop clock, no pause email,
+the connection row untouched).
 """
 
 from __future__ import annotations
@@ -29,7 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.connections.secrets import get_secret_store
 from app.knowledge import service, sync
-from app.knowledge.providers import ProviderUnavailable, provider_for_connection
+from app.knowledge.providers import (
+    CrawlUnreachable,
+    ProviderUnavailable,
+    provider_for_connection,
+)
 from app.models.audit import ActorType
 from app.models.connection import InstanceConnection
 from app.models.instance import Account, Instance, is_paused
@@ -319,6 +326,24 @@ async def sync_due_connections(
                     provider=provider_for_connection(conn, get_secret_store()),
                 )
             synced += 1
+        except CrawlUnreachable as exc:
+            # The site answered no page (maintenance 503, a bot wall's 403, a dead
+            # host) — round 7 Phase 2 review, knowledge #2. A crawl holds no
+            # credential, so this is NOT the revocation path below: no D10 stop
+            # clock, no "your sign-in was revoked" email, no connection flipped to
+            # error by the sync (the health sweep has no liveness probe for a crawl
+            # and would only flip it back). The sources read the honest "error"
+            # state and the next pass retries, exactly like any failed sync.
+            await _record_sync_failure(
+                admin_id=admin_id,
+                instance_id=conn.instance_id,
+                connection_id=conn.connection_id,
+                origin=origin,
+                exc=exc,
+            )
+            logger.warning(
+                "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
+            )
         except ProviderUnavailable as exc:
             # Dead credential: pause + flag (§3.2.3) — never silently serve
             # stale content, never crash the rest of the tenant's connections.

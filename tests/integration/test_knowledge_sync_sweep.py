@@ -20,7 +20,7 @@ import pytest
 from app.db.session import tenant_session
 from app.jobs import sweeps
 from app.knowledge import sweep as knowledge_sweep
-from app.knowledge.providers import ProviderUnavailable
+from app.knowledge.providers import CrawlUnreachable, ProviderUnavailable
 from app.knowledge.sync import RemoteItem, RemoteSnapshot
 from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
@@ -33,7 +33,10 @@ NOW = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
 
 
 async def _seed(
-    *, status: str = "connected", last_synced_at: datetime | None = None
+    *,
+    status: str = "connected",
+    last_synced_at: datetime | None = None,
+    provider: str = "google_drive",
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     admin, iid, cid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
@@ -68,7 +71,7 @@ async def _seed(
                 instance_id=iid,
                 connection_type="knowledge_source",
                 auth_class="oauth_token",
-                provider="google_drive",
+                provider=provider,
                 status=status,
             )
         )
@@ -78,8 +81,8 @@ async def _seed(
                 admin_id=admin,
                 instance_id=iid,
                 name="Playbook.pdf",
-                origin="google_drive",
-                source_origin="google_drive",
+                origin=provider,
+                source_origin=provider,
                 external_id="drive-1",
                 connection_id=cid,
                 ingestion_status="ready",
@@ -164,6 +167,63 @@ async def test_a_dead_credential_pauses_the_sources_instead_of_crashing(monkeypa
         ).scalar_one()
         # §3.2.3: never silently serve stale content from a revoked credential.
         assert src.sync_status == "paused_reconnect_needed"
+
+
+# --- Round 7 Phase 2 review, knowledge #2: an unreachable site is not a revoked sign-in -
+# A crawl whose every page failed (a maintenance 503, a bot wall's 403) raised the same
+# ProviderUnavailable as a revoked OAuth grant: the sources paused with the D10 7-day
+# stop clock, the connection row flipped to error, and the owner was emailed that "its
+# saved sign-in was revoked" on a connection that has no sign-in at all.
+
+
+class _UnreachableSite:
+    origin = "website_crawl"
+
+    async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+        raise CrawlUnreachable("crawl fetched no pages: https://acme.example/")
+
+
+async def test_an_unreachable_site_is_a_failed_sync_not_a_revoked_credential(monkeypatch):
+    from app.models.audit import AdminAuditLog
+    from app.models.notice_delivery import NoticeDelivery
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2), provider="website_crawl")
+    monkeypatch.setattr(
+        knowledge_sweep, "provider_for_connection", lambda conn, store: _UnreachableSite()
+    )
+
+    async with tenant_session(admin) as s:
+        synced = await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW)
+    assert synced == 0
+    async with tenant_session(admin) as s:
+        src = (
+            await s.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin))
+        ).scalar_one()
+        # The honest failed-sync state — no pause, so no D10 stop clock.
+        assert src.sync_status == "error"
+        assert src.paused_since is None
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_id == cid)
+            )
+        ).scalar_one()
+        assert conn.status == "connected"  # no credential to call broken
+        # No "sign-in revoked" pause email, no connection attention flip.
+        assert (
+            await s.execute(select(NoticeDelivery).where(NoticeDelivery.admin_id == admin))
+        ).first() is None
+        events = [
+            (r.event_type, r.event_payload)
+            for r in (
+                await s.execute(select(AdminAuditLog).where(AdminAuditLog.admin_id == admin))
+            ).scalars()
+        ]
+        kinds = {e for e, _ in events}
+        assert "knowledge_pause_notice_emailed" not in kinds
+        assert "connection_status_changed" not in kinds
+        failures = [p for e, p in events if p.get("action") == "sync_failed"]
+        assert [f["error"] for f in failures] == ["CrawlUnreachable"]
+        assert failures[0]["origin"] == "website_crawl"
 
 
 # --- Round 7 WP-4c #3: a mid-sync failure leaves no "Processing…" ghost ---------------

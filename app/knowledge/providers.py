@@ -927,6 +927,16 @@ class CrawlFetchRefused(ProviderUnavailable):
         self.status_code = status_code
 
 
+class CrawlUnreachable(ProviderUnavailable):
+    """A whole crawl reached no page (every fetch timed out, 403'd, 5xx'd or was
+    refused) — the SITE is unreachable this pass, not a credential (round 7 Phase 2
+    review, knowledge #2). A crawl connection holds no sign-in, so this must never
+    take the revocation path (D10 stop clock, paused rows, "your sign-in was revoked"
+    email, the connection row flipped to error): the sweep and the manual routes
+    read it as an ordinary failed sync. A subclass, so every caller that only knows
+    ``ProviderUnavailable`` (and the manual routes' 409 wording) is unchanged."""
+
+
 _SKIP_EXTENSIONS = (
     ".pdf",
     ".jpg",
@@ -1130,7 +1140,7 @@ class WebsiteCrawlProvider:
         if not fetched_any and failed:
             # Every page failed (a blocked address, a dead site): raise rather than
             # hand the sync an 'empty site' it would read as a mass retirement.
-            raise ProviderUnavailable(f"crawl fetched no pages: {failed[0]}")
+            raise CrawlUnreachable(f"crawl fetched no pages: {failed[0]}")
         return RemoteSnapshot(items=items, failed_ids=failed)
 
     async def _robots_allow(self, url: str, cache: dict[str, RobotFileParser | None]) -> bool:

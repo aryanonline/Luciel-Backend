@@ -33,6 +33,7 @@ from app.knowledge import scope as knowledge_scope
 from app.knowledge import service, sync
 from app.knowledge.parsers import ParseError, parse_file
 from app.knowledge.providers import (
+    CrawlUnreachable,
     HttpTransport,
     OAuthExchangeError,
     ProviderUnavailable,
@@ -252,6 +253,17 @@ async def _flag_dead_credential(admin_id: uuid.UUID, connection_id: uuid.UUID) -
             await mark_connection_broken(s, conn, detail=_DEAD_CREDENTIAL_DETAIL)
 
 
+async def _flag_unreachable_site(admin_id: uuid.UUID, connection_id: uuid.UUID) -> None:
+    """Bookkeeping for a crawl that reached no page (round 7 Phase 2 review,
+    knowledge #2), in its OWN transaction (the 409 unwinds the request's).
+
+    A website crawl holds no credential, so this is NOT ``_flag_dead_credential``:
+    the sources read the honest "error" sync state and nothing else changes — no
+    D10 stop clock, no pause notice, the connection row keeps its status."""
+    async with tenant_session(admin_id) as s:
+        await sync.mark_sync_error(s, admin_id=admin_id, connection_id=connection_id)
+
+
 @router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
 async def resync_source(
     source_id: uuid.UUID,
@@ -323,6 +335,11 @@ async def resync_source(
                 return _source_out(refreshed)
             # One-time ingest: no connector to re-pull from; nothing to do.
             return _source_out(src)
+    except CrawlUnreachable as exc:
+        # The site answered no page: a failed sync, not a dead credential.
+        if dead_connection is not None:
+            await _flag_unreachable_site(subject.admin_id, dead_connection)
+        raise conflict(f"Sync unavailable: {exc}") from exc
     except ProviderUnavailable as exc:
         # Same clean-error rule as trigger_sync: a revoked/expired/never-connected
         # credential surfaces a structured 409, never a crash. Caught OUTSIDE the
@@ -647,6 +664,12 @@ async def trigger_sync(
             return SyncResultOut.model_validate(
                 {"added": result.added, "updated": result.updated, "removed": result.removed}
             )
+    except CrawlUnreachable as exc:
+        # The site answered no page (round 7 Phase 2 review, knowledge #2): the same
+        # 409 the owner always saw, but the bookkeeping is a failed sync — never the
+        # revocation pause or the connection flipped to error on a credential-less row.
+        await _flag_unreachable_site(subject.admin_id, connection_id)
+        raise conflict(f"Sync unavailable: {exc}") from exc
     except ProviderUnavailable as exc:
         # No token on file (never connected / revoked / expired) or the provider's
         # live call isn't reachable in this posture: surface a clean, structured
