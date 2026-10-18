@@ -446,3 +446,119 @@ async def test_an_origin_removal_is_not_restorable_and_is_purged_without_the_win
     async with tenant_session(admin) as s:
         ext_ids = {x.external_id for x in await service.list_sources(s, admin)}
         assert ext_ids == {"doc1", "doc2", None}
+
+
+# --- Round 7 Phase 2 review, knowledge #1: a sync never spends the customers' share ----
+# Every ingested page's LLM graph call is admitted under the tenant's per-minute cap —
+# the SAME counter its customer turns are admitted under. A large sync used to spend
+# the whole minute, and a customer on the widget got the at-cap "unavailable" reply
+# because of a background job. Above half the cap the pass is skipped (grammar only),
+# and the skipped pages keep an unbumped revision so the next pass re-extracts them.
+
+_GRAPH_REPLY = '{"entities":[{"name":"Lifetime Warranty","type":"Policy"}],"edges":[]}'
+
+
+def _page(i: int, rev: str = "r1") -> RemoteItem:
+    return RemoteItem(
+        external_id=f"page{i}",
+        name=f"Page {i}",
+        text=f"Page {i}. Our widgets ship in two days and every one carries a lifetime "
+        "warranty, honoured at any of our stores.",
+        revision=rev,
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_large_sync_leaves_the_customers_their_share_of_the_llm_cap(monkeypatch):
+    import app.runtime.llm_cap as llm_cap
+    from app.knowledge import graph_extract as ge
+    from app.models.knowledge import KnowledgeEntity, KnowledgeSource
+    from app.runtime.llm_router import LLMRouter
+    from app.runtime.testing import EchoModel
+
+    store = llm_cap.InMemoryLLMCapStore()
+    monkeypatch.setattr(llm_cap, "_store", store)
+    # The production shape: the extractor's router is built WITHOUT a tenant and never
+    # opens a turn, so LLMRouter.complete admits every call under the ingesting tenant.
+    monkeypatch.setattr(
+        ge,
+        "_default",
+        ge.LlmGraphExtractor(
+            router_factory=lambda: LLMRouter(
+                primary=EchoModel(fixed_reply=_GRAPH_REPLY),
+                fallback=EchoModel(fixed_reply=_GRAPH_REPLY),
+            )
+        ),
+    )
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    conn = uuid.uuid4()
+    cap = llm_cap.LLM_CAP_PER_MINUTE
+    headroom = int(cap * ge.INGEST_HEADROOM_FRACTION)
+    pages = [_page(i) for i in range(cap)]
+    assert all(len(p.text) >= ge.MIN_LLM_TEXT_CHARS for p in pages)
+    provider = FakeDriveProvider(pages)
+
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="google_drive",
+            provider=provider,
+        )
+    # Every page was ingested and serves; only half the cap went to the graph pass.
+    assert len(res.added) == cap
+    assert store.current_count(str(admin)) == headroom
+    assert len(res.graph_deferred) == cap - headroom
+    # A customer turn right after the sync is still admitted (it used to be refused:
+    # the sync alone drove the counter to the cap).
+    with LLMRouter(EchoModel(), EchoModel(), admin_id=admin).turn():
+        pass
+
+    async def _rows() -> dict[str, tuple[str | None, set[str]]]:
+        async with tenant_session(admin) as s:
+            out: dict[str, tuple[str | None, set[str]]] = {}
+            for src in (
+                await s.execute(
+                    select(KnowledgeSource).where(
+                        KnowledgeSource.admin_id == admin,
+                        KnowledgeSource.soft_deleted_at.is_(None),
+                    )
+                )
+            ).scalars():
+                types = set(
+                    (
+                        await s.execute(
+                            select(KnowledgeEntity.entity_type).where(
+                                KnowledgeEntity.source_id == src.id
+                            )
+                        )
+                    ).scalars()
+                )
+                out[str(src.external_id)] = (src.original_object_key, types)
+            return out
+
+    rows = await _rows()
+    deferred = set(res.graph_deferred)
+    for ext_id, (revision, types) in rows.items():
+        if ext_id in deferred:
+            assert revision is None and "Policy" not in types  # grammar only, marker unset
+        else:
+            assert revision == "r1" and "Policy" in types  # the LLM pass ran
+
+    # The next pass (a fresh minute) re-extracts exactly the deferred pages — nothing
+    # changed at the source, so nothing else is touched.
+    monkeypatch.setattr(llm_cap, "_store", llm_cap.InMemoryLLMCapStore())
+    async with tenant_session(admin) as s:
+        res2 = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="google_drive",
+            provider=provider,
+        )
+    assert set(res2.updated) == deferred and res2.added == [] and res2.graph_deferred == []
+    assert all(rev == "r1" and "Policy" in types for rev, types in (await _rows()).values())

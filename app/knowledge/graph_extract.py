@@ -30,7 +30,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,12 @@ class ExtractedEdge:
 class ExtractionResult:
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge]
+    # True when the LLM pass was owed but deliberately not run (the tenant's per-minute
+    # budget was spoken for — see INGEST_HEADROOM_FRACTION): the result is grammar-only
+    # and the sync leaves the source's revision marker unbumped so the next pass
+    # re-extracts it. A pass that was never owed (a short source, the deterministic
+    # extractor) or that the model answered unusably is not "skipped".
+    llm_skipped: bool = False
 
 
 def canonicalize(name: str) -> str:
@@ -183,6 +189,15 @@ MAX_LLM_TEXT_CHARS = 12_000
 # bounded again by MAX_LLM_TEXT_CHARS — one bounded fast-model call per ingest.
 MIN_LLM_TEXT_CHARS = 80
 MAX_LLM_CHUNKS = 8
+# Ingest headroom (round 7 Phase 2 review, knowledge #1): the ingest call is admitted
+# under the SAME per-tenant per-minute cap as the tenant's customer turns (§9 C9, item
+# 4), and a sync ingests page after page with no pacing — a large sync could spend the
+# whole minute and push a customer on the widget into the at-cap reply. So the pass is
+# skipped (grammar-only, ``llm_skipped``; the sync re-extracts it next pass) once the
+# tenant's current window already holds this fraction of the cap. The check READS the
+# counter (never an INCR), so a skipped pass costs the tenant nothing, and ingest alone
+# can never take more than this share: customer turns always keep the rest.
+INGEST_HEADROOM_FRACTION = 0.5
 _MAX_NAME = 200
 _MAX_TYPE = 64
 _MAX_ATTRS = 20
@@ -336,6 +351,11 @@ class LlmGraphExtractor:
         clipped = llm_input_for(text)
         if clipped is None:
             return base
+        from app.runtime.llm_cap import LLMCapExceeded  # noqa: PLC0415 — import cycle
+
+        if admin_id is not None and not ingest_has_headroom(admin_id):
+            log.info("graph_extract.llm_skipped_headroom", extra={"admin_id": str(admin_id)})
+            return replace(base, llm_skipped=True)
         try:
             resp = await self._router_or_build().complete(
                 _LLM_SYSTEM_PROMPT,
@@ -347,12 +367,25 @@ class LlmGraphExtractor:
             )
         except Exception as exc:  # noqa: BLE001 — never let a vendor break ingest
             log.warning("graph_extract.llm_failed", extra={"error": type(exc).__name__})
-            return base
+            # A cap refusal (customer turns filled the window between the headroom
+            # read and the admission) is the same budget skip: re-extract next pass.
+            return replace(base, llm_skipped=isinstance(exc, LLMCapExceeded))
         parsed = parse_llm_graph(getattr(resp, "text", "") or "")
         if parsed is None:
             log.warning("graph_extract.llm_unparseable")
             return base
         return merge_results(base, parsed)
+
+
+def ingest_has_headroom(admin_id: uuid.UUID) -> bool:
+    """True while the tenant's current cap window leaves the ingest pass its share.
+
+    ``current_count`` is a read (a Redis GET in live), never an admission, so asking
+    costs the tenant nothing."""
+    from app.runtime.llm_cap import LLM_CAP_PER_MINUTE, get_llm_cap_store  # noqa: PLC0415
+
+    threshold = int(LLM_CAP_PER_MINUTE * INGEST_HEADROOM_FRACTION)
+    return get_llm_cap_store().current_count(str(admin_id)) < threshold
 
 
 async def extract_async(

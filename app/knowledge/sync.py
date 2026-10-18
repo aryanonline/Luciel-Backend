@@ -31,6 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.knowledge import service
+from app.knowledge.graph_extract import (
+    ExtractionResult,
+    GraphExtractor,
+    extract_async,
+    get_extractor,
+)
 from app.models.audit import ActorType
 from app.models.knowledge import KnowledgeSource
 
@@ -86,6 +92,25 @@ class SyncProvider(Protocol):
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot: ...
 
 
+class _GraphPass:
+    """The bound graph extractor for ONE synced item, remembering whether its LLM pass
+    was skipped for budget (``ExtractionResult.llm_skipped``) so the sync can leave
+    that item's revision marker unbumped — a skipped page is re-extracted next pass
+    instead of keeping a grammar-only graph until its content happens to change."""
+
+    def __init__(self, inner: GraphExtractor) -> None:
+        self._inner = inner
+        self.llm_skipped = False
+
+    def extract(self, text: str) -> ExtractionResult:
+        return self._inner.extract(text)
+
+    async def aextract(self, text: str, *, admin_id: uuid.UUID | None = None) -> ExtractionResult:
+        result = await extract_async(self._inner, text, admin_id=admin_id)
+        self.llm_skipped = result.llm_skipped
+        return result
+
+
 class SyncResult:
     def __init__(self) -> None:
         self.added: list[str] = []
@@ -96,6 +121,11 @@ class SyncResult:
         # past either keeps its PREVIOUS chunks serving and reads ``sync_status =
         # "error"`` — never a silently truncated or silently absent page.
         self.refused: list[str] = []
+        # Items ingested this pass whose LLM graph pass was skipped for the tenant's
+        # per-minute budget (graph_extract.INGEST_HEADROOM_FRACTION): their chunks are
+        # served now, their graph is grammar-only, and their revision marker is left
+        # unbumped so the next pass re-extracts them.
+        self.graph_deferred: list[str] = []
 
     def as_dict(self) -> dict[str, list[str]]:
         return {"added": self.added, "updated": self.updated, "removed": self.removed}
@@ -187,6 +217,7 @@ async def sync_connection(
     # the page — so a synced page could grow past every limit unnoticed.
     for ext_id, item in remote_by_id.items():
         prior = existing_by_ext.get(ext_id)
+        graph = _GraphPass(get_extractor())
         if prior is None:
             try:
                 src = await service.ingest_text(
@@ -196,6 +227,7 @@ async def sync_connection(
                     name=item.name,
                     text=item.text,
                     origin=origin,
+                    extractor=graph,
                 )
             except service.QuotaError:
                 # Nothing was written for this item (ingest_text checks before it
@@ -206,8 +238,12 @@ async def sync_connection(
             src.external_id = ext_id
             src.last_synced_at = datetime.now(UTC)
             src.sync_status = "synced"
-            # store revision in name-adjacent field via non-destructive approach:
-            src.original_object_key = item.revision
+            # store revision in name-adjacent field via non-destructive approach.
+            # A graph pass skipped for budget leaves NO revision, so the next pass
+            # reads the item as changed and re-extracts it.
+            src.original_object_key = None if graph.llm_skipped else item.revision
+            if graph.llm_skipped:
+                result.graph_deferred.append(ext_id)
             result.added.append(ext_id)
         elif prior.original_object_key != item.revision:
             # Changed: re-ingest through replace_source — quota (crediting the old
@@ -220,6 +256,7 @@ async def sync_connection(
                     text=item.text,
                     size_bytes=len(item.text.encode("utf-8")),
                     action="sync_update",
+                    extractor=graph,
                 )
             except service.QuotaError:
                 # The previous revision keeps serving (replace_source refuses before
@@ -231,7 +268,12 @@ async def sync_connection(
                 result.refused.append(ext_id)
                 continue
             prior.name = item.name
-            prior.original_object_key = item.revision
+            if graph.llm_skipped:
+                # The new content serves now; the marker stays on the OLD revision
+                # so the next pass re-extracts the graph the budget deferred.
+                result.graph_deferred.append(ext_id)
+            else:
+                prior.original_object_key = item.revision
             prior.last_synced_at = datetime.now(UTC)
             prior.sync_status = "synced"
             result.updated.append(ext_id)
@@ -270,6 +312,7 @@ async def sync_connection(
             "origin": origin,
             **result.as_dict(),
             "refused": result.refused,
+            "graph_deferred": result.graph_deferred,
         },
     )
     return result
