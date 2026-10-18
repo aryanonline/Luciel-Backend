@@ -2696,7 +2696,14 @@ class Orchestrator:
             on_record = None
         to = typed or on_record
         if to is not None:
-            if typed and resolved_lead_id is not None:
+            # A typed address is confirmed onto the lead only when the customer gave it
+            # as THEIR OWN (finding 6): "email it to my accountant at karen@…" sends
+            # this one message to Karen and records nothing.
+            if (
+                typed
+                and resolved_lead_id is not None
+                and channel_switch.is_own_identifier(kind, typed, inbound_text)
+            ):
                 await channel_switch.confirm_identifier(
                     self.session,
                     admin_id=self.admin_id,
@@ -2747,7 +2754,11 @@ class Orchestrator:
         if to is None:
             reply = channel_switch.DECLINED_LINE
         else:
-            if resolved_lead_id is not None:
+            # The offered candidate came from the lead's own record; a typed address
+            # is confirmed only when given as the customer's own (finding 6) — "send
+            # it to my wife at …" is that one send's destination, nothing more.
+            own = not typed or channel_switch.is_own_identifier(kind, typed, inbound_text)
+            if resolved_lead_id is not None and own:
                 await channel_switch.confirm_identifier(
                     self.session,
                     admin_id=self.admin_id,
@@ -2759,7 +2770,7 @@ class Orchestrator:
                 )
             delivered = await self._deliver_elsewhere(pending.channel, to, pending.body)
             reply = (
-                channel_switch.sent_line(pending.channel, to)
+                channel_switch.sent_line(pending.channel, to, own=own)
                 if delivered
                 else f"{channel_switch.failed_line(pending.channel)}\n\n{pending.body}"
             )

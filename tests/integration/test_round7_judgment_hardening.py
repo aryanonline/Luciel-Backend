@@ -671,3 +671,130 @@ async def test_a_gather_that_progresses_from_the_time_to_the_email_is_not_a_repe
         assert "still missing email after 2 asks" in _reasons(await _rows(s, sid))
         assert (await _session_row(s, sid)).input_ask_attempts == 0
     await escalation_dispatch.drain_background_notifications()
+
+
+# --- finding 6: a mentioned address is a destination, never the lead's own ---------- #
+KAREN = "karen@books.com"
+
+
+async def _confirmed_values(s, admin: uuid.UUID) -> list[str]:
+    from app.models.lead import LeadIdentifier
+
+    return [
+        str(v)
+        for v in (
+            await s.execute(
+                select(LeadIdentifier.value).where(
+                    LeadIdentifier.admin_id == admin,
+                    LeadIdentifier.kind == "email",
+                    LeadIdentifier.confirmed_at.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    ]
+
+
+def _answer_orch(s, admin, iid, *, tool: _ScriptedTool | None = None) -> Orchestrator:
+    model = _CountingEcho(confidence=1.0, fixed_reply=STARTER)
+    if tool is None:
+        return _orch(s, admin, iid, primary=model, retriever=_starter_retriever)
+    return _tool_orch(s, admin, iid, primary=model, tool=tool, retriever=_starter_retriever)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_accountants_address_in_an_email_me_request_is_sent_to_but_never_confirmed(
+    delivered: list[dict[str, object]],
+):
+    """An SMS customer: "email the details … to my accountant at karen@…". The answer
+    goes to Karen, as asked. It used to ALSO be confirmed as the customer's own email
+    (lead capture had classified it as a mention): from then on a booking was filled
+    with Karen's address and read back, and a later "email me the details" went to
+    Karen without asking."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _BookingTool()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        await _authorize(s, admin, iid, tool)
+        sent = await _turn(
+            _answer_orch(s, admin, iid, tool=tool),
+            sid,
+            f"can you email the details of the starter package to my accountant at {KAREN}",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert delivered == [{"channel": "email", "to": KAREN}]  # this one send: as asked
+        assert f"I've also emailed this to {KAREN}." in sent.reply_text
+        assert KAREN not in await _confirmed_values(s, admin)  # never the lead's own
+
+        booked = await _turn(
+            _tool_orch(s, admin, iid, primary=_booking_model(), tool=tool),
+            sid,
+            "book me a cleaning for 2pm on the 1st",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert booked.tool_outcomes == ["missing_input"]  # Karen's address fills nothing
+        assert tool.calls == []
+
+        again = await _turn(
+            _answer_orch(s, admin, iid, tool=tool),
+            sid,
+            "can you email me the details of the starter package?",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert delivered == [{"channel": "email", "to": KAREN}]  # nothing more to Karen
+        assert KAREN not in again.reply_text
+        assert "What's the best email address to send it to?" in again.reply_text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_spouses_address_given_as_the_destination_is_sent_once_and_not_kept(
+    delivered: list[dict[str, object]],
+):
+    """The parked path: asked where to send it, the customer names their wife's
+    address. It is that one send's destination — sent, said truthfully ("Sent to …",
+    not "check your email") — and not confirmed onto the lead; a bare address typed in
+    answer is still the customer's own and is kept."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    wife = "maria@home.example"
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        asked = await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            "can you email me the details of the starter package?",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert "What's the best email address to send it to?" in asked.reply_text
+
+        settled = await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            f"send it to my wife at {wife}",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert delivered == [{"channel": "email", "to": wife}]
+        assert settled.reply_text == f"Sent to {wife}."
+        assert await _confirmed_values(s, admin) == []
+
+        await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            "can you email me the details of the starter package?",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        own = await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            "dana@lead.example",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert own.reply_text == "Sent — check your email at dana@lead.example."
+        assert await _confirmed_values(s, admin) == ["dana@lead.example"]

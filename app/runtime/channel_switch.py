@@ -126,7 +126,10 @@ def ask_line(channel: str, candidate: str | None) -> str:
     return f"Happy to {noun} you this. What's the best {what} to send it to?"
 
 
-def sent_line(channel: str, to: str) -> str:
+def sent_line(channel: str, to: str, *, own: bool = True) -> str:
+    if not own:
+        # Somebody else's address (finding 6): it went there, not to "your email".
+        return f"Sent to {to}."
     if channel == "email":
         return f"Sent — check your email at {to}."
     return f"Sent — check your messages at {to}."
@@ -214,6 +217,22 @@ def identifiers_supplied(history: Iterable[Transcript]) -> frozenset[str]:
         signals = extract_lead_signals(turn.text)
         out.update(normalize_identifier(v) for v in (signals.email, signals.phone) if v)
     return frozenset(out)
+
+
+def is_own_identifier(kind: str, value: str, text: str) -> bool:
+    """Did ``text`` give ``value`` as the customer's OWN address/number (finding 6)?
+
+    "Email the quote to my accountant at karen@…" names a DESTINATION for that one
+    send — the lead-capture own-vs-mentioned rule (``extract_lead_signals``) says it
+    is somebody else's — so it may receive the message but is never confirmed onto
+    the lead: confirmed, it would win every later auto-fill and readback, a later
+    "email me" would go to Karen without asking, and her mail would resolve to this
+    customer's record."""
+    from app.runtime.lead_capture import extract_lead_signals  # noqa: PLC0415
+
+    signals = extract_lead_signals(text)
+    own = signals.email if kind == "email" else signals.phone
+    return own is not None and normalize_identifier(own) == normalize_identifier(value)
 
 
 def record_readable(channel: str | None, value: str | None, supplied: Collection[str]) -> bool:
