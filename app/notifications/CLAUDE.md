@@ -90,3 +90,23 @@ make that state explicit and test it.
   clock); the deferred sweep emits `EscalationBacklog` after its drain and the
   ObservabilityStack alarms on ≥ 1 over the sweep's hourly period. An unknown backlog
   emits nothing — a fabricated 0 would read as all clear.
+
+## Delivery hardening (round 7 Phase 2 review, 2026-10-18; migration 0072)
+- Every accepted page through a real Twilio sender reads `sent` (`dlr_pending`), BOTH
+  credential shapes: the OAuth bearer sender asks for the same StatusCallback. Twilio signs
+  receipts with the ACCOUNT auth token, so a tenant without one verifies on the C11
+  capability token in the URL; a tenant with neither gets no callback (never accepted unsigned).
+- The status route verifies BEFORE charging its flood bucket, and re-looks-up an unknown SID
+  for a few seconds (a receipt can beat the sender's commit).
+- `sweep_stale_escalations` (inside the deferred sweep, no new process): `pending` > 10 min
+  (the off-turn task died) is audited `notification_lost:pending_stale` and retried once
+  through `notify_escalation_safely`; `sent` > 15 min from `sent_at` gets ONE status fetch
+  with the tenant's own credentials — terminal → stamped like a receipt, else `unconfirmed`
+  and the owner is told. Both bounds are copied into 0072's SQL (candidates + backlog).
+- The owner is emailed at most once per escalation: the `+owner` marker on
+  `delivery_detail` covers the cc fan-out, the unverified copy and a re-stamped fallback.
+  A contacts-only replay with nothing retryable completes its queue item
+  (`settled:owner_heard`) instead of living 24h.
+- Code texts spend a per-tenant `escalation_code_sms` budget (refusal
+  `code_send_rate_limited`, audited); dashboard code entries spend `escalation_code_entry`,
+  sized to 3 SMS contacts × `MAX_CODE_ATTEMPTS` — the per-code counter is the brute-force guard.
