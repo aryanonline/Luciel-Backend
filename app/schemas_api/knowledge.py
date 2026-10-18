@@ -121,11 +121,15 @@ class SyncConnectionOut(WireModel):
 
 
 class SyncResultOut(WireModel):
-    """Result of a manual sync/crawl trigger: external_ids added/updated/removed."""
+    """Result of a manual sync/crawl trigger: external_ids added/updated/removed, and
+    the ones the storage quota refused (round 7 Phase 2 review, knowledge #4) — a new
+    item over the per-file cap or the tenant total is not ingested, a changed one keeps
+    its previous revision; either way the owner is told, never a silently absent page."""
 
     added: list[str]
     updated: list[str]
     removed: list[str]
+    refused: list[str] = []
 
 
 # --- Knowledge SCOPE selection (Decision #9) --------------------------------- #

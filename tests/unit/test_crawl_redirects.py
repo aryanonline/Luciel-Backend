@@ -119,6 +119,69 @@ async def test_a_redirect_to_a_private_address_is_refused_before_any_connect():
     assert [r.headers["host"] for r in site.requests] == ["acme.example"]
 
 
+async def test_a_redirect_that_downgrades_https_to_http_is_refused():
+    """Round 7 Phase 2 review, knowledge #6: the owner registered an https site and a
+    misconfigured edge answered ``Location: http://...``. The follower accepted the hop
+    and every page was fetched — and ingested as readable chunks — over cleartext. The
+    hop is refused before any cleartext connect."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("http://acme.example/plain"),
+            ("acme.example", "/plain"): _page("<html>cleartext</html>"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    with pytest.raises(ProviderUnavailable, match="downgraded https to http"):
+        await provider._fetch_page("https://acme.example/")
+    assert [r.url.scheme for r in site.requests] == ["https"]  # the http hop never connected
+
+
+async def test_a_downgrading_seed_is_a_failed_page_never_an_ingested_one():
+    """At the snapshot level the refused hop is a failed page (kept + flagged by the
+    sync, F117), never cleartext content — and a site that only downgrades reached no
+    page at all, which is the unreachable-site failure, not an empty site."""
+    from app.knowledge.providers import CrawlUnreachable
+
+    site = _Site(
+        {
+            ("acme.example", "/"): _page('<html>home <a href="/pricing">p</a></html>'),
+            ("acme.example", "/pricing"): _redirect("http://acme.example/pricing"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    snapshot = await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert [i.external_id for i in snapshot.items] == ["https://acme.example/"]
+    assert snapshot.failed_ids == ["https://acme.example/pricing"]
+    assert all(r.url.scheme == "https" for r in site.requests)
+
+    only = _Site({("acme.example", "/"): _redirect("http://acme.example/")})
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=only.transport()
+    )
+    with pytest.raises(CrawlUnreachable):
+        await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert all(r.url.scheme == "https" for r in only.requests)
+
+
+async def test_an_http_seed_may_upgrade_to_https():
+    """The guard is one-directional: an owner may register an http URL, and its
+    redirect to https is followed."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("https://www.acme.example/"),
+            ("www.acme.example", "/"): _page("<html><body>Welcome</body></html>"),
+        }
+    )
+    provider = WebsiteCrawlProvider(urls=["http://acme.example/"], httpx_transport=site.transport())
+    body, final_url = await provider._fetch_page("http://acme.example/")
+    assert "Welcome" in body and final_url == "https://www.acme.example/"
+    assert [r.url.scheme for r in site.requests] == ["http", "https"]
+
+
 async def test_a_redirect_to_a_name_that_resolves_privately_is_refused():
     """Rebinding through the redirect: a public first hop, then a Location naming a host
     whose DNS answer is RFC 1918. Re-pinning on the hop catches it."""
@@ -193,6 +256,39 @@ async def test_the_whole_crawl_survives_an_apex_redirect_and_follows_www_links(m
     assert sorted(robots) == ["acme.example", "www.acme.example"]
 
 
+async def test_an_apex_redirect_does_not_ingest_the_home_page_twice():
+    """Round 7 Phase 2 review, knowledge #5: the seed (apex) redirects to www, and the
+    www home page links to itself (the logo, a "Home" nav item). The www home URL was
+    never recorded as visited, so it was fetched and ingested again — two sources, the
+    same text, two embedding and LLM passes, duplicate hits in retrieval."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("https://www.acme.example/"),
+            ("www.acme.example", "/"): _page(
+                '<html><body>Acme home <a href="/">Home</a> <a href="/pricing">Pricing</a>'
+                "</body></html>"
+            ),
+            ("www.acme.example", "/pricing"): _page(
+                '<html><body>From $10 a month <a href="/">Home</a></body></html>'
+            ),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    snapshot = await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert {i.external_id: i.text for i in snapshot.items} == {
+        "https://acme.example/": "Acme home Home Pricing",
+        "https://www.acme.example/pricing": "From $10 a month Home",
+    }
+    assert len({i.revision for i in snapshot.items}) == len(snapshot.items)
+    www_home = [
+        r for r in site.requests if r.headers["host"] == "www.acme.example" and r.url.path == "/"
+    ]
+    assert len(www_home) == 1  # the www home body was fetched once
+    assert snapshot.complete is True and snapshot.unreached_ids == []
+
+
 async def test_a_403_robots_txt_keeps_the_crawler_out(monkeypatch):
     """RFC 9309: an unauthorized/forbidden robots.txt means the whole origin is off
     limits. It used to read as 'no rule', and the pages were crawled anyway."""
@@ -263,3 +359,23 @@ async def test_a_fetched_robots_txt_is_honoured_for_our_user_agent():
         "https://acme.example/public",
     }
     assert "/private" not in [r.url.path for r in site.requests]
+
+
+async def test_a_crawl_that_reaches_no_page_raises_crawl_unreachable_not_a_credential_error():
+    """Round 7 Phase 2 review, knowledge #2: a maintenance page (503 everywhere) is an
+    unreachable SITE. The typed failure lets the sweep and the manual routes keep it off
+    the revoked-credential path; it stays a ProviderUnavailable for every other caller."""
+    from app.knowledge.providers import CrawlUnreachable
+
+    site = _Site(
+        {
+            ("acme.example", "/robots.txt"): lambda: httpx.Response(503, text="maintenance"),
+            ("acme.example", "/"): lambda: httpx.Response(503, text="maintenance"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    with pytest.raises(CrawlUnreachable, match="crawl fetched no pages") as caught:
+        await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert isinstance(caught.value, ProviderUnavailable)

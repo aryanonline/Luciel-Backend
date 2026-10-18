@@ -196,3 +196,95 @@ def test_llm_input_for_is_the_single_bound():
     assert ge.llm_input_for("x" * (ge.MIN_LLM_TEXT_CHARS - 1)) is None
     body = ge.llm_input_for("word " * 5_000)
     assert body is not None and len(body) <= ge.MAX_LLM_TEXT_CHARS
+
+
+# --- Ingest headroom (round 7 Phase 2 review, knowledge #1) --------------------------
+#
+# The ingest pass is admitted under the SAME per-tenant minute cap as the tenant's
+# customer turns. A sync ingests page after page, so without headroom it could spend the
+# whole minute and push a customer into the at-cap reply. Above INGEST_HEADROOM_FRACTION
+# of the cap the pass is skipped (grammar only, flagged for re-extraction) — and the
+# check is a READ, so skipping costs the tenant nothing.
+
+
+def _fresh_cap_store(monkeypatch: pytest.MonkeyPatch):
+    import app.runtime.llm_cap as llm_cap
+
+    store = llm_cap.InMemoryLLMCapStore()
+    monkeypatch.setattr(llm_cap, "_store", store)
+    return store
+
+
+def _headroom_threshold() -> int:
+    from app.runtime.llm_cap import LLM_CAP_PER_MINUTE
+
+    return int(LLM_CAP_PER_MINUTE * ge.INGEST_HEADROOM_FRACTION)
+
+
+async def test_ingest_skips_the_llm_pass_once_half_the_tenants_cap_is_spent(monkeypatch):
+    import uuid
+
+    store = _fresh_cap_store(monkeypatch)
+    admin = uuid.uuid4()
+    for _ in range(_headroom_threshold()):
+        assert store.admit(str(admin)) is True  # customer turns / earlier ingests
+    before = store.current_count(str(admin))
+
+    router = _FakeRouter(_GOOD)
+    out = await ge.extract_async(
+        ge.LlmGraphExtractor(router_factory=lambda: router), PROSE, admin_id=admin
+    )
+
+    assert router.calls == []  # the model was never called
+    grammar = ge.DeterministicGraphExtractor().extract(PROSE)
+    assert (out.entities, out.edges) == (grammar.entities, grammar.edges)
+    assert out.llm_skipped is True  # the sync re-extracts it next pass
+    assert store.current_count(str(admin)) == before  # the skip was free (no INCR)
+    # Another tenant's spend is not this tenant's: its pass still runs.
+    other = uuid.uuid4()
+    assert (
+        await ge.extract_async(ge.LlmGraphExtractor(lambda: router), PROSE, admin_id=other)
+    ).llm_skipped is False
+    assert router.calls[0]["admin_id"] == other
+
+
+async def test_ingest_below_the_headroom_still_reaches_the_model_under_the_tenant(monkeypatch):
+    import uuid
+
+    store = _fresh_cap_store(monkeypatch)
+    admin = uuid.uuid4()
+    for _ in range(_headroom_threshold() - 1):
+        assert store.admit(str(admin)) is True
+
+    router = _FakeRouter(_GOOD)
+    out = await ge.extract_async(
+        ge.LlmGraphExtractor(router_factory=lambda: router), PROSE, admin_id=admin
+    )
+
+    assert router.calls[0]["admin_id"] == admin
+    assert out.llm_skipped is False
+    assert any(e.entity_type == "Skill" for e in out.entities)
+
+
+async def test_a_cap_refusal_is_a_budget_skip_but_a_vendor_failure_is_not(monkeypatch):
+    import uuid
+
+    from app.runtime.llm_cap import LLMCapExceeded
+
+    _fresh_cap_store(monkeypatch)
+    admin = uuid.uuid4()
+    refused = await ge.LlmGraphExtractor(
+        router_factory=lambda: _FakeRouter(error=LLMCapExceeded(admin))
+    ).aextract(PROSE, admin_id=admin)
+    assert refused.llm_skipped is True
+    assert {e.name for e in refused.entities} == {"Trail Runner"}
+    failed = await ge.LlmGraphExtractor(
+        router_factory=lambda: _FakeRouter(error=ProviderError("boom"))
+    ).aextract(PROSE, admin_id=admin)
+    # A broken vendor is not retried every pass: the grammar-only graph stands.
+    assert failed.llm_skipped is False
+    # A pass that was never owed (a short source) is never "skipped" either.
+    tiny = await ge.LlmGraphExtractor(router_factory=lambda: _FakeRouter(_GOOD)).aextract(
+        "Trail Runner (Product): price=120", admin_id=admin
+    )
+    assert tiny.llm_skipped is False

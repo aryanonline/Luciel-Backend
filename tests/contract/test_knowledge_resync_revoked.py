@@ -146,3 +146,86 @@ async def test_a_connection_the_owner_never_connected_is_not_flipped_to_error(cl
     assert conn.status == "unconfigured"
     assert "connection_status_changed" not in events and emails == 0
     assert src.sync_status == "paused_reconnect_needed"  # never silently served
+
+
+# --- Round 7 Phase 2 review, knowledge #2: an unreachable site is not a dead grant ------
+# A crawl whose every page failed raised the same ProviderUnavailable as a revoked
+# grant, so both manual routes ran _flag_dead_credential on a connection that has no
+# credential: the D10 stop clock started, the chip went red with "reconnect", and the
+# owner got the attention email. The 409 wording is unchanged; the bookkeeping is now
+# an ordinary failed sync.
+
+
+async def _crawl_connection(client, admin: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID]:
+    rc = await client.post(
+        "/api/v1/admin/knowledge/sync-connections",
+        json={"provider": "website_crawl", "crawlUrls": ["https://acme.example/"]},
+    )
+    assert rc.status_code == 201, rc.text
+    cid = uuid.UUID(rc.json()["connectionId"])
+    sid = uuid.uuid4()
+    async with tenant_session(admin) as s:
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_id == cid)
+            )
+        ).scalar_one()
+        assert conn.status == "connected"
+        s.add(
+            KnowledgeSource(
+                id=sid,
+                admin_id=admin,
+                instance_id=conn.instance_id,
+                name="https://acme.example/",
+                origin="website_crawl",
+                source_origin="website_crawl",
+                external_id="https://acme.example/",
+                connection_id=cid,
+                ingestion_status="ready",
+                sync_status="synced",
+            )
+        )
+    return cid, sid
+
+
+class _UnreachableSite:
+    origin = "website_crawl"
+
+    async def snapshot(self, connection_id: uuid.UUID):  # noqa: ANN201
+        from app.knowledge.providers import CrawlUnreachable
+
+        raise CrawlUnreachable("crawl fetched no pages: https://acme.example/")
+
+
+@pytest.mark.parametrize("route", ["trigger_sync", "resync_source"])
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_crawl_that_reached_no_page_is_a_failed_sync_not_a_dead_grant(
+    client, monkeypatch, route: str
+):
+    import app.api.v1.admin.knowledge as knowledge_routes
+
+    admin = await _ready(client)
+    cid, sid = await _crawl_connection(client, admin)
+    monkeypatch.setattr(
+        knowledge_routes, "provider_for_connection", lambda conn, store: _UnreachableSite()
+    )
+
+    url = (
+        f"/api/v1/admin/knowledge/sync-connections/{cid}/sync"
+        if route == "trigger_sync"
+        else f"/api/v1/admin/knowledge/sources/{sid}/resync"
+    )
+    rs = await client.post(url)
+    # The owner-facing answer is unchanged.
+    assert rs.status_code == 409
+    assert rs.json()["message"] == (
+        "Sync unavailable: crawl fetched no pages: https://acme.example/"
+    )
+
+    conn, src, events, emails = await _state(admin, cid, sid)
+    # A failed sync, durable past the 409's rollback ...
+    assert src.sync_status == "error"
+    # ... and NOT a revocation: no stop clock, chip still connected, nobody emailed.
+    assert src.paused_since is None
+    assert conn.status == "connected" and conn.status_detail is None
+    assert "connection_status_changed" not in events and emails == 0

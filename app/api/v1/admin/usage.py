@@ -212,6 +212,34 @@ def _transition(payload: dict[str, object], *, note_key: str) -> str | None:
     return f"{frm} → {to}" + (f" ({note})" if note else "")
 
 
+def _count(payload: dict[str, object], key: str) -> int:
+    value = payload.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+def _knowledge_edit(payload: dict[str, object]) -> str | None:
+    """A sync row renders COUNTS (round 7 Phase 2 review, knowledge #4): its lists are
+    external ids — a crawl's are URLs — and never reach the detail. A page the quota
+    refused used to leave nothing the owner could see but a bare event name."""
+    action = _code(payload, "action")
+    if action == "sync":
+        head = (
+            f"sync: {_count(payload, 'added')} added, {_count(payload, 'updated')} updated, "
+            f"{_count(payload, 'removed')} removed, {_count(payload, 'refused')} refused"
+        )
+        unreached = _count(payload, "unreached")
+        return head + (f", {unreached} not reached" if unreached else "")
+    if action == "sync_refused_shrink":
+        synced, reported = _code(payload, "synced"), _code(payload, "reported")
+        if synced is None or reported is None:
+            return "sync refused (shrink)"
+        return f"sync refused (shrink): {synced} synced, {reported} reported"
+    if action == "sync_failed":
+        error = _code(payload, "error")
+        return f"sync failed ({error})" if error else "sync failed"
+    return action
+
+
 def audit_detail(event_type: str, payload: dict[str, object]) -> str | None:
     """The one-line, owner-readable detail for an audit row (round 7 WP-5, item 6).
 
@@ -272,6 +300,8 @@ def audit_detail(event_type: str, payload: dict[str, object]) -> str | None:
     if event_type == "billing_period_anchored":
         frm, to = _code(payload, "from_period_start"), _code(payload, "to_period_start")
         return f"period anchor {frm} → {to}" if frm and to else None
+    if event_type == "knowledge_source_edited":
+        return _knowledge_edit(payload)
     if event_type == "connection_status_changed":
         action = _code(payload, "action")
         if action:
