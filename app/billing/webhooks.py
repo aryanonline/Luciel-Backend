@@ -16,7 +16,7 @@ Events handled:
                                       The final invoice of a subscription the account
                                       no longer holds (closure / card removal) settles
                                       WITHOUT advancing the anchor or the watermarks.
-  * invoice.payment_failed         → drive dunning none→retrying, email notification +
+  * invoice.payment_failed          → drive dunning none→retrying, email notification +
                                       lifecycle_notice_sent audit (Legal §A3 / §3.6.7).
                                       The attempt number is Stripe's own ``attempt_count``.
   * payment_method.attached         → flip billingState→payg_enabled + store display tuple,
