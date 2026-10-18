@@ -159,16 +159,31 @@ async def note_sent(
 class SmsConfirmationStart:
     """What ``begin_sms_confirmation`` did. ``sent`` is True only when the tenant's own
     number accepted the code; ``reason`` names why not (``already_confirmed``,
-    ``pending`` — a live code is outstanding, ``cooldown``, or the SMS leg's refusal
-    such as ``sms_channel_not_provisioned``)."""
+    ``pending`` — a live code is outstanding, ``cooldown``, ``code_send_rate_limited``
+    — the tenant's code-send budget is spent, or the SMS leg's refusal such as
+    ``sms_channel_not_provisioned``)."""
 
     sent: bool
     reason: str | None = None
     receipt: DeliveryReceipt | None = None
 
 
+#: ``rate_limit.LIMITS`` bucket every code text spends from, keyed per tenant (round 7
+#: delivery hardening): the sibling of the test text's ``escalation_test_sms``.
+CODE_SEND_LIMIT = "escalation_code_sms"
+#: The refusal ``begin_sms_confirmation`` records when that budget is spent.
+CODE_SEND_RATE_LIMITED = "code_send_rate_limited"
+#: The tenant-controlled name rides the text; bounded so it stays one short message.
+_BODY_NAME_MAX = 40
+
+
 def _code_body(code: str, business_name: str | None) -> str:
-    who = f"{business_name}'s Luciel" if business_name else "a Luciel"
+    name = " ".join((business_name or "").split())
+    if len(name) > _BODY_NAME_MAX:
+        # ASCII "...", never "…": one non-GSM character re-encodes the whole text as
+        # UCS-2 and doubles its segment count on the tenant's account.
+        name = name[: _BODY_NAME_MAX - 3].rstrip() + "..."
+    who = f"{name}'s Luciel" if name else "a Luciel"
     return (
         f"VantageMind: {code} is your code to confirm this number as an escalation "
         f"contact for {who}. Reply with the code or enter it on the dashboard. "
@@ -189,8 +204,10 @@ async def begin_sms_confirmation(
 ) -> SmsConfirmationStart:
     """Send (or re-send) the 6-digit code to an SMS escalation contact through the
     tenant's own number. ``force`` is the owner's explicit resend: it re-mints even
-    while a code is outstanding, but never inside the cooldown. Audited either way —
-    a refusal is the record the dashboard shows, never a fabricated send."""
+    while a code is outstanding, but never inside the cooldown. Every text spends from
+    the tenant's code-send budget (``CODE_SEND_LIMIT``); with it spent the start is
+    refused as ``code_send_rate_limited``. Audited either way — a refusal is the
+    record the dashboard shows, never a fabricated send."""
     from app.notifications.sms_notifier import SmsNotifier  # noqa: PLC0415
 
     moment = now or datetime.now(UTC)
@@ -209,13 +226,22 @@ async def begin_sms_confirmation(
         return SmsConfirmationStart(sent=False, reason="pending")
 
     code = f"{secrets.randbelow(10**6):06d}"
-    receipt = await SmsNotifier().send_text(
-        session,
-        admin_id=admin_id,
-        instance_id=instance_id,
-        to=number,
-        body=_code_body(code, business_name),
-    )
+    # Round 7 delivery hardening: every code text spends from the tenant's code-send
+    # budget, charged only when a text is about to go out (a re-save that sends
+    # nothing spends nothing). Refused is recorded like any refused send — audited,
+    # no code outstanding — never a fabricated one.
+    from app.channels import rate_limit  # noqa: PLC0415
+
+    if not rate_limit.get_store().check_source(CODE_SEND_LIMIT, str(admin_id)).allowed:
+        receipt = DeliveryReceipt(accepted=False, detail=CODE_SEND_RATE_LIMITED)
+    else:
+        receipt = await SmsNotifier().send_text(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            to=number,
+            body=_code_body(code, business_name),
+        )
     if receipt.accepted:
         row.code_hash = _hash_code(admin_id, row.value_normalized, code)
         row.code_expires_at = moment + CODE_TTL

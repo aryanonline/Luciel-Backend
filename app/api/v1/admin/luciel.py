@@ -858,6 +858,15 @@ async def resend_contact_confirmation(
                 )
             if start.reason == "already_confirmed":
                 raise validation_error("That number is already confirmed.")
+            if start.reason == contact_confirmation.CODE_SEND_RATE_LIMITED:
+                # Round 7 delivery hardening: the tenant's code-send budget is spent.
+                from app.api.errors import rate_limited  # noqa: PLC0415
+
+                raise rate_limited(
+                    "Too many confirmation codes were texted recently. Please wait a "
+                    "while, then resend.",
+                    retry_after_seconds=600,
+                )
             if not start.sent:
                 if start.reason == "sms_channel_not_provisioned":
                     raise validation_error(

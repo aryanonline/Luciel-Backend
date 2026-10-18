@@ -363,3 +363,54 @@ async def test_the_after_hours_address_gets_the_link_loop_and_shows_in_contact_h
     # Resend honours the after-hours address too (inside the cooldown: refused honestly).
     r = await client.post(RESEND, json={"address": address})
     assert r.status_code == 422 and "moments ago" in r.text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_code_texts_spend_a_per_tenant_budget_so_a_save_loop_is_not_a_texting_tool(
+    client, twilio
+):
+    """Round 7 delivery hardening. PUT /escalation (and team-availability) texted a code
+    to every unconfirmed number in the request with no ceiling but a per-number
+    cooldown — the test-text route next door is limited "so it cannot be turned into a
+    texting tool", these were not: a loop of saves with two fresh numbers each sent two
+    texts to arbitrary phones per call, unbounded. Code texts now spend a per-tenant
+    budget; past it nothing is texted, the refusal is audited like any refused send,
+    the number reads unverified, and a resend says why with a 429."""
+    from app.channels import rate_limit
+    from app.notifications import contact_confirmation
+
+    admin = await _ready_account_with_luciel(client)
+    await _attach_number(admin)
+    budget = rate_limit.LIMITS[contact_confirmation.CODE_SEND_LIMIT].burst
+    numbers = [f"+1604555{3000 + i:04d}" for i in range(budget + 4)]
+
+    for primary, secondary in zip(numbers[::2], numbers[1::2], strict=True):
+        r = await client.put(
+            PUT, json={"primarySms": primary, "secondarySms": secondary, "preferredChannel": "sms"}
+        )
+        assert r.status_code == 200, r.text  # the save itself is never refused
+
+    assert len(twilio) == budget
+    assert [t["to"] for t in twilio] == numbers[:budget]
+    sent = await _audit(admin, "escalation_contact_verification_sent")
+    refused = [e for e in sent if e.event_payload["detail"] == "code_send_rate_limited"]
+    assert len(refused) == len(numbers) - budget
+    assert all(e.event_payload["delivered"] is False for e in refused)
+    assert _health(r.json(), numbers[-1])["state"] == "unverified"
+
+    r = await client.post(RESEND, json={"address": numbers[-1]})
+    assert r.status_code == 429, r.text
+    assert "Too many confirmation codes" in r.text
+    assert len(twilio) == budget
+
+
+async def test_the_code_text_bounds_the_tenant_controlled_name():
+    """The Luciel's name rides the code text and had no length bound on the wire: a
+    long name made every code a multi-segment message on the tenant's account."""
+    from app.notifications.contact_confirmation import _code_body
+
+    body = _code_body("123456", "Acme  Patios\nand " + "x" * 400)
+    assert "123456" in body and len(body) < 260
+    assert "Acme Patios and" in body and "\n" not in body
+    assert body.isascii()  # a truncation mark must not turn the text into UCS-2
+    assert _code_body("123456", None).count("a Luciel") == 1

@@ -80,6 +80,12 @@ LIMITS: dict[str, ChannelLimits] = {
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
     # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
     "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
+    # Confirmation-code TEXTS to escalation contacts, per tenant (round 7 delivery
+    # hardening) — the test text's sibling. Saving contacts (escalation, team
+    # availability) and resending codes texted any number a request named with no
+    # ceiling but a per-number cooldown, so a save loop with fresh numbers was an
+    # unbounded texting tool. Three contacts plus a few resends an hour; 20 a day.
+    "escalation_code_sms": ChannelLimits(burst=6, refill_seconds=600.0, daily_cap=20),
     # Account-export downloads per signed link (adversarial review R-WP2-2): the
     # door is unauthenticated by design (the token is the authorization), so a
     # leaked or replayed link must not become an unbounded audit-row + presign mill.
