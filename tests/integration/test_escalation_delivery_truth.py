@@ -267,7 +267,9 @@ async def test_owner_fallback_keeps_retrying_the_contact_without_paging_the_owne
     assert ses.sent == [OWNER_EMAIL, CONTACT]
     row = await _row(admin, sid)
     assert row.delivery_status == "delivered"
-    assert row.delivery_detail == "email:primary"
+    # The owner heard first (the fallback): the replay that re-stamps the row keeps that
+    # fact on it (round 7 delivery hardening), so nothing pages the owner again later.
+    assert row.delivery_detail == "email:primary+owner"
     assert len(await _audit(admin, "escalation_owner_fallback")) == 1
 
 
