@@ -488,3 +488,113 @@ async def test_reopen_names_a_subscription_the_closure_could_not_end(gateway: Fa
         reopen.SUBSCRIPTION_LIVE,
     )
     assert (outcome.luciel_restored, outcome.luciel_state) == (False, None)
+
+
+# --------------------------------------------------------------------------- #
+# Billing dormancy across a closure                                            #
+# --------------------------------------------------------------------------- #
+async def _dormant_action_tools(admin: uuid.UUID, iid: uuid.UUID) -> None:
+    """A calendar and a CRM, both healthy, sent dormant by the day-7 reduction."""
+    from app.billing import dunning
+    from app.models.connection import InstanceConnection
+
+    async with tenant_session(admin) as s:
+        for ctype, provider in (("calendar", "google_calendar"), ("crm", "hubspot")):
+            s.add(
+                InstanceConnection(
+                    connection_id=uuid.uuid4(),
+                    admin_id=admin,
+                    instance_id=iid,
+                    connection_type=ctype,
+                    auth_class="oauth_token",
+                    provider=provider,
+                    status="connected",
+                    status_detail=f"{provider} verified",
+                    secret_ref=f"vm/{admin}/{ctype}",
+                    non_secret_config={},
+                )
+            )
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        billing.billing_state = "payg_enabled"
+        billing.dunning_state = dunning.REDUCED
+        billing.dunning_started_at = datetime.now(UTC) - timedelta(days=8)
+        assert (
+            await dunning.set_dormant_for_action_tools(s, admin_id=admin, reason="dunning_reduced")
+            == 2
+        )
+
+
+async def _tool_rows(admin: uuid.UUID) -> dict[str, tuple[str, str | None, str | None]]:
+    from app.models.connection import InstanceConnection
+
+    async with tenant_session(admin) as s:
+        rows = (
+            (
+                await s.execute(
+                    select(InstanceConnection).where(InstanceConnection.admin_id == admin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return {r.connection_type: (r.status, r.status_detail, r.status_stashed) for r in rows}
+
+
+async def _invoice_paid(admin: uuid.UUID, event_id: str) -> None:
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s, admin_id=admin, event=StripeEvent(event_id=event_id, type="invoice.paid", data={})
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_dormant_tool_comes_back_connected_after_close_reopen_and_payment(
+    gateway: FakeStripeGateway,
+):
+    """Round 7 money review, finding 2. Dunning ``reduced`` put the calendar and CRM to
+    sleep (stash = connected). The closure's delete used to overwrite that stash with
+    "dormant", the reopen restored "dormant" with no stash, and the payment that
+    followed turned both into 'unconfigured' / 'restored_after_payment' — the
+    dashboard said "reconnect" over intact OAuth grants and bookings were refused."""
+    admin, iid = await _seed()
+    await _dormant_action_tools(admin, iid)
+
+    await _close(admin)
+    rows = await _tool_rows(admin)
+    assert {c: r[0] for c, r in rows.items()} == {"calendar": "quiescing", "crm": "quiescing"}
+    assert rows["calendar"][2] == "connected", "the delete overwrote the pre-dormant stash"
+
+    async with tenant_session(admin) as s:
+        await reopen.reopen_account(s, admin, admin)
+    rows = await _tool_rows(admin)
+    # Dunning is still reduced: the tools are dormant again, with their real status kept.
+    assert rows["calendar"] == ("dormant", "dunning_reduced", "connected")
+    assert rows["crm"] == ("dormant", "dunning_reduced", "connected")
+
+    await _invoice_paid(admin, "evt_paid_after_reopen")
+    rows = await _tool_rows(admin)
+    assert rows["calendar"] == ("connected", "google_calendar verified", None)
+    assert rows["crm"] == ("connected", "hubspot verified", None)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_payment_during_the_closure_brings_the_tools_back_connected_at_reopen(
+    gateway: FakeStripeGateway,
+):
+    """The open invoice is paid while the account is closed: the rows are quiescing, so
+    the payment has nothing dormant to restore. The reopen must not bring them back
+    dormant on a paid account — dormancy is re-derived from the dunning state."""
+    admin, iid = await _seed()
+    await _dormant_action_tools(admin, iid)
+    await _close(admin)
+    await _invoice_paid(admin, "evt_paid_while_closed")
+
+    async with tenant_session(admin) as s:
+        await reopen.reopen_account(s, admin, admin)
+    rows = await _tool_rows(admin)
+    assert rows["calendar"] == ("connected", "google_calendar verified", None)
+    assert rows["crm"] == ("connected", "hubspot verified", None)
