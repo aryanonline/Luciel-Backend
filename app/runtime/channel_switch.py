@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Collection, Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.conversation import Transcript
 from app.models.lead import LeadIdentifier
 from app.runtime.lead_capture import identifier_kind, normalize_identifier, normalize_phone
 
@@ -181,6 +183,48 @@ async def confirmed_identifier(
 _INPUT_KINDS = ("email", "phone")
 
 
+# --- who may read the lead record back (round 7 judgment hardening, finding 3) ------- #
+# A session on a STRONG channel is the person the transport names: SMS, voice and
+# WhatsApp from the number, email from the address, Messenger/Instagram from the
+# sender id. The lead record it resolved to is theirs, so a confirmed email or phone
+# on it may fill a tool input and be read back. A WIDGET session binds to an existing
+# lead on a typed identifier alone — someone who types another customer's number is
+# bound to that customer's record — so nothing there comes from the record unless the
+# session itself supplied the value: reading back (or booking, or cancelling under)
+# the OTHER confirmed identifier would hand one customer's address to a stranger.
+
+
+def identity_proven(channel: str | None) -> bool:
+    """Does ``channel`` itself prove who is writing?"""
+    from app.runtime.sessions import IDENTITY_STRENGTH, IdentityStrength  # noqa: PLC0415
+
+    return IDENTITY_STRENGTH.get(channel or "", IdentityStrength.weak) is not IdentityStrength.weak
+
+
+def identifiers_supplied(history: Iterable[Transcript]) -> frozenset[str]:
+    """The addresses and numbers the customer claimed as THEIR OWN in this session's
+    transcript, normalised — what the session itself supplied. A mention of somebody
+    else's address is not supplied."""
+    from app.runtime.lead_capture import extract_lead_signals  # noqa: PLC0415
+
+    out: set[str] = set()
+    for turn in history:
+        if turn.role != "lead":
+            continue
+        signals = extract_lead_signals(turn.text)
+        out.update(normalize_identifier(v) for v in (signals.email, signals.phone) if v)
+    return frozenset(out)
+
+
+def record_readable(channel: str | None, value: str | None, supplied: Collection[str]) -> bool:
+    """May THIS session act on ``value`` from the lead record — fill a tool input with
+    it, send to it, read it back? Yes when the channel proves the identity, or when
+    the session itself supplied that very value."""
+    if not value:
+        return False
+    return identity_proven(channel) or normalize_identifier(value) in supplied
+
+
 async def confirmed_inputs_on_file(
     session: AsyncSession,
     *,
@@ -188,24 +232,34 @@ async def confirmed_inputs_on_file(
     instance_id: uuid.UUID,
     lead_id: uuid.UUID | None,
     transport_identifier: str | None = None,
+    channel: str | None = None,
+    supplied: Collection[str] = (),
 ) -> dict[str, str]:
     """The tool inputs this conversation can fill without asking (round 7 WP-2
     remainder, item 10): the lead's CONFIRMED email and phone — confirmed at capture
     when the transport carried them, or in conversation — and the transport
     identifier itself when it IS one of those kinds. Never an address that was merely
-    mentioned: the same confirmation bar as sending to it."""
+    mentioned: the same confirmation bar as sending to it.
+
+    From the lead RECORD only when ``channel`` proves the identity, or for a value
+    this session ``supplied`` itself (finding 3; see ``record_readable``). A caller
+    that names no channel gets the widget rule — fail closed. The transport
+    identifier wins its own kind: it is the one value the channel itself proves,
+    where the record's newest confirmed number may be another one merged in."""
     out: dict[str, str] = {}
-    for kind in _INPUT_KINDS:
-        value = await confirmed_identifier(
-            session, admin_id=admin_id, instance_id=instance_id, lead_id=lead_id, kind=kind
-        )
-        if value:
-            out[kind] = value
     if transport_identifier:
         key = normalize_identifier(transport_identifier)
         kind = identifier_kind(key)
         if kind in _INPUT_KINDS:
-            out.setdefault(kind, key)
+            out[kind] = key
+    for kind in _INPUT_KINDS:
+        if kind in out:
+            continue
+        value = await confirmed_identifier(
+            session, admin_id=admin_id, instance_id=instance_id, lead_id=lead_id, kind=kind
+        )
+        if value and record_readable(channel, value, supplied):
+            out[kind] = value
     return out
 
 

@@ -380,3 +380,190 @@ async def test_a_choice_framed_as_a_drop_answers_the_ambiguity_instead_of_declin
         assert "cancelled" in chosen.reply_text
         assert not any("declined to say which" in r for r in _reasons(await _rows(s, sid)))
         assert (await _session_row(s, sid)).input_ask_attempts == 0
+
+
+# --- finding 3: the lead record is read back only to the person it proves ------------ #
+JANE_PHONE = "+15551234567"
+JANE_EMAIL = "jane@example.com"
+STARTER = "The starter package includes onboarding, two channels and email support."
+
+
+async def _starter_retriever(_q: str) -> list[str]:
+    return [STARTER]
+
+
+class _BookingTool(_ScriptedTool):
+    """book_appointment that confirms with whatever it was given — the readback a
+    customer sees names the booked email."""
+
+    def __init__(self) -> None:
+        super().__init__("book_appointment", frozenset({"slot", "email"}), [])
+
+    async def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
+        self.calls.append(dict(inputs))
+        return tool_contract.ok(
+            {"bookingRef": "bk-1", "start": inputs["slot"], "email": inputs["email"]}
+        )
+
+
+@pytest.fixture
+def delivered(monkeypatch) -> list[dict[str, object]]:
+    """Every channel-switch send (to, channel); nothing leaves the test."""
+    from app.channels import outbound
+    from app.channels.outbound import OutboundResult
+
+    calls: list[dict[str, object]] = []
+
+    async def fake(session, *, admin_id, instance_id, channel, to, body, subject=None, **kw):
+        calls.append({"channel": channel, "to": to})
+        return OutboundResult(channel=channel, delivered=True, detail=None)
+
+    monkeypatch.setattr(outbound, "send_outbound_reply", fake)
+    return calls
+
+
+async def _jane_on_file(s, admin: uuid.UUID, iid: uuid.UUID) -> uuid.UUID:
+    """Jane texted once (her number confirmed by the transport) and confirmed her
+    email in that conversation: an existing customer with both on her record."""
+    from app.models.lead import Lead
+    from app.runtime import channel_switch
+
+    sms_sid = await _seed_session(s, admin, iid, channel="sms")
+    opener = EchoModel(confidence=1.0, fixed_reply="Happy to help — when suits you?")
+    await _orch(s, admin, iid, primary=opener).run_turn(
+        session_id=sms_sid,
+        resolved_lead_id=None,
+        channel="sms",
+        mode="ai",
+        inbound_text="hi, can I book a cleaning?",
+        transport_identifier=JANE_PHONE,
+        received_at=datetime.now(UTC),
+    )
+    lead = (
+        await s.execute(select(Lead).where(Lead.admin_id == admin, Lead.instance_id == iid))
+    ).scalar_one()
+    lead.email = JANE_EMAIL
+    await channel_switch.confirm_identifier(
+        s,
+        admin_id=admin,
+        instance_id=iid,
+        lead_id=lead.id,
+        kind="email",
+        value=JANE_EMAIL,
+        source="volunteered",
+    )
+    await s.flush()
+    return lead.id
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_widget_visitor_typing_a_customers_number_is_never_given_her_email(
+    delivered: list[dict[str, object]],
+):
+    """Jane is an existing SMS customer with a confirmed email. A widget visitor types
+    Jane's number and asks to book: the session binds to Jane's record (a typed
+    identifier is all the widget has). The broker used to fill the booking's email
+    from Jane's record and the readback ended "To confirm the exact details: … email:
+    jane@…" — one customer's address handed to whoever knew her number, and a booking
+    (or a cancel) made under it. On the widget the record now fills only what the
+    session itself supplied: the email is ASKED for. "Email me the details" neither
+    sends to Jane's address nor offers it back."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _BookingTool()
+    async with tenant_session(admin) as s:
+        jane = await _jane_on_file(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        sid = await _seed_session(s, admin, iid, channel="widget")
+
+        asked = await _turn(
+            _tool_orch(s, admin, iid, primary=_booking_model(), tool=tool),
+            sid,
+            f"it's {JANE_PHONE}, book me a cleaning for 2pm on the 1st",
+        )
+        assert (await _session_row(s, sid)).resolved_lead_id == jane  # bound by the number
+        assert asked.tool_outcomes == ["missing_input"]
+        assert tool.calls == []  # nothing booked under Jane's email
+        assert JANE_EMAIL not in asked.reply_text
+        assert EMAIL_ASK in asked.reply_text
+
+        details = await _turn(
+            _tool_orch(
+                s,
+                admin,
+                iid,
+                primary=_CountingEcho(confidence=1.0, fixed_reply=STARTER),
+                tool=tool,
+                retriever=_starter_retriever,
+            ),
+            sid,
+            "can you email me the details of the starter package?",
+        )
+        assert delivered == []  # never sent to the record's address
+        assert JANE_EMAIL not in details.reply_text  # nor offered back as a question
+        assert "What's the best email address to send it to?" in details.reply_text
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_widget_visitor_who_types_the_email_themselves_gets_it_filled():
+    """The same record, but THIS session supplied the address ("my email is …"): it
+    may fill the booking and be read back — the visitor gave it."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _BookingTool()
+    async with tenant_session(admin) as s:
+        await _jane_on_file(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        sid = await _seed_session(s, admin, iid, channel="widget")
+        model = _CountingEcho(
+            confidence=1.0,
+            tool_call_script=[[{"tool_id": "book_appointment", "inputs": {"slot": SLOT}}]],
+            fixed_reply="Booked — see you then.",
+        )
+        booked = await _turn(
+            _tool_orch(s, admin, iid, primary=model, tool=tool),
+            sid,
+            f"my email is {JANE_EMAIL}, book me a cleaning for 2pm on the 1st",
+        )
+        assert booked.tool_outcomes == ["ok"]
+        assert tool.calls == [{"slot": SLOT, "email": JANE_EMAIL}]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_on_sms_the_transport_number_fills_the_phone_and_the_record_fills_the_email():
+    """A strong channel proves who is writing: the record's confirmed email fills, and
+    the phone is the number the message came from, not some other number on file."""
+    from app.runtime import channel_switch
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        jane = await _jane_on_file(s, admin, iid)
+        await channel_switch.confirm_identifier(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            lead_id=jane,
+            kind="phone",
+            value="+15559876543",
+            source="volunteered",
+        )
+        on_sms = await channel_switch.confirmed_inputs_on_file(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            lead_id=jane,
+            transport_identifier=JANE_PHONE,
+            channel="sms",
+        )
+        assert on_sms == {"email": JANE_EMAIL, "phone": JANE_PHONE}
+        on_widget = await channel_switch.confirmed_inputs_on_file(
+            s, admin_id=admin, instance_id=iid, lead_id=jane, channel="widget"
+        )
+        assert on_widget == {}
+        typed = await channel_switch.confirmed_inputs_on_file(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            lead_id=jane,
+            channel="widget",
+            supplied=frozenset({JANE_EMAIL}),
+        )
+        assert typed == {"email": JANE_EMAIL}

@@ -60,7 +60,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -1421,6 +1421,11 @@ class Orchestrator:
         # The lead's CONFIRMED email/phone — or the transport identifier itself —
         # fill a required input the model leaves out, at the broker; the stanza names
         # the fields so the model stops asking for what the customer already gave.
+        # From the RECORD only when the channel proves who is writing, or for a value
+        # this session typed itself (judgment hardening, finding 3): a widget session
+        # bound to a lead by a typed number must never be filled with — and read
+        # back — that lead's confirmed email.
+        supplied = channel_switch.identifiers_supplied(history)
         gathered: dict[str, Any] = (
             await channel_switch.confirmed_inputs_on_file(
                 self.session,
@@ -1428,6 +1433,8 @@ class Orchestrator:
                 instance_id=instance_id,
                 lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                channel=channel,
+                supplied=supplied,
             )
             if tool_defs
             else {}
@@ -1893,6 +1900,8 @@ class Orchestrator:
                     reply_text=reply_text,
                     inbound_text=inbound_text,
                     resolved_lead_id=resolved_lead_id,
+                    channel=channel,
+                    supplied=supplied,
                 )
             elif escalation is None and outbound in _CHANNEL_OFFER:
                 # The arbiter would rather answer elsewhere (a long answer on SMS,
@@ -2575,9 +2584,19 @@ class Orchestrator:
         )
         return result.delivered
 
-    async def _unconfirmed_candidate(self, lead_id: uuid.UUID | None, kind: str) -> str | None:
+    async def _unconfirmed_candidate(
+        self,
+        lead_id: uuid.UUID | None,
+        kind: str,
+        *,
+        channel: str,
+        supplied: Collection[str],
+    ) -> str | None:
         """An address on the lead's own record that was never confirmed — offered back
-        as a question, never used on its own."""
+        as a question, never used on its own. Only when this session may read the
+        record (finding 3): on a widget session bound by a typed number, the record's
+        email is somebody else's to the platform's knowledge, and offering it back
+        ("should I send it to jane@…?") is the read-back the rule forbids."""
         if lead_id is None:
             return None
         from app.models.lead import Lead  # noqa: PLC0415
@@ -2591,7 +2610,11 @@ class Orchestrator:
         if lead is None:
             return None
         for value in (lead.email if kind == "email" else lead.phone, lead.contact_identifier):
-            if value and identifier_kind(value) == kind:
+            if (
+                value
+                and identifier_kind(value) == kind
+                and channel_switch.record_readable(channel, value, supplied)
+            ):
                 return str(value)
         return None
 
@@ -2603,18 +2626,26 @@ class Orchestrator:
         reply_text: str,
         inbound_text: str,
         resolved_lead_id: uuid.UUID | None,
+        channel: str,
+        supplied: Collection[str],
     ) -> str:
         """The customer asked for this answer on ``outbound``. A confirmed address gets
-        it now (with a same-channel note); otherwise ask where, and park the answer."""
+        it now (with a same-channel note); otherwise ask where, and park the answer.
+
+        A confirmed address from the lead RECORD counts only when this session may
+        read the record (finding 3) — the same rule as the required-input fill."""
         kind = channel_switch.KIND_FOR_CHANNEL[outbound]
         typed = channel_switch.identifier_for(kind, inbound_text)
-        to = typed or await channel_switch.confirmed_identifier(
+        on_record = await channel_switch.confirmed_identifier(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
             lead_id=resolved_lead_id,
             kind=kind,
         )
+        if not channel_switch.record_readable(channel, on_record, supplied):
+            on_record = None
+        to = typed or on_record
         if to is not None:
             if typed and resolved_lead_id is not None:
                 await channel_switch.confirm_identifier(
@@ -2633,7 +2664,9 @@ class Orchestrator:
                 else channel_switch.failed_line(outbound)
             )
             return f"{reply_text.rstrip()}\n\n{note}"
-        candidate = await self._unconfirmed_candidate(resolved_lead_id, kind)
+        candidate = await self._unconfirmed_candidate(
+            resolved_lead_id, kind, channel=channel, supplied=supplied
+        )
         sess_obj.pending_outbound = channel_switch.new_pending(
             outbound, reply_text, candidate
         ).as_json()
