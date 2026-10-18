@@ -941,3 +941,91 @@ async def test_a_take_over_that_could_not_be_recorded_never_claims_the_team_was_
         assert asked.handed_off is False
     await escalation_dispatch.drain_background_notifications()
     assert paged == []
+
+
+# --- finding 8: Luciel's own hand-off and a below-floor draft are ONE page ---------- #
+LOYALTY_Q = "do you have a loyalty discount for repeat customers?"
+LOYALTY_REASON = "asked about a loyalty discount we have no policy for"
+HONEST_DRAFT = "I don't have that information, so I've passed your question to the team."
+
+
+def _hands_to_team(reason: str = LOYALTY_REASON) -> _CountingEcho:
+    """Calls hand_to_team, reads the result back, then says so in words the knowledge
+    cannot back (there is nothing in it about discounts): the draft is below the floor."""
+    return _CountingEcho(
+        confidence=1.0,
+        tool_call_script=[[{"tool_id": "hand_to_team", "inputs": {"reason": reason}}]],
+        fixed_reply=HONEST_DRAFT,
+    )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hand_to_team_with_a_below_floor_reply_is_one_row_and_one_page(paged: list[str]):
+    """An uncovered question: the model calls hand_to_team (row + page at dispatch)
+    and says it passed the question on. Gate 2 scored that draft 0% — hand_to_team is
+    not answer-bearing — and wrote a SECOND row, cannot_answer, with a second page:
+    the owner was paged twice for one message. The answer-quality reasons now ride on
+    the hand-off row this turn already paged; the draft is still replaced."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        result = await _turn(
+            _orch(s, admin, iid, primary=_hands_to_team()),
+            sid,
+            LOYALTY_Q,
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert result.tool_outcomes == ["ok"]
+        rows = await _rows(s, sid)
+        assert [r.signal for r in rows] == ["luciel_requested_handoff"]  # one row
+        reasons = [str(r) for r in (rows[0].reasons or [])]
+        assert reasons[:2] == ["Luciel asked for a person", LOYALTY_REASON]
+        assert "answer only 0% backed by your knowledge" in reasons
+        assert result.escalation is not None
+        assert result.escalation.signal is Signal.luciel_requested_handoff
+        assert result.escalation.answer_ungrounded is True
+        assert HONEST_DRAFT not in result.reply_text  # the below-floor draft never leaves
+        assert _HANDOFF_ACK_MARK.search(result.reply_text)
+        assert paged == []  # nothing starts before the commit
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["luciel_requested_handoff"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_hand_to_team_on_a_later_uncovered_question_is_that_turns_only_page(
+    paged: list[str],
+):
+    """The session already carries a cannot_answer row from an earlier uncovered
+    question. A distinct one now, and the model hands it to the team: that is the
+    turn's page. The cannot_answer row used to be extended with 'also asked' and
+    re-paged on top of it — two pages for the one message."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        first = await _turn(
+            _orch(s, admin, iid), sid, UNCOVERED, channel="sms", transport_identifier=JANE_PHONE
+        )
+        assert first.escalation is not None
+        assert first.escalation.signal is Signal.cannot_answer
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["cannot_answer"]
+
+    async with tenant_session(admin) as s:
+        second = await _turn(
+            _orch(s, admin, iid, primary=_hands_to_team()),
+            sid,
+            LOYALTY_Q,
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        rows = {r.signal: r for r in await _rows(s, sid)}
+        assert sorted(rows) == ["cannot_answer", "luciel_requested_handoff"]
+        assert not any("also asked" in str(r) for r in (rows["cannot_answer"].reasons or []))
+        assert "answer only 0% backed by your knowledge" in [
+            str(r) for r in (rows["luciel_requested_handoff"].reasons or [])
+        ]
+        assert second.escalation is not None
+        assert second.escalation.signal is Signal.luciel_requested_handoff
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["cannot_answer", "luciel_requested_handoff"]

@@ -338,6 +338,10 @@ SELF_HARM_REPLY = (
 #: A take-over whose escalation could NOT be recorded (finding 7): nothing reached the
 #: team, so nothing says it did, and the conversation stays with Luciel rather than
 #: going silent under a person nobody paged.
+#: ``hand_to_team``'s payload state when THIS call wrote the row and scheduled the
+#: owner's page (a repeat in the same session reads "already_passed_this_conversation").
+HAND_TO_TEAM_RECORDED = "recorded"
+
 TAKEOVER_UNRECORDED_REPLY = (
     "I'm sorry — I wasn't able to pass this to the team just now. Please send your "
     "message again in a moment."
@@ -1803,7 +1807,37 @@ class Orchestrator:
             context=" ".join(trailing[-5:]),
         )
         escalation: EscalationDecision | None = None
-        if outcome.fired:
+        # Luciel's own hand-off WROTE its row and scheduled its page in this very turn
+        # (at dispatch, finding 8). The owner is being paged about this message
+        # already, so the answer-quality news of the same turn rides on that row —
+        # one turn, one row, one page — instead of a second row and a second page.
+        handoff_paged = any(
+            str(call.get("tool_id", "")) == HAND_TO_TEAM_TOOL_ID
+            and r.outcome is tool_contract.Outcome.ok
+            and r.payload.get("state") == HAND_TO_TEAM_RECORDED
+            for call, r in resp.dispatched
+        )
+        if outcome.fired and handoff_paged and outcome.signal is Signal.cannot_answer:
+            await _append_escalation_reasons(
+                self.session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=Signal.luciel_requested_handoff.value,
+                gate=Gate.outcome.value,
+                reasons=list(outcome.reasons),
+            )
+            # The turn reports the row it actually wrote; the answer verdict rides
+            # along, so the below-floor draft is still replaced below.
+            escalation = EscalationDecision(
+                True,
+                Signal.luciel_requested_handoff,
+                Gate.outcome,
+                outcome.score_or_confidence,
+                ("Luciel asked for a person", *outcome.reasons),
+                answer_ungrounded=outcome.answer_ungrounded,
+                answer_reasons=outcome.answer_reasons,
+            )
+        elif outcome.fired:
             escalation = outcome
             # Every signal fires AT MOST ONCE per session (live-caught 2026-08-18 for
             # cannot_answer: every below-floor turn of one call emailed the owner
@@ -1839,8 +1873,19 @@ class Orchestrator:
                 # The lead signal already fired earlier in this session, but THIS
                 # turn's answer is a guess: that is cannot_answer news of its own
                 # (once per session like any other signal), never buried under the
-                # suppressed repeat.
-                if not await _session_already_escalated(
+                # suppressed repeat — and when Luciel's own hand-off paged this turn
+                # already, the news rides on that row (finding 8).
+                if handoff_paged:
+                    await _append_escalation_reasons(
+                        self.session,
+                        admin_id=admin_id,
+                        session_id=session_id,
+                        signal=Signal.luciel_requested_handoff.value,
+                        gate=Gate.outcome.value,
+                        reasons=list(outcome.answer_reasons),
+                    )
+                    row_written = True
+                elif not await _session_already_escalated(
                     self.session,
                     admin_id=admin_id,
                     session_id=session_id,
@@ -2478,7 +2523,7 @@ class Orchestrator:
         return tool_contract.ok(
             {
                 "passed_to_team": True,
-                "state": "recorded" if written else "already_passed_this_conversation",
+                "state": HAND_TO_TEAM_RECORDED if written else "already_passed_this_conversation",
                 # Read back by the model (T3): the honest wording of what happens next.
                 "note": (
                     "The team has been notified and a person will follow up later; keep "
