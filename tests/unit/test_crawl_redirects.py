@@ -193,6 +193,39 @@ async def test_the_whole_crawl_survives_an_apex_redirect_and_follows_www_links(m
     assert sorted(robots) == ["acme.example", "www.acme.example"]
 
 
+async def test_an_apex_redirect_does_not_ingest_the_home_page_twice():
+    """Round 7 Phase 2 review, knowledge #5: the seed (apex) redirects to www, and the
+    www home page links to itself (the logo, a "Home" nav item). The www home URL was
+    never recorded as visited, so it was fetched and ingested again — two sources, the
+    same text, two embedding and LLM passes, duplicate hits in retrieval."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("https://www.acme.example/"),
+            ("www.acme.example", "/"): _page(
+                '<html><body>Acme home <a href="/">Home</a> <a href="/pricing">Pricing</a>'
+                "</body></html>"
+            ),
+            ("www.acme.example", "/pricing"): _page(
+                '<html><body>From $10 a month <a href="/">Home</a></body></html>'
+            ),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    snapshot = await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert {i.external_id: i.text for i in snapshot.items} == {
+        "https://acme.example/": "Acme home Home Pricing",
+        "https://www.acme.example/pricing": "From $10 a month Home",
+    }
+    assert len({i.revision for i in snapshot.items}) == len(snapshot.items)
+    www_home = [
+        r for r in site.requests if r.headers["host"] == "www.acme.example" and r.url.path == "/"
+    ]
+    assert len(www_home) == 1  # the www home body was fetched once
+    assert snapshot.complete is True and snapshot.unreached_ids == []
+
+
 async def test_a_403_robots_txt_keeps_the_crawler_out(monkeypatch):
     """RFC 9309: an unauthorized/forbidden robots.txt means the whole origin is off
     limits. It used to read as 'no rule', and the pages were crawled anyway."""

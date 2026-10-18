@@ -1142,6 +1142,16 @@ class WebsiteCrawlProvider:
                 failed.append(url)
                 frontier_unread = frontier_unread or depth < max_depth
                 continue
+            # One page, one source (round 7 Phase 2 review, knowledge #5): the page is
+            # keyed on the URL that reached it (a seed stays keyed on what the owner
+            # registered), but the URL it redirected to is the page itself. Recording
+            # it keeps the site's own home link (apex -> www, then href="/" on www)
+            # from fetching and ingesting the same body a second time.
+            canonical = _normalize_url(final_url)
+            if canonical and canonical != url:
+                if canonical in seen:
+                    continue  # already captured (or tried) under the URL it lands on
+                seen.add(canonical)
             text = _extract_visible_text(html)
             revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
             items.append(RemoteItem(external_id=url, name=url, text=text, revision=revision))
