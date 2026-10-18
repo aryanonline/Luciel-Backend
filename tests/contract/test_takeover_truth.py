@@ -9,6 +9,11 @@ tests/integration/test_takeover_reply_context.py.
     widget-then-SMS unification the lead record is keyed on the older email, and the
     SMS reply went there. No identifier of that kind → ``no_recipient_for_channel``,
     never a send to another channel.
+  * phase-2 review: of that kind, the one IN THE CONVERSATION — the raw sender the
+    ingress persisted (``transport_sender``, migration 0074), else (a session from
+    before the column) the identifier whose participant key is the session's. A lead
+    known by two phones used to have the reply texted to the number the record was
+    keyed on, stamped delivered; nothing matching → ``no_recipient_for_channel``.
   * item 2: an email reply threads under the customer's mail — Graph's
     ``/me/messages/{id}/reply`` on a BYO mailbox, In-Reply-To / References on the
     legacy SES path — instead of a fresh "Re: your inquiry".
@@ -40,12 +45,19 @@ from app.models.conversation import Session as SessionModel
 from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from app.models.lead import Lead, LeadIdentifier, LeadState
+from app.runtime.sessions import participant_key_for
 from sqlalchemy import select
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
 LEAD_EMAIL = "dana@lead.example"
 LEAD_PHONE = "+15557778888"
+# A second number / address the SAME lead is known by (a customer writing from a new
+# phone, or a number joined to the record by a typed claim - WP-3c item 1), and one
+# the lead is not known by at all.
+OTHER_PHONE = "+15557779999"
+STRANGER_PHONE = "+15550004444"
+OTHER_EMAIL = "dana.work@lead.example"
 TENANT_NUMBER = "+15550001111"
 TENANT_EMAIL = "hello@acmepatios.example"
 PAGE_ID = "page-4242"
@@ -288,6 +300,7 @@ async def test_an_sms_reply_to_a_widget_then_sms_unified_lead_goes_to_the_phone(
         contact=LEAD_EMAIL,
         identifiers=(("email", LEAD_EMAIL), ("phone", LEAD_PHONE)),
         sms_status="connected",
+        transport_sender=LEAD_PHONE,
     )
 
     body = await _take_over_and_reply(client, seeded.session_id)
@@ -339,6 +352,7 @@ async def test_an_email_reply_to_a_phone_keyed_lead_goes_to_the_email_identifier
         contact=LEAD_PHONE,
         identifiers=(("phone", LEAD_PHONE), ("email", LEAD_EMAIL)),
         email_provider="ses",
+        transport_sender=LEAD_EMAIL,
     )
 
     body = await _take_over_and_reply(client, seeded.session_id)
@@ -352,9 +366,16 @@ async def test_an_email_reply_to_a_phone_keyed_lead_goes_to_the_email_identifier
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_volunteered_phone_beside_an_email_key_reaches_the_sms_reply(client, twilio):
     """The record's own ``phone`` column (a typed number, F111) is an identifier of
-    the SMS kind too — used before any identifier row, never the email key."""
+    the SMS kind too — never the email key. A session from before migration 0074
+    carries no raw sender: its participant key names the number it was keyed on."""
     admin = await _signup_verify_login(client)
-    seeded = await _seed(admin, channel="sms", contact=LEAD_EMAIL, sms_status="connected")
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_EMAIL,
+        sms_status="connected",
+        participant_key=participant_key_for(admin, "sms", LEAD_PHONE),
+    )
     async with tenant_session(admin) as s:
         lead = (await s.execute(select(Lead).where(Lead.id == seeded.lead_id))).scalar_one()
         lead.phone = LEAD_PHONE
@@ -364,6 +385,108 @@ async def test_a_volunteered_phone_beside_an_email_key_reaches_the_sms_reply(cli
 
     assert body["delivered"] is True
     assert twilio.sent["to"] == LEAD_PHONE
+
+
+# --- phase-2 review: the reply reaches the person IN the conversation ---------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_sms_reply_to_a_lead_known_by_two_phones_goes_to_the_number_in_the_conversation(
+    client, twilio
+):
+    """Dana's record is keyed on her first number; a conversation from her second
+    number (or a number joined to her record by a typed claim) was bound to it. The
+    owner's reply used to be texted to the KEY — the person actually texting heard
+    nothing, someone else got the message, and the dashboard said delivered."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        identifiers=(("phone", LEAD_PHONE), ("phone", OTHER_PHONE)),
+        sms_status="connected",
+        transport_sender=OTHER_PHONE,
+    )
+    async with tenant_session(admin) as s:
+        lead = (await s.execute(select(Lead).where(Lead.id == seeded.lead_id))).scalar_one()
+        # Both of the record's own columns name the number NOT in this conversation.
+        lead.phone = LEAD_PHONE
+        await s.flush()
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    assert twilio.sent == {"from_number": TENANT_NUMBER, "to": OTHER_PHONE, "body": REPLY}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_pre_0074_session_on_a_second_phone_is_answered_by_its_participant_key(
+    client, twilio
+):
+    """A session opened before the raw sender was persisted: its participant key is
+    ``sha256(admin | sms | number)``, so the lead identifier that hashes to it IS the
+    number in the conversation — the second phone, not the record's key."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        identifiers=(("phone", LEAD_PHONE), ("phone", OTHER_PHONE)),
+        sms_status="connected",
+        participant_key=participant_key_for(admin, "sms", OTHER_PHONE),
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    assert twilio.sent["to"] == OTHER_PHONE
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_session_keyed_on_a_number_the_lead_is_not_known_by_is_refused(client, twilio):
+    """The session's key names a number none of the lead's identifiers hashes to: the
+    person in the conversation cannot be told. Refused honestly — never handed to
+    another phone of the same kind just because the record has one."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        identifiers=(("phone", LEAD_PHONE), ("phone", OTHER_PHONE)),
+        sms_status="connected",
+        participant_key=participant_key_for(admin, "sms", STRANGER_PHONE),
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is False
+    assert body["deliveryDetail"] == "no_recipient_for_channel"
+    assert twilio.sent == {}
+    (payload,) = await _sent_audit_payloads(admin)
+    assert payload["delivered"] is False
+    msgs = await client.get(f"/api/v1/dashboard/conversations/{seeded.session_id}/messages")
+    assert [m["deliveryStatus"] for m in msgs.json()] == ["failed"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_legacy_ses_reply_to_a_lead_known_by_two_addresses_goes_to_the_sender(
+    client, platform_email
+):
+    """The email mirror: the record is keyed on Dana's personal address, the
+    conversation came from her work address. The reply answers the work address."""
+    admin = await _signup_verify_login(client)
+    seeded = await _seed(
+        admin,
+        channel="email",
+        contact=LEAD_EMAIL,
+        identifiers=(("email", LEAD_EMAIL), ("email", OTHER_EMAIL)),
+        email_provider="ses",
+        transport_sender=OTHER_EMAIL,
+    )
+
+    body = await _take_over_and_reply(client, seeded.session_id)
+
+    assert body["delivered"] is True
+    (sent,) = platform_email.sent
+    assert sent["to"] == OTHER_EMAIL
 
 
 # --- items 2 + 3: the email reply threads and is signed by a person ------------------ #
@@ -412,6 +535,7 @@ async def test_a_byo_mailbox_reply_threads_under_the_customers_message(client, g
         email_provider="outlook",
         inbound_subject="Patio quote",
         inbound_message_id="AAMkAGE1",
+        transport_sender=LEAD_EMAIL,
     )
 
     body = await _take_over_and_reply(client, seeded.session_id)
@@ -435,7 +559,13 @@ async def test_a_byo_mailbox_reply_with_no_inbound_context_is_a_new_mail_to_the_
     the reply is still sent, as a new mail to the lead's address, and says so
     through the endpoint it takes — never a fabricated reply handle."""
     admin = await _signup_verify_login(client)
-    seeded = await _seed(admin, channel="email", contact=LEAD_EMAIL, email_provider="outlook")
+    seeded = await _seed(
+        admin,
+        channel="email",
+        contact=LEAD_EMAIL,
+        email_provider="outlook",
+        participant_key=participant_key_for(admin, "email", LEAD_EMAIL),
+    )
 
     body = await _take_over_and_reply(client, seeded.session_id)
 
@@ -462,6 +592,7 @@ async def test_a_legacy_ses_reply_threads_with_headers_and_is_signed_by_the_busi
         email_provider="ses",
         inbound_subject="Patio quote",
         inbound_message_id="<abc123@lead.example>",
+        transport_sender=LEAD_EMAIL,
     )
 
     body = await _take_over_and_reply(client, seeded.session_id)
@@ -661,7 +792,13 @@ async def test_a_twilio_rejected_reply_reads_failed_after_reopen(client, rejecti
     carries the outcome and GET .../messages replays it as failed — beside the
     customer's own row, which carries no outcome at all (it is not a send)."""
     admin = await _signup_verify_login(client)
-    seeded = await _seed(admin, channel="sms", contact=LEAD_PHONE, sms_status="connected")
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        sms_status="connected",
+        transport_sender=LEAD_PHONE,
+    )
     async with tenant_session(admin) as s:
         s.add(
             Transcript(
@@ -702,7 +839,13 @@ async def test_a_twilio_rejected_reply_reads_failed_after_reopen(client, rejecti
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_delivered_reply_replays_as_delivered_with_the_time_it_left(client, twilio):
     admin = await _signup_verify_login(client)
-    seeded = await _seed(admin, channel="sms", contact=LEAD_PHONE, sms_status="connected")
+    seeded = await _seed(
+        admin,
+        channel="sms",
+        contact=LEAD_PHONE,
+        sms_status="connected",
+        transport_sender=LEAD_PHONE,
+    )
 
     body = await _take_over_and_reply(client, seeded.session_id)
     assert body["delivered"] is True

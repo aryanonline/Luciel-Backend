@@ -84,6 +84,13 @@ class Session(Base, TenantMixin, TimestampMixin):
     inbound_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
     meta_destination_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     meta_sender_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Migration 0074: the raw sender the sms / voice / email transport carried (the
+    # From number, the caller, the From address), persisted at ingress the way 0066
+    # persists ``meta_sender_id`` — ``participant_key`` is only a hash. A human reply
+    # and the owner page address THIS person, not whichever identifier the lead
+    # record happens to be keyed on (app/runtime/conversation_sender.py). Cleared on
+    # lead erasure; NULL on other channels and on sessions opened before the column.
+    transport_sender: Mapped[str | None] = mapped_column(String(320), nullable=True)
     # When the CURRENT takeover began (app/runtime/handoff.py); NULL in ai mode. The
     # hand-back audit event reads its duration_seconds off this, not off a guess.
     human_controlled_since: Mapped[datetime | None] = mapped_column(

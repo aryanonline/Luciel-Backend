@@ -14,9 +14,10 @@ What goes, per lead:
     S3 — a store outage is counted and logged, never swallowed silently; the
     bucket's lifecycle backstop still bounds the object);
   * the session summaries written for the lead;
-  * the session rows are ANONYMISED, not deleted: summary text, transport key and
-    the lead link go, the row (channel, timings, counted flag) stays — it is the
-    billing/analytics record and carries no personal data once those are gone;
+  * the session rows are ANONYMISED, not deleted: summary text, transport key, the
+    raw sender (``transport_sender`` / ``meta_sender_id``) and the lead link go,
+    the row (channel, timings, counted flag) stays — it is the billing/analytics
+    record and carries no personal data once those are gone;
   * voice call records for those sessions lose the caller's number (the
     disclosure-played proof is compliance evidence and stays);
   * deferred follow-ups addressed to the person (their contact rides in the
@@ -122,6 +123,10 @@ async def erase_lead_data(
                 sess.archive_object_key = None
             sess.summary = None
             sess.participant_key = None
+            # The raw senders the transport carried (0066 Meta id, 0074 sms/voice/
+            # email sender) are the person's identifiers in plaintext: they go too.
+            sess.transport_sender = None
+            sess.meta_sender_id = None
             sess.resolved_lead_id = None
             counts.sessions_anonymised += 1
 

@@ -451,6 +451,38 @@ async def test_voice_caller_number_alone_writes_the_lead():
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_call_session_keeps_the_callers_number_for_a_later_human_reply():
+    """The call session is keyed on the CallSid, so its participant key names no
+    number (migration 0074): the pipeline stores the caller's number raw, which is
+    where an owner's takeover reply is bridged to — the caller, not whichever phone
+    the lead record happens to be keyed on."""
+    from app.models.conversation import Session
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        inst = _instance(admin, iid, state=LucielState.active)
+        s.add(inst)
+        await s.flush()
+        await handle_turn(
+            s,
+            instance=inst,
+            admin_id=admin,
+            instance_id=iid,
+            from_number="+15557654321",
+            speech_audio_ref="Do you install patios?",
+            action_url=_ACTION_URL,
+            stt=EchoSpeechToText(),
+            tts=EchoTextToSpeech(),
+            router=_router(),
+            has_payment_method=False,
+            provider_call_id="CA_sender",
+        )
+        sess = (await s.execute(select(Session).where(Session.admin_id == admin))).scalar_one()
+        assert sess.transport_sender == "+15557654321"
+        assert sess.participant_key is not None and "+1555" not in sess.participant_key
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_call_a_person_holds_hears_an_honest_handoff_line_not_a_fabricated_relay():
     """§3.4.12 during a voice takeover: the loop has nothing to say, so the caller used
     to hear the AT-CAP line (a lie about capacity). Now they hear that a person has

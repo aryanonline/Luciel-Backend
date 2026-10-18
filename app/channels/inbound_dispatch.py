@@ -117,12 +117,16 @@ async def persist_reply_context(
     * Meta (WhatsApp / Messenger / Instagram): the tenant surface the message arrived
       on (page / IG account / WhatsApp phone-number id) and the customer's
       platform-scoped id.
+    * sms / email: the raw sender the transport carried (``transport_sender``,
+      migration 0074) — the participant key is only a hash, and a lead known by two
+      numbers or addresses must be answered at the one in THIS conversation.
 
     Always the LATEST inbound: a thread's subject can change and a reply must hang
     under the message it answers. Other channels carry nothing here."""
     from sqlalchemy import select  # noqa: PLC0415
 
     from app.models.conversation import Session as SessionModel  # noqa: PLC0415
+    from app.runtime.conversation_sender import clip_sender  # noqa: PLC0415
 
     meta = msg.channel_metadata or {}
     if msg.channel == "email":
@@ -131,7 +135,10 @@ async def persist_reply_context(
             "inbound_message_id": _clip(
                 meta.get("graph_message_id") or meta.get("internet_message_id"), _SUBJECT_MAX
             ),
+            "transport_sender": clip_sender(msg.customer_identifier),
         }
+    elif msg.channel == "sms":
+        values = {"transport_sender": clip_sender(msg.customer_identifier)}
     elif msg.channel in outbound.META_CHANNELS:
         values = {
             "meta_destination_id": _clip(

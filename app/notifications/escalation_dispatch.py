@@ -578,6 +578,20 @@ async def _build_notification(
     # are genuinely anonymous unless they volunteered contact info (then the lead
     # row carries it and lead_contact serves it).
     customer_identifier = lead.contact_identifier if lead else None
+    # The person in THIS conversation (phase-2 security review): on sms / voice / email
+    # the contact line is the sender the session's transport carried — the same choice
+    # the takeover reply makes — never whichever identifier of that kind the lead
+    # record is keyed on (a lead known by two phones paged the other one).
+    if sess_row is not None:
+        from app.runtime.conversation_sender import (  # noqa: PLC0415
+            SENDER_KIND,
+            conversation_sender,
+        )
+
+        if sess_row.channel in SENDER_KIND:
+            customer_identifier = await conversation_sender(
+                session, admin_id=admin_id, sess=sess_row, lead=lead
+            )
     # Item 3: the address / number the lead VOLUNTEERED on top of the transport key
     # (lead.email / lead.phone are NULL when contact_identifier already is it).
     lead_email = (lead.email or None) if lead else None
@@ -602,7 +616,7 @@ async def _build_notification(
         gate=gate,
         business_name=(inst.name if inst and inst.name else "Your business"),
         lead_name=lead.name if lead else None,
-        lead_contact=lead.contact_identifier if lead else None,
+        lead_contact=customer_identifier,
         lead_intent=lead.intent if lead else None,
         # The escalation's own score is the live one; the lead row's is capture-time.
         lead_score=score if score is not None else (lead.lead_score if lead else None),

@@ -126,6 +126,9 @@ async def test_an_inbound_email_persists_its_subject_and_provider_message_id():
     # Email carries no Meta context; the columns stay honestly NULL.
     assert sess.meta_destination_id is None
     assert sess.meta_sender_id is None
+    # The From address itself (migration 0074): a takeover reply answers THIS sender,
+    # never another address the lead record also knows.
+    assert sess.transport_sender == "dana@lead.example"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -199,9 +202,11 @@ async def test_an_inbound_whatsapp_message_persists_the_phone_number_id_as_the_s
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_an_inbound_text_persists_no_reply_context():
-    """SMS answers to the number the lead wrote from; nothing to stash, nothing
-    fabricated."""
+async def test_an_inbound_text_persists_its_sender_and_nothing_else():
+    """SMS answers to the number the lead wrote from. That number is persisted raw
+    (migration 0074 — the participant key is only a hash): a lead known by two phones
+    gets the owner's takeover reply at the one in THIS conversation. Nothing else is
+    stashed, nothing fabricated."""
     admin = uuid.uuid4()
     iid = await _seed(admin, "sms")
 
@@ -209,9 +214,27 @@ async def test_an_inbound_text_persists_no_reply_context():
         _inbound(admin, iid, channel="sms", identifier="+15557778888", text="Hi")
     )
     sess = await _session(admin, reply.session_id)
+    assert sess.transport_sender == "+15557778888"
     assert (
         sess.inbound_subject,
         sess.inbound_message_id,
         sess.meta_destination_id,
         sess.meta_sender_id,
     ) == (None, None, None, None)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_meta_message_never_fills_the_transport_sender():
+    """The Meta sender lives in ``meta_sender_id`` (0066); the sms/voice/email column
+    stays NULL so no reader mistakes a platform-scoped id for a phone or address."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin, "messenger")
+
+    reply = await inbound_dispatch.run_and_reply_full(
+        _inbound(
+            admin, iid, channel="messenger", identifier=PSID, text="Hi", destination_id=PAGE_ID
+        )
+    )
+    sess = await _session(admin, reply.session_id)
+    assert sess.meta_sender_id == PSID
+    assert sess.transport_sender is None

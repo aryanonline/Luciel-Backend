@@ -370,24 +370,30 @@ async def _takeover_recipient(
     s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel
 ) -> str | None:
     """The identifier a human reply on THIS session's channel can reach (round 7
-    WP-3b, item 1), or None when the lead is not known by one of that kind.
+    WP-3b, item 1), or None when the conversation's own recipient cannot be told.
 
     ``Lead.contact_identifier`` is whichever identity the record was keyed on FIRST —
     after a widget-then-SMS unification that is the older, email-keyed row — so it is
     not, in general, an identifier the session's transport can deliver to; the reply
-    used to go to it regardless of channel. The destination is picked by the session's
-    channel kind from the identifiers the lead is known by (own columns, then the
-    ``lead_identifiers`` rows a unification re-pointed — confirmed ones first):
+    used to go to it regardless of channel. Nor is "an identifier of the session's
+    kind" enough (phase-2 security review): a lead known by TWO phones — a second
+    number, or one joined to the record by a typed claim — had the reply texted to
+    the number the record was keyed on, not the one in the conversation, and stamped
+    delivered. The reply goes to the person the conversation is WITH:
 
-      * email → an email identifier;
-      * sms / voice → an E.164 phone (a voice reply bridges to a text);
+      * sms / voice / email → the raw sender the transport carried, persisted on the
+        session at ingress (``transport_sender``, migration 0074); for a session from
+        before that column, the call record's caller (voice) or the lead identifier
+        whose participant key IS the session's (``conversation_sender``). Nothing
+        matches → None (``no_recipient_for_channel``), never another identifier of
+        the same kind. A voice reply bridges to a text to that caller.
       * Meta → the platform-scoped sender id persisted for the session at ingress
         (item 7). A session from before that column can use the record's own key only
         when it IS a platform-scoped id — never an email or phone from another channel.
 
     The widget has no transport at all and is reported as ``widget_poll_only`` by the
     sender; nothing is picked for it here."""
-    from app.models.lead import LeadIdentifier  # noqa: PLC0415
+    from app.runtime.conversation_sender import conversation_sender  # noqa: PLC0415
     from app.runtime.lead_capture import identifier_kind  # noqa: PLC0415
 
     if sess.channel in outbound.POLL_ONLY_CHANNELS:
@@ -400,30 +406,7 @@ async def _takeover_recipient(
         if own and identifier_kind(own) == "transport":
             return own.strip()
         return None
-    if lead is None:
-        return None
-    kind = "email" if sess.channel == "email" else "phone"
-    volunteered = lead.email if kind == "email" else lead.phone
-    for value in (lead.contact_identifier, volunteered):
-        if value and identifier_kind(value) == kind:
-            return value.strip()
-    known: str | None = (
-        await s.execute(
-            select(LeadIdentifier.value)
-            .where(
-                LeadIdentifier.admin_id == admin_id,
-                LeadIdentifier.lead_id == lead.id,
-                LeadIdentifier.kind == kind,
-            )
-            .order_by(
-                LeadIdentifier.confirmed_at.desc().nulls_last(),
-                LeadIdentifier.created_at.desc(),
-                LeadIdentifier.id.desc(),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return known
+    return await conversation_sender(s, admin_id=admin_id, sess=sess, lead=lead)
 
 
 async def _bridge_voice_reply_to_sms(
