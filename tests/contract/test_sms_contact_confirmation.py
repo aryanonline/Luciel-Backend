@@ -183,26 +183,18 @@ async def test_five_wrong_entries_kill_the_code_and_a_resend_mints_a_new_one(cli
     code = _code_in(twilio[0]["body"])
     wrong = f"{(int(code) + 7) % 1_000_000:06d}"
 
+    # All five entries are answered by the code loop itself, back to back — the
+    # throttle never speaks first (round 7 delivery hardening: it used to 429 the
+    # fourth). The fifth wrong entry locks the code: the right code is refused until
+    # a new one is sent.
     outcomes = []
-    for _ in range(3):  # the per-tenant bucket admits three entries in a row
+    for _ in range(5):
         r = await client.post(CONFIRM, json={"number": CONTACT, "code": wrong})
         assert r.status_code == 200, r.text
         outcomes.append(r.json()["outcome"])
-    assert outcomes == ["wrong_code"] * 3
-    # Entry number four in the same window is throttled, not counted.
-    r = await client.post(CONFIRM, json={"number": CONTACT, "code": wrong})
-    assert r.status_code == 429, r.text
-
-    # Two more wrong entries (the store is per-process; a fresh one models the window
-    # passing) lock the code: the right code is refused until a new one is sent.
-    from app.channels import rate_limit
-
-    rate_limit._store = rate_limit.TokenBucketStore()
-    r = await client.post(CONFIRM, json={"number": CONTACT, "code": wrong})
-    assert r.json()["outcome"] == "wrong_code"
-    r = await client.post(CONFIRM, json={"number": CONTACT, "code": wrong})
-    assert r.json()["outcome"] == "locked"
+    assert outcomes == ["wrong_code"] * 4 + ["locked"]
     r = await client.post(CONFIRM, json={"number": CONTACT, "code": code})
+    assert r.status_code == 200, r.text
     assert r.json()["outcome"] == "locked"
 
     # Inside the cooldown a resend is refused honestly; past it, a fresh code goes out
@@ -223,8 +215,6 @@ async def test_five_wrong_entries_kill_the_code_and_a_resend_mints_a_new_one(cli
     assert len(twilio) == 2
     fresh = _code_in(twilio[1]["body"])
     assert _health(r.json(), CONTACT)["state"] == "pending_confirmation"
-    # Six minutes passed for the resend; the entry bucket refilled with them.
-    rate_limit._store = rate_limit.TokenBucketStore()
     r = await client.post(CONFIRM, json={"number": CONTACT, "code": code})
     assert r.json()["outcome"] == "wrong_code"
     r = await client.post(CONFIRM, json={"number": CONTACT, "code": fresh})
@@ -414,3 +404,52 @@ async def test_the_code_text_bounds_the_tenant_controlled_name():
     assert "Acme Patios and" in body and "\n" not in body
     assert body.isascii()  # a truncation mark must not turn the text into UCS-2
     assert _code_body("123456", None).count("a Luciel") == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_entry_throttle_answers_after_every_codes_attempts_never_before(client, twilio):
+    """Round 7 delivery hardening. confirm-sms borrowed the test text's bucket: three
+    entries per 30 minutes per tenant, against five attempts per code and three SMS
+    contacts (primary, secondary, after-hours) to confirm. One typo and the next entry
+    was a 429 for up to half an hour, by which time the 15-minute code had expired —
+    the documented "five wrong entries kill the code" was unreachable. Now every
+    attempt of every contact's code is answered by the code loop, and only an entry
+    past all of them meets the flood throttle."""
+    from app.channels import rate_limit
+    from app.notifications import contact_confirmation
+
+    limits = rate_limit.LIMITS[contact_confirmation.CODE_ENTRY_LIMIT]
+    attempts = contact_confirmation.MAX_CODE_ATTEMPTS
+    assert limits.burst == contact_confirmation.SMS_CONTACT_SLOTS * attempts
+    # On Redis the bucket is a fixed window of burst x refill: at least a code's life.
+    assert limits.burst * limits.refill_seconds >= contact_confirmation.CODE_TTL.total_seconds()
+
+    admin = await _ready_account_with_luciel(client)
+    await _attach_number(admin)
+    secondary = "+16045555678"
+    r = await client.put(
+        PUT, json={"primarySms": CONTACT, "secondarySms": secondary, "preferredChannel": "sms"}
+    )
+    assert r.status_code == 200, r.text
+    r = await client.put(TEAM, json=_after_hours("sms", AFTER_HOURS))
+    assert r.status_code == 200, r.text
+    assert [t["to"] for t in twilio] == [CONTACT, secondary, AFTER_HOURS]
+    codes = {t["to"]: _code_in(t["body"]) for t in twilio}
+
+    for number in (CONTACT, secondary, AFTER_HOURS):
+        wrong = f"{(int(codes[number]) + 3) % 1_000_000:06d}"
+        outcomes = []
+        for _ in range(attempts):
+            r = await client.post(CONFIRM, json={"number": number, "code": wrong})
+            assert r.status_code == 200, (number, r.text)
+            outcomes.append(r.json()["outcome"])
+        assert outcomes == ["wrong_code"] * (attempts - 1) + ["locked"], number
+
+    rejected = await _audit(admin, "escalation_contact_code_rejected")
+    assert len(rejected) == contact_confirmation.SMS_CONTACT_SLOTS * attempts
+
+    # Past every attempt of every code, a flood is still throttled — and not counted.
+    r = await client.post(CONFIRM, json={"number": CONTACT, "code": codes[CONTACT]})
+    assert r.status_code == 429, r.text
+    assert "Too many code entries" in r.text
+    assert len(await _audit(admin, "escalation_contact_code_rejected")) == len(rejected)

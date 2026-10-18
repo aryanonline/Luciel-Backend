@@ -693,12 +693,14 @@ async def confirm_sms_contact(
     """The owner enters the 6-digit code an SMS escalation contact received (round 7
     WP-4b). The contact may instead text the code back to the number that sent it.
     Rate-limited per tenant and every entry is audited; five wrong entries kill the
-    code and the owner asks for a new one."""
+    code and the owner asks for a new one. The throttle is the code loop's own bucket,
+    sized so every attempt of every contact's code is answered by the loop (round 7
+    delivery hardening) — it used to borrow the test text's 3-per-30-minutes."""
     from app.channels import rate_limit  # noqa: PLC0415
     from app.notifications import contact_confirmation  # noqa: PLC0415
 
     decision = rate_limit.get_store().check_source(
-        "escalation_test_sms", f"confirm:{subject.admin_id}"
+        contact_confirmation.CODE_ENTRY_LIMIT, str(subject.admin_id)
     )
     if not decision.allowed:
         from app.api.errors import rate_limited  # noqa: PLC0415

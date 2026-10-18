@@ -173,6 +173,12 @@ class SmsConfirmationStart:
 CODE_SEND_LIMIT = "escalation_code_sms"
 #: The refusal ``begin_sms_confirmation`` records when that budget is spent.
 CODE_SEND_RATE_LIMITED = "code_send_rate_limited"
+#: ``rate_limit.LIMITS`` bucket the owner's code entries (confirm-sms) spend from, per
+#: tenant. Sized to ``SMS_CONTACT_SLOTS`` x ``MAX_CODE_ATTEMPTS`` so the throttle never
+#: answers before a code's own attempt limit does.
+CODE_ENTRY_LIMIT = "escalation_code_entry"
+#: SMS contacts one tenant can have awaiting a code: primary, secondary, after-hours.
+SMS_CONTACT_SLOTS = 3
 #: The tenant-controlled name rides the text; bounded so it stays one short message.
 _BODY_NAME_MAX = 40
 
