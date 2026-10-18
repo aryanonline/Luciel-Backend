@@ -186,9 +186,11 @@ async def test_an_export_link_is_throttled_per_link(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_valid_link_to_a_swept_bundle_is_a_410_not_a_redirect_to_nothing(client):
-    """Round 7 WP-5 item 8: a Luciel hard delete sweeps the tenant's bundles and
-    leaves the account, so the 7-day token still verifies. The presign is computed
-    locally and "succeeded" for the missing object — the owner was redirected to the
+    """Round 7 WP-5 item 8: a bundle can be gone while the account remains (removed
+    by hand, or the bucket's lifecycle backstop), so the 7-day token still verifies.
+    (A Luciel hard delete no longer sweeps bundles — money review finding 1.) The
+    presign is computed locally and "succeeded" for the missing object — the owner
+    was redirected to the
     bucket's raw NoSuchKey page. The door now asks the store first; a store that
     cannot answer is NOT read as gone (the redirect goes ahead, as before)."""
     from app.lifecycle.export_link import mint_export_token
