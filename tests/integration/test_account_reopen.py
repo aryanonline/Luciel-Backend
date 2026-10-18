@@ -331,6 +331,143 @@ async def test_billing_resumes_after_a_reopen_and_bills_only_what_is_new(
     assert gateway.subscription_price(billing.stripe_subscription_id) == PAYG_PRICE
 
 
+@pytest.mark.parametrize("shape", ["basil_parent", "legacy_top_level"])
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_closure_final_invoice_does_not_hand_a_reopen_a_second_free_fifty(
+    gateway: FakeStripeGateway, shape: str
+):
+    """Live posture: the closure's ``cancel(invoice_now=True)`` makes Stripe issue and
+    charge a final invoice, and its ``invoice.paid`` (period_end = the cancel instant)
+    reaches ``handle_event`` while the account is closed. That used to move the anchor
+    to the cancel instant and zero the watermarks, so after a reopen conversations
+    241-250+ counted from zero again: a second free 50 inside the period already used.
+    The fake emits no events, so this test pushes the one Stripe sends."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    admin, iid = await _seed()
+    customer = f"cus_fake_{admin.hex[:16]}"
+    # The subscription's cycle began on the 1st; the closure lands later in it.
+    gateway.now = STRIPE_PERIOD_START
+    async with tenant_session(admin) as s:
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=STRIPE_PERIOD_START.date(),
+                counted_conversations=250,
+                counted_session_ids=[str(uuid.uuid4()) for _ in range(250)],
+            )
+        )
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        billing.billing_state = "payg_enabled"
+        billing.stripe_customer_id = customer
+        billing.period_start = STRIPE_PERIOD_START
+    async with tenant_session(admin) as s:
+        assert await metering.report_usage_after_count(s, admin_id=admin, instance_id=iid) == 2
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        first_sub = billing.stripe_subscription_id
+        resets_before = billing.period_resets_at
+    assert first_sub is not None
+    assert billing.period_start == STRIPE_PERIOD_START
+    gateway.now = None  # from here the fake's clock is the real one (a later rebind)
+
+    await _close(admin)
+    # The final invoice Stripe issues for the cancelled subscription, paid.
+    cancel_instant = max(datetime.now(UTC), STRIPE_PERIOD_START + timedelta(days=1))
+    invoice: dict[str, object] = {
+        "object": "invoice",
+        "customer": customer,
+        "period_start": int(STRIPE_PERIOD_START.timestamp()),
+        "period_end": int(cancel_instant.timestamp()),
+    }
+    if shape == "basil_parent":
+        invoice["parent"] = {
+            "type": "subscription_details",
+            "subscription_details": {"subscription": first_sub},
+        }
+    else:
+        invoice["subscription"] = first_sub
+    async with tenant_session(admin) as s:
+        action = await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(event_id=f"evt_final_{shape}", type="invoice.paid", data=invoice),
+        )
+    assert action == "invoice_paid"
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert billing.period_start == STRIPE_PERIOD_START, "the final invoice moved the anchor"
+        assert billing.period_resets_at == resets_before
+        assert (billing.accrued_blocks, billing.last_reported_blocks) == (2, 2)
+        assert billing.accrual_period_start == STRIPE_PERIOD_START.date()
+
+    async with tenant_session(admin) as s:
+        outcome = await reopen.reopen_account(s, admin, admin)
+    assert outcome.subscription == reopen.SUBSCRIPTION_REBINDS
+
+    # Conversation 251 is the first of block 3: billed, not the first of a fresh 50.
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(ConversationBudget)
+            .where(ConversationBudget.admin_id == admin, ConversationBudget.instance_id == iid)
+            .values(counted_conversations=251)
+        )
+    async with tenant_session(admin) as s:
+        assert await metering.report_usage_after_count(s, admin_id=admin, instance_id=iid) == 1
+    assert gateway.billed_quantity(customer) == 3, "2 settled at closure + block 3"
+    async with tenant_session(admin) as s:
+        counted = (
+            await s.execute(
+                select(ConversationBudget.counted_conversations).where(
+                    ConversationBudget.admin_id == admin
+                )
+            )
+        ).scalar_one()
+    assert counted == 251, "the reopened account kept its period's count"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_invoice_for_the_bound_subscription_still_advances_the_period(
+    gateway: FakeStripeGateway,
+):
+    """The ended-subscription rule is narrow: the cycle invoice of the subscription the
+    account currently holds is the period boundary, exactly as before."""
+    from app.billing import webhooks as billing_webhooks
+    from app.billing.stripe_gateway import StripeEvent
+
+    admin, _ = await _seed(luciel=None)
+    next_start = STRIPE_PERIOD_START + timedelta(days=31)
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        billing.billing_state = "payg_enabled"
+        billing.stripe_customer_id = "cus_cycle"
+        billing.stripe_subscription_id = "sub_current"
+        billing.period_start = STRIPE_PERIOD_START
+    async with tenant_session(admin) as s:
+        await billing_webhooks.handle_event(
+            s,
+            admin_id=admin,
+            event=StripeEvent(
+                event_id="evt_cycle_current",
+                type="invoice.paid",
+                data={
+                    "object": "invoice",
+                    "customer": "cus_cycle",
+                    "parent": {"subscription_details": {"subscription": "sub_current"}},
+                    "period_start": int(STRIPE_PERIOD_START.timestamp()),
+                    "period_end": int(next_start.timestamp()),
+                },
+            ),
+        )
+    async with tenant_session(admin) as s:
+        billing = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert billing.period_start == next_start
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_reopen_names_a_subscription_the_closure_could_not_end(gateway: FakeStripeGateway):
     """Stripe refused the cancel at closure: the subscription never stopped, the
