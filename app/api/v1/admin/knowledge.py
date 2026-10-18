@@ -661,9 +661,7 @@ async def trigger_sync(
                     "synced, so nothing was removed. If you did remove them at the source, "
                     "sync again and confirm the shrink."
                 ) from exc
-            return SyncResultOut.model_validate(
-                {"added": result.added, "updated": result.updated, "removed": result.removed}
-            )
+            return SyncResultOut.model_validate(result.as_dict())
     except CrawlUnreachable as exc:
         # The site answered no page (round 7 Phase 2 review, knowledge #2): the same
         # 409 the owner always saw, but the bookkeeping is a failed sync — never the

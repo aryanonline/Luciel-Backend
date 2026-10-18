@@ -134,6 +134,56 @@ def test_the_detail_never_carries_a_sentence_a_secret_or_pii() -> None:
     assert audit_detail("lifecycle_transition", {"from": "active"}) is None
 
 
+def test_a_knowledge_sync_row_renders_counts_never_the_ids() -> None:
+    """Round 7 Phase 2 review, knowledge #4: a page the quota refused left the owner a
+    bare ``knowledge_source_edited``. The sync row now counts every outcome; its lists
+    are external ids (a crawl's are URLs) and never reach the detail."""
+    detail = audit_detail(
+        "knowledge_source_edited",
+        {
+            "action": "sync",
+            "connection_id": str(uuid.uuid4()),
+            "origin": "website_crawl",
+            "added": ["https://acme.example/a"],
+            "updated": [],
+            "removed": [],
+            "refused": ["https://acme.example/big"],
+            "graph_deferred": [],
+            "unreached": [],
+        },
+    )
+    assert detail == "sync: 1 added, 0 updated, 0 removed, 1 refused"
+    assert "acme.example" not in detail
+    assert (
+        audit_detail(
+            "knowledge_source_edited",
+            {"action": "sync", "added": [], "updated": [], "removed": [], "unreached": ["x"]},
+        )
+        == "sync: 0 added, 0 updated, 0 removed, 0 refused, 1 not reached"
+    )
+    assert (
+        audit_detail(
+            "knowledge_source_edited",
+            {"action": "sync_refused_shrink", "synced": 10, "reported": 2, "unreadable": 0},
+        )
+        == "sync refused (shrink): 10 synced, 2 reported"
+    )
+    assert (
+        audit_detail(
+            "knowledge_source_edited", {"action": "sync_failed", "error": "CrawlUnreachable"}
+        )
+        == "sync failed (CrawlUnreachable)"
+    )
+    # Other edits name the action only — a rename's names are the owner's words.
+    assert (
+        audit_detail(
+            "knowledge_source_edited",
+            {"action": "rename", "old_name": "Jane's notes", "new_name": "Prices"},
+        )
+        == "rename"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_audit_log_route_serves_the_detail(client):

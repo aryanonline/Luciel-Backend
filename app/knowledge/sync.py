@@ -138,7 +138,15 @@ class SyncResult:
         self.graph_deferred: list[str] = []
 
     def as_dict(self) -> dict[str, list[str]]:
-        return {"added": self.added, "updated": self.updated, "removed": self.removed}
+        # ``refused`` travels with the other three (round 7 Phase 2 review, knowledge
+        # #4): the manual re-sync answered 200 with a quota-refused page silently
+        # absent, because only the audit payload carried it.
+        return {
+            "added": self.added,
+            "updated": self.updated,
+            "removed": self.removed,
+            "refused": self.refused,
+        }
 
 
 async def sync_connection(
@@ -328,7 +336,6 @@ async def sync_connection(
             "connection_id": str(connection_id),
             "origin": origin,
             **result.as_dict(),
-            "refused": result.refused,
             "graph_deferred": result.graph_deferred,
             "unreached": sorted(unreached),
         },

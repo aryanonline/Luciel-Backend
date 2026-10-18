@@ -290,6 +290,65 @@ async def test_trigger_sync_for_website_crawl_ingests_and_is_idempotent_when_unc
     assert r2.json()["updated"] == []  # unchanged content -> no-op, not a re-ingest
 
 
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_the_quota_refuses_on_a_manual_sync_is_reported_not_dropped(
+    client, monkeypatch
+):
+    """Round 7 Phase 2 review, knowledge #4: a page the storage quota refused during a
+    manual re-sync used to vanish — 200 with ``added: []``, no row, nothing in the
+    owner's audit log but a bare event name. The result now names it under
+    ``refused`` and the sync's audit row counts it."""
+    import httpx
+    from app.knowledge import providers as providers_module
+    from app.knowledge import service
+
+    monkeypatch.setattr(service, "PER_FILE_MAX_BYTES", 200)
+
+    class FakeTransport:
+        async def get(self, url, *, headers=None, params=None):
+            body = "<p>" + ("x" * 500 if url.endswith("/big") else "Open 9 to 5") + "</p>"
+            return httpx.Response(200, text=body, request=httpx.Request("GET", url))
+
+    original_factory = providers_module.provider_for_connection
+
+    def patched_factory(connection, store):
+        p = original_factory(connection, store)
+        if isinstance(p, providers_module.WebsiteCrawlProvider):
+            p._transport = FakeTransport()
+        return p
+
+    import app.api.v1.admin.knowledge as knowledge_api
+
+    monkeypatch.setattr(providers_module, "provider_for_connection", patched_factory)
+    monkeypatch.setattr(knowledge_api, "provider_for_connection", patched_factory)
+
+    await _ready_account_with_luciel(client)
+    rc = await client.post(
+        "/api/v1/admin/knowledge/sync-connections",
+        json={
+            "provider": "website_crawl",
+            "crawlUrls": ["https://example.com/ok", "https://example.com/big"],
+        },
+    )
+    connection_id = rc.json()["connectionId"]
+    r = await client.post(f"/api/v1/admin/knowledge/sync-connections/{connection_id}/sync")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["added"] == ["https://example.com/ok"]
+    assert body["refused"] == ["https://example.com/big"]
+
+    log = await client.get("/api/v1/admin/usage/audit-log")
+    assert log.status_code == 200
+    sync_rows = [
+        row
+        for row in log.json()
+        if row["eventType"] == "knowledge_source_edited"
+        and (row["detail"] or "").startswith("sync:")
+    ]
+    assert sync_rows[0]["detail"] == "sync: 1 added, 0 updated, 0 removed, 1 refused"
+    assert "example.com" not in (sync_rows[0]["detail"] or "")
+
+
 # --- OAuth code->token callback (the previously-MISSING link) --------------- #
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_token(

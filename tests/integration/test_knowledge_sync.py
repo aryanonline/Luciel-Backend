@@ -325,6 +325,8 @@ async def test_a_new_synced_item_over_the_cap_is_not_ingested(monkeypatch):
             provider=provider,
         )
     assert res.added == ["ok"] and res.refused == ["big"]
+    # The refusal travels with the result the manual route answers (knowledge #4).
+    assert res.as_dict()["refused"] == ["big"]
     async with tenant_session(admin) as s:
         rows = await service.list_sources(s, admin)
         assert [r.external_id for r in rows] == ["ok"]  # no half-written row for "big"

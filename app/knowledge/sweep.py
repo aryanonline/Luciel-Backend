@@ -317,7 +317,7 @@ async def sync_due_connections(
             # every half-written row of THIS connection and leaves the rest of the
             # tenant's pass (earlier connections, the token refresh above) intact.
             async with session.begin_nested():
-                await sync.sync_connection(
+                result = await sync.sync_connection(
                     session,
                     admin_id=admin_id,
                     instance_id=conn.instance_id,
@@ -326,6 +326,14 @@ async def sync_due_connections(
                     provider=provider_for_connection(conn, get_secret_store()),
                 )
             synced += 1
+            if result.refused:
+                # The quota refused part of the pass (knowledge #4): the sync itself
+                # succeeded and its audit row counts the refusals for the owner.
+                logger.warning(
+                    "knowledge_sync_quota_refused provider=%s refused=%d",
+                    conn.provider,
+                    len(result.refused),
+                )
         except CrawlUnreachable as exc:
             # The site answered no page (maintenance 503, a bot wall's 403, a dead
             # host) — round 7 Phase 2 review, knowledge #2. A crawl holds no
