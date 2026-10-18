@@ -214,6 +214,13 @@ def test_is_decline_turn_positives(text: str) -> None:
         "leave it for tomorrow?",
         "without a doubt I'll book",
         "",
+        # A choice framed as a drop answers "which one?" (round 7 judgment hardening).
+        "drop the Tuesday one",
+        "skip the Tuesday one",
+        "never mind, Thursday at 3 works",
+        "forget it, let's do tomorrow at 10am",
+        "no, the first one",
+        "skip that, the later one please",
     ],
 )
 def test_is_decline_turn_negatives(text: str) -> None:

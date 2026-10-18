@@ -162,3 +162,31 @@ make that state explicit and test it.
   UTC. A context constructed without the two fields adds no line. `_dispatch_tools`
   passes the same zone to `ToolBroker.dispatch(timezone=)`, so the model and the
   appointment tools always agree on the clock (see app/tools/CLAUDE.md).
+
+## Judgment hardening (round 7 review:judgment, built 2026-10-11..18)
+- Retrieval skip: `retrieval_skippable` / `routing_hints` skip the knowledge search only
+  when the WHOLE message is a pleasantry or a contact detail
+  (`escalation.substantive_remainder` empty, no question). When unsure, retrieve.
+- Take-overs: every entry into human_controlled pages (`record_takeover_escalation`: the
+  session's explicit_human_request row is written, or extended — a safety take-over's
+  `moderation:<category>` first — and re-paged). A take-over always gets the full
+  take-over wording (`_handoff_reply(take_over=True)`); if the row + page could not be
+  written nothing claims the team was told and the session stays in ai mode
+  (`SELF_HARM_CRISIS_LINES` / `TAKEOVER_UNRECORDED_REPLY`). A take-over or moderated
+  message while an answer is parked on `pending_outbound` drops the parked answer and
+  reaches the gates — it is never settled as "no".
+- `sessions.input_ask_attempts` means consecutive stalls ON THE SAME detail: cleared on
+  every served turn, re-counted only when this turn stalls on the same asks as the
+  previous turn's durable traces (`PendingGather.asks`). The decline classifier runs only
+  while it is > 0, and a named choice (weekday, time, ordinal) is never a decline.
+- The lead record fills a tool input / receives a channel-switch send / is offered back
+  only when the transport proves the identity or THIS session supplied the value
+  (`channel_switch.record_readable`). A mentioned address ("my accountant at …") is the
+  destination of that one send, never confirmed as the lead's own (`is_own_identifier`).
+- One page per turn for one piece of news: hand_to_team recorded this turn + a
+  below-floor draft → the answer reasons ride on the hand-off row (no cannot_answer row,
+  no re-page). Every canned "passed to the team" line is backed by a page: the ask bound
+  and the unfounded-claim replacement use `record_or_extend_escalation`.
+- An empty draft is never sent as silence: a tool does not ground words never written
+  (the honest hand-off goes out), except a confirmed booking/move/cancel, read back from
+  its payload ("Here are the details: …").

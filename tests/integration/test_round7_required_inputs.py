@@ -159,7 +159,12 @@ async def test_an_sms_lead_with_a_confirmed_email_is_not_asked_for_it_again():
             source="volunteered",
         )
         assert await channel_switch.confirmed_inputs_on_file(
-            s, admin_id=admin, instance_id=iid, lead_id=lead.id, transport_identifier=PHONE
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            lead_id=lead.id,
+            transport_identifier=PHONE,
+            channel="sms",
         ) == {"email": EMAIL, "phone": PHONE}
 
         model = _booking_model()
@@ -205,7 +210,12 @@ async def test_an_unconfirmed_email_never_fills_a_required_input():
         )
         assert [r.confirmed_at for r in rows] == [None]  # on the record, not confirmed
         assert await channel_switch.confirmed_inputs_on_file(
-            s, admin_id=admin, instance_id=iid, lead_id=lead.id, transport_identifier=PHONE
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            lead_id=lead.id,
+            transport_identifier=PHONE,
+            channel="sms",
         ) == {"phone": PHONE}
 
         model = _booking_model()

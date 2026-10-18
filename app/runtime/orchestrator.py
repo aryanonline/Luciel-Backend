@@ -60,7 +60,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -93,6 +93,7 @@ from app.runtime.escalation import (
     is_decline_turn,
     is_new_question,
     is_repeated_question,
+    substantive_remainder,
 )
 from app.runtime.grounding import faithful_readback_ok, score_grounding
 from app.runtime.input_safety import (
@@ -224,6 +225,29 @@ def _stalled_gather_reasons(reasoned: _Reasoned) -> tuple[str, ...]:
     return tuple(reasons)
 
 
+def _stall_asks(reasoned: _Reasoned) -> frozenset[str]:
+    """What THIS turn's stalled dispatches wait for, in ``PendingGather.asks`` terms:
+    the field names the broker refused on or, with none, the tool whose choice was
+    ambiguous. Empty for a prose stall (no tool behind it)."""
+    missing = frozenset(
+        f
+        for _, r in reasoned.dispatched
+        if r.outcome is tool_contract.Outcome.missing_input
+        for f in r.missing_fields
+    )
+    if missing:
+        return missing
+    which = next(
+        (
+            str(call.get("tool_id", ""))
+            for call, r in reasoned.dispatched
+            if r.outcome is tool_contract.Outcome.ambiguous
+        ),
+        None,
+    )
+    return frozenset({f"which:{which}"}) if which is not None else frozenset()
+
+
 def is_clarifying_question(text: str) -> bool:
     """A single short question with no assertion in it — the one ungrounded draft that
     is honest to send, because it claims nothing (F100)."""
@@ -250,12 +274,23 @@ def retrieval_skippable(inbound_text: str, *, gather_pending: bool) -> bool:
     or contact-details turn with no question mark / interrogative, while no tool
     gather is pending, skips the embedding call and the Knowledge block. Gate 2 is
     untouched: it already exempts these turns from the floor, and a question in the
-    same breath keeps both the search and the floor."""
+    same breath keeps both the search and the floor.
+
+    Only when the WHOLE message is that pleasantry or that contact detail (round 7
+    judgment hardening): the classifiers read how a message opens or what it
+    contains, so "Hi, opening hours on Saturday please", "ok and the address" and
+    "My number is 416-555-0143. Wondering if you service Oakville" all passed for
+    turns with nothing to look up — the search was skipped and a covered question
+    was answered from nothing. Anything substantive left once the greeting, the
+    acknowledgement and the contact detail are removed keeps the search. When
+    unsure, retrieve."""
     if gather_pending:
         return False
     if _CARRIES_QUESTION.search(inbound_text or ""):
         return False
-    return is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)
+    if not (is_conversational_turn(inbound_text) or is_contact_details_turn(inbound_text)):
+        return False
+    return not substantive_remainder(inbound_text)
 
 
 #: What the model is told about the knowledge search on a turn with NO chunks
@@ -288,14 +323,31 @@ ANSWER_BEARING_TOOLS = frozenset(
         "lookup_record",
     }
 )
+#: The answer-bearing tools that CHANGE something for the customer: an ok from one is
+#: read back from its payload even when the model wrote no words (final pass).
+_ANSWER_BEARING_ACTIONS = ANSWER_BEARING_TOOLS & ACTION_TOOLS
 
 #: Compassion first, honesty second, a person third (2026-09-05 audit F116). No
 #: contact ask is appended: the person in distress is not asked for a phone number.
-SELF_HARM_REPLY = (
+SELF_HARM_CRISIS_LINES = (
     "I'm really sorry you're going through this. If you're in immediate danger, please "
     "contact your local emergency number right now — in Canada and the US you can call "
-    "or text 988 to reach a crisis line, any time. I've also let the team here know so a "
-    "person can follow up with you."
+    "or text 988 to reach a crisis line, any time."
+)
+SELF_HARM_REPLY = (
+    f"{SELF_HARM_CRISIS_LINES} I've also let the team here know so a person can follow up with you."
+)
+
+#: A take-over whose escalation could NOT be recorded (finding 7): nothing reached the
+#: team, so nothing says it did, and the conversation stays with Luciel rather than
+#: going silent under a person nobody paged.
+#: ``hand_to_team``'s payload state when THIS call wrote the row and scheduled the
+#: owner's page (a repeat in the same session reads "already_passed_this_conversation").
+HAND_TO_TEAM_RECORDED = "recorded"
+
+TAKEOVER_UNRECORDED_REPLY = (
+    "I'm sorry — I wasn't able to pass this to the team just now. Please send your "
+    "message again in a moment."
 )
 
 #: Honest offers when the arbiter (§3.4.2) would rather answer on another channel
@@ -311,6 +363,8 @@ _UNFOUNDED_CLAIM_REPLACEMENT = (
     "I wasn't able to complete that just now — I've flagged it for the team, and "
     "someone will follow up with you shortly."
 )
+#: The owner-facing reason on the row behind that replacement.
+UNFOUNDED_CLAIM_REASON = "an action the customer asked for did not go through"
 
 # Why no model served the turn (round 7 WP-2, item 4), for the llm_unavailable row.
 # ``provider``: both providers failed (the pre-existing case, no reason on the row);
@@ -458,6 +512,17 @@ class PendingGather:
     def what(self) -> str:
         return GATHER_WHAT.get(self.tool_id or "", "that")
 
+    @property
+    def asks(self) -> frozenset[str]:
+        """The detail(s) this gather waits for: the field names, or the tool whose
+        choice is ambiguous. Two stalls in a row are the SAME ask only when these
+        match (finding 5); empty for a prose stall."""
+        if self.missing_fields:
+            return frozenset(self.missing_fields)
+        if self.ambiguous:
+            return frozenset({f"which:{self.tool_id or ''}"})
+        return frozenset()
+
     def field_reason(self) -> str:
         """The owner-facing reason naming what is still missing."""
         if self.missing_fields:
@@ -566,6 +631,104 @@ async def record_or_extend_escalation(
     return True
 
 
+#: The first-reason token the delivery layer routes and labels a SAFETY page on
+#: (``moderation_reasons`` writes it; ``notifications.base.safety_category_from_reasons``
+#: reads it).
+MODERATION_REASON_PREFIX = "moderation:"
+
+
+async def record_takeover_escalation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    reasons: list[str],
+    audit_detail: dict[str, object] | None = None,
+) -> bool:
+    """Record a TAKE-OVER and page the owner — on EVERY entry into human_controlled
+    (round 7 judgment hardening, finding 7).
+
+    A take-over writes the session's ``explicit_human_request`` row once; after the
+    owner hands the conversation back, a second take-over in the same session (a new
+    request for a person, a threat, a self-harm disclosure) met that row and — the
+    insert being ON CONFLICT DO NOTHING — wrote nothing and paged nobody, while the
+    customer was told the team knew and every later message went unanswered. Now the
+    existing row takes this take-over's reasons and the owner is paged AGAIN, even
+    when the reasons are the same ("asked for a person" twice is still a person
+    needed now). A safety take-over puts its ``moderation:<category>`` reasons FIRST,
+    so the page is routed and labelled as the safety page it is.
+
+    Returns whether a row was written or re-paged; False only when the conflicting
+    row cannot be found (then nothing was scheduled, and the caller must not say the
+    team was told)."""
+    if await _record_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+        reasons=reasons,
+        audit_detail=audit_detail,
+    ):
+        return True
+    row = (
+        await session.execute(
+            select(EscalationEvent)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        # The conflicting row went away between the insert and this read: with no
+        # row there, the insert writes it. A second conflict is reported as nothing
+        # recorded on THIS turn.
+        return await _record_escalation(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=gate,
+            score=score,
+            reasons=reasons,
+            audit_detail=audit_detail,
+        )
+    existing = [str(r) for r in (row.reasons or [])]
+    if reasons and reasons[0].startswith(MODERATION_REASON_PREFIX):
+        merged = [*reasons, *(r for r in existing if r not in reasons)]
+    else:
+        merged = [*existing, *(r for r in reasons if r not in existing)]
+    if merged != existing:
+        row.reasons = merged
+        await session.flush()
+    emit_metric("EscalationRenotified", dimensions={"Signal": signal})
+    schedule_notification_after_commit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+    )
+    return True
+
+
 #: Longest excerpt of a new unanswered question carried on the row's reasons.
 _QUESTION_EXCERPT_CAP = 120
 
@@ -601,7 +764,7 @@ def moderation_reasons(category: ModerationCategory) -> tuple[str, ...]:
     labels on, then the owner-facing phrase. Threats/self-harm rows (which take the
     conversation away under explicit_human_request, D2) used to carry no reasons at
     all, so the owner could not tell a threat from a polite request for a person."""
-    return (f"moderation:{category.value}", _MODERATION_REASON[category])
+    return (f"{MODERATION_REASON_PREFIX}{category.value}", _MODERATION_REASON[category])
 
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
@@ -1098,6 +1261,21 @@ class Orchestrator:
                 handed_off=True,
             )
 
+        # --- CONSECUTIVE STALLS (round 7 judgment hardening, finding 5) -------- #
+        # ``sessions.input_ask_attempts`` means "how many turns IN A ROW Luciel ended
+        # by asking for a detail a tool could not run without". It used to reset only
+        # on a tool ok, the ask bound or a decline, so one stall followed by any
+        # ordinary turn (a free/busy check that came back empty, a price answered from
+        # the knowledge, a take-over, an outage ack) left it at 1 — and an ordinary
+        # "no" turns later was read as refusing the long-settled detail, the session
+        # was escalated at close as an unfinished gather. Every served turn now
+        # starts from 0; the stall accounting below re-counts from the previous value
+        # only when THIS turn stalls too, so the decline check applies exactly while
+        # the previous Luciel turn was that ask.
+        prior_ask_attempts = sess_obj.input_ask_attempts if sess_obj is not None else 0
+        if sess_obj is not None and prior_ask_attempts:
+            sess_obj.input_ask_attempts = 0
+
         # The session's own transcript, loaded once for every path below: the intake
         # gate reads the trailing lead turns from it, and the hand-off ack / contact
         # ask decide from it whether they already went out this session (round 7
@@ -1154,6 +1332,25 @@ class Orchestrator:
         # The customer asked for the last answer on another channel and was asked
         # where to send it; this turn is their answer. Deterministic — no model call —
         # and nothing goes to an address they did not confirm.
+        #
+        # Unless a person must see this message (judgment hardening, final pass): a
+        # threat, a self-harm disclosure or a request for a person used to be read
+        # here as the answer — "no, I want to talk to a real person" matched the
+        # decline and got "No problem — I'll keep everything here", "no. honestly I
+        # want to kill myself" the same, and the gates below never ran: no crisis
+        # line, no take-over, no page. Such a message drops the parked answer and
+        # goes on to the gates that hand it to a person.
+        mod = moderate(inbound_text)
+        if (
+            sess_obj is not None
+            and sess_obj.pending_outbound
+            and (
+                mod.should_escalate
+                or evaluate_intake([inbound_text]).signal is Signal.explicit_human_request
+            )
+        ):
+            sess_obj.pending_outbound = None
+            await self.session.flush()
         if sess_obj is not None and sess_obj.pending_outbound:
             settled = await self._settle_pending_outbound(
                 sess_obj,
@@ -1173,7 +1370,7 @@ class Orchestrator:
         team_told = False
 
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
-        mod = moderate(inbound_text)
+        # (``mod`` was classified above, before the channel-switch confirmation.)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
             # Every moderation row: "moderation:<category>" first, then the owner's
@@ -1200,15 +1397,20 @@ class Orchestrator:
                 )
             else:
                 # Threats and self-harm: a person takes the conversation (D2).
+                unrecorded_ack = TAKEOVER_UNRECORDED_REPLY
                 if mod.category is ModerationCategory.self_harm:
                     # Immediate escalation with crisis copy; no contact ask (F116).
+                    # The crisis lines go out whatever happens; "I've also let the
+                    # team here know" only when the page really was scheduled.
                     ack = SELF_HARM_REPLY
+                    unrecorded_ack = SELF_HARM_CRISIS_LINES
                 else:
                     ack = await self._handoff_reply(
                         history,
                         channel=channel,
                         resolved_lead_id=resolved_lead_id,
                         transport_identifier=transport_identifier,
+                        take_over=True,
                     )
                 return await self._hand_off_with_ack(
                     session_id=session_id,
@@ -1220,6 +1422,7 @@ class Orchestrator:
                     ack=ack,
                     reasons=reasons,
                     audit_detail=audit_detail,
+                    unrecorded_ack=unrecorded_ack,
                 )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -1245,6 +1448,7 @@ class Orchestrator:
                     channel=channel,
                     resolved_lead_id=resolved_lead_id,
                     transport_identifier=transport_identifier,
+                    take_over=True,
                 ),
             )
         if intake.fired:
@@ -1273,7 +1477,15 @@ class Orchestrator:
         # fabricated. When bound, an empty list here is a REAL "retrieval found
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
-        gather_pending = sess_obj is not None and sess_obj.input_ask_attempts > 0
+        gather_pending = prior_ask_attempts > 0
+        # What the previous (stalled) turn was waiting for, read from its durable
+        # tool traces BEFORE this turn dispatches anything: the decline check names
+        # it, and the stall accounting below compares it with this turn's ask.
+        prior_gather = (
+            await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            if gather_pending
+            else PendingGather()
+        )
 
         # --- DECLINED INPUT (§3.3.7 rule 4; round 7 WP-2 remainder, item 2) --- #
         # The last turn stalled asking for a detail and the customer now declines
@@ -1282,9 +1494,8 @@ class Orchestrator:
         # page naming the field, the honest line); a prose stall just moves on.
         declined_prefix = ""
         if sess_obj is not None and gather_pending and is_decline_turn(inbound_text):
-            sess_obj.input_ask_attempts = 0
             gather_pending = False
-            gather = await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            gather = prior_gather
             if gather.blocks_action:
                 emit_metric("GatherDeclined", dimensions={"Channel": channel})
                 decline_reasons = [
@@ -1393,6 +1604,11 @@ class Orchestrator:
         # The lead's CONFIRMED email/phone — or the transport identifier itself —
         # fill a required input the model leaves out, at the broker; the stanza names
         # the fields so the model stops asking for what the customer already gave.
+        # From the RECORD only when the channel proves who is writing, or for a value
+        # this session typed itself (judgment hardening, finding 3): a widget session
+        # bound to a lead by a typed number must never be filled with — and read
+        # back — that lead's confirmed email.
+        supplied = channel_switch.identifiers_supplied(history)
         gathered: dict[str, Any] = (
             await channel_switch.confirmed_inputs_on_file(
                 self.session,
@@ -1400,6 +1616,8 @@ class Orchestrator:
                 instance_id=instance_id,
                 lead_id=resolved_lead_id,
                 transport_identifier=transport_identifier,
+                channel=channel,
+                supplied=supplied,
             )
             if tool_defs
             else {}
@@ -1501,7 +1719,8 @@ class Orchestrator:
         # model's reply is (per the T1/T3 stanzas) a question back to the customer.
         # Asking is bounded, not infinite — after ASK_ATTEMPT_BOUND consecutive
         # stalled turns, Luciel stops re-asking and hands off with the context
-        # (§3.3.7 rule 4). An `ok` outcome resets the counter: the gather worked.
+        # (§3.3.7 rule 4). Any turn that does not stall leaves the counter at the 0
+        # it was cleared to on entry (finding 5): the gather worked, or moved on.
         any_ok = any(r.outcome is tool_contract.Outcome.ok for _, r in resp.dispatched)
         stalled = not any_ok and any(
             r.outcome in (tool_contract.Outcome.missing_input, tool_contract.Outcome.ambiguous)
@@ -1515,73 +1734,87 @@ class Orchestrator:
         if not stalled and not resp.dispatched:
             previous_luciel = next((t.text for t in reversed(history) if t.role == "luciel"), None)
             stalled = is_repeated_question(resp.text, previous_luciel)
-        if sess_obj is not None:
-            if stalled:
-                sess_obj.input_ask_attempts += 1
-                if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
-                    # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
-                    # still missing, send the honest hand-off line instead of the
-                    # re-ask — and stay in ai mode. The next turn is answered.
-                    sess_obj.input_ask_attempts = 0
-                    stall_reasons = _stalled_gather_reasons(resp)
-                    written = await _record_escalation(
-                        self.session,
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        resolved_lead_id=resolved_lead_id,
-                        signal=Signal.cannot_answer.value,
-                        gate=Gate.outcome.value,
-                        score=None,
-                        reasons=list(stall_reasons),
-                    )
-                    if not written:
-                        # The session's one cannot_answer row already exists (an
-                        # earlier below-floor turn): the owner still reads WHICH
-                        # fields the gather stalled on.
-                        await _append_escalation_reasons(
-                            self.session,
-                            admin_id=admin_id,
-                            session_id=session_id,
-                            signal=Signal.cannot_answer.value,
-                            gate=Gate.outcome.value,
-                            reasons=list(stall_reasons),
-                        )
-                    ack = await self._handoff_reply(
-                        history,
-                        channel=channel,
-                        resolved_lead_id=resolved_lead_id,
-                        transport_identifier=transport_identifier,
-                    )
-                    ack_row = await persist_turn(
-                        self.session,
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        role="luciel",
-                        text=ack,
-                        at=datetime.now(UTC),
-                        deterministic=True,
-                    )
-                    return LoopResult(
-                        reply_message_id=ack_row.id,
-                        reply_text=ack,
-                        outbound_channel=channel,
-                        counted=counted,
-                        escalation=EscalationDecision(
-                            True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
-                        ),
-                        used_fallback=used_fallback,
-                        iterations=iterations,
-                        tool_outcomes=resp.tool_outcomes,
-                    )
-            elif any_ok and sess_obj.input_ask_attempts:
+        if sess_obj is not None and stalled:
+            # One more stall IN A ROW: counted from the previous turn's value, which
+            # this turn cleared on entry (finding 5). A turn that did not stall keeps
+            # the 0 — there is no reset branch to forget. A stall waiting for a
+            # DIFFERENT detail than the last one is a new ask, not a re-ask: the
+            # customer answered ("2pm on the 1st" → now the email), so it is the
+            # first in a row — "still missing email after 2 asks" would be untrue.
+            in_a_row = prior_ask_attempts
+            now_asks = _stall_asks(resp)
+            if prior_gather.asks and now_asks and now_asks != prior_gather.asks:
+                in_a_row = 0
+            sess_obj.input_ask_attempts = in_a_row + 1
+            if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
+                # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
+                # still missing, send the honest hand-off line instead of the
+                # re-ask — and stay in ai mode. The next turn is answered.
                 sess_obj.input_ask_attempts = 0
+                stall_reasons = _stalled_gather_reasons(resp)
+                # The session's one cannot_answer row may already exist (an earlier
+                # below-floor turn): the owner still reads WHICH fields the gather
+                # stalled on — and is paged with it (final pass): the line below
+                # tells the customer it was passed to the team, and only appending
+                # to a row paged hours ago about another question passed nothing.
+                await record_or_extend_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=Signal.cannot_answer.value,
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=list(stall_reasons),
+                )
+                ack = await self._handoff_reply(
+                    history,
+                    channel=channel,
+                    resolved_lead_id=resolved_lead_id,
+                    transport_identifier=transport_identifier,
+                )
+                ack_row = await persist_turn(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    role="luciel",
+                    text=ack,
+                    at=datetime.now(UTC),
+                    deterministic=True,
+                )
+                return LoopResult(
+                    reply_message_id=ack_row.id,
+                    reply_text=ack,
+                    outbound_channel=channel,
+                    counted=counted,
+                    escalation=EscalationDecision(
+                        True, Signal.cannot_answer, Gate.outcome, None, stall_reasons
+                    ),
+                    used_fallback=used_fallback,
+                    iterations=iterations,
+                    tool_outcomes=resp.tool_outcomes,
+                )
 
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
         # Only an ANSWER-BEARING tool grounds the words (F119): a CRM push or a queued
         # callback succeeding is not evidence the reply's facts are true.
-        tool_succeeded = any(
+        #
+        # An EMPTY draft (final pass): a model can finish a tool turn with no words at
+        # all, and the transports send nothing for an empty reply — Luciel went
+        # silent, even after an availability check or a lookup came back. A tool
+        # cannot ground words that were never written, so the empty draft is judged
+        # as the non-answer it is (the honest hand-off below). A confirmed booking,
+        # move or cancellation is the exception: it is read back from its own
+        # payload in the readback step.
+        drafted = bool(pre_send_check(resp.text))
+        confirmed_change = any(
+            str(call.get("tool_id", "")) in _ANSWER_BEARING_ACTIONS
+            and r.outcome is tool_contract.Outcome.ok
+            for call, r in resp.dispatched
+        )
+        tool_succeeded = (drafted or confirmed_change) and any(
             str(call.get("tool_id", "")) in ANSWER_BEARING_TOOLS
             and r.outcome is tool_contract.Outcome.ok
             for call, r in resp.dispatched
@@ -1605,7 +1838,37 @@ class Orchestrator:
             context=" ".join(trailing[-5:]),
         )
         escalation: EscalationDecision | None = None
-        if outcome.fired:
+        # Luciel's own hand-off WROTE its row and scheduled its page in this very turn
+        # (at dispatch, finding 8). The owner is being paged about this message
+        # already, so the answer-quality news of the same turn rides on that row —
+        # one turn, one row, one page — instead of a second row and a second page.
+        handoff_paged = any(
+            str(call.get("tool_id", "")) == HAND_TO_TEAM_TOOL_ID
+            and r.outcome is tool_contract.Outcome.ok
+            and r.payload.get("state") == HAND_TO_TEAM_RECORDED
+            for call, r in resp.dispatched
+        )
+        if outcome.fired and handoff_paged and outcome.signal is Signal.cannot_answer:
+            await _append_escalation_reasons(
+                self.session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=Signal.luciel_requested_handoff.value,
+                gate=Gate.outcome.value,
+                reasons=list(outcome.reasons),
+            )
+            # The turn reports the row it actually wrote; the answer verdict rides
+            # along, so the below-floor draft is still replaced below.
+            escalation = EscalationDecision(
+                True,
+                Signal.luciel_requested_handoff,
+                Gate.outcome,
+                outcome.score_or_confidence,
+                ("Luciel asked for a person", *outcome.reasons),
+                answer_ungrounded=outcome.answer_ungrounded,
+                answer_reasons=outcome.answer_reasons,
+            )
+        elif outcome.fired:
             escalation = outcome
             # Every signal fires AT MOST ONCE per session (live-caught 2026-08-18 for
             # cannot_answer: every below-floor turn of one call emailed the owner
@@ -1641,8 +1904,19 @@ class Orchestrator:
                 # The lead signal already fired earlier in this session, but THIS
                 # turn's answer is a guess: that is cannot_answer news of its own
                 # (once per session like any other signal), never buried under the
-                # suppressed repeat.
-                if not await _session_already_escalated(
+                # suppressed repeat — and when Luciel's own hand-off paged this turn
+                # already, the news rides on that row (finding 8).
+                if handoff_paged:
+                    await _append_escalation_reasons(
+                        self.session,
+                        admin_id=admin_id,
+                        session_id=session_id,
+                        signal=Signal.luciel_requested_handoff.value,
+                        gate=Gate.outcome.value,
+                        reasons=list(outcome.answer_reasons),
+                    )
+                    row_written = True
+                elif not await _session_already_escalated(
                     self.session,
                     admin_id=admin_id,
                     session_id=session_id,
@@ -1717,24 +1991,29 @@ class Orchestrator:
             deterministic_reply = True
             if escalation is None:
                 escalation = EscalationDecision(
-                    True, Signal.cannot_answer, None, None, answer_ungrounded=True
+                    True,
+                    Signal.cannot_answer,
+                    None,
+                    None,
+                    (UNFOUNDED_CLAIM_REASON,),
+                    answer_ungrounded=True,
                 )
-                if not await _session_already_escalated(
+                # The replacement says it was flagged for the team, so it is (final
+                # pass): a new row, or the session's existing cannot_answer row —
+                # written about an earlier question — extended with this failed
+                # action and paged again. It used to be skipped whenever that row
+                # existed, so "I've flagged it for the team" reached nobody.
+                await record_or_extend_escalation(
                     self.session,
                     admin_id=admin_id,
+                    instance_id=instance_id,
                     session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
                     signal=Signal.cannot_answer.value,
-                ):
-                    await _record_escalation(
-                        self.session,
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        resolved_lead_id=resolved_lead_id,
-                        signal=Signal.cannot_answer.value,
-                        gate="outcome",
-                        score=None,
-                    )
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=[UNFOUNDED_CLAIM_REASON],
+                )
         elif ok_actions:
             # A confirmed action's numbers must come from its payload; on a mismatch,
             # append the deterministic confirmation built from what actually happened
@@ -1743,10 +2022,17 @@ class Orchestrator:
             confirmed_fields: dict[str, object] = {}
             for _, r in ok_actions:
                 confirmed_fields.update(r.payload)
-            if not faithful_readback_ok(reply_text, confirmed_fields):
-                summary = ", ".join(
-                    f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
-                )
+            summary = ", ".join(
+                f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
+            )
+            if not reply_text and confirmed_change:
+                # The model wrote nothing after a confirmed change (final pass): the
+                # customer still hears what actually happened, from the payload.
+                reply_text = f"Here are the details: {summary}."
+                if not summary:
+                    reply_text = "That's been taken care of."
+                deterministic_reply = True
+            elif not faithful_readback_ok(reply_text, confirmed_fields):
                 reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
         if not claimed_without_action and escalation is None and _HANDOFF_CLAIM.search(reply_text):
             # The reply promises the team a hand-off that nothing recorded (round 7
@@ -1864,6 +2150,8 @@ class Orchestrator:
                     reply_text=reply_text,
                     inbound_text=inbound_text,
                     resolved_lead_id=resolved_lead_id,
+                    channel=channel,
+                    supplied=supplied,
                 )
             elif escalation is None and outbound in _CHANNEL_OFFER:
                 # The arbiter would rather answer elsewhere (a long answer on SMS,
@@ -2278,7 +2566,7 @@ class Orchestrator:
         return tool_contract.ok(
             {
                 "passed_to_team": True,
-                "state": "recorded" if written else "already_passed_this_conversation",
+                "state": HAND_TO_TEAM_RECORDED if written else "already_passed_this_conversation",
                 # Read back by the model (T3): the honest wording of what happens next.
                 "note": (
                     "The team has been notified and a person will follow up later; keep "
@@ -2367,11 +2655,23 @@ class Orchestrator:
         channel: str,
         resolved_lead_id: uuid.UUID | None,
         transport_identifier: str | None,
+        take_over: bool = False,
     ) -> str:
         """The hand-off line for THIS turn (round 7 WP-2 remainder, item 1): the full
         ack the first time this session, a short varied acknowledgement after — the
-        team already has the thread — with the contact ask only when it is due."""
-        ack = short_handoff_ack(history) if handoff_ack_sent(history) else await self._handoff_ack()
+        team already has the thread — with the contact ask only when it is due.
+
+        ``take_over`` (round 7 judgment hardening): a turn that hands the WHOLE
+        conversation to a person — an explicit request for one, a threat — always
+        gets the full, honest line. The short cycle is for a later question Luciel
+        cannot answer while it keeps answering; "That's another one I can't answer
+        from what I have" to "can I talk to a real person please" read as Luciel not
+        understanding, right before every later message went unanswered."""
+        ack = (
+            await self._handoff_ack()
+            if take_over or not handoff_ack_sent(history)
+            else short_handoff_ack(history)
+        )
         return self._with_contact_ask(
             ack,
             channel=channel,
@@ -2435,6 +2735,7 @@ class Orchestrator:
         ack: str,
         reasons: tuple[str, ...] = (),
         audit_detail: dict[str, object] | None = None,
+        unrecorded_ack: str = TAKEOVER_UNRECORDED_REPLY,
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
@@ -2443,8 +2744,15 @@ class Orchestrator:
         Owner decision D2 (2026-09-14): ONLY an explicit request for a person and the
         threats_violence / self_harm moderation categories come through here. Strong
         negative sentiment, the ask bound, abuse and an illegal ask record + notify
-        and leave the conversation with Luciel (see run_turn)."""
-        await _record_escalation(
+        and leave the conversation with Luciel (see run_turn).
+
+        Every take-over pages (finding 7): a second one in the same session — after
+        the owner handed back — re-pages the session's row instead of meeting the
+        once-per-session rule and paging nobody. ``ack`` says the team was told, so
+        it goes out only when the row + page really were written/scheduled; if they
+        were not, ``unrecorded_ack`` goes out instead and the conversation is NOT
+        handed to a person nobody paged."""
+        recorded = await record_takeover_escalation(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
@@ -2456,6 +2764,25 @@ class Orchestrator:
             reasons=list(reasons),
             audit_detail=audit_detail,
         )
+        if not recorded:
+            _LOG.error("take-over escalation not recorded: session=%s", session_id)
+            emit_metric("TakeoverUnrecorded", dimensions={"Channel": channel})
+            unrecorded_row = await persist_turn(
+                self.session,
+                admin_id=self.admin_id,
+                instance_id=self.instance_id,
+                session_id=session_id,
+                role="luciel",
+                text=unrecorded_ack,
+                at=datetime.now(UTC),
+                deterministic=True,
+            )
+            return LoopResult(
+                reply_message_id=unrecorded_row.id,
+                reply_text=unrecorded_ack,
+                outbound_channel=channel,
+                counted=False,
+            )
         ack_row = await persist_turn(
             self.session,
             admin_id=self.admin_id,
@@ -2534,9 +2861,19 @@ class Orchestrator:
         )
         return result.delivered
 
-    async def _unconfirmed_candidate(self, lead_id: uuid.UUID | None, kind: str) -> str | None:
+    async def _unconfirmed_candidate(
+        self,
+        lead_id: uuid.UUID | None,
+        kind: str,
+        *,
+        channel: str,
+        supplied: Collection[str],
+    ) -> str | None:
         """An address on the lead's own record that was never confirmed — offered back
-        as a question, never used on its own."""
+        as a question, never used on its own. Only when this session may read the
+        record (finding 3): on a widget session bound by a typed number, the record's
+        email is somebody else's to the platform's knowledge, and offering it back
+        ("should I send it to jane@…?") is the read-back the rule forbids."""
         if lead_id is None:
             return None
         from app.models.lead import Lead  # noqa: PLC0415
@@ -2550,7 +2887,11 @@ class Orchestrator:
         if lead is None:
             return None
         for value in (lead.email if kind == "email" else lead.phone, lead.contact_identifier):
-            if value and identifier_kind(value) == kind:
+            if (
+                value
+                and identifier_kind(value) == kind
+                and channel_switch.record_readable(channel, value, supplied)
+            ):
                 return str(value)
         return None
 
@@ -2562,20 +2903,35 @@ class Orchestrator:
         reply_text: str,
         inbound_text: str,
         resolved_lead_id: uuid.UUID | None,
+        channel: str,
+        supplied: Collection[str],
     ) -> str:
         """The customer asked for this answer on ``outbound``. A confirmed address gets
-        it now (with a same-channel note); otherwise ask where, and park the answer."""
+        it now (with a same-channel note); otherwise ask where, and park the answer.
+
+        A confirmed address from the lead RECORD counts only when this session may
+        read the record (finding 3) — the same rule as the required-input fill."""
         kind = channel_switch.KIND_FOR_CHANNEL[outbound]
         typed = channel_switch.identifier_for(kind, inbound_text)
-        to = typed or await channel_switch.confirmed_identifier(
+        on_record = await channel_switch.confirmed_identifier(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
             lead_id=resolved_lead_id,
             kind=kind,
         )
+        if not channel_switch.record_readable(channel, on_record, supplied):
+            on_record = None
+        to = typed or on_record
         if to is not None:
-            if typed and resolved_lead_id is not None:
+            # A typed address is confirmed onto the lead only when the customer gave it
+            # as THEIR OWN (finding 6): "email it to my accountant at karen@…" sends
+            # this one message to Karen and records nothing.
+            if (
+                typed
+                and resolved_lead_id is not None
+                and channel_switch.is_own_identifier(kind, typed, inbound_text)
+            ):
                 await channel_switch.confirm_identifier(
                     self.session,
                     admin_id=self.admin_id,
@@ -2592,7 +2948,9 @@ class Orchestrator:
                 else channel_switch.failed_line(outbound)
             )
             return f"{reply_text.rstrip()}\n\n{note}"
-        candidate = await self._unconfirmed_candidate(resolved_lead_id, kind)
+        candidate = await self._unconfirmed_candidate(
+            resolved_lead_id, kind, channel=channel, supplied=supplied
+        )
         sess_obj.pending_outbound = channel_switch.new_pending(
             outbound, reply_text, candidate
         ).as_json()
@@ -2624,7 +2982,11 @@ class Orchestrator:
         if to is None:
             reply = channel_switch.DECLINED_LINE
         else:
-            if resolved_lead_id is not None:
+            # The offered candidate came from the lead's own record; a typed address
+            # is confirmed only when given as the customer's own (finding 6) — "send
+            # it to my wife at …" is that one send's destination, nothing more.
+            own = not typed or channel_switch.is_own_identifier(kind, typed, inbound_text)
+            if resolved_lead_id is not None and own:
                 await channel_switch.confirm_identifier(
                     self.session,
                     admin_id=self.admin_id,
@@ -2636,7 +2998,7 @@ class Orchestrator:
                 )
             delivered = await self._deliver_elsewhere(pending.channel, to, pending.body)
             reply = (
-                channel_switch.sent_line(pending.channel, to)
+                channel_switch.sent_line(pending.channel, to, own=own)
                 if delivered
                 else f"{channel_switch.failed_line(pending.channel)}\n\n{pending.body}"
             )
@@ -2749,9 +3111,11 @@ def routing_hints(
     and the orchestrator never passed any, so the bound fast provider was dead weight
     (cost, 2026-09-05 audit). A social turn (thanks / goodbye / a bare greeting) has
     no factual claim to ground and nothing for a tool to do: that is the honest fast
-    lane. Everything else keeps the primary model.
+    lane. Everything else keeps the primary model — including a request that merely
+    OPENS with a greeting ("Hi, opening hours on Saturday please"): the whole message
+    must be the pleasantry, exactly as for the retrieval skip.
     """
-    social = is_conversational_turn(inbound_text)
+    social = is_conversational_turn(inbound_text) and not substantive_remainder(inbound_text)
     chars = len(prompt) + sum(len(str(m.get("content", ""))) for m in messages)
     return {
         "requires_tools": bool(tool_defs) and not social,
