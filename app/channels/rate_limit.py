@@ -80,6 +80,11 @@ LIMITS: dict[str, ChannelLimits] = {
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
     # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
     "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
+    # Owner-triggered CRM backfill passes, per admin (phase-2 security review): each
+    # pass pushes up to 100 leads through outbound CRM calls, so a click-storm (or a
+    # retry loop on a slow CRM) must not become a pool-pinning, CRM-hammering mill.
+    # A tenant with a large backlog still gets a pass a minute after the burst.
+    "crm_backfill": ChannelLimits(burst=2, refill_seconds=60.0, daily_cap=50),
     # Account-export downloads per signed link (adversarial review R-WP2-2): the
     # door is unauthenticated by design (the token is the authorization), so a
     # leaked or replayed link must not become an unbounded audit-row + presign mill.
