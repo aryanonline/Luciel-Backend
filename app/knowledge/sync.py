@@ -62,6 +62,16 @@ class RemoteSnapshot:
 
     items: list[RemoteItem] = field(default_factory=list)
     failed_ids: list[str] = field(default_factory=list)
+    # Items the provider KNOWS exist but did not visit because its budget ended the
+    # walk before them (a crawl's depth cap — round 7 Phase 2 review, knowledge #3).
+    # Kept and flagged exactly like ``failed_ids`` (F117).
+    unreached_ids: list[str] = field(default_factory=list)
+    # False when the provider stopped enumerating before its scope was exhausted and
+    # cannot say what lies beyond (a crawl's page cap tripped, or a page whose links
+    # were never read): an item absent from an incomplete snapshot was not REACHED,
+    # which is not evidence it was removed at the origin. Every absent item is then
+    # kept and flagged, never tombstoned as removed at origin and purged.
+    complete: bool = True
 
 
 class SnapshotShrunk(Exception):
@@ -172,11 +182,17 @@ async def sync_connection(
         .all()
     )
     existing_by_ext = {s.external_id: s for s in existing if s.external_id}
+    # Absent items the provider cannot vouch for: unreadable this pass (F117), known
+    # but beyond its budget, or — under an incomplete snapshot — any absent item at
+    # all (knowledge #3). Kept and flagged, never retired.
+    absent = {e for e in existing_by_ext if e not in remote_by_id and e not in failed_ids}
+    unreached = absent if not snapshot.complete else absent & set(snapshot.unreached_ids)
+    unvouched = failed_ids | unreached
 
     # Floor guard (F107): a listing that lost more than half of what is synced — or
     # everything — is treated as a broken read, not a mass deletion. Nothing is
     # touched; the sources read "error" until the owner re-syncs with confirmation.
-    survivors = len([e for e in existing_by_ext if e in remote_by_id or e in failed_ids])
+    survivors = len([e for e in existing_by_ext if e in remote_by_id or e in unvouched])
     if existing_by_ext and not allow_shrink and survivors < SHRINK_FLOOR * len(existing_by_ext):
         # The refusal is durable evidence for the owner (the rows read 'error', the
         # audit row says why), so it is written in its OWN transaction: the caller's
@@ -284,9 +300,10 @@ async def sync_connection(
             prior.sync_status = "synced"
 
     # Deletions: items present locally but gone from the source (§3.2.3 safety).
-    # Unreadable-this-pass items (F117) are kept and flagged, never retired.
+    # Unreadable-this-pass items (F117) and items an incomplete snapshot never reached
+    # (knowledge #3) are kept and flagged, never retired.
     for ext_id, src in existing_by_ext.items():
-        if ext_id in failed_ids:
+        if ext_id in unvouched:
             src.sync_status = "error"
             continue
         if ext_id not in remote_by_id:
@@ -313,6 +330,7 @@ async def sync_connection(
             **result.as_dict(),
             "refused": result.refused,
             "graph_deferred": result.graph_deferred,
+            "unreached": sorted(unreached),
         },
     )
     return result

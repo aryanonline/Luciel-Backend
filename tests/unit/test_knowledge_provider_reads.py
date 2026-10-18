@@ -256,6 +256,11 @@ async def test_crawl_discovers_same_origin_pages_within_bounds_and_honours_robot
     assert "https://acme.example/private/notes" not in ids
     assert not any(u.endswith("/deeper") for u, _ in t.calls)
     assert snap.failed_ids == []
+    # /deeper exists but the depth cap ended the walk before it: the snapshot names it,
+    # so the sync never reads its absence as "removed at the site" (knowledge #3). Every
+    # page below the cap was read, so nothing else is unknown: the walk is complete.
+    assert snap.unreached_ids == ["https://acme.example/deeper"]
+    assert snap.complete is True
 
 
 @pytest.mark.asyncio
@@ -279,3 +284,83 @@ async def test_crawl_reports_a_page_it_could_not_fetch_and_stops_at_the_page_cap
         "https://acme.example/a"
     ]  # kept + flagged by the sync, never retired
     assert not any(u.endswith("/b") or u.endswith("/c") for u, _ in t.calls)  # the cap held
+    # /b and /c were still queued when the page cap tripped: an incomplete snapshot.
+    assert snap.complete is False
+    assert snap.unreached_ids == []
+
+
+# --- Round 7 Phase 2 review, knowledge #3: the budget is not the site ------------------- #
+# A page that merely fell outside this run's page/depth budget (which pages fit depends
+# on link order) used to be absent from a snapshot that looked complete, so the sync
+# tombstoned it "removed at origin" and the retention pass purged it that night.
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_a_crawl_that_walked_the_whole_site_is_complete(monkeypatch):
+    monkeypatch.setattr(get_settings(), "website_crawl_max_pages", 10, raising=False)
+    monkeypatch.setattr(get_settings(), "website_crawl_max_depth", 2, raising=False)
+    t = RoutedTransport()
+    t.on(lambda u, p: u.endswith("/robots.txt"), httpx.ConnectError("no robots"))
+    t.on(
+        lambda u, p: u == "https://acme.example/",
+        '<a href="/a">a</a><a href="/b">b</a><a href="/">home</a>',
+    )
+    t.on(lambda u, p: u == "https://acme.example/a", '<a href="/b">b</a><p>a</p>')
+    t.on(lambda u, p: u == "https://acme.example/b", '<a href="/">home</a><p>b</p>')
+    snap = await WebsiteCrawlProvider(urls=["https://acme.example/"], transport=t).snapshot(
+        uuid.uuid4()
+    )
+    assert len(snap.items) == 3
+    # Links back to pages already visited (or queued twice) are not "unreached".
+    assert snap.complete is True
+    assert snap.unreached_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_a_page_at_the_depth_cap_names_the_pages_it_links_onward_to(monkeypatch):
+    monkeypatch.setattr(get_settings(), "website_crawl_max_pages", 10, raising=False)
+    monkeypatch.setattr(get_settings(), "website_crawl_max_depth", 0, raising=False)
+    t = RoutedTransport()
+    t.on(lambda u, p: u.endswith("/robots.txt"), httpx.ConnectError("no robots"))
+    t.on(lambda u, p: u == "https://acme.example/", '<a href="/pricing">p</a><p>home</p>')
+    snap = await WebsiteCrawlProvider(urls=["https://acme.example/"], transport=t).snapshot(
+        uuid.uuid4()
+    )
+    assert [i.external_id for i in snap.items] == ["https://acme.example/"]
+    assert snap.unreached_ids == ["https://acme.example/pricing"]  # kept by the sync
+    # The same page with no onward link is the whole site.
+    t2 = RoutedTransport()
+    t2.on(lambda u, p: u.endswith("/robots.txt"), httpx.ConnectError("no robots"))
+    t2.on(lambda u, p: u == "https://acme.example/", '<a href="/">home</a><p>home</p>')
+    snap2 = await WebsiteCrawlProvider(urls=["https://acme.example/"], transport=t2).snapshot(
+        uuid.uuid4()
+    )
+    assert snap2.complete is True and snap2.unreached_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_a_failed_page_below_the_depth_cap_makes_the_crawl_incomplete(monkeypatch):
+    """/blog timed out, so the posts it links to were never even discovered: their
+    absence says nothing about the site, and the snapshot must not claim to be whole.
+    The same failure AT the depth cap hides nothing (its links would not be followed)."""
+    monkeypatch.setattr(get_settings(), "website_crawl_max_pages", 10, raising=False)
+    monkeypatch.setattr(get_settings(), "website_crawl_max_depth", 2, raising=False)
+    t = RoutedTransport()
+    t.on(lambda u, p: u.endswith("/robots.txt"), httpx.ConnectError("no robots"))
+    t.on(lambda u, p: u == "https://acme.example/", '<a href="/blog">b</a><p>home</p>')
+    t.on(lambda u, p: u == "https://acme.example/blog", httpx.ReadTimeout("slow"))
+    snap = await WebsiteCrawlProvider(urls=["https://acme.example/"], transport=t).snapshot(
+        uuid.uuid4()
+    )
+    assert snap.failed_ids == ["https://acme.example/blog"]
+    assert snap.complete is False
+
+    monkeypatch.setattr(get_settings(), "website_crawl_max_depth", 1, raising=False)
+    snap2 = await WebsiteCrawlProvider(urls=["https://acme.example/"], transport=t).snapshot(
+        uuid.uuid4()
+    )
+    assert snap2.failed_ids == ["https://acme.example/blog"]
+    assert snap2.complete is True

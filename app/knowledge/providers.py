@@ -1101,7 +1101,18 @@ class WebsiteCrawlProvider:
         """Fetch every seed URL and the same-origin pages it links to, breadth-first,
         bounded by ``website_crawl_max_pages`` / ``website_crawl_max_depth`` and
         ``robots.txt`` (2026-09-05 audit F117/F123). A page that fails to fetch is
-        reported in ``failed_ids`` so the sync keeps what it knew, never retires it."""
+        reported in ``failed_ids`` so the sync keeps what it knew, never retires it.
+
+        The BUDGET is not the site (round 7 Phase 2 review, knowledge #3): which pages
+        fit inside ``max_pages`` depends on link order, so a page outside it this pass
+        is not evidence it was removed from the site. ``complete`` is False when the
+        walk's frontier is unknown — same-origin pages were still queued when the page
+        cap tripped, or a page below the depth cap failed, so the pages it links to
+        were never read — and the sync then retires nothing. Pages linked from a page
+        AT the depth cap are known to exist but were not visited: they are reported in
+        ``unreached_ids`` and kept like ``failed_ids``. With the cap untripped and every
+        page below the depth cap read, BFS depth is the site's own link distance, so a
+        synced page absent from such a walk genuinely left the crawl's reach."""
         import hashlib
 
         settings = get_settings()
@@ -1112,6 +1123,10 @@ class WebsiteCrawlProvider:
         robots: dict[str, RobotFileParser | None] = {}
         queue: list[tuple[str, int]] = [(u, 0) for u in self._urls]
         seen: set[str] = set()
+        # Same-origin links on pages at the depth cap: not followed this pass.
+        depth_pruned: set[str] = set()
+        # A page below the depth cap failed: whatever it links to is unknown this pass.
+        frontier_unread = False
         fetched_any = False
         while queue and len(items) + len(failed) < max_pages:
             url, depth = queue.pop(0)
@@ -1125,6 +1140,7 @@ class WebsiteCrawlProvider:
                 html, final_url = await self._fetch_page(url)
             except (ProviderUnavailable, httpx.HTTPError, ValueError):
                 failed.append(url)
+                frontier_unread = frontier_unread or depth < max_depth
                 continue
             text = _extract_visible_text(html)
             revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1137,11 +1153,21 @@ class WebsiteCrawlProvider:
                 for link in _same_origin_links(final_url, html):
                     if link not in seen:
                         queue.append((link, depth + 1))
+            else:
+                depth_pruned.update(_same_origin_links(final_url, html))
         if not fetched_any and failed:
             # Every page failed (a blocked address, a dead site): raise rather than
             # hand the sync an 'empty site' it would read as a mass retirement.
             raise CrawlUnreachable(f"crawl fetched no pages: {failed[0]}")
-        return RemoteSnapshot(items=items, failed_ids=failed)
+        # Still queued when the page cap tripped. Dupes are only filtered on pop, so a
+        # queued URL already visited does not count.
+        cut_off = {_normalize_url(u) for u, _depth in queue} - seen - {""}
+        return RemoteSnapshot(
+            items=items,
+            failed_ids=failed,
+            unreached_ids=sorted(depth_pruned - seen),
+            complete=not cut_off and not frontier_unread,
+        )
 
     async def _robots_allow(self, url: str, cache: dict[str, RobotFileParser | None]) -> bool:
         """robots.txt per origin, fetched once per snapshot; unreachable robots = allowed

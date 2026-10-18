@@ -25,12 +25,18 @@ class FakeDriveProvider:
 
     def __init__(self, items: list[RemoteItem]) -> None:
         self._items = items
+        self.complete = True
+        self.unreached_ids: list[str] = []
 
     def set_items(self, items: list[RemoteItem]) -> None:
         self._items = items
 
     async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
-        return RemoteSnapshot(items=list(self._items))
+        return RemoteSnapshot(
+            items=list(self._items),
+            unreached_ids=list(self.unreached_ids),
+            complete=self.complete,
+        )
 
 
 async def _seed(admin_id: uuid.UUID) -> uuid.UUID:
@@ -562,3 +568,198 @@ async def test_a_large_sync_leaves_the_customers_their_share_of_the_llm_cap(monk
         )
     assert set(res2.updated) == deferred and res2.added == [] and res2.graph_deferred == []
     assert all(rev == "r1" and "Policy" in types for rev, types in (await _rows()).values())
+
+
+# --- Round 7 Phase 2 review, knowledge #3: an incomplete snapshot never retires a page -
+# A crawl page that merely fell outside the run's page/depth budget was absent from a
+# snapshot that claimed to be complete: tombstoned "removed at origin", dropped from
+# retrieval at once, hard-deleted by that night's retention pass, and Restore told the
+# owner it was removed from their site.
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_an_incomplete_snapshot_did_not_reach_is_kept_and_flagged():
+    from datetime import UTC, datetime
+
+    from app.models.audit import AdminAuditLog
+    from app.models.knowledge import KnowledgeChunk, KnowledgeSource
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    conn = uuid.uuid4()
+    doc1 = RemoteItem(external_id="doc1", name="Home", text="alpha pricing 899", revision="r1")
+    doc2 = RemoteItem(external_id="doc2", name="Pricing", text="beta hours weekdays", revision="r1")
+    provider = FakeDriveProvider([doc1, doc2])
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+        assert set(res.added) == {"doc1", "doc2"}
+
+    # The budget ended the walk before doc2 this time.
+    provider.set_items([doc1])
+    provider.complete = False
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+        assert res.removed == []
+
+    async def _doc2() -> KnowledgeSource:
+        async with tenant_session(admin) as s:
+            return (
+                await s.execute(
+                    select(KnowledgeSource).where(
+                        KnowledgeSource.admin_id == admin, KnowledgeSource.external_id == "doc2"
+                    )
+                )
+            ).scalar_one()
+
+    kept = await _doc2()
+    assert kept.soft_deleted_at is None and kept.deleted_by is None
+    assert kept.sync_status == "error"  # honest: not verified this pass (F117 semantics)
+    async with tenant_session(admin) as s:
+        # Nothing for the retention pass to purge; the page still has its chunks.
+        assert await service.purge_expired_deletions(s, admin_id=admin, now=datetime.now(UTC)) == 0
+        assert (
+            await s.execute(select(KnowledgeChunk).where(KnowledgeChunk.source_id == kept.id))
+        ).first() is not None
+        payloads = [
+            r.event_payload
+            for r in (
+                await s.execute(
+                    select(AdminAuditLog).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "knowledge_source_edited",
+                    )
+                )
+            ).scalars()
+            if r.event_payload.get("action") == "sync"
+        ]
+        assert ["doc2"] in [p.get("unreached") for p in payloads]
+
+    # Reached again on a later pass: synced, nothing was lost or re-ingested.
+    provider.set_items([doc1, doc2])
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+        assert res.added == [] and res.updated == [] and res.removed == []
+    back = await _doc2()
+    assert back.id == kept.id and back.sync_status == "synced"
+
+    # A COMPLETE snapshot without doc2 is still a removal at the origin (the existing path).
+    provider.set_items([doc1])
+    provider.complete = True
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+        assert res.removed == ["doc2"]
+    gone = await _doc2()
+    assert gone.soft_deleted_at is not None and gone.deleted_by == service.DELETED_BY_ORIGIN
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_incomplete_snapshot_is_not_a_shrink():
+    """Keeping everything it did not reach, an incomplete snapshot retires nothing, so the
+    F107 floor (which guards against a mass retirement) has nothing to refuse."""
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    conn = uuid.uuid4()
+    pages = [
+        RemoteItem(external_id=f"p{i}", name=f"P{i}", text=f"page {i} text", revision="r1")
+        for i in range(4)
+    ]
+    provider = FakeDriveProvider(pages)
+    async with tenant_session(admin) as s:
+        await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+    provider.set_items(pages[:1])
+    provider.complete = False
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+    assert res.removed == []
+    async with tenant_session(admin) as s:
+        rows = {r.external_id: r.sync_status for r in await service.list_sources(s, admin)}
+    assert rows == {"p0": "synced", "p1": "error", "p2": "error", "p3": "error"}
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_known_beyond_the_budget_is_kept_and_an_unlinked_one_retires():
+    """A complete walk that names a page it knows of but did not visit (linked from the
+    depth cap) keeps that page; a synced page the complete walk neither reached nor
+    heard of is gone from the site's reach and still retires as removed at origin."""
+    from app.models.knowledge import KnowledgeSource
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    conn = uuid.uuid4()
+    docs = [
+        RemoteItem(external_id=f"d{i}", name=f"D{i}", text=f"page {i} words", revision="r1")
+        for i in range(3)
+    ]
+    provider = FakeDriveProvider(docs)
+    async with tenant_session(admin) as s:
+        await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+    provider.set_items(docs[:1])
+    provider.unreached_ids = ["d1"]
+    async with tenant_session(admin) as s:
+        res = await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=conn,
+            origin="website_crawl",
+            provider=provider,
+        )
+    assert res.removed == ["d2"]
+    async with tenant_session(admin) as s:
+        rows = {
+            r.external_id: r
+            for r in (
+                await s.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin))
+            ).scalars()
+        }
+    assert rows["d1"].soft_deleted_at is None and rows["d1"].sync_status == "error"
+    assert rows["d2"].deleted_by == service.DELETED_BY_ORIGIN
