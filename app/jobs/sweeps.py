@@ -69,6 +69,7 @@ from app.db.session import claim_sweep_lock, tenant_session, untenanted_session
 from app.lifecycle import audit_retention, grace_expiry, retention, transcript_archive
 from app.lifecycle.close_purge import purge_closed_account_if_due
 from app.models.connection import InstanceConnection
+from app.notifications import escalation_dispatch
 from app.notifications.backlog import emit_backlog_metric
 from app.observability.metrics import emit_metric
 from app.runtime import session_close
@@ -220,6 +221,12 @@ async def _drain_deferred(
         admin_id=admin_id,
         deliverer=deferred_queue.ChannelDeliverer(session),
         now=now,
+    )
+    # Round 7 delivery hardening: the escalation rows no queue item describes — a
+    # ``pending`` row whose notification task died, a ``sent`` row whose delivery
+    # receipt never came. Migration 0072 makes their tenant a candidate of this sweep.
+    counts.update(
+        await escalation_dispatch.sweep_stale_escalations(session, admin_id=admin_id, now=now)
     )
     # ``_per_tenant`` records a tenant as acted-upon only on a truthy result, and the
     # counts dict is truthy even when every counter is zero.

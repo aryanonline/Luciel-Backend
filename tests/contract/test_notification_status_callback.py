@@ -5,14 +5,20 @@
 and a receipt for a message this platform never sent is a 200 no-op. Same posture as the
 voice status route: signature or capability-URL verified, per-number flood control, a
 forged ``cap`` 403s and is audited under the tenant it names.
+
+Round 7 delivery hardening: the flood bucket is charged only AFTER verification, so
+unsigned posts cannot blind a tenant's real receipts; a verified receipt that arrives
+before the sending transaction commits is looked up again rather than dropped.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 
 import pytest
+from app.channels import rate_limit
 from app.channels.tenant_twilio import FIELD_CAPABILITY_TOKEN
 from app.connections.secrets import get_secret_store, secret_ref_for
 from app.db.session import tenant_session
@@ -222,15 +228,99 @@ async def test_a_failed_receipt_for_a_page_the_owner_was_already_copied_on_does_
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_a_receipt_for_a_message_this_platform_never_sent_is_a_no_op(client, ses):
+async def test_a_receipt_for_a_message_this_platform_never_sent_is_a_no_op(
+    client, ses, monkeypatch
+):
+    from app.api.v1.webhooks import channels as webhooks
+
+    monkeypatch.setattr(webhooks, "RECEIPT_LOOKUP_RETRY_DELAYS", (0.01, 0.01))
     number, sid = "+16045550184", "SM" + "d" * 32
     admin, session_id = await _seed(number, sid=sid)
 
     r = await client.post(
         f"{ROUTE}?cap=status-cap", data=_receipt(number, sid="SM" + "0" * 32, status="delivered")
     )
-    assert r.status_code == 200
+    assert r.status_code == 200  # looked up again, then let go — never an error to Twilio
     assert (await _row(admin, session_id)).delivery_status == "sent"
+    assert ses.sent == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_unsigned_posts_cannot_blind_a_tenants_real_receipts(client, ses):
+    """Round 7 delivery hardening. The flood bucket was charged on the unauthenticated
+    From field BEFORE verification: anyone who knew a business's number could post
+    enough unsigned receipts to exhaust it (burst 10) and auto-block the key for a day
+    (50 rejections), after which every real receipt for that tenant was a 429 and a
+    carrier failure never reached the owner. A forgery costs the forger a 403 now and
+    nothing of the tenant's; the bucket still bounds VERIFIED traffic."""
+    number, sid = "+16045550187", "SM" + "1" * 32
+    admin, session_id = await _seed(number, sid=sid)
+
+    for _ in range(rate_limit.AUTO_BLOCK_ABUSE_THRESHOLD + 5):
+        forged = await client.post(
+            f"{ROUTE}?cap=wrong", data=_receipt(number, sid=sid, status="delivered")
+        )
+        assert forged.status_code == 403
+    assert (await _row(admin, session_id)).delivery_status == "sent"
+
+    ok = await client.post(
+        f"{ROUTE}?cap=status-cap", data=_receipt(number, sid=sid, status="delivered")
+    )
+    assert ok.status_code == 200
+    assert (await _row(admin, session_id)).delivery_status == "delivered"
+
+    # The flood control is still there for traffic that verifies.
+    statuses = [
+        (
+            await client.post(
+                f"{ROUTE}?cap=status-cap", data=_receipt(number, sid=sid, status="sent")
+            )
+        ).status_code
+        for _ in range(rate_limit.LIMITS["voice_status"].burst + 5)
+    ]
+    assert 429 in statuses and statuses[0] == 200
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_receipt_that_arrives_before_the_senders_commit_is_not_dropped(
+    client, ses, monkeypatch
+):
+    """Round 7 delivery hardening. Twilio posts the receipt within seconds of the
+    accept, and the deferred sweep sends all of a tenant's queued pages inside one
+    transaction: the receipt could land while the SID was not yet visible on any row,
+    be answered 200 ``unknown_message`` and be gone (Twilio does not retry). The route
+    now looks the SID up again, in fresh transactions, until the sender's commit is
+    seen — and the row is stamped from the carrier's word, not left at ``sent``."""
+    from app.api.v1.webhooks import channels as webhooks
+
+    monkeypatch.setattr(webhooks, "RECEIPT_LOOKUP_RETRY_DELAYS", (0.25, 0.5, 1.0))
+    number, sid = "+16045550188", "SM" + "2" * 32
+    admin, session_id = await _seed(number, sid="SM" + "8" * 32)
+    async with tenant_session(admin) as s:
+        row = (
+            await s.execute(select(EscalationEvent).where(EscalationEvent.admin_id == admin))
+        ).scalar_one()
+        row.delivery_status = "pending"  # the send is in flight, its transaction open
+        row.delivery_detail = None
+        row.delivery_provider_message_id = None
+
+    receipt = asyncio.create_task(
+        client.post(f"{ROUTE}?cap=status-cap", data=_receipt(number, sid=sid, status="delivered"))
+    )
+    await asyncio.sleep(0.5)
+    assert not receipt.done()  # the first lookup found nothing; the route is waiting
+    async with tenant_session(admin) as s:  # the sender's commit
+        row = (
+            await s.execute(select(EscalationEvent).where(EscalationEvent.admin_id == admin))
+        ).scalar_one()
+        row.delivery_status = "sent"
+        row.delivery_detail = "sms:primary"
+        row.delivery_provider_message_id = sid
+
+    assert (await receipt).status_code == 200
+    row = await _row(admin, session_id)
+    assert row.delivery_status == "delivered"
+    assert row.delivered_at is not None
     assert ses.sent == []
 
 

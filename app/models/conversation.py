@@ -185,8 +185,11 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     # What happened to the owner notification for this row (2026-09-05 audit F079):
-    # pending → delivered | owner_fallback | queued | failed. Rows from before the
-    # column existed read ``unknown`` — never a fabricated ``delivered``.
+    # pending → delivered | owner_fallback | queued | failed, plus ``sent`` (a live SMS
+    # with its delivery receipt outstanding, round 7 WP-4b) and ``unconfirmed`` (no
+    # receipt ever came and the provider could not settle it either, round 7 delivery
+    # hardening). Rows from before the column existed read ``unknown`` — never a
+    # fabricated ``delivered``.
     delivery_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending", server_default="unknown"
     )

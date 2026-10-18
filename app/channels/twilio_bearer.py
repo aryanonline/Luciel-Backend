@@ -189,6 +189,24 @@ class TwilioBearerSmsSender:
             return None
         return str(payload.get("sid") or "") or None
 
+    async def fetch_message_status(self, message_sid: str) -> tuple[str, str | None] | None:
+        """The Message resource's ``status`` and ``error_code`` over bearer auth — the
+        same seam ``TwilioSmsSender.fetch_message_status`` is. None on ANY failure."""
+        payload = await _request(
+            "GET",
+            f"{TWILIO_API_BASE}/Accounts/{self.account_sid}/Messages/{message_sid}.json",
+            access_token=self.access_token,
+            params={},
+            transport=self.transport,
+        )
+        if not isinstance(payload, dict):
+            return None
+        status = str(payload.get("status") or "")
+        if not status:
+            return None
+        code = payload.get("error_code")
+        return status, (str(code) if code not in (None, "") else None)
+
 
 @dataclass
 class TwilioBearerOperabilityProbe:

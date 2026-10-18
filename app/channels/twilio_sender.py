@@ -130,6 +130,21 @@ class TwilioSmsSender:
         )
         return str(getattr(msg, "sid", "")) or None
 
+    async def fetch_message_status(self, message_sid: str) -> tuple[str, str | None] | None:
+        """The Message resource's ``status`` and ``error_code`` (round 7 delivery
+        hardening: the sweep's one fetch for a page whose receipt never came). None
+        when Twilio returned no status; a transport error propagates to the caller,
+        which treats it as "could not be asked"."""
+        import asyncio  # noqa: PLC0415
+
+        client = self._get_client()
+        msg = await asyncio.to_thread(lambda: client.messages(message_sid).fetch())  # type: ignore[attr-defined]
+        status = str(getattr(msg, "status", "") or "")
+        if not status:
+            return None
+        code = getattr(msg, "error_code", None)
+        return status, (str(code) if code not in (None, "") else None)
+
 
 def build_sms_sender() -> SmsSenderProtocol:
     """PLATFORM Twilio sender — dev/mock fallback ONLY (§3.1.4).

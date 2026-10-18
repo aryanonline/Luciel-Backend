@@ -26,8 +26,9 @@ the API's. Only the mock/Null sender reports what it always did (``recorded``).
 
 from __future__ import annotations
 
+import logging
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +39,8 @@ from app.channels.twilio_sender import NullSmsSender, TwilioSmsSender
 from app.config import get_settings
 from app.connections.service import resolve_sms_number
 from app.notifications.base import EscalationNotification, owner_facing_reasons
+
+_LOG = logging.getLogger(__name__)
 
 # One SMS segment is 160 GSM-7 chars; the body is condensed to stay in a small number of
 # segments (§3.5.1 "SMS condensed form") while keeping the contact info, which is the
@@ -77,6 +80,42 @@ async def notification_status_callback_url(
         return None
     suffix = f"?cap={quote(capability, safe='')}" if capability else ""
     return f"{base}{NOTIFICATION_STATUS_PATH}{suffix}"
+
+
+@dataclass(frozen=True)
+class SmsStatus:
+    """The provider's own word on one message, as its status resource reports it:
+    ``status`` lower-cased (``queued`` … ``delivered`` / ``undelivered`` / ``failed``)
+    and the error code when there is one."""
+
+    status: str
+    error_code: str | None = None
+
+
+async def fetch_sms_status(
+    session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID, provider_message_id: str
+) -> SmsStatus | None:
+    """Ask the tenant's OWN Twilio for a message's status (round 7 delivery hardening):
+    the deferred sweep's one fetch for a page whose delivery receipt never came. None
+    when the provider cannot be asked — no live sender for this tenant (mock mode,
+    credentials gone), or the call failed — and the caller must not read None as any
+    status. Never raises."""
+    sender = await build_tenant_sms_sender(session, admin_id, instance_id)
+    fetch = getattr(sender, "fetch_message_status", None)
+    if fetch is None:
+        return None
+    try:
+        answer = await fetch(provider_message_id)
+    except Exception as exc:  # noqa: BLE001 — an unanswerable provider is data, not a raise
+        _LOG.warning("sms status fetch failed: error=%s", type(exc).__name__)
+        return None
+    if not answer:
+        return None
+    status, error_code = answer
+    status = str(status or "").strip().lower()
+    if not status:
+        return None
+    return SmsStatus(status=status, error_code=str(error_code) if error_code else None)
 
 
 class SmsNotifier:

@@ -23,6 +23,7 @@ bare 200 the provider needs as an ack.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hmac
@@ -439,6 +440,11 @@ async def twilio_voice_status(request: Request) -> Response:
     return Response(status_code=200)
 
 
+#: Seconds to wait before looking an unknown receipt SID up again (round 7 delivery
+#: hardening): the sending transaction commits within moments of the API accept.
+RECEIPT_LOOKUP_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.5, 3.0)
+
+
 @router.post("/twilio/notifications/status")
 async def twilio_notification_status(request: Request) -> Response:
     """Delivery receipt for an OWNER notification text (round 7 WP-4b).
@@ -450,6 +456,12 @@ async def twilio_notification_status(request: Request) -> Response:
     verify → resolve → stamp, no admission/opt-out semantics, and the tenant is the
     owner of the FROM number (their own BYO number, the one the page went out on),
     never the To. A receipt for a message this platform did not send is a no-op 200.
+
+    Round 7 delivery hardening: the signature (or capability token) is checked BEFORE
+    the per-tenant flood bucket is charged, so unsigned traffic can never blind a
+    tenant's real receipts; and a verified receipt whose SID no row carries yet (it
+    raced the sending transaction's commit) is looked up again for a few seconds
+    before it is let go — Twilio does not retry a status callback.
     """
     from app.channels import pipeline, rate_limit  # noqa: PLC0415
     from app.channels.signatures import verify_twilio_inbound  # noqa: PLC0415
@@ -459,11 +471,6 @@ async def twilio_notification_status(request: Request) -> Response:
     form = await request.form()
     params: dict[str, str] = {k: str(v) for k, v in form.items()}
     from_number = params.get("From", "")
-    admitted = rate_limit.get_store().check_source(
-        "voice_status", f"notification:{from_number or '?'}"
-    )
-    if not admitted.allowed:
-        return Response(status_code=429)
     tenant_token, capability = await _tenant_twilio_inbound_auth(from_number)
     async with untenanted_session() as s:
         if not verify_twilio_inbound(
@@ -479,6 +486,18 @@ async def twilio_notification_status(request: Request) -> Response:
             if "cap=" in str(request.url.query or ""):
                 await _audit_capability_rejection(from_number)
             return Response(status_code=403)
+        # Flood control AFTER verification (round 7 delivery hardening): the bucket
+        # used to be charged on the unauthenticated From field, so anyone who knew a
+        # business's number could exhaust it with unsigned posts, auto-block the key
+        # for a day, and blind every real receipt for that tenant (429) — a carrier
+        # failure then never reached the owner. Only a receipt Twilio signed (or that
+        # carries the tenant's capability token) spends from the tenant's bucket now;
+        # a forgery costs the forger a 403 and nothing of the tenant's.
+        admitted = rate_limit.get_store().check_source(
+            "voice_status", f"notification:{from_number or '?'}"
+        )
+        if not admitted.allowed:
+            return Response(status_code=429)
         try:
             ctx = await _resolve("sms_sender", from_number)
         except InboundRejected as rej:
@@ -489,15 +508,27 @@ async def twilio_notification_status(request: Request) -> Response:
     message_status = params.get("MessageStatus") or params.get("SmsStatus") or ""
     if not message_sid or not message_status:
         return Response(status_code=200)
-    async with tenant_session(ctx.admin_id) as s:
-        await escalation_dispatch.record_sms_delivery_receipt(
-            s,
-            admin_id=ctx.admin_id,
-            instance_id=ctx.instance_id,
-            provider_message_id=message_sid,
-            message_status=message_status,
-            error_code=params.get("ErrorCode") or None,
-        )
+    # A receipt can arrive BEFORE the sending transaction commits (Twilio posts within
+    # seconds; the deferred sweep sends all of a tenant's queued pages in one
+    # transaction), when no row carries the SID yet. Twilio does not retry a status
+    # callback, so an unknown SID is looked up again after short waits — each in a
+    # fresh transaction, so a commit in between is seen — before it is let go; the
+    # sweep's status fetch (``sweep_stale_escalations``) is the backstop past that.
+    # Only a VERIFIED receipt reaches this wait: nothing unsigned can make it sleep.
+    for delay in (0.0, *RECEIPT_LOOKUP_RETRY_DELAYS):
+        if delay:
+            await asyncio.sleep(delay)
+        async with tenant_session(ctx.admin_id) as s:
+            outcome = await escalation_dispatch.record_sms_delivery_receipt(
+                s,
+                admin_id=ctx.admin_id,
+                instance_id=ctx.instance_id,
+                provider_message_id=message_sid,
+                message_status=message_status,
+                error_code=params.get("ErrorCode") or None,
+            )
+        if outcome != "unknown_message":
+            break
     return Response(status_code=200)
 
 

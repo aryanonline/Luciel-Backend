@@ -7,10 +7,20 @@ Each test models the live condition a reviewer found:
   ended in a "could not deliver" email to an owner who had heard within a minute — it
   now completes once, as ``settled:owner_heard``, and the row keeps saying
   ``owner_fallback``.
+* an escalation whose off-turn notification task died (a deploy's shutdown cancelled
+  it) stayed ``pending`` forever: not retried, not in the backlog, no alarm — now the
+  deferred sweep audits the loss, retries it once through the normal path, and the
+  backlog counts it meanwhile.
+* a page whose delivery receipt never came read ``sent`` forever — now the sweep asks
+  the tenant's own Twilio once and stamps the answer; with no answer the row is
+  ``unconfirmed`` and the owner is told.
+* a failed receipt could email the owner a second time (after the cc fan-out, or after
+  an owner fallback a replay re-stamped) — the row remembers the owner heard, once.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -21,11 +31,18 @@ from app.jobs import sweeps
 from app.models.audit import AdminAuditLog
 from app.models.conversation import EscalationEvent
 from app.models.deferred import DeferredAction
-from app.models.email_incident import EmailDeliveryIncident
+from app.models.email_incident import EmailDeliveryIncident, EscalationContactConfirmation
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead
-from app.notifications import email_dispatcher, email_notifier, escalation_dispatch
-from app.notifications.escalation_dispatch import ESCALATION_RETRY_ACTION, SETTLED_OWNER_HEARD
+from app.notifications import email_dispatcher, email_notifier, escalation_dispatch, sms_notifier
+from app.notifications.backlog import degraded_entry
+from app.notifications.escalation_dispatch import (
+    ESCALATION_RETRY_ACTION,
+    NOTIFICATION_LOST,
+    PENDING_STALE_AFTER,
+    SENT_UNCONFIRMED_AFTER,
+    SETTLED_OWNER_HEARD,
+)
 from app.runtime.integration_status import escalation_backlog
 from app.runtime.orchestrator import _record_escalation
 from sqlalchemy import select, update
@@ -34,6 +51,8 @@ pytestmark = [pytest.mark.asyncio]
 
 OWNER_EMAIL = "owner@acme.example"
 CONTACT = "sales@acme.example"
+CONTACT_SMS = "+16045551234"
+BYO_NUMBER = "+16045550100"
 
 
 class SelectiveEmailSender:
@@ -64,12 +83,54 @@ def ses(monkeypatch) -> SelectiveEmailSender:
     return fake
 
 
+class FakeTenantTwilio:
+    """The tenant's own Twilio as the page and the sweep see it: a real provider
+    sender (so an accepted send is ``dlr_pending`` and the row reads ``sent``) that
+    refuses when told to, and answers the sweep's one status fetch the way the test
+    says — a terminal word, nothing terminal yet, or no answer at all."""
+
+    def __init__(self) -> None:
+        self.refuse = False
+        self.sent: list[dict[str, str]] = []
+        self.status: tuple[str, str | None] | None = None
+        self.fetch_raises: Exception | None = None
+        self.fetched: list[str] = []
+
+    async def send_sms(self, from_number: str, to: str, body: str) -> str | None:
+        if self.refuse:
+            raise RuntimeError("twilio 503")
+        self.sent.append({"from_number": from_number, "to": to, "body": body})
+        return f"SM{len(self.sent):032d}"
+
+    async def fetch_message_status(self, message_sid: str) -> tuple[str, str | None] | None:
+        self.fetched.append(message_sid)
+        if self.fetch_raises is not None:
+            raise self.fetch_raises
+        return self.status
+
+
+@pytest.fixture
+def twilio(monkeypatch) -> FakeTenantTwilio:
+    fake = FakeTenantTwilio()
+
+    async def _sender(*a, **kw):
+        return fake
+
+    async def _from_number(*a, **kw):
+        return BYO_NUMBER
+
+    monkeypatch.setattr(sms_notifier, "build_tenant_sms_sender", _sender)
+    monkeypatch.setattr(sms_notifier, "resolve_sms_number", _from_number)
+    return fake
+
+
 async def _seed(
     admin: uuid.UUID,
     iid: uuid.UUID,
     *,
     escalation: dict[str, object],
     verified_emails: tuple[str, ...] = (),
+    confirmed_numbers: tuple[str, ...] = (),
 ) -> uuid.UUID:
     lead_id = uuid.uuid4()
     async with tenant_session(admin) as s:
@@ -77,6 +138,15 @@ async def _seed(
             s.add(
                 EmailDeliveryIncident(
                     admin_id=admin, email_lower=address, verified_at=datetime.now(UTC)
+                )
+            )
+        for number in confirmed_numbers:
+            s.add(
+                EscalationContactConfirmation(
+                    admin_id=admin,
+                    kind="sms",
+                    value_normalized=number,
+                    confirmed_at=datetime.now(UTC),
                 )
             )
         s.add(
@@ -298,3 +368,289 @@ async def test_a_contact_that_can_still_recover_keeps_its_retry(ses):
     assert item.status == "delivered"
     assert ses.recipients == [OWNER_EMAIL, CONTACT]
     assert (await _row(admin, sid)).delivery_status == "delivered"
+
+
+async def _age_row(admin: uuid.UUID, sid: uuid.UUID, age: timedelta) -> None:
+    """The row was written this long ago (the sweep's candidate list and its bounds
+    both read ``fired_at`` against the database clock)."""
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(EscalationEvent)
+            .where(EscalationEvent.admin_id == admin, EscalationEvent.session_id == sid)
+            .values(fired_at=datetime.now(UTC) - age)
+        )
+
+
+SMS_ESCALATION: dict[str, object] = {"primarySms": CONTACT_SMS, "preferredChannel": "sms"}
+
+
+# --- a notification whose task died is the sweep's business ---------------------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_notification_whose_task_died_is_retried_by_the_sweep_and_counted(
+    ses, monkeypatch, capsys
+):
+    """A deploy's shutdown cancels the off-turn notification task just after the
+    customer's turn committed the escalation: the row stands at ``pending``, no page
+    went out, nothing was queued. Nothing read ``pending`` — not the sweep, not the
+    backlog, not the alarm — so the hot lead was dropped silently. Now a ``pending``
+    row past the bound is counted in the backlog (and in /healthz's degraded entry
+    once it outlives a sweep interval), and the hourly sweep audits the loss and
+    retries it once through the normal path."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation={"primaryEmail": CONTACT}, verified_emails=(CONTACT,))
+
+    real_notify = escalation_dispatch.notify_escalation_safely
+
+    async def _cancelled_by_shutdown(*a, **kw):
+        raise asyncio.CancelledError  # the lifespan's wait_for cancelling the gather
+
+    monkeypatch.setattr(escalation_dispatch, "notify_escalation_safely", _cancelled_by_shutdown)
+    await _fire(admin, iid, sid, lead)
+    monkeypatch.setattr(escalation_dispatch, "notify_escalation_safely", real_notify)
+
+    assert (await _row(admin, sid)).delivery_status == "pending"
+    assert await _items(admin) == []
+    assert ses.recipients == []
+    # Young: the task may still be running — not a candidate, not in the backlog.
+    assert await sweeps.run_deferred_retry() == []
+    backlog = await escalation_backlog()
+    assert backlog is not None and backlog["queued"] == 0
+    assert (await _row(admin, sid)).delivery_status == "pending"
+
+    await _age_row(admin, sid, PENDING_STALE_AFTER + timedelta(hours=1))
+    backlog = await escalation_backlog()
+    assert backlog is not None and backlog["queued"] == 1
+    assert degraded_entry(backlog) == "escalation_backlog:1"
+
+    capsys.readouterr()
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    assert ses.recipients == [CONTACT]
+    assert (await _row(admin, sid)).delivery_status == "delivered"
+    lost = [
+        e
+        for e in await _audit(admin, "escalation_delivery_failed")
+        if e.event_payload.get("failure_reason") == NOTIFICATION_LOST
+    ]
+    assert len(lost) == 1 and lost[0].event_payload["session_id"] == str(sid)
+    backlog = await escalation_backlog()
+    assert backlog is not None and backlog["queued"] == 0
+    assert _backlog_data(capsys.readouterr().out) == [0.0]
+
+    # Once: the next hour finds nothing to do and pages nobody again.
+    assert await sweeps.run_deferred_retry() == []
+    assert ses.recipients == [CONTACT]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_lost_notification_the_retry_cannot_deliver_joins_the_queue(ses, twilio):
+    """The retry is the normal path: when the tenant's Twilio refuses it, the page is
+    queued for the 24h ladder like any first attempt — the row leaves ``pending`` on
+    the sweep's one pass whatever the provider says."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    async with tenant_session(admin) as s:
+        s.add(
+            EscalationEvent(
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                resolved_lead_id=lead,
+                signal="high_value_lead",
+                gate="outcome",
+                score_or_confidence=0.9,
+                fired_at=datetime.now(UTC) - PENDING_STALE_AFTER - timedelta(minutes=1),
+                delivery_status="pending",
+            )
+        )
+    twilio.refuse = True
+    ses.refuse = None  # the owner's email blips too
+
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "queued"
+    (item,) = await _items(admin)
+    assert item.status == "queued" and item.payload["contacts_only"] is False
+    assert twilio.sent == [] and ses.recipients == []
+
+
+# --- a page whose receipt never came ------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("answer", "status", "detail", "emails"),
+    [
+        (("delivered", None), "delivered", "sms:primary", []),
+        (("undelivered", "30003"), "owner_fallback", "sms_dlr:undelivered:30003", [OWNER_EMAIL]),
+    ],
+)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_whose_receipt_never_came_is_settled_by_one_status_fetch(
+    ses, twilio, answer, status, detail, emails
+):
+    """Twilio accepted the page and the carrier's receipt never reached us (lost,
+    blocked, or posted before the sending transaction committed): the row read
+    ``sent`` forever and a carrier failure never reached the owner. Past the bound,
+    the sweep asks the tenant's own Twilio for the message's status ONCE and stamps
+    the answer exactly as the receipt would have."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    await _fire(admin, iid, sid, lead)
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent" and row.delivery_provider_message_id
+    message_sid = row.delivery_provider_message_id
+    assert len(twilio.sent) == 1 and ses.recipients == []
+
+    # Within the bound the receipt may still be on its way: nothing is asked.
+    twilio.status = answer
+    assert await sweeps.run_deferred_retry() == []
+    assert twilio.fetched == []
+
+    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    assert twilio.fetched == [message_sid]
+    row = await _row(admin, sid)
+    assert row.delivery_status == status
+    assert row.delivery_detail == detail
+    assert ses.recipients == emails
+    assert len(twilio.sent) == 1  # never paged again
+
+    # Settled: the next sweep asks nothing and pages nobody.
+    assert await sweeps.run_deferred_retry() == []
+    assert twilio.fetched == [message_sid] and ses.recipients == emails
+
+
+@pytest.mark.parametrize(
+    ("answer", "raises", "why"),
+    [
+        (None, None, "status_unavailable"),
+        (None, RuntimeError("twilio 500"), "status_unavailable"),
+        (("sent", None), None, "status_sent"),
+    ],
+)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_the_provider_cannot_settle_is_unconfirmed_and_the_owner_is_told(
+    ses, twilio, answer, raises, why
+):
+    """No receipt, and the provider cannot be asked (or still has no terminal word):
+    nobody can say the contact heard. The row is settled — never paged again — and
+    the ladder continues to the owner, who is told; the row reads ``owner_fallback``
+    with the honest reason. With no owner to reach it reads ``unconfirmed``."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    await _fire(admin, iid, sid, lead)
+    message_sid = (await _row(admin, sid)).delivery_provider_message_id
+    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    twilio.status, twilio.fetch_raises = answer, raises
+
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    assert twilio.fetched == [message_sid]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    assert row.delivery_detail == f"sms_unconfirmed:{why}"
+    assert ses.recipients == [OWNER_EMAIL]
+    (fallback,) = await _audit(admin, "escalation_owner_fallback")
+    assert fallback.event_payload["reason"] == "sms_delivery_unconfirmed"
+    (failed,) = await _audit(admin, "escalation_delivery_failed")
+    assert failed.event_payload["failure_reason"] == f"sms_unconfirmed:{why}"
+    assert failed.event_payload["provider_message_id"] == message_sid
+
+    assert await sweeps.run_deferred_retry() == []
+    assert ses.recipients == [OWNER_EMAIL] and len(twilio.sent) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_with_no_owner_to_reach_an_unsettled_page_reads_unconfirmed(ses, twilio):
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    await _fire(admin, iid, sid, lead)
+    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    ses.refuse = None  # the owner's mailbox is unreachable too
+
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "unconfirmed"
+    assert row.delivery_detail == "sms_unconfirmed:status_unavailable"
+    assert ses.recipients == []
+    assert await sweeps.run_deferred_retry() == []  # terminal: never asked again
+    assert len(twilio.fetched) == 1
+
+
+# --- the owner is told once ---------------------------------------------------------- #
+async def _receipt(admin: uuid.UUID, iid: uuid.UUID, message_sid: str, status: str) -> str:
+    async with tenant_session(admin) as s:
+        return await escalation_dispatch.record_sms_delivery_receipt(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            provider_message_id=message_sid,
+            message_status=status,
+            error_code="30003" if status != "delivered" else None,
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_failed_receipt_after_the_cc_fan_out_does_not_email_the_owner_twice(ses, twilio):
+    """A routing rule with ccOwnerEmail and a confirmed SMS contact: the page is
+    accepted and the owner gets the cc email. The carrier then reports undelivered —
+    the owner used to receive an identical second email, because only the
+    unverified-contact copy left the ``+owner`` marker on the row."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(
+        admin,
+        iid,
+        escalation={
+            **SMS_ESCALATION,
+            "routing": [{"signal": "high_value_lead", "channel": "sms", "ccOwnerEmail": True}],
+        },
+        confirmed_numbers=(CONTACT_SMS,),
+    )
+    await _fire(admin, iid, sid, lead)
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent"
+    assert row.delivery_detail == "sms:primary+owner"
+    assert ses.recipients == [OWNER_EMAIL]  # the cc
+    message_sid = row.delivery_provider_message_id
+    assert message_sid
+
+    assert await _receipt(admin, iid, message_sid, "undelivered") == "owner_fallback"
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    assert row.delivery_detail == "sms_dlr:undelivered:30003"
+    assert ses.recipients == [OWNER_EMAIL]  # once
+    assert await _audit(admin, "escalation_owner_fallback") == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_owner_fallback_then_a_replayed_page_that_fails_does_not_email_the_owner_twice(
+    ses, twilio
+):
+    """Twilio's API refuses the first attempt, so the owner gets the fallback email and
+    the contact's retry is queued contacts-only. The hourly replay is accepted by the
+    API — which re-stamped the row ``sent`` / ``sms:primary`` over the
+    ``owner_fallback`` that said the owner heard — and the carrier then fails it: the
+    owner was emailed again. The replay keeps that fact on the row now."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    twilio.refuse = True
+    await _fire(admin, iid, sid, lead)
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    assert ses.recipients == [OWNER_EMAIL]
+    (item,) = await _items(admin)
+    assert item.status == "queued" and item.payload["contacts_only"] is True
+
+    twilio.refuse = False
+    assert await sweeps.run_deferred_retry(now=item.next_attempt_at + timedelta(seconds=1)) == [
+        str(admin)
+    ]
+    (item,) = await _items(admin)
+    assert item.status == "delivered"
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent"
+    assert row.delivery_detail == "sms:primary+owner"
+    message_sid = row.delivery_provider_message_id
+    assert message_sid and len(twilio.sent) == 1
+
+    assert await _receipt(admin, iid, message_sid, "failed") == "owner_fallback"
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    assert ses.recipients == [OWNER_EMAIL]  # once
+    assert len(await _audit(admin, "escalation_owner_fallback")) == 1  # the first pass only
