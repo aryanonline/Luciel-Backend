@@ -881,8 +881,10 @@ async def capture_or_update_lead(
         changed.update(merged_facts)
         # A transport identifier that reached a lead known under another key (item
         # 1: the SMS number of the widget lead who typed their email) is stored, so
-        # the CRM hears it and a later "text me" can go there without asking.
-        _absorb_transport(existing, transport_confirmed, changed)
+        # the CRM hears it — in a column only while the lead has no confirmed
+        # identifier of that kind (phase-2 review: a number that joined by a typed
+        # claim never displaces the lead's own as its phone).
+        await _absorb_transport(session, existing, transport_confirmed, changed)
         existing.last_activity_at = datetime.now(UTC)  # item 4: real inactivity
         await _reactivate_if_archived(session, existing)
         lead_id = existing.id
@@ -957,16 +959,25 @@ def _own_identifiers(signals: LeadSignals) -> list[str]:
     return [normalize_identifier(v) for v in (signals.email, signals.phone) if v]
 
 
-def _absorb_transport(lead: Lead, transport: str | None, changed: dict[str, str]) -> None:
+async def _absorb_transport(
+    session: AsyncSession, lead: Lead, transport: str | None, changed: dict[str, str]
+) -> None:
     """Fill-when-absent: store the channel-carried identifier on a lead resolved
     under another key (item 1). A platform-scoped id (a Meta PSID) with no free
-    column lives in the identifier table alone — never in a phone/email column."""
+    column lives in the identifier table alone — never in a phone/email column.
+
+    Only while the lead has no OTHER confirmed identifier of that kind (phase-2
+    security review): a number that reached Jane's record through a typed claim is
+    recorded beside it (``claim_transport_identifier``), but it does not become
+    Jane's ``phone`` — nor her CRM phone — when her own number is already proven."""
     if not transport:
         return
     key = normalize_identifier(transport)
     if key in _lead_identifier_values(lead):
         return
     kind = identifier_kind(key)
+    if kind in ("phone", "email") and await _holds_other_confirmed(session, lead, kind, key):
+        return
     if lead.contact_identifier is None:
         lead.contact_identifier = key
         changed["contact"] = key
@@ -976,6 +987,24 @@ def _absorb_transport(lead: Lead, transport: str | None, changed: dict[str, str]
     elif kind == "email" and lead.email is None:
         lead.email = key
         changed["email"] = key
+
+
+async def _holds_other_confirmed(session: AsyncSession, lead: Lead, kind: str, key: str) -> bool:
+    """Does ``lead`` already hold a CONFIRMED identifier of ``kind`` other than ``key``?"""
+    row = (
+        await session.execute(
+            select(LeadIdentifier.id)
+            .where(
+                LeadIdentifier.admin_id == lead.admin_id,
+                LeadIdentifier.lead_id == lead.id,
+                LeadIdentifier.kind == kind,
+                LeadIdentifier.value != key,
+                LeadIdentifier.confirmed_at.is_not(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
 
 
 async def _settle_transport_contest(
