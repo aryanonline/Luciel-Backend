@@ -4,8 +4,9 @@ The lifecycle transitions were each tested against a tenant at rest. Three thing
 not at rest when an owner clicks Delete (or the day-30 sweep fires):
 
 * an EXPORT being built — the bundle must still be delivered, or the request must fail
-  honestly; and a bundle must never land AFTER the hard-delete cascade swept the
-  tenant's export prefix (a full copy of the data outliving "hard-deleted");
+  honestly; and a bundle must never land AFTER the account purge swept the tenant's
+  export prefix (a full copy of the data outliving "permanently deleted"). A Luciel
+  hard delete waits for the upload too, but leaves the bundle to its 7-day link;
 * a knowledge SYNC whose provider fetch is on the wire — it must not leave the deleted
   Luciel with a second copy of every synced document for restore to bring back beside
   the first, and it is not run again while the Luciel is deleted;
@@ -177,10 +178,12 @@ async def test_a_luciel_delete_during_an_inflight_export_still_delivers_the_bund
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "export_store")
-async def test_the_hard_delete_cascade_waits_for_an_inflight_export_and_sweeps_its_bundle():
+async def test_the_grace_expiry_waits_for_an_inflight_export_and_the_bundle_outlives_the_luciel():
     """Day 30 of the grace window fires while an export upload is on the wire. The
-    cascade's prefix sweep used to run first and find nothing; the upload then landed
-    a full copy of the tenant under a prefix nothing would ever sweep again."""
+    cascade still waits for the upload (it reads the rows the bundle is built from);
+    but a Luciel hard delete leaves the account, which still holds the 7-day link it
+    was just handed, so the bundle is NOT swept (round 7 money review, finding 1:
+    the sweep used to run here and the fresh link answered 410 "expired")."""
     admin, _ = await _seed(
         luciel_state=LucielState.luciel_grace_window, grace_started=NOW - timedelta(days=31)
     )
@@ -205,17 +208,81 @@ async def test_the_hard_delete_cascade_waits_for_an_inflight_export_and_sweeps_i
         async with tenant_session(admin) as s:
             return await grace_expiry.expire_grace_window_if_due(s, admin_id=admin, now=NOW)
 
-    purge_task = asyncio.create_task(_expire())
+    expire_task = asyncio.create_task(_expire())
+    done, _ = await asyncio.wait({expire_task}, timeout=1.5)
+    try:
+        assert not done, "the cascade ran while a bundle was still uploading"
+    finally:
+        release.set()
+        await asyncio.gather(export_task, expire_task, return_exceptions=True)
+
+    assert export_task.exception() is None
+    assert expire_task.result() is not None, "the cascade ran once the export finished"
+    token = export_task.result().download_url.rsplit("/", 1)[1]
+    _, export_id = parse_export_token(token)
+    assert LocalExportStore.keys() == [export_key_for(admin, export_id)]
+    assert [
+        p
+        for p in await _events(admin, "data_retention_hard_delete")
+        if p.get("data_class") == "export_bundle_object"
+    ] == []
+    # The link the owner was handed a moment before the Luciel was destroyed still opens.
+    opened = await exports_route.download_export(token)
+    assert opened.status_code == 302
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "export_store")
+async def test_the_account_purge_waits_for_an_inflight_export_and_sweeps_its_bundle():
+    """A closed account's re-export is on the wire when the day-30 purge fires. The
+    purge's prefix sweep used to be able to run first and find nothing; the upload then
+    landed a full copy of the tenant under a prefix nothing would ever sweep again."""
+    admin, _ = await _seed(
+        account_state=AccountState.closed,
+        luciel_state=LucielState.luciel_grace_window,
+        grace_started=NOW - timedelta(days=31),
+    )
+    async with tenant_session(admin) as s:
+        await audit.emit(
+            s,
+            admin_id=admin,
+            event_type="account_closure_initiated",
+            actor_type=ActorType.admin_user,
+            actor_user_id=admin,
+        )
+    uploading, release = asyncio.Event(), asyncio.Event()
+
+    class SlowUpload(LocalExportStore):
+        async def put(self, *, key: str, data: bytes) -> None:
+            uploading.set()
+            await release.wait()
+            await super().put(key=key, data=data)
+
+    store = SlowUpload()
+    set_export_store(store)
+    export_task = asyncio.create_task(
+        account_route.request_export(
+            subject=Subject(admin_id=admin, user_id=admin, session_epoch=0), store=store
+        )
+    )
+    await asyncio.wait_for(uploading.wait(), timeout=20)
+
+    async def _purge() -> bool:
+        async with tenant_session(admin) as s:
+            return await close_purge.purge_closed_account_if_due(
+                s, admin_id=admin, now=datetime.now(UTC) + timedelta(days=31)
+            )
+
+    purge_task = asyncio.create_task(_purge())
     done, _ = await asyncio.wait({purge_task}, timeout=1.5)
     try:
-        assert not done, "the cascade swept the export prefix while a bundle was still uploading"
+        assert not done, "the purge swept the export prefix while a bundle was still uploading"
     finally:
         release.set()
         await asyncio.gather(export_task, purge_task, return_exceptions=True)
 
     assert export_task.exception() is None
-    assert purge_task.result() is not None, "the cascade ran once the export finished"
-    assert LocalExportStore.keys() == [], "a bundle outlived the hard delete"
+    assert purge_task.result() is True, "the purge ran once the export finished"
+    assert LocalExportStore.keys() == [], "a bundle outlived the account purge"
     (sweep,) = [
         p
         for p in await _events(admin, "data_retention_hard_delete")
@@ -223,8 +290,7 @@ async def test_the_hard_delete_cascade_waits_for_an_inflight_export_and_sweeps_i
     ]
     assert sweep["count"] == 1
     assert sweep["object_prefix"] == export_prefix_for(admin)
-    # The link the owner was handed a moment before the Luciel was destroyed says so
-    # honestly instead of redirecting to an object that is no longer there.
+    # The account is gone with its data; the link says "expired", nothing more specific.
     token = export_task.result().download_url.rsplit("/", 1)[1]
     with pytest.raises(ApiError) as gone:
         await exports_route.download_export(token)
