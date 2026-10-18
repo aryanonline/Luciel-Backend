@@ -752,3 +752,40 @@ async def test_an_owner_fallback_then_a_replayed_page_that_fails_does_not_email_
     assert row.delivery_status == "owner_fallback"
     assert ses.recipients == [OWNER_EMAIL]  # once
     assert len(await _audit(admin, "escalation_owner_fallback")) == 1  # the first pass only
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_cc_that_reached_the_owner_is_the_fallback_so_replays_never_cc_again(ses, twilio):
+    """ccOwnerEmail with a contact whose page Twilio refused: the cc reached the owner,
+    but the row was queued as if nobody had heard, with a retry that was NOT
+    contacts-only — so every replay (the ladder's rungs, each hourly sweep) sent the
+    owner the cc again before trying the contact. The cc that landed is the owner
+    hearing: the row reads ``owner_fallback`` and the retry is for the contact alone."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(
+        admin,
+        iid,
+        escalation={
+            **SMS_ESCALATION,
+            "routing": [{"signal": "high_value_lead", "channel": "sms", "ccOwnerEmail": True}],
+        },
+        confirmed_numbers=(CONTACT_SMS,),
+    )
+    twilio.refuse = True
+    await _fire(admin, iid, sid, lead)
+    assert ses.recipients == [OWNER_EMAIL]  # the cc, once
+    row = await _row(admin, sid)
+    assert row.delivery_status == "owner_fallback"
+    (item,) = await _items(admin)
+    assert item.status == "queued" and item.payload["contacts_only"] is True
+
+    # The hourly replay: still refused, then accepted — the owner is never cc'd again.
+    await _make_due(admin)
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    assert ses.recipients == [OWNER_EMAIL]
+    twilio.refuse = False
+    await _make_due(admin)
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent" and row.delivery_detail == "sms:primary+owner"
+    assert ses.recipients == [OWNER_EMAIL] and len(twilio.sent) == 1
