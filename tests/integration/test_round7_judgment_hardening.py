@@ -1086,3 +1086,82 @@ async def test_a_take_over_message_while_an_answer_is_parked_reaches_a_person(
         assert row.signal == "explicit_human_request"
     await escalation_dispatch.drain_background_notifications()
     assert paged == ["explicit_human_request"]
+
+
+# --- final pass: every "passed to the team" line is backed by a page ---------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_ask_bound_hand_off_pages_the_owner_even_when_the_row_exists(
+    paged: list[str],
+):
+    """A booking stalls twice in a row for want of an email. The first stall's
+    clarifying question already wrote the session's cannot_answer row (and paged). At
+    the bound the customer is told it has been passed to the team — but the stalled
+    fields were only APPENDED to that row and nobody was paged about the booking.
+    The bound now extends the row AND pages, like a declined detail does."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _ScriptedTool("book_appointment", frozenset({"slot", "email"}), [])
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        await _booking_stall(s, admin, iid, sid, tool, "book me a cleaning for 2pm on the 1st")
+    await escalation_dispatch.drain_background_notifications()
+    before = list(paged)
+    assert before == ["cannot_answer"]
+
+    async with tenant_session(admin) as s:
+        bound = await _booking_stall(s, admin, iid, sid, tool, "just book the 2pm please")
+        assert EMAIL_ASK not in bound.reply_text
+        assert _HANDOFF_ACK_MARK.search(bound.reply_text) or any(
+            bound.reply_text.startswith(ack) for ack in SHORT_HANDOFF_ACKS
+        )
+        assert "still missing email after 2 asks" in _reasons(await _rows(s, sid))
+    await escalation_dispatch.drain_background_notifications()
+    assert paged[len(before) :] == ["cannot_answer"]
+
+
+BROCHURE_CHUNK = "Our brochure covers every cleaning package and its price."
+
+
+async def _brochure_retriever(_q: str) -> list[str]:
+    return [BROCHURE_CHUNK]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_unfounded_action_claim_is_flagged_for_real_when_the_row_exists(
+    paged: list[str],
+):
+    """The session already has a cannot_answer row (an earlier uncovered question).
+    The model then says "I've sent you the brochure" with no tool behind it: the
+    reply is replaced with "I wasn't able to complete that just now — I've flagged it
+    for the team", and nothing was recorded or paged because the row existed. Now the
+    failed action is added to the row and the owner is paged."""
+    from app.runtime.orchestrator import _UNFOUNDED_CLAIM_REPLACEMENT, UNFOUNDED_CLAIM_REASON
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        first = await _turn(_orch(s, admin, iid), sid, UNCOVERED)
+        assert first.escalation is not None
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["cannot_answer"]
+
+    async with tenant_session(admin) as s:
+        claimed = await _turn(
+            _orch(
+                s,
+                admin,
+                iid,
+                primary=EchoModel(
+                    confidence=1.0,
+                    fixed_reply="I've sent you the brochure — it covers every cleaning package.",
+                ),
+                retriever=_brochure_retriever,
+            ),
+            sid,
+            "could you send me the brochure?",
+        )
+        assert claimed.reply_text.startswith(_UNFOUNDED_CLAIM_REPLACEMENT)
+        (row,) = await _rows(s, sid)
+        assert UNFOUNDED_CLAIM_REASON in [str(r) for r in (row.reasons or [])]
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["cannot_answer", "cannot_answer"]

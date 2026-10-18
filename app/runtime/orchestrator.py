@@ -360,6 +360,8 @@ _UNFOUNDED_CLAIM_REPLACEMENT = (
     "I wasn't able to complete that just now — I've flagged it for the team, and "
     "someone will follow up with you shortly."
 )
+#: The owner-facing reason on the row behind that replacement.
+UNFOUNDED_CLAIM_REASON = "an action the customer asked for did not go through"
 
 # Why no model served the turn (round 7 WP-2, item 4), for the llm_unavailable row.
 # ``provider``: both providers failed (the pre-existing case, no reason on the row);
@@ -1747,7 +1749,12 @@ class Orchestrator:
                 # re-ask — and stay in ai mode. The next turn is answered.
                 sess_obj.input_ask_attempts = 0
                 stall_reasons = _stalled_gather_reasons(resp)
-                written = await _record_escalation(
+                # The session's one cannot_answer row may already exist (an earlier
+                # below-floor turn): the owner still reads WHICH fields the gather
+                # stalled on — and is paged with it (final pass): the line below
+                # tells the customer it was passed to the team, and only appending
+                # to a row paged hours ago about another question passed nothing.
+                await record_or_extend_escalation(
                     self.session,
                     admin_id=admin_id,
                     instance_id=instance_id,
@@ -1758,18 +1765,6 @@ class Orchestrator:
                     score=None,
                     reasons=list(stall_reasons),
                 )
-                if not written:
-                    # The session's one cannot_answer row already exists (an
-                    # earlier below-floor turn): the owner still reads WHICH
-                    # fields the gather stalled on.
-                    await _append_escalation_reasons(
-                        self.session,
-                        admin_id=admin_id,
-                        session_id=session_id,
-                        signal=Signal.cannot_answer.value,
-                        gate=Gate.outcome.value,
-                        reasons=list(stall_reasons),
-                    )
                 ack = await self._handoff_reply(
                     history,
                     channel=channel,
@@ -1979,24 +1974,29 @@ class Orchestrator:
             deterministic_reply = True
             if escalation is None:
                 escalation = EscalationDecision(
-                    True, Signal.cannot_answer, None, None, answer_ungrounded=True
+                    True,
+                    Signal.cannot_answer,
+                    None,
+                    None,
+                    (UNFOUNDED_CLAIM_REASON,),
+                    answer_ungrounded=True,
                 )
-                if not await _session_already_escalated(
+                # The replacement says it was flagged for the team, so it is (final
+                # pass): a new row, or the session's existing cannot_answer row —
+                # written about an earlier question — extended with this failed
+                # action and paged again. It used to be skipped whenever that row
+                # existed, so "I've flagged it for the team" reached nobody.
+                await record_or_extend_escalation(
                     self.session,
                     admin_id=admin_id,
+                    instance_id=instance_id,
                     session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
                     signal=Signal.cannot_answer.value,
-                ):
-                    await _record_escalation(
-                        self.session,
-                        admin_id=admin_id,
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        resolved_lead_id=resolved_lead_id,
-                        signal=Signal.cannot_answer.value,
-                        gate="outcome",
-                        score=None,
-                    )
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=[UNFOUNDED_CLAIM_REASON],
+                )
         elif ok_actions:
             # A confirmed action's numbers must come from its payload; on a mismatch,
             # append the deterministic confirmation built from what actually happened
