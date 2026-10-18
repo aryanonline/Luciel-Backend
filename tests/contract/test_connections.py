@@ -756,3 +756,106 @@ async def test_a_reverify_claim_conflict_is_audited_and_rate_limited(client, mon
             )
         ).scalar_one()
     assert int(audited) >= 1
+
+
+# --- Round 7 phase 2 review (seams 8): a deleted Luciel's draining rows are hidden -----
+# The delete writes ``quiescing`` on every connection (WP-5); the list filtered only
+# ``revoked``, so GET /connections answered each draining row with a status outside
+# ConnectionStatusWire. The frontend's chip fell to its default and the Overview of a
+# deleted Luciel read "N need attention" over connections that were healthy and merely
+# draining — where it used to read "Nothing connected yet".
+
+
+async def _connected_calendar(client, admin_id: uuid.UUID) -> str:
+    """A calendar driven to ``connected`` through the service seam, so the restore
+    assertion below is about a REAL stashed status, not ``unconfigured``."""
+    from app.connections import service as conn_service
+    from app.db.session import tenant_session
+
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "calendar", "provider": "google_calendar"},
+    )
+    cid = (await client.get("/api/v1/admin/connections")).json()[0]["connectionId"]
+    async with tenant_session(admin_id) as s:
+        await conn_service.confirm_reconnect(
+            s, admin_id=admin_id, connection_id=uuid.UUID(cid), user_id=None, probe_ok=True
+        )
+    return str(cid)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_deleted_luciels_draining_connections_are_hidden_until_restore(client):
+    """Delete: the list is empty (not a row with a raw ``quiescing`` status) while the
+    row drains underneath with its pre-delete status stashed. Restore: the same row is
+    listed again with that status — nothing to reconnect."""
+    from typing import get_args
+
+    from app.db.session import tenant_session
+    from app.models.connection import QUIESCING, InstanceConnection
+    from app.schemas_api.luciel import ConnectionStatusWire
+    from sqlalchemy import select as _select
+
+    admin_id = await _ready_account_with_luciel(client)
+    cid = await _connected_calendar(client, admin_id)
+    (before,) = (await client.get("/api/v1/admin/connections")).json()
+    assert before["status"] == "connected"
+
+    rd = await client.post("/api/v1/admin/luciel/delete")
+    assert rd.status_code == 200 and rd.json()["state"] == "luciel_grace_window"
+    r = await client.get("/api/v1/admin/connections")
+    assert r.status_code == 200
+    assert r.json() == [], "a draining connection is not an Overview row"
+    async with tenant_session(admin_id) as s:  # hidden, not gone
+        row = (
+            await s.execute(
+                _select(InstanceConnection).where(
+                    InstanceConnection.connection_id == uuid.UUID(cid)
+                )
+            )
+        ).scalar_one()
+        assert (row.status, row.status_stashed) == (QUIESCING, "connected")
+
+    rr = await client.post("/api/v1/admin/luciel/restore")
+    assert rr.status_code == 200 and rr.json()["state"] == "active"
+    (after,) = (await client.get("/api/v1/admin/connections")).json()
+    assert after["connectionId"] == cid
+    assert after["status"] == "connected", "restore lists the row with its stashed status"
+    assert {before["status"], after["status"]} <= set(get_args(ConnectionStatusWire))
+
+
+@pytest.mark.parametrize("hidden_status", ["revoked", "quiescing"])
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_connection_in_a_not_serving_status_is_never_listed(client, hidden_status):
+    """The two statuses a row can hold without serving (NOT_SERVING_STATUSES — the
+    set the delete, the restore and the cascade agree on) are both hidden by the
+    SAME filter, and nothing the list does return carries a status outside the wire
+    vocabulary. A status added to the set later is hidden with it."""
+    from typing import get_args
+
+    from app.db.session import tenant_session
+    from app.models.connection import NOT_SERVING_STATUSES, InstanceConnection
+    from app.schemas_api.luciel import ConnectionStatusWire
+    from sqlalchemy import select as _select
+
+    assert NOT_SERVING_STATUSES == {"revoked", "quiescing"}, "extend the parametrize"
+    admin_id = await _ready_account_with_luciel(client)
+    cid = await _connected_calendar(client, admin_id)
+    await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "crm", "provider": "hubspot"},
+    )
+    async with tenant_session(admin_id) as s:
+        row = (
+            await s.execute(
+                _select(InstanceConnection).where(
+                    InstanceConnection.connection_id == uuid.UUID(cid)
+                )
+            )
+        ).scalar_one()
+        row.status = hidden_status
+        row.status_stashed = "connected"
+
+    rows = (await client.get("/api/v1/admin/connections")).json()
+    assert [c["connectionType"] for c in rows] == ["crm"], rows
+    assert all(c["status"] in set(get_args(ConnectionStatusWire)) for c in rows)

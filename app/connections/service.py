@@ -36,7 +36,7 @@ from app.connections.secrets import (
     secret_ref_for_connection,
 )
 from app.models.audit import ActorType
-from app.models.connection import InstanceConnection
+from app.models.connection import NOT_SERVING_STATUSES, InstanceConnection
 
 if TYPE_CHECKING:
     from app.channels.tenant_twilio import TwilioCredentials
@@ -207,15 +207,22 @@ async def _single_active(
 
 
 async def list_connections(session: AsyncSession, admin_id: uuid.UUID) -> list[InstanceConnection]:
-    """All non-revoked connections for the tenant (§3.8.4: revoked rows are retained
-    but not surfaced in the live list)."""
+    """The tenant's connections as Overview lists them: every row that is serving or
+    reconnectable. Revoked rows are retained but not surfaced (§3.8.4), and a Luciel
+    in its delete drain hides its ``quiescing`` rows the same way (round 7 phase 2,
+    seams 8): ``quiescing`` is not in ``ConnectionStatusWire``, and listing it raw
+    made a deleted Luciel's Overview read "N need attention" over connections that
+    were healthy and merely draining. The rows are listed again with their stashed
+    status the moment the Luciel is restored. ``_single_active`` is deliberately NOT
+    narrowed the same way: a re-attach during grace must still find the draining
+    row, which ``uq_conn_active_type`` still counts as the type's single slot."""
     return list(
         (
             await session.execute(
                 select(InstanceConnection)
                 .where(
                     InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.status != "revoked",
+                    InstanceConnection.status.not_in(sorted(NOT_SERVING_STATUSES)),
                 )
                 .order_by(InstanceConnection.created_at)
             )
