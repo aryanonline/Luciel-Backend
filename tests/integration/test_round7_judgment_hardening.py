@@ -611,3 +611,63 @@ async def test_the_sweep_close_of_a_stalled_sms_booking_schedules_one_page_namin
         assert "the conversation ended before the booking could be completed" in list(
             row.reasons or []
         )
+
+
+# --- finding 5 (cont.): a stall for a DIFFERENT detail is a new ask, not a re-ask --- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_gather_that_progresses_from_the_time_to_the_email_is_not_a_repeated_ask(
+    paged: list[str],
+):
+    """T1 "book me a cleaning": the broker refuses for want of a slot and an email and
+    Luciel asks when. T2 the customer gives the time; the broker now waits only for
+    the email. That is progress — the customer answered — but the counter read 2 and
+    the bound fired: the hand-off line instead of the email ask, and a cannot_answer
+    row "still missing email after 2 asks" although the email was asked for once.
+    The pending set changed, so T2 is the first ask for it; only a third turn that
+    still lacks the email after it was asked reaches the bound. Each turn is its own
+    transaction, as every inbound message is live."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _ScriptedTool("book_appointment", frozenset({"slot", "email"}), [])
+    when_ask = "What day and time would suit you?"
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        first = await _turn(
+            _tool_orch(
+                s,
+                admin,
+                iid,
+                primary=_CountingEcho(
+                    confidence=1.0,
+                    tool_call_script=[[{"tool_id": "book_appointment", "inputs": {}}]],
+                    fixed_reply=when_ask,
+                ),
+                tool=tool,
+            ),
+            sid,
+            "book me a cleaning",
+        )
+        assert first.tool_outcomes == ["missing_input"]
+        assert (await _session_row(s, sid)).input_ask_attempts == 1
+
+    async with tenant_session(admin) as s:
+        second = await _turn(
+            _tool_orch(s, admin, iid, primary=_booking_model(), tool=tool), sid, "2pm on the 1st"
+        )
+        assert second.tool_outcomes == ["missing_input"]
+        assert (await _session_row(s, sid)).input_ask_attempts == 1  # a new ask
+        assert second.handed_off is False
+        assert EMAIL_ASK in second.reply_text  # the email is asked for, once
+        assert not any("after 2 asks" in r for r in _reasons(await _rows(s, sid)))
+
+    # The same detail still missing after it was asked: now it is a re-ask.
+    async with tenant_session(admin) as s:
+        third = await _turn(
+            _tool_orch(s, admin, iid, primary=_booking_model(), tool=tool),
+            sid,
+            "just book it please",
+        )
+        assert EMAIL_ASK not in third.reply_text  # the bound: no third ask
+        assert "still missing email after 2 asks" in _reasons(await _rows(s, sid))
+        assert (await _session_row(s, sid)).input_ask_attempts == 0
+    await escalation_dispatch.drain_background_notifications()

@@ -225,6 +225,29 @@ def _stalled_gather_reasons(reasoned: _Reasoned) -> tuple[str, ...]:
     return tuple(reasons)
 
 
+def _stall_asks(reasoned: _Reasoned) -> frozenset[str]:
+    """What THIS turn's stalled dispatches wait for, in ``PendingGather.asks`` terms:
+    the field names the broker refused on or, with none, the tool whose choice was
+    ambiguous. Empty for a prose stall (no tool behind it)."""
+    missing = frozenset(
+        f
+        for _, r in reasoned.dispatched
+        if r.outcome is tool_contract.Outcome.missing_input
+        for f in r.missing_fields
+    )
+    if missing:
+        return missing
+    which = next(
+        (
+            str(call.get("tool_id", ""))
+            for call, r in reasoned.dispatched
+            if r.outcome is tool_contract.Outcome.ambiguous
+        ),
+        None,
+    )
+    return frozenset({f"which:{which}"}) if which is not None else frozenset()
+
+
 def is_clarifying_question(text: str) -> bool:
     """A single short question with no assertion in it — the one ungrounded draft that
     is honest to send, because it claims nothing (F100)."""
@@ -469,6 +492,17 @@ class PendingGather:
     @property
     def what(self) -> str:
         return GATHER_WHAT.get(self.tool_id or "", "that")
+
+    @property
+    def asks(self) -> frozenset[str]:
+        """The detail(s) this gather waits for: the field names, or the tool whose
+        choice is ambiguous. Two stalls in a row are the SAME ask only when these
+        match (finding 5); empty for a prose stall."""
+        if self.missing_fields:
+            return frozenset(self.missing_fields)
+        if self.ambiguous:
+            return frozenset({f"which:{self.tool_id or ''}"})
+        return frozenset()
 
     def field_reason(self) -> str:
         """The owner-facing reason naming what is still missing."""
@@ -1303,6 +1337,14 @@ class Orchestrator:
         # nothing", distinct from None.
         attributed_chunks: list[dict[str, object]] | None = None
         gather_pending = prior_ask_attempts > 0
+        # What the previous (stalled) turn was waiting for, read from its durable
+        # tool traces BEFORE this turn dispatches anything: the decline check names
+        # it, and the stall accounting below compares it with this turn's ask.
+        prior_gather = (
+            await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            if gather_pending
+            else PendingGather()
+        )
 
         # --- DECLINED INPUT (§3.3.7 rule 4; round 7 WP-2 remainder, item 2) --- #
         # The last turn stalled asking for a detail and the customer now declines
@@ -1312,7 +1354,7 @@ class Orchestrator:
         declined_prefix = ""
         if sess_obj is not None and gather_pending and is_decline_turn(inbound_text):
             gather_pending = False
-            gather = await pending_gather(self.session, admin_id=admin_id, session_id=session_id)
+            gather = prior_gather
             if gather.blocks_action:
                 emit_metric("GatherDeclined", dimensions={"Channel": channel})
                 decline_reasons = [
@@ -1554,8 +1596,15 @@ class Orchestrator:
         if sess_obj is not None and stalled:
             # One more stall IN A ROW: counted from the previous turn's value, which
             # this turn cleared on entry (finding 5). A turn that did not stall keeps
-            # the 0 — there is no reset branch to forget.
-            sess_obj.input_ask_attempts = prior_ask_attempts + 1
+            # the 0 — there is no reset branch to forget. A stall waiting for a
+            # DIFFERENT detail than the last one is a new ask, not a re-ask: the
+            # customer answered ("2pm on the 1st" → now the email), so it is the
+            # first in a row — "still missing email after 2 asks" would be untrue.
+            in_a_row = prior_ask_attempts
+            now_asks = _stall_asks(resp)
+            if prior_gather.asks and now_asks and now_asks != prior_gather.asks:
+                in_a_row = 0
+            sess_obj.input_ask_attempts = in_a_row + 1
             if sess_obj.input_ask_attempts >= ASK_ATTEMPT_BOUND:
                 # D2 (round 7 WP-2, item 3): stop asking, tell the owner WHAT is
                 # still missing, send the honest hand-off line instead of the
