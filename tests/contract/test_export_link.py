@@ -186,9 +186,11 @@ async def test_an_export_link_is_throttled_per_link(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_valid_link_to_a_swept_bundle_is_a_410_not_a_redirect_to_nothing(client):
-    """Round 7 WP-5 item 8: a Luciel hard delete sweeps the tenant's bundles and
-    leaves the account, so the 7-day token still verifies. The presign is computed
-    locally and "succeeded" for the missing object — the owner was redirected to the
+    """Round 7 WP-5 item 8: a bundle can be gone while the account remains (removed
+    by hand, or the bucket's lifecycle backstop), so the 7-day token still verifies.
+    (A Luciel hard delete no longer sweeps bundles — money review finding 1.) The
+    presign is computed locally and "succeeded" for the missing object — the owner
+    was redirected to the
     bucket's raw NoSuchKey page. The door now asks the store first; a store that
     cannot answer is NOT read as gone (the redirect goes ahead, as before)."""
     from app.lifecycle.export_link import mint_export_token
@@ -296,3 +298,55 @@ async def test_the_bundle_contains_the_original_uploaded_files(client):
     finally:
         set_original_store(None)
         LocalOriginalStore.reset()
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_luciel_hard_delete_does_not_kill_an_export_link_the_open_account_holds(client):
+    """Round 7 money review, finding 1. Live condition: the owner deletes the Luciel on
+    day 0 and keeps the account; on day 28 they download their data (200, ttlDays 7,
+    the email says the link is valid 7 days); on day 30 the grace-expiry sweep runs the
+    Luciel-scope hard delete. That cascade swept every bundle under the tenant's
+    prefix, so on day 31 the link answered 410 "expired" with four promised days left.
+    Only the account purge sweeps bundles now; the account here is still open."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.lifecycle import grace_expiry
+    from app.models.instance import Instance, LucielState
+    from sqlalchemy import update
+
+    LocalExportStore.reset()
+    admin_id = await _signup_verify_login(client)
+    created = await client.post(
+        "/api/v1/admin/luciel",
+        json={"name": "L", "websiteUrl": "x.com", "businessOneLiner": "b"},
+    )
+    assert created.status_code == 200, created.text
+    deleted = await client.post("/api/v1/admin/luciel/delete")
+    assert deleted.status_code == 200, deleted.text
+    # Day 28 of the grace window.
+    day0 = datetime.now(UTC) - timedelta(days=28)
+    async with tenant_session(admin_id) as s:
+        await s.execute(
+            update(Instance)
+            .where(Instance.admin_id == admin_id)
+            .values(grace_window_started_at=day0, soft_deleted_at=day0)
+        )
+
+    r = await client.post("/api/v1/admin/account/export")
+    assert r.status_code == 200, r.text
+    assert r.json()["ttl_days"] == 7
+    door = r.json()["download_url"].split("/api/v1", 1)[1]
+
+    # Day 30: the sweep destroys the Luciel's data.
+    async with tenant_session(admin_id) as s:
+        counts = await grace_expiry.expire_grace_window_if_due(
+            s, admin_id=admin_id, now=day0 + timedelta(days=30, minutes=1)
+        )
+    assert counts is not None, "the grace window expired and the cascade ran"
+    async with tenant_session(admin_id) as s:
+        inst = (await s.execute(select(Instance))).scalar_one_or_none()
+    assert inst is None or inst.state == LucielState.luciel_hard_deleted
+
+    # The link the owner was promised for seven days still opens.
+    opened = await client.get(f"/api/v1{door}", follow_redirects=False)
+    assert opened.status_code == 302, opened.text

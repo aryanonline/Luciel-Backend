@@ -23,7 +23,9 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
+from app.billing import dunning
 from app.models.audit import ActorType
+from app.models.billing import BillingAccount
 from app.models.connection import NOT_SERVING_STATUSES, QUIESCING, InstanceConnection
 from app.models.crm_link import CrmLeadLink
 from app.models.instance import Instance, LucielState
@@ -194,8 +196,18 @@ async def delete_luciel(
             # what makes that possible; blanket 'unconfigured' told every restored
             # owner to reconnect everything. The outbound seams read the stash
             # through ``serving_status`` while the row drains.
-            c.status_stashed = c.status
-            c.status_detail_stashed = c.status_detail
+            #
+            # A billing-DORMANT action tool already carries a stash: the status it
+            # held before dunning put it to sleep (``dunning.set_dormant_for_action_tools``).
+            # Overwriting that with "dormant" lost the credential's real status, so a
+            # close → reopen → payment brought a healthy calendar/CRM back
+            # 'unconfigured' (round 7 money review, finding 2). The pre-dormant stash
+            # is kept; dormancy is a billing fact, and ``restore`` re-derives it from
+            # the dunning state at that moment. (``serving_status`` is read only by the
+            # channel senders, which are never dormant — D1.)
+            if not (c.status == "dormant" and c.status_stashed is not None):
+                c.status_stashed = c.status
+                c.status_detail_stashed = c.status_detail
             c.status = QUIESCING
             await audit.emit(
                 session,
@@ -474,6 +486,21 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
         intact_providers=intact_crm_providers,
         actor_user_id=actor_user_id,
     )
+    # Billing dormancy is re-derived, not replayed (round 7 money review, finding 2):
+    # the delete kept each action tool's PRE-dormant stash, so the rows above came
+    # back at their real status. If dunning is still ``reduced`` they go dormant again
+    # (stashing that status for the payment that restores them); if the invoice was
+    # paid during the grace window they stay as they were — a payment then found the
+    # rows quiescing and had nothing to restore.
+    dunning_state = (
+        await session.execute(
+            select(BillingAccount.dunning_state).where(BillingAccount.admin_id == admin_id)
+        )
+    ).scalar_one_or_none()
+    if dunning_state is not None and dunning.behaves_as_free_cap(dunning_state):
+        await dunning.set_dormant_for_action_tools(
+            session, admin_id=admin_id, reason="dunning_reduced"
+        )
     sources = list(
         (await session.execute(select(KnowledgeSource).where(KnowledgeSource.admin_id == admin_id)))
         .scalars()

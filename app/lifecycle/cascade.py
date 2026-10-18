@@ -326,10 +326,19 @@ async def _delete_tenant_export_bundles(
     session: AsyncSession, admin_id: uuid.UUID, instance_id: uuid.UUID | None
 ) -> None:
     """Destroy the tenant's export ZIPs (§3.6.6 / §5.10) by prefix (round 7 WP-5,
-    item 4). A bundle is every table the tenant owns in one object; the cascade
-    below deletes those tables, and a bundle left behind would keep a full copy of
-    the data past "hard-deleted" for as long as the bucket's lifecycle backstop let
-    it. Same best-effort-with-audit posture as the three sibling sweeps above."""
+    item 4). A bundle is every table the tenant owns in one object; the account
+    purge deletes those tables and the account itself, and a bundle left behind
+    would keep a full copy of the data past "permanently deleted" for as long as the
+    bucket's lifecycle backstop let it. Same best-effort-with-audit posture as the
+    three sibling sweeps above.
+
+    ACCOUNT PURGE ONLY (round 7 money review, finding 1). A Luciel hard delete leaves
+    the account open — or, after a closure, still reopenable — and that owner was
+    handed a 7-day link (response + email) they can still reach. Sweeping here killed
+    it with days left and the same "expired" copy as a stale token: a Luciel deleted
+    on day 0 and exported on day 28 lost its download on day 30. Such a bundle is the
+    owner's own requested copy and goes with its link: the bucket's lifecycle rule
+    expires every object a day after the link (data-stack ``export-bundle-expiry``)."""
     prefix = export_prefix_for(admin_id)
     try:
         swept = await get_export_store().delete_prefix(prefix=prefix)
@@ -384,7 +393,10 @@ async def hard_delete_cascade(
     await _delete_tenant_secrets(session, admin_id, iid)
     await _delete_tenant_transcript_archive(session, admin_id, iid)
     await _delete_tenant_knowledge_originals(session, admin_id, iid)
-    await _delete_tenant_export_bundles(session, admin_id, iid)
+    if include_account_scope:
+        # The account goes too, so nobody is left to reach a link. A Luciel-scope
+        # delete keeps the bundles: the account that requested them still can.
+        await _delete_tenant_export_bundles(session, admin_id, iid)
 
     if inst is not None:
         inst.state = LucielState.luciel_hard_deleted

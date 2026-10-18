@@ -13,6 +13,9 @@ Events handled:
                                       restore dormant connections (Legal §A3 / §3.6.7).
                                       The settled period's ledger rows are KEPT: they are
                                       the evidence behind the invoice (audit F005/F042).
+                                      The final invoice of a subscription the account
+                                      no longer holds (closure / card removal) settles
+                                      WITHOUT advancing the anchor or the watermarks.
   * invoice.payment_failed          → drive dunning none→retrying, email notification +
                                       lifecycle_notice_sent audit (Legal §A3 / §3.6.7).
                                       The attempt number is Stripe's own ``attempt_count``.
@@ -127,7 +130,20 @@ async def _on_invoice_paid(
     are the evidence behind the invoice and are KEPT for disputes (F042). Deleting them
     also made the fire-once guard forget every session, so a conversation that straddled
     the boundary was counted again on its next turn (F029).
+
+    An invoice for a subscription the account no longer holds is NOT a period boundary
+    (round 7 money review, finding 0): it is the final invoice of a subscription that
+    closure (or a card removal) cancelled with ``invoice_now``. Its ``period_end`` is
+    the cancellation instant, and treating that as the next period's start handed a
+    reopened account a second free 50 inside the Stripe period it had already used,
+    with the watermarks zeroed under it. That payment clears dunning like any other,
+    but the anchor and the watermarks stay where they are.
     """
+    billed_subscription = _invoice_subscription_id(event)
+    if billed_subscription is not None and billed_subscription != account.stripe_subscription_id:
+        return await _on_ended_subscription_paid(
+            session, admin_id=admin_id, account=account, subscription_id=billed_subscription
+        )
     prev_start = account.period_start
     ps = event.data.get("period_start")
     pe = event.data.get("period_end")
@@ -198,6 +214,77 @@ async def _on_invoice_paid(
         )
 
     # Legal §A3: restore dormant connections on successful payment.
+    await _restore_dormant_connections(session, admin_id=admin_id, reason="invoice_paid")
+    return "invoice_paid"
+
+
+def _invoice_subscription_id(event: StripeEvent) -> str | None:
+    """The subscription an ``invoice.paid`` bills, or None when it names none.
+
+    API 2025-03-31 "basil" (the platform pin) moved ``invoice.subscription`` under
+    ``invoice.parent.subscription_details.subscription``; an older-shaped payload
+    still carries it at the top level (possibly expanded). Read either."""
+    if event.type != "invoice.paid":
+        return None
+    data = event.data
+    sub = data.get("subscription")
+    if isinstance(sub, dict):
+        sub = sub.get("id")
+    if isinstance(sub, str) and sub:
+        return sub
+    parent = data.get("parent")
+    details = parent.get("subscription_details") if isinstance(parent, dict) else None
+    nested = details.get("subscription") if isinstance(details, dict) else None
+    if isinstance(nested, dict):
+        nested = nested.get("id")
+    return nested if isinstance(nested, str) and nested else None
+
+
+async def _on_ended_subscription_paid(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    account: BillingAccount,
+    subscription_id: str,
+) -> str:
+    """The final invoice of a subscription that is no longer the account's was paid.
+
+    Closure and card removal both cancel the metered subscription with ``invoice_now``
+    after flushing the residual, so this invoice collects blocks the watermarks already
+    record as reported. The period the counter is keyed on has NOT ended: it keeps its
+    anchor (rolling by whole cycles on its own, ``current_period``) and its watermarks,
+    so a reopen or a re-added card continues it instead of starting a fresh free 50.
+    The debt is settled, so dunning clears and dormant tools return as for any payment.
+    """
+    period_start = account.period_start
+    prev_dunning = account.dunning_state
+    account.dunning_state = dunning.on_payment_succeeded()
+    account.dunning_started_at = None
+    await session.flush()
+    anchor = period_start.astimezone(UTC).date().isoformat() if period_start else None
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        actor_type=ActorType.platform,
+        event_type="invoice_paid",
+        payload={
+            "reset": "none",
+            "reason": "ended_subscription_settled",
+            "subscription_id": subscription_id,
+            "rollover": False,
+            "ledger_retained": True,
+            "period_start": anchor,
+            "previous_period_start": anchor,
+        },
+    )
+    if prev_dunning != account.dunning_state:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            actor_type=ActorType.platform,
+            event_type="dunning_state_changed",
+            payload={"from": prev_dunning, "to": account.dunning_state, "reason": "invoice_paid"},
+        )
     await _restore_dormant_connections(session, admin_id=admin_id, reason="invoice_paid")
     return "invoice_paid"
 

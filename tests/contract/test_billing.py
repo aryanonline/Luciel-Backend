@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 from app.billing import metering
@@ -289,6 +289,68 @@ async def test_remove_payment_method_settles_the_residual_before_detaching(clien
         acct = await metering.get_or_create_billing_account(s, admin_id=admin)
         assert acct.stripe_subscription_id is None
         assert acct.billing_state == "free_cap"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "stripe_test_posture")
+async def test_the_final_invoice_after_a_card_removal_does_not_reset_the_period(client) -> None:
+    """Round 7 money review, finding 0 (the pre-D5 entry point). The card removal ends
+    the metered subscription with ``invoice_now``; Stripe's ``invoice.paid`` for that
+    final invoice (period_end = the cancel instant) used to move the anchor to the
+    cancel instant, so the free-cap account read 0 counted and ``atCap`` false — a
+    fresh 50 inside the period whose blocks it had just paid for."""
+    admin = await _signup_verify_login(client)
+    await _seed_instance(admin, counted=210)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.stripe_customer_id = "cus_final"
+        acct.stripe_subscription_id = "sub_final"
+        acct.accrued_blocks = 2
+        acct.last_reported_blocks = 2
+        acct.accrual_period_start = current_billing_period_start()
+        acct.pm_brand = "visa"
+        acct.pm_last4 = "4242"
+        await s.flush()
+    gw = FakeStripeGateway()
+    gw.seed_customer("cus_final", subscription_id="sub_final")
+    set_stripe_gateway(gw)
+    try:
+        assert (await client.delete("/api/v1/billing/payment-method")).status_code == 200
+        assert gw.cancelled_subscriptions == [("sub_final", True)]
+        month_start = datetime.combine(current_billing_period_start(), time.min, tzinfo=UTC)
+        cancel_instant = max(datetime.now(UTC), month_start + timedelta(days=1))
+        payload = json.dumps(
+            {
+                "id": "evt_final_after_removal",
+                "type": "invoice.paid",
+                "data": {
+                    "object": {
+                        "object": "invoice",
+                        "customer": "cus_final",
+                        "metadata": {"admin_id": str(admin)},
+                        "parent": {"subscription_details": {"subscription": "sub_final"}},
+                        "period_start": int(month_start.timestamp()),
+                        "period_end": int(cancel_instant.timestamp()),
+                    }
+                },
+            }
+        ).encode()
+        header = build_signature_header(gw.WEBHOOK_SECRET, payload)
+        r = await client.post(
+            "/api/v1/webhooks/stripe", content=payload, headers={"Stripe-Signature": header}
+        )
+        assert r.status_code == 200
+        assert r.json()["action"] == "invoice_paid"
+    finally:
+        set_stripe_gateway(None)
+    budget = (await client.get("/api/v1/billing")).json()["budget"]
+    assert budget["billingState"] == "free_cap"
+    assert budget["conversationsThisPeriod"] == 210, "the final invoice reset the period"
+    assert budget["atCap"] is True
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert acct.period_start is None, "the final invoice anchored a new period"
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (2, 2)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

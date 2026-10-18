@@ -34,7 +34,7 @@ from app.channels.outbound import send_outbound_reply
 from app.connections import gate
 from app.models.audit import ActorType
 from app.models.deferred import DeferredAction
-from app.models.instance import NON_SERVING_STATES, Instance, LucielState
+from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
 from app.notifications import escalation_dispatch
 
@@ -48,14 +48,18 @@ MAX_AGE = timedelta(hours=24)
 BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
 # How soon a HELD item (round 7 WP-5, item 2) is looked at again. A paused Luciel
-# resumes on an owner click, not a schedule, so the hold is re-checked on a short
-# cadence rather than the retry backoff — a resumed Luciel drains within this window.
+# resumes on an owner click, not a schedule (a Luciel in its grace window comes back
+# on a Restore or a D5 reopen), so the hold is re-checked on a short cadence rather
+# than the retry backoff — a resumed / restored Luciel drains within this window.
 HOLD_RECHECK = timedelta(minutes=15)
 
-#: ``last_error`` on an item the Luciel's deletion aged out: the abandon is audited
-#: like any other, but the owner email is suppressed — they deleted the Luciel, and a
-#: "your follow-up could not be completed" notice for each queued callback is noise
-#: the 48h catch-up pass must not resurrect either.
+#: ``last_error`` on an item a HARD-deleted Luciel aged out: the abandon is audited
+#: like any other, but the owner email is suppressed — the Luciel is gone for good,
+#: and a "your follow-up could not be completed" notice for each queued callback is
+#: noise the 48h catch-up pass must not resurrect either. A Luciel still in its
+#: 30-day grace window is NOT this case: it holds its items like a paused one, since
+#: a Restore or the D5 reopen brings it back "exactly as it was" (round 7 money
+#: review, finding 3); the day-30 cascade deletes what is still held, audited.
 LUCIEL_DELETED = "luciel_deleted"
 #: ``last_error`` on a lead-facing item held while the Luciel is not serving.
 LUCIEL_NOT_SERVING = "luciel_not_serving"
@@ -254,12 +258,15 @@ async def run_sweep(
     The Luciel's own state gates the LEAD-FACING items (round 7 WP-5, item 2 — the
     queue used to speak for a paused Luciel: "Pausing the Luciel pauses every
     channel", and a scheduled callback fired by the sweep is a channel send):
-      * PAUSED → the item is HELD: not attempted, not aged. Its TTL is re-anchored
-        so the 24h retry window runs from when delivery becomes possible again, and
-        the next sweep after the owner resumes drains it.
-      * DELETED (grace window / hard-deleted) → the item is never attempted and ages
-        out to its TTL. The abandon is audited as always, but the owner email is
-        suppressed (``LUCIEL_DELETED``): they deleted the Luciel.
+      * PAUSED or in its GRACE WINDOW → the item is HELD: not attempted, not aged.
+        Its TTL is re-anchored so the 24h retry window runs from when delivery
+        becomes possible again, and the next sweep after the owner resumes (or
+        restores the Luciel / reopens the closed account, D5) drains it. A grace-
+        window Luciel that is never restored takes its held items with it at the
+        day-30 cascade (``deferred_action`` is a Luciel-scope table, audited there).
+      * HARD-DELETED → the item is never attempted and ages out to its TTL. The
+        abandon is audited as always, but the owner email is suppressed
+        (``LUCIEL_DELETED``): the Luciel is gone for good.
     Owner-facing items (escalation retries) are unaffected — the owner of a paused
     Luciel still hears about the lead it escalated before the pause.
 
@@ -268,8 +275,12 @@ async def run_sweep(
     now = now or datetime.now(UTC)
     counts = {"delivered": 0, "abandoned": 0, "retried": 0, "held": 0}
     luciel_state = await _luciel_state(session, admin_id)
-    paused = luciel_state == LucielState.paused
-    deleted = luciel_state in NON_SERVING_STATES and not paused
+    # Round 7 money review, finding 3: the grace window used to age lead-facing items
+    # out like a final deletion, so a callback queued before a closure was abandoned
+    # (owner email suppressed) while the D5 reopen — or the Luciel's own Restore —
+    # was still on offer, and the restored Luciel owed a lead a call it never made.
+    held = luciel_state in (LucielState.paused, LucielState.luciel_grace_window)
+    deleted = luciel_state == LucielState.luciel_hard_deleted
 
     due = (
         (
@@ -320,7 +331,7 @@ async def run_sweep(
                 counts["abandoned"] += 1
                 continue
 
-        if paused and _lead_facing(action):
+        if held and _lead_facing(action):
             # Held, not aged: the TTL runs from when the Luciel can speak again.
             action.last_error = LUCIEL_NOT_SERVING
             action.next_attempt_at = now + HOLD_RECHECK
@@ -342,8 +353,8 @@ async def run_sweep(
             continue
 
         if deleted and _lead_facing(action):
-            # A deleted Luciel says nothing new to anyone (§3.6.3 drains only the
-            # sessions already in flight); the item simply ages out to its TTL.
+            # A hard-deleted Luciel says nothing new to anyone; the item simply ages
+            # out to its TTL.
             action.last_error = LUCIEL_NOT_SERVING
             action.next_attempt_at = now + HOLD_RECHECK
             counts["held"] += 1
