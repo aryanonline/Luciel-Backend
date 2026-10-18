@@ -1029,3 +1029,60 @@ async def test_hand_to_team_on_a_later_uncovered_question_is_that_turns_only_pag
         assert second.escalation.signal is Signal.luciel_requested_handoff
     await escalation_dispatch.drain_background_notifications()
     assert paged == ["cannot_answer", "luciel_requested_handoff"]
+
+
+# --- final pass: a parked channel-switch answer never swallows a take-over ---------- #
+@pytest.mark.parametrize(
+    ("message", "self_harm"),
+    [
+        ("no, I want to talk to a real person", False),
+        ("no. honestly I want to kill myself", True),
+    ],
+)
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_take_over_message_while_an_answer_is_parked_reaches_a_person(
+    delivered: list[dict[str, object]], paged: list[str], message: str, self_harm: bool
+):
+    """Luciel asked where to email the answer and parked it. The next message was read
+    as the answer to that question BEFORE moderation and the intake gate ran: "no, I
+    want to talk to a real person" matched the decline and got "No problem — I'll
+    keep everything here in this conversation", and a self-harm disclosure opening
+    with "no" got the same line — no crisis line, no take-over, nobody paged. Now the
+    parked answer is dropped and the message goes to the gates that hand it over."""
+    from app.runtime.channel_switch import DECLINED_LINE
+    from app.runtime.orchestrator import SELF_HARM_REPLY
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        asked = await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            "can you email me the details of the starter package?",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert "What's the best email address to send it to?" in asked.reply_text
+        assert (await _session_row(s, sid)).pending_outbound
+
+        taken = await _turn(
+            _answer_orch(s, admin, iid),
+            sid,
+            message,
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert taken.reply_text != DECLINED_LINE
+        assert taken.handed_off is True
+        if self_harm:
+            assert taken.reply_text == SELF_HARM_REPLY
+        else:
+            assert _HANDOFF_ACK_MARK.search(taken.reply_text)
+        sess = await _session_row(s, sid)
+        assert sess.mode == "human_controlled"
+        assert sess.pending_outbound is None  # the parked answer is dropped, not sent
+        assert delivered == []
+        (row,) = await _rows(s, sid)
+        assert row.signal == "explicit_human_request"
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["explicit_human_request"]

@@ -1327,6 +1327,25 @@ class Orchestrator:
         # The customer asked for the last answer on another channel and was asked
         # where to send it; this turn is their answer. Deterministic — no model call —
         # and nothing goes to an address they did not confirm.
+        #
+        # Unless a person must see this message (judgment hardening, final pass): a
+        # threat, a self-harm disclosure or a request for a person used to be read
+        # here as the answer — "no, I want to talk to a real person" matched the
+        # decline and got "No problem — I'll keep everything here", "no. honestly I
+        # want to kill myself" the same, and the gates below never ran: no crisis
+        # line, no take-over, no page. Such a message drops the parked answer and
+        # goes on to the gates that hand it to a person.
+        mod = moderate(inbound_text)
+        if (
+            sess_obj is not None
+            and sess_obj.pending_outbound
+            and (
+                mod.should_escalate
+                or evaluate_intake([inbound_text]).signal is Signal.explicit_human_request
+            )
+        ):
+            sess_obj.pending_outbound = None
+            await self.session.flush()
         if sess_obj is not None and sess_obj.pending_outbound:
             settled = await self._settle_pending_outbound(
                 sess_obj,
@@ -1346,7 +1365,7 @@ class Orchestrator:
         team_told = False
 
         # --- CONTENT MODERATION (§3.4.15) ------------------------------------ #
-        mod = moderate(inbound_text)
+        # (``mod`` was classified above, before the channel-switch confirmation.)
         if mod.should_escalate:
             await self._audit_moderation(session_id, mod.category.value)
             # Every moderation row: "moderation:<category>" first, then the owner's
