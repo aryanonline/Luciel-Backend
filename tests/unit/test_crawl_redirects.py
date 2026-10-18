@@ -119,6 +119,69 @@ async def test_a_redirect_to_a_private_address_is_refused_before_any_connect():
     assert [r.headers["host"] for r in site.requests] == ["acme.example"]
 
 
+async def test_a_redirect_that_downgrades_https_to_http_is_refused():
+    """Round 7 Phase 2 review, knowledge #6: the owner registered an https site and a
+    misconfigured edge answered ``Location: http://...``. The follower accepted the hop
+    and every page was fetched — and ingested as readable chunks — over cleartext. The
+    hop is refused before any cleartext connect."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("http://acme.example/plain"),
+            ("acme.example", "/plain"): _page("<html>cleartext</html>"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    with pytest.raises(ProviderUnavailable, match="downgraded https to http"):
+        await provider._fetch_page("https://acme.example/")
+    assert [r.url.scheme for r in site.requests] == ["https"]  # the http hop never connected
+
+
+async def test_a_downgrading_seed_is_a_failed_page_never_an_ingested_one():
+    """At the snapshot level the refused hop is a failed page (kept + flagged by the
+    sync, F117), never cleartext content — and a site that only downgrades reached no
+    page at all, which is the unreachable-site failure, not an empty site."""
+    from app.knowledge.providers import CrawlUnreachable
+
+    site = _Site(
+        {
+            ("acme.example", "/"): _page('<html>home <a href="/pricing">p</a></html>'),
+            ("acme.example", "/pricing"): _redirect("http://acme.example/pricing"),
+        }
+    )
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=site.transport()
+    )
+    snapshot = await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert [i.external_id for i in snapshot.items] == ["https://acme.example/"]
+    assert snapshot.failed_ids == ["https://acme.example/pricing"]
+    assert all(r.url.scheme == "https" for r in site.requests)
+
+    only = _Site({("acme.example", "/"): _redirect("http://acme.example/")})
+    provider = WebsiteCrawlProvider(
+        urls=["https://acme.example/"], httpx_transport=only.transport()
+    )
+    with pytest.raises(CrawlUnreachable):
+        await provider.snapshot(connection_id=None)  # type: ignore[arg-type]
+    assert all(r.url.scheme == "https" for r in only.requests)
+
+
+async def test_an_http_seed_may_upgrade_to_https():
+    """The guard is one-directional: an owner may register an http URL, and its
+    redirect to https is followed."""
+    site = _Site(
+        {
+            ("acme.example", "/"): _redirect("https://www.acme.example/"),
+            ("www.acme.example", "/"): _page("<html><body>Welcome</body></html>"),
+        }
+    )
+    provider = WebsiteCrawlProvider(urls=["http://acme.example/"], httpx_transport=site.transport())
+    body, final_url = await provider._fetch_page("http://acme.example/")
+    assert "Welcome" in body and final_url == "https://www.acme.example/"
+    assert [r.url.scheme for r in site.requests] == ["http", "https"]
+
+
 async def test_a_redirect_to_a_name_that_resolves_privately_is_refused():
     """Rebinding through the redirect: a public first hop, then a Location naming a host
     whose DNS answer is RFC 1918. Re-pinning on the hop catches it."""

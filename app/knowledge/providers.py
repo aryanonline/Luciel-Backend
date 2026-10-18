@@ -1085,9 +1085,19 @@ class WebsiteCrawlProvider:
                 )
                 location = resp.headers.get("location")
                 if resp.status_code in _REDIRECT_STATUSES and location:
+                    hop_scheme = urlparse(current).scheme
                     current = urljoin(current, location)
                     if urlparse(current).scheme not in ("http", "https"):
                         raise ProviderUnavailable(f"crawl redirect left http(s): {current}")
+                    # Never https -> http (round 7 Phase 2 review, knowledge #6): the
+                    # body would arrive over cleartext and become readable chunks an
+                    # on-path party could shape. The owner chose https; the page fails
+                    # (kept + flagged by the sync) instead. An http -> https upgrade is
+                    # still followed — an http seed is the owner's own choice.
+                    if hop_scheme == "https" and urlparse(current).scheme == "http":
+                        raise ProviderUnavailable(
+                            f"crawl redirect downgraded https to http: {current}"
+                        )
                     continue
                 if resp.status_code >= 400:
                     raise CrawlFetchRefused(current, resp.status_code)
