@@ -136,6 +136,49 @@ def test_redis_store_mirrors_the_in_memory_semantics():
         assert client.ttl(key) > 0, f"{key} has no expiry"
 
 
+def test_has_capacity_reads_the_bucket_without_charging_it():
+    """Phase-2 security review: the destination-claim gate CONSULTS the bucket before a
+    claim is evaluated — a read that charges nothing — and only refusals pay into it.
+    Both stores answer it the same way, and an unknown bucket always has capacity."""
+    import fakeredis
+
+    for store in (
+        TokenBucketStore(),
+        rate_limit.RedisTokenBucketStore(fakeredis.FakeRedis(decode_responses=True)),
+    ):
+        src = "admin-1"
+        burst = rate_limit.LIMITS["destination_claim"].burst
+        for _ in range(10):
+            assert store.has_capacity("destination_claim", src) is True  # reads are free
+        for _ in range(burst):
+            assert store.check_source("destination_claim", src).allowed
+        assert store.has_capacity("destination_claim", src) is False  # spent
+        assert store.has_capacity("destination_claim", "admin-2") is True  # per source
+        assert store.has_capacity("no_such_bucket", src) is True
+
+
+def test_has_capacity_is_false_while_a_source_is_blocked_or_over_its_daily_cap(monkeypatch):
+    store = TokenBucketStore()
+    for _ in range(5 + AUTO_BLOCK_ABUSE_THRESHOLD + 1):
+        store.check_source("sms", "abuser")
+    assert store.has_capacity("sms", "abuser") is False
+
+    capped = TokenBucketStore()
+    monkeypatch.setitem(
+        rate_limit.LIMITS,
+        "destination_claim",
+        rate_limit.ChannelLimits(burst=100, refill_seconds=1.0, daily_cap=2),
+    )
+    for _ in range(2):
+        assert capped.check_source("destination_claim", "a").allowed
+    assert capped.has_capacity("destination_claim", "a") is False
+
+
+def test_crm_backfill_is_a_tight_per_admin_bucket():
+    limits = rate_limit.LIMITS["crm_backfill"]
+    assert (limits.burst, limits.refill_seconds, limits.daily_cap) == (2, 60.0, 50)
+
+
 def test_redis_store_degrades_to_in_memory_on_redis_error():
     """A Redis outage must not fail OPEN (cap removed) nor drop all traffic."""
 

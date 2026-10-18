@@ -225,6 +225,12 @@ async def start_connection(
 ) -> StartConnectionResult:
     from app.channels.phone_lifecycle import NumberAlreadyClaimed  # noqa: PLC0415
 
+    if req.connection_type == "sms_sender" and req.phone_number is not None:
+        # An SMS attach is a claim point: once refusals have spent the claimant's
+        # bucket, every attach answers the same 429, held number or not (phase 2).
+        await _gate_claim_attempt(
+            subject.admin_id, connection_type="sms_sender", destination=req.phone_number
+        )
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
         try:
@@ -256,19 +262,8 @@ async def start_connection(
             # oracle for which numbers are claimed. The pipeline abuse-block
             # (pipeline.py) is the precedent for the separate-session audit.
             await _record_claim_rejection(subject.admin_id, req.phone_number or "")
-            from app.channels import rate_limit  # noqa: PLC0415
-
-            decision = rate_limit.get_store().check_source(
-                "destination_claim", str(subject.admin_id)
-            )
-            if not decision.allowed:
-                from app.api.errors import rate_limited  # noqa: PLC0415
-
-                raise rate_limited(
-                    "Too many attempts to connect numbers that belong to other "
-                    "accounts. Please wait a minute before trying again.",
-                    retry_after_seconds=60,
-                ) from exc
+            if await _claim_rate_exhausted(subject.admin_id):
+                raise rate_limited(CLAIM_RATE_LIMITED_MESSAGE, retry_after_seconds=60) from exc
             raise conflict(str(exc)) from exc
         return StartConnectionResult.model_validate(result)
 
@@ -302,8 +297,10 @@ async def _record_claim_rejection(
         )
 
 
+#: Neutral on purpose (phase-2 security review): once the bucket is spent the same
+#: 429 answers EVERY claim attempt, held id or not, so the wording must not say which.
 CLAIM_RATE_LIMITED_MESSAGE = (
-    "Too many attempts to connect destinations that belong to other accounts. "
+    "Too many attempts to connect destinations in a short time. "
     "Please wait a minute before trying again."
 )
 
@@ -317,6 +314,24 @@ async def _claim_rate_exhausted(admin_id: uuid.UUID) -> bool:
 
     decision = rate_limit.get_store().check_source("destination_claim", str(admin_id))
     return not decision.allowed
+
+
+async def _gate_claim_attempt(
+    admin_id: uuid.UUID, *, connection_type: str, destination: str
+) -> None:
+    """Consult the ``destination_claim`` bucket BEFORE a claim is evaluated (phase-2
+    security review). Only refusals pay into it, but once they have spent it EVERY
+    bind / attach attempt in the window answers the same 429 — an id nobody holds
+    included. Checking it only on the refusal path left the answer itself the oracle:
+    409-or-429 meant "held by another account", anything else "free". The attempt is
+    recorded like any refused claim (under the claimant, never the full id)."""
+    from app.channels import rate_limit  # noqa: PLC0415
+
+    if rate_limit.get_store().has_capacity("destination_claim", str(admin_id)):
+        return
+    await _record_claim_rejection(admin_id, destination, connection_type=connection_type)
+    await _claim_rate_exhausted(admin_id)  # counts toward the auto-block like any refusal
+    raise rate_limited(CLAIM_RATE_LIMITED_MESSAGE, retry_after_seconds=60)
 
 
 async def _refuse_claim(
@@ -464,6 +479,13 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
 
     async with tenant_session(subject.admin_id) as s:
         instance_id = await _instance_id(s, subject.admin_id)
+        # A promotion is a claim point: once refusals have spent the bucket it is
+        # answered like every other claim attempt, before the number is evaluated.
+        await _gate_claim_attempt(
+            subject.admin_id,
+            connection_type="sms_sender",
+            destination=await _pending_sms_number(s, subject.admin_id, instance_id),
+        )
         try:
             conn = await _reverify(
                 s, admin_id=subject.admin_id, instance_id=instance_id, user_id=subject.user_id
@@ -476,19 +498,8 @@ async def reverify_sms_number(subject: Subject = Depends(current_admin)) -> Conn
             claimed = str(exc)
             number = await _pending_sms_number(s, subject.admin_id, instance_id)
             await _record_claim_rejection(subject.admin_id, number)
-            from app.channels import rate_limit  # noqa: PLC0415
-
-            decision = rate_limit.get_store().check_source(
-                "destination_claim", str(subject.admin_id)
-            )
-            if not decision.allowed:
-                from app.api.errors import rate_limited  # noqa: PLC0415
-
-                raise rate_limited(
-                    "Too many attempts to connect numbers that belong to other "
-                    "accounts. Please wait a minute before trying again.",
-                    retry_after_seconds=60,
-                ) from exc
+            if await _claim_rate_exhausted(subject.admin_id):
+                raise rate_limited(CLAIM_RATE_LIMITED_MESSAGE, retry_after_seconds=60) from exc
             raise conflict(claimed) from exc
         if conn is None:
             raise not_found("No SMS number attached to re-verify.")
@@ -1586,14 +1597,33 @@ async def bind_destination(
                 f"{'Instagram' if req.channel == 'instagram' else 'Meta'} connection."
             )
         instance_id = await _instance_id(s, subject.admin_id)
+        # Phase-2 security review: the claim bucket is consulted before anything
+        # about the id is evaluated, and — where Meta can be asked — the grant must
+        # cover the id BEFORE the cross-tenant check. A caller whose grant does not
+        # (or who holds no grant at all) gets the same 422 for an id another account
+        # holds as for one nobody does; "connected to another account" is reachable
+        # only by a grant Meta says manages the asset, for whom it is the right
+        # answer, not a leak. ``_require_asset_on_grant`` never touches the session,
+        # so it also keeps the Graph round-trip out of the claim lock below.
+        await _gate_claim_attempt(
+            subject.admin_id, connection_type=conn.connection_type, destination=req.destination
+        )
+        proven = await _require_asset_on_grant(
+            admin_id=subject.admin_id,
+            instance_id=instance_id,
+            connection_type=conn.connection_type,
+            destination=req.destination,
+        )
         await routing.lock_destination_claim(s, req.destination)  # c21 TOCTOU guard
         # Across BOTH Meta grants (audit F052): inbound resolves an entry id against
         # instagram_auth and channel_auth in turn, so a claim on either must block a
         # claim on the other or one tenant's messages land on another's Luciel.
         owner = await routing.owner_of_meta_destination(s, req.destination)
         if owner is not None and owner != subject.admin_id:
-            # Item 12: audited under the claimant + the destination_claim bucket, so
-            # the 409 is not an oracle for which Meta ids other accounts hold.
+            # Item 12: audited under the claimant + the destination_claim bucket. In
+            # a posture with no Meta to ask (proven False) this is still reached by
+            # any caller — bounded by the gate above, which answers every attempt
+            # alike once refusals have spent the bucket.
             raise await _refuse_claim(
                 subject.admin_id,
                 connection_type=conn.connection_type,
@@ -1603,12 +1633,6 @@ async def bind_destination(
                     "Disconnect it there first."
                 ),
             )
-        proven = await _require_asset_on_grant(
-            admin_id=subject.admin_id,
-            instance_id=instance_id,
-            connection_type=conn.connection_type,
-            destination=req.destination,
-        )
         # Item 11: only an id a lister PROVED becomes the routable claim. Where Meta
         # could not be asked the id is parked under pending_destination(s) — honest
         # status_detail, no routing, no claim another tenant has to fight — and the

@@ -263,3 +263,125 @@ async def test_the_meta_refusal_is_recorded_even_when_meta_cannot_be_asked(clien
     assert clash.status_code == 409, clash.text
     assert len(await _claim_rejections(claimant)) == 1
     assert await _claim_rejections(holder) == []  # never under the victim
+
+
+# --------------------------------------------------------------------------- #
+# phase-2 security review — the limiter closes the oracle it was added for
+# --------------------------------------------------------------------------- #
+
+
+async def _holder_with_a_proven_claim(client, monkeypatch) -> tuple[uuid.UUID, str]:
+    """An account whose grant Meta vouched for holds ``shared`` as a routable claim."""
+    _meta_proves_every_id(monkeypatch)
+    await _ready_account_with_luciel(client)
+    holder = _admin_id(client)
+    cid = await _connected_meta(client, monkeypatch)
+    shared = f"pnid-{uuid.uuid4().hex[:10]}"
+    r = await client.put(
+        f"/api/v1/admin/connections/{cid}/destination",
+        json={"destination": shared, "channel": "whatsapp"},
+    )
+    assert r.status_code == 200, r.text
+    assert await _resolves_to(holder, shared) == holder
+    await client.post("/api/v1/auth/logout")
+    return holder, shared
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_once_refusals_spend_the_bucket_every_claim_attempt_answers_alike(
+    client, monkeypatch
+):
+    """The bucket used to be charged and read only on the held-id path, so 409-or-429
+    meant "another account holds this" and a 200 meant "free" — before the burst and
+    after it. It is now consulted BEFORE the claim is evaluated: once refusals have
+    spent it, an id nobody holds gets the very same 429 (and is not parked), and so
+    does an SMS attach — the bucket is shared by every claim point."""
+    holder, shared = await _holder_with_a_proven_claim(client, monkeypatch)
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: None)  # mock posture
+
+    await _ready_account_with_luciel(client)
+    claimant = _admin_id(client)
+    cid = await _connected_meta(client, monkeypatch)
+    path = f"/api/v1/admin/connections/{cid}/destination"
+    for _ in range(3):  # the burst: the held id is refused, audited, charged
+        r = await client.put(path, json={"destination": shared, "channel": "whatsapp"})
+        assert r.status_code == 409, r.text
+
+    held = await client.put(path, json={"destination": shared, "channel": "whatsapp"})
+    free_id = f"pnid-{uuid.uuid4().hex[:10]}"
+    free = await client.put(path, json={"destination": free_id, "channel": "whatsapp"})
+    assert held.status_code == free.status_code == 429
+    assert held.json() == free.json()  # nothing in the answer says which was held
+    attach = await client.post(
+        "/api/v1/admin/connections",
+        json={"connectionType": "sms_sender", "provider": "twilio", "phoneNumber": "+16045550177"},
+    )
+    assert attach.status_code == 429
+    assert attach.json() == free.json()
+
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    (row,) = [c for c in listed if c["connectionId"] == cid]
+    assert free_id not in str(row["nonSecretConfig"])  # the free id was not parked either
+    assert len(await _claim_rejections(claimant)) == 6  # every refused attempt, recorded
+    assert not any(shared in str(p) or free_id in str(p) for p in await _claim_rejections(claimant))
+    assert await _claim_rejections(holder) == []
+    assert await _resolves_to(holder, shared) == holder
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_grant_that_does_not_cover_the_id_gets_one_answer_held_or_not(client, monkeypatch):
+    """Where Meta can be asked, the grant must cover the id BEFORE the cross-tenant
+    check: a claimant whose grant manages neither id gets the same 422 for the one
+    another account holds as for one nobody does — and no claim refusal is recorded,
+    because no claim was ever evaluated."""
+    holder, shared = await _holder_with_a_proven_claim(client, monkeypatch)
+
+    async def _lists_nothing(*, material, connection_type, transport):
+        return set()
+
+    monkeypatch.setattr(meta_assets, "lister_for_posture", lambda: _lists_nothing)
+    await _ready_account_with_luciel(client)
+    claimant = _admin_id(client)
+    cid = await _connected_meta(client, monkeypatch)
+    path = f"/api/v1/admin/connections/{cid}/destination"
+
+    held = await client.put(path, json={"destination": shared, "channel": "whatsapp"})
+    free = await client.put(
+        path, json={"destination": f"pnid-{uuid.uuid4().hex[:10]}", "channel": "whatsapp"}
+    )
+    assert held.status_code == free.status_code == 422
+    assert held.json() == free.json()
+    assert "doesn't list that id" in held.json()["message"]
+    assert await _claim_rejections(claimant) == []
+    assert await _resolves_to(holder, shared) == holder
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_connection_with_no_meta_grant_learns_nothing_about_held_ids(client, monkeypatch):
+    """The cheapest prober: a channel_auth row started but never authorized. It used
+    to get 409 for a held id and 422 for a free one; both now answer "holds no
+    authorization yet"."""
+    from tests.contract.test_connection_lifecycle import _configure_meta
+
+    holder, shared = await _holder_with_a_proven_claim(client, monkeypatch)
+    _meta_proves_every_id(monkeypatch)  # Meta could be asked — the grant is what is missing
+    await _ready_account_with_luciel(client)
+    claimant = _admin_id(client)
+    _configure_meta(monkeypatch)
+    started = await client.post(
+        "/api/v1/admin/connections", json={"connectionType": "channel_auth", "provider": "meta"}
+    )
+    assert started.status_code == 200, started.text
+    listed = (await client.get("/api/v1/admin/connections")).json()
+    cid = next(c["connectionId"] for c in listed if c["connectionType"] == "channel_auth")
+    path = f"/api/v1/admin/connections/{cid}/destination"
+
+    held = await client.put(path, json={"destination": shared, "channel": "whatsapp"})
+    free = await client.put(
+        path, json={"destination": f"pnid-{uuid.uuid4().hex[:10]}", "channel": "whatsapp"}
+    )
+    assert held.status_code == free.status_code == 422
+    assert held.json() == free.json()
+    assert "holds no authorization yet" in held.json()["message"]
+    assert await _claim_rejections(claimant) == []
+    assert await _resolves_to(holder, shared) == holder
