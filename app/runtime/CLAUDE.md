@@ -48,6 +48,15 @@ Runs the tenant-scoped AI loop: sessions, safety, retrieval, grounding, handoff,
   `sessions.pending_outbound` for the next turn (yes/an address sends; no drops; anything
   else drops and the loop runs). Never to an unconfirmed address; audited as
   `channel_switch_delivery`. The arbiter's own long-SMS switch still only OFFERS.
+- Phase-2 security review (round 7): a lead holding SEVERAL confirmed identifiers of a
+  kind (a second phone, or one joined by a typed claim — WP-3c item 1 stays) sends
+  without asking only to the one THIS conversation's transport carried
+  (`confirmed_identifier(sess=…)`); otherwise it asks and offers the record's candidate
+  masked (`mask_identifier`). `_absorb_transport` fills phone/email columns only while
+  the lead has no other confirmed identifier of that kind. Who a conversation is WITH
+  (takeover reply, voice→SMS bridge, owner page contact line) is
+  `conversation_sender.py`: `sessions.transport_sender` (0074), else the participant-key
+  match, never another identifier of the same kind.
 
 ## Judgment quality (round 6 WP-G, 2026-09-08)
 - F124: live providers parse a trailing `<confidence>X</confidence>` line the prompt asks
