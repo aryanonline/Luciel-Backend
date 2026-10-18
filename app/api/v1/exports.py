@@ -67,10 +67,12 @@ async def download_export(token: str) -> RedirectResponse:
             _log.warning("export_exists_check_failed admin_id=%s", admin_id, exc_info=True)
             present = True
         if not present:
-            # The account outlived its bundle: a Luciel hard delete (day 30 of the
-            # grace window) sweeps ``vm-export-bundles/{admin_id}/`` and leaves the
-            # account shell. The token still verifies, but a presign would redirect
-            # to the bucket's raw NoSuchKey page (round 7 WP-5, item 8).
+            # The account outlived its bundle (the object is gone — e.g. removed by
+            # hand, or the bucket's lifecycle backstop ran early). A Luciel hard delete
+            # no longer sweeps bundles: only the account purge does, and that removes
+            # the account too (round 7 money review, finding 1). The token still
+            # verifies, but a presign would redirect to the bucket's raw NoSuchKey page
+            # (round 7 WP-5, item 8).
             raise ApiError(410, _EXPIRED)
         url = await store.presign(key=key, ttl_seconds=PRESIGN_TTL_SECONDS)
         await audit.emit(
