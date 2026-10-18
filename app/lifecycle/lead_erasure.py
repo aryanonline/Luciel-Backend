@@ -14,9 +14,16 @@ What goes, per lead:
     S3 — a store outage is counted and logged, never swallowed silently; the
     bucket's lifecycle backstop still bounds the object);
   * the session summaries written for the lead;
-  * the session rows are ANONYMISED, not deleted: summary text, transport key and
-    the lead link go, the row (channel, timings, counted flag) stays — it is the
-    billing/analytics record and carries no personal data once those are gone;
+  * the session rows are ANONYMISED, not deleted: summary text, transport key, the
+    lead link, the reply context persisted at ingress (the customer's email subject
+    and message id, their Meta platform id and the surface they wrote to — migration
+    0066) and any answer parked for another channel (``pending_outbound``: the body
+    plus the address the person gave) go; the row (channel, timings, counted flag)
+    stays — it is the billing/analytics record and carries no personal data once
+    those are gone. With the reply context gone a human takeover on a still-open
+    session has no recipient: nothing can be sent to an erased person.
+    ``tests/integration/test_lead_erasure.py`` walks every column of the model, so a
+    column added later must be classified there (cleared here, or kept with a reason);
   * voice call records for those sessions lose the caller's number (the
     disclosure-played proof is compliance evidence and stays);
   * deferred follow-ups addressed to the person (their contact rides in the
@@ -123,6 +130,17 @@ async def erase_lead_data(
             sess.summary = None
             sess.participant_key = None
             sess.resolved_lead_id = None
+            # The takeover reply context (migration 0066) is the person's identifier
+            # in the clear: their WhatsApp number / PSID / IGSID, their subject line,
+            # their Message-ID. ``meta_destination_id`` is the tenant's own surface,
+            # cleared with it so the row keeps no route back to them.
+            sess.inbound_subject = None
+            sess.inbound_message_id = None
+            sess.meta_sender_id = None
+            sess.meta_destination_id = None
+            # A parked channel-switch answer carries the body and the address the
+            # person supplied (migration 0063); it must not be sent after the erase.
+            sess.pending_outbound = None
             counts.sessions_anonymised += 1
 
         voice = await session.execute(

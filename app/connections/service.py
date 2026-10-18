@@ -36,7 +36,7 @@ from app.connections.secrets import (
     secret_ref_for_connection,
 )
 from app.models.audit import ActorType
-from app.models.connection import InstanceConnection
+from app.models.connection import NOT_SERVING_STATUSES, InstanceConnection
 
 if TYPE_CHECKING:
     from app.channels.tenant_twilio import TwilioCredentials
@@ -207,15 +207,22 @@ async def _single_active(
 
 
 async def list_connections(session: AsyncSession, admin_id: uuid.UUID) -> list[InstanceConnection]:
-    """All non-revoked connections for the tenant (§3.8.4: revoked rows are retained
-    but not surfaced in the live list)."""
+    """The tenant's connections as Overview lists them: every row that is serving or
+    reconnectable. Revoked rows are retained but not surfaced (§3.8.4), and a Luciel
+    in its delete drain hides its ``quiescing`` rows the same way (round 7 phase 2,
+    seams 8): ``quiescing`` is not in ``ConnectionStatusWire``, and listing it raw
+    made a deleted Luciel's Overview read "N need attention" over connections that
+    were healthy and merely draining. The rows are listed again with their stashed
+    status the moment the Luciel is restored. ``_single_active`` is deliberately NOT
+    narrowed the same way: a re-attach during grace must still find the draining
+    row, which ``uq_conn_active_type`` still counts as the type's single slot."""
     return list(
         (
             await session.execute(
                 select(InstanceConnection)
                 .where(
                     InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.status != "revoked",
+                    InstanceConnection.status.not_in(sorted(NOT_SERVING_STATUSES)),
                 )
                 .order_by(InstanceConnection.created_at)
             )
@@ -1365,6 +1372,44 @@ async def _cascade_dependents(
     return {"tools": disabled_tools, "channels": disabled_channels}
 
 
+async def reset_crm_push_state(
+    session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> int:
+    """Return every lead of the instance to "nothing was ever attempted" in the CRM.
+
+    The four ``crm_*`` stamps describe a push against ONE CRM account. Once that
+    account is no longer the connected one — a disconnect, a swap (``clear_crm_links``),
+    or a restore that could not revive the credential the leads were pushed with
+    (``lifecycle.state_machine._requalify_crm_links``, round 7 phase 2 seams 7) — a
+    lead stamped ``synced`` keeps reading "in your CRM" on the Leads page against an
+    account it was never pushed to, is skipped by the one-time backfill into the new
+    account (which selects ``crm_push_status IS NULL``) and still counts in the
+    "leads to CRM" numbers; a ``failed`` one keeps counting as a broken push against a
+    connection that no longer exists. Every stamp returns to NULL, including the
+    once-per-lead failure notice, so the next connection starts clean and its first
+    failure is reported. Returns the number of leads reset; the caller audits it with
+    the links it cleared, never with lead PII."""
+    from sqlalchemy import update as sa_update  # noqa: PLC0415
+
+    from app.models.lead import Lead  # noqa: PLC0415
+
+    result = await session.execute(
+        sa_update(Lead)
+        .where(
+            Lead.admin_id == admin_id,
+            Lead.instance_id == instance_id,
+            Lead.crm_push_status.is_not(None),
+        )
+        .values(
+            crm_push_status=None,
+            crm_push_detail=None,
+            crm_pushed_at=None,
+            crm_failure_notified_at=None,
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 async def clear_crm_links(
     session: AsyncSession,
     *,
@@ -1384,14 +1429,12 @@ async def clear_crm_links(
     stamped ``synced`` kept reading "in your CRM" on the Leads page after the CRM
     was disconnected — or swapped for an account it was never pushed to — and a
     ``failed`` one kept counting as a broken push against a connection that no
-    longer exists. Every stamp returns to NULL ("nothing was ever attempted"),
-    including the once-per-lead failure notice, so the next connection starts
-    clean and its first failure is reported."""
+    longer exists. :func:`reset_crm_push_state` returns every stamp to NULL
+    ("nothing was ever attempted"); the restore path shares it, so the three ways a
+    CRM account stops being the connected one forget the same state."""
     from sqlalchemy import delete as sa_delete  # noqa: PLC0415
-    from sqlalchemy import update as sa_update  # noqa: PLC0415
 
     from app.models.crm_link import CrmLeadLink  # noqa: PLC0415
-    from app.models.lead import Lead  # noqa: PLC0415
 
     cleared_result = await session.execute(
         sa_delete(CrmLeadLink).where(
@@ -1400,21 +1443,9 @@ async def clear_crm_links(
         )
     )
     cleared_count = int(getattr(cleared_result, "rowcount", 0) or 0)
-    reset_result = await session.execute(
-        sa_update(Lead)
-        .where(
-            Lead.admin_id == admin_id,
-            Lead.instance_id == connection.instance_id,
-            Lead.crm_push_status.is_not(None),
-        )
-        .values(
-            crm_push_status=None,
-            crm_push_detail=None,
-            crm_pushed_at=None,
-            crm_failure_notified_at=None,
-        )
+    leads_reset = await reset_crm_push_state(
+        session, admin_id=admin_id, instance_id=connection.instance_id
     )
-    leads_reset = int(getattr(reset_result, "rowcount", 0) or 0)
     await audit.emit(
         session,
         admin_id=admin_id,

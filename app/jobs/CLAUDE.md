@@ -17,7 +17,7 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
 - `tests/unit/test_sweep_scheduling.py`.
 
 ## Gotchas from the 2026-08-06 truth delta
-- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), the 90-day transcript hot→cold archive (Commitment #38), and the 5-minute BYO-mailbox delta poll (`mailbox_poll` — a TRANSPORT, not a compliance sweep; candidates are only CONNECTED outlook rows, migration 0038).
+- Lifecycle sweeps prove unverified purge, retention, delete/close grace, lead prune, dunning, audit retention, usage reconcile, session finalization (hourly close + §3.4.7 summarize), the 90-day transcript hot→cold archive (Commitment #38), and the 5-minute BYO-mailbox delta poll (`mailbox_poll` — a TRANSPORT, not a compliance sweep; candidates are CONNECTED outlook rows plus QUIESCING ones stashed as connected, migrations 0038 + 0071 — the poll is the only inbound door a draining mailbox has, so the delete drain is unreachable on email without it).
 - “Freed” pages may be reused; files shrink only after explicit `VACUUM FULL`.
 
 ## deferred (round 7 WP-4b item 8, 2026-09-28)
@@ -26,6 +26,15 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
   the ObservabilityStack's hourly alarm reads. Emitted AFTER the drain so a page this run
   delivered is not counted; nothing is emitted when the count could not be taken.
   `DEFERRED_SWEEP_INTERVAL` there is a copy of this sweep's cron and a unit test refuses drift.
+
+## The process drains what it scheduled (round 7 phase 2 review, 2026-10-04)
+- A sweep that writes an escalation row only QUEUES the owner notification (a background task
+  started after the tenant's commit). `__main__._run_sweep` awaits
+  `escalation_dispatch.drain_background_notifications()` for at most 60 s after the sweep, in a
+  `finally`; under the old bare `asyncio.run(sweep())` the page was cancelled at process exit and
+  the row read `pending` forever. A timeout logs `sweep_notification_drain_timeout` at ERROR
+  (SweepErrors alarms) and keeps the exit code. Notifications only — never the retry ladder, and
+  never inside `_per_tenant` (the API process's in-process mailbox poller shares it).
 
 ## daily_brief (round 6 WP-F, 2026-09-07)
 - Hourly sweep; a tenant is due once its LOCAL clock (instances.timezone, UTC when unset)

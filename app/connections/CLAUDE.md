@@ -15,6 +15,10 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
 - Connection lifecycle: Connect → healthy / Action needed / Reconnect → Disconnect → Switch; swap keeps old credentials serving until verification.
 - Store tenant secrets under `vm/`; disconnect clears credentials and is audited.
 - Be honestly disabled/action-needed for unconfigured providers or unbound channel destinations.
+- `list_connections` (GET /connections, the Overview list) hides every NOT_SERVING row — revoked
+  and a deleted Luciel's `quiescing` ones alike (the raw drain status is not a wire status); the
+  rows reappear with their stashed status on restore. `_single_active` still finds a quiescing
+  row so a re-attach during grace reuses the type's single slot.
 
 ## Testing pointers
 - `tests/contract/test_connection_lifecycle.py`, `test_connections.py`, and OAuth callback tests.

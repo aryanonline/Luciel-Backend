@@ -381,8 +381,15 @@ async def _send_meta(
     # row still "sent" through a token Graph then rejected, and the failure collapsed
     # to a generic send_failed with "try again" copy. The truth is that the owner has
     # to reconnect Meta — say so in the wire vocabulary.
+    # A QUIESCING grant (a Luciel in its delete drain, round 7 WP-5) is judged by the
+    # status it had before the delete, exactly as the SMS and email gates judge theirs:
+    # the token is intact until the day-30 cascade and the reply to the in-flight
+    # WhatsApp / Messenger / Instagram customer is what the drain owes them. Reading
+    # the raw status here refused that reply and paged the owner to reconnect a
+    # healthy grant. A quiescing row with no stash, or one that was already expired /
+    # errored before the delete, still refuses.
     row = await _connection_row(session, admin_id, instance_id, grant)
-    if row is not None and row.status != "connected":
+    if row is not None and _serving_status(row) != "connected":
         return DeliveryReceipt(accepted=False, detail="meta_reconnect_needed")
     meta_sender = await build_tenant_meta_sender(
         session, admin_id, instance_id, connection_type=grant

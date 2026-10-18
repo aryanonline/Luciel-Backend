@@ -255,8 +255,10 @@ async def _requalify_crm_links(
     new row that superseded it), or the row restores ``unconfigured`` and must be
     reconnected — and a stale id there does not merely 404-heal: it PATCHes whatever
     contact carries that id in the other portal. Cleared exactly as a disconnect or a
-    swap clears them (``connections.service.clear_crm_links``); the next push relinks
-    by the documented search-by-key step. Audited with a count, never a lead key."""
+    swap clears them (``connections.service.clear_crm_links``): the link rows go, and
+    with them the leads' CRM push stamps (``connections.service.reset_crm_push_state``,
+    round 7 phase 2 seams 7). The next push relinks by the documented search-by-key
+    step. Audited with counts, never a lead key."""
     stmt = delete(CrmLeadLink).where(
         CrmLeadLink.admin_id == inst.admin_id, CrmLeadLink.instance_id == inst.id
     )
@@ -264,7 +266,22 @@ async def _requalify_crm_links(
         stmt = stmt.where(CrmLeadLink.provider.not_in(sorted(intact_providers)))
     result = await session.execute(stmt)
     cleared = int(getattr(result, "rowcount", 0) or 0)
-    if cleared:
+    leads_reset = 0
+    if not intact_providers:
+        # The per-lead stamps go with the links. ``Lead`` has no provider column and
+        # CRM is single-active per type, so the stamps are kept exactly when a CRM
+        # connection came back intact (they then describe the account that IS
+        # connected) and reset otherwise — keyed on the connection, not on how many
+        # link rows happened to exist. Left stamped ``synced``, a lead read "in your
+        # CRM" against an account it was never pushed to, was skipped by the one-time
+        # backfill into the new account (``crm_push_status IS NULL``), and still
+        # counted in the "leads to CRM" numbers.
+        from app.connections.service import reset_crm_push_state  # noqa: PLC0415
+
+        leads_reset = await reset_crm_push_state(
+            session, admin_id=inst.admin_id, instance_id=inst.id
+        )
+    if cleared or leads_reset:
         current = next(
             (
                 c
@@ -284,6 +301,7 @@ async def _requalify_crm_links(
                 "connection_id": str(current.connection_id) if current else None,
                 "provider": current.provider if current else None,
                 "count": cleared,
+                "leads_reset": leads_reset,
                 "reason": "restore_crm_connection_changed",
             },
         )
