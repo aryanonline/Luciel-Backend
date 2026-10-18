@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import gc
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -138,6 +140,32 @@ def _watchdog_fire(nodeid: str) -> None:
             lines.append(f"-- {task!r}")
             for frame in task.get_stack(limit=12):
                 lines.extend(traceback.format_stack(frame, limit=1))
+    # A task's stack stops at an async-generator fixture's finalizer ("await
+    # gen_obj.__anext__()") and never shows the fixture's own frame — the 2026-10-12
+    # nightly hung in exactly such a teardown and the dump could not say which one.
+    # Every suspended async generator and the chain it is awaiting is listed here.
+    lines.append("suspended async generators (fixtures) and what they await:")
+    for obj in gc.get_objects():
+        if not isinstance(obj, types.AsyncGeneratorType) or obj.ag_frame is None:
+            continue
+        code = obj.ag_frame.f_code
+        lines.append(
+            f"-- {code.co_name} ({code.co_filename}:{obj.ag_frame.f_lineno})"
+            f"{' running' if obj.ag_running else ''}"
+        )
+        awaited: object = obj.ag_await
+        depth = 0
+        while awaited is not None and depth < 8:
+            frame = getattr(awaited, "cr_frame", None) or getattr(awaited, "ag_frame", None)
+            if frame is not None:
+                lines.append(
+                    f"     awaits {frame.f_code.co_name} "
+                    f"({frame.f_code.co_filename}:{frame.f_lineno})"
+                )
+            else:
+                lines.append(f"     awaits {awaited!r}"[:300])
+            awaited = getattr(awaited, "cr_await", None) or getattr(awaited, "ag_await", None)
+            depth += 1
     try:
         lines.append("sessions on the test database:")
         lines.append(_blocking_sessions_report())
@@ -290,11 +318,25 @@ async def assert_no_bypass() -> None:
 
 @pytest_asyncio.fixture
 async def db_engine_reset() -> AsyncIterator[None]:
-    """Dispose the cached engine after each test that uses it, so settings re-read."""
-    from app.db.engine import dispose_engine
+    """Dispose the cached engine after each test that uses it, so settings re-read.
+
+    Bounded: closing a pooled asyncpg connection waits for the server's answer, and a
+    connection a cancelled task left mid-protocol never answers. The engine is then
+    dropped without closing (the next test builds a fresh one; the sockets go with
+    garbage collection) and the run summary names the test, instead of the teardown
+    hanging until the watchdog kills the job.
+    """
+    from app.db.engine import dispose_engine, reset_engine_cache
 
     yield
-    await dispose_engine()
+    try:
+        await asyncio.wait_for(dispose_engine(), timeout=30)
+    except TimeoutError:
+        reset_engine_cache()
+        _LEAKED_TRANSACTIONS.append(
+            f"{_CURRENT_TEST or '?'} -> engine dispose did not finish within 30 s "
+            "(a pooled connection never closed); engine dropped without closing"
+        )
 
 
 def new_admin_id() -> uuid.UUID:
