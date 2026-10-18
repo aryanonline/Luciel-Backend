@@ -15,7 +15,8 @@ What goes, per lead:
     bucket's lifecycle backstop still bounds the object);
   * the session summaries written for the lead;
   * the session rows are ANONYMISED, not deleted: summary text, transport key, the
-    lead link, the reply context persisted at ingress (the customer's email subject
+    lead link, the raw sender (``transport_sender`` / ``meta_sender_id``), the reply
+    context persisted at ingress (the customer's email subject
     and message id, their Meta platform id and the surface they wrote to — migration
     0066) and any answer parked for another channel (``pending_outbound``: the body
     plus the address the person gave) go; the row (channel, timings, counted flag)
@@ -129,6 +130,10 @@ async def erase_lead_data(
                 sess.archive_object_key = None
             sess.summary = None
             sess.participant_key = None
+            # The raw senders the transport carried (0066 Meta id, 0074 sms/voice/
+            # email sender) are the person's identifiers in plaintext: they go too.
+            sess.transport_sender = None
+            sess.meta_sender_id = None
             sess.resolved_lead_id = None
             # The takeover reply context (migration 0066) is the person's identifier
             # in the clear: their WhatsApp number / PSID / IGSID, their subject line,

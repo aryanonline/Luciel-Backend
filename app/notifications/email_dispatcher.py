@@ -420,6 +420,47 @@ async def send_crm_push_failed(
     )
 
 
+async def send_crm_backfill_failed(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    to: str,
+    failed: int,
+    detail: str,
+    stopped: bool,
+    sender: EmailSender | None = None,
+) -> DeliveryOutcome:
+    """ONE notice for a CRM backfill run whose pushes failed at the CRM (phase-2
+    security review): a failing CRM used to send the owner one email per lead — up to
+    a hundred from one click. The per-lead failed state is on the Leads page."""
+    leads = "1 lead" if failed == 1 else f"{failed} leads"
+    stop_line = (
+        "Luciel stopped the backfill after your CRM rejected several pushes in a row; "
+        "the leads it did not reach are still waiting and will be sent the next time "
+        "you run it.\n\n"
+        if stopped
+        else ""
+    )
+    body = (
+        f"Your CRM backfill could not push {leads} to your CRM ({detail}). "
+        "Every lead is safe in your VantageMind dashboard.\n\n"
+        f"{stop_line}"
+        "Check your CRM connection, then open the Leads page to retry the failed leads "
+        "and run the backfill again."
+    )
+    return await _dispatch(
+        session,
+        admin_id=admin_id,
+        to=to,
+        subject="Some leads did not reach your CRM",
+        body=body,
+        notice_type="crm_push_failed",
+        audit_event="crm_push_failure_emailed",
+        extra_payload={"detail": detail[:160], "leads": failed, "backfill": True},
+        sender=sender,
+    )
+
+
 async def send_payg_usage_nudge(
     session: AsyncSession,
     *,

@@ -57,6 +57,15 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
   bind refuse through the same audit + `destination_claim` bucket as the SMS attach.
   A CRM portal shared by two accounts is ALLOWED: an informational status note and
   `crm_portal_shared`, never a refusal.
+- The claim oracle, closed (round 7 phase-2 security review): the `destination_claim`
+  bucket is CONSULTED (`has_capacity`, a read) before any claim is evaluated on the
+  Meta bind, the SMS attach and the re-verify promotion — once refusals have spent it,
+  every attempt gets the same neutral 429, held id or not. The Meta bind proves the id
+  is on the caller's grant BEFORE the cross-tenant check, so a grant that does not
+  cover it (or no grant) gets one 422 either way.
+- `sessions.transport_sender` (migration 0074): the raw sms/email sender is persisted
+  at ingress by `inbound_dispatch.persist_reply_context` (voice: the pipeline, from the
+  caller) beside 0066's Meta context; lead erasure clears it with `meta_sender_id`.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

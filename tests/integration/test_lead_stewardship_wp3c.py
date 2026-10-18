@@ -367,6 +367,150 @@ async def test_backfill_is_refused_when_nothing_could_be_pushed():
     assert "switched off" in str(off.value.message)
 
 
+# --- phase-2 security review: the backfill is bounded --------------------------------- #
+class _FailingCrmApi:
+    """A CRM that answers 500 for the given lead keys (every key when ``None``) and
+    accepts the rest into ``inner``. Not a 401/403: those already flip the
+    connection and stop the pass through the broker's readiness gate."""
+
+    def __init__(self, inner: crm_backend.InMemoryCrmApi, failing: set[str] | None) -> None:
+        self.inner = inner
+        self.failing = failing
+        self.creates = 0
+
+    async def find_by_key(self, token, lead_key):
+        return await self.inner.find_by_key(token, lead_key)
+
+    async def get(self, token, record_id):
+        return await self.inner.get(token, record_id)
+
+    async def create(self, token, lead_key, fields, notes=None):
+        self.creates += 1
+        if self.failing is None or lead_key in self.failing:
+            raise crm_backend.CrmUnavailable("hubspot_create_http_500")
+        return await self.inner.create(token, lead_key, fields, notes)
+
+    async def update(self, token, record_id, lead_key, fields, notes=None):
+        return await self.inner.update(token, record_id, lead_key, fields, notes)
+
+
+async def _seed_keyed_leads(admin: uuid.UUID, iid: uuid.UUID, n: int) -> list[uuid.UUID]:
+    return [await _seed_lead(admin, iid, contact=f"lead{i}@acme.com") for i in range(n)]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_backfill_stops_after_three_crm_failures_in_a_row_with_one_notice(
+    monkeypatch, fresh_mock_crm
+):
+    """A CRM that rejects every push used to take all 100 leads of the pass — minutes
+    of a pinned connection — and email the owner once PER LEAD. The pass now stops
+    after three failures in a row, says so, leaves the rest for the next run, and
+    sends ONE notice; each failed lead keeps its own failed stamp."""
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, provider="hubspot")
+    leads = await _seed_keyed_leads(admin, iid, 10)
+    api = _FailingCrmApi(fresh_mock_crm, failing=None)
+    monkeypatch.setattr(crm_backend, "build_crm_api", lambda: api)
+
+    result = await dashboard.backfill_crm(subject=_subject(admin))
+
+    assert (result.attempted, result.synced, result.failed) == (3, 0, 3)
+    assert result.remaining == 7
+    assert result.refused_reason is not None and "3 pushes in a row" in result.refused_reason
+    assert api.creates == 3  # the CRM was not asked about the other seven
+    for lid in leads[:3]:
+        lead = await _lead(admin, lid)
+        assert lead.crm_push_status == "failed"
+        assert lead.crm_failure_notified_at is not None  # covered by the run's notice
+    for lid in leads[3:]:
+        assert (await _lead(admin, lid)).crm_push_status is None  # next pass's work
+    (notice,) = await _audit(admin, "crm_push_failure_emailed")
+    assert notice["leads"] == 3 and notice["backfill"] is True
+    (run,) = await _audit(admin, "crm_backfill_run")
+    assert run["stopped_after_failures"] is True and run["remaining"] == 7
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_backfill_failures_that_are_not_in_a_row_run_through_with_one_notice(
+    monkeypatch, fresh_mock_crm
+):
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, provider="hubspot")
+    await _seed_keyed_leads(admin, iid, 6)
+    failing = {"lead0@acme.com", "lead1@acme.com", "lead3@acme.com", "lead4@acme.com"}
+    monkeypatch.setattr(
+        crm_backend, "build_crm_api", lambda: _FailingCrmApi(fresh_mock_crm, failing)
+    )
+
+    result = await dashboard.backfill_crm(subject=_subject(admin))
+
+    assert (result.attempted, result.synced, result.failed) == (6, 2, 4)
+    assert result.remaining == 0 and result.refused_reason is None
+    (notice,) = await _audit(admin, "crm_push_failure_emailed")
+    assert notice["leads"] == 4
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_second_backfill_while_one_runs_is_refused_and_nothing_is_pushed_twice(
+    monkeypatch, fresh_mock_crm
+):
+    """Two clicks (or a load-balancer retry) used to run two passes over the same
+    uncommitted candidates: every lead pushed twice. One pass holds the tenant's run
+    lock; the other answers 409 at once and touches nothing."""
+    import asyncio
+
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin, provider="hubspot")
+    leads = await _seed_keyed_leads(admin, iid, 3)
+    entered, release = asyncio.Event(), asyncio.Event()
+    pushed: list[str] = []
+
+    class _SlowApi(_FailingCrmApi):
+        async def create(self, token, lead_key, fields, notes=None):
+            pushed.append(lead_key)
+            entered.set()
+            await release.wait()
+            return await self.inner.create(token, lead_key, fields, notes)
+
+    monkeypatch.setattr(crm_backend, "build_crm_api", lambda: _SlowApi(fresh_mock_crm, set()))
+
+    first = asyncio.create_task(dashboard.backfill_crm(subject=_subject(admin)))
+    await asyncio.wait_for(entered.wait(), timeout=30)
+    with pytest.raises(ApiError) as busy:
+        # Bounded: without the run lock this second pass would block on the same
+        # slow CRM (and push every lead again once released).
+        await asyncio.wait_for(dashboard.backfill_crm(subject=_subject(admin)), timeout=30)
+    assert busy.value.status_code == 409
+    assert "already running" in str(busy.value.message)
+    release.set()
+    result = await asyncio.wait_for(first, timeout=60)
+
+    assert (result.attempted, result.synced) == (3, 3)
+    assert sorted(pushed) == ["lead0@acme.com", "lead1@acme.com", "lead2@acme.com"]
+    assert len(fresh_mock_crm.records) == 3  # each lead pushed exactly once
+    for lid in leads:
+        assert (await _lead(admin, lid)).crm_push_status == "synced"
+    assert len(await _audit(admin, "crm_backfill_run")) == 1
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_backfill_is_rate_limited_per_tenant_before_any_work():
+    admin = uuid.uuid4()
+    await _seed_tenant(admin, provider="hubspot")
+    for _ in range(2):  # the burst
+        result = await dashboard.backfill_crm(subject=_subject(admin))
+        assert result.attempted == 0
+    with pytest.raises(ApiError) as limited:
+        await dashboard.backfill_crm(subject=_subject(admin))
+    assert limited.value.status_code == 429
+    assert len(await _audit(admin, "crm_backfill_run")) == 2  # the third did no work
+
+    # Per tenant: another account's backfill is unaffected.
+    other = uuid.uuid4()
+    await _seed_tenant(other, provider="hubspot")
+    assert (await dashboard.backfill_crm(subject=_subject(other))).attempted == 0
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_single_lead_retry_accepts_a_never_attempted_row(fresh_mock_crm):
     admin = uuid.uuid4()

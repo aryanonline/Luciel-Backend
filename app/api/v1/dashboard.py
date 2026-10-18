@@ -409,24 +409,30 @@ async def _takeover_recipient(
     s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel
 ) -> str | None:
     """The identifier a human reply on THIS session's channel can reach (round 7
-    WP-3b, item 1), or None when the lead is not known by one of that kind.
+    WP-3b, item 1), or None when the conversation's own recipient cannot be told.
 
     ``Lead.contact_identifier`` is whichever identity the record was keyed on FIRST —
     after a widget-then-SMS unification that is the older, email-keyed row — so it is
     not, in general, an identifier the session's transport can deliver to; the reply
-    used to go to it regardless of channel. The destination is picked by the session's
-    channel kind from the identifiers the lead is known by (own columns, then the
-    ``lead_identifiers`` rows a unification re-pointed — confirmed ones first):
+    used to go to it regardless of channel. Nor is "an identifier of the session's
+    kind" enough (phase-2 security review): a lead known by TWO phones — a second
+    number, or one joined to the record by a typed claim — had the reply texted to
+    the number the record was keyed on, not the one in the conversation, and stamped
+    delivered. The reply goes to the person the conversation is WITH:
 
-      * email → an email identifier;
-      * sms / voice → an E.164 phone (a voice reply bridges to a text);
+      * sms / voice / email → the raw sender the transport carried, persisted on the
+        session at ingress (``transport_sender``, migration 0074); for a session from
+        before that column, the call record's caller (voice) or the lead identifier
+        whose participant key IS the session's (``conversation_sender``). Nothing
+        matches → None (``no_recipient_for_channel``), never another identifier of
+        the same kind. A voice reply bridges to a text to that caller.
       * Meta → the platform-scoped sender id persisted for the session at ingress
         (item 7). A session from before that column can use the record's own key only
         when it IS a platform-scoped id — never an email or phone from another channel.
 
     The widget has no transport at all and is reported as ``widget_poll_only`` by the
     sender; nothing is picked for it here."""
-    from app.models.lead import LeadIdentifier  # noqa: PLC0415
+    from app.runtime.conversation_sender import conversation_sender  # noqa: PLC0415
     from app.runtime.lead_capture import identifier_kind  # noqa: PLC0415
 
     if sess.channel in outbound.POLL_ONLY_CHANNELS:
@@ -439,30 +445,7 @@ async def _takeover_recipient(
         if own and identifier_kind(own) == "transport":
             return own.strip()
         return None
-    if lead is None:
-        return None
-    kind = "email" if sess.channel == "email" else "phone"
-    volunteered = lead.email if kind == "email" else lead.phone
-    for value in (lead.contact_identifier, volunteered):
-        if value and identifier_kind(value) == kind:
-            return value.strip()
-    known: str | None = (
-        await s.execute(
-            select(LeadIdentifier.value)
-            .where(
-                LeadIdentifier.admin_id == admin_id,
-                LeadIdentifier.lead_id == lead.id,
-                LeadIdentifier.kind == kind,
-            )
-            .order_by(
-                LeadIdentifier.confirmed_at.desc().nulls_last(),
-                LeadIdentifier.created_at.desc(),
-                LeadIdentifier.id.desc(),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return known
+    return await conversation_sender(s, admin_id=admin_id, sess=sess, lead=lead)
 
 
 async def _bridge_voice_reply_to_sms(
@@ -927,6 +910,11 @@ async def list_leads(
 #: says how many remain and the dashboard calls again.
 CRM_BACKFILL_BATCH = 100
 _CRM_BACKFILL_SCAN = 1000
+#: A pass stops after this many CRM failures IN A ROW (phase-2 security review): a
+#: CRM that rejects or hangs on every push would otherwise hold the request — and its
+#: pooled connection — open for the whole batch. The leads not reached stay untouched
+#: for the next pass.
+CRM_BACKFILL_FAILURE_STOP = 3
 
 
 @router.post("/leads/crm-backfill", response_model=CrmBackfillResult)
@@ -941,8 +929,19 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
     and every push goes through the standard broker path (authorization, connection
     health, the key-ownership guard) exactly like a capture push. 409 when the CRM
     cannot be pushed to at all, so the owner is told what to fix instead of watching
-    a button do nothing."""
-    from app.runtime.crm_push import push_captured_lead  # noqa: PLC0415
+    a button do nothing.
+
+    Bounded per tenant (phase-2 security review): a ``crm_backfill`` bucket is
+    charged before any database work (429 once spent); one pass runs at a time — a
+    transaction-scoped advisory lock is the first statement, and a second click while
+    a pass runs answers 409 instead of pushing the same uncommitted candidates twice;
+    the pass stops after :data:`CRM_BACKFILL_FAILURE_STOP` CRM failures in a row with
+    the rest left for the next call; and a failing CRM produces ONE owner notice per
+    pass (the per-lead ``failed`` stamp stays), not one email per lead."""
+    from app.api.errors import rate_limited  # noqa: PLC0415
+    from app.channels import rate_limit  # noqa: PLC0415
+    from app.db.session import claim_sweep_lock  # noqa: PLC0415
+    from app.runtime.crm_push import notify_backfill_failures, push_captured_lead  # noqa: PLC0415
     from app.runtime.lead_capture import (  # noqa: PLC0415
         CaptureResult,
         crm_lead_key,
@@ -950,7 +949,16 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
     )
     from app.tools.registry import make_tool_resolver  # noqa: PLC0415
 
+    if not rate_limit.get_store().check_source("crm_backfill", str(subject.admin_id)).allowed:
+        raise rate_limited(
+            "Too many CRM backfills. Please wait a minute and run it again.",
+            retry_after_seconds=60,
+        )
     async with tenant_session(subject.admin_id) as s:
+        if not await claim_sweep_lock(s, "crm_backfill", subject.admin_id):
+            raise conflict(
+                "A CRM backfill is already running. Wait for it to finish, then run it again."
+            )
         instance_id = (
             await s.execute(select(Instance.id).where(Instance.admin_id == subject.admin_id))
         ).scalar_one_or_none()
@@ -991,8 +999,11 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
         batch, rest = keyed[:CRM_BACKFILL_BATCH], keyed[CRM_BACKFILL_BATCH:]
         attempted = synced = failed = 0
         refused_reason: str | None = None
+        failed_leads: list[Lead] = []
+        in_a_row = 0
+        stopped = False
         resolver = make_tool_resolver()
-        for lead in batch:
+        for index, lead in enumerate(batch):
             receipt = await push_captured_lead(
                 s,
                 admin_id=subject.admin_id,
@@ -1004,6 +1015,8 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
                 snapshot_tool_ids=None,
                 tool_resolver=resolver,
                 session_id=None,
+                # One notice for the whole pass (below), not one email per lead.
+                notify=False,
             )
             if receipt is None:
                 skipped_no_key += 1
@@ -1012,13 +1025,30 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
                 # The broker refused for the TENANT (tool off / not ready): nothing
                 # was attempted for this lead and nothing will be for the rest.
                 refused_reason = receipt.refusal_reason
-                rest = [lead, *batch[batch.index(lead) + 1 :], *rest]
+                rest = [lead, *batch[index + 1 :], *rest]
                 break
             attempted += 1
             if receipt.outcome == "ok":
                 synced += 1
-            else:
-                failed += 1
+                in_a_row = 0
+                continue
+            failed += 1
+            failed_leads.append(lead)
+            in_a_row += 1
+            if in_a_row >= CRM_BACKFILL_FAILURE_STOP:
+                # The CRM is rejecting (or timing out on) everything: stop holding
+                # the request open. This lead is stamped failed; the ones after it
+                # were never tried and stay in the candidate set for the next pass.
+                stopped = True
+                refused_reason = (
+                    f"your CRM rejected {in_a_row} pushes in a row, so the backfill "
+                    "stopped; fix the CRM connection and run it again"
+                )
+                rest = [*batch[index + 1 :], *rest]
+                break
+        await notify_backfill_failures(
+            s, admin_id=subject.admin_id, leads=failed_leads, stopped=stopped
+        )
         remaining = len(rest)
         await audit.emit(
             s,
@@ -1035,6 +1065,7 @@ async def backfill_crm(subject: Subject = Depends(current_admin)) -> CrmBackfill
                 "skipped_no_key": skipped_no_key,
                 "remaining": remaining,
                 "refused_reason": refused_reason,
+                "stopped_after_failures": stopped,
             },
         )
         await s.flush()

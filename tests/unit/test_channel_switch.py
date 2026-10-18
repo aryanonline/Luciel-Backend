@@ -11,6 +11,7 @@ from app.runtime.channel_switch import (
     identifier_for,
     is_confirmation,
     is_decline,
+    mask_identifier,
     new_pending,
     sent_line,
 )
@@ -62,10 +63,20 @@ def test_pending_round_trips_and_the_copy_never_claims_real_time():
         ask_line("email", None)
         == "Happy to email you this. What's the best email address to send it to?"
     )
+    # The candidate comes off the lead record and is offered MASKED (phase-2 review):
+    # whoever is asking may have reached the record by typing someone's email.
     assert ask_line("sms", "+16045550123").startswith(
-        "Happy to text you this. Should I send it to +16045550123?"
+        "Happy to text you this. Should I send it to the number ending in 0123?"
     )
+    assert "+16045550123" not in ask_line("sms", "+16045550123")
+    assert "d***@lead.example" in ask_line("email", "dana@lead.example")
     assert (
         sent_line("email", "dana@lead.example") == "Sent — check your email at dana@lead.example."
     )
     assert "right now" not in DECLINED_LINE
+
+
+def test_a_masked_identifier_is_recognisable_but_never_whole():
+    assert mask_identifier("+16045550123") == "the number ending in 0123"
+    assert mask_identifier("Dana@Lead.Example") == "D***@Lead.Example"
+    assert mask_identifier("") == "the number on file"

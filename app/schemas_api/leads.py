@@ -50,6 +50,8 @@ class CrmBackfillResult(WireModel):
     failed: int
     skipped_no_key: int
     remaining: int
-    # The broker refused before reaching the CRM (tool off / connection not ready):
-    # nothing was attempted. Null when the CRM accepted the batch.
+    # Why the pass ended early, in plain words: the broker refused before reaching
+    # the CRM (tool off / connection not ready — nothing was attempted), or the CRM
+    # rejected several pushes in a row and the pass stopped (phase-2 review; the
+    # leads not reached are counted in ``remaining``). Null when the pass ran through.
     refused_reason: str | None = None

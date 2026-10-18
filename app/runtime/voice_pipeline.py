@@ -48,6 +48,7 @@ from app.employee.context import build_operating_context
 from app.models.audit import ActorType
 from app.models.instance import Instance, is_paused
 from app.models.voice import VoiceCallRecord
+from app.runtime.conversation_sender import clip_sender
 from app.runtime.knowledge_retrieval import (
     make_chunk_attributor,
     make_retriever,
@@ -242,6 +243,12 @@ async def handle_turn(
         resolved_lead_id=None,
         participant_key=participant_key_for(admin_id, "voice", provider_call_id or from_number),
     )
+    # The caller's number, raw (migration 0074): the session is keyed on the CALL, so
+    # its participant key names no number — a takeover reply bridged to a text and the
+    # owner page reach THIS caller, not whichever phone the lead record is keyed on.
+    caller = clip_sender(from_number)
+    if caller and sess.transport_sender != caller:
+        sess.transport_sender = caller
     if provider_call_id is not None:
         # Join the session onto the call's disclosure record (§3.1.2): set once, never
         # re-pointed — the first turn wins, matching "one call, one session".

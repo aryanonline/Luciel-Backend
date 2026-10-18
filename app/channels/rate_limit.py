@@ -94,6 +94,11 @@ LIMITS: dict[str, ChannelLimits] = {
     # 15-minute window). Brute force is bounded by the per-code attempt counter (five,
     # then the code is dead) and the code-send budget above; this only stops a flood.
     "escalation_code_entry": ChannelLimits(burst=15, refill_seconds=60.0, daily_cap=100),
+    # Owner-triggered CRM backfill passes, per admin (phase-2 security review): each
+    # pass pushes up to 100 leads through outbound CRM calls, so a click-storm (or a
+    # retry loop on a slow CRM) must not become a pool-pinning, CRM-hammering mill.
+    # A tenant with a large backlog still gets a pass a minute after the burst.
+    "crm_backfill": ChannelLimits(burst=2, refill_seconds=60.0, daily_cap=50),
     # Account-export downloads per signed link (adversarial review R-WP2-2): the
     # door is unauthenticated by design (the token is the authorization), so a
     # leaked or replayed link must not become an unbounded audit-row + presign mill.
@@ -205,6 +210,26 @@ class TokenBucketStore:
             return RateLimitResult(False, "daily_cap")
         return RateLimitResult(True)
 
+    def has_capacity(self, channel: str, source_id: str) -> bool:
+        """Would :meth:`check_source` admit one more right now? A READ: it charges
+        nothing and records no abuse. The destination-claim gate consults the bucket
+        BEFORE a claim is evaluated (phase-2 security review) — once refusals have
+        spent it, every claim attempt is answered alike, held id or not."""
+        limits = LIMITS.get(channel)
+        if limits is None:
+            return True
+        key = f"{channel}:{source_id}"
+        now = self._now()
+        expiry = self._blocked.get(key)
+        if expiry is not None and expiry > now:
+            return False
+        tokens, last = self._tokens.get(key, (float(limits.burst), now))
+        if min(float(limits.burst), tokens + max(0.0, now - last) / limits.refill_seconds) < 1.0:
+            return False
+        today = _utc_day(self._wall())
+        dcount, day = self._daily.get(key, (0, today))
+        return day != today or dcount < limits.daily_cap
+
     def check_tenant(self, admin_id: str) -> RateLimitResult:
         now = self._now()
         count, window = self._tenant_minute.get(admin_id, (0, now))
@@ -294,6 +319,26 @@ class RedisTokenBucketStore:
             return RateLimitResult(True)
         except Exception:  # noqa: BLE001 — any redis error → degrade, never fail open
             return self._degraded().check_source(channel, source_id)
+
+    def has_capacity(self, channel: str, source_id: str) -> bool:
+        """See ``TokenBucketStore.has_capacity``: the same windows, read not charged."""
+        limits = LIMITS.get(channel)
+        if limits is None:
+            return True
+        key = f"{channel}:{source_id}"
+        try:
+            if self._client.exists(f"rl:b:{key}"):  # type: ignore[attr-defined]
+                return False
+            wall = time.time()
+            window = max(1, math.ceil(limits.burst * limits.refill_seconds))
+            slot = int(wall // window)
+            used = int(self._client.get(f"rl:w:{key}:{slot}") or 0)  # type: ignore[attr-defined]
+            if used >= limits.burst:
+                return False
+            day = int(self._client.get(f"rl:d:{key}:{_utc_day(wall)}") or 0)  # type: ignore[attr-defined]
+            return day < limits.daily_cap
+        except Exception:  # noqa: BLE001 — any redis error → degrade, never fail open
+            return self._degraded().has_capacity(channel, source_id)
 
     def check_tenant(self, admin_id: str) -> RateLimitResult:
         try:

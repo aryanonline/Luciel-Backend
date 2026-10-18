@@ -91,10 +91,26 @@ async def _crm_provider(
     return str(provider) if provider else None
 
 
+async def _owner_email(session: AsyncSession, admin_id: uuid.UUID) -> str | None:
+    from app.models.instance import Account  # noqa: PLC0415
+
+    email = (
+        await session.execute(select(Account.email).where(Account.id == admin_id))
+    ).scalar_one_or_none()
+    return str(email) if email else None
+
+
 async def _stamp_and_notify(
-    session: AsyncSession, *, admin_id: uuid.UUID, lead: Lead, outcome: str, reason: str | None
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    lead: Lead,
+    outcome: str,
+    reason: str | None,
+    notify: bool = True,
 ) -> None:
-    """Record the honest CRM state on the lead (F134); email the owner once per lead."""
+    """Record the honest CRM state on the lead (F134); email the owner once per lead
+    (``notify=False``: the caller sends one notice for a whole run instead)."""
     now = datetime.now(UTC)
     if outcome == "ok":
         lead.crm_push_status = "synced"
@@ -105,14 +121,11 @@ async def _stamp_and_notify(
         return  # a refusal: nothing was attempted, nothing to report as broken
     lead.crm_push_status = "failed"
     lead.crm_push_detail = (reason or "failed")[:160]
-    if lead.crm_failure_notified_at is not None:
+    if not notify or lead.crm_failure_notified_at is not None:
         return
-    from app.models.instance import Account  # noqa: PLC0415
     from app.notifications import email_dispatcher  # noqa: PLC0415
 
-    owner_email = (
-        await session.execute(select(Account.email).where(Account.id == admin_id))
-    ).scalar_one_or_none()
+    owner_email = await _owner_email(session, admin_id)
     if not owner_email:
         return
     try:
@@ -129,6 +142,39 @@ async def _stamp_and_notify(
     lead.crm_failure_notified_at = now
 
 
+async def notify_backfill_failures(
+    session: AsyncSession, *, admin_id: uuid.UUID, leads: list[Lead], stopped: bool
+) -> None:
+    """ONE owner notice for a backfill run whose pushes failed at the CRM (phase-2
+    security review): the run pushes with ``notify=False``, so a failing CRM no
+    longer mails the owner once per lead. The leads it covers are stamped notified,
+    keeping "once per lead" for any later capture-time failure. Never raises."""
+    if not leads:
+        return
+    from app.notifications import email_dispatcher  # noqa: PLC0415
+
+    owner_email = await _owner_email(session, admin_id)
+    if not owner_email:
+        return
+    detail = next((lead.crm_push_detail for lead in reversed(leads) if lead.crm_push_detail), None)
+    try:
+        await email_dispatcher.send_crm_backfill_failed(
+            session,
+            admin_id=admin_id,
+            to=owner_email,
+            failed=len(leads),
+            detail=detail or "failed",
+            stopped=stopped,
+        )
+    except Exception:  # noqa: BLE001 — the notice must never break the run's answer
+        logger.exception("crm_backfill_failure_notice_failed")
+        return
+    now = datetime.now(UTC)
+    for lead in leads:
+        if lead.crm_failure_notified_at is None:
+            lead.crm_failure_notified_at = now
+
+
 async def push_captured_lead(
     session: AsyncSession,
     *,
@@ -139,6 +185,7 @@ async def push_captured_lead(
     snapshot_tool_ids: frozenset[str] | set[str] | None,
     tool_resolver: Callable[[str], Any] | None,
     session_id: uuid.UUID | None,
+    notify: bool = True,
 ) -> PushReceipt | None:
     """Push this turn's changed lead facts to the tenant's CRM, broker-gated.
 
@@ -147,7 +194,9 @@ async def push_captured_lead(
     changed, the lead has no key the connected CRM accepts, the tool is outside
     this conversation's snapshot, or no backend resolves. Broker refusals
     (disabled tool, disconnected or dormant connection) resolve inside dispatch
-    and land in the tool trace — exactly as a model-proposed call would."""
+    and land in the tool trace — exactly as a model-proposed call would.
+    ``notify=False`` keeps the lead's failed stamp but leaves the owner notice to
+    the caller (the CRM backfill sends one per run)."""
     changed = dict(captured.changed)
     # `contact` and `email` are the CRM KEY, not CRM fields — the key rides as
     # lead_key, never in the payload. (When a phone-keyed lead's volunteered
@@ -193,6 +242,11 @@ async def push_captured_lead(
         logger.info("crm_push_on_capture_not_ok outcome=%s", outcome)
     if lead is not None:
         await _stamp_and_notify(
-            session, admin_id=admin_id, lead=lead, outcome=outcome, reason=result.reason
+            session,
+            admin_id=admin_id,
+            lead=lead,
+            outcome=outcome,
+            reason=result.reason,
+            notify=notify,
         )
     return PushReceipt(outcome=outcome, reason=result.reason)

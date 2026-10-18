@@ -103,6 +103,8 @@ async def _seed_person(
                 channel="sms",
                 mode="ai",
                 participant_key="+16045550100",
+                # The raw sender the SMS transport carried (migration 0074).
+                transport_sender="+16045550100",
                 resolved_lead_id=lead_id,
                 summary="Jane asked for a quote",
                 archive_object_key=f"vm/{admin}/transcripts/{iid}/{sid}.jsonl",
@@ -221,6 +223,8 @@ async def test_the_cascade_takes_everything_and_leaves_the_neighbour(cold_store)
         sess = (await s.execute(select(Session).where(Session.id == sid))).scalar_one()
         assert (sess.summary, sess.participant_key, sess.resolved_lead_id) == (None, None, None)
         assert sess.archive_object_key is None
+        # The plaintext sender the session held for a takeover reply goes too (0074).
+        assert sess.transport_sender is None
         voice = (await s.execute(select(VoiceCallRecord))).scalar_one()
         assert voice.from_number == ""
         assert voice.disclosure_played_at is not None  # compliance proof stays

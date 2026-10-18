@@ -7,6 +7,13 @@ SMS, their own address on email) is confirmed at capture; one typed into the sam
 message as the request is theirs by construction; anything else is ASKED for, the
 answer parked on the session, and sent on the next turn once they confirm or supply
 it. The reply on the channel they wrote on always keeps the full answer.
+
+A confirmed identifier is a delivery address for the conversation it came from, not
+for every conversation on the lead (phase-2 security review): a number that joined a
+lead through a typed claim (WP-3c item 1 - "it's Jane, jane@acme.com" from a new
+phone) is recorded on the lead, but when the lead holds more than one confirmed
+identifier of a kind, only the one this conversation's own transport carried is used
+without asking; otherwise Luciel asks and offers the record's candidate MASKED.
 """
 
 from __future__ import annotations
@@ -20,8 +27,9 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.conversation import Transcript
+from app.models.conversation import Session, Transcript
 from app.models.lead import LeadIdentifier
+from app.runtime.conversation_sender import is_session_sender
 from app.runtime.lead_capture import identifier_kind, normalize_identifier, normalize_phone
 
 #: outbound channel -> the identifier kind it needs
@@ -118,11 +126,28 @@ def new_pending(channel: str, body: str, candidate: str | None) -> PendingOutbou
 # --- copy (deterministic, never a real-time claim) --------------------------------------
 
 
+def mask_identifier(value: str) -> str:
+    """An address/number as it may be SHOWN to whoever is in the conversation: enough
+    for the real owner to recognise it, never the whole identifier. The candidate an
+    ask offers comes off the lead record, and the person asking may have reached that
+    record by typing someone's email (§3.4.9: a typed identifier never gates a PII
+    disclosure)."""
+    text = value.strip()
+    if "@" in text:
+        local, _, domain = text.partition("@")
+        return f"{local[:1]}***@{domain}"
+    digits = re.sub(r"\D", "", text)
+    return f"the number ending in {digits[-4:]}" if digits else "the number on file"
+
+
 def ask_line(channel: str, candidate: str | None) -> str:
     noun = "email" if channel == "email" else "text"
     what = "email address" if channel == "email" else "mobile number"
     if candidate:
-        return f"Happy to {noun} you this. Should I send it to {candidate}? Reply yes to confirm."
+        return (
+            f"Happy to {noun} you this. Should I send it to {mask_identifier(candidate)}? "
+            "Reply yes to confirm."
+        )
     return f"Happy to {noun} you this. What's the best {what} to send it to?"
 
 
@@ -159,26 +184,47 @@ async def confirmed_identifier(
     instance_id: uuid.UUID,
     lead_id: uuid.UUID | None,
     kind: str,
+    sess: Session | None = None,
+    transport_identifier: str | None = None,
 ) -> str | None:
     """An identifier of ``kind`` the customer has CONFIRMED (transport-carried or
-    confirmed in conversation); the most recently confirmed one when several."""
+    confirmed in conversation) that THIS conversation may send to without asking.
+
+    One confirmed identifier of the kind: that one. Several (a customer's second
+    phone, or a number that joined the lead through a typed claim - WP-3c item 1):
+    only the one this conversation's own transport carried (``transport_identifier``,
+    else the session's persisted sender / participant key); none of them → None, so
+    the caller ASKS instead of silently picking the newest. The newest used to win:
+    a stranger who texted "it's Jane, jane@acme.com" became the address Jane's later
+    "text me the quote" went to (phase-2 security review)."""
     if lead_id is None:
         return None
-    row = (
-        await session.execute(
-            select(LeadIdentifier.value)
-            .where(
-                LeadIdentifier.admin_id == admin_id,
-                LeadIdentifier.instance_id == instance_id,
-                LeadIdentifier.lead_id == lead_id,
-                LeadIdentifier.kind == kind,
-                LeadIdentifier.confirmed_at.is_not(None),
+    values = [
+        str(v)
+        for v in (
+            await session.execute(
+                select(LeadIdentifier.value)
+                .where(
+                    LeadIdentifier.admin_id == admin_id,
+                    LeadIdentifier.instance_id == instance_id,
+                    LeadIdentifier.lead_id == lead_id,
+                    LeadIdentifier.kind == kind,
+                    LeadIdentifier.confirmed_at.is_not(None),
+                )
+                .order_by(LeadIdentifier.confirmed_at.desc(), LeadIdentifier.id)
             )
-            .order_by(LeadIdentifier.confirmed_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return str(row) if row else None
+        ).scalars()
+        if v
+    ]
+    if len(values) <= 1:
+        return values[0] if values else None
+    own = normalize_identifier(transport_identifier) if transport_identifier else None
+    for value in values:
+        if own is not None and normalize_identifier(value) == own:
+            return value
+        if sess is not None and is_session_sender(admin_id, sess, value):
+            return value
+    return None
 
 
 #: The identifier kinds that double as a tool's required input of the same name
@@ -263,8 +309,10 @@ async def confirmed_inputs_on_file(
     From the lead RECORD only when ``channel`` proves the identity, or for a value
     this session ``supplied`` itself (finding 3; see ``record_readable``). A caller
     that names no channel gets the widget rule — fail closed. The transport
-    identifier wins its own kind: it is the one value the channel itself proves,
-    where the record's newest confirmed number may be another one merged in."""
+    identifier wins its own kind: it is the one value the channel itself proves.
+    A lead holding several confirmed identifiers of a kind fills the one THIS
+    conversation's transport carried, else nothing (``confirmed_identifier``):
+    the record's newest confirmed number may be another one merged in."""
     out: dict[str, str] = {}
     if transport_identifier:
         key = normalize_identifier(transport_identifier)
@@ -275,7 +323,12 @@ async def confirmed_inputs_on_file(
         if kind in out:
             continue
         value = await confirmed_identifier(
-            session, admin_id=admin_id, instance_id=instance_id, lead_id=lead_id, kind=kind
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            lead_id=lead_id,
+            kind=kind,
+            transport_identifier=transport_identifier,
         )
         if value and record_readable(channel, value, supplied):
             out[kind] = value

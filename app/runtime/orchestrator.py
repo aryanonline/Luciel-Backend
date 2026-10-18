@@ -2919,6 +2919,8 @@ class Orchestrator:
             instance_id=self.instance_id,
             lead_id=resolved_lead_id,
             kind=kind,
+            # Several confirmed of the kind → only THIS conversation's own (phase 2).
+            sess=sess_obj,
         )
         if not channel_switch.record_readable(channel, on_record, supplied):
             on_record = None
@@ -2998,7 +3000,12 @@ class Orchestrator:
                 )
             delivered = await self._deliver_elsewhere(pending.channel, to, pending.body)
             reply = (
-                channel_switch.sent_line(pending.channel, to, own=own)
+                # The offered candidate was shown masked; a yes does not unmask it.
+                channel_switch.sent_line(
+                    pending.channel,
+                    to if typed else channel_switch.mask_identifier(to),
+                    own=own,
+                )
                 if delivered
                 else f"{channel_switch.failed_line(pending.channel)}\n\n{pending.body}"
             )
