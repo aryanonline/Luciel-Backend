@@ -567,3 +567,47 @@ async def test_on_sms_the_transport_number_fills_the_phone_and_the_record_fills_
             supplied=frozenset({JANE_EMAIL}),
         )
         assert typed == {"email": JANE_EMAIL}
+
+
+# --- finding 4: the close's stalled-booking row is written AND its page scheduled ---- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_sweep_close_of_a_stalled_sms_booking_schedules_one_page_naming_the_field(
+    paged: list[str],
+):
+    """An SMS customer's booking stalls for want of an email and they go quiet. The
+    hourly sweep seals the session: the cannot_answer row names the missing field and
+    the conversation's end, and the owner page is scheduled on the sweep's own commit
+    (the process that runs the sweep must drain it before exiting — app/jobs)."""
+    from datetime import timedelta
+
+    from app.runtime.session_close import finalize_due_sessions
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _ScriptedTool("book_appointment", frozenset({"slot", "email"}), [])
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        await _authorize(s, admin, iid, tool)
+        stalled = await _turn(
+            _tool_orch(s, admin, iid, primary=_booking_model(), tool=tool),
+            sid,
+            "book me a cleaning for 2pm on the 1st",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert stalled.tool_outcomes == ["missing_input"]
+        assert (await _session_row(s, sid)).input_ask_attempts == 1
+    await escalation_dispatch.drain_background_notifications()
+    before = list(paged)
+
+    async with tenant_session(admin) as s:
+        later = datetime.now(UTC) + timedelta(hours=9)
+        assert await finalize_due_sessions(s, admin_id=admin, now=later) == 1
+        assert paged == before  # nothing starts before the sweep's transaction commits
+    await escalation_dispatch.drain_background_notifications()
+    assert paged[len(before) :] == ["cannot_answer"]  # one page for the stalled booking
+    async with tenant_session(admin) as s:
+        (row,) = [r for r in await _rows(s, sid) if r.signal == "cannot_answer"]
+        assert "still missing email" in list(row.reasons or [])
+        assert "the conversation ended before the booking could be completed" in list(
+            row.reasons or []
+        )
