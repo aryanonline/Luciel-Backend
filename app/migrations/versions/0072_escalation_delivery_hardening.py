@@ -18,6 +18,9 @@ Both become the deferred sweep's business:
     row older than ten minutes or a ``sent`` row (with a provider message id) older
     than fifteen; the sweep retries the first through the normal path and asks the
     provider for the second's status (``escalation_dispatch.sweep_stale_escalations``).
+    The ``sent`` window runs from the new ``escalation_events.sent_at`` (the moment the
+    provider accepted the page; ``fired_at`` for rows stamped before this revision) —
+    a page the sweep itself replays an hour after the escalation is seconds old.
   * ``platform_escalation_backlog()`` counts the stale ``pending`` rows in ``queued``
     and lets ``oldest_queued_at`` reach back to the oldest of them, so ``/healthz`` and
     the EscalationBacklog alarm see a lost notification exactly like a queued retry.
@@ -41,6 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0072_escalation_delivery_hardening"
@@ -140,7 +144,8 @@ _STALE_ESCALATIONS_BRANCH = f"""
                  AND e.fired_at < now() - interval '{PENDING_STALE_INTERVAL}')
              OR (e.delivery_status = 'sent'
                  AND e.delivery_provider_message_id IS NOT NULL
-                 AND e.fired_at < now() - interval '{SENT_UNCONFIRMED_INTERVAL}')
+                 AND COALESCE(e.sent_at, e.fired_at)
+                     < now() - interval '{SENT_UNCONFIRMED_INTERVAL}')
            )
 """  # noqa: S608 — the intervals are the two module constants above, never input
 
@@ -207,6 +212,9 @@ def upgrade() -> None:
     # Room for this revision's 34-character id (see the module docstring); DDL is
     # transactional here, so alembic's own version stamp follows in the same commit.
     op.execute("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)")
+    # When the provider accepted the page a ``sent`` row rests on: the receipt window
+    # runs from the send, not from ``fired_at`` (a replay an hour later is seconds old).
+    op.add_column("escalation_events", sa.Column("sent_at", sa.DateTime(timezone=True)))
     _replace_candidates(_BODY_0065 + _STALE_ESCALATIONS_BRANCH)
     _install_backlog_function(_BACKLOG_0072)
 
@@ -214,3 +222,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     _install_backlog_function(_BACKLOG_0069)
     _replace_candidates(_BODY_0065)
+    op.drop_column("escalation_events", "sent_at")

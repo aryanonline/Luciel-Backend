@@ -38,7 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import event, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
@@ -259,6 +259,10 @@ async def _stamp_delivery(
         values["delivery_provider_message_id"] = str(provider_message_id)[:64]
     if status == DELIVERY_DELIVERED:
         values["delivered_at"] = datetime.now(UTC)
+    if status == DELIVERY_SENT:
+        # The receipt window runs from here (round 7 delivery hardening), not from
+        # ``fired_at``: a replay an hour after the escalation is a seconds-old page.
+        values["sent_at"] = datetime.now(UTC)
     await session.execute(
         update(EscalationEvent)
         .where(
@@ -1247,7 +1251,8 @@ async def sweep_stale_escalations(
       retried ONCE through the normal path (``notify_escalation_safely``): a refusal
       queues it for the 24h ladder like any first attempt, so the row leaves
       ``pending`` on this pass whatever happens.
-    * ``sent`` older than ``SENT_UNCONFIRMED_AFTER`` — the provider accepted the page
+    * ``sent`` for longer than ``SENT_UNCONFIRMED_AFTER``, counted from the send
+      (``sent_at``) — the provider accepted the page
       and the carrier's receipt never came (lost, blocked, or posted before the
       sending transaction committed). The provider is asked ONCE for the message's
       status with the tenant's own credentials: a terminal answer is stamped exactly
@@ -1311,7 +1316,11 @@ async def sweep_stale_escalations(
                     EscalationEvent.delivery_status == DELIVERY_SENT,
                     EscalationEvent.session_id.is_not(None),
                     EscalationEvent.delivery_provider_message_id.is_not(None),
-                    EscalationEvent.fired_at < moment - SENT_UNCONFIRMED_AFTER,
+                    # Counted from the SEND (``sent_at``): a page this very pass just
+                    # replayed or retried is seconds old whatever its ``fired_at``.
+                    # Rows stamped before the column existed fall back to ``fired_at``.
+                    func.coalesce(EscalationEvent.sent_at, EscalationEvent.fired_at)
+                    < moment - SENT_UNCONFIRMED_AFTER,
                 )
             )
         )

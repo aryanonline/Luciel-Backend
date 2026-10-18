@@ -381,6 +381,22 @@ async def _age_row(admin: uuid.UUID, sid: uuid.UUID, age: timedelta) -> None:
         )
 
 
+async def _age_send(admin: uuid.UUID, sid: uuid.UUID, age: timedelta) -> None:
+    """The provider accepted the page this long ago (the receipt window's start)."""
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(EscalationEvent)
+            .where(EscalationEvent.admin_id == admin, EscalationEvent.session_id == sid)
+            .values(sent_at=datetime.now(UTC) - age)
+        )
+
+
+async def _age_page(admin: uuid.UUID, sid: uuid.UUID, age: timedelta) -> None:
+    """The escalation fired AND its page went out this long ago."""
+    await _age_row(admin, sid, age)
+    await _age_send(admin, sid, age)
+
+
 SMS_ESCALATION: dict[str, object] = {"primarySms": CONTACT_SMS, "preferredChannel": "sms"}
 
 
@@ -503,7 +519,7 @@ async def test_a_page_whose_receipt_never_came_is_settled_by_one_status_fetch(
     assert await sweeps.run_deferred_retry() == []
     assert twilio.fetched == []
 
-    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    await _age_page(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
     assert await sweeps.run_deferred_retry() == [str(admin)]
     assert twilio.fetched == [message_sid]
     row = await _row(admin, sid)
@@ -537,7 +553,7 @@ async def test_a_page_the_provider_cannot_settle_is_unconfirmed_and_the_owner_is
     lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
     await _fire(admin, iid, sid, lead)
     message_sid = (await _row(admin, sid)).delivery_provider_message_id
-    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    await _age_page(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
     twilio.status, twilio.fetch_raises = answer, raises
 
     assert await sweeps.run_deferred_retry() == [str(admin)]
@@ -561,7 +577,7 @@ async def test_with_no_owner_to_reach_an_unsettled_page_reads_unconfirmed(ses, t
     admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
     await _fire(admin, iid, sid, lead)
-    await _age_row(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    await _age_page(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
     ses.refuse = None  # the owner's mailbox is unreachable too
 
     assert await sweeps.run_deferred_retry() == [str(admin)]
@@ -571,6 +587,88 @@ async def test_with_no_owner_to_reach_an_unsettled_page_reads_unconfirmed(ses, t
     assert ses.recipients == []
     assert await sweeps.run_deferred_retry() == []  # terminal: never asked again
     assert len(twilio.fetched) == 1
+
+
+async def _make_due(admin: uuid.UUID) -> None:
+    """The queued retry's backoff has run out (the hourly sweep finds it due)."""
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(DeferredAction)
+            .where(DeferredAction.admin_id == admin, DeferredAction.status == "queued")
+            .values(next_attempt_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_page_the_sweep_itself_just_replayed_is_not_asked_about_in_the_same_pass(
+    ses, twilio
+):
+    """The bound runs from the SEND, not from the escalation. The contact's first page
+    and the owner's email both blipped, so the page was queued; the hourly sweep
+    replays it an hour after the escalation fired and Twilio accepts it — the row reads
+    ``sent``. The stale-``sent`` pass right after the replay, in the same sweep, read
+    the row's age from ``fired_at``: it asked Twilio about a seconds-old message (still
+    ``queued``), settled the row ``unconfirmed`` and emailed the owner that nobody could
+    confirm a page the carrier was still delivering. The row now carries when it was
+    sent, and the receipt gets its full window."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    twilio.refuse, ses.refuse = True, None
+    await _fire(admin, iid, sid, lead)
+    assert (await _row(admin, sid)).delivery_status == "queued"
+    await _age_row(admin, sid, timedelta(hours=1))
+    await _make_due(admin)
+    twilio.refuse, ses.refuse = False, set()
+    twilio.status = ("queued", None)  # what Twilio says about a message seconds old
+
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent" and row.delivery_detail == "sms:primary"
+    assert row.sent_at is not None
+    assert twilio.fetched == [] and ses.recipients == [] and len(twilio.sent) == 1
+    (item,) = await _items(admin)
+    assert item.status == "delivered"
+
+    # The next hour: still inside the window counted from the send — nothing asked.
+    assert await sweeps.run_deferred_retry() == []
+    assert twilio.fetched == []
+
+    # Past the window counted from the send, the one status fetch runs.
+    await _age_send(admin, sid, SENT_UNCONFIRMED_AFTER + timedelta(minutes=1))
+    twilio.status = ("delivered", None)
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    assert twilio.fetched == [row.delivery_provider_message_id]
+    assert (await _row(admin, sid)).delivery_status == "delivered"
+    assert ses.recipients == []
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_lost_notification_retried_by_text_is_not_asked_about_in_the_same_pass(ses, twilio):
+    """The same hole on the lost-``pending`` path: a notification lost half an hour ago
+    is retried by the sweep through the tenant's Twilio, and the page it just sent must
+    not be judged stale by the escalation's age a moment later."""
+    admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    lead = await _seed(admin, iid, escalation=SMS_ESCALATION, confirmed_numbers=(CONTACT_SMS,))
+    async with tenant_session(admin) as s:
+        s.add(
+            EscalationEvent(
+                admin_id=admin,
+                instance_id=iid,
+                session_id=sid,
+                resolved_lead_id=lead,
+                signal="high_value_lead",
+                gate="outcome",
+                score_or_confidence=0.9,
+                fired_at=datetime.now(UTC) - timedelta(minutes=30),
+                delivery_status="pending",
+            )
+        )
+    twilio.status = ("queued", None)
+
+    assert await sweeps.run_deferred_retry() == [str(admin)]
+    row = await _row(admin, sid)
+    assert row.delivery_status == "sent" and row.sent_at is not None
+    assert len(twilio.sent) == 1 and twilio.fetched == [] and ses.recipients == []
 
 
 # --- the owner is told once ---------------------------------------------------------- #

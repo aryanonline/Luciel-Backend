@@ -2,7 +2,8 @@
 
 The deferred sweep's candidate list and the escalation backlog both learn about the
 rows the queue cannot see: a ``pending`` escalation whose notification task died and a
-``sent`` one whose delivery receipt never came. Downgrade restores 0065's candidate
+``sent`` one whose delivery receipt never came (its window counted from the new
+``sent_at`` column, ``fired_at`` for rows stamped before it). Downgrade restores 0065's candidate
 body and 0069's backlog function exactly, so a rollback leaves the 0070 shape.
 """
 
@@ -66,7 +67,13 @@ async def _seed(admin: uuid.UUID, iid: uuid.UUID) -> None:
 
 
 async def _escalation(
-    admin: uuid.UUID, iid: uuid.UUID, *, status: str, age: timedelta, sid: str | None = None
+    admin: uuid.UUID,
+    iid: uuid.UUID,
+    *,
+    status: str,
+    age: timedelta,
+    sid: str | None = None,
+    sent_age: timedelta | None = None,
 ) -> None:
     async with tenant_session(admin) as s:
         s.add(
@@ -79,8 +86,21 @@ async def _escalation(
                 fired_at=datetime.now(UTC) - age,
                 delivery_status=status,
                 delivery_provider_message_id=sid,
+                sent_at=(datetime.now(UTC) - sent_age) if sent_age is not None else None,
             )
         )
+
+
+async def _has_sent_at() -> bool:
+    async with untenanted_session() as s:
+        return (
+            await s.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name = 'escalation_events' AND column_name = 'sent_at'"
+                )
+            )
+        ).scalar_one() == 1
 
 
 async def _function_source(name: str) -> str:
@@ -109,8 +129,8 @@ def test_the_sql_bounds_are_copies_of_the_dispatcher_constants() -> None:
 async def test_0072_upgrades_downgrades_and_upgrades_again():
     from app.db.engine import dispose_engine
 
-    lost, young, unreceipted, idle = (uuid.uuid4() for _ in range(4))
-    for admin in (lost, young, unreceipted, idle):
+    lost, young, unreceipted, idle, just_sent = (uuid.uuid4() for _ in range(5))
+    for admin in (lost, young, unreceipted, idle, just_sent):
         await _seed(admin, uuid.uuid4())
     lost_iid = uuid.uuid4()
     await _escalation(
@@ -125,13 +145,25 @@ async def test_0072_upgrades_downgrades_and_upgrades_again():
         sid="SM" + "a" * 32,
     )
     await _escalation(idle, uuid.uuid4(), status="delivered", age=timedelta(hours=2))
+    # An hour-old escalation whose page went out a minute ago (a replay): the receipt
+    # window runs from ``sent_at``, so it is not a candidate yet. ``unreceipted`` above
+    # has no ``sent_at`` (stamped before the column existed) and falls back to fired_at.
+    await _escalation(
+        just_sent,
+        uuid.uuid4(),
+        status="sent",
+        age=timedelta(hours=1),
+        sid="SM" + "b" * 32,
+        sent_age=timedelta(minutes=1),
+    )
 
     # Upgraded (the suite's head): the lost and unreceipted tenants are deferred
     # candidates, the young and settled ones are not; the backlog counts the lost page
     # and dates the backlog from it.
     candidates = set(await sweeps.sweep_candidates(sweeps.DEFERRED))
     assert {lost, unreceipted} <= candidates
-    assert not {young, idle} & candidates
+    assert not {young, idle, just_sent} & candidates
+    assert await _has_sent_at()
     backlog = await escalation_backlog()
     assert backlog is not None and backlog["queued"] == 1
     assert backlog["oldestQueuedAt"] is not None
@@ -140,9 +172,10 @@ async def test_0072_upgrades_downgrades_and_upgrades_again():
 
     await dispose_engine()
     _alembic("downgrade", "0070_knowledge_answer_flags")
-    assert not {lost, unreceipted, young, idle} & set(
+    assert not {lost, unreceipted, young, idle, just_sent} & set(
         await sweeps.sweep_candidates(sweeps.DEFERRED)
     )
+    assert not await _has_sent_at()
     backlog = await escalation_backlog()
     assert backlog is not None and backlog["queued"] == 0 and backlog["oldestQueuedAt"] is None
     assert "pending" not in await _function_source("platform_escalation_backlog")
@@ -150,6 +183,7 @@ async def test_0072_upgrades_downgrades_and_upgrades_again():
 
     await dispose_engine()
     _alembic("upgrade", "head")
+    assert await _has_sent_at()
     assert {lost, unreceipted} <= set(await sweeps.sweep_candidates(sweeps.DEFERRED))
     backlog = await escalation_backlog()
     assert backlog is not None and backlog["queued"] == 1
