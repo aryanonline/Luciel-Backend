@@ -798,3 +798,146 @@ async def test_a_spouses_address_given_as_the_destination_is_sent_once_and_not_k
         )
         assert own.reply_text == "Sent — check your email at dana@lead.example."
         assert await _confirmed_values(s, admin) == ["dana@lead.example"]
+
+
+# --- finding 7: every take-over pages, and only a real page is claimed ---------------- #
+async def _take_over_then_hand_back(admin: uuid.UUID, iid: uuid.UUID, sid: uuid.UUID) -> None:
+    """T1 asks for a person on SMS (row + page + take-over, committed); the owner
+    replies from the dashboard and hands the conversation back (its own commit)."""
+    from app.runtime import handoff
+
+    async with tenant_session(admin) as s:
+        first = await _turn(
+            _orch(s, admin, iid),
+            sid,
+            "can I talk to a real person please",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert first.handed_off is True
+        assert (await _session_row(s, sid)).mode == "human_controlled"
+    await escalation_dispatch.drain_background_notifications()
+    async with tenant_session(admin) as s:
+        await handoff.hand_back(
+            s, admin_id=admin, instance_id=iid, session_id=sid, actor_user_id=None
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_second_request_for_a_person_after_a_hand_back_pages_the_owner_again(
+    paged: list[str],
+):
+    """The owner took the first request, replied and handed back. Two hours later, same
+    SMS thread: "can I speak to someone again?". The session's explicit_human_request
+    row already existed, the insert met it and did nothing — Luciel said it had passed
+    this to the team, the session went to a person, and nobody was paged: every later
+    message went unanswered. Each take-over now re-pages the row."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+    await _take_over_then_hand_back(admin, iid, sid)
+    assert paged == ["explicit_human_request"]
+
+    async with tenant_session(admin) as s:
+        again = await _turn(
+            _orch(s, admin, iid),
+            sid,
+            "can I speak to someone again please",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert again.handed_off is True
+        assert _HANDOFF_ACK_MARK.search(again.reply_text)
+        assert (await _session_row(s, sid)).mode == "human_controlled"
+        assert paged == ["explicit_human_request"]  # nothing starts before the commit
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["explicit_human_request", "explicit_human_request"]
+    async with tenant_session(admin) as s:
+        (row,) = await _rows(s, sid)  # still one business event: the session's row
+        assert row.signal == "explicit_human_request"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_self_harm_disclosure_after_a_hand_back_is_a_real_safety_page():
+    """Same session, the second take-over is a self-harm disclosure. SELF_HARM_REPLY
+    says "I've also let the team here know" — and it used to be untrue: no row was
+    written and no safety page went out. Now the row leads with the safety category
+    (the dispatcher routes and labels the page on its FIRST reason) and the page is
+    scheduled, so the words are true."""
+    from app.notifications.base import safety_category_from_reasons
+    from app.runtime.orchestrator import SELF_HARM_REPLY
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    pages: list[dict[str, Any]] = []
+
+    async def fake_notify(session, **kw):
+        pages.append(kw)
+
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(escalation_dispatch, "notify_escalation_safely", fake_notify)
+        await _take_over_then_hand_back(admin, iid, sid)
+        assert len(pages) == 1
+
+        async with tenant_session(admin) as s:
+            disclosed = await _turn(
+                _orch(s, admin, iid),
+                sid,
+                "honestly I want to kill myself",
+                channel="sms",
+                transport_identifier=JANE_PHONE,
+            )
+            assert disclosed.reply_text == SELF_HARM_REPLY
+            assert disclosed.handed_off is True
+        await escalation_dispatch.drain_background_notifications()
+    assert len(pages) == 2 and pages[1]["signal"] == "explicit_human_request"
+    async with tenant_session(admin) as s:
+        (row,) = await _rows(s, sid)
+        reasons = tuple(str(r) for r in (row.reasons or []))
+        assert reasons[0] == "moderation:self_harm"
+        assert safety_category_from_reasons(reasons) == "self_harm"
+        assert "asked for a person" in reasons  # the first take-over's reason stays
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_take_over_that_could_not_be_recorded_never_claims_the_team_was_told(
+    monkeypatch, paged: list[str]
+):
+    """When the take-over's row + page could not be written, nothing may say the team
+    knows and the conversation must not be handed to a person nobody paged: the
+    self-harm disclosure still gets the crisis lines, without the claim, and Luciel
+    keeps the conversation."""
+    from app.runtime import orchestrator as orch_mod
+
+    async def not_recorded(*_a: Any, **_kw: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(orch_mod, "record_takeover_escalation", not_recorded)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="sms")
+        result = await _turn(
+            _orch(s, admin, iid),
+            sid,
+            "honestly I want to kill myself",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert result.reply_text == orch_mod.SELF_HARM_CRISIS_LINES
+        assert "988" in result.reply_text
+        assert "team" not in result.reply_text
+        assert result.handed_off is False
+        assert (await _session_row(s, sid)).mode == "ai"
+
+        asked = await _turn(
+            _orch(s, admin, iid),
+            sid,
+            "can I talk to a real person please",
+            channel="sms",
+            transport_identifier=JANE_PHONE,
+        )
+        assert asked.reply_text == orch_mod.TAKEOVER_UNRECORDED_REPLY
+        assert asked.handed_off is False
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == []

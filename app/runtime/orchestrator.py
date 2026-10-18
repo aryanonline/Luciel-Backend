@@ -326,11 +326,21 @@ ANSWER_BEARING_TOOLS = frozenset(
 
 #: Compassion first, honesty second, a person third (2026-09-05 audit F116). No
 #: contact ask is appended: the person in distress is not asked for a phone number.
-SELF_HARM_REPLY = (
+SELF_HARM_CRISIS_LINES = (
     "I'm really sorry you're going through this. If you're in immediate danger, please "
     "contact your local emergency number right now — in Canada and the US you can call "
-    "or text 988 to reach a crisis line, any time. I've also let the team here know so a "
-    "person can follow up with you."
+    "or text 988 to reach a crisis line, any time."
+)
+SELF_HARM_REPLY = (
+    f"{SELF_HARM_CRISIS_LINES} I've also let the team here know so a person can follow up with you."
+)
+
+#: A take-over whose escalation could NOT be recorded (finding 7): nothing reached the
+#: team, so nothing says it did, and the conversation stays with Luciel rather than
+#: going silent under a person nobody paged.
+TAKEOVER_UNRECORDED_REPLY = (
+    "I'm sorry — I wasn't able to pass this to the team just now. Please send your "
+    "message again in a moment."
 )
 
 #: Honest offers when the arbiter (§3.4.2) would rather answer on another channel
@@ -612,6 +622,104 @@ async def record_or_extend_escalation(
     return True
 
 
+#: The first-reason token the delivery layer routes and labels a SAFETY page on
+#: (``moderation_reasons`` writes it; ``notifications.base.safety_category_from_reasons``
+#: reads it).
+MODERATION_REASON_PREFIX = "moderation:"
+
+
+async def record_takeover_escalation(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    session_id: uuid.UUID,
+    resolved_lead_id: uuid.UUID | None,
+    signal: str,
+    gate: str,
+    score: float | None,
+    reasons: list[str],
+    audit_detail: dict[str, object] | None = None,
+) -> bool:
+    """Record a TAKE-OVER and page the owner — on EVERY entry into human_controlled
+    (round 7 judgment hardening, finding 7).
+
+    A take-over writes the session's ``explicit_human_request`` row once; after the
+    owner hands the conversation back, a second take-over in the same session (a new
+    request for a person, a threat, a self-harm disclosure) met that row and — the
+    insert being ON CONFLICT DO NOTHING — wrote nothing and paged nobody, while the
+    customer was told the team knew and every later message went unanswered. Now the
+    existing row takes this take-over's reasons and the owner is paged AGAIN, even
+    when the reasons are the same ("asked for a person" twice is still a person
+    needed now). A safety take-over puts its ``moderation:<category>`` reasons FIRST,
+    so the page is routed and labelled as the safety page it is.
+
+    Returns whether a row was written or re-paged; False only when the conflicting
+    row cannot be found (then nothing was scheduled, and the caller must not say the
+    team was told)."""
+    if await _record_escalation(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+        reasons=reasons,
+        audit_detail=audit_detail,
+    ):
+        return True
+    row = (
+        await session.execute(
+            select(EscalationEvent)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == signal,
+                EscalationEvent.gate == gate,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        # The conflicting row went away between the insert and this read: with no
+        # row there, the insert writes it. A second conflict is reported as nothing
+        # recorded on THIS turn.
+        return await _record_escalation(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            resolved_lead_id=resolved_lead_id,
+            signal=signal,
+            gate=gate,
+            score=score,
+            reasons=reasons,
+            audit_detail=audit_detail,
+        )
+    existing = [str(r) for r in (row.reasons or [])]
+    if reasons and reasons[0].startswith(MODERATION_REASON_PREFIX):
+        merged = [*reasons, *(r for r in existing if r not in reasons)]
+    else:
+        merged = [*existing, *(r for r in reasons if r not in existing)]
+    if merged != existing:
+        row.reasons = merged
+        await session.flush()
+    emit_metric("EscalationRenotified", dimensions={"Signal": signal})
+    schedule_notification_after_commit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        resolved_lead_id=resolved_lead_id,
+        signal=signal,
+        gate=gate,
+        score=score,
+    )
+    return True
+
+
 #: Longest excerpt of a new unanswered question carried on the row's reasons.
 _QUESTION_EXCERPT_CAP = 120
 
@@ -647,7 +755,7 @@ def moderation_reasons(category: ModerationCategory) -> tuple[str, ...]:
     labels on, then the owner-facing phrase. Threats/self-harm rows (which take the
     conversation away under explicit_human_request, D2) used to carry no reasons at
     all, so the owner could not tell a threat from a polite request for a person."""
-    return (f"moderation:{category.value}", _MODERATION_REASON[category])
+    return (f"{MODERATION_REASON_PREFIX}{category.value}", _MODERATION_REASON[category])
 
 
 # Retriever: (query) -> list of retrieved chunk texts. Vector impl lands Arc 11,
@@ -1261,9 +1369,13 @@ class Orchestrator:
                 )
             else:
                 # Threats and self-harm: a person takes the conversation (D2).
+                unrecorded_ack = TAKEOVER_UNRECORDED_REPLY
                 if mod.category is ModerationCategory.self_harm:
                     # Immediate escalation with crisis copy; no contact ask (F116).
+                    # The crisis lines go out whatever happens; "I've also let the
+                    # team here know" only when the page really was scheduled.
                     ack = SELF_HARM_REPLY
+                    unrecorded_ack = SELF_HARM_CRISIS_LINES
                 else:
                     ack = await self._handoff_reply(
                         history,
@@ -1282,6 +1394,7 @@ class Orchestrator:
                     ack=ack,
                     reasons=reasons,
                     audit_detail=audit_detail,
+                    unrecorded_ack=unrecorded_ack,
                 )
 
         # Monitoring-only injection signal (NOT a security boundary, §3.4.14).
@@ -2534,6 +2647,7 @@ class Orchestrator:
         ack: str,
         reasons: tuple[str, ...] = (),
         audit_detail: dict[str, object] | None = None,
+        unrecorded_ack: str = TAKEOVER_UNRECORDED_REPLY,
     ) -> LoopResult:
         """Acknowledge to the customer, record the escalation, and set the session
         human_controlled (§3.4.12 Luciel-initiated handoff). The session counts as
@@ -2542,8 +2656,15 @@ class Orchestrator:
         Owner decision D2 (2026-09-14): ONLY an explicit request for a person and the
         threats_violence / self_harm moderation categories come through here. Strong
         negative sentiment, the ask bound, abuse and an illegal ask record + notify
-        and leave the conversation with Luciel (see run_turn)."""
-        await _record_escalation(
+        and leave the conversation with Luciel (see run_turn).
+
+        Every take-over pages (finding 7): a second one in the same session — after
+        the owner handed back — re-pages the session's row instead of meeting the
+        once-per-session rule and paging nobody. ``ack`` says the team was told, so
+        it goes out only when the row + page really were written/scheduled; if they
+        were not, ``unrecorded_ack`` goes out instead and the conversation is NOT
+        handed to a person nobody paged."""
+        recorded = await record_takeover_escalation(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,
@@ -2555,6 +2676,25 @@ class Orchestrator:
             reasons=list(reasons),
             audit_detail=audit_detail,
         )
+        if not recorded:
+            _LOG.error("take-over escalation not recorded: session=%s", session_id)
+            emit_metric("TakeoverUnrecorded", dimensions={"Channel": channel})
+            unrecorded_row = await persist_turn(
+                self.session,
+                admin_id=self.admin_id,
+                instance_id=self.instance_id,
+                session_id=session_id,
+                role="luciel",
+                text=unrecorded_ack,
+                at=datetime.now(UTC),
+                deterministic=True,
+            )
+            return LoopResult(
+                reply_message_id=unrecorded_row.id,
+                reply_text=unrecorded_ack,
+                outbound_channel=channel,
+                counted=False,
+            )
         ack_row = await persist_turn(
             self.session,
             admin_id=self.admin_id,
