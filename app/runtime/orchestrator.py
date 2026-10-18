@@ -323,6 +323,9 @@ ANSWER_BEARING_TOOLS = frozenset(
         "lookup_record",
     }
 )
+#: The answer-bearing tools that CHANGE something for the customer: an ok from one is
+#: read back from its payload even when the model wrote no words (final pass).
+_ANSWER_BEARING_ACTIONS = ANSWER_BEARING_TOOLS & ACTION_TOOLS
 
 #: Compassion first, honesty second, a person third (2026-09-05 audit F116). No
 #: contact ask is appended: the person in distress is not asked for a phone number.
@@ -1797,7 +1800,21 @@ class Orchestrator:
         # --- GROUNDING (§3.4.13) --------------------------------------------- #
         # Only an ANSWER-BEARING tool grounds the words (F119): a CRM push or a queued
         # callback succeeding is not evidence the reply's facts are true.
-        tool_succeeded = any(
+        #
+        # An EMPTY draft (final pass): a model can finish a tool turn with no words at
+        # all, and the transports send nothing for an empty reply — Luciel went
+        # silent, even after an availability check or a lookup came back. A tool
+        # cannot ground words that were never written, so the empty draft is judged
+        # as the non-answer it is (the honest hand-off below). A confirmed booking,
+        # move or cancellation is the exception: it is read back from its own
+        # payload in the readback step.
+        drafted = bool(pre_send_check(resp.text))
+        confirmed_change = any(
+            str(call.get("tool_id", "")) in _ANSWER_BEARING_ACTIONS
+            and r.outcome is tool_contract.Outcome.ok
+            for call, r in resp.dispatched
+        )
+        tool_succeeded = (drafted or confirmed_change) and any(
             str(call.get("tool_id", "")) in ANSWER_BEARING_TOOLS
             and r.outcome is tool_contract.Outcome.ok
             for call, r in resp.dispatched
@@ -2005,10 +2022,17 @@ class Orchestrator:
             confirmed_fields: dict[str, object] = {}
             for _, r in ok_actions:
                 confirmed_fields.update(r.payload)
-            if not faithful_readback_ok(reply_text, confirmed_fields):
-                summary = ", ".join(
-                    f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
-                )
+            summary = ", ".join(
+                f"{k}: {v}" for k, v in sorted(confirmed_fields.items()) if v is not None
+            )
+            if not reply_text and confirmed_change:
+                # The model wrote nothing after a confirmed change (final pass): the
+                # customer still hears what actually happened, from the payload.
+                reply_text = f"Here are the details: {summary}."
+                if not summary:
+                    reply_text = "That's been taken care of."
+                deterministic_reply = True
+            elif not faithful_readback_ok(reply_text, confirmed_fields):
                 reply_text = f"{reply_text}\n\nTo confirm the exact details: {summary}."
         if not claimed_without_action and escalation is None and _HANDOFF_CLAIM.search(reply_text):
             # The reply promises the team a hand-off that nothing recorded (round 7

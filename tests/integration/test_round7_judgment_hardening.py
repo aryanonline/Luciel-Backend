@@ -1165,3 +1165,79 @@ async def test_an_unfounded_action_claim_is_flagged_for_real_when_the_row_exists
         assert UNFOUNDED_CLAIM_REASON in [str(r) for r in (row.reasons or [])]
     await escalation_dispatch.drain_background_notifications()
     assert paged == ["cannot_answer", "cannot_answer"]
+
+
+# --- final pass: an empty draft is never sent as silence ---------------------------- #
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_empty_draft_after_an_availability_check_gets_the_honest_hand_off(
+    paged: list[str],
+):
+    """Mid-conversation, the model checks availability (ok) and finishes the turn with
+    no words — a live provider can end a tool turn with an empty completion. The ok
+    tool scored the empty draft 1.0, nothing escalated, the reply was "" and the
+    transports send nothing for an empty reply: Luciel went silent. An empty draft
+    is now judged as no answer: the honest hand-off line, backed by a row and page."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _ScriptedTool(
+        "check_availability",
+        frozenset(),
+        [tool_contract.ok({"slots": ["2026-10-01T14:00:00"]})],
+    )
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        await _price_question(s, admin, iid, sid, tool)
+        model = _CountingEcho(
+            confidence=1.0,
+            tool_call_script=[[{"tool_id": "check_availability", "inputs": {}}]],
+            fixed_reply="",
+        )
+        result = await _turn(
+            _tool_orch(s, admin, iid, primary=model, tool=tool),
+            sid,
+            "do you have anything on the 1st?",
+        )
+        assert result.tool_outcomes == ["ok"]
+        assert result.reply_text.strip() != ""
+        assert _HANDOFF_ACK_MARK.search(result.reply_text)
+        assert [r.signal for r in await _rows(s, sid)] == ["cannot_answer"]
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["cannot_answer"]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_empty_draft_after_a_confirmed_booking_reads_the_booking_back(
+    paged: list[str],
+):
+    """The booking went through and the model wrote nothing: the customer was never
+    told it was booked. The confirmation is read back from the booking's own payload;
+    nothing escalates as unanswered, because nothing went wrong."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    tool = _BookingTool()
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        await _authorize(s, admin, iid, tool)
+        await _price_question(s, admin, iid, sid, tool)
+        model = _CountingEcho(
+            confidence=1.0,
+            tool_call_script=[
+                [
+                    {
+                        "tool_id": "book_appointment",
+                        "inputs": {"slot": SLOT, "email": "dana@lead.example"},
+                    }
+                ]
+            ],
+            fixed_reply="",
+        )
+        result = await _turn(
+            _tool_orch(s, admin, iid, primary=model, tool=tool),
+            sid,
+            "ok, the 2pm on the 1st then, dana@lead.example",
+        )
+        assert result.tool_outcomes == ["ok"]
+        assert result.reply_text.startswith("Here are the details: ")
+        assert "bookingRef: bk-1" in result.reply_text and SLOT in result.reply_text
+        assert "cannot_answer" not in [r.signal for r in await _rows(s, sid)]
+    await escalation_dispatch.drain_background_notifications()
+    assert "cannot_answer" not in paged
