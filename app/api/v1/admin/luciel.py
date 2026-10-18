@@ -693,12 +693,14 @@ async def confirm_sms_contact(
     """The owner enters the 6-digit code an SMS escalation contact received (round 7
     WP-4b). The contact may instead text the code back to the number that sent it.
     Rate-limited per tenant and every entry is audited; five wrong entries kill the
-    code and the owner asks for a new one."""
+    code and the owner asks for a new one. The throttle is the code loop's own bucket,
+    sized so every attempt of every contact's code is answered by the loop (round 7
+    delivery hardening) — it used to borrow the test text's 3-per-30-minutes."""
     from app.channels import rate_limit  # noqa: PLC0415
     from app.notifications import contact_confirmation  # noqa: PLC0415
 
     decision = rate_limit.get_store().check_source(
-        "escalation_test_sms", f"confirm:{subject.admin_id}"
+        contact_confirmation.CODE_ENTRY_LIMIT, str(subject.admin_id)
     )
     if not decision.allowed:
         from app.api.errors import rate_limited  # noqa: PLC0415
@@ -858,6 +860,15 @@ async def resend_contact_confirmation(
                 )
             if start.reason == "already_confirmed":
                 raise validation_error("That number is already confirmed.")
+            if start.reason == contact_confirmation.CODE_SEND_RATE_LIMITED:
+                # Round 7 delivery hardening: the tenant's code-send budget is spent.
+                from app.api.errors import rate_limited  # noqa: PLC0415
+
+                raise rate_limited(
+                    "Too many confirmation codes were texted recently. Please wait a "
+                    "while, then resend.",
+                    retry_after_seconds=600,
+                )
             if not start.sent:
                 if start.reason == "sms_channel_not_provisioned":
                     raise validation_error(

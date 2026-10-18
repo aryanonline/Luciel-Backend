@@ -80,6 +80,20 @@ LIMITS: dict[str, ChannelLimits] = {
     "destination_claim": ChannelLimits(burst=3, refill_seconds=60.0, daily_cap=20),
     # Owner-triggered test texts to an escalation contact (F084): a handful an hour.
     "escalation_test_sms": ChannelLimits(burst=3, refill_seconds=600.0, daily_cap=20),
+    # Confirmation-code TEXTS to escalation contacts, per tenant (round 7 delivery
+    # hardening) — the test text's sibling. Saving contacts (escalation, team
+    # availability) and resending codes texted any number a request named with no
+    # ceiling but a per-number cooldown, so a save loop with fresh numbers was an
+    # unbounded texting tool. Three contacts plus a few resends an hour; 20 a day.
+    "escalation_code_sms": ChannelLimits(burst=6, refill_seconds=600.0, daily_cap=20),
+    # Code ENTRIES on the dashboard (confirm-sms), per tenant (round 7 delivery
+    # hardening). This borrowed the test text's 3-per-30-minutes, fewer than the five
+    # attempts one code allows in its 15-minute life, so an owner confirming three
+    # numbers was answered 429 after one typo. Sized to the loop it guards: every
+    # attempt of all three SMS contacts' codes inside one code's life (15 x 60 s = a
+    # 15-minute window). Brute force is bounded by the per-code attempt counter (five,
+    # then the code is dead) and the code-send budget above; this only stops a flood.
+    "escalation_code_entry": ChannelLimits(burst=15, refill_seconds=60.0, daily_cap=100),
     # Account-export downloads per signed link (adversarial review R-WP2-2): the
     # door is unauthenticated by design (the token is the authorization), so a
     # leaked or replayed link must not become an unbounded audit-row + presign mill.

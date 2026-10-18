@@ -185,8 +185,11 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     # What happened to the owner notification for this row (2026-09-05 audit F079):
-    # pending → delivered | owner_fallback | queued | failed. Rows from before the
-    # column existed read ``unknown`` — never a fabricated ``delivered``.
+    # pending → delivered | owner_fallback | queued | failed, plus ``sent`` (a live SMS
+    # with its delivery receipt outstanding, round 7 WP-4b) and ``unconfirmed`` (no
+    # receipt ever came and the provider could not settle it either, round 7 delivery
+    # hardening). Rows from before the column existed read ``unknown`` — never a
+    # fabricated ``delivered``.
     delivery_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending", server_default="unknown"
     )
@@ -195,3 +198,9 @@ class EscalationEvent(Base, TenantMixin, TimestampMixin):
     # The provider id of the send ``delivery_status`` rests on (round 7 WP-4b, migration
     # 0069): a Twilio status callback finds the row by it and stamps the real DLR.
     delivery_provider_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # When the provider accepted the page the ``sent`` status rests on (round 7 delivery
+    # hardening, migration 0072): the deferred sweep's receipt window runs from the
+    # SEND, never from ``fired_at`` — a page the sweep itself replays an hour after the
+    # escalation fired is seconds old, not an hour. NULL on rows never ``sent`` and on
+    # rows stamped ``sent`` before the column existed (those fall back to ``fired_at``).
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -36,9 +36,9 @@ import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import event, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
@@ -84,8 +84,32 @@ DELIVERY_FAILED = "failed"  # terminal
 #: an SMS with a delivery receipt outstanding. Not a retry candidate; ``delivered`` is
 #: stamped by the receipt (``record_sms_delivery_receipt``), never by the API accept.
 DELIVERY_SENT = "sent"
+#: Round 7 delivery hardening: the provider accepted the page, no receipt ever came,
+#: and the sweep's one status fetch could not settle it either (the provider could not
+#: be asked, or still had no terminal word). The contact MAY have heard — so nothing
+#: pages them again — but nobody can say so; the owner is told, like a failure.
+DELIVERY_UNCONFIRMED = "unconfirmed"
 #: Statuses under which nothing may page the configured contact again.
-_SETTLED = frozenset({DELIVERY_DELIVERED, DELIVERY_SENT})
+_SETTLED = frozenset({DELIVERY_DELIVERED, DELIVERY_SENT, DELIVERY_UNCONFIRMED})
+
+#: Round 7 delivery hardening — the two bounds the deferred sweep applies to rows the
+#: queue cannot see (``sweep_stale_escalations``). Copied into migration 0072's SQL
+#: (the candidate list and the backlog count); the migration test pins the copy.
+#: A ``pending`` row older than this had its off-turn notification task die before
+#: it paged or queued anything (the task itself finishes in seconds).
+PENDING_STALE_AFTER = timedelta(minutes=10)
+#: A ``sent`` row older than this never got its delivery receipt (Twilio posts one
+#: within seconds of the carrier's word).
+SENT_UNCONFIRMED_AFTER = timedelta(minutes=15)
+#: ``failure_reason`` on the audit row the sweep writes before it retries a lost one.
+NOTIFICATION_LOST = "notification_lost:pending_stale"
+
+#: ``deferred_actions.last_error`` on a queued retry the dispatcher completed WITHOUT a
+#: send: the owner had already heard and nothing retryable was left for the configured
+#: contact (round 7 delivery hardening). The item reads ``delivered`` — the queue's
+#: "nothing more is owed" — and this says how; the escalation row keeps saying
+#: ``owner_fallback``, never ``delivered``.
+SETTLED_OWNER_HEARD = "settled:owner_heard"
 
 #: Refusals that look exactly the same tomorrow (round 7 WP-4b, item 6): a contact
 #: that could never be an address or a number, and an SMS contact with no number
@@ -235,6 +259,10 @@ async def _stamp_delivery(
         values["delivery_provider_message_id"] = str(provider_message_id)[:64]
     if status == DELIVERY_DELIVERED:
         values["delivered_at"] = datetime.now(UTC)
+    if status == DELIVERY_SENT:
+        # The receipt window runs from here (round 7 delivery hardening), not from
+        # ``fired_at``: a replay an hour after the escalation is a seconds-old page.
+        values["sent_at"] = datetime.now(UTC)
     await session.execute(
         update(EscalationEvent)
         .where(
@@ -670,6 +698,12 @@ async def notify_escalation(
     new 24h TTL on every pass and never abandon. ``contacts_only`` is the replay of a
     notification the OWNER already received as a fallback (F083): the configured
     contact is tried again, the owner is never paged a second time for it.
+
+    A contacts-only pass with nothing retryable left — no contact configured (any
+    more), or every one refused terminally — STANDS DOWN: it completes the row's queued
+    retry itself (``SETTLED_OWNER_HEARD``) and returns True, "settled", so neither
+    the ladder nor the sweep replays an item that can never do anything. The row keeps
+    reading ``owner_fallback``.
     """
     notification, inst, owner_email = await _build_notification(
         session,
@@ -755,6 +789,11 @@ async def notify_escalation(
     last_refusal: str | None = None  # a provider refusal that could clear on its own
     terminal_refusal: str | None = None  # a refusal that waiting cannot change (item 6)
     owner_fallback: DeliveryReceipt | None = None  # the owner-email last resort, if tried
+    # Round 7 delivery hardening: has the account owner heard about THIS escalation —
+    # before this pass (a contacts-only replay follows an owner fallback) or during it
+    # (the cc fan-out, the unverified-contact copy)? Remembered on the row as the
+    # ``+owner`` marker so a later failed delivery receipt never emails them twice.
+    owner_heard = contacts_only
     for role, contact in (("primary", routing.primary), ("secondary", routing.secondary)):
         if not contact:
             continue
@@ -823,14 +862,36 @@ async def notify_escalation(
     if contacts_only:
         # The owner already heard (fallback); this replay is for the configured
         # contact alone. Nothing below may page the owner again.
+        if not delivered and last_refusal is None:
+            # Nothing a retry could change: there is no contact to try, or every one
+            # refused terminally. Left queued, this item was replayed for 24h doing
+            # nothing, counted in the backlog the whole time, and then abandoned with
+            # a "could not deliver" email to an owner who had heard within a minute.
+            await _settle_queued_retry(
+                session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+            )
+            return True
+        if delivered and delivered_role is not None:
+            # The replay re-stamped the row (``sent`` / ``delivered``) over the
+            # ``owner_fallback`` that said the owner heard: keep that fact on the row.
+            await _mark_owner_heard(
+                session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=signal,
+                gate=gate,
+                channel=routing.channel,
+                role=delivered_role,
+            )
         return delivered
 
     # cc-owner-email is fan-out, not fallback: it goes out even on a successful primary.
     if routing.cc_owner_email and owner_email and ("email", owner_email) not in attempted:
         attempted.add(("email", owner_email))
-        await _deliver(
+        cc = await _deliver(
             session, notification, channel="email", to=owner_email, role="cc_owner_email"
         )
+        owner_heard = owner_heard or cc.accepted
 
     if delivered:
         # Round 5B item 13: an UNCONFIRMED contact accepted the send — copy the
@@ -857,21 +918,27 @@ async def notify_escalation(
                     "configured_channel": routing.channel,
                 },
             )
-            if copy.accepted:
-                # Remembered on the row: a failed delivery receipt for the contact
-                # must not page the owner a second time for this escalation.
-                await session.execute(
-                    update(EscalationEvent)
-                    .where(
-                        EscalationEvent.admin_id == admin_id,
-                        EscalationEvent.session_id == session_id,
-                        EscalationEvent.signal == signal,
-                        EscalationEvent.gate == gate,
-                    )
-                    .values(delivery_detail=f"{routing.channel}:{delivered_role}+owner"[:64])
-                )
+            owner_heard = owner_heard or copy.accepted
+        if owner_heard and delivered_role is not None:
+            # Remembered on the row: a failed (or never-confirmed) delivery receipt for
+            # the contact must not page the owner a second time for this escalation —
+            # whichever way they heard: the cc fan-out or the unverified-contact copy.
+            await _mark_owner_heard(
+                session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=signal,
+                gate=gate,
+                channel=routing.channel,
+                role=delivered_role,
+            )
         return True
     # Nothing reached the configured contacts — fall back to the account owner (§3.5.4).
+    # Round 7 delivery hardening: the cc fan-out above may already have reached them on
+    # this pass. That IS the owner hearing about this escalation — the same last resort,
+    # taken once: the row says so (``owner_fallback``) and the contact's retry is
+    # contacts-only, so neither a replay nor a failed receipt mails the owner again.
+    owner_reached = owner_heard
     if owner_email and ("email", owner_email) not in attempted:
         # Recorded BEFORE the attempt, because ``attempted`` now decides more than
         # dedupe: an empty set below means "there was nowhere to send this", and a
@@ -902,66 +969,76 @@ async def notify_escalation(
                 session, notification, channel="email", to=owner_email, role="owner_fallback"
             )
         ).accepted:
-            await audit.emit(
+            owner_reached = True
+    if owner_reached:
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            event_type="escalation_owner_fallback",
+            actor_type=ActorType.platform,
+            payload={
+                "signal": signal,
+                "gate": gate,
+                "conversation_ref": notification.conversation_ref,
+                "reason": (
+                    "no_contact_configured"
+                    if not (routing.primary or routing.secondary)
+                    else "configured_contacts_undeliverable"
+                ),
+                "configured_channel": routing.channel,
+            },
+        )
+        await _stamp_delivery(
+            session,
+            admin_id=admin_id,
+            session_id=session_id,
+            signal=signal,
+            gate=gate,
+            status=DELIVERY_OWNER_FALLBACK,
+            detail=last_refusal or terminal_refusal or "no_contact_configured",
+        )
+        if not queue_retry and last_refusal is not None:
+            # A REPLAY (sweep or ladder) reached the owner: the queued item for this
+            # row must not page the owner again on its next pass — re-point it to
+            # the configured contact alone (round 7 WP-4b, item 7).
+            await _repoint_queued_to_contacts_only(
+                session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+            )
+        if not queue_retry and last_refusal is None:
+            # A replay reached the owner and no configured contact is waiting on a
+            # retry (none configured, or all terminal): the queued item filed when
+            # the owner's email blipped has nothing left to do. Completed here,
+            # once — not left for the sweep to replay into a 24h abandon.
+            await _settle_queued_retry(
+                session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
+            )
+        if queue_retry and last_refusal is not None:
+            # The owner heard, but the person the owner CONFIGURED did not (audit
+            # F083): keep trying that contact — contacts only, the owner is never
+            # paged twice for one escalation.
+            await _enqueue_retry(
                 session,
                 admin_id=admin_id,
                 instance_id=instance_id,
-                event_type="escalation_owner_fallback",
-                actor_type=ActorType.platform,
-                payload={
-                    "signal": signal,
-                    "gate": gate,
-                    "conversation_ref": notification.conversation_ref,
-                    "reason": (
-                        "no_contact_configured"
-                        if not (routing.primary or routing.secondary)
-                        else "configured_contacts_undeliverable"
-                    ),
-                    "configured_channel": routing.channel,
-                },
-            )
-            await _stamp_delivery(
-                session,
-                admin_id=admin_id,
                 session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
                 signal=signal,
                 gate=gate,
-                status=DELIVERY_OWNER_FALLBACK,
-                detail=last_refusal or terminal_refusal or "no_contact_configured",
+                score=score,
+                contacts_only=True,
             )
-            if not queue_retry and last_refusal is not None:
-                # A REPLAY (sweep or ladder) reached the owner: the queued item for this
-                # row must not page the owner again on its next pass — re-point it to
-                # the configured contact alone (round 7 WP-4b, item 7).
-                await _repoint_queued_to_contacts_only(
-                    session, admin_id=admin_id, session_id=session_id, signal=signal, gate=gate
-                )
-            if queue_retry and last_refusal is not None:
-                # The owner heard, but the person the owner CONFIGURED did not (audit
-                # F083): keep trying that contact — contacts only, the owner is never
-                # paged twice for one escalation.
-                await _enqueue_retry(
-                    session,
-                    admin_id=admin_id,
-                    instance_id=instance_id,
-                    session_id=session_id,
-                    resolved_lead_id=resolved_lead_id,
-                    signal=signal,
-                    gate=gate,
-                    score=score,
-                    contacts_only=True,
-                )
-                _schedule_background_retries(
-                    admin_id=admin_id,
-                    instance_id=instance_id,
-                    session_id=session_id,
-                    resolved_lead_id=resolved_lead_id,
-                    signal=signal,
-                    gate=gate,
-                    score=score,
-                    contacts_only=True,
-                )
-            return True
+            _schedule_background_retries(
+                admin_id=admin_id,
+                instance_id=instance_id,
+                session_id=session_id,
+                resolved_lead_id=resolved_lead_id,
+                signal=signal,
+                gate=gate,
+                score=score,
+                contacts_only=True,
+            )
+        return True
     if not attempted:
         # No contact anywhere, not even an owner email: record it as a failure so the
         # gap is visible instead of an escalation that silently notified nobody. NOT
@@ -1128,6 +1205,161 @@ def _sms_dlr_pending() -> str:
     return DLR_PENDING
 
 
+OWNER_HEARD_MARKER = "+owner"
+
+
+async def _mark_owner_heard(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    channel: str,
+    role: str,
+) -> None:
+    """``delivery_detail = <channel>:<role>+owner``: the configured contact's page
+    went out AND the account owner has heard about this escalation (round 7 delivery
+    hardening — one marker whichever way: cc fan-out, unverified copy, or an earlier
+    owner fallback a replay just re-stamped). ``record_sms_delivery_receipt`` and the
+    sweep's unconfirmed settlement read it before they page the owner."""
+    await session.execute(
+        update(EscalationEvent)
+        .where(
+            EscalationEvent.admin_id == admin_id,
+            EscalationEvent.session_id == session_id,
+            EscalationEvent.signal == signal,
+            EscalationEvent.gate == gate,
+        )
+        .values(delivery_detail=f"{channel}:{role}{OWNER_HEARD_MARKER}"[:64])
+    )
+
+
+# --- the rows the queue cannot see (round 7 delivery hardening) --------------------- #
+
+
+async def sweep_stale_escalations(
+    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime | None = None
+) -> dict[str, int]:
+    """The deferred sweep's pass over this tenant's escalation rows that no queue item
+    describes (migration 0072 makes such a tenant a ``deferred`` candidate):
+
+    * ``pending`` older than ``PENDING_STALE_AFTER`` — the off-turn notification task
+      died (a deploy's shutdown cancelled it, the process was killed, its transaction
+      aborted) before it paged or queued anything. Nothing read ``pending``: not the
+      sweep, not the backlog, not the alarm. It is audited as a lost notification and
+      retried ONCE through the normal path (``notify_escalation_safely``): a refusal
+      queues it for the 24h ladder like any first attempt, so the row leaves
+      ``pending`` on this pass whatever happens.
+    * ``sent`` for longer than ``SENT_UNCONFIRMED_AFTER``, counted from the send
+      (``sent_at``) — the provider accepted the page
+      and the carrier's receipt never came (lost, blocked, or posted before the
+      sending transaction committed). The provider is asked ONCE for the message's
+      status with the tenant's own credentials: a terminal answer is stamped exactly
+      as the receipt would have been; anything else (the provider could not be asked,
+      or still has no terminal word) settles the row as ``unconfirmed`` and the ladder
+      continues to the owner, who is told nobody can confirm the contact heard.
+
+    Returns counts for the sweep log."""
+    from app.notifications.sms_notifier import fetch_sms_status  # noqa: PLC0415
+
+    moment = now or datetime.now(UTC)
+    counts = {"pending_retried": 0, "sent_settled": 0, "sent_unconfirmed": 0}
+
+    lost = (
+        (
+            await session.execute(
+                select(EscalationEvent).where(
+                    EscalationEvent.admin_id == admin_id,
+                    EscalationEvent.delivery_status == DELIVERY_PENDING,
+                    EscalationEvent.session_id.is_not(None),
+                    EscalationEvent.fired_at < moment - PENDING_STALE_AFTER,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in lost:
+        if row.session_id is None:  # pragma: no cover — filtered above; narrows the type
+            continue
+        await audit.emit(
+            session,
+            admin_id=admin_id,
+            instance_id=row.instance_id,
+            event_type="escalation_delivery_failed",
+            actor_type=ActorType.platform,
+            payload={
+                "signal": row.signal,
+                "gate": row.gate,
+                "session_id": str(row.session_id),
+                "failure_reason": NOTIFICATION_LOST,
+            },
+        )
+        await notify_escalation_safely(
+            session,
+            admin_id=admin_id,
+            instance_id=row.instance_id,
+            session_id=row.session_id,
+            resolved_lead_id=row.resolved_lead_id,
+            signal=row.signal,
+            gate=row.gate,
+            score=row.score_or_confidence,
+        )
+        counts["pending_retried"] += 1
+
+    unreceipted = (
+        (
+            await session.execute(
+                select(EscalationEvent).where(
+                    EscalationEvent.admin_id == admin_id,
+                    EscalationEvent.delivery_status == DELIVERY_SENT,
+                    EscalationEvent.session_id.is_not(None),
+                    EscalationEvent.delivery_provider_message_id.is_not(None),
+                    # Counted from the SEND (``sent_at``): a page this very pass just
+                    # replayed or retried is seconds old whatever its ``fired_at``.
+                    # Rows stamped before the column existed fall back to ``fired_at``.
+                    func.coalesce(EscalationEvent.sent_at, EscalationEvent.fired_at)
+                    < moment - SENT_UNCONFIRMED_AFTER,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in unreceipted:
+        sid = row.delivery_provider_message_id
+        if not sid:  # pragma: no cover — filtered above; narrows the type
+            continue
+        fetched = await fetch_sms_status(session, admin_id, row.instance_id, sid)
+        if fetched is not None and (
+            fetched.status in _DLR_DELIVERED or fetched.status in _DLR_FAILED
+        ):
+            await record_sms_delivery_receipt(
+                session,
+                admin_id=admin_id,
+                instance_id=row.instance_id,
+                provider_message_id=sid,
+                message_status=fetched.status,
+                error_code=fetched.error_code,
+            )
+            counts["sent_settled"] += 1
+            continue
+        why = "status_unavailable" if fetched is None else f"status_{fetched.status}"
+        await _settle_unheard_page(
+            session,
+            admin_id=admin_id,
+            instance_id=row.instance_id,
+            row=row,
+            reason=f"sms_unconfirmed:{why}",
+            owner_reason="sms_delivery_unconfirmed",
+            provider_message_id=sid,
+            terminal_status=DELIVERY_UNCONFIRMED,
+        )
+        counts["sent_unconfirmed"] += 1
+    return counts
+
+
 async def _record_terminal_refusal(
     session: AsyncSession, *, admin_id: uuid.UUID, channel: str, contact: str, reason: str
 ) -> None:
@@ -1192,6 +1424,51 @@ async def _repoint_queued_to_contacts_only(
     return changed
 
 
+async def _settle_queued_retry(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    gate: str,
+    outcome: str = SETTLED_OWNER_HEARD,
+) -> int:
+    """Complete this row's still-queued retry without a send: the owner heard and
+    nothing retryable is left. Only ``queued`` items are touched, so an item completes
+    exactly once whichever pass (ladder rung, sweep replay) gets there first. Returns
+    the number completed."""
+    from app.models.deferred import DeferredAction  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(DeferredAction).where(
+                    DeferredAction.admin_id == admin_id,
+                    DeferredAction.action_type == ESCALATION_RETRY_ACTION,
+                    DeferredAction.status == "queued",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    settled = 0
+    for action in rows:
+        payload = action.payload or {}
+        if (
+            payload.get("session_id") != str(session_id)
+            or payload.get("signal") != signal
+            or payload.get("gate") != gate
+        ):
+            continue
+        action.status = "delivered"
+        action.last_error = outcome
+        settled += 1
+    if settled:
+        await session.flush()
+    return settled
+
+
 #: Twilio ``MessageStatus`` values a delivery receipt settles a row with.
 _DLR_DELIVERED = frozenset({"delivered", "read"})
 _DLR_FAILED = frozenset({"failed", "undelivered"})
@@ -1231,9 +1508,40 @@ async def record_sms_delivery_receipt(
             row.delivered_at = datetime.now(UTC)
             await session.flush()
         return "delivered"
-    if row.delivery_status in (DELIVERY_FAILED, DELIVERY_OWNER_FALLBACK):
+    if row.delivery_status in (DELIVERY_FAILED, DELIVERY_OWNER_FALLBACK, DELIVERY_UNCONFIRMED):
         return "ignored"  # a retried receipt for a row already settled by one
     reason = f"sms_dlr:{status}" + (f":{error_code}" if error_code else "")
+    return await _settle_unheard_page(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        row=row,
+        reason=reason,
+        owner_reason="sms_delivery_failed",
+        provider_message_id=provider_message_id,
+        terminal_status=DELIVERY_FAILED,
+    )
+
+
+async def _settle_unheard_page(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    row: EscalationEvent,
+    reason: str,
+    owner_reason: str,
+    provider_message_id: str,
+    terminal_status: str,
+) -> str:
+    """The contact did not hear (a failed receipt) or nobody can say they did (the
+    sweep's unconfirmed settlement): audit it, and page the owner by email now —
+    unless the owner already heard about this escalation (the ``+owner`` marker), in
+    which case the row simply reads ``owner_fallback``. With no owner to reach the row
+    takes ``terminal_status`` (``failed`` / ``unconfirmed``). Returns what was done:
+    owner_fallback | failed | unconfirmed."""
+    if row.session_id is None:  # pragma: no cover — every caller checked; narrows the type
+        return "unknown_message"
     notification, _inst, owner_email = await _build_notification(
         session,
         admin_id=admin_id,
@@ -1259,7 +1567,7 @@ async def record_sms_delivery_receipt(
             "failure_reason": reason,
         },
     )
-    if "+owner" in (row.delivery_detail or ""):
+    if OWNER_HEARD_MARKER in (row.delivery_detail or ""):
         row.delivery_status = DELIVERY_OWNER_FALLBACK
         row.delivery_detail = reason[:64]
         await session.flush()
@@ -1284,7 +1592,7 @@ async def record_sms_delivery_receipt(
                     "signal": row.signal,
                     "gate": row.gate,
                     "conversation_ref": notification.conversation_ref,
-                    "reason": "sms_delivery_failed",
+                    "reason": owner_reason,
                     "configured_channel": "sms",
                 },
             )
@@ -1292,10 +1600,10 @@ async def record_sms_delivery_receipt(
             row.delivery_detail = reason[:64]
             await session.flush()
             return "owner_fallback"
-    row.delivery_status = DELIVERY_FAILED
+    row.delivery_status = terminal_status
     row.delivery_detail = reason[:64]
     await session.flush()
-    return "failed"
+    return terminal_status
 
 
 async def notify_escalation_safely(
