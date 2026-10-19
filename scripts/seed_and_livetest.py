@@ -36,12 +36,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import sys
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
 
@@ -342,6 +343,126 @@ def _paced(send: Callable[[], httpx.Response], ctx: str) -> httpx.Response:
     raise RuntimeError(f"{ctx}: still rate-limited after bounded retries")
 
 
+# --------------------------------------------------------------------------- #
+# Event-loop hygiene                                                           #
+# --------------------------------------------------------------------------- #
+# Every in-process block runs under its own asyncio.run(), which CLOSES its loop on the
+# way out. An async client opened inside one — the Anthropic/OpenAI SDK clients a live
+# router builds lazily, the app's DB engine — and left open stays bound to that dead
+# loop. The SDK's finalizer runs whenever the garbage collector reaches the client
+# (typically during the NEXT asyncio.run()) and schedules ``aclose()`` on whatever loop
+# is running then; closing the dead loop's transports raises "RuntimeError: Event loop is
+# closed" ("Task exception was never retrieved" — three of them in the 2026-10-19 dev run,
+# after T5 and T6). So every client is closed inside the loop that opened it.
+class LoopClients:
+    """The async clients one event loop opened, closed in THAT loop, last tracked first."""
+
+    def __init__(self) -> None:
+        self._held: list[object] = []
+
+    def track[H](self, holder: H) -> H:
+        """Remember a client — or a provider/router holding one — opened in this loop."""
+        self._held.append(holder)
+        return holder
+
+    async def aclose(self) -> list[str]:
+        """Close every tracked client once. Returns what could not be closed: one failing
+        close never leaves the others open."""
+        errors: list[str] = []
+        seen: set[int] = set()
+        while self._held:
+            for client in _async_clients_of(self._held.pop()):
+                if id(client) in seen:
+                    continue
+                seen.add(id(client))
+                try:
+                    await _close_client(client)
+                except Exception as exc:  # noqa: BLE001 — reported, never masks the rest
+                    errors.append(f"{type(client).__name__}: {type(exc).__name__}: {exc}")
+        return errors
+
+
+def _async_clients_of(holder: object) -> list[object]:
+    """The closeable clients behind ``holder``: a client itself (it has close/aclose); a
+    provider's lazily-built SDK client (``_client``, None until first used); or every leg
+    of an LLMRouter (``_primary`` / ``_fallback`` / ``_fast``)."""
+    if holder is None:
+        return []
+    if callable(getattr(holder, "aclose", None)) or callable(getattr(holder, "close", None)):
+        return [holder]
+    legs = [getattr(holder, leg, None) for leg in ("_primary", "_fallback", "_fast")]
+    if any(leg is not None for leg in legs):
+        return [client for leg in legs for client in _async_clients_of(leg)]
+    return _async_clients_of(getattr(holder, "_client", None))
+
+
+async def _close_client(client: object) -> None:
+    is_closed = getattr(client, "is_closed", None)
+    if (is_closed() if callable(is_closed) else is_closed) is True:
+        return
+    closer = getattr(client, "aclose", None) or client.close  # type: ignore[attr-defined]
+    result = closer()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def close_llm_clients(*holders: object) -> None:
+    """Close the SDK clients the given routers/providers opened — call it inside the loop
+    that used them, before that loop ends."""
+    scope = LoopClients()
+    for holder in holders:
+        scope.track(holder)
+    for error in await scope.aclose():
+        print(f"::warning::seedtest could not close {error}", flush=True)
+
+
+async def _settle_background_work(timeout: float = 60.0) -> None:
+    """Let the off-turn work an in-process turn started — the owner notification its
+    escalation row schedules after the commit — finish INSIDE this loop, bounded.
+    asyncio.run() would otherwise cancel it mid-flight when the loop closes."""
+    from app.notifications import escalation_dispatch
+
+    try:
+        await asyncio.wait_for(escalation_dispatch.drain_background_work(), timeout)
+    except TimeoutError:
+        print(
+            f"::warning::seedtest: off-turn escalation work still running after {timeout:.0f}s "
+            "- cancelled inside its loop (the deferred sweep owns the retry)",
+            flush=True,
+        )
+
+
+def run_async[T](fn: Callable[[LoopClients], Awaitable[T]], *, app_cleanup: bool = True) -> T:
+    """asyncio.run() with the hygiene built in: ``fn`` receives the loop's LoopClients to
+    track what it opens; on the way out — still INSIDE the loop — the tracked clients are
+    closed and (``app_cleanup``) the off-turn work is settled and the DB engine disposed."""
+
+    async def _scoped() -> T:
+        clients = LoopClients()
+        try:
+            return await fn(clients)
+        finally:
+            for error in await clients.aclose():
+                print(f"::warning::seedtest could not close {error}", flush=True)
+            if app_cleanup:
+                from app.db.engine import dispose_engine
+
+                await _settle_background_work()
+                await dispose_engine()
+
+    return asyncio.run(_scoped())
+
+
+def _harness_process_posture() -> None:
+    """This process exits minutes after its in-process turns: the dispatcher's in-process
+    retry ladder (30 s, 120 s) would either hold a loop open or be cancelled at its close.
+    The durable deferred queue the dispatcher also writes owns the retry — the same
+    posture the test suite runs in."""
+    from app.notifications import escalation_dispatch
+
+    escalation_dispatch.ESCALATION_RETRY_DELAYS = ()
+
+
 def usage_conversations(client: httpx.Client) -> int:
     data = _check(client.get(f"{API_BASE}/api/v1/admin/usage/overview"), "usage_overview")
     return int(data.get("conversationsThisPeriod", -1))
@@ -511,19 +632,22 @@ def test_llm_cap_live(r: Results, admin_id: uuid.UUID) -> None:
     async def _go() -> None:
         nonlocal admitted, rejected, failure
         router = build_llm_router(admin_id=admin_id)
-        for _ in range(LLM_CAP_PER_MINUTE):
-            resp = await router.complete(
-                "Reply with the single word OK.",
-                [{"role": "user", "content": "OK?"}],
-            )
-            if not resp.text.strip():
-                failure = "empty completion"
-                return
-            admitted += 1
         try:
-            await router.complete("Reply with OK.", [{"role": "user", "content": "OK?"}])
-        except LLMCapExceeded:
-            rejected = True
+            for _ in range(LLM_CAP_PER_MINUTE):
+                resp = await router.complete(
+                    "Reply with the single word OK.",
+                    [{"role": "user", "content": "OK?"}],
+                )
+                if not resp.text.strip():
+                    failure = "empty completion"
+                    return
+                admitted += 1
+            try:
+                await router.complete("Reply with OK.", [{"role": "user", "content": "OK?"}])
+            except LLMCapExceeded:
+                rejected = True
+        finally:
+            await close_llm_clients(router)  # inside the loop that opened them
 
     try:
         asyncio.run(_go())
@@ -573,7 +697,9 @@ async def _run_inprocess_turn(
     participant_key = participant_key_for(admin_id, channel, synthetic_identifier)
 
     # This coroutine is invoked from several separate asyncio.run() blocks; dispose
-    # the global engine on exit so it is never reused across a dead event loop.
+    # the global engine on exit so it is never reused across a dead event loop — and
+    # settle the off-turn work and close the router's SDK clients first, inside THIS
+    # loop (see "Event-loop hygiene").
     try:
         async with tenant_session(admin_id) as s:
             instance_id = (
@@ -606,6 +732,8 @@ async def _run_inprocess_turn(
                 inbound_text=inbound,
             )
     finally:
+        await _settle_background_work()
+        await close_llm_clients(router)
         await dispose_engine()
 
 
@@ -693,10 +821,13 @@ def test_fallback_failover(r: Results) -> None:
     router = LLMRouter(primary=primary, fallback=fallback, admin_id=uuid.uuid4())
 
     async def _go():
-        return await router.complete(
-            "You are a helpful assistant. Answer in one short sentence.",
-            [{"role": "user", "content": "Say the word 'pong' and nothing else."}],
-        )
+        try:
+            return await router.complete(
+                "You are a helpful assistant. Answer in one short sentence.",
+                [{"role": "user", "content": "Say the word 'pong' and nothing else."}],
+            )
+        finally:
+            await close_llm_clients(router)  # inside the loop that opened them
 
     try:
         resp = asyncio.run(_go())
@@ -893,6 +1024,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'}",
         flush=True,
     )
+    _harness_process_posture()
     r = Results()
     try:
         run_cases(r)
@@ -950,43 +1082,50 @@ def run_cases(r: Results) -> None:
         # behind in the environment. LUCIEL_SEEDTEST_KEEP=1 keeps them for debugging.
         if os.environ.get("LUCIEL_SEEDTEST_KEEP") != "1":
             asyncio.run(_teardown([main_tenant, cap_tenant]))
+        for tenant in (main_tenant, cap_tenant):
+            tenant.client.close()
 
 
 async def _teardown(tenants: list[Tenant]) -> None:
     """Hard-purge the synthetic tenants this run created (F179): the Luciel-scope
     cascade plus the billing identity and the account shell — the same destruction the
     account purge paths run, on rows only this run ever knew about."""
+    from app.db.engine import dispose_engine
     from app.db.session import tenant_session
     from app.lifecycle.cascade import hard_delete_cascade
     from app.models.instance import Account
     from sqlalchemy import delete as sa_delete
 
-    for tenant in tenants:
-        if not tenant.embed_key and not tenant.email:
-            continue
-        try:
-            admin_id = await _admin_id_for(tenant.email)
-        except Exception as exc:  # noqa: BLE001 — never seeded; nothing to purge
-            print(
-                f"[seedtest] teardown: {tenant.role} was never seeded ({type(exc).__name__})",
-                flush=True,
-            )
-            continue
-        try:
-            async with tenant_session(admin_id) as s:
-                counts = await hard_delete_cascade(s, admin_id, include_account_scope=True)
-                await s.execute(sa_delete(Account).where(Account.id == admin_id))
-            rows = sum(counts.values())
-            print(
-                f"[seedtest] teardown: purged synthetic tenant '{tenant.role}' ({rows} rows)",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001 — report, never mask the test result
-            print(
-                f"::warning::seedtest teardown could not purge '{tenant.role}': "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
+    try:
+        for tenant in tenants:
+            if not tenant.embed_key and not tenant.email:
+                continue
+            try:
+                admin_id = await _admin_id_for(tenant.email)
+            except Exception as exc:  # noqa: BLE001 — never seeded; nothing to purge
+                print(
+                    f"[seedtest] teardown: {tenant.role} was never seeded ({type(exc).__name__})",
+                    flush=True,
+                )
+                continue
+            try:
+                async with tenant_session(admin_id) as s:
+                    counts = await hard_delete_cascade(s, admin_id, include_account_scope=True)
+                    await s.execute(sa_delete(Account).where(Account.id == admin_id))
+                rows = sum(counts.values())
+                print(
+                    f"[seedtest] teardown: purged synthetic tenant '{tenant.role}' ({rows} rows)",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — report, never mask the test result
+                print(
+                    f"::warning::seedtest teardown could not purge '{tenant.role}': "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+    finally:
+        # The purge's engine was built on THIS loop; dispose it here, not at exit.
+        await dispose_engine()
 
 
 async def _admin_id_for(email: str) -> uuid.UUID:
