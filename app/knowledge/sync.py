@@ -21,6 +21,7 @@ same interface in Arc 17/11b integration.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -38,7 +39,14 @@ from app.knowledge.graph_extract import (
     get_extractor,
 )
 from app.models.audit import ActorType
+from app.models.instance import NON_SERVING_STATES, Instance
 from app.models.knowledge import KnowledgeSource
+
+logger = logging.getLogger(__name__)
+
+#: ``SyncResult.halted`` when the Luciel stopped serving while the provider fetch was
+#: on the wire (paused or deleted meanwhile): the run ended before any write.
+HALTED_NOT_SERVING = "instance_not_serving"
 
 
 @dataclass
@@ -136,6 +144,11 @@ class SyncResult:
         # served now, their graph is grammar-only, and their revision marker is left
         # unbumped so the next pass re-extracts them.
         self.graph_deferred: list[str] = []
+        # Set when the run ended WITHOUT writing anything because the Luciel stopped
+        # serving while the provider fetch was on the wire (``HALTED_NOT_SERVING``).
+        # Not a failure: nothing is flagged, the next pass after a resume/restore
+        # reconciles as usual.
+        self.halted: str | None = None
 
     def as_dict(self) -> dict[str, list[str]]:
         # ``refused`` travels with the other three (round 7 Phase 2 review, knowledge
@@ -147,6 +160,25 @@ class SyncResult:
             "removed": self.removed,
             "refused": self.refused,
         }
+
+
+async def _instance_serving(
+    session: AsyncSession, *, admin_id: uuid.UUID, instance_id: uuid.UUID
+) -> bool:
+    """Whether the Luciel is serving RIGHT NOW, read from the database.
+
+    A column select, not an entity load: the caller's session may already hold the
+    Instance in its identity map (the sweep loads it to decide whether to start), and
+    a re-query of the entity would hand back that stale object. Under READ COMMITTED
+    this statement sees a pause or delete another transaction committed while the
+    provider fetch was on the wire. A missing row reads as not serving.
+    """
+    state = (
+        await session.execute(
+            select(Instance.state).where(Instance.admin_id == admin_id, Instance.id == instance_id)
+        )
+    ).scalar_one_or_none()
+    return state is not None and state not in NON_SERVING_STATES
 
 
 async def sync_connection(
@@ -169,9 +201,32 @@ async def sync_connection(
     (``SnapshotShrunk``) unless ``allow_shrink`` says the owner confirmed it (F107);
     items the provider could not read this pass (``failed_ids``) are kept and
     flagged, never retired (F117).
+
+    In-flight lifecycle (round 7 M10): the sweep skips a non-serving Luciel when it
+    STARTS, but the provider fetch can take minutes (a crawl), and the owner may pause
+    or delete the Luciel meanwhile. The serving state is re-read after the snapshot
+    returns and BEFORE any write: a Luciel that was serving when the run began and is
+    not serving now ends the run with no writes at all — no chunks, no tombstones, no
+    status flags, no audit row — and ``result.halted`` says why. The sources are not
+    marked failed (nothing failed); the first pass after a resume or restore
+    reconciles as usual. A run the owner started on a Luciel that was ALREADY paused
+    (the manual Re-sync while preparing knowledge) proceeds as before: nothing
+    changed under it.
     """
     result = SyncResult()
+    serving_at_start = await _instance_serving(session, admin_id=admin_id, instance_id=instance_id)
     snapshot = await provider.snapshot(connection_id)
+    if serving_at_start and not await _instance_serving(
+        session, admin_id=admin_id, instance_id=instance_id
+    ):
+        result.halted = HALTED_NOT_SERVING
+        logger.info(
+            "knowledge_sync_halted reason=%s origin=%s items=%d",
+            HALTED_NOT_SERVING,
+            origin,
+            len(snapshot.items),
+        )
+        return result
     remote_by_id = {item.external_id: item for item in snapshot.items}
     failed_ids = set(snapshot.failed_ids)
 

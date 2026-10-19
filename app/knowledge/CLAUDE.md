@@ -58,3 +58,14 @@ make that state explicit and test it.
   live tenant's chunks on 2026-09-13 (the live sweep restored them); both passes now refuse
   to touch live-labelled rows when the mock embedder is active.
 
+
+## Round 7 M10 — a sync in flight at a pause or delete
+- `sync.sync_connection` reads the Luciel's serving state (a column select — never the
+  identity-mapped entity) before `provider.snapshot()` and again after it returns, BEFORE
+  any write. Serving at the start and not serving now (paused or deleted meanwhile) ends
+  the run with NO writes — no chunks, tombstones, status flags or audit row — and
+  `SyncResult.halted = "instance_not_serving"`. Nothing is marked failed; the first pass
+  after resume/restore reconciles. A run STARTED on an already-paused Luciel (the owner's
+  manual Re-sync) proceeds as before; restore's grace-window de-duplication remains the
+  safety net for a manual run on a deleted one.
+  Tests: `tests/integration/test_knowledge_sync_halts_when_not_serving.py`.
