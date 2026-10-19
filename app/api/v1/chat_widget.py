@@ -7,9 +7,16 @@ resolution runs on an untenanted session, then every tenant read/write runs insi
 a tenant_session so the three-layer isolation holds (§3.7.2b).
 
 Render directives (the widget renders what it is told):
-  - paused  → empty render, no chat (Luciel paused/soft-deleted, §3.6.2). No LLM.
-  - at_cap  → graceful no-LLM reply, message passed along (§3.4.1b).
-  - active  → normal agentic turn.
+  - paused      → empty render, no chat (Luciel paused/soft-deleted, §3.6.2). No LLM.
+  - channel_off → empty render, no chat: the owner switched the Website chat channel
+                  off (round 7 owner decision D9). No LLM, no session opened.
+  - at_cap      → graceful no-LLM reply, message passed along (§3.4.1b).
+  - active      → normal agentic turn.
+
+Both held states keep the in-flight carve-out: a supplied session id that resolves to
+an OPEN widget session of this instance keeps being served. When the Luciel is paused
+AND the channel is off, ``paused`` wins (the stronger, account-wide state — the widget
+stops re-checking; ``channel_off`` would keep it polling a Luciel that serves nobody).
 
 AI-identity disclosure (§3.4.16) and the "Powered by VantageMind" chrome (§3.4.17)
 are ALWAYS present on bootstrap — admin wording may shape the opening but cannot
@@ -57,6 +64,7 @@ from app.schemas_api.widget import (
     WidgetBootstrapOut,
     WidgetBootstrapRequest,
     WidgetMessageOut,
+    WidgetRenderStateWire,
     WidgetSendRequest,
     WidgetSendResult,
 )
@@ -272,6 +280,35 @@ def _disclosure_business_name(inst: Instance) -> str:
     return (inst.business_short_name or "").strip() or "this business"
 
 
+def _widget_channel_on(inst: Instance) -> bool:
+    """Whether the owner has the Website chat channel switched ON (owner decision D9).
+
+    Read from the LIVE channels pillar exactly as ``effective_config`` reads enabled
+    channels for a conversation with no snapshot yet (a new visitor has none): the
+    ``widget`` entry's ``enabled`` flag. An instance whose pillar carries no widget
+    entry at all (legacy rows, seeded tests) keeps serving — the widget has always
+    been on by default, so only an explicit ``enabled: false`` holds it. The frontend
+    reads the same rule (absent = on).
+    """
+    for entry in inst.channels or []:
+        if isinstance(entry, dict) and entry.get("id") == CHANNEL:
+            return bool(entry.get("enabled", True))
+    return True
+
+
+def _held_render_state(inst: Instance) -> WidgetRenderStateWire | None:
+    """The quiet directive for a visitor with NO in-flight session, or None to serve.
+
+    ``paused`` wins over ``channel_off`` (see the module docstring): both render
+    nothing, but only ``channel_off`` makes the widget keep re-checking the bootstrap.
+    """
+    if is_paused(inst):
+        return "paused"
+    if not _widget_channel_on(inst):
+        return "channel_off"
+    return None
+
+
 @router.post("/bootstrap", response_model=WidgetBootstrapOut)
 async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBootstrapOut:
     """Resolve the host page's embed key → render directive + disclosure (§3.6.2/§3.4.16)."""
@@ -291,8 +328,10 @@ async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBoo
         # visitor's tab carries its session id across pages, and the bootstrap
         # used to ignore it — a paused Luciel rendered nothing for a visitor who
         # was mid-sentence and clicked to the next page (2026-09-06 E2E walk).
+        # The Website chat channel switched off (D9) holds new visitors the same way.
+        held = _held_render_state(inst)
         in_flight = None
-        if is_paused(inst) and body.session_id is not None:
+        if held is not None and body.session_id is not None:
             in_flight = await find_open_session(
                 s,
                 admin_id=ctx.admin_id,
@@ -300,10 +339,11 @@ async def bootstrap(body: WidgetBootstrapRequest, request: Request) -> WidgetBoo
                 channel=CHANNEL,
                 session_id=body.session_id,
             )
-        if is_paused(inst) and in_flight is None:
-            # Paused → the widget renders an empty <div>; still honest literals.
+        if held is not None and in_flight is None:
+            # Paused / channel off → the widget renders an empty <div>; still honest
+            # literals. No budget read, no LLM, no greeting.
             return WidgetBootstrapOut(
-                render_state="paused",
+                render_state=held,
                 business_name=business,
                 assistant_name=assistant,
                 opening_message="",
@@ -367,9 +407,11 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
             session_id=body.session_id,
         )
 
-        if is_paused(inst) and existing is None:
+        held = _held_render_state(inst)
+        if held is not None and existing is None:
             # Without a live in-window session this is the empty render directive —
-            # no session opened, no LLM.
+            # no session opened, no LLM. Paused (§3.6.2) or the Website chat channel
+            # switched off by the owner (D9); paused wins when both hold.
             return WidgetSendResult(
                 session_id=body.session_id or uuid.uuid4(),
                 reply=WidgetMessageOut(
@@ -378,7 +420,7 @@ async def send_message(body: WidgetSendRequest, request: Request) -> WidgetSendR
                     text="",
                     at=datetime.now(UTC),
                 ),
-                render_state="paused",
+                render_state=held,
             )
 
         # Stage two (§3.1.5): the per-session bucket only for a PROVEN open session;

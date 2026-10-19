@@ -43,6 +43,19 @@ Defines FastAPI v1 routes, dependencies, error behavior, and the control/data-pl
 - `tests/unit/test_closed_account_surface.py` walks every registered route and pins those sets by
   dependency: putting a new route on the wrong gate fails there, by name.
 
+## The Website chat toggle (round 7 owner decision D9)
+- `chat_widget.py` honours the channels pillar's `widget` entry: an explicit `enabled: false`
+  holds NEW visitors — bootstrap answers `renderState: "channel_off"` (no greeting, no budget
+  read, no LLM) and `/messages` opens no session and answers `channel_off`. A missing widget
+  entry reads as ON (legacy rows; the frontend uses the same rule).
+- The carve-out is the pause/delete drain's: a supplied session id that resolves to an OPEN
+  widget session of the instance keeps being served.
+- Paused AND off → `paused` WINS. Both render nothing, but the widget keeps re-checking the
+  bootstrap on `channel_off` (so it appears when the owner switches it back on) and stops on
+  `paused`; re-polling a Luciel that serves nobody would be wasted load.
+- Ordering is unchanged: embed key → per-IP gate → origin allowlist → held states → budget
+  (bootstrap) / stage-two session gate (messages). Tests: `tests/contract/test_widget_channel_off.py`.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.
