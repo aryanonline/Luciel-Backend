@@ -25,7 +25,8 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   task-state rules for failed sweep tasks alarm too; `productionPosture`
   (preprod/prod) gates cost-bearing telemetry, the paused-WAF exception and
   autoscaling; dev data stores are RETAIN + deletion-protected (only preprod is
-  disposable); dev has NO VPC interface endpoints (env-gated, ~$73/mo).
+  disposable); NO environment has VPC interface endpoints (env-gated, ~$73/mo —
+  NAT already carries that traffic; round 7 WP-8b).
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
 - Dev deploys run `scripts/smoke_probe.sh` + the §10 verify task after migrating and

@@ -151,11 +151,16 @@ export interface EnvConfig {
   /**
    * Whether the VPC gets interface endpoints (Secrets Manager, ECR, ECR-Docker,
    * CloudWatch Logs, STS). They exist to keep that traffic off the NAT path, but
-   * five endpoints x two AZs is ~$73/month of standing cost — the single largest
-   * line item in an idle dev environment, which already has a NAT gateway that
-   * serves the same traffic for pennies at dev volume. So dev goes without and
-   * rides NAT; preprod/prod keep the endpoints for throughput and blast-radius
-   * isolation. The free S3 GATEWAY endpoint stays in every environment.
+   * five endpoints x two AZs is ~$73/month of standing cost whether or not a byte
+   * flows. FALSE in every environment since round 7 WP-8b: each environment
+   * already pays for NAT (one in dev, one per AZ in preprod/prod) and the NAT
+   * carries this exact traffic for metered pennies at our volume, so prod was
+   * paying for the same reachability twice. The endpoints are not a security
+   * control here — the tasks egress through NAT for the LLM/Twilio/Stripe calls
+   * anyway. The future option, if Secrets Manager reachability ever needs to
+   * survive a NAT outage, is the SECRETS MANAGER endpoint alone (~$15/month for
+   * two AZs), not the set of five. The free S3 GATEWAY endpoint stays in every
+   * environment (ECR layer pulls ride it).
    */
   readonly vpcInterfaceEndpoints: boolean;
 }
@@ -219,7 +224,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     monthlyBudgetUsd: 400,
     // The release rehearsal runs the exact gated artifact prod will run.
     imageRepoName: 'luciel-backend-prod',
-    vpcInterfaceEndpoints: true,
+    // Mirrors prod (see the field doc): NAT carries the AWS-API traffic.
+    vpcInterfaceEndpoints: false,
   },
   prod: {
     envName: 'prod',
@@ -241,14 +247,16 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // lists the gateway as degraded rather than implying billing reaches Stripe.
     stripeIntegrationPosture: 'mock',
     // Prod's standing run-rate is ~$750–900/mo before traffic (RDS r6g.large
-    // Multi-AZ ≈ $380, Fargate ≈ $180, interface endpoints ≈ $73, NAT ≈ $70,
-    // 2×ALB ≈ $36, Redis + misc). The previous 400 sat at roughly HALF that,
+    // Multi-AZ ≈ $380, Fargate ≈ $180, NAT ≈ $70, ALB ≈ $18, Redis + misc; the
+    // interface endpoints (≈ $73) and the second ALB (≈ $18) left in round 7 WP-8b). The previous 400 sat at roughly HALF that,
     // so the alarm would have fired permanently from day one and trained
     // alert-blindness. 1000 restores meaning: 80% (~$800) marks the top of
     // normal, 100% means something real changed.
     monthlyBudgetUsd: 1000,
     imageRepoName: 'luciel-backend-prod',
-    vpcInterfaceEndpoints: true,
+    // Round 7 WP-8b: NAT (one per AZ) already carries this traffic; paying ~$73/mo
+    // for five interface endpoints on top bought the same reachability twice.
+    vpcInterfaceEndpoints: false,
   },
 };
 
