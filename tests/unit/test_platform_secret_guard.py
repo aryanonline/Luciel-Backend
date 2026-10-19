@@ -85,17 +85,17 @@ def test_live_mode_boots_with_a_fully_populated_blob():
     ("omitted", "attr"),
     [
         ("TWILIO_AUTH_TOKEN", "twilio_auth_token"),
-        ("META_APP_SECRET", "meta_app_secret"),
         ("PLATFORM_EMAIL_SENDER", "platform_email_sender"),
     ],
 )
 def test_live_mode_refuses_to_boot_without_a_delivery_secret(omitted: str, attr: str):
-    """P1-9/P1-10: these three default to "" and nothing downstream refuses.
+    """P1-9/P1-10: these default to "" and nothing downstream refuses.
 
-    An empty Twilio/Meta HMAC key makes ``verify_hmac_shared_secret`` succeed for a
-    forged webhook rather than skip verification, and an unset sender identity binds
-    ``NullEmailSender``, so every platform email is recorded and dropped. Neither is
-    visible from outside, so the refusal has to happen at boot.
+    An empty Twilio HMAC key verified a forged webhook rather than skipping
+    verification, and an unset sender identity binds ``NullEmailSender``, so every
+    platform email is recorded and dropped. Neither is visible from outside, so the
+    refusal has to happen at boot. (META_APP_SECRET is conditional on a provisioned
+    Meta app since round 7 WP-7 — tests/unit/test_meta_app_posture.py.)
     """
     blob = {k: v for k, v in REQUIRED_IN_LIVE_MODE.items() if k != omitted}
     with pytest.raises(RuntimeError, match=omitted):
@@ -157,14 +157,19 @@ def test_a_half_provisioned_instagram_app_refuses_to_boot_in_live_mode():
         live_settings(INSTAGRAM_APP_ID="ig-cid")
 
     with pytest.raises(RuntimeError, match="INSTAGRAM_APP_SECRET"):
-        live_settings(INSTAGRAM_REDIRECT_URI="https://api.example.com/cb")
+        live_settings(
+            INSTAGRAM_REDIRECT_URI="https://api.example.com/api/v1/connections/instagram/callback"
+        )
 
 
 def test_a_fully_provisioned_instagram_app_boots():
     s = live_settings(
         INSTAGRAM_APP_ID="ig-cid",
         INSTAGRAM_APP_SECRET="ig-csecret",
-        INSTAGRAM_REDIRECT_URI="https://api.example.com/cb",
+        INSTAGRAM_REDIRECT_URI="https://api.example.com/api/v1/connections/instagram/callback",
+        # The Instagram app's webhook subscribes to the same GET /webhooks/meta
+        # handshake, so a provisioned Instagram app needs the verify token too.
+        META_VERIFY_TOKEN="unit-test-verify-token",
     )
     assert s.instagram_app_id == "ig-cid"
     assert s.instagram_app_secret == "ig-csecret"  # noqa: S105 — test fixture
@@ -185,14 +190,16 @@ def test_a_half_provisioned_microsoft_app_refuses_to_boot_in_live_mode():
         live_settings(MICROSOFT_CLIENT_ID="ms-cid")
 
     with pytest.raises(RuntimeError, match="MICROSOFT_CLIENT_SECRET"):
-        live_settings(MICROSOFT_REDIRECT_URI="https://api.example.com/cb")
+        live_settings(
+            MICROSOFT_REDIRECT_URI="https://api.example.com/api/v1/connections/microsoft/callback"
+        )
 
 
 def test_a_fully_provisioned_microsoft_app_boots():
     s = live_settings(
         MICROSOFT_CLIENT_ID="ms-cid",
         MICROSOFT_CLIENT_SECRET="ms-csecret",
-        MICROSOFT_REDIRECT_URI="https://api.example.com/cb",
+        MICROSOFT_REDIRECT_URI="https://api.example.com/api/v1/connections/microsoft/callback",
     )
     assert s.microsoft_client_id == "ms-cid"
     assert s.microsoft_client_secret == "ms-csecret"  # noqa: S105 — test fixture

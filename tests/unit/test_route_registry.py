@@ -197,6 +197,10 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # The marketing site's contact form (ruling 1) — unauthenticated by nature,
         # gated by hCaptcha + rate limit rather than by a session.
         ("POST", "/api/v1/contact"),
+        # Round 7 WP-7: the frontend's runtime PUBLIC configuration (hCaptcha site key,
+        # origins, widget embed URL) — unauthenticated, cacheable, no secrets.
+        # Deliberate addition.
+        ("GET", "/api/v1/public/config"),
         # webhooks
         ("POST", "/api/v1/webhooks/stripe"),
         ("POST", "/api/v1/webhooks/twilio/sms"),

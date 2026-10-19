@@ -51,6 +51,9 @@ CONTROL_PLANE_PREFIXES = (
     "/api/v1/billing",
     "/api/v1/contact",
     "/api/v1/escalation-contact",
+    # The frontend's runtime public configuration (round 7 WP-7): unauthenticated and
+    # cacheable, but the dashboard's API, so it lives with the dashboard's plane.
+    "/api/v1/public",
 )
 # Answered by the data plane (the ALB default): public ingress and the platform's
 # own health surface.
@@ -293,6 +296,7 @@ def create_app() -> FastAPI:
     from app.api.v1.dashboard import router as dashboard_router
     from app.api.v1.escalation_contact import router as escalation_contact_router
     from app.api.v1.exports import router as exports_router
+    from app.api.v1.public_config import router as public_config_router
     from app.api.v1.webhooks.channels import router as channels_webhook_router
     from app.api.v1.webhooks.stripe import router as stripe_webhook_router
 
@@ -326,6 +330,9 @@ def create_app() -> FastAPI:
     app.include_router(escalation_contact_router)
     # Account-export download door (§3.6.6): token-authorized, opened from email.
     app.include_router(exports_router)
+    # The frontend's runtime public configuration (round 7 WP-7): site key, origins,
+    # widget embed URL — public values only, no session needed.
+    app.include_router(public_config_router)
 
     return app
 

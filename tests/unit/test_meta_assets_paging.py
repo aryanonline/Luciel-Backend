@@ -31,8 +31,8 @@ class _Transport:
         return _Resp(self.pages.get(url, {"data": []}))
 
 
-ACCOUNTS = f"{meta_assets.GRAPH_BASE}/me/accounts"
-BUSINESSES = f"{meta_assets.GRAPH_BASE}/me/businesses"
+ACCOUNTS = f"{meta_assets.graph_base()}/me/accounts"
+BUSINESSES = f"{meta_assets.graph_base()}/me/businesses"
 
 
 async def test_an_off_graph_next_url_ends_the_walk_and_is_never_fetched():

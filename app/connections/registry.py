@@ -20,9 +20,17 @@ never credential values. Per-tenant tokens continue to live only in the SecretSt
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 
 from app.config import get_settings
+
+#: The slot a registry endpoint carries where the Meta Graph API version goes. The
+#: version is a SETTING (``meta_graph_version``, round 7 WP-7), so the table stores the
+#: template and ``get_provider`` fills it at read time — no version literal lives here.
+GRAPH_VERSION_SLOT = "{meta_graph_version}"
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,10 @@ class OAuthClientConfig:
     client_id: str
     client_secret: str
     redirect_uri: str
+    # False when the configured redirect URI is not one the callback route serves
+    # (``Settings.oauth_redirect_problems``, round 7 WP-7): a consent started on it
+    # ends on a 404 or a refused redeem, so the provider is not offered.
+    redirect_valid: bool = True
 
     @property
     def configured(self) -> bool:
@@ -46,8 +58,9 @@ class OAuthClientConfig:
         consent also needs the registered redirect URI (oauth_flow refuses without
         it). Availability surfaces must use THIS, or a provider with id+secret and
         no redirect renders an enabled Connect button that dead-ends on the
-        placeholder URL (GAP-N3, round 4)."""
-        return self.configured and bool(self.redirect_uri)
+        placeholder URL (GAP-N3, round 4). A redirect URI the callback route cannot
+        serve counts as absent (round 7 WP-7)."""
+        return self.configured and bool(self.redirect_uri) and self.redirect_valid
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,13 @@ class ProviderSpec:
     # credential needs nothing from us, so the provider stays available and the
     # start flow degrades to the form when the OAuth client is unconfigured.
     credential_fallback: bool = False
+    # Providers whose OAuth AUTH host is a per-connection choice (round 7 WP-7):
+    # ``(choice, host)`` pairs, the FIRST being the default the table's endpoints are
+    # written against. Salesforce sandboxes authenticate at test.salesforce.com, not
+    # login.salesforce.com — a sandbox org cannot be connected through the production
+    # host at all. The choice lives on the connection row (``non_secret_config``
+    # ``login_host``) and is honoured by authorize, exchange and refresh.
+    login_hosts: tuple[tuple[str, str], ...] = ()
 
     @property
     def is_oauth(self) -> bool:
@@ -239,6 +259,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
         client_id_setting="salesforce_consumer_key",
         client_secret_setting="salesforce_consumer_secret",  # noqa: S106 — field NAME  # nosec B106
         redirect_uri_setting="salesforce_redirect_uri",
+        # A sandbox org signs in at test.salesforce.com (round 7 WP-7). The endpoints
+        # above are the production default; the connection's choice swaps the host.
+        login_hosts=(("production", "login.salesforce.com"), ("sandbox", "test.salesforce.com")),
         # Lead-push is REAL since Phase 6.5 (owner decision 2026-08-23):
         # SalesforceCrmBackend upserts Lead records in the tenant's own org
         # (instance_url from token_fields) with the same link/heal discipline
@@ -352,8 +375,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         display_name="Meta",
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
-            endpoint="https://www.facebook.com/v19.0/dialog/oauth",
-            exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+            endpoint=f"https://www.facebook.com/{GRAPH_VERSION_SLOT}/dialog/oauth",
+            exchange_endpoint=f"https://graph.facebook.com/{GRAPH_VERSION_SLOT}/oauth/access_token",
             scopes="whatsapp_business_messaging,whatsapp_business_management,"
             "pages_messaging,pages_show_list,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
@@ -363,7 +386,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             # this, WhatsApp/Messenger died an hour after connect and stayed dead
             # until the 6-hourly sweep happened to re-exchange — instagram below
             # always had its equivalent.
-            long_lived_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+            long_lived_endpoint=f"https://graph.facebook.com/{GRAPH_VERSION_SLOT}/oauth/access_token",
             long_lived_grant_type="fb_exchange_token",  # noqa: S106 — a grant type
         ),
         client_id_setting="meta_app_id",
@@ -564,9 +587,126 @@ _ALSO_ACCEPTED: dict[str, frozenset[str]] = {
 }
 
 
-def get_provider(provider: str) -> ProviderSpec | None:
-    """The spec for a provider id, or None if it is not registered."""
-    return PROVIDERS.get(canonical_provider(provider))
+#: The ``non_secret_config`` key a connection's login-host choice is stored under.
+LOGIN_HOST_CONFIG_KEY = "login_host"
+
+# The login-host choice in force for registry reads that carry no connection context of
+# their own — the token exchange in ``knowledge.providers`` asks ``get_provider(provider)``
+# with nothing but the provider id. The callback sets it from the connection row for the
+# duration of the exchange (``login_host_scope``); a None means "the default host".
+_LOGIN_HOST_CHOICE: ContextVar[str | None] = ContextVar("oauth_login_host", default=None)
+
+
+class LoginHostRejected(ValueError):
+    """A login-host choice the provider does not offer (or a provider with none)."""
+
+
+def login_host_choices(provider: str) -> tuple[str, ...]:
+    """The login-host choices a provider offers, default first (empty = no choice)."""
+    spec = PROVIDERS.get(canonical_provider(provider))
+    return tuple(choice for choice, _host in spec.login_hosts) if spec is not None else ()
+
+
+def validated_login_host(provider: str, choice: str | None) -> str | None:
+    """The choice to store on a new connection: the provider's default when ``choice`` is
+    None, ``choice`` itself when the provider offers it; refuses anything else. None for a
+    provider with no choice and no request."""
+    choices = login_host_choices(provider)
+    if choice is None:
+        return choices[0] if choices else None
+    if choice not in choices:
+        offered = ", ".join(choices) if choices else "none"
+        raise LoginHostRejected(
+            f"'{choice}' is not a login host for {provider} (offered: {offered})."
+        )
+    return choice
+
+
+@contextmanager
+def login_host_scope(choice: object) -> Iterator[None]:
+    """Resolve registry endpoints against this connection's login-host ``choice`` for the
+    duration of the block (a non-string / empty choice means the default host)."""
+    token = _LOGIN_HOST_CHOICE.set(choice if isinstance(choice, str) and choice else None)
+    try:
+        yield
+    finally:
+        _LOGIN_HOST_CHOICE.reset(token)
+
+
+def _login_host_swap(spec: ProviderSpec, choice: str | None) -> tuple[str, str] | None:
+    """``(default host, chosen host)`` when ``choice`` moves this provider off its default
+    host; None otherwise (no choices, no choice, the default, or an unknown choice — an
+    unknown one is refused where it is written, never silently honoured here)."""
+    if not spec.login_hosts or not choice:
+        return None
+    hosts = dict(spec.login_hosts)
+    default_host = spec.login_hosts[0][1]
+    chosen = hosts.get(choice)
+    if chosen is None or chosen == default_host:
+        return None
+    return default_host, chosen
+
+
+def resolve_endpoint(url: str, *, swap: tuple[str, str] | None = None) -> str:
+    """A registry endpoint with its setting-driven slots filled (the Graph version) and,
+    for a provider with login-host choices, its auth host moved to the chosen one."""
+    if GRAPH_VERSION_SLOT in url:
+        url = url.replace(GRAPH_VERSION_SLOT, get_settings().meta_graph_version)
+    if swap is not None:
+        url = url.replace(f"://{swap[0]}/", f"://{swap[1]}/", 1)
+    return url
+
+
+def resolve_provider_endpoint(provider: str, url: str, *, login_host: object = None) -> str:
+    """``url`` (one of ``provider``'s endpoints) resolved for a connection whose login
+    host choice is ``login_host`` — the refresh path's entry, which has the row."""
+    spec = PROVIDERS.get(canonical_provider(provider))
+    choice = login_host if isinstance(login_host, str) and login_host else None
+    swap = _login_host_swap(spec, choice) if spec is not None else None
+    return resolve_endpoint(url, swap=swap)
+
+
+def _resolved(spec: ProviderSpec, login_host: str | None = None) -> ProviderSpec:
+    """``spec`` with every authorize endpoint resolved against the running settings and
+    the login-host choice in force (``login_host``, else the scope's).
+
+    The table holds templates (``GRAPH_VERSION_SLOT``) and default hosts; what a caller
+    reads must be the real URL for THIS connection, so every lookup goes through here."""
+    authorize = spec.authorize
+    if authorize is None:
+        return spec
+    swap = _login_host_swap(spec, login_host or _LOGIN_HOST_CHOICE.get())
+
+    def _r(url: str) -> str:
+        return resolve_endpoint(url, swap=swap)
+
+    endpoint = _r(authorize.endpoint)
+    exchange = authorize.exchange_endpoint and _r(authorize.exchange_endpoint)
+    long_lived = authorize.long_lived_endpoint and _r(authorize.long_lived_endpoint)
+    if (endpoint, exchange, long_lived) == (
+        authorize.endpoint,
+        authorize.exchange_endpoint,
+        authorize.long_lived_endpoint,
+    ):
+        return spec
+    return replace(
+        spec,
+        authorize=replace(
+            authorize,
+            endpoint=endpoint,
+            exchange_endpoint=exchange,
+            long_lived_endpoint=long_lived,
+        ),
+    )
+
+
+def get_provider(provider: str, *, login_host: str | None = None) -> ProviderSpec | None:
+    """The spec for a provider id (endpoints resolved), or None if it is not registered.
+
+    ``login_host`` is the connection's login-host choice; without it the choice in the
+    current ``login_host_scope`` (if any) applies, else the provider's default host."""
+    spec = PROVIDERS.get(canonical_provider(provider))
+    return _resolved(spec, login_host) if spec is not None else None
 
 
 def providers_for(connection_type: str) -> list[ProviderSpec]:
@@ -576,8 +716,8 @@ def providers_for(connection_type: str) -> list[ProviderSpec]:
     registered for them, so the function is total over the catalog."""
     ordered = _ORDER.get(connection_type)
     if ordered is not None:
-        return [PROVIDERS[p] for p in ordered if p in PROVIDERS]
-    return [s for s in PROVIDERS.values() if s.connection_type == connection_type]
+        return [_resolved(PROVIDERS[p]) for p in ordered if p in PROVIDERS]
+    return [_resolved(s) for s in PROVIDERS.values() if s.connection_type == connection_type]
 
 
 def default_provider(connection_type: str) -> str | None:
@@ -720,10 +860,12 @@ def oauth_client_config(provider: str) -> OAuthClientConfig:
     def _read(name: str | None) -> str:
         return str(getattr(s, name, "") or "") if name else ""
 
+    label = oauth_client_label(spec.provider)
     return OAuthClientConfig(
         _read(spec.client_id_setting),
         _read(spec.client_secret_setting),
         _read(spec.redirect_uri_setting),
+        redirect_valid=label not in s.oauth_redirect_problems(),
     )
 
 

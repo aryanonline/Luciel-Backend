@@ -93,11 +93,13 @@ def test_oauth_client_config_reads_from_settings(monkeypatch):
     fresh = Settings(
         google_client_id="cid",
         google_client_secret="csecret",
-        google_redirect_uri="https://api.example.com/callback",
+        google_redirect_uri="https://api.example.com/api/v1/connections/google/callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: fresh)
     cfg = oauth_client_config("google_drive")
-    assert cfg == OAuthClientConfig("cid", "csecret", "https://api.example.com/callback")
+    assert cfg == OAuthClientConfig(
+        "cid", "csecret", "https://api.example.com/api/v1/connections/google/callback"
+    )
     assert cfg.configured
 
 
@@ -536,16 +538,16 @@ def _configured_settings(monkeypatch, provider_module):
     fresh = Settings(
         google_client_id="gcid",
         google_client_secret="gcsecret",
-        google_redirect_uri="https://api.example.com/gd-callback",
+        google_redirect_uri="https://api.example.com/api/v1/connections/google/callback",
         hubspot_client_id="hcid",
         hubspot_client_secret="hcsecret",
-        hubspot_redirect_uri="https://api.example.com/hs-callback",
+        hubspot_redirect_uri="https://api.example.com/api/v1/connections/hubspot/callback",
         salesforce_consumer_key="scid",
         salesforce_consumer_secret="scsecret",
-        salesforce_redirect_uri="https://api.example.com/sf-callback",
+        salesforce_redirect_uri="https://api.example.com/api/v1/connections/salesforce/callback",
         notion_client_id="ncid",
         notion_client_secret="ncsecret",  # noqa: S106 — test fixture value  # nosec B106
-        notion_redirect_uri="https://api.example.com/n-callback",
+        notion_redirect_uri="https://api.example.com/api/v1/connections/notion/callback",
     )
     monkeypatch.setattr(provider_module, "get_settings", lambda: fresh)
     # The OAuth app-credential lookup reads settings through the provider registry, so
@@ -607,7 +609,10 @@ async def test_exchange_code_for_token_notion_uses_basic_auth_and_json_body(monk
     assert transport.last_json is not None
     assert transport.last_json["grant_type"] == "authorization_code"
     assert transport.last_json["code"] == "authcode-3"
-    assert transport.last_json["redirect_uri"] == "https://api.example.com/n-callback"
+    assert (
+        transport.last_json["redirect_uri"]
+        == "https://api.example.com/api/v1/connections/notion/callback"
+    )
     # Credentials travel ONLY in the Basic header.
     assert "client_id" not in transport.last_json
     assert "client_secret" not in transport.last_json

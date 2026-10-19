@@ -406,7 +406,7 @@ async def test_oauth_callback_exchanges_code_and_connects_then_sync_uses_stored_
     configured = Settings(
         google_client_id="gcid",
         google_client_secret="gcsecret",
-        google_redirect_uri="https://api.example.com/gd-callback",
+        google_redirect_uri="https://api.example.com/api/v1/connections/google/callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
     # The OAuth app credential is resolved through the provider REGISTRY now (Decision #6),
@@ -513,7 +513,7 @@ async def test_oauth_callback_rejected_code_is_clean_409_not_500(client, monkeyp
     configured = Settings(
         hubspot_client_id="hcid",
         hubspot_client_secret="hcsecret",
-        hubspot_redirect_uri="https://api.example.com/hs-callback",
+        hubspot_redirect_uri="https://api.example.com/api/v1/connections/hubspot/callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: configured)
     # The OAuth app credential is resolved through the provider REGISTRY now (Decision #6),

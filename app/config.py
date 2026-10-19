@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 
 from pydantic import Field
@@ -22,6 +23,170 @@ logger = logging.getLogger(__name__)
 # REFUSE it: it is published in this repo, so anything it verifies is forgeable. Defined
 # in config to keep the fail-closed check free of a billing import cycle.
 FAKE_STRIPE_WEBHOOK_SECRET = "whsec_fake_test_only"  # noqa: S105  # nosec B105
+
+# --------------------------------------------------------------------------- #
+# The platform secret's key set (LUCIEL_PLATFORM_SECRET — one JSON object in Secrets
+# Manager). Every key the runtime reads is declared below, ONCE, so the owner-facing
+# merge script (scripts/merge_platform_secret.py) can refuse a typo instead of storing
+# a key nothing reads. It used to scrape the source for literal ``blob.get("KEY")``
+# calls, which missed every key read through a loop variable (the Stripe webhook secret,
+# the three LLM model pins) and so refused keys the runtime does read.
+# tests/unit/test_platform_secret_keys.py proves every key read here is in the set.
+# --------------------------------------------------------------------------- #
+
+# blob key -> Settings field, applied by ``Settings.model_post_init`` only when the
+# field is still EMPTY (a direct LUCIEL_* env var wins). Only platform-owned values.
+# NOTE: the dict VALUES are Pydantic field NAMES (not secret values); bandit's B105
+# heuristic flags the name strings ending in secret/token/key, hence the per-line
+# ``# nosec B105`` on those entries. No secret material is hardcoded here.
+PLATFORM_SECRET_FIELD_MAP: dict[str, str] = {
+    # The Google app credential is one client for Drive + Calendar. GOOGLE_DRIVE_* is
+    # the key set the blob was first provisioned under and names that same client, so
+    # it is still accepted; GOOGLE_* wins when both are present.
+    "GOOGLE_CLIENT_ID": "google_client_id",
+    "GOOGLE_DRIVE_CLIENT_ID": "google_client_id",
+    "GOOGLE_CLIENT_SECRET": "google_client_secret",  # nosec B105
+    "GOOGLE_DRIVE_CLIENT_SECRET": "google_client_secret",  # nosec B105
+    "GOOGLE_REDIRECT_URI": "google_redirect_uri",
+    "GOOGLE_DRIVE_REDIRECT_URI": "google_redirect_uri",
+    "HUBSPOT_CLIENT_ID": "hubspot_client_id",
+    "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",  # nosec B105
+    "HUBSPOT_REDIRECT_URI": "hubspot_redirect_uri",
+    "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
+    "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
+    "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
+    "CALENDLY_CLIENT_ID": "calendly_client_id",
+    "CALENDLY_CLIENT_SECRET": "calendly_client_secret",  # nosec B105
+    "CALENDLY_REDIRECT_URI": "calendly_redirect_uri",
+    "NOTION_CLIENT_ID": "notion_client_id",
+    "NOTION_CLIENT_SECRET": "notion_client_secret",  # nosec B105
+    "NOTION_REDIRECT_URI": "notion_redirect_uri",
+    "META_APP_ID": "meta_app_id",
+    "META_REDIRECT_URI": "meta_redirect_uri",
+    "INSTAGRAM_APP_ID": "instagram_app_id",
+    "INSTAGRAM_REDIRECT_URI": "instagram_redirect_uri",
+    "MICROSOFT_CLIENT_ID": "microsoft_client_id",
+    "MICROSOFT_REDIRECT_URI": "microsoft_redirect_uri",
+    "MICROSOFT_CLIENT_SECRET": "microsoft_client_secret",  # nosec B105
+    "PLATFORM_EMAIL_SENDER": "platform_email_sender",
+    # Not secret material, but it is per-environment Stripe account state that travels
+    # with the Stripe keys — so it is rotated in the same blob rather than pinned in a
+    # task definition.
+    "STRIPE_PAYG_PRICE_ID": "stripe_payg_price_id",
+    "STRIPE_PORTAL_CONFIGURATION_ID": "stripe_portal_configuration_id",
+    # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret, rather
+    # than needing a task-definition change to reach every account.
+    "PLATFORM_NOTICES": "platform_notices",
+    "LLM_MODEL_UPDATED": "llm_model_updated",
+    "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
+    "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
+    "WIDGET_EMBED_URL": "widget_embed_url",
+    "TWILIO_ACCOUNT_SID": "twilio_account_sid",
+    "TWILIO_API_KEY_SID": "twilio_api_key_sid",
+    "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
+    "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
+    "TWILIO_OAUTH_CLIENT_ID": "twilio_oauth_client_id",
+    "TWILIO_OAUTH_CLIENT_SECRET": "twilio_oauth_client_secret",  # nosec B105
+    "TWILIO_OAUTH_REDIRECT_URI": "twilio_oauth_redirect_uri",
+    "META_APP_SECRET": "meta_app_secret",  # nosec B105
+    "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
+    "INSTAGRAM_APP_SECRET": "instagram_app_secret",  # nosec B105
+    "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
+    # Round 5B item 13: the SES events pipeline (bounce/complaint) — also settable as
+    # plain task env (the CDK wires both ways).
+    "SES_CONFIGURATION_SET": "ses_configuration_set",
+    "SES_EVENTS_TOPIC_ARN": "ses_events_topic_arn",
+    "SES_INBOUND_TOPIC_ARN": "ses_inbound_topic_arn",
+}
+
+# Fields that carry NON-empty defaults, so the empty-field overlay above can never reach
+# them: (env var, blob key, field) bridged with env > blob > default precedence. The LLM
+# model pins are the §3.4.3 model-retirement contingency (a retired model is a secret
+# rotation + restart, not a rebuild). PLATFORM_CONTACT_INBOX sat in the empty-field map
+# above, where its non-empty default meant the documented per-environment override
+# could never apply (round 7 WP-7).
+DEFAULTED_FIELD_PINS: tuple[tuple[str, str, str], ...] = (
+    (
+        "LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL",
+        "LLM_ANTHROPIC_PRIMARY_MODEL",
+        "llm_anthropic_primary_model",
+    ),
+    ("LUCIEL_LLM_ANTHROPIC_FAST_MODEL", "LLM_ANTHROPIC_FAST_MODEL", "llm_anthropic_fast_model"),
+    (
+        "LUCIEL_LLM_OPENAI_FALLBACK_MODEL",
+        "LLM_OPENAI_FALLBACK_MODEL",
+        "llm_openai_fallback_model",
+    ),
+    ("LUCIEL_PLATFORM_CONTACT_INBOX", "PLATFORM_CONTACT_INBOX", "platform_contact_inbox"),
+    ("LUCIEL_META_GRAPH_VERSION", "META_GRAPH_VERSION", "meta_graph_version"),
+    # Round 7 WP-6 item 9: the ElevenLabs vendor ids rotate the same way.
+    ("LUCIEL_ELEVENLABS_VOICE_ID", "ELEVENLABS_VOICE_ID", "elevenlabs_voice_id"),
+    ("LUCIEL_ELEVENLABS_MODEL_ID", "ELEVENLABS_MODEL_ID", "elevenlabs_model_id"),
+)
+
+# The Stripe webhook signing secret, first match wins. STRIPE_TEST_WEBHOOK_SECRET is an
+# alias so the "test" posture keys already provisioned in the blob also arm the route.
+STRIPE_WEBHOOK_SECRET_KEYS: tuple[str, ...] = (
+    "STRIPE_WEBHOOK_SECRET",  # nosec B105 — a blob KEY name, not a secret
+    "STRIPE_TEST_WEBHOOK_SECRET",  # nosec B105 — a blob KEY name, not a secret
+)
+
+# Keys ``Settings.model_post_init`` reads by name outside the two tables above (each
+# has its own precedence or coercion rule there).
+_SETTINGS_DIRECT_KEYS: tuple[str, ...] = (
+    "APP_BASE_URL",
+    "API_BASE_URL",
+    "DASHBOARD_ORIGINS",
+    "JWT_SIGNING_KEY",
+    "JWT_SIGNING_KEY_PREVIOUS",
+    "ALLOW_CAPTCHA_BYPASS_TOKEN",
+)
+
+# Keys other modules read through ``parse_platform_secret`` (provider keys are consumed
+# where the provider is built, never copied onto Settings).
+_PROVIDER_KEYS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",  # runtime/provider_factory.py, runtime/model_currency.py
+    "OPENAI_API_KEY",  # runtime/provider_factory.py, knowledge/embeddings.py
+    "ELEVENLABS_API_KEY",  # runtime/provider_factory.py (voice)
+    # The ElevenLabs voice + model pins (round 7 Phase 3, voice track): accepted here so
+    # the owner can provision them the moment that reader lands.
+    "ELEVENLABS_VOICE_ID",
+    "ELEVENLABS_MODEL_ID",
+    "STRIPE_TEST_SECRET_KEY",  # billing/stripe_gateway.py ("test" posture)
+    "STRIPE_TEST_PUBLISHABLE_KEY",  # billing/stripe_gateway.py (optional)
+)
+
+# THE accepted key set. Anything outside it is a typo as far as the runtime is concerned.
+PLATFORM_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        *PLATFORM_SECRET_FIELD_MAP,
+        *(blob_key for _env, blob_key, _field in DEFAULTED_FIELD_PINS),
+        *STRIPE_WEBHOOK_SECRET_KEYS,
+        *_SETTINGS_DIRECT_KEYS,
+        *_PROVIDER_KEYS,
+    }
+)
+
+
+#: Each OAuth app's redirect-URI setting -> the OAuth CLIENT label its callback is served
+#: under (``GET /api/v1/connections/<label>/callback``, app/api/v1/connections_callback.py).
+#: The label is ``connections.registry.oauth_client_label`` — Drive and Calendar share
+#: the one Google client, hence one URI. Kept here (config cannot import the registry)
+#: and proved equal to the registry by tests/unit/test_oauth_redirect_validation.py.
+OAUTH_REDIRECT_URI_FIELDS: dict[str, str] = {
+    "google_redirect_uri": "google",
+    "hubspot_redirect_uri": "hubspot",
+    "salesforce_redirect_uri": "salesforce",
+    "calendly_redirect_uri": "calendly",
+    "notion_redirect_uri": "notion",
+    "meta_redirect_uri": "meta",
+    "instagram_redirect_uri": "instagram",
+    "microsoft_redirect_uri": "microsoft",
+    "twilio_oauth_redirect_uri": "twilio",
+}
+
+#: The path every registered redirect URI must end with.
+OAUTH_CALLBACK_PATH = "/api/v1/connections/{label}/callback"
 
 
 class Settings(BaseSettings):
@@ -230,9 +395,12 @@ class Settings(BaseSettings):
     # secret / task env (SES_CONFIGURATION_SET / SES_EVENTS_TOPIC_ARN).
     ses_configuration_set: str = ""
     ses_events_topic_arn: str = ""
-    # The SNS topic the SES INBOUND receipt rule publishes to (out-of-band ops, root
-    # CLAUDE.md). When set in live mode the inbound route refuses any other topic
-    # (2026-09-05 audit F048) — the events route already pinned; inbound did not.
+    # The SNS topic(s) the SES INBOUND receipt rule publishes to, comma-separated. The
+    # inbound route refuses any other topic in live mode (2026-09-05 audit F048) and,
+    # since round 7 WP-7, refuses EVERYTHING in live mode while this is unset: an
+    # unpinned route accepted a signed envelope from anyone's topic. ComputeStack
+    # injects the managed `-v2` topic plus the console-created `luciel-<env>-ses-inbound`
+    # by name (whichever the active receipt rule set publishes to).
     ses_inbound_topic_arn: str = ""
     # TTL for escalation-contact confirmation links (round 5B item 13).
     escalation_contact_link_ttl_seconds: int = 7 * 24 * 3600
@@ -254,7 +422,16 @@ class Settings(BaseSettings):
     # hCaptcha signup bot-protection (§3.7.1a). Empty -> verification is a no-op
     # (mock/CI/local); set in live mode to enforce siteverify on signup.
     hcaptcha_secret_key: str = ""
+    # The PUBLIC site key the signup/contact pages render the widget with. Served to
+    # the frontend by GET /api/v1/public/config (round 7 WP-7) — before that nothing
+    # read it and the frontend baked a literal in at build time.
     hcaptcha_site_key: str = ""
+    # The widget embed script customers paste onto their sites
+    # (https://<widget host>/v1/luciel.js), served by GET /api/v1/public/config so the
+    # dashboard's embed snippet follows the environment. ComputeStack injects
+    # LUCIEL_WIDGET_EMBED_URL; the platform secret's WIDGET_EMBED_URL fills it
+    # otherwise. Empty = not configured here (the frontend keeps its own fallback).
+    widget_embed_url: str = ""
     # Non-production ONLY: when True, the signup captcha check accepts the fixed
     # seed/live-test bypass token so the §10 harness can create synthetic accounts
     # through the real API in a live-configured dev/preprod. MUST remain False in prod
@@ -357,6 +534,15 @@ class Settings(BaseSettings):
     # authorization-code flow for the WhatsApp / Instagram channel connect.
     meta_app_id: str = ""
     meta_redirect_uri: str = ""
+    # The Meta Graph API version EVERY Meta URL is built on (round 7 WP-7): the
+    # Facebook OAuth dialog, the token exchange/refresh, the WhatsApp/Messenger send,
+    # the asset lookup and the identity probe on graph.facebook.com, and the Instagram
+    # Login send/lookup/probe on graph.instagram.com. It was pinned at v19.0 in four
+    # files while Instagram ran on v23.0; Meta retires a version roughly two years
+    # after release, so this is the ONE place it changes. Override per environment
+    # with LUCIEL_META_GRAPH_VERSION or the platform secret's META_GRAPH_VERSION
+    # ("vNN.N"; a bare "NN.N" is accepted). Use ``meta_graph_base`` to build a URL.
+    meta_graph_version: str = "v23.0"
     # Instagram is a SEPARATE Meta app (the "Instagram API with Business Login for
     # Instagram" product), with its own app id/secret and its own OAuth host — the
     # Facebook dialog rejects the instagram_* scopes outright. Empty -> the Instagram
@@ -426,69 +612,6 @@ class Settings(BaseSettings):
         # overlay below is already written as `blob.get(...)`, so an empty mapping is
         # a no-op for them; only the guards change behaviour.
         blob = parse_platform_secret(self.platform_secret, live=self.integration_mode == "live")
-        # blob key -> settings attribute. Only platform-owned APP credentials.
-        # NOTE: the dict VALUES are Pydantic field NAMES (not secret values); bandit's
-        # B105 heuristic flags the name strings ending in secret/token/key, hence the
-        # per-line `# nosec B105` on those entries. No secret material is hardcoded here.
-        overlay = {
-            # The Google app credential is one client for Drive + Calendar. GOOGLE_DRIVE_*
-            # is the key set the blob was first provisioned under and names that same
-            # client, so it is still accepted; GOOGLE_* wins when both are present.
-            "GOOGLE_CLIENT_ID": "google_client_id",
-            "GOOGLE_DRIVE_CLIENT_ID": "google_client_id",
-            "GOOGLE_CLIENT_SECRET": "google_client_secret",  # nosec B105
-            "GOOGLE_DRIVE_CLIENT_SECRET": "google_client_secret",  # nosec B105
-            "GOOGLE_REDIRECT_URI": "google_redirect_uri",
-            "GOOGLE_DRIVE_REDIRECT_URI": "google_redirect_uri",
-            "HUBSPOT_CLIENT_ID": "hubspot_client_id",
-            "HUBSPOT_CLIENT_SECRET": "hubspot_client_secret",  # nosec B105
-            "HUBSPOT_REDIRECT_URI": "hubspot_redirect_uri",
-            "SALESFORCE_CONSUMER_KEY": "salesforce_consumer_key",
-            "SALESFORCE_CONSUMER_SECRET": "salesforce_consumer_secret",  # nosec B105
-            "SALESFORCE_REDIRECT_URI": "salesforce_redirect_uri",
-            "CALENDLY_CLIENT_ID": "calendly_client_id",
-            "CALENDLY_CLIENT_SECRET": "calendly_client_secret",  # nosec B105
-            "CALENDLY_REDIRECT_URI": "calendly_redirect_uri",
-            "NOTION_CLIENT_ID": "notion_client_id",
-            "NOTION_CLIENT_SECRET": "notion_client_secret",  # nosec B105
-            "NOTION_REDIRECT_URI": "notion_redirect_uri",
-            "META_APP_ID": "meta_app_id",
-            "META_REDIRECT_URI": "meta_redirect_uri",
-            "INSTAGRAM_APP_ID": "instagram_app_id",
-            "INSTAGRAM_REDIRECT_URI": "instagram_redirect_uri",
-            "MICROSOFT_CLIENT_ID": "microsoft_client_id",
-            "MICROSOFT_REDIRECT_URI": "microsoft_redirect_uri",
-            "MICROSOFT_CLIENT_SECRET": "microsoft_client_secret",  # nosec B105
-            "PLATFORM_EMAIL_SENDER": "platform_email_sender",
-            "PLATFORM_CONTACT_INBOX": "platform_contact_inbox",
-            # Not secret material, but it is per-environment Stripe account state that
-            # travels with the Stripe keys — so it is rotated in the same blob rather
-            # than pinned in a task definition.
-            "STRIPE_PAYG_PRICE_ID": "stripe_payg_price_id",
-            "STRIPE_PORTAL_CONFIGURATION_ID": "stripe_portal_configuration_id",
-            # Lets an operator PUBLISH a §A5/§A10/§B6 notice by rotating the secret,
-            # rather than needing a task-definition change to reach every account.
-            "PLATFORM_NOTICES": "platform_notices",
-            "LLM_MODEL_UPDATED": "llm_model_updated",
-            "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
-            "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
-            "TWILIO_ACCOUNT_SID": "twilio_account_sid",
-            "TWILIO_API_KEY_SID": "twilio_api_key_sid",
-            "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
-            "TWILIO_CLIENT_SECRET": "twilio_api_key_secret",  # nosec B105
-            "TWILIO_OAUTH_CLIENT_ID": "twilio_oauth_client_id",
-            "TWILIO_OAUTH_CLIENT_SECRET": "twilio_oauth_client_secret",  # nosec B105
-            "TWILIO_OAUTH_REDIRECT_URI": "twilio_oauth_redirect_uri",
-            "META_APP_SECRET": "meta_app_secret",  # nosec B105
-            "META_VERIFY_TOKEN": "meta_verify_token",  # nosec B105
-            "INSTAGRAM_APP_SECRET": "instagram_app_secret",  # nosec B105
-            "TWILIO_AUTH_TOKEN": "twilio_auth_token",  # nosec B105
-            # Round 5B item 13: the SES events pipeline (bounce/complaint) —
-            # also settable as plain task env (the CDK wires both ways).
-            "SES_CONFIGURATION_SET": "ses_configuration_set",
-            "SES_EVENTS_TOPIC_ARN": "ses_events_topic_arn",
-            "SES_INBOUND_TOPIC_ARN": "ses_inbound_topic_arn",
-        }
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
         # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
         # (the public frontend origin used in customer-facing links, e.g. the verify
@@ -511,37 +634,21 @@ class Settings(BaseSettings):
             if not getattr(self, ses_field) and os.environ.get(plain_env):
                 object.__setattr__(self, ses_field, os.environ[plain_env])
 
-        # LLM model IDs (§3.4.3 model-retirement contingency). These carry
-        # non-empty defaults, so the generic empty-field overlay above never
-        # reaches them — bridged explicitly with env > platform-secret > default
-        # precedence. The point: when a provider retires a model version, the
-        # swap is a platform-secret rotation + ECS restart, not an image
-        # rebuild + deploy. A direct env var (local/CI, and any deliberate
-        # task-definition pin) still wins over the blob.
-        for env_name, blob_key, field_name in (
-            (
-                "LUCIEL_LLM_ANTHROPIC_PRIMARY_MODEL",
-                "LLM_ANTHROPIC_PRIMARY_MODEL",
-                "llm_anthropic_primary_model",
-            ),
-            (
-                "LUCIEL_LLM_ANTHROPIC_FAST_MODEL",
-                "LLM_ANTHROPIC_FAST_MODEL",
-                "llm_anthropic_fast_model",
-            ),
-            (
-                "LUCIEL_LLM_OPENAI_FALLBACK_MODEL",
-                "LLM_OPENAI_FALLBACK_MODEL",
-                "llm_openai_fallback_model",
-            ),
-            # Round 7 WP-6 item 9: the ElevenLabs vendor ids rotate the same way.
-            ("LUCIEL_ELEVENLABS_VOICE_ID", "ELEVENLABS_VOICE_ID", "elevenlabs_voice_id"),
-            ("LUCIEL_ELEVENLABS_MODEL_ID", "ELEVENLABS_MODEL_ID", "elevenlabs_model_id"),
-        ):
+        # Non-empty-default fields (the LLM model IDs — §3.4.3 model-retirement
+        # contingency — and the contact inbox). The generic empty-field overlay never
+        # reaches them, so they are bridged explicitly with env > platform-secret >
+        # default precedence. The point: when a provider retires a model version, the
+        # swap is a platform-secret rotation + ECS restart, not an image rebuild +
+        # deploy. A direct env var (local/CI, and any deliberate task-definition pin)
+        # still wins over the blob.
+        for env_name, blob_key, field_name in DEFAULTED_FIELD_PINS:
             if os.environ.get(env_name):
                 continue  # pydantic already applied the env value; env wins
             if blob.get(blob_key):
                 object.__setattr__(self, field_name, blob[blob_key])
+        object.__setattr__(
+            self, "meta_graph_version", _normalized_graph_version(self.meta_graph_version)
+        )
 
         # JWT signing key: security-critical. Bridge it from the platform secret; it has
         # a KNOWN dev-default (published in source), so in live mode we must FAIL CLOSED
@@ -565,7 +672,7 @@ class Settings(BaseSettings):
         # billing event (state changes, dunning exits) — fail closed exactly as above.
         # STRIPE_TEST_WEBHOOK_SECRET is accepted as an alias so the "test" posture keys
         # already provisioned in the blob also arm the webhook route.
-        for key in ("STRIPE_WEBHOOK_SECRET", "STRIPE_TEST_WEBHOOK_SECRET"):
+        for key in STRIPE_WEBHOOK_SECRET_KEYS:
             if blob.get(key):
                 object.__setattr__(self, "stripe_webhook_secret", blob[key])
                 break
@@ -632,19 +739,31 @@ class Settings(BaseSettings):
                 # single-level TLDs this product uses.
                 parent = ".".join(labels[-2:])
                 object.__setattr__(self, "cookie_domain", "." + parent)
-        for blob_key, attr in overlay.items():
+        for blob_key, attr in PLATFORM_SECRET_FIELD_MAP.items():
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
+
+        # Redirect URIs, checked once every source has been applied (round 7 WP-7). They
+        # were read raw: a URI registered at the wrong path sent the owner through a real
+        # consent screen to a 404 (or a redeem the provider refuses for a mismatched
+        # redirect_uri). Not a boot failure — the rest of the platform is fine — but the
+        # provider is unavailable until fixed (``oauth_redirect_problems`` is read by the
+        # registry and /healthz) and the reason is logged at ERROR here.
+        for label, reason in self.oauth_redirect_problems().items():
+            logger.error(
+                "oauth_redirect_invalid provider=%s %s — connect is unavailable until fixed",
+                label,
+                reason,
+            )
 
         # Delivery/verification secrets, checked AFTER the overlay bridge above so the
         # blob has already been applied. These fail closed in live mode for two distinct
         # reasons, both of which are silent in a running system:
         #
         #  * TWILIO_AUTH_TOKEN / META_APP_SECRET are the HMAC keys the inbound channel
-        #    webhooks verify with. Empty-string keys do not disable verification — they
-        #    make it succeed for anyone who can compute an HMAC with a key they also
-        #    know is "" (P1-9). A forged webhook is an inbound message attributed to a
-        #    tenant.
+        #    webhooks verify with (P1-9: an empty key once verified anyone's HMAC;
+        #    ``verify_hmac_shared_secret`` now refuses an empty key outright). A forged
+        #    webhook is an inbound message attributed to a tenant.
         #  * PLATFORM_EMAIL_SENDER decides whether ``build_email_sender`` binds SES or
         #    the Null sender. Unset, every platform email (verification, reset, dunning,
         #    escalation, export-ready) is recorded and dropped (P1-10).
@@ -653,11 +772,22 @@ class Settings(BaseSettings):
                 name
                 for name, value in (
                     ("TWILIO_AUTH_TOKEN", self.twilio_auth_token),
-                    ("META_APP_SECRET", self.meta_app_secret),
                     ("PLATFORM_EMAIL_SENDER", self.platform_email_sender),
                 )
                 if not value
             ]
+            # The Facebook Meta app (WhatsApp + Messenger) follows the same
+            # half-provisioned rule as Instagram/Microsoft below (round 7 WP-7). Absent
+            # entirely, it is honestly unconfigured: no authorize URL, and the inbound
+            # route refuses every signature because the HMAC key is empty. Provisioned,
+            # it needs its app secret (to redeem codes and verify webhooks) AND the
+            # webhook verify token — without the token Meta's GET handshake answers 403,
+            # the webhook subscription can never be saved, and every channel connects
+            # cleanly and then never receives a message.
+            if self.meta_app_configured and not self.meta_app_secret:
+                missing.append("META_APP_SECRET")
+            if self.meta_webhook_unconfigured:
+                missing.append("META_VERIFY_TOKEN")
             # INSTAGRAM_APP_SECRET is conditional, and the condition is the point. An
             # absent Instagram app is a supported posture — the connection reports
             # configured=false and the owner sees a disabled tile. A HALF-provisioned one
@@ -701,6 +831,96 @@ class Settings(BaseSettings):
                 "allow_captcha_bypass_token",
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
+
+    def oauth_redirect_problems(self) -> dict[str, str]:
+        """``{oauth client label: reason}`` for every CONFIGURED redirect URI that the
+        callback route cannot serve; empty when all are well-formed.
+
+        A URI must end with ``/api/v1/connections/<label>/callback`` and, when the
+        public API origin is known, be exactly that origin plus the path. Computed on
+        read (not cached at boot) so it always describes the settings in effect. The
+        reason names the platform-secret key and the expected shape; a redirect URI is
+        public (it travels in every authorize URL), never secret material."""
+        base = (self.public_api_base_url or "").strip().rstrip("/")
+        problems: dict[str, str] = {}
+        for field_name, label in OAUTH_REDIRECT_URI_FIELDS.items():
+            uri = str(getattr(self, field_name, "") or "").strip()
+            if not uri:
+                continue
+            path = OAUTH_CALLBACK_PATH.format(label=label)
+            key = field_name.upper()
+            if not uri.endswith(path):
+                problems[label] = f"{key} must end with {path} (got {uri!r})"
+            elif base and uri != f"{base}{path}":
+                problems[label] = f"{key} must be {base}{path} (got {uri!r})"
+        return problems
+
+    @property
+    def platform_twilio_configured(self) -> bool:
+        """A PLATFORM Twilio account was intentionally configured (any of its three
+        settings). The customer-facing path is BYO; this one is the dev fallback."""
+        return bool(
+            self.twilio_account_sid or self.twilio_api_key_sid or self.twilio_api_key_secret
+        )
+
+    @property
+    def ses_inbound_topic_arns(self) -> frozenset[str]:
+        """The pinned SES inbound topics (``ses_inbound_topic_arn``, comma-separated)."""
+        return frozenset(a.strip() for a in self.ses_inbound_topic_arn.split(",") if a.strip())
+
+    @property
+    def meta_app_configured(self) -> bool:
+        """The Facebook Meta app (WhatsApp + Messenger) is at least partly provisioned."""
+        return bool(self.meta_app_id or self.meta_redirect_uri)
+
+    @property
+    def instagram_app_configured(self) -> bool:
+        """The Instagram Business Login app is at least partly provisioned."""
+        return bool(self.instagram_app_id or self.instagram_redirect_uri)
+
+    @property
+    def meta_webhook_unconfigured(self) -> bool:
+        """A Meta-family app is provisioned but the webhook verify token is not.
+
+        Both apps (Facebook and Instagram) subscribe their webhooks to the ONE
+        ``GET /api/v1/webhooks/meta`` handshake, which answers 403 to every
+        ``hub.verify_token`` while META_VERIFY_TOKEN is empty — so the subscription can
+        never be saved and the channels never receive a message."""
+        provisioned = self.meta_app_configured or self.instagram_app_configured
+        return provisioned and not self.meta_verify_token
+
+
+_GRAPH_VERSION_RE = re.compile(r"^v\d{1,3}\.\d{1,2}$")
+
+#: The Facebook Graph host (WhatsApp, Messenger, the Meta token endpoints).
+FACEBOOK_GRAPH_HOST = "graph.facebook.com"
+#: Instagram Login tokens are issued by, and only accepted at, Instagram's own host.
+INSTAGRAM_GRAPH_HOST = "graph.instagram.com"
+#: The Facebook OAuth consent dialog's host.
+FACEBOOK_DIALOG_HOST = "www.facebook.com"
+
+
+def _normalized_graph_version(raw: str) -> str:
+    """``vNN.N`` (a bare ``NN.N`` gains its ``v``); anything else refuses to boot.
+
+    Every Meta URL is built on this value, so a malformed pin would turn every Graph
+    call into a 4xx — a boot failure names the key instead (the value is not secret)."""
+    value = (raw or "").strip()
+    if value[:1].isdigit():
+        value = "v" + value
+    if not _GRAPH_VERSION_RE.match(value):
+        raise RuntimeError(
+            f"META_GRAPH_VERSION {raw!r} is not a Graph API version (expected e.g. 'v23.0')"
+        )
+    return value
+
+
+def meta_graph_base(host: str = FACEBOOK_GRAPH_HOST) -> str:
+    """``https://<host>/<pinned Graph version>`` — the root of every Meta Graph URL.
+
+    Read at call time (not at import) so the pinned ``meta_graph_version`` is the one
+    the running settings carry."""
+    return f"https://{host}/{get_settings().meta_graph_version}"
 
 
 class PlatformSecretError(RuntimeError):

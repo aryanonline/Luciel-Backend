@@ -230,13 +230,15 @@ async def test_calendly_with_no_active_event_type_connects_and_says_so():
 
 
 async def test_meta_and_instagram_name_the_account():
-    meta = _Transport({verify.META_ME_ENDPOINT: _Resp(200, {"id": "1001", "name": "Aryan Singh"})})
+    meta_me = verify.meta_me_endpoint()
+    meta = _Transport({meta_me: _Resp(200, {"id": "1001", "name": "Aryan Singh"})})
     updates = await verify.verify_meta_grant(material={"access_token": "m-tok"}, transport=meta)
     assert updates["metaUserId"] == "1001"
     assert updates["connectedAs"] == "Meta · Aryan Singh"
     assert updates["token_expires_at"]
 
-    ig = _Transport({verify.INSTAGRAM_ME_ENDPOINT: _Resp(200, {"id": "1789", "username": "acme"})})
+    ig_me = verify.instagram_me_endpoint()
+    ig = _Transport({ig_me: _Resp(200, {"id": "1789", "username": "acme"})})
     updates = await verify.verify_instagram_grant(
         material={"access_token": "i-tok", "user_id": "1789"}, transport=ig
     )

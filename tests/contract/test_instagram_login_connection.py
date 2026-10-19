@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from app.config import INSTAGRAM_GRAPH_HOST, meta_graph_base
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -115,7 +116,7 @@ def _fake_instagram_token_server(monkeypatch, *, long_lived_status: int = 200):
 
         async def get(self, url, *, params=None, headers=None):
             self.gets.append((url, dict(params or {})))
-            if url.startswith("https://graph.instagram.com/v23.0/me"):
+            if url.startswith(f"{meta_graph_base(INSTAGRAM_GRAPH_HOST)}/me"):
                 # Round 6 WP-C: the verifier proves the LONG-lived token against
                 # graph.instagram.com/me and records the @username.
                 assert (headers or {}).get("Authorization") == f"Bearer {LONG_LIVED}"
@@ -309,7 +310,7 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
 
     class _FacebookTokenServer:
         async def post(self, url, *, data=None, headers=None):
-            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert url == f"{meta_graph_base()}/oauth/access_token"
             return httpx.Response(
                 200,
                 json={"access_token": "fb-tok", "expires_in": 5184000},
@@ -317,7 +318,7 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
             )
 
         async def get(self, url, *, params=None, headers=None):
-            if url.startswith("https://graph.facebook.com/v19.0/me"):
+            if url.startswith(f"{meta_graph_base()}/me"):
                 # Round 6 WP-C: Graph /me with the long-lived token names who authorized.
                 assert (headers or {}).get("Authorization") == "Bearer fb-tok-long"
                 return httpx.Response(
@@ -326,7 +327,7 @@ async def test_connecting_instagram_leaves_the_facebook_grant_alone(client, monk
                     request=httpx.Request("GET", url),
                 )
             # Facebook's own long-lived upgrade (round 5B item 14) — same endpoint, GET.
-            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert url == f"{meta_graph_base()}/oauth/access_token"
             assert params["grant_type"] == "fb_exchange_token"
             assert params["fb_exchange_token"] == "fb-tok"
             return httpx.Response(

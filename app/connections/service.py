@@ -130,11 +130,13 @@ def _start_result(
     pending = cfg.get("pending_provider")
     provider = pending if isinstance(pending, str) and pending else connection.provider
 
+    login_host = cfg.get(registry.LOGIN_HOST_CONFIG_KEY)
     start = build_authorize_start(
         provider=provider,
         admin_id=admin_id,
         instance_id=connection.instance_id,
         connection_id=connection.connection_id,
+        login_host=login_host if isinstance(login_host, str) else None,
     )
     if start.unconfigured:
         # A provider with a standalone credential form (Twilio, C10) degrades
@@ -153,6 +155,18 @@ def _start_result(
     if start.unconfigured and not mid_reconnect:
         connection.status_detail = UNCONFIGURED_DETAIL
     return {"authorize_url": start.authorize_url}
+
+
+def _stamp_login_host(connection: InstanceConnection, choice: str | None) -> None:
+    """Record the connection's login-host choice (round 7 WP-7) — or clear a stale one
+    a reused row carried for another provider. Read back by authorize, the callback's
+    exchange and the refresher, so the three always talk to the same host."""
+    cfg = dict(connection.non_secret_config or {})
+    if choice is None:
+        cfg.pop(registry.LOGIN_HOST_CONFIG_KEY, None)
+    else:
+        cfg[registry.LOGIN_HOST_CONFIG_KEY] = choice
+    connection.non_secret_config = cfg
 
 
 def consume_oauth_state(connection: InstanceConnection) -> str | None:
@@ -243,6 +257,7 @@ async def start_connection(
     phone_number: str | None = None,
     now: datetime | None = None,
     store: SecretStore | None = None,
+    login_host: str | None = None,
 ) -> tuple[InstanceConnection, dict[str, object]]:
     """Begin a connect flow: create (or reuse) the row in ``unconfigured`` and return
     the row + StartConnectionResult (§3.8.4 lifecycle starts at unconfigured).
@@ -261,7 +276,12 @@ async def start_connection(
     number — the admin supplies their own E.164 number via ``phone_number``. When
     supplied it is validated and stored as non-secret ``destination`` config and the
     row goes to ``pending_carrier_registration`` (§3.1.6); when omitted the row stays
-    ``unconfigured`` — the "Action needed: add your number" state (channel not live)."""
+    ``unconfigured`` — the "Action needed: add your number" state (channel not live).
+
+    ``login_host`` (round 7 WP-7) is the owner's choice of OAuth auth host for a
+    provider that offers one (Salesforce: ``production`` | ``sandbox``); omitted means
+    the provider's default, and a choice the provider does not offer is refused
+    (``registry.LoginHostRejected``) before any row is written."""
     now = now or datetime.now(UTC)
     # Decision #6: the chosen provider must be one the registry offers for this type.
     # Validated BEFORE any row is written so a bad selection cannot leave a half-created
@@ -281,6 +301,7 @@ async def start_connection(
     _spec = registry.get_provider(provider)
     if _spec is not None and connection_type in _spec.unavailable_for:
         raise ProviderNotRegistered(f"'{provider}' is not available yet for {connection_type}.")
+    chosen_login_host = registry.validated_login_host(provider, login_host)
     auth_class = _auth_class_for(connection_type, provider)
 
     # BYO SMS number intake (§3.1.4): delegate to the single source of truth in
@@ -330,6 +351,7 @@ async def start_connection(
             auth_class=auth_class,
             user_id=user_id,
         )
+        _stamp_login_host(connection, chosen_login_host)
         await audit.emit(
             session,
             admin_id=admin_id,
@@ -415,6 +437,7 @@ async def start_connection(
         )
         session.add(connection)
 
+    _stamp_login_host(connection, chosen_login_host)
     await session.flush()
 
     # §3.7.1/§3.8: configuring a dependency is an admin-config event.

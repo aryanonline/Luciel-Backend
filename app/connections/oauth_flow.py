@@ -32,7 +32,7 @@ from urllib.parse import urlencode
 import jwt
 
 from app.config import get_settings
-from app.connections.registry import PROVIDERS, ProviderAuthorize, oauth_client_config
+from app.connections.registry import ProviderAuthorize, get_provider, oauth_client_config
 
 STATE_TTL_SECONDS = 600  # a consent click-through is minutes, not hours
 STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, not a secret  # nosec B105
@@ -40,13 +40,15 @@ STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, n
 UNCONFIGURED_DETAIL = "Action needed: this provider's OAuth client is not configured yet"
 
 
-def authorize_spec(provider: str) -> ProviderAuthorize | None:
+def authorize_spec(provider: str, *, login_host: str | None = None) -> ProviderAuthorize | None:
     """This provider's authorize endpoint/scopes/PKCE posture, from the registry.
 
     The table used to live here; it now lives in ``connections.registry`` alongside the
     provider's credential source and health class, so registering a provider is one
-    entry rather than edits in three files."""
-    spec = PROVIDERS.get(provider)
+    entry rather than edits in three files. Read through ``get_provider`` so the
+    endpoints come back resolved (the Meta Graph version is a setting, and a provider
+    with login-host choices — Salesforce sandbox — resolves to the connection's host)."""
+    spec = get_provider(provider, login_host=login_host)
     return spec.authorize if spec is not None else None
 
 
@@ -188,14 +190,20 @@ def build_authorize_start(
     admin_id: uuid.UUID,
     instance_id: uuid.UUID,
     connection_id: uuid.UUID,
+    login_host: str | None = None,
 ) -> AuthorizeStart:
     """Build the provider consent URL for one connect attempt (§5.1).
 
+    ``login_host`` is the connection's login-host choice (``non_secret_config``
+    ``login_host``) — a Salesforce sandbox consents at test.salesforce.com.
+
     Falls back to the internal placeholder for providers with no registered OAuth
     client — see the module docstring for why that is a fallback and not an error."""
-    spec = authorize_spec(provider)
+    spec = authorize_spec(provider, login_host=login_host)
     cfg = oauth_client_config(provider)
-    if spec is None or not cfg.configured or not cfg.redirect_uri:
+    # authorize_ready = id + secret + a redirect URI the callback route serves (an
+    # invalid one is logged at boot and named on /healthz, round 7 WP-7).
+    if spec is None or not cfg.authorize_ready:
         return AuthorizeStart(
             authorize_url=f"/api/v1/admin/connections/{connection_id}/authorize",
             unconfigured=True,

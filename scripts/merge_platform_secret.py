@@ -4,7 +4,7 @@ Round 6 (2026-09-08) — the owner-at-the-keyboard half of every provider regist
 (Google, HubSpot, Salesforce, Calendly, Notion, Meta, Instagram, Microsoft, Twilio OAuth).
 The platform secret is ONE JSON object in Secrets Manager (``luciel/<env>/platform``,
 security-stack.ts) that ECS injects as LUCIEL_PLATFORM_SECRET; every key name the runtime
-reads is listed in app/config.py (parse_platform_secret's mapping). This script:
+reads is declared ONCE in app/config.py (``PLATFORM_SECRET_KEYS``). This script:
 
   1. reads KEY=VALUE pairs from stdin (one per line; blank lines and ``#`` comments
      ignored) — the owner pastes secrets here, never on a command line where a shell
@@ -22,6 +22,9 @@ Usage (from the backend repo, with AWS credentials for the target account):
         python scripts/merge_platform_secret.py --env dev --redeploy
 
     python scripts/merge_platform_secret.py --env dev --list      # key names present, no values
+
+    # Pre-deploy: what the runtime will refuse or report degraded (no secret values).
+    python scripts/merge_platform_secret.py --env dev --check --api-base https://api.vantagemind.ai
 """
 
 from __future__ import annotations
@@ -30,29 +33,69 @@ import argparse
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 _KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 _REGION = "ca-central-1"  # residency lock (DEVOPS §2.1, LD 21)
 
+# Run as ``python scripts/merge_platform_secret.py`` the script directory, not the repo
+# root, is on sys.path; the accepted key set lives in the app package.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-_READ_RE = re.compile(r'(?:blob|secret|platform)(?:\.get\(|\[)\s*"([A-Z][A-Z0-9_]+)"')
-_MAP_RE = re.compile(r'"([A-Z][A-Z0-9_]+)":\s*"[a-z_]+"')
+
+def _known_keys() -> frozenset[str]:
+    """Every platform-secret key the runtime reads — the ONE explicit list in
+    app/config.py, not a scrape of the source.
+
+    The scrape this replaces matched only literal ``blob.get("KEY")`` reads, so the keys
+    config.py reads through a loop variable (STRIPE_WEBHOOK_SECRET and the three LLM
+    model pins) were refused as typos (round 7 WP-7)."""
+    from app.config import PLATFORM_SECRET_KEYS  # noqa: PLC0415 — keep import lazy
+
+    return PLATFORM_SECRET_KEYS
 
 
-def _known_keys() -> set[str]:
-    """Every platform-secret key the runtime reads: scanned from the app source (the
-    config.py blob->field mapping plus every direct ``blob.get("KEY")`` read)."""
-    from pathlib import Path  # noqa: PLC0415
+def unknown_keys(pairs: dict[str, str]) -> list[str]:
+    """The pasted key names the runtime does not read, sorted (empty = all accepted)."""
+    known = _known_keys()
+    return sorted(k for k in pairs if k not in known)
 
-    root = Path(__file__).resolve().parent.parent / "app"
-    keys: set[str] = set()
-    for path in root.rglob("*.py"):
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        keys.update(_READ_RE.findall(text))
-        if path.name == "config.py":
-            keys.update(_MAP_RE.findall(text))
-    return keys
+
+def check_blob(blob: dict[str, Any], *, api_base: str) -> list[str]:
+    """What this blob's PROVIDER posture will look like to the runtime — printed before a
+    deploy rather than discovered on /healthz after it (round 7 WP-7).
+
+    Returns one line per finding, naming keys and OAuth client labels. A redirect URI is
+    public (it travels in every authorize URL) so it may appear; no secret value does.
+    """
+    from app.config import PLATFORM_SECRET_KEYS, Settings  # noqa: PLC0415
+
+    findings = [
+        f"unread key (the runtime ignores it): {key}"
+        for key in sorted(blob)
+        if key not in PLATFORM_SECRET_KEYS
+    ]
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        integration_mode="mock",  # describe the posture; never fail on live-only guards
+        public_api_base_url=api_base,
+        platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
+    )
+    findings += [
+        f"oauth_redirect:{label} — {reason}"
+        for label, reason in sorted(settings.oauth_redirect_problems().items())
+    ]
+    if settings.meta_webhook_unconfigured:
+        findings.append(
+            "meta_webhook:unconfigured — a Meta/Instagram app is provisioned without "
+            "META_VERIFY_TOKEN (a live boot refuses this)"
+        )
+    if settings.meta_app_configured and not settings.meta_app_secret:
+        findings.append("META_APP_SECRET missing for a provisioned Meta app (live boot refuses)")
+    return findings
 
 
 def _read_pairs(stream: Any) -> dict[str, str]:
@@ -90,7 +133,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--allow-unknown", action="store_true", help="store a key the runtime does not read"
     )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="report unread keys, invalid OAuth redirect URIs and Meta webhook gaps, then exit",
+    )
+    ap.add_argument(
+        "--api-base",
+        default="",
+        help="with --check: the environment's public API origin (redirect URIs must sit on it)",
+    )
     args = ap.parse_args(argv)
+    read_only = args.list or args.check
+
+    # Validate the paste BEFORE touching AWS: a typo is refused without reading the
+    # secret at all, and nothing is written.
+    pairs: dict[str, str] = {}
+    if not read_only:
+        pairs = _read_pairs(sys.stdin)
+        if not pairs:
+            raise SystemExit("nothing to merge: paste KEY=VALUE lines on stdin")
+        unknown = unknown_keys(pairs)
+        if unknown and not args.allow_unknown:
+            raise SystemExit(
+                "these keys are not read by the runtime (typo?): "
+                + ", ".join(unknown)
+                + " — see PLATFORM_SECRET_KEYS in app/config.py, or pass --allow-unknown"
+            )
 
     import boto3  # noqa: PLC0415 — keep the app import surface small
 
@@ -105,17 +174,12 @@ def main(argv: list[str] | None = None) -> int:
         for key in sorted(blob):
             print(key)
         return 0
-
-    pairs = _read_pairs(sys.stdin)
-    if not pairs:
-        raise SystemExit("nothing to merge: paste KEY=VALUE lines on stdin")
-    unknown = sorted(k for k in pairs if k not in _known_keys())
-    if unknown and not args.allow_unknown:
-        raise SystemExit(
-            "these keys are not read by the runtime (typo?): "
-            + ", ".join(unknown)
-            + " — see parse_platform_secret in app/config.py, or pass --allow-unknown"
-        )
+    if args.check:
+        findings = check_blob(blob, api_base=args.api_base)
+        for line in findings:
+            print(line)
+        print(f"{len(findings)} finding(s) in {secret_id}")
+        return 1 if findings else 0
 
     merged = {**blob, **pairs}
     resp = sm.put_secret_value(

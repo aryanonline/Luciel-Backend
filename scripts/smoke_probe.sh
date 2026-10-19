@@ -13,7 +13,9 @@
 #      stand-ins (Null email/SMS senders, the local secret store, the in-memory
 #      calendar, the echo LLM) and nothing else. The old probe demanded an empty
 #      list for ANY mode, which mock can never satisfy, so a mock deploy always
-#      failed the probe and rolled back (round 7 WP-8). The optional third
+#      failed the probe and rolled back (round 7 WP-8). The platform SMS sender is
+#      listed only where a platform Twilio account is configured (round 7 WP-7),
+#      so in mock mode it may be present or absent. The optional third
 #      argument is the environment's Stripe posture (default `test`, dev's):
 #      a `mock` posture (prod) adds stripe_gateway:FakeStripeGateway to the
 #      expected set in either mode, because that is the honest answer there.
@@ -56,14 +58,19 @@ status, got_mode, degraded = d.get("status"), d.get("integrationMode"), d.get("d
 # emits. Compared as a set equality, so an unexpected entry (database:...,
 # pgvector_too_old:..., a live-mode Null sender) fails the probe.
 expected = set()
+# Entries the mode MAY list without failing the probe. platform_sms is a seam only when
+# the environment's platform secret carries a platform Twilio account (round 7 WP-7):
+# in mock mode it is then honestly Null, and an environment without one omits it. In
+# live mode it is never optional — listed means half-configured, which fails.
+optional = set()
 if mode == "mock":
     expected = {
         "platform_email:NullEmailSender",
-        "platform_sms:NullSmsSender",
         "secret_store:LocalSecretStore",
         "calendar_api:InMemoryCalendarApi",
         "llm:EchoModel",
     }
+    optional = {"platform_sms:NullSmsSender"}
 if stripe_posture != "test":
     expected.add("stripe_gateway:FakeStripeGateway")
 # `escalation_backlog:<n>` (round 7 WP-4b) is an OPERATIONS signal — some tenant has
@@ -76,8 +83,8 @@ operational = {d for d in all_degraded if d.startswith("escalation_backlog:")}
 got = all_degraded - operational
 if operational:
     print(f"[smoke] operations signal (not gating the deploy): {sorted(operational)}")
-print(f"[smoke] healthz status={status} integrationMode={got_mode} degraded={sorted(got)} expected={sorted(expected)}")
-sys.exit(0 if (status == "ok" and got_mode == mode and got == expected) else 1)
+print(f"[smoke] healthz status={status} integrationMode={got_mode} degraded={sorted(got)} expected={sorted(expected)} optional={sorted(optional)}")
+sys.exit(0 if (status == "ok" and got_mode == mode and expected <= got <= expected | optional) else 1)
 PY
   then ok=true; break; fi
   echo "[smoke] healthz not ready or not healthy (attempt $i/24, http $code) - waiting 15s"

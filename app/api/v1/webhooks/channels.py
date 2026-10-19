@@ -28,6 +28,7 @@ import base64
 import binascii
 import hmac
 import json
+import logging
 import uuid
 from email import message_from_bytes
 from email import policy as email_policy
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from app.channels.email_adapter import EmailAdapter
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
+logger = logging.getLogger(__name__)
 
 
 async def _resolve(connection_type: str, destination: str) -> InstanceContext:
@@ -547,8 +549,14 @@ async def ses_inbound(request: Request) -> dict[str, str]:
     # A signed message from SOMEONE ELSE'S topic is still a valid SNS signature
     # (2026-09-05 audit F048): pin the receipt-rule topic the way the events route
     # does, so a stranger cannot feed this tenant inbound mail through their own topic.
-    pinned_topic = settings.ses_inbound_topic_arn
-    if live and pinned_topic and sns_message.get("TopicArn") != pinned_topic:
+    # Fail CLOSED in live mode (round 7 WP-7): the pin used to be skipped whenever the
+    # ARN was unset — and ComputeStack never injected it, so every live deploy ran
+    # unpinned. No pin, no inbound mail.
+    pinned_topics = settings.ses_inbound_topic_arns
+    if live and not pinned_topics:
+        logger.error("ses_inbound_rejected reason=topic_unpinned (SES_INBOUND_TOPIC_ARN unset)")
+        return {"status": "rejected", "reason": "topic_unpinned"}
+    if live and sns_message.get("TopicArn") not in pinned_topics:
         return {"status": "rejected", "reason": "topic_mismatch"}
     # SNS subscription confirmation handshake (one-time, on subscribe). Verified with
     # the SAME verifier as a notification before we act on it: confirming an unverified

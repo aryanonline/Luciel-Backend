@@ -71,6 +71,8 @@ export interface ComputeStackProps extends StackProps {
 export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> = [
   ['/api/v1/admin/*', '/api/v1/auth/*', '/api/v1/dashboard/*', '/api/v1/connections/*', '/api/v1/exports/*'],
   ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
+  // The frontend's runtime public configuration (round 7 WP-7, GET /api/v1/public/config).
+  ['/api/v1/public/*'],
 ];
 
 /**
@@ -506,6 +508,12 @@ export class ComputeStack extends Stack {
       endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/inbound`,
     });
 
+    // The inbound topics the app's SES inbound route pins (SES_INBOUND_TOPIC_ARN,
+    // injected into both app planes below): the managed `-v2` topic plus the
+    // console-created one by name (unmanaged, so no construct to Ref).
+    const sesInboundLegacyTopicArn = `arn:${this.partition}:sns:${this.region}:${this.account}:luciel-${envConfig.envName}-ses-inbound`;
+    const sesInboundTopicArns = `${sesInboundTopic.topicArn},${sesInboundLegacyTopicArn}`;
+
     // Every awsLogs driver below names an EXPLICIT log group. Left to itself the driver
     // creates one on first write with retention "Never expire", which is the one AWS
     // default in this stack that converts a fixed cost into a growing one — and it is
@@ -597,6 +605,32 @@ export class ComputeStack extends Stack {
           // route uses the topic ARN to pin which topic's envelopes it accepts.
           SES_CONFIGURATION_SET: sesConfigurationSetName,
           SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
+          // The topics the SES INBOUND webhook accepts envelopes from (round 7
+          // WP-7). Never injected before, so the inbound route's topic pin
+          // (2026-09-05 audit F048) was skipped and any AWS account could feed a
+          // tenant inbound mail through its own signed topic; the route now refuses
+          // EVERYTHING in live mode while this is unset. Comma-separated:
+          //   1. the CDK-managed `-v2` topic above — the one the ACTIVE receipt rule
+          //      set publishes to once the documented cutover has run (dev: active
+          //      rule set `luciel-dev-inbound-v2` -> `luciel-dev-ses-inbound-v2`,
+          //      read 2026-10-19);
+          //   2. the console-created `luciel-<env>-ses-inbound` (root CLAUDE.md),
+          //      referenced BY NAME because it is unmanaged — still the publishing
+          //      topic in an environment whose cutover has not run.
+          // Both are this account's own SES-only topics.
+          SES_INBOUND_TOPIC_ARN: sesInboundTopicArns,
+          // The PUBLIC API origin external providers are pointed at: Twilio webhook
+          // auto-config + drift repair, SMS escalation links, export download links
+          // (app reads it as public_api_base_url). Left to the platform secret's
+          // API_BASE_URL alone it could be absent, and Twilio auto-config then
+          // silently degraded to manual guidance (round 7 WP-7, /healthz names
+          // api_base_url:unset in live). Same value the SNS subscriptions and the
+          // SeedTest harness use, so a hostname move changes ONE constant.
+          LUCIEL_PUBLIC_API_BASE_URL: publicApiBaseUrl,
+          // The widget embed script the dashboard's snippet names, served to the
+          // frontend by GET /api/v1/public/config (round 7 WP-7) — the CDN host
+          // WidgetStack publishes luciel.js under.
+          LUCIEL_WIDGET_EMBED_URL: `https://${DOMAINS.widget}/v1/luciel.js`,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -905,6 +939,10 @@ export class ComputeStack extends Stack {
         // through the live API, never by sending directly.)
         SES_CONFIGURATION_SET: sesConfigurationSetName,
         SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
+        // The public API origin — MUST match the app planes: the health sweep
+        // re-points every BYO Twilio number's webhooks at it (drift repair), and the
+        // export/escalation sweeps build customer-facing links on it.
+        LUCIEL_PUBLIC_API_BASE_URL: publicApiBaseUrl,
         // model_currency auto-swap targets (§3.4.3): WHERE to write the successor
         // model ID and WHICH services to redeploy so it takes effect. Absent in
         // local/CI runs, where the watchdog degrades to alert-only by design.

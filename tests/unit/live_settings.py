@@ -20,11 +20,11 @@ from app.config import Settings
 REQUIRED_IN_LIVE_MODE = {
     "JWT_SIGNING_KEY": "unit-test-signing-key",
     "STRIPE_WEBHOOK_SECRET": "whsec_unit_test_not_the_published_constant",
-    # The inbound-webhook HMAC keys and the platform sender identity fail closed too:
-    # an empty HMAC key verifies forged webhooks, and an unset sender identity drops
-    # every platform email silently.
+    # The Twilio inbound-webhook HMAC key and the platform sender identity fail closed
+    # too: an empty HMAC key verified forged webhooks, and an unset sender identity drops
+    # every platform email silently. META_APP_SECRET is required only once a Meta app is
+    # provisioned (round 7 WP-7), so it is not part of the minimum live blob.
     "TWILIO_AUTH_TOKEN": "unit-test-twilio-auth-token",
-    "META_APP_SECRET": "unit-test-meta-app-secret",
     "PLATFORM_EMAIL_SENDER": "no-reply@unit.test",
 }
 

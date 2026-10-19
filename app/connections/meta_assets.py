@@ -23,8 +23,19 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-GRAPH_BASE = "https://graph.facebook.com/v19.0"
-INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com/v23.0"
+from app.config import INSTAGRAM_GRAPH_HOST, meta_graph_base
+
+
+def graph_base() -> str:
+    """The Facebook Graph root at the pinned version (``meta_graph_version``)."""
+    return meta_graph_base()
+
+
+def instagram_graph_base() -> str:
+    """The Instagram Login Graph root at the pinned version."""
+    return meta_graph_base(INSTAGRAM_GRAPH_HOST)
+
+
 _MAX_PAGES = 10
 # The only origins a ``paging.next`` URL may point at (adversarial review R-WP2-1):
 # the next URL carries the grant's access token in its query string, so following
@@ -96,7 +107,9 @@ async def list_grant_assets(
     ids: set[str] = set()
     if connection_type == "instagram_auth":
         me = await _get_json(
-            transport, f"{INSTAGRAM_GRAPH_BASE}/me", {"fields": "id,user_id", "access_token": token}
+            transport,
+            f"{instagram_graph_base()}/me",
+            {"fields": "id,user_id", "access_token": token},
         )
         for key in ("id", "user_id"):
             if me.get(key):
@@ -105,7 +118,7 @@ async def list_grant_assets(
 
     pages = await _get_all(
         transport,
-        f"{GRAPH_BASE}/me/accounts",
+        f"{graph_base()}/me/accounts",
         {"fields": "id,instagram_business_account", "access_token": token},
     )
     for page in pages:
@@ -115,14 +128,14 @@ async def list_grant_assets(
         if isinstance(linked, dict) and linked.get("id"):
             ids.add(str(linked["id"]))
     businesses = await _get_all(
-        transport, f"{GRAPH_BASE}/me/businesses", {"fields": "id", "access_token": token}
+        transport, f"{graph_base()}/me/businesses", {"fields": "id", "access_token": token}
     )
     for business in businesses:
         if not business.get("id"):
             continue
         wabas = await _get_all(
             transport,
-            f"{GRAPH_BASE}/{business['id']}/owned_whatsapp_business_accounts",
+            f"{graph_base()}/{business['id']}/owned_whatsapp_business_accounts",
             {"fields": "id", "access_token": token},
         )
         for waba in wabas:
@@ -130,7 +143,7 @@ async def list_grant_assets(
                 continue
             numbers = await _get_all(
                 transport,
-                f"{GRAPH_BASE}/{waba['id']}/phone_numbers",
+                f"{graph_base()}/{waba['id']}/phone_numbers",
                 {"fields": "id", "access_token": token},
             )
             for number in numbers:

@@ -116,6 +116,11 @@ class StartConnectionRequest(WireModel):
     connection_type: str
     provider: str
     phone_number: str | None = None
+    # ADDITIVE optional (round 7 WP-7): the OAuth auth host for a provider that offers a
+    # choice — ``production`` | ``sandbox`` for Salesforce (a sandbox org signs in at
+    # test.salesforce.com). Omitted = the provider's default; a value the provider does
+    # not offer (see ``loginHosts`` on GET /connections/providers) is a 422.
+    login_host: str | None = None
 
 
 class StartConnectionResult(WireModel):
@@ -219,6 +224,9 @@ class ProviderOptionOut(WireModel):
     # 'drive_folders' | 'notion_pages' | null — whether the owner may narrow this
     # connection's knowledge scope after connecting (Decision #9).
     scope_kind: str | None = None
+    # The login-host choices the connect request may name (``loginHost``), default
+    # first; empty = no choice (round 7 WP-7 — Salesforce: production, sandbox).
+    login_hosts: list[str] = []
 
 
 class ConnectionProvidersOut(WireModel):

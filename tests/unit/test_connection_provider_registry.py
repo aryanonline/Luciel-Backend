@@ -106,10 +106,16 @@ def test_every_oauth_authorize_host_is_mirrored_in_the_frontend_allowlist():
         for spec in registry.PROVIDERS.values()
         if spec.is_oauth
     }
+    # Round 7 WP-7: a provider with login-host choices consents on every one of them
+    # (a Salesforce sandbox signs in at test.salesforce.com), so each must be allowed.
+    registry_hosts |= {
+        host for spec in registry.PROVIDERS.values() for _choice, host in spec.login_hosts
+    }
     assert registry_hosts == frozenset(
         {
             "accounts.google.com",
             "login.salesforce.com",
+            "test.salesforce.com",
             "app.hubspot.com",
             "auth.calendly.com",
             "www.facebook.com",

@@ -27,6 +27,7 @@ _CDK_PATTERNS = [
     "/api/v1/contact",
     "/api/v1/contact/*",
     "/api/v1/escalation-contact/*",
+    "/api/v1/public/*",
 ]
 
 

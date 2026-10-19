@@ -29,11 +29,12 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channels.whatsapp_adapter import MetaSender, NullMetaSender
+from app.config import INSTAGRAM_GRAPH_HOST, meta_graph_base
 from app.connections.secrets import SecretStore
 
-_GRAPH_BASE = "https://graph.facebook.com/v19.0"
-# Instagram Login tokens are issued by, and only accepted at, Instagram's own Graph host.
-_INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com/v23.0"
+# The Graph version comes from settings (``meta_graph_version``, round 7 WP-7) — this
+# module pinned an older version than the Instagram host it also calls. Instagram Login
+# tokens are issued by, and only accepted at, Instagram's own Graph host.
 
 
 class GraphMetaSender:
@@ -44,9 +45,9 @@ class GraphMetaSender:
     URL just because they share a request shape.
     """
 
-    def __init__(self, access_token: str, *, graph_base: str = _GRAPH_BASE) -> None:
+    def __init__(self, access_token: str, *, graph_base: str | None = None) -> None:
         self._token = access_token
-        self._graph_base = graph_base
+        self._graph_base = graph_base or meta_graph_base()
 
     async def send_message(
         self, *, channel: str, sender_id: str, recipient_id: str, body: str
@@ -162,5 +163,9 @@ async def build_tenant_meta_sender(
     )
     if not token:
         return NullMetaSender()
-    base = _INSTAGRAM_GRAPH_BASE if connection_type == "instagram_auth" else _GRAPH_BASE
+    base = (
+        meta_graph_base(INSTAGRAM_GRAPH_HOST)
+        if connection_type == "instagram_auth"
+        else meta_graph_base()
+    )
     return GraphMetaSender(access_token=token, graph_base=base)

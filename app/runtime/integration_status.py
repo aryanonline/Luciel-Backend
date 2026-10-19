@@ -89,12 +89,19 @@ def degraded_bindings() -> list[str]:
     # process-wide Meta binding to report on. Whether a given tenant can send is a
     # property of their channel_auth connection and surfaces on that connection's status,
     # not here — listing it would report every deployment as degraded forever.
-    seams: tuple[tuple[str, object], ...] = (
-        ("platform_email", build_email_sender()),
-        ("platform_sms", build_sms_sender()),
+    seams: list[tuple[str, object]] = [("platform_email", build_email_sender())]
+    # Round 7 WP-7: the PLATFORM Twilio sender is a dev/mock fallback with no live
+    # consumer that is not refused (BYO telephony sends through the tenant's own
+    # account), so an absent platform Twilio account is the normal posture — listing it
+    # made every deployment without one degraded forever. It is a seam only when a
+    # platform account was intentionally configured (any of its three settings), and
+    # then a Null binding (half-configured, or mock) is named like any other.
+    if settings.platform_twilio_configured:
+        seams.append(("platform_sms", build_sms_sender()))
+    seams += [
         ("secret_store", get_secret_store()),
         ("calendar_api", build_calendar_api()),
-    )
+    ]
     degraded = [f"{seam}:{type(obj).__name__}" for seam, obj in seams if is_degraded_binding(obj)]
     # The gateway singleton is read from config rather than built: constructing it here
     # would bind the process-wide instance as a side effect of a health check.
@@ -125,6 +132,28 @@ def degraded_bindings() -> list[str]:
     # probe it without spending a verification.)
     if live_mode() and not settings.hcaptcha_secret_key:
         degraded.append("hcaptcha:unconfigured")
+    # Round 7 WP-7: a Meta (or Instagram) app provisioned without the webhook verify
+    # token. Meta's GET handshake answers 403 without it, so the webhook subscription
+    # can never be saved and every Meta channel connects and then hears nothing. Live
+    # boot refuses this posture outright; any other mode names it here.
+    if settings.meta_webhook_unconfigured:
+        degraded.append("meta_webhook:unconfigured")
+    # Round 7 WP-7: the SES inbound route fails CLOSED in live mode without a pinned
+    # receipt-rule topic, so an unset pin is inbound reply mail refused wholesale.
+    if live_mode() and not settings.ses_inbound_topic_arns:
+        degraded.append("ses_inbound_topic:unpinned")
+    # Round 7 WP-7: without the public API origin there is no URL to point a provider
+    # at — Twilio webhook auto-config and its drift repair silently fall back to
+    # manual guidance, and SMS/export links lose their host. Live mode only: mock never
+    # configures a provider.
+    if live_mode() and not settings.public_api_base_url:
+        degraded.append("api_base_url:unset")
+    # Round 7 WP-7: a configured OAuth redirect URI the callback route cannot serve.
+    # The provider is withheld from the connect surface (a consent on it would end on a
+    # 404 or a refused redeem) and the reason was logged at boot; named here by label.
+    degraded.extend(
+        f"oauth_redirect:{label}" for label in sorted(settings.oauth_redirect_problems())
+    )
     # §3.1.5 / §4.5: the abuse ceilings are only platform-wide when the Redis store is
     # bound. A live task counting in-process still enforces them, but per task and
     # reset on every deploy — a degraded binding this list exists to surface.
