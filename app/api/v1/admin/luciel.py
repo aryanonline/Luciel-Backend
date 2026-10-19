@@ -23,6 +23,7 @@ from app.api.v1.admin.luciel_invariants import (
     validate_personality,
 )
 from app.audit import log as audit
+from app.channels import voice_adapter
 from app.connections import gate
 from app.db.session import tenant_session
 from app.employee.status import build_employee_status
@@ -245,6 +246,21 @@ def _merge_tool_status(
     ]
 
 
+def _personality_out(personality: dict[str, object] | None) -> dict[str, object]:
+    """The stored personality blob plus the READ-ONLY Voice notice preview (round 7).
+
+    The preview is derived on every read by the same builder the call path speaks
+    from (voice_adapter.disclosure_preview → build_disclosure), so the dashboard shows
+    the owner the full sentence — their opening line, then the AI-identity and
+    recording facts they cannot remove. It is never stored and never accepted back.
+    """
+    out: dict[str, object] = dict(personality or {"preset": "warm_concierge"})
+    intro = out.get("voiceDisclosureIntro")
+    out["voiceDisclosureIntro"] = intro if isinstance(intro, str) and intro.strip() else None
+    out["voiceDisclosurePreview"] = voice_adapter.disclosure_preview(out)
+    return out
+
+
 def _to_out(
     inst: Instance,
     *,
@@ -269,7 +285,7 @@ def _to_out(
             "tools": tools,
             "escalation": inst.escalation or {},
             "escalationContactHealth": contact_health or [],
-            "personality": inst.personality or {"preset": "warm_concierge"},
+            "personality": _personality_out(inst.personality),
             "leadRetentionDays": inst.lead_retention_days,
             "allowedOrigins": list(inst.allowed_origins) if inst.allowed_origins else None,
             "timezone": inst.timezone,

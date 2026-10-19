@@ -28,6 +28,7 @@ Protocol abstracts so the pipeline is vendor-agnostic and hermetically testable.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -74,6 +75,19 @@ def build_disclosure(custom_intro: str | None = None) -> str:
     parts.append(_RECORDING_FACT)
     parts.append(_CONSENT_TAIL)
     return " ".join(parts)
+
+
+def disclosure_preview(personality: Mapping[str, object] | None) -> str:
+    """The exact notice ``voice_pipeline.start_call`` speaks for this personality blob.
+
+    READ-ONLY preview for the dashboard (round 7): it reads ``voiceDisclosureIntro``
+    the way ``start_call`` does (a non-string or blank value means no intro) and runs
+    it through the SAME ``build_disclosure`` — so the owner sees the full sentence,
+    including the AI-identity and recording facts no setting removes. Never composed
+    anywhere else; the frontend shows it word for word.
+    """
+    raw = (personality or {}).get("voiceDisclosureIntro")
+    return build_disclosure(raw if isinstance(raw, str) and raw.strip() else None)
 
 
 def disclosure_contains_mandatory_facts(text: str) -> bool:
