@@ -167,6 +167,29 @@ describe.each<EnvName>(['dev', 'prod'])('SES inbound codification (%s)', (envNam
     });
   });
 
+  test('both app planes pin the inbound topics: the managed -v2 topic and the console one by name', () => {
+    // Round 7 WP-7: SES_INBOUND_TOPIC_ARN was never injected, so the inbound
+    // route's topic pin (audit F048) was skipped and any AWS account's signed
+    // topic could feed a tenant inbound mail. The route now fails CLOSED in live
+    // mode without it, so both planes must carry it.
+    const inboundTopicIds = Object.keys(
+      template.findResources('AWS::SNS::Topic', {
+        Properties: { TopicName: `luciel-${envName}-ses-inbound-v2` },
+      }),
+    );
+    expect(inboundTopicIds).toHaveLength(1);
+    for (const container of ['data-planeContainer', 'control-planeContainer']) {
+      const value = envValue(template, container, 'SES_INBOUND_TOPIC_ARN');
+      expect(value).toBeDefined();
+      const rendered = JSON.stringify(value);
+      // The managed topic by Ref (never a literal ARN of some other env's topic)...
+      expect(rendered).toContain(`{"Ref":"${inboundTopicIds[0]}"}`);
+      // ...and the console-created topic by NAME, in THIS account and region (the
+      // closing quote keeps `-ses-inbound-v2` from satisfying it).
+      expect(rendered).toContain(`:sns:${ENV.region}:${ENV.account}:luciel-${envName}-ses-inbound"`);
+    }
+  });
+
   test('the -v2 inbound topic exists with its HTTPS subscription to the inbound webhook', () => {
     template.hasResourceProperties('AWS::SNS::Topic', {
       TopicName: `luciel-${envName}-ses-inbound-v2`,

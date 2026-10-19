@@ -368,9 +368,12 @@ class Settings(BaseSettings):
     # secret / task env (SES_CONFIGURATION_SET / SES_EVENTS_TOPIC_ARN).
     ses_configuration_set: str = ""
     ses_events_topic_arn: str = ""
-    # The SNS topic the SES INBOUND receipt rule publishes to (out-of-band ops, root
-    # CLAUDE.md). When set in live mode the inbound route refuses any other topic
-    # (2026-09-05 audit F048) — the events route already pinned; inbound did not.
+    # The SNS topic(s) the SES INBOUND receipt rule publishes to, comma-separated. The
+    # inbound route refuses any other topic in live mode (2026-09-05 audit F048) and,
+    # since round 7 WP-7, refuses EVERYTHING in live mode while this is unset: an
+    # unpinned route accepted a signed envelope from anyone's topic. ComputeStack
+    # injects the managed `-v2` topic plus the console-created `luciel-<env>-ses-inbound`
+    # by name (whichever the active receipt rule set publishes to).
     ses_inbound_topic_arn: str = ""
     # TTL for escalation-contact confirmation links (round 5B item 13).
     escalation_contact_link_ttl_seconds: int = 7 * 24 * 3600
@@ -758,6 +761,11 @@ class Settings(BaseSettings):
                 "allow_captcha_bypass_token",
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
+
+    @property
+    def ses_inbound_topic_arns(self) -> frozenset[str]:
+        """The pinned SES inbound topics (``ses_inbound_topic_arn``, comma-separated)."""
+        return frozenset(a.strip() for a in self.ses_inbound_topic_arn.split(",") if a.strip())
 
     @property
     def meta_app_configured(self) -> bool:

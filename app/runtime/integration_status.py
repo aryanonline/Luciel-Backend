@@ -131,6 +131,10 @@ def degraded_bindings() -> list[str]:
     # boot refuses this posture outright; any other mode names it here.
     if settings.meta_webhook_unconfigured:
         degraded.append("meta_webhook:unconfigured")
+    # Round 7 WP-7: the SES inbound route fails CLOSED in live mode without a pinned
+    # receipt-rule topic, so an unset pin is inbound reply mail refused wholesale.
+    if live_mode() and not settings.ses_inbound_topic_arns:
+        degraded.append("ses_inbound_topic:unpinned")
     # §3.1.5 / §4.5: the abuse ceilings are only platform-wide when the Redis store is
     # bound. A live task counting in-process still enforces them, but per task and
     # reset on every deploy — a degraded binding this list exists to surface.

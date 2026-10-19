@@ -506,6 +506,12 @@ export class ComputeStack extends Stack {
       endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/inbound`,
     });
 
+    // The inbound topics the app's SES inbound route pins (SES_INBOUND_TOPIC_ARN,
+    // injected into both app planes below): the managed `-v2` topic plus the
+    // console-created one by name (unmanaged, so no construct to Ref).
+    const sesInboundLegacyTopicArn = `arn:${this.partition}:sns:${this.region}:${this.account}:luciel-${envConfig.envName}-ses-inbound`;
+    const sesInboundTopicArns = `${sesInboundTopic.topicArn},${sesInboundLegacyTopicArn}`;
+
     // Every awsLogs driver below names an EXPLICIT log group. Left to itself the driver
     // creates one on first write with retention "Never expire", which is the one AWS
     // default in this stack that converts a fixed cost into a growing one — and it is
@@ -597,6 +603,20 @@ export class ComputeStack extends Stack {
           // route uses the topic ARN to pin which topic's envelopes it accepts.
           SES_CONFIGURATION_SET: sesConfigurationSetName,
           SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
+          // The topics the SES INBOUND webhook accepts envelopes from (round 7
+          // WP-7). Never injected before, so the inbound route's topic pin
+          // (2026-09-05 audit F048) was skipped and any AWS account could feed a
+          // tenant inbound mail through its own signed topic; the route now refuses
+          // EVERYTHING in live mode while this is unset. Comma-separated:
+          //   1. the CDK-managed `-v2` topic above — the one the ACTIVE receipt rule
+          //      set publishes to once the documented cutover has run (dev: active
+          //      rule set `luciel-dev-inbound-v2` -> `luciel-dev-ses-inbound-v2`,
+          //      read 2026-10-19);
+          //   2. the console-created `luciel-<env>-ses-inbound` (root CLAUDE.md),
+          //      referenced BY NAME because it is unmanaged — still the publishing
+          //      topic in an environment whose cutover has not run.
+          // Both are this account's own SES-only topics.
+          SES_INBOUND_TOPIC_ARN: sesInboundTopicArns,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
