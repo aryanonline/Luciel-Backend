@@ -29,7 +29,7 @@ The bounds are copies of ``escalation_dispatch.PENDING_STALE_AFTER`` /
 ``SENT_UNCONFIRMED_AFTER``; tests/integration/test_migration_0072_escalation_delivery_hardening.py
 refuses a drift. Same SECURITY DEFINER posture as 0018 / 0057 / 0069; ``luciel_auth``
 has held SELECT on ``escalation_events`` since 0057. Both functions are restated
-verbatim on downgrade (0065's candidate body, 0069's backlog body).
+verbatim on downgrade (0071's candidate body, 0069's backlog body).
 
 This revision id is 34 characters and alembic creates its own ``alembic_version``
 table as ``varchar(32)`` (0040 sits exactly at the ceiling): the column is widened
@@ -48,7 +48,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0072_escalation_delivery_hardening"
-down_revision: str | None = "0070_knowledge_answer_flags"
+down_revision: str | None = "0071_mailbox_poll_drains_quiescing"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 
@@ -64,8 +64,11 @@ _CANDIDATES_HEADER = """
 
 _CANDIDATES_FOOTER = "    $$;"
 
-# 0065's body verbatim (0056's branches + daily_brief + knowledge_chunks).
-_BODY_0065 = """
+# 0071's body verbatim: 0065's branches (0056 + daily_brief + knowledge_chunks) with the
+# mailbox_poll branch that admits a draining mailbox (0071). This revision chains after
+# 0071, so BOTH its upgrade and its downgrade must carry that clause - restating 0065's
+# text here would silently undo the mailbox drain of a deleted Luciel.
+_BODY_0071 = """
         SELECT i.admin_id FROM instances i
          WHERE p_kind = 'retention' AND i.state IN ('active', 'paused')
         UNION
@@ -111,7 +114,8 @@ _BODY_0065 = """
          WHERE p_kind = 'mailbox_poll'
            AND c.connection_type = 'email_sender'
            AND c.provider = 'outlook'
-           AND c.status = 'connected'
+           AND (c.status = 'connected'
+                OR (c.status = 'quiescing' AND c.status_stashed = 'connected'))
         UNION
         SELECT c.admin_id FROM instance_connections c
          WHERE p_kind = 'knowledge_sync'
@@ -215,11 +219,11 @@ def upgrade() -> None:
     # When the provider accepted the page a ``sent`` row rests on: the receipt window
     # runs from the send, not from ``fired_at`` (a replay an hour later is seconds old).
     op.add_column("escalation_events", sa.Column("sent_at", sa.DateTime(timezone=True)))
-    _replace_candidates(_BODY_0065 + _STALE_ESCALATIONS_BRANCH)
+    _replace_candidates(_BODY_0071 + _STALE_ESCALATIONS_BRANCH)
     _install_backlog_function(_BACKLOG_0072)
 
 
 def downgrade() -> None:
     _install_backlog_function(_BACKLOG_0069)
-    _replace_candidates(_BODY_0065)
+    _replace_candidates(_BODY_0071)
     op.drop_column("escalation_events", "sent_at")

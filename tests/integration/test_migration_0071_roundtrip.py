@@ -65,6 +65,12 @@ def _alembic(*args: str) -> None:
         _admin_psql(f"REVOKE luciel_auth FROM {APP_USER}")
 
 
+def _norm(sql: str) -> str:
+    """SQL text modulo whitespace: the later 0072 restates this body verbatim but
+    composes its blank lines differently."""
+    return " ".join(sql.split())
+
+
 async def _function_shape(s) -> tuple[str, str, bool]:
     """(body, owner, luciel_app may EXECUTE) of ``platform_sweep_candidates``."""
     row = (
@@ -157,7 +163,9 @@ async def test_0071_downgrades_and_upgrades_again():
 
     async with tenant_session(admin) as s:
         body, owner, executable = await _function_shape(s)
-    assert body.strip() == this.BODY_0071.strip()
+    # At head the body is 0072's: this revision's text plus the stale-escalation branch
+    # 0072 appends (it chains after 0071 and restates this body, drain clause included).
+    assert _norm(this.BODY_0071) in _norm(body)
     assert (owner, executable) == ("luciel_auth", True)
     assert admin in await sweeps.sweep_candidates("mailbox_poll"), (
         "at head a draining mailbox stashed as connected is polled"
@@ -167,7 +175,7 @@ async def test_0071_downgrades_and_upgrades_again():
     try:
         async with tenant_session(admin) as s:
             body, owner, executable = await _function_shape(s)
-        assert body.strip() == this.BODY_0065.strip(), "the downgrade restores 0065's body"
+        assert _norm(body) == _norm(this.BODY_0065), "the downgrade restores 0065's body"
         assert (owner, executable) == ("luciel_auth", True)
         # The live condition this revision fixes: before it, the tenant fell out of
         # the candidate list the moment the delete landed.
@@ -177,6 +185,6 @@ async def test_0071_downgrades_and_upgrades_again():
 
     async with tenant_session(admin) as s:
         body, owner, executable = await _function_shape(s)
-    assert body.strip() == this.BODY_0071.strip()
+    assert _norm(this.BODY_0071) in _norm(body)
     assert (owner, executable) == ("luciel_auth", True)
     assert admin in await sweeps.sweep_candidates("mailbox_poll")

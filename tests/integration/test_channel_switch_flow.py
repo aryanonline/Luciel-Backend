@@ -319,8 +319,9 @@ async def test_jane_asking_for_a_text_elsewhere_never_reaches_the_number_that_jo
     """Jane later writes by email (or on the widget, typing her email) "text me the
     quote". The newest confirmed phone used to win: the stranger got Jane's quote with
     no question asked. Now the lead's two confirmed phones are ambiguous for this
-    conversation, so Luciel asks — offering the record's number masked — and a yes
-    sends to Jane's own number."""
+    conversation, so Luciel asks. On Jane's own email session it offers the record's
+    number masked and a yes sends to it; on the widget, bound by a typed email alone,
+    it offers nothing from the record and sends only to a number Jane types."""
     admin, iid = uuid.uuid4(), uuid.uuid4()
     async with tenant_session(admin) as s:
         jane, _jane_sms, _stranger_sms = await _jane_then_the_stranger(s, admin, iid)
@@ -337,15 +338,37 @@ async def test_jane_asking_for_a_text_elsewhere_never_reaches_the_number_that_jo
         row = (await s.execute(select(SessionModel).where(SessionModel.id == sid))).scalar_one()
         assert row.resolved_lead_id == jane
         assert sent.calls == []  # nothing went anywhere, least of all to the stranger
-        assert "Should I send it to the number ending in 0100?" in ask.reply_text
         assert JANE_PHONE not in ask.reply_text and STRANGER_PHONE not in ask.reply_text
         assert row.pending_outbound and row.pending_outbound["channel"] == "sms"
-        assert row.pending_outbound["candidate"] == JANE_PHONE
-
-        confirmed = await _turn(s, admin, iid, sid, "yes", channel=channel, transport=transport)
-        assert [c["to"] for c in sent.calls] == [JANE_PHONE]
-        # The masked number stays masked in the confirmation.
-        assert confirmed.reply_text == "Sent — check your messages at the number ending in 0100."
+        if channel == "widget":
+            # A widget session is bound to Jane's record by a typed email alone, so it
+            # may read nothing back from the record — not even a masked number (the
+            # judgment hardening's identity gate): it asks for the number outright, and
+            # only a number Jane types herself is sent to.
+            assert "What's the best mobile number to send it to?" in ask.reply_text
+            assert not row.pending_outbound.get("candidate")
+            confirmed = await _turn(
+                s,
+                admin,
+                iid,
+                sid,
+                f"send it to my number {JANE_PHONE}",
+                channel=channel,
+                transport=transport,
+            )
+            assert [c["to"] for c in sent.calls] == [JANE_PHONE]
+            assert confirmed.reply_text.startswith("Sent")
+        else:
+            # Jane's own email session proves who she is: the record's number is offered
+            # masked, and a yes sends to it — never to the number that joined by a claim.
+            assert "Should I send it to the number ending in 0100?" in ask.reply_text
+            assert row.pending_outbound["candidate"] == JANE_PHONE
+            confirmed = await _turn(s, admin, iid, sid, "yes", channel=channel, transport=transport)
+            assert [c["to"] for c in sent.calls] == [JANE_PHONE]
+            # The masked number stays masked in the confirmation.
+            assert confirmed.reply_text == (
+                "Sent — check your messages at the number ending in 0100."
+            )
 
         # The booking tools' "on file" inputs follow the same rule: no stranger's phone.
         on_file = await channel_switch.confirmed_inputs_on_file(

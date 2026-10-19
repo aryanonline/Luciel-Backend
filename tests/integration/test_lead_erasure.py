@@ -466,6 +466,7 @@ _SESSION_CLEARED: dict[str, object] = {
     "inbound_message_id": MESSAGE_ID,
     "meta_destination_id": "pn-1",
     "meta_sender_id": WA_NUMBER,
+    "transport_sender": "+16045550100",  # the raw sender persisted at ingress (0074)
 }
 
 _VOICE_SURVIVES: dict[str, str] = {

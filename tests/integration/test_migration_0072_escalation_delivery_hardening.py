@@ -3,7 +3,7 @@
 The deferred sweep's candidate list and the escalation backlog both learn about the
 rows the queue cannot see: a ``pending`` escalation whose notification task died and a
 ``sent`` one whose delivery receipt never came (its window counted from the new
-``sent_at`` column, ``fired_at`` for rows stamped before it). Downgrade restores 0065's candidate
+``sent_at`` column, ``fired_at`` for rows stamped before it). Downgrade restores 0071's candidate
 body and 0069's backlog function exactly, so a rollback leaves the 0070 shape.
 """
 
@@ -122,6 +122,31 @@ def test_the_sql_bounds_are_copies_of_the_dispatcher_constants() -> None:
     assert pending and sent
     assert timedelta(minutes=int(pending.group(1))) == PENDING_STALE_AFTER
     assert timedelta(minutes=int(sent.group(1))) == SENT_UNCONFIRMED_AFTER
+
+
+def test_the_candidate_body_is_0071s_text_plus_the_stale_branch() -> None:
+    """0072 chains after 0071 and restates the same function. Its base body must be
+    0071's (the mailbox_poll branch that admits a draining mailbox), not 0065's: a
+    restatement from the older text would silently undo the mailbox drain of a
+    deleted Luciel on upgrade AND on downgrade."""
+    import importlib.util
+
+    def _load(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    this = _load(_MIGRATION, "migration_0072")
+    previous = _load(
+        os.path.join(os.path.dirname(_MIGRATION), "0071_mailbox_poll_drains_quiescing.py"),
+        "migration_0071",
+    )
+    norm = lambda sql: " ".join(sql.split())  # noqa: E731 — modulo whitespace
+    assert norm(this._BODY_0071) == norm(previous.BODY_0071)
+    assert "c.status_stashed = 'connected'" in this._BODY_0071
+    assert this._STALE_ESCALATIONS_BRANCH.strip().startswith("UNION")
 
 
 @pytest.mark.asyncio
