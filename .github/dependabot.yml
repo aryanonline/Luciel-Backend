@@ -14,9 +14,9 @@
 # PR, so the lock CI tests is the lock the image installs. The `pip` updater does not
 # maintain uv.lock: it would bump pyproject ranges and leave the lock stale (CI's
 # `uv lock --check` then fails the PR), and it never moves a locked version that is
-# already inside its range. PR titles keep the
-# same shapes ("Bump X from A to B", "Update X requirement from S to T", the grouped
-# "minor-and-patch group") that dependabot-auto-merge.yml classifies.
+# already inside its range. PR titles keep the same shapes ("Bump X from A to B",
+# "Update X requirement from S to T", the grouped "minor-and-patch group") that
+# dependabot-auto-merge.yml classifies.
 version: 2
 updates:
   - package-ecosystem: uv
