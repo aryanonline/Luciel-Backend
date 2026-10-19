@@ -242,8 +242,13 @@ async def start_connection(
                 provider=req.provider,
                 user_id=subject.user_id,
                 phone_number=req.phone_number,
+                login_host=req.login_host,
             )
         except service.ProviderNotRegistered as exc:
+            raise validation_error(str(exc)) from exc
+        except registry.LoginHostRejected as exc:
+            # Round 7 WP-7: a login host the provider does not offer (or any login
+            # host on a provider with no choice) — refused before any row is written.
             raise validation_error(str(exc)) from exc
         except service.DormantConnection as exc:
             # Round 5B item 16: dormant is billing-suspended — Connect must not
@@ -972,6 +977,7 @@ async def list_providers(
                                 for f in spec.credential_fields
                             ],
                             "scopeKind": spec.scope_kind,
+                            "loginHosts": list(registry.login_host_choices(spec.provider)),
                         }
                     )
                     for spec in registry.providers_for(ct)
@@ -1211,6 +1217,9 @@ async def complete_oauth_connect(
             raise OAuthStateRejected(
                 f"Provider '{provider}' has no OAuth callback (not an OAuth-class provider)."
             )
+        # The host the consent ran on (round 7 WP-7): the code must be redeemed at the
+        # same login host — a Salesforce sandbox code is unknown to login.salesforce.com.
+        login_host = (conn.non_secret_config or {}).get(registry.LOGIN_HOST_CONFIG_KEY)
         connection_type = conn.connection_type
         instance_id = await _instance_id(s, admin_id)
         expected_jti = service.consume_oauth_state(conn)
@@ -1244,12 +1253,13 @@ async def complete_oauth_connect(
     )
     async with oauth_transport() as transport:
         try:
-            material = await exchange_code_for_token(
-                provider,
-                code=code,
-                transport=cast("HttpTransport", transport),
-                code_verifier=verifier,
-            )
+            with registry.login_host_scope(login_host):
+                material = await exchange_code_for_token(
+                    provider,
+                    code=code,
+                    transport=cast("HttpTransport", transport),
+                    code_verifier=verifier,
+                )
         except OAuthExchangeError as exc:
             await _fail_exchange(admin_id, connection_id, actor_user_id, pending_provider, str(exc))
             raise OAuthExchangeRejected(f"OAuth token exchange failed: {exc}") from exc

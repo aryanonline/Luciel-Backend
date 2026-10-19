@@ -186,6 +186,7 @@ async def _refresh_material(
     *,
     spec: RefreshSpec,
     transport: _Transport,
+    login_host: object = None,
 ) -> tuple[dict[str, str], datetime] | None:
     """One refresh call for ``provider``; (rotated material, new expiry) or None.
 
@@ -193,7 +194,9 @@ async def _refresh_material(
     error, provider rejection — because every failure means the same thing to
     the caller: this credential cannot be made fresh.
     """
-    endpoint = registry.resolve_endpoint(spec.endpoint)
+    # The Graph version is a setting; a Salesforce sandbox row refreshes at its own
+    # login host (``non_secret_config`` ``login_host``, round 7 WP-7).
+    endpoint = registry.resolve_provider_endpoint(provider, spec.endpoint, login_host=login_host)
     try:
         if spec.style == STYLE_REFRESH_TOKEN_POST:
             refresh_token = material.get("refresh_token", "")
@@ -280,7 +283,11 @@ class RegistryTokenRefresher:
             return None
         material = await store.get(connection.secret_ref) or {}
         refreshed = await _refresh_material(
-            connection.provider, material, spec=spec, transport=self._transport_factory()
+            connection.provider,
+            material,
+            spec=spec,
+            transport=self._transport_factory(),
+            login_host=(connection.non_secret_config or {}).get(registry.LOGIN_HOST_CONFIG_KEY),
         )
         if refreshed is None:
             return None
@@ -387,7 +394,11 @@ async def ensure_fresh_access_token(
         return access_token
 
     refreshed = await _refresh_material(
-        conn.provider, material, spec=spec, transport=transport or _transport_factory()
+        conn.provider,
+        material,
+        spec=spec,
+        transport=transport or _transport_factory(),
+        login_host=(conn.non_secret_config or {}).get(registry.LOGIN_HOST_CONFIG_KEY),
     )
     if refreshed is None:
         return None
