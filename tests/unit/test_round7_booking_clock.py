@@ -9,12 +9,14 @@ transports (the production code path, only the HTTP faked):
   Monday to 8 pm Tuesday in Toronto), and every time read back was a UTC hour. With
   ``ToolContext.timezone`` an offset-less time and a bare date are read on the business's
   clock, an explicit offset is honoured, and every returned time is on that clock with
-  the zone named. No zone on file keeps the tools on UTC, byte for byte;
+  the zone named. No zone on file keeps the tools on UTC — and (round 7 M10) every
+  time then carries the explicit label ``UTC``;
 * **a time that has already gone** — "anything today?" asked at 2 pm offered 9 am (the
   day's window starts at midnight) and a past slot could be written; on Calendly the
   same question failed outright, because its API refuses a start_time in the past and
   the tool reported a calendar outage. A started slot is never offered, a write into
-  the past is a conflict, and Calendly is asked from now on.
+  the past is refused as ``slot_in_past`` (round 7 M10; it used to read as a conflict),
+  and Calendly is asked from now on.
 """
 
 from __future__ import annotations
@@ -203,14 +205,14 @@ async def test_google_today_never_offers_the_part_of_the_day_already_gone() -> N
     assert gone.outcome is Outcome.empty
 
 
-async def test_google_a_time_already_gone_is_a_conflict_never_a_write() -> None:
+async def test_google_a_time_already_gone_is_slot_in_past_never_a_write() -> None:
     ctx, cred = await _google_ctx()
     whole_week = (NOW - timedelta(days=3), NOW + timedelta(days=7))
     past = await catalog.BookAppointmentTool(_google()).execute(
         {"slot": "2026-10-06T09:00:00", "email": LEAD}, ctx
     )
     assert past.outcome is Outcome.failed
-    assert past.reason == "slot_conflict"
+    assert past.reason == catalog.SLOT_IN_PAST  # round 7 M10: not a conflict
     assert await InMemoryCalendarApi().events_in(cred, *whole_week) == []
 
     booked = await catalog.BookAppointmentTool(_google()).execute(
@@ -222,7 +224,7 @@ async def test_google_a_time_already_gone_is_a_conflict_never_a_write() -> None:
         {"email": LEAD, "slot": "2026-10-06T10:00:00"}, ctx
     )
     assert moved.outcome is Outcome.failed
-    assert moved.reason == "slot_conflict"
+    assert moved.reason == catalog.SLOT_IN_PAST
     (event,) = await InMemoryCalendarApi().events_in(cred, *whole_week)
     assert event.start == datetime(2026, 10, 8, 19, 0, tzinfo=UTC)
 
@@ -276,7 +278,7 @@ async def test_google_without_a_zone_on_file_everything_stays_utc() -> None:
     )
     assert booked.outcome is Outcome.ok, booked.reason
     assert booked.payload["start"] == "2026-10-08T15:00:00+00:00"
-    assert "timezone" not in booked.payload
+    assert booked.payload["timezone"] == "UTC"  # round 7 M10: labelled, never bare
     event = await InMemoryCalendarApi().get_event(cred, booked.payload["bookingRef"])
     assert event is not None
     assert event.start == datetime(2026, 10, 8, 15, 0, tzinfo=UTC)
@@ -352,8 +354,9 @@ async def test_calendly_today_is_asked_from_now_on_never_from_a_past_start() -> 
 
     # Yesterday has nothing to offer and Calendly is not asked.
     assert await backend.free_busy(ctx, "2026-10-05") == []
-    # This morning cannot be booked and Calendly is not asked.
-    assert await backend.book(ctx, "2026-10-06T09:00:00", LEAD) is None
+    # This morning cannot be booked (it has already passed) and Calendly is not asked.
+    with pytest.raises(calendar_backend.SlotInPast):
+        await backend.book(ctx, "2026-10-06T09:00:00", LEAD)
     assert len(api.asked) == 1
 
 
@@ -387,4 +390,4 @@ async def test_calendly_without_a_zone_on_file_everything_stays_utc() -> None:
     link = await backend.book(ctx, "2026-10-08T15:00:00", LEAD)
     assert link is not None
     assert link["start"] == "2026-10-08T15:00:00+00:00"
-    assert "timezone" not in link
+    assert link["timezone"] == "UTC"  # round 7 M10: labelled, never bare

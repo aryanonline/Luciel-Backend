@@ -50,6 +50,17 @@ NEAR_CAP_AT = 40
 STALE_SYNC_AFTER = timedelta(days=7)
 #: Abandoned callbacks are worth a line for this long.
 RECENT_ABANDON_WINDOW = timedelta(days=7)
+#: Tools that read, propose or write a clock time — the ones a missing business time
+#: zone puts on UTC (round 7 M10, the ``timezone_unset`` need).
+TIME_BOUND_TOOLS = frozenset(
+    {
+        "check_availability",
+        "book_appointment",
+        "reschedule_appointment",
+        "cancel_appointment",
+        "schedule_callback",
+    }
+)
 
 CHANNEL_LABELS: dict[str, str] = {
     "widget": "Website chat",
@@ -537,6 +548,23 @@ def derive_needs(snap: Snapshot) -> list[Need]:  # noqa: C901, PLR0912, PLR0915 
                 f"{snap.callbacks_abandoned_recent} promised follow-up(s) could not be delivered",
                 "See the conversation for who was waiting and reach out yourself.",
                 "/dashboard/conversations",
+            )
+        )
+    if not (snap.timezone and team_hours.valid_timezone(snap.timezone)):
+        # Round 7 M10: a tenant with no zone books, proposes and counts days in UTC.
+        # Luciel says "UTC" with every time it states; the owner is told here — the
+        # zone is never guessed. Attention while a time-bound tool is on (a booking
+        # in the wrong hour is a real failure), info otherwise.
+        scheduling_on = any(snap.tools_enabled.get(t) for t in TIME_BOUND_TOOLS)
+        needs.append(
+            Need(
+                "timezone_unset",
+                "attention" if scheduling_on else "info",
+                "Set your business time zone",
+                "No time zone is set, so Luciel states and books every time in UTC "
+                "(and says so) and your Today card counts days in UTC. Set your "
+                "business time zone under Configure and times follow your clock.",
+                configure,
             )
         )
     if not snap.team_availability_set:

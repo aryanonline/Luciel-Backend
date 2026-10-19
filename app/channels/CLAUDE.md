@@ -66,6 +66,12 @@ Handles widget, email, SMS, voice, WhatsApp, Messenger, and Instagram ingress/ro
 - `sessions.transport_sender` (migration 0074): the raw sms/email sender is persisted
   at ingress by `inbound_dispatch.persist_reply_context` (voice: the pipeline, from the
   caller) beside 0066's Meta context; lead erasure clears it with `meta_sender_id`.
+- The Voice opening line (round 7): `personality.voiceDisclosureIntro` is owner-settable
+  through the personality PUT (plain text, trimmed, <= 200 chars, no control characters or
+  markup; empty stores null — `schemas_api.luciel.clean_voice_disclosure_intro`). The GET
+  serves a READ-ONLY `voiceDisclosurePreview` from `voice_adapter.disclosure_preview`, which
+  reads the intro exactly as `voice_pipeline.start_call` does and runs the SAME
+  `build_disclosure`: the AI-identity and recording facts are appended unconditionally.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

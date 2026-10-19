@@ -450,6 +450,11 @@ async def reverify_sms_number(
             raise NumberAlreadyClaimed(str(destination))
         merged = {**cfg, "destination": destination}
         merged.pop("pending_destination", None)
+        # The claim is live again (round 7 M10): a released copy never survives
+        # beside it, or a later disconnect / restore would read stale state.
+        from app.connections.service import RELEASED_DESTINATION_KEY  # noqa: PLC0415
+
+        merged.pop(RELEASED_DESTINATION_KEY, None)
         existing.non_secret_config = merged
 
     # Post-promotion cfg: an attested row that re-probes OPERABLE stays connected;

@@ -26,6 +26,10 @@ _NOT_ARCHIVED: dict[str, str] = {
     "admin_id": "the tenant is the object key's prefix (transcript_key_for); RLS scopes the read",
     "instance_id": "in the object key too, and on the session row the archive hangs off",
     "created_at": "row insertion time; 'at' is the message's own time and is archived",
+    # Round 7 M10 (migration 0076): only the lookup key a carrier receipt uses, minutes
+    # after the send; the OUTCOME it produces (delivery_status/detail/at) is archived.
+    "delivery_provider_message_id": "the carrier-receipt lookup key, spent long before "
+    "the 90-day move; the delivery outcome it writes is archived",
 }
 
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)

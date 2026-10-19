@@ -21,7 +21,11 @@ from app.schemas_api.common import WireModel
 # surface, §3.1.5 / §3.4.14). The shipped widget input enforces the same limit.
 WIDGET_TEXT_MAX_CHARS = 4000
 
-WidgetRenderStateWire = Literal["active", "paused", "at_cap"]
+# "channel_off" (round 7 owner decision D9): the owner switched the Website chat
+# channel off in the channels pillar. The widget renders NOTHING (exactly as for
+# "paused") and re-checks the bootstrap so it can appear once the owner switches the
+# channel back on; a conversation already in flight finishes.
+WidgetRenderStateWire = Literal["active", "paused", "at_cap", "channel_off"]
 # "human": a person's reply from the dashboard (2026-09-06 E2E walk, E2E-11) — the
 # widget must never present it under the AI assistant's name.
 WidgetRoleWire = Literal["visitor", "assistant", "human"]

@@ -529,6 +529,21 @@ async def twilio_notification_status(request: Request) -> Response:
                 message_status=message_status,
                 error_code=params.get("ErrorCode") or None,
             )
+            if outcome == "unknown_message":
+                # Not an owner page: a person's take-over reply sent as a text carries
+                # its SID on the transcript row (round 7 M10) — the carrier's word goes
+                # there, so the dashboard stops reading an undelivered reply as sent.
+                from app.channels.reply_receipts import (  # noqa: PLC0415
+                    record_reply_delivery_receipt,
+                )
+
+                outcome = await record_reply_delivery_receipt(
+                    s,
+                    admin_id=ctx.admin_id,
+                    provider_message_id=message_sid,
+                    message_status=message_status,
+                    error_code=params.get("ErrorCode") or None,
+                )
         if outcome != "unknown_message":
             break
     return Response(status_code=200)

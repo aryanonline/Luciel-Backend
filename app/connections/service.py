@@ -963,6 +963,137 @@ def _release_routing_claim(connection: InstanceConnection, cfg: dict[str, object
     return claim if isinstance(claim, str) and claim else None
 
 
+#: Round 7 M10: the per-channel counterpart of ``RELEASED_DESTINATION_KEY`` for the
+#: Meta grants, whose routing claims live in the ``destinations`` map ({channel: id} —
+#: a WhatsApp phone-number id and a Messenger Page id on ``channel_auth``, the
+#: Instagram account id on ``instagram_auth``). Like the scalar copy it is NOT a claim:
+#: the resolver and the claim gate read ``destination`` / ``destinations`` only.
+RELEASED_DESTINATIONS_KEY = "released_destinations"
+
+#: The Meta grant types whose rows hold a Meta asset routing claim.
+META_CLAIM_TYPES: frozenset[str] = frozenset({"channel_auth", "instagram_auth"})
+
+
+def _str_map(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in value.items() if isinstance(v, str) and v}
+
+
+def _release_meta_claims(
+    connection: InstanceConnection, cfg: dict[str, object]
+) -> tuple[str | None, dict[str, str]]:
+    """Take a disconnected Meta row's asset ids off its routing keys (round 7 M10).
+
+    The same owner ruling as ``_release_routing_claim`` (2026-09-14, WP-4a item 12),
+    applied to the Meta grants that it skipped: before this a disconnected WhatsApp
+    number / Messenger Page / Instagram account kept resolving inbound to the dead
+    tenant (the resolver admits every non-revoked row) and kept refusing its real
+    owner as "already connected to another account".
+
+    Mutates ``cfg``. The routable ids (``destination`` / ``destinations``) and the
+    parked ones (``pending_destination(s)``, never claims) move to the released copies
+    — routable first per channel — so a reconnect can offer them back and re-prove
+    them (``reclaim_released_meta``). Returns the CLAIMS released: the legacy scalar
+    destination (or None) and the per-channel map.
+    """
+    if connection.connection_type not in META_CLAIM_TYPES:
+        return None, {}
+    claim = cfg.pop("destination", None)
+    parked = cfg.pop("pending_destination", None)
+    kept = next((v for v in (claim, parked) if isinstance(v, str) and v), None)
+    if kept is not None:
+        cfg[RELEASED_DESTINATION_KEY] = kept
+    claims = _str_map(cfg.pop("destinations", None))
+    on_file = {**_str_map(cfg.pop("pending_destinations", None)), **claims}
+    if on_file:
+        cfg[RELEASED_DESTINATIONS_KEY] = on_file
+    return (claim if isinstance(claim, str) and claim else None), claims
+
+
+def released_meta_destinations(cfg: dict[str, object] | None) -> dict[str, str]:
+    """The Meta ids a disconnect released on this row, keyed by channel. The legacy
+    scalar copy (a row bound before per-channel destinations existed) is keyed ``""``."""
+    cfg = cfg or {}
+    out = _str_map(cfg.get(RELEASED_DESTINATIONS_KEY))
+    scalar = cfg.get(RELEASED_DESTINATION_KEY)
+    if isinstance(scalar, str) and scalar:
+        out[""] = scalar
+    return out
+
+
+#: Outcomes of re-claiming a released Meta id on reconnect.
+RECLAIMED = "reclaimed"
+PARKED_UNPROVEN = "parked_unproven"
+PARKED_TAKEN = "parked_taken"
+
+
+async def reclaim_released_meta(
+    session: AsyncSession,
+    connection: InstanceConnection,
+    *,
+    admin_id: uuid.UUID,
+    proven_assets: set[str] | None,
+) -> dict[str, tuple[str, str]]:
+    """Re-prove and re-claim the Meta ids a disconnect released, on reconnect (M10).
+
+    Called by the OAuth callback once the NEW grant has verified. Each released id is
+    a claim attempt like any bind: under the per-destination advisory lock, the
+    cross-grant holder check runs first; an id another account bound meanwhile is
+    parked under ``pending_destination(s)`` (never routable, never a claim) and the
+    owner told; an id the new grant's asset lister PROVED becomes the routable claim
+    again; an id that could not be proven (no Meta to ask in this posture, Meta
+    unreachable, or not on the new grant) is parked exactly as an unproven bind is.
+    The released copies are consumed either way — the claim was re-established or
+    the parked id now stands in for it — so a later disconnect/restore never reads a
+    stale marker. Returns ``{channel: (id, outcome)}``; the caller audits it and sets
+    the status detail. ``proven_assets`` is None when Meta could not be asked.
+    """
+    from app.channels import routing  # noqa: PLC0415 — channels imports connections
+
+    cfg = dict(connection.non_secret_config or {})
+    released = released_meta_destinations(cfg)
+    cfg.pop(RELEASED_DESTINATIONS_KEY, None)
+    cfg.pop(RELEASED_DESTINATION_KEY, None)
+    routable = _str_map(cfg.get("destinations"))
+    parked = _str_map(cfg.get("pending_destinations"))
+    outcomes: dict[str, tuple[str, str]] = {}
+    for channel, asset_id in sorted(released.items()):
+        await routing.lock_destination_claim(session, asset_id)  # c21 TOCTOU guard
+        holder = await routing.owner_of_meta_destination(session, asset_id)
+        if holder is not None and holder != admin_id:
+            outcome = PARKED_TAKEN
+        elif proven_assets is not None and asset_id in proven_assets:
+            outcome = RECLAIMED
+        else:
+            outcome = PARKED_UNPROVEN
+        outcomes[channel] = (asset_id, outcome)
+        if channel == "":
+            if outcome == RECLAIMED:
+                cfg["destination"] = asset_id
+                cfg.pop("pending_destination", None)
+            else:
+                cfg["pending_destination"] = asset_id
+            continue
+        if outcome == RECLAIMED:
+            routable[channel] = asset_id
+            parked.pop(channel, None)
+        else:
+            parked[channel] = asset_id
+            routable.pop(channel, None)
+    if routable:
+        cfg["destinations"] = routable
+    else:
+        cfg.pop("destinations", None)
+    if parked:
+        cfg["pending_destinations"] = parked
+    else:
+        cfg.pop("pending_destinations", None)
+    connection.non_secret_config = cfg
+    await session.flush()
+    return outcomes
+
+
 def _stage_reconnect_marker(
     connection: InstanceConnection, prior_status: str, now: datetime
 ) -> None:
@@ -1532,6 +1663,10 @@ async def disconnect(
     # This used to hold for an Outlook mailbox only; a BYO number and a platform
     # address kept their claim forever.
     released_claim = _release_routing_claim(connection, cfg)
+    # Round 7 M10: the same ruling for the Meta grants (WhatsApp phone-number id,
+    # Messenger Page id, Instagram account id) — they used to keep their claim.
+    meta_scalar, meta_claims = _release_meta_claims(connection, cfg)
+    released_claim = released_claim or meta_scalar
     if connection.provider == "outlook":
         # The mailbox's expiry hint, poll cursor and dedupe window go with it — a
         # future reconnect re-baselines from scratch (the baseline rule), which is
@@ -1571,8 +1706,10 @@ async def disconnect(
             "disabled_channels": cascaded["channels"],
             # Item 12: whether this disconnect gave up a number / mailbox claim, and
             # which (non-secret config, §3.8.3 — the owner's own number or address).
-            "routing_claim_released": released_claim is not None,
+            "routing_claim_released": released_claim is not None or bool(meta_claims),
             **({"released_destination": released_claim} if released_claim else {}),
+            # M10: a Meta grant's per-channel claims ({channel: id}).
+            **({"released_destinations": meta_claims} if meta_claims else {}),
         },
     )
     # §3.8.3 rule 4: cleanup audit carries NO secret material — only the ref + result.

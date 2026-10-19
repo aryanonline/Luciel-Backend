@@ -113,6 +113,34 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+#: Clock-skew tolerance for "that time has already passed" (round 7 M10): our clock,
+#: the provider's and the customer's can disagree by seconds, and "the 2 pm slot"
+#: confirmed at 2:00:20 is not a request for a time gone by. A slot that started
+#: longer ago than this is refused as past.
+PAST_SLOT_TOLERANCE = timedelta(minutes=2)
+
+
+class SlotInPast(Exception):  # noqa: N818 — a refusal, read as a reason, not an error
+    """A book or a move whose start time has already passed (round 7 M10).
+
+    Raised BEFORE any read or write against the provider; the catalog maps it to
+    ``failed("slot_in_past")`` with read-back copy, so the model says the time has
+    gone by and asks for another — instead of a ``slot_conflict`` it would explain as
+    "someone else took it"."""
+
+    def __init__(self, start: datetime) -> None:
+        super().__init__(f"slot started at {start.isoformat()}")
+        self.start = start
+
+
+def ensure_not_past(start: datetime) -> None:
+    """Refuse a slot that started more than ``PAST_SLOT_TOLERANCE`` ago. ``start`` is
+    an aware instant already read on the business's clock (``parse_interval(tz=)``),
+    so "9:00" for a Toronto business is compared as 9:00 in Toronto, never 9:00 UTC."""
+    if start < now_utc() - PAST_SLOT_TOLERANCE:
+        raise SlotInPast(start)
+
+
 def business_zone(name: str | None) -> tzinfo:
     """The clock the tools read and render times on (round 7 WP-2 remainder, item 11):
     ``instances.timezone`` (``ToolContext.timezone``) when it is a real IANA name, else
@@ -127,14 +155,26 @@ def business_zone(name: str | None) -> tzinfo:
 
 
 def zone_name(tz: tzinfo) -> str | None:
-    """The IANA name of a business zone; None for UTC (nothing to tell the model)."""
+    """The IANA name of a business zone; None for the no-zone UTC fallback."""
     return getattr(tz, "key", None)
 
 
+#: The label every time carries when the business has set no time zone (round 7 M10):
+#: the tools then work in UTC, and the customer must hear "UTC" with the time — never
+#: a bare hour they would read as their own. The zone is never guessed.
+NO_ZONE_LABEL = "UTC"
+
+
+def zone_label(tz: tzinfo) -> str:
+    """The zone a time is stated in: the business's IANA name, else ``UTC``."""
+    return zone_name(tz) or NO_ZONE_LABEL
+
+
 def stamp_zone(payload: dict[str, Any], tz: tzinfo) -> dict[str, Any]:
-    """Name the business's zone on a confirming payload; UTC (no zone) adds nothing."""
-    name = zone_name(tz)
-    return {**payload, "timezone": name} if name else payload
+    """Name the zone on a confirming payload: the business's zone, or ``UTC`` when none
+    is set (round 7 M10 — a zoneless tenant used to get times with no label at all, so
+    a UTC hour was read back as if it were local)."""
+    return {**payload, "timezone": zone_label(tz)}
 
 
 def _as_utc(value: datetime, tz: tzinfo = UTC) -> datetime:
@@ -323,8 +363,9 @@ class GoogleCalendarBackend:
         cred = await self._credentials(ctx)
         tz = business_zone(ctx.timezone)
         start, end = parse_interval(slot, tz=tz)
-        if start < now_utc():
-            return None  # already started: nobody can still hold it -> failed("slot_conflict")
+        # Already gone (beyond the clock-skew tolerance): refused before any read or
+        # write -> failed("slot_in_past"), round 7 M10.
+        ensure_not_past(start)
         if not await self._is_free(cred, start, end):
             return None  # -> failed("slot_conflict")
         return _booking(await self._api.insert_event(cred, start=start, end=end, email=email), tz)
@@ -363,8 +404,8 @@ class GoogleCalendarBackend:
         existing = await self._api.get_event(cred, booking_ref)
         if existing is None:
             return None  # gone since the read -> failed, never a fabricated move
-        if start < now_utc():
-            return None  # a move into the past is not a move -> failed("slot_conflict")
+        # A move into the past is not a move -> failed("slot_in_past"), no write.
+        ensure_not_past(start)
         if not await self._is_free(cred, start, end, ignore_event_id=booking_ref):
             return None  # -> failed("slot_conflict")
         moved = await self._api.patch_event(cred, booking_ref, start=start, end=end)

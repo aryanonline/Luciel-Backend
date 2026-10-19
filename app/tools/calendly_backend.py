@@ -45,6 +45,9 @@ AVAILABILITY_MAX_DAYS = 7
 #: (HTTP 400). A window that began earlier — "today" is one from midnight on — is
 #: asked from this far ahead of now instead (round 7 WP-2 remainder, item 11).
 AVAILABILITY_LEAD = timedelta(minutes=1)
+#: Where the connection row records the chosen event type's length in minutes
+#: (written when the owner chooses the event type; round 7 M10).
+EVENT_DURATION_KEY = "eventTypeDurationMinutes"
 
 _T = TypeVar("_T")
 
@@ -59,6 +62,9 @@ class CalendlyCredentials:
     access_token: str
     user_uri: str
     event_type_uri: str
+    # The chosen event type's own length, when the connection row recorded it
+    # (round 7 M10). None = not on file: the backend asks Calendly.
+    event_duration_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,8 +184,14 @@ class CalendlyBackend:
         )
         if not token:
             raise CalendlyUnavailable("calendly_token_unavailable")
+        raw_duration = cfg.get(EVENT_DURATION_KEY)
         return CalendlyCredentials(
-            access_token=token, user_uri=user_uri, event_type_uri=event_type_uri
+            access_token=token,
+            user_uri=user_uri,
+            event_type_uri=event_type_uri,
+            event_duration_minutes=(
+                raw_duration if isinstance(raw_duration, int) and raw_duration > 0 else None
+            ),
         )
 
     async def _guarded(self, ctx: ToolContext, call: Awaitable[_T]) -> _T:
@@ -198,6 +210,23 @@ class CalendlyBackend:
                     reason=str(exc),
                 )
             raise
+
+    async def _event_minutes(self, cred: CalendlyCredentials) -> int | None:
+        """The chosen event type's OWN length (round 7 M10): a booking link's end used
+        to be start + the generic 30-minute default whatever the event type was — a
+        60-minute consultation read back as ending half an hour early. The length on
+        file wins; else Calendly is asked; None when neither can say (the payload then
+        names no end rather than a guessed one)."""
+        if cred.event_duration_minutes:
+            return cred.event_duration_minutes
+        try:
+            types = await self._api.event_types(cred, cred.user_uri)
+        except CalendlyUnavailable:
+            return None
+        match = next((t for t in types if t.uri == cred.event_type_uri), None)
+        if match is None or match.duration_minutes <= 0:
+            return None
+        return match.duration_minutes
 
     async def free_busy(self, ctx: ToolContext, window: str) -> list[str]:
         return await self._guarded(ctx, self._free_busy(ctx, window))
@@ -225,26 +254,28 @@ class CalendlyBackend:
     async def _book(self, ctx: ToolContext, slot: str, email: str) -> dict[str, Any] | None:
         cred = await self._credentials(ctx)
         tz = business_zone(ctx.timezone)
-        start, end = parse_interval(slot, tz=tz)
+        start, _requested_end = parse_interval(slot, tz=tz)
+        # Gone by (beyond the clock-skew tolerance) -> failed("slot_in_past"), M10.
+        calendar_backend.ensure_not_past(start)
         if start <= calendar_backend.now_utc():
-            return None  # already started: not a time anyone can still take
+            return None  # started seconds ago: Calendly no longer offers it -> conflict
         times = await self._api.available_times(
             cred, cred.event_type_uri, start, start + timedelta(minutes=1)
         )
         match = next((url for t, url in times if _as_utc(t) == start), None)
         if match is None:
             return None  # the slot is no longer offered -> failed("slot_conflict")
-        return stamp_zone(
-            {
-                "state": "scheduling_link",
-                "schedulingLink": match,
-                "start": start.astimezone(tz).isoformat(),
-                "end": end.astimezone(tz).isoformat(),
-                "email": email,
-                "note": BOOKING_LINK_NOTE,
-            },
-            tz,
-        )
+        payload: dict[str, Any] = {
+            "state": "scheduling_link",
+            "schedulingLink": match,
+            "start": start.astimezone(tz).isoformat(),
+        }
+        # The END is the event type's own length (M10), never the generic default.
+        minutes = await self._event_minutes(cred)
+        if minutes is not None:
+            payload["end"] = (start + timedelta(minutes=minutes)).astimezone(tz).isoformat()
+        payload.update({"email": email, "note": BOOKING_LINK_NOTE})
+        return stamp_zone(payload, tz)
 
     async def find_bookings(
         self, ctx: ToolContext, *, email: str, booking_ref: str | None = None
@@ -293,15 +324,20 @@ class CalendlyBackend:
         if event is None or event.status != "active":
             return None
         tz = business_zone(ctx.timezone)
-        start, end = parse_interval(slot, tz=tz)
-        return {
+        start, _requested_end = parse_interval(slot, tz=tz)
+        # A move into a time already gone -> failed("slot_in_past"), no link (M10).
+        calendar_backend.ensure_not_past(start)
+        out: dict[str, Any] = {
             **_booking(event, tz),
             "state": "reschedule_link",
             "rescheduleLink": event.reschedule_url,
             "requestedStart": start.astimezone(tz).isoformat(),
-            "requestedEnd": end.astimezone(tz).isoformat(),
-            "note": RESCHEDULE_LINK_NOTE,
         }
+        minutes = await self._event_minutes(cred)
+        if minutes is not None:
+            out["requestedEnd"] = (start + timedelta(minutes=minutes)).astimezone(tz).isoformat()
+        out["note"] = RESCHEDULE_LINK_NOTE
+        return out
 
     async def cancel(self, ctx: ToolContext, booking_ref: str) -> dict[str, Any] | None:
         return await self._guarded(ctx, self._cancel(ctx, booking_ref))

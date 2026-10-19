@@ -104,6 +104,11 @@ def _source_out(src: KnowledgeSource, used_7d: int = 0) -> KnowledgeSourceOut:
             "syncStatus": src.sync_status,
             "usedByQuestions7d": used_7d,
             "connectionId": src.connection_id,
+            # Round 7 M10: the D10 clock and the tombstone's author, so the dashboard
+            # can say "stops answering on <date>" and "deleted at its origin — not
+            # restorable" without waiting for a failed restore.
+            "pausedSince": src.paused_since,
+            "deletedBy": src.deleted_by,
         }
     )
 
@@ -145,8 +150,28 @@ async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
 async def list_sources(subject: Subject = Depends(current_admin)) -> list[KnowledgeSourceOut]:
     async with tenant_session(subject.admin_id) as s:
         sources = await service.list_sources(s, subject.admin_id)
+        # Round 7 M10: a source the sync found GONE at its origin is listed (with
+        # ``deletedBy: "origin"``) until the retention pass purges it, so the owner
+        # reads "removed at its source — not restorable" on the list itself instead of
+        # discovering it through a failed restore. Owner-deleted tombstones stay off
+        # the list (their undo lives on the delete confirmation, unchanged).
+        removed_at_origin = (
+            (
+                await s.execute(
+                    select(KnowledgeSource)
+                    .where(
+                        KnowledgeSource.admin_id == subject.admin_id,
+                        KnowledgeSource.soft_deleted_at.is_not(None),
+                        KnowledgeSource.deleted_by == service.DELETED_BY_ORIGIN,
+                    )
+                    .order_by(KnowledgeSource.soft_deleted_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
         used = await _used_by_questions_7d(s, subject.admin_id)
-        return [_source_out(x, used.get(x.id, 0)) for x in sources]
+        return [_source_out(x, used.get(x.id, 0)) for x in [*sources, *removed_at_origin]]
 
 
 @router.get("/sources/{source_id}/chunks", response_model=KnowledgeChunkPageOut)

@@ -42,6 +42,7 @@ from app.runtime.orchestrator import persist_turn
 from app.schemas_api.conversations import (
     AnswerEvidenceOut,
     ConversationSummaryOut,
+    CountedForBillingReasonWire,
     DeliveryDetailWire,
     DeliveryStatusWire,
     EscalationEventOut,
@@ -100,7 +101,15 @@ async def list_conversations(
                 .limit(limit)
             )
         ).all()
-        return [_summary(sess, counted=counted_id is not None) for sess, counted_id in rows]
+        reasons = await _unbilled_reasons(
+            s,
+            admin_id=subject.admin_id,
+            session_ids=[sess.id for sess, counted_id in rows if counted_id is None],
+        )
+        return [
+            _summary(sess, counted=counted_id is not None, reason=reasons.get(sess.id))
+            for sess, counted_id in rows
+        ]
 
 
 def _counted_join(admin_id: uuid.UUID) -> ColumnElement[bool]:
@@ -112,6 +121,43 @@ def _counted_join(admin_id: uuid.UUID) -> ColumnElement[bool]:
         CountedSession.instance_id == SessionModel.instance_id,
         CountedSession.session_id == SessionModel.id,
     )
+
+
+#: Escalation signals that say why a session never reached the fire-once billing
+#: trigger (round 7 M10), mapped to the wire reason.
+_UNBILLED_SIGNALS: dict[str, CountedForBillingReasonWire] = {
+    "budget_exhausted": "at_capacity",
+    "llm_unavailable": "outage",
+}
+
+
+async def _unbilled_reasons(
+    s: AsyncSession, *, admin_id: uuid.UUID, session_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, CountedForBillingReasonWire]:
+    """Why each UNCOUNTED session went unbilled, from what the turn persisted (M10).
+
+    The at-cap reply writes a ``budget_exhausted`` escalation row and an outage (or
+    the per-minute LLM cap) an ``llm_unavailable`` one — each once per session — so
+    the persisted state CAN tell the two apart. The earlier row is the reason the
+    first turn went unbilled. A session with neither has no reason to report."""
+    if not session_ids:
+        return {}
+    rows = (
+        await s.execute(
+            select(EscalationEvent.session_id, EscalationEvent.signal)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id.in_(session_ids),
+                EscalationEvent.signal.in_(tuple(_UNBILLED_SIGNALS)),
+            )
+            .order_by(EscalationEvent.fired_at.asc())
+        )
+    ).all()
+    out: dict[uuid.UUID, CountedForBillingReasonWire] = {}
+    for session_id, signal in rows:
+        if session_id is not None and session_id not in out:
+            out[session_id] = _UNBILLED_SIGNALS[signal]
+    return out
 
 
 async def _counted_for_billing(
@@ -317,7 +363,12 @@ async def send_human_message(
             # number being connected/attested, and LABELLED as a text so the owner never
             # believes the caller heard it on the call (audit F150).
             result = await _bridge_voice_reply_to_sms(
-                s, admin_id=subject.admin_id, sess=sess, to=recipient, body=body.text
+                s,
+                admin_id=subject.admin_id,
+                sess=sess,
+                to=recipient,
+                body=body.text,
+                status_callback=await _reply_receipt_url(s, admin_id=subject.admin_id, sess=sess),
             )
         else:
             result = await outbound.send_outbound_reply(
@@ -327,6 +378,13 @@ async def send_human_message(
                 channel=sess.channel,
                 to=recipient,
                 body=body.text,
+                # Round 7 M10: a text asks the carrier for its delivery receipt, which
+                # lands on this row (app/channels/reply_receipts.py).
+                status_callback=(
+                    await _reply_receipt_url(s, admin_id=subject.admin_id, sess=sess)
+                    if sess.channel == "sms"
+                    else None
+                ),
                 # The reply goes out AS the conversation it answers (round 7 WP-3b): in
                 # the customer's own email thread (subject + the inbound message id the
                 # ingress persisted — Graph's /messages/{id}/reply on a BYO mailbox,
@@ -369,10 +427,28 @@ async def send_human_message(
         )
 
 
+async def _reply_receipt_url(
+    s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel
+) -> str | None:
+    """Where Twilio posts the carrier's receipt for a person's text reply (round 7
+    M10): the tenant's verified status route the owner pages already use. None in a
+    deployment with no public origin, or for a tenant whose receipt could not be
+    verified — the row then keeps the API accept as its outcome, as before."""
+    from app.notifications.sms_notifier import (  # noqa: PLC0415
+        notification_status_callback_url,
+    )
+
+    return await notification_status_callback_url(s, admin_id, sess.instance_id)
+
+
 def _persist_delivery_outcome(row: Transcript, result: outbound.OutboundResult) -> None:
     if result.delivered:
         row.delivery_status = "delivered"
         row.delivered_at = datetime.now(UTC)
+        # Round 7 M10: the id the carrier's receipt will name (Twilio's MessageSid),
+        # so the receipt can record its word on THIS row.
+        if result.provider_message_id:
+            row.delivery_provider_message_id = str(result.provider_message_id)[:64]
     elif result.detail == "widget_poll_only":
         # Not a failure: the widget has no push transport and serves the reply on its
         # next history fetch. Not a delivery either — nothing has reached the visitor
@@ -449,7 +525,13 @@ async def _takeover_recipient(
 
 
 async def _bridge_voice_reply_to_sms(
-    s: AsyncSession, *, admin_id: uuid.UUID, sess: SessionModel, to: str | None, body: str
+    s: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    sess: SessionModel,
+    to: str | None,
+    body: str,
+    status_callback: str | None = None,
 ) -> outbound.OutboundResult:
     from app.channels.phone_lifecycle import sms_number_status  # noqa: PLC0415
     from app.models.instance import Instance, channel_enabled  # noqa: PLC0415
@@ -466,7 +548,13 @@ async def _bridge_voice_reply_to_sms(
             channel="voice", delivered=False, detail="voice_reply_requires_sms"
         )
     result = await outbound.send_outbound_reply(
-        s, admin_id=admin_id, instance_id=sess.instance_id, channel="sms", to=to, body=body
+        s,
+        admin_id=admin_id,
+        instance_id=sess.instance_id,
+        channel="sms",
+        to=to,
+        body=body,
+        status_callback=status_callback,
     )
     if result.delivered:
         return outbound.OutboundResult(
@@ -559,7 +647,12 @@ async def hand_back(
             actor_user_id=subject.user_id,
         )
         counted = await _counted_for_billing(s, admin_id=subject.admin_id, session_id=session_id)
-        return _summary(sess, counted=counted)
+        reasons = (
+            {}
+            if counted
+            else await _unbilled_reasons(s, admin_id=subject.admin_id, session_ids=[session_id])
+        )
+        return _summary(sess, counted=counted, reason=reasons.get(session_id))
 
 
 @router.get(
@@ -1486,7 +1579,9 @@ async def mark_lead_outcome(
         return await _lead_out_in(s, subject.admin_id, lead)
 
 
-def _summary(sess: SessionModel, *, counted: bool) -> ConversationSummaryOut:
+def _summary(
+    sess: SessionModel, *, counted: bool, reason: CountedForBillingReasonWire | None = None
+) -> ConversationSummaryOut:
     return ConversationSummaryOut(
         session_id=sess.id,
         lead_id=sess.resolved_lead_id,
@@ -1497,4 +1592,6 @@ def _summary(sess: SessionModel, *, counted: bool) -> ConversationSummaryOut:
         summary=sess.summary,
         ended_at=sess.ended_at,
         counted_for_billing=counted,
+        # A counted session has nothing to explain (round 7 M10).
+        counted_for_billing_reason=None if counted else reason,
     )

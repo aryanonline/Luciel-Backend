@@ -51,6 +51,9 @@ EscalationEventSignalWire = Literal[
 ]
 
 
+CountedForBillingReasonWire = Literal["at_capacity", "outage"]
+
+
 class ConversationSummaryOut(WireModel):
     session_id: uuid.UUID
     lead_id: uuid.UUID | None = None
@@ -69,6 +72,13 @@ class ConversationSummaryOut(WireModel):
     # the first model call — so the page can label an unbilled conversation instead of
     # listing it beside the billed ones as if it were one.
     counted_for_billing: bool = False
+    # Round 7 M10: WHY an uncounted session was not billed, when the persisted state
+    # says — ``at_capacity`` (the budget gate refused it: a ``budget_exhausted``
+    # escalation row) or ``outage`` (no model could serve it: an ``llm_unavailable``
+    # row — a provider outage or the per-minute LLM cap). The earlier of the two wins.
+    # Null for a counted session and for one with neither row (e.g. a visitor who
+    # opened the chat and never reached a model call).
+    counted_for_billing_reason: CountedForBillingReasonWire | None = None
 
 
 # Round 7 WP-3b item 5: what happened to a ``human_agent`` reply on the customer's

@@ -81,13 +81,30 @@ make that state explicit and test it.
   and a bare `YYYY-MM-DD` in it (the LOCAL day, 23/25 h across a clock change) and
   honours an explicit offset; every returned time (`open_slots`, `_booking`, the
   Calendly link/reschedule payloads) is rendered in it with the offset on the string,
-  and confirming payloads carry `timezone`. No zone → UTC, byte-identical to before.
+  and confirming payloads carry `timezone` (M10: `UTC` when no zone is set).
   `schemas._WINDOW_DESC` says the same thing to the model.
 - A time already gone (2026-10-04): `calendar_backend.now_utc()` is the one clock seam.
   `open_slots(not_before=)` never offers a started slot ("today" used to offer this
-  morning); a book or a move into the past returns None → `slot_conflict`, no write.
+  morning); a book or a move into the past is `slot_in_past` (M10), no write.
   Calendly's available-times API answers a past `start_time` with a 400 (it read as a
   calendar outage on every "anything today?"), so the window is asked from
   now + `AVAILABILITY_LEAD`, and a window wholly behind us is `empty` without a call.
   Pinned in `tests/unit/test_round7_booking_clock.py` and
   `tests/integration/test_round7_booking_timezone.py`.
+
+## Round 7 M10 scheduling follow-ups
+- `slot_in_past`: `calendar_backend.ensure_not_past` (both backends, before any read or
+  write; the start is read on the business's clock; `PAST_SLOT_TOLERANCE` = 2 min of clock
+  skew) raises `SlotInPast`, which Book/Reschedule map to `failed("slot_in_past")`. A slot
+  that started inside the tolerance books on Google and stays a `slot_conflict` on Calendly
+  (Calendly no longer offers it). `catalog.FAILURE_READBACK` is the reason → read-back copy
+  catalog; the orchestrator's `_tool_result_feedback` adds it as `means` beside `reason`.
+- Calendly link/reschedule end = the chosen event type's OWN length: the connection row's
+  `eventTypeDurationMinutes` (written by PUT /connections/{id}/settings), else Calendly's
+  event types, else NO end on the payload (never the 30-minute default).
+- No business zone: `stamp_zone` labels every confirming payload `timezone: "UTC"`,
+  check_availability carries `timezone` (zone name or `UTC`), and schedule_callback's ok
+  adds `fireAtBusinessTime` + `timezone` beside the raw `fireAt` (`_callback_readback`;
+  a naive instant is UTC, as the deferred queue reads it) — never a bare hour. The Today
+  card's `timezone_unset` need (app/employee/status.py) tells the owner; never guessed.
+  Tests: `tests/unit/test_m10_scheduling.py`, `tests/integration/test_m10_timezone_need.py`.

@@ -223,9 +223,12 @@ async def test_restore_refuses_a_source_removed_at_its_origin(client):
     message = rr.json()["message"]
     assert "Pricing page was removed at its sync source (website_crawl)" in message
     assert "sync again" in message and "undo window" not in message
-    # Nothing was revived.
+    # Nothing was revived: the list carries it only as the origin tombstone it is
+    # (round 7 M10 lists those with ``deletedBy: "origin"`` so the owner reads "removed
+    # at its source" without a failed restore), never as a live source.
     rl = await client.get("/api/v1/admin/knowledge/sources")
-    assert all(x["sourceId"] != source_id for x in rl.json())
+    listed = [x for x in rl.json() if x["sourceId"] == source_id]
+    assert [x["deletedBy"] for x in listed] == ["origin"]
     async with tenant_session(admin) as s:
         src = (
             await s.execute(

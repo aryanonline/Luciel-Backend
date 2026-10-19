@@ -14,11 +14,13 @@ Two families live here:
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Literal
 
 from pydantic import ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from app.channels.origins import MAX_ALLOWED_ORIGINS, normalize_origin
 from app.runtime.team_availability import parse_hhmm, valid_timezone
@@ -172,6 +174,53 @@ class PersonalityConfigWire(WireModel):
     # declaring it makes it settable instead of always falling back to
     # "<business>'s assistant".
     assistant_name: str | None = Field(default=None, max_length=80)
+    # The owner's optional opening line for Voice calls (round 7): voice_pipeline.
+    # start_call PREPENDS it to the mandatory spoken notice. Null = no opening line.
+    voice_disclosure_intro: str | None = None
+    # READ-ONLY, served: the exact sentence build_disclosure(intro) speaks — intro
+    # followed by the AI-identity and recording facts no setting removes. Derived on
+    # every read (never stored); the strict personality PUT refuses it as input.
+    voice_disclosure_preview: str | None = None
+
+
+# The owner's Voice opening line (round 7): plain text, trimmed, at most this long.
+VOICE_DISCLOSURE_INTRO_MAX = 200
+# Markup has no place in a spoken line: TwiML/SSML tags would either be read aloud
+# (escaped) or — worse — be an attempt to shape the notice itself.
+_MARKUP_CHARS = frozenset("<>")
+
+
+def clean_voice_disclosure_intro(value: str | None) -> str | None:
+    """Validate the owner's Voice opening line; ``None`` means no opening line.
+
+    Trimmed; an empty (or all-whitespace) line stores null. Refused (422 with the
+    field named) when longer than ``VOICE_DISCLOSURE_INTRO_MAX`` after trimming, when
+    it carries a control character (newline, tab, NUL, …) or a line/paragraph
+    separator, or when it carries markup. The mandatory AI-identity and recording
+    facts are appended by build_disclosure regardless — this guards the wording only.
+    """
+    if value is None:
+        return None
+    line = value.strip()
+    if not line:
+        return None
+    if len(line) > VOICE_DISCLOSURE_INTRO_MAX:
+        raise PydanticCustomError(
+            "voice_disclosure_intro_too_long",
+            f"The opening line is at most {VOICE_DISCLOSURE_INTRO_MAX} characters.",
+        )
+    if any(unicodedata.category(ch) in {"Cc", "Zl", "Zp"} for ch in line):
+        raise PydanticCustomError(
+            "voice_disclosure_intro_control",
+            "The opening line must be one line of plain text (no line breaks or "
+            "control characters).",
+        )
+    if any(ch in _MARKUP_CHARS for ch in line):
+        raise PydanticCustomError(
+            "voice_disclosure_intro_markup",
+            "The opening line must be plain text (no markup such as < or >).",
+        )
+    return line
 
 
 class EscalationContactHealthOut(WireModel):
@@ -420,6 +469,14 @@ class UpdatePersonalityRequest(StrictWireModel):
     business_context: str | None = Field(default=None, max_length=280)
     assistant_name: str | None = Field(default=None, max_length=80)
     high_value_signals: list[str] | None = Field(default=None, max_length=MAX_HIGH_VALUE_SIGNALS)
+    # Round 7: the Voice opening line. voiceDisclosurePreview is served, never accepted
+    # (extra='forbid' refuses it here).
+    voice_disclosure_intro: str | None = None
+
+    @field_validator("voice_disclosure_intro")
+    @classmethod
+    def _clean_voice_intro(cls, v: str | None) -> str | None:
+        return clean_voice_disclosure_intro(v)
 
     @field_validator("high_value_signals")
     @classmethod

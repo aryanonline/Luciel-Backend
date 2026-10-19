@@ -425,13 +425,31 @@ async def test_a_sync_in_flight_at_the_delete_is_not_resumed_and_restore_brings_
             return await super().snapshot(connection_id)
 
     async with tenant_session(admin) as s:
-        await sync.sync_connection(
+        halted = await sync.sync_connection(
             s,
             admin_id=admin,
             instance_id=iid,
             connection_id=cid,
             origin="google_drive",
             provider=DeleteLandsDuringFetch(),
+        )
+    # Round 7 M10: the run re-reads the serving state after the fetch and stops before
+    # any write — no second copy of each document is ingested into the deleted Luciel.
+    assert halted.halted == sync.HALTED_NOT_SERVING
+    assert (halted.added, halted.updated, halted.removed) == ([], [], [])
+    assert await _live_sources(admin) == []
+
+    # A run that STARTS on the already-deleted Luciel (the owner's manual Re-sync —
+    # the knowledge routes have no lifecycle gate) still writes copies; restore's
+    # de-duplication below is the safety net for exactly that.
+    async with tenant_session(admin) as s:
+        await sync.sync_connection(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            connection_id=cid,
+            origin="google_drive",
+            provider=_Drive(),
         )
 
     # The in-flight run did not un-delete anything: the connection is still draining

@@ -270,11 +270,11 @@ async def test_the_broker_hands_the_zone_to_the_google_tools_and_utc_stays_the_d
     assert await _bookings_counted(admin, iid) == 1
 
     # A caller that resolved no zone (no operating context) reads the same booking
-    # back in UTC, exactly as before a zone could be set — and names no zone.
+    # back in UTC — and (round 7 M10) says so: the label is UTC, never a bare hour.
     found = await _dispatch(admin, iid, "cancel_appointment", {"email": LEAD}, timezone=None)
     assert found.outcome is Outcome.ok, found.reason
     assert found.payload["start"] == THREE_PM_UTC.isoformat()
-    assert "timezone" not in found.payload
+    assert found.payload["timezone"] == "UTC"
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
