@@ -267,13 +267,41 @@ def test_test_posture_fails_closed_when_a_key_is_missing(monkeypatch) -> None:
     monkeypatch.setenv("LUCIEL_STRIPE_INTEGRATION_POSTURE", "test")
     monkeypatch.setenv(
         "LUCIEL_PLATFORM_SECRET",
-        json.dumps({"STRIPE_TEST_SECRET_KEY": "sk_test_fixture"}),  # missing the other two
+        json.dumps({"STRIPE_TEST_SECRET_KEY": "sk_test_fixture"}),  # no webhook secret
     )
     get_settings.cache_clear()
     set_stripe_gateway(None)
     try:
-        with pytest.raises(RuntimeError, match="STRIPE_TEST_PUBLISHABLE_KEY"):
+        with pytest.raises(RuntimeError, match="STRIPE_TEST_WEBHOOK_SECRET") as refused:
             get_stripe_gateway()
+        # The publishable key is optional (round 7 WP-7): never named as missing.
+        assert "STRIPE_TEST_PUBLISHABLE_KEY" not in str(refused.value)
+    finally:
+        set_stripe_gateway(None)
+        get_settings.cache_clear()
+
+
+def test_test_posture_binds_without_a_publishable_key(monkeypatch) -> None:
+    """Round 7 WP-7: STRIPE_TEST_PUBLISHABLE_KEY has no reader on the server path
+    (Checkout and the Billing Portal are server-created redirects), yet the binder
+    refused the whole "test" posture without it. The two keys the server DOES use
+    are enough."""
+    from app.config import get_settings
+
+    monkeypatch.setenv("LUCIEL_STRIPE_INTEGRATION_POSTURE", "test")
+    monkeypatch.setenv(
+        "LUCIEL_PLATFORM_SECRET",
+        json.dumps(
+            {
+                "STRIPE_TEST_SECRET_KEY": "sk_test_fixture",
+                "STRIPE_TEST_WEBHOOK_SECRET": "whsec_fixture",
+            }
+        ),
+    )
+    get_settings.cache_clear()
+    set_stripe_gateway(None)
+    try:
+        assert isinstance(get_stripe_gateway(), RealStripeGateway)
     finally:
         set_stripe_gateway(None)
         get_settings.cache_clear()

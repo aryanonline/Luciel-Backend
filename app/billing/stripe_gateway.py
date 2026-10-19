@@ -521,7 +521,9 @@ class RealStripeGateway:
     blob (``LUCIEL_PLATFORM_SECRET``, the same JSON-blob-from-Secrets-Manager shape
     ``app.runtime.provider_factory`` uses for the LLM keys) under:
       * ``STRIPE_TEST_SECRET_KEY``      (sk_test_...)
-      * ``STRIPE_TEST_PUBLISHABLE_KEY`` (pk_test_...) — handed to the frontend only
+      * ``STRIPE_TEST_PUBLISHABLE_KEY`` (pk_test_...) — OPTIONAL: nothing on the
+        server path uses it (Checkout and the Billing Portal are server-created
+        redirects), so its absence never blocks the binding (round 7 WP-7)
       * ``STRIPE_TEST_WEBHOOK_SECRET``  (whsec_...)   — verifies Stripe-Signature
 
     NEVER hardcode a key literal here — construction fails loudly (RuntimeError,
@@ -536,7 +538,7 @@ class RealStripeGateway:
     verify-before-route discipline (HARD CONSTRAINT #4) is identical for both.
     """
 
-    def __init__(self, *, secret_key: str, publishable_key: str, webhook_secret: str) -> None:
+    def __init__(self, *, secret_key: str, webhook_secret: str, publishable_key: str = "") -> None:
         if not secret_key.startswith("sk_test_"):
             # Hard fail-closed: refuse anything that is not a recognizable TEST key
             # (in particular, this rejects an sk_live_ key outright — objective
@@ -768,6 +770,10 @@ def _build_test_gateway() -> RealStripeGateway:
     Fails loudly (RuntimeError naming only the missing key names — NEVER a value)
     if a required TEST key is absent, mirroring
     ``app.runtime.provider_factory._build_live_router``'s fail-closed discipline.
+    Required: the secret key (every API call) and the webhook signing secret (every
+    inbound event). The publishable key is read when present but is NOT required:
+    no server path uses it, and requiring it refused the whole "test" posture over a
+    key nothing reads (round 7 WP-7).
     """
     from app.config import get_settings, parse_platform_secret  # noqa: PLC0415
 
@@ -780,7 +786,6 @@ def _build_test_gateway() -> RealStripeGateway:
         n
         for n, v in (
             ("STRIPE_TEST_SECRET_KEY", secret_key),
-            ("STRIPE_TEST_PUBLISHABLE_KEY", publishable_key),
             ("STRIPE_TEST_WEBHOOK_SECRET", webhook_secret),
         )
         if not v
