@@ -286,6 +286,30 @@ async def test_crawling_the_same_site_twice_is_one_connection(client):
     assert len(rows) == 2
 
 
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_site_removed_and_crawled_again_is_live_again(client):
+    """ "Remove crawl" leaves the connection row not_connected (a disconnect, not a
+    revocation). Crawling the same site again used to hand that dead row back as-is
+    (200): its pages synced, but the row never read connected, so the pillar offered no
+    Re-sync - found by the first live walk on dev, 2026-10-19."""
+    await _ready(client)
+    body = {"provider": "website_crawl", "crawlUrls": ["https://acme.example/"]}
+    first = await client.post("/api/v1/admin/knowledge/sync-connections", json=body)
+    assert first.status_code == 201, first.text
+    cid = first.json()["connectionId"]
+    gone = await client.post(f"/api/v1/admin/connections/{cid}/disconnect")
+    assert gone.status_code in (200, 204), gone.text
+    listed = {c["connectionId"]: c for c in (await client.get("/api/v1/admin/connections")).json()}
+    assert listed[cid]["status"] != "connected"
+
+    again = await client.post("/api/v1/admin/knowledge/sync-connections", json=body)
+    assert again.status_code == 200, again.text
+    assert again.json()["connectionId"] == cid
+    assert again.json()["status"] == "connected"
+    listed = {c["connectionId"]: c for c in (await client.get("/api/v1/admin/connections")).json()}
+    assert listed[cid]["status"] == "connected"
+
+
 # --- F156: closing needs the Luciel's deletion confirmed ------------------------------------
 
 

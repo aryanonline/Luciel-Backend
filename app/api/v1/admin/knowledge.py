@@ -606,9 +606,34 @@ async def create_sync_connection(
             for row in existing_rows:
                 raw = (row.non_secret_config or {}).get("crawl_urls")
                 have = sorted(str(u) for u in raw) if isinstance(raw, list) else []
-                if have == wanted:
-                    response.status_code = 200
-                    return _sync_connection_out(row)
+                if have != wanted:
+                    continue
+                if row.status != "connected":
+                    # The same site crawled again after "Remove crawl" (disconnect leaves
+                    # the row ``not_connected``) or after a failure: the owner just asked
+                    # for it, and a crawl has nothing to authorize, so the row is live
+                    # again — not handed back dead, where its pages sync but the pillar
+                    # never offers Re-sync (found by the first live walk, 2026-10-19).
+                    old_status = row.status
+                    row.status = "connected"
+                    row.status_detail = None
+                    await s.flush()
+                    await audit.emit(
+                        s,
+                        admin_id=subject.admin_id,
+                        instance_id=instance_id,
+                        actor_type=ActorType.admin_user,
+                        actor_user_id=subject.user_id,
+                        event_type="connection_status_changed",
+                        payload={
+                            "connection_id": str(row.connection_id),
+                            "old_status": old_status,
+                            "new_status": "connected",
+                            "reason": "crawl_requested_again",
+                        },
+                    )
+                response.status_code = 200
+                return _sync_connection_out(row)
         connection, _result = await connections_service.start_connection(
             s,
             admin_id=subject.admin_id,
