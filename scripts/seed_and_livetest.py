@@ -15,8 +15,17 @@ conversations to convert several §10 rows from CI-proven to LIVE-proven:
                                     end-to-end (max_completion_tokens fix exercised live).
   T6  Row 11 channel parity      — same query across two channels → parity + the
                                     AI-identity disclosure is present.
+  T7  CRM custom webhook (opt-in) — a captured lead reaches an owner-provided endpoint.
 
 Each test prints PASS/FAIL with evidence; the process exits non-zero if ANY fails.
+
+STRICT (``--strict``, or LUCIEL_SEEDTEST_STRICT=1 — the SeedTest task definition sets
+it, and scripts/run-seedtest-task.sh passes ``--strict`` unless told ``--no-strict``):
+a ``[SKIP]`` is otherwise non-fatal and invisible in the exit code, so a case that
+silently stopped running (a missing key, a broken precondition) still read "all
+PASS". Under strict, every skip whose (case, reason) is not in ``OWNER_GATED_SKIPS``
+— the cases the OWNER gates behind LUCIEL_SEEDTEST_LIVE_CAP / LUCIEL_SEEDTEST_WEBHOOK_URL
+because they spend money or need an owner asset — fails the run with the list.
 
 Runs as a one-off in-VPC ECS task (SeedTestTask) so it can both reach the private
 API/RDS and read the verify JTI from the DB. Synthetic data only; no secrets are
@@ -25,12 +34,15 @@ hardcoded (LLM keys come from the platform secret already in the live dev env).
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
 import sys
 import time
 import uuid
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 
 # --------------------------------------------------------------------------- #
@@ -80,27 +92,85 @@ def _email(role: str) -> str:
 # --------------------------------------------------------------------------- #
 # Result accounting                                                            #
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Row:
+    """One recorded check. ``status`` is ``pass`` | ``fail`` | ``skip``; ``kind`` tells a
+    T-case from a matrix combination; ``evidence`` is the skip REASON for a skip."""
+
+    name: str
+    status: str
+    evidence: str
+    kind: str = "case"
+    seconds: float | None = None
+
+
 class Results:
     def __init__(self) -> None:
-        self._rows: list[tuple[str, bool, str]] = []
+        self.rows: list[Row] = []
 
-    def record(self, name: str, ok: bool, evidence: str) -> None:
-        self._rows.append((name, ok, evidence))
+    def record(
+        self,
+        name: str,
+        ok: bool,
+        evidence: str,
+        *,
+        kind: str = "case",
+        seconds: float | None = None,
+    ) -> None:
+        self.rows.append(Row(name, "pass" if ok else "fail", evidence, kind, seconds))
         status = "PASS" if ok else "FAIL"
-        print(f"[{status}] {name}: {evidence}", flush=True)
+        timing = f" ({seconds:.1f}s)" if seconds is not None else ""
+        print(f"[{status}] {name}{timing}: {evidence}", flush=True)
 
     def skip(self, name: str, reason: str) -> None:
         # A skip is non-fatal but visible. Used only when a precondition (e.g. live
-        # keys) is genuinely unavailable; documented in the PR.
-        self._rows.append((name, True, f"SKIPPED — {reason}"))
+        # keys) is genuinely unavailable; --strict fails the run on any skip that is
+        # not owner-gated (OWNER_GATED_SKIPS).
+        self.rows.append(Row(name, "skip", reason))
         print(f"[SKIP] {name}: {reason}", flush=True)
 
     def any_failed(self) -> bool:
-        return any(not ok for _, ok, _ in self._rows)
+        return any(row.status == "fail" for row in self.rows)
 
     def summary(self) -> str:
-        passed = sum(1 for _, ok, _ in self._rows if ok)
-        return f"{passed}/{len(self._rows)} checks passed"
+        # A skip counts as "passed" here, exactly as before --strict existed; the strict
+        # verdict and the one-line SUMMARY say what was skipped.
+        passed = sum(1 for row in self.rows if row.status != "fail")
+        return f"{passed}/{len(self.rows)} checks passed"
+
+
+#: The ONLY skips ``--strict`` tolerates, as (case-name prefix, reason prefix): cases the
+#: OWNER deliberately gates behind a flag because they spend real money (50 model calls)
+#: or need an owner asset (a real CRM endpoint). Any other skip — a missing key, a
+#: precondition that quietly stopped holding — is a case that did not run, and strict
+#: fails the run on it instead of letting it read as PASS.
+OWNER_GATED_SKIPS: tuple[tuple[str, str], ...] = (
+    ("T3b ", "set LUCIEL_SEEDTEST_LIVE_CAP=1"),
+    ("T7 ", "set LUCIEL_SEEDTEST_WEBHOOK_URL"),
+)
+
+
+def is_owner_gated_skip(name: str, reason: str) -> bool:
+    return any(
+        name.startswith(case) and reason.startswith(gate) for case, gate in OWNER_GATED_SKIPS
+    )
+
+
+def strict_violations(rows: Sequence[Row]) -> list[Row]:
+    """Skipped cases outside the owner-gated allowlist (what ``--strict`` fails on)."""
+    return [
+        row
+        for row in rows
+        if row.status == "skip" and not is_owner_gated_skip(row.name, row.evidence)
+    ]
+
+
+def exit_code(rows: Sequence[Row], *, strict: bool) -> int:
+    if any(row.status == "fail" for row in rows):
+        return 1
+    if strict and strict_violations(rows):
+        return 1
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -237,21 +307,39 @@ def widget_send(client: httpx.Client, embed_key: str, text: str) -> dict:
     cap-burning loop fires messages far faster than the per-source refill
     (burst 5, ~3s), so without this the harness read the product's own
     admission control as a failure (live-caught on the 2026-08-23 run)."""
+    return widget_turn(client, embed_key, text)
+
+
+def widget_turn(
+    client: httpx.Client, embed_key: str, text: str, *, session_id: str | None = None
+) -> dict:
+    """One widget message; ``session_id`` continues THAT conversation (the shipped widget
+    sends the id it holds), omitted opens a new one. Paced on 429 like ``widget_send``."""
+    body: dict[str, str] = {"embedKey": embed_key, "text": text}
+    if session_id:
+        body["sessionId"] = str(session_id)
+    resp = _paced(
+        lambda: client.post(f"{API_BASE}/api/v1/chat-widget/messages", json=body), "widget_send"
+    )
+    return _check(resp, "widget_send")
+
+
+def _retry_after(resp: httpx.Response) -> float:
+    try:
+        return float(resp.json().get("retryAfterSeconds") or 3.0)
+    except Exception:  # noqa: BLE001 — a malformed body still means "wait"
+        return 3.0
+
+
+def _paced(send: Callable[[], httpx.Response], ctx: str) -> httpx.Response:
+    """Send, honoring the edge's graceful 429 (``retryAfterSeconds``) a bounded number of
+    times — the product's own admission control, never a harness failure."""
     for _ in range(40):
-        resp = client.post(
-            f"{API_BASE}/api/v1/chat-widget/messages",
-            json={"embedKey": embed_key, "text": text},
-        )
-        if resp.status_code == 429:
-            retry = 3.0
-            try:
-                retry = float(resp.json().get("retryAfterSeconds") or 3.0)
-            except Exception:  # noqa: BLE001 — a malformed body still means "wait"
-                pass
-            time.sleep(min(retry, 10.0) + 0.2)
-            continue
-        return _check(resp, "widget_send")
-    raise RuntimeError("widget_send: still rate-limited after bounded retries")
+        resp = send()
+        if resp.status_code != 429:
+            return resp
+        time.sleep(min(_retry_after(resp), 10.0) + 0.2)
+    raise RuntimeError(f"{ctx}: still rate-limited after bounded retries")
 
 
 def usage_conversations(client: httpx.Client) -> int:
@@ -774,10 +862,69 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
 # --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
-def main() -> int:
-    print(f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID}", flush=True)
-    r = Results()
+@dataclass(frozen=True)
+class Options:
+    strict: bool
 
+
+def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Options:
+    """Command line → Options. ``--strict`` / ``--no-strict`` beat LUCIEL_SEEDTEST_STRICT
+    (the task definition's default); with neither, strict is off."""
+    env = dict(os.environ) if env is None else env
+    p = argparse.ArgumentParser(
+        prog="seed_and_livetest.py", description="§10 live-behavior SEED + TEST harness"
+    )
+    p.add_argument(
+        "--strict",
+        dest="strict",
+        action="store_true",
+        default=None,
+        help="fail the run on any skip outside the owner-gated allowlist",
+    )
+    p.add_argument("--no-strict", dest="strict", action="store_false", help="opt out of strict")
+    ns = p.parse_args(list(argv))
+    strict = ns.strict if ns.strict is not None else env.get("LUCIEL_SEEDTEST_STRICT") == "1"
+    return Options(strict=bool(strict))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    opts = parse_args(sys.argv[1:] if argv is None else argv)
+    print(
+        f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'}",
+        flush=True,
+    )
+    r = Results()
+    try:
+        run_cases(r)
+    except Exception as exc:  # noqa: BLE001 — an aborted run still reports its verdict
+        import traceback
+
+        traceback.print_exc()
+        r.record("T-cases aborted", False, f"{type(exc).__name__}: {str(exc)[:300]}")
+    return finish(r, strict=opts.strict)
+
+
+def finish(r: Results, *, strict: bool) -> int:
+    """Print the verdict and return the process exit code."""
+    print(f"[seedtest] {r.summary()}", flush=True)
+    unexpected = strict_violations(r.rows)
+    if strict and unexpected:
+        listed = "; ".join(f"{row.name} ({row.evidence[:120]})" for row in unexpected)
+        print(
+            f"::error::--strict: {len(unexpected)} case(s) skipped outside the owner-gated "
+            f"allowlist: {listed}",
+            flush=True,
+        )
+    code = exit_code(r.rows, strict=strict)
+    if r.any_failed():
+        print("::error::§10 live-behavior harness found FAIL(s)", flush=True)
+    elif code == 0:
+        print("[seedtest] §10 live-behavior harness: all checks PASS.", flush=True)
+    return code
+
+
+def run_cases(r: Results) -> None:
+    """T1–T7 on two synthetic tenants, torn down afterwards."""
     # Seed two synthetic tenants: a primary (happy-path / parity / fail-safe) and a
     # dedicated free-cap tenant (driven to its conversation cap in T2).
     main_tenant = Tenant("main")
@@ -803,13 +950,6 @@ def main() -> int:
         # behind in the environment. LUCIEL_SEEDTEST_KEEP=1 keeps them for debugging.
         if os.environ.get("LUCIEL_SEEDTEST_KEEP") != "1":
             asyncio.run(_teardown([main_tenant, cap_tenant]))
-
-    print(f"[seedtest] {r.summary()}", flush=True)
-    if r.any_failed():
-        print("::error::§10 live-behavior harness found FAIL(s)", flush=True)
-        return 1
-    print("[seedtest] §10 live-behavior harness: all checks PASS.", flush=True)
-    return 0
 
 
 async def _teardown(tenants: list[Tenant]) -> None:

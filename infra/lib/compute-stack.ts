@@ -795,6 +795,12 @@ export class ComputeStack extends Stack {
         // hostname move (owner console work) changes this ONE value and nothing
         // in the harness.
         LUCIEL_API_BASE: publicApiBaseUrl,
+        // STRICT by default wherever the task is started from (round 7 WP-12): a
+        // [SKIP] outside the owner-gated allowlist (LUCIEL_SEEDTEST_LIVE_CAP /
+        // LUCIEL_SEEDTEST_WEBHOOK_URL) fails the run instead of reading as PASS.
+        // run-seedtest-task.sh also passes --strict; `--no-strict` on its command
+        // line is the one opt-out.
+        LUCIEL_SEEDTEST_STRICT: '1',
       },
     });
     new cdk.CfnOutput(this, 'SeedTestTaskArn', {

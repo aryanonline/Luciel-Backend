@@ -362,7 +362,10 @@ jobs:
         run: |
           # Either probe exiting non-zero fails the job (set -e). Because prod-deploy
           # `needs` this job, a failure here BLOCKS the prod deploy. Teardown still
-          # runs (if: always()).
+          # runs (if: always()). run-seedtest-task.sh runs the harness --strict by
+          # default (round 7 WP-12): a case that skipped outside the owner-gated
+          # allowlist fails this gate instead of reading as PASS. Never add
+          # --no-strict here.
           set -e
           bash scripts/run-verify-task.sh preprod
           bash scripts/run-seedtest-task.sh preprod
