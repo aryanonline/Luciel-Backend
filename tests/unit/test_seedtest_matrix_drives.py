@@ -185,7 +185,16 @@ class FakeLuciel:
             self.state = "luciel_grace_window"
             return httpx.Response(204)
         if path.endswith("/export"):
-            return httpx.Response(200, json={"downloadUrl": "https://api.example.test/x"})
+            # The served shape: ExportResult has no alias generator (download_url).
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "download_url": "https://api.example.test/x",
+                    "ttl_days": 7,
+                    "emailOutcome": "recorded",
+                },
+            )
         if path.endswith("/reopen"):
             self.closed, self.state = False, "active"
             return httpx.Response(200, json={"state": "verified", "lucielRestored": True})

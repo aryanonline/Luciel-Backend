@@ -1845,6 +1845,17 @@ def judge_m7(o: dict) -> tuple[bool, str]:
 
 
 # --- M8 closure ------------------------------------------------------------------- #
+#: The export response's link key. ExportResult is a plain BaseModel, so the link is
+#: served snake_case (``download_url``) while ``emailOutcome`` is aliased — caught by a
+#: local run against the real app. ``downloadUrl`` is read too, so a later camelCase
+#: fix of the wire does not fail M8 (a unit test pins the served key).
+EXPORT_LINK_KEYS = ("download_url", "downloadUrl")
+
+
+def export_link(body: dict) -> str:
+    return next((str(body[k]) for k in EXPORT_LINK_KEYS if body.get(k)), "")
+
+
 def m8_drive(t: Tenant) -> dict:
     close = _api(t, "POST", "/api/v1/admin/account/close", json_body={"confirmDeleteLuciel": True})
     # The pre-closure session: the closure bumped the epoch (security contract).
@@ -1866,7 +1877,7 @@ def m8_drive(t: Tenant) -> dict:
         "account_status": account.status_code,
         "account": _obj(account),
         "export_status": export.status_code,
-        "export_has_link": bool(_obj(export).get("downloadUrl")),
+        "export_has_link": bool(export_link(_obj(export))),
         "refused": refused,
         "reopen_status": reopen.status_code,
         "reopen": _obj(reopen),

@@ -592,6 +592,24 @@ def test_m8_judge(changes: dict[str, Any], label: str) -> None:
     _assert_fails(H.judge_m8, _with(M8, **changes), label)
 
 
+def test_m8_reads_the_export_link_from_the_key_the_api_serves() -> None:
+    """ExportResult has no alias generator, so the link goes out as ``download_url``
+    (``emailOutcome`` alone is aliased). M8 read ``downloadUrl`` and failed against the
+    real app; it now reads the served key (and the camelCase one, should the wire be
+    fixed later)."""
+    from app.api.v1.admin.account import ExportResult
+
+    served = ExportResult(
+        download_url="https://api.example.test/api/v1/exports/t",
+        ttl_days=7,
+        email_outcome="recorded",
+    ).model_dump(mode="json", by_alias=True)
+    assert H.export_link(served) == "https://api.example.test/api/v1/exports/t"
+    assert H.export_link({"downloadUrl": "https://x.test/e"}) == "https://x.test/e"
+    assert H.export_link({"ok": True, "download_url": ""}) == ""
+    assert H.export_link({}) == ""
+
+
 def test_the_closure_route_lists_are_real_routes() -> None:
     from tests.unit.test_route_registry import EXPECTED_ROUTES
 
