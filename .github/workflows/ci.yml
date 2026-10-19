@@ -47,6 +47,8 @@ jobs:
     env:
       PGPASSWORD: postgres
       LUCIEL_COOKIE_SECURE: "false"
+      # uv sync builds .venv on the 3.12 line the image runs (python:3.12.x-slim).
+      UV_PYTHON: '3.12'
 
     steps:
       - uses: actions/checkout@v4
@@ -55,15 +57,25 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          # Pinned (round 7 WP-9): uv.lock was written by this version and the
+          # Dockerfile copies the same one (ghcr.io/astral-sh/uv:<version>). Bump the
+          # three together — ci.yml, dependency-review.yml, Dockerfile.
+          version: '0.12.23'
 
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install deps
+      - name: Install deps (the LOCKED set — uv.lock)
         run: |
-          uv venv .venv
-          . .venv/bin/activate
-          uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
+          # The lock must match pyproject.toml: a range edited without re-locking
+          # fails HERE, not as a silently different install (`uv lock --check`
+          # re-resolves and refuses to write).
+          uv lock --check
+          # --frozen: install exactly uv.lock, never re-resolve. The image installs
+          # the same lock (`uv sync --frozen --no-dev`), so what this run tests is
+          # what the deploy ships (before the lock, both floated within the ranges).
+          uv sync --frozen --extra dev
 
       - name: Provision DB roles (the non-superuser app role + narrow auth role + audit owner)
         run: |
@@ -152,3 +164,67 @@ jobs:
         run: |
           . .venv/bin/activate
           python -m pytest tests/unit tests/integration tests/contract tests/migrations -v
+
+  # The daily scheduled run exists so a CVE published on a quiet week still blocks
+  # (F039) — but a red scheduled run on a branch nobody pushed to that day notified
+  # no one. It now lands on the month's "Dependency & CVE review YYYY-MM" issue, the
+  # one the monthly steward routine reads (same title as image-rebuild.yml and
+  # dependency-review.yml, via scripts/post_review_issue.sh). Only a scheduled run
+  # that did not succeed posts; pushes and PRs report on themselves.
+  report-scheduled-failure:
+    needs: quality-gate
+    if: always() && github.event_name == 'schedule' && needs.quality-gate.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/post_review_issue.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Post the failed daily run on the month's review issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RESULT: ${{ needs.quality-gate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The run is still in progress (this job is part of it), so read the
+          # finished quality-gate JOB through the API rather than `gh run view --log`.
+          jobs=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" || echo '{"jobs":[]}')
+          failed=$(jq -r '.jobs[] | select(.name == "quality-gate") | .steps[]
+                          | select(.conclusion == "failure") | "- " + .name' <<<"$jobs" || true)
+          job=$(jq -r '[.jobs[] | select(.name == "quality-gate")][0].id // empty' <<<"$jobs" || true)
+          # The 40 log lines before the first error annotation: the failing step's tail
+          # (pip-audit's vulnerable package, bandit's finding, the failing test).
+          # curl, not `gh api`: the log carries ANSI colour codes, which gh refuses to
+          # print without a flag older gh releases do not have.
+          log=""
+          if [ -n "$job" ]; then
+            log=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+                    "${GITHUB_API_URL:-https://api.github.com}/repos/$REPO/actions/jobs/$job/logs" 2>/dev/null \
+                    | grep -B 40 -m 1 '##\[error\]' \
+                    | sed -E 's/^[0-9-]+T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' | cut -c1-300 || true)
+          fi
+          {
+            echo "### Daily CI (scheduled) — **$RESULT** — $(date -u +%Y-%m-%d)"
+            echo
+            echo "The daily run of the release branch did not pass ([run $RUN_ID]($RUN_URL)). It runs pip-audit, bandit and the secret scan every day so a CVE published on a quiet week is caught without a push; fix it, or record the review here."
+            echo
+            echo "Failed step(s):"
+            echo "${failed:-"- (none recorded — cancelled or timed out?)"}"
+            echo
+            echo "<details><summary>Log before the first error</summary>"
+            echo
+            echo '```'
+            echo "${log:-(log unavailable)}"
+            echo '```'
+            echo "</details>"
+          } > ci-failure.md
+          bash scripts/post_review_issue.sh ci-failure.md

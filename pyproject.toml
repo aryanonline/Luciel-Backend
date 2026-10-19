@@ -26,7 +26,13 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",
     "alembic>=1.14",
-    "pydantic>=2.10",
+    # psycopg (v3) drives Alembic's sync URL and scripts/run_sql.py; the `email` extra
+    # (email-validator) backs every EmailStr field. Both were installed ad hoc by the
+    # Dockerfile and CI (`uv pip install ... "psycopg[binary]" "pydantic[email]"`) and
+    # so floated outside any lock; declared here, uv.lock pins them like the rest
+    # (round 7 WP-9).
+    "psycopg[binary]>=3.2",
+    "pydantic[email]>=2.10",
     "pydantic-settings>=2.7",
     "redis>=5.2",
     "pgvector>=0.3.6",
@@ -69,6 +75,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Locked like the runtime set (uv.lock): CI runs `uv sync --frozen --extra dev`, the
+# image `uv sync --frozen --no-dev` (no extras). A range below is what the lock MAY
+# resolve to; the lock is what actually installs. Dependabot (package-ecosystem uv)
+# moves the lock, and the monthly dependency-review issue lists range drift.
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

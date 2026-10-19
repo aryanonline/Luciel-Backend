@@ -12,17 +12,33 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# --- builder: install dependencies into a venv via uv ---
+# --- builder: install the LOCKED dependency set into a venv via uv ---
 FROM base AS builder
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# uv is pinned to the version CI uses (setup-uv `version:` in ci.yml): the lockfile
+# was written by it and `--frozen` installs it verbatim. Bump both together.
+COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /usr/local/bin/uv
 WORKDIR /app
-# Copy dependency manifests first for layer caching.
-COPY pyproject.toml uv.lock* CLAUDE.md ./
-# Create the venv and install runtime deps (no dev extras in prod).
-RUN uv venv /opt/venv
+# --frozen: install exactly uv.lock, never re-resolve — the image ships the versions
+# the CI run on the same commit tested (round 7 WP-9: before the lock, installs
+# floated within the pyproject ranges, so a green commit could deploy different
+# versions than it tested). A pyproject change without a matching lock update fails
+# CI's `uv lock --check` step first.
+# --no-dev: runtime deps only (no extras; the dev extra is CI's).
+# UV_PYTHON + UV_PYTHON_DOWNLOADS=never: the venv is built on the base image's own
+# interpreter, which the runtime stage shares; uv never fetches a different one.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON=/usr/local/bin/python3.12 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1
+# Dependency manifests first for layer caching: third-party deps install in a layer
+# that only a pyproject/lock change invalidates.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 COPY . .
-RUN uv pip install --python /opt/venv/bin/python -e . "psycopg[binary]" "pydantic[email]"
+# Then the project itself (editable, as before: /app is copied into the runtime too).
+RUN uv sync --frozen --no-dev
 
 # --- runtime: slim, non-root ---
 FROM base AS runtime
