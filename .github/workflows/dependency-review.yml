@@ -5,6 +5,14 @@ name: dependency-review
 # review issue a person can act on — without anyone having to remember to look.
 # Also on demand.
 #
+# Round 7 WP-9 additions: pyproject range drift against uv.lock; the latest dev
+# image's scan resolved per platform child through scripts/gate_image_scan.sh in
+# report mode (the multi-arch TAG itself is never scanned); and Debian tracker
+# status for every waived and every unallowlisted CVE, fetched by this runner
+# because the monthly steward routine's sandbox cannot reach the tracker. Posted
+# through scripts/post_review_issue.sh — the one "Dependency & CVE review YYYY-MM"
+# title ci.yml's scheduled failures and image-rebuild.yml post to as well.
+#
 # Explicit `ref`: a scheduled run checks out the DEFAULT branch, which is the
 # release branch now, but the ref is named so a later default-branch change can
 # never point this at stale code.
@@ -94,19 +102,61 @@ jobs:
           role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Latest dev image scan summary (ECR, advisory)
+      # The deploy pushes ONE tag that is a multi-arch index (round 7 WP-8); ECR scans
+      # each platform child, never the index, so describe-image-scan-findings on the
+      # TAG always answered ScanNotFoundException and this section was empty every
+      # month. The gate script resolves the children exactly as the deploy does and
+      # writes scan-findings-<os>-<arch>.json for each; here it runs in REPORT mode
+      # (its verdict is shown, never enforced) and the counts come from those files.
+      # Only TAGGED images are candidates: the platform children are untagged.
+      - name: Latest dev image scan, per platform (ECR, report mode)
+        id: scan
         if: steps.aws.outcome == 'success'
         continue-on-error: true
         run: |
+          set +e
           tag=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
-                  --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text 2>/dev/null || echo "")
+                  --query 'sort_by(imageDetails[?imageTags], &imagePushedAt)[-1].imageTags[0]' \
+                  --output text 2>/dev/null)
           if [ -z "$tag" ] || [ "$tag" = "None" ]; then
-            echo "no image found in $ECR_REPOSITORY" | tee ecr.txt; exit 0
+            echo "no tagged image found in $ECR_REPOSITORY" | tee ecr.txt; exit 0
           fi
-          aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" \
-            --image-id imageTag="$tag" --query 'imageScanFindings.findingSeverityCounts' \
-            --output table 2>&1 | tee ecr.txt || true
-          echo "image tag: $tag" | tee -a ecr.txt
+          echo "$tag" > ecr-tag.txt
+          # Already-pushed images: their scans finished long ago, so a short wait.
+          SCAN_WAIT_ATTEMPTS=3 bash scripts/gate_image_scan.sh "$ECR_REPOSITORY" "$tag" > gate.txt 2>&1
+          echo "gate exit code: $?" >> gate.txt
+          cat gate.txt
+          python3 - <<'PY' | tee ecr.txt
+          import glob
+          import json
+
+          ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNDEFINED"]
+          paths = sorted(glob.glob("scan-findings-*.json"))
+          if not paths:
+              print("no platform child resolved - see the gate output below")
+          for path in paths:
+              platform = path[len("scan-findings-") : -len(".json")].replace("-", "/", 1)
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (OSError, ValueError) as exc:
+                  print(f"{platform}: findings unreadable ({type(exc).__name__})")
+                  continue
+              status = (data.get("imageScanStatus") or {}).get("status") or "absent"
+              counts = (data.get("imageScanFindings") or {}).get("findingSeverityCounts") or {}
+              shown = ", ".join(f"{k} {counts[k]}" for k in ORDER if k in counts)
+              print(f"{platform}: scan {status} - {shown or 'no findings'}")
+          PY
+
+      - name: Debian tracker status for every waived and every unallowlisted CVE
+        continue-on-error: true
+        run: |
+          # The monthly steward routine cannot reach the tracker (egress-blocked in its
+          # sandbox); this runner can. gate.txt is absent when AWS was unavailable —
+          # the waivers are still looked up.
+          python3 scripts/debian_tracker_status.py \
+            --allowlist .security/cve-allowlist.json --gate-output gate.txt \
+            --markdown tracker.md
 
       - name: Open or update the month's review issue
         env:
@@ -116,8 +166,6 @@ jobs:
           EXPIRY_OUTCOME: ${{ steps.expiry.outcome }}
         run: |
           set -euo pipefail
-          month=$(date -u +%Y-%m)
-          title="Dependency & CVE review $month"
           {
             echo "Automated monthly review (\`dependency-review.yml\`, run ${{ github.run_id }})."
             echo
@@ -132,8 +180,15 @@ jobs:
             echo "## Image CVE waivers — **$EXPIRY_OUTCOME** (⚠️ = expires within 35 days)"
             cat expiry.md 2>/dev/null || echo "(no waivers file)"
             echo
-            echo "## Latest dev image scan (severity counts)"
+            echo "## Latest dev image scan — \`$(cat ecr-tag.txt 2>/dev/null || echo '?')\` (severity counts per platform child)"
             echo '```'; cat ecr.txt 2>/dev/null || echo "(not read — AWS role unavailable to this run)"; echo '```'
+            echo
+            echo "<details><summary>Governed gate on that image, report mode (CRITICAL/HIGH; \`not allowlisted\` lines name package + installed version)</summary>"
+            echo
+            echo '```'; grep -v 'scan not ready' gate.txt 2>/dev/null || echo "(gate not run)"; echo '```'
+            echo "</details>"
+            echo
+            cat tracker.md 2>/dev/null || echo "(Debian tracker status not gathered)"
             echo
             echo "## Newest on the index (advisory — includes versions OUTSIDE the ranges; a range bump is a person's call)"
             echo '```'; tail -n 60 outdated-python.txt 2>/dev/null || echo "(none)"; echo '```'
@@ -141,11 +196,7 @@ jobs:
             echo
             echo "Minor/patch updates merge themselves once CI is green (Dependabot + auto-merge); majors carry the \`major-update\` label and need a person. Re-review waivers in \`.security/cve-allowlist.json\` before they expire — an expired one blocks the deploy."
           } > body.md
-          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body-file body.md
-            echo "updated issue #$existing"
-          else
-            gh issue create --repo "$REPO" --title "$title" --label dependencies --body-file body.md
-          fi
+          # One title for every poster (ci.yml, image-rebuild.yml, this): the monthly
+          # steward routine reads exactly "Dependency & CVE review YYYY-MM".
+          bash scripts/post_review_issue.sh body.md
           [ "$AUDIT_OUTCOME" = "success" ] && [ "$EXPIRY_OUTCOME" = "success" ]

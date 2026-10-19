@@ -9,10 +9,12 @@ name: image-rebuild
 # This job rebuilds the image from the release branch every Monday, pushes it under
 # a `weekly-<date>` tag (the repo's lifecycle policy expires it), waits for the ECR
 # scan, runs the SAME governed gate the deploy uses in REPORT mode, and posts the
-# outcome — remaining CRITICAL/HIGH findings and waivers that no longer match — on
-# the month's "Dependency & CVE review" issue. The monthly steward reads that comment
-# to retire or renew waivers with evidence. It never deploys and never touches a
-# running service.
+# outcome — remaining CRITICAL/HIGH findings and waivers that no longer match, plus
+# the Debian tracker status of every waived and every new CVE — on the month's
+# "Dependency & CVE review YYYY-MM" issue (scripts/post_review_issue.sh, the one title
+# ci.yml and dependency-review.yml post to as well). The monthly steward reads that
+# comment to retire or renew waivers with evidence. It never deploys and never
+# touches a running service.
 
 on:
   schedule:
@@ -86,7 +88,21 @@ jobs:
           # check on each. Report mode here: the step's outcome is posted below.
           bash scripts/gate_image_scan.sh "$REPO" "$TAG" 2>&1 | tee gate.txt
 
+      # Tracker evidence for the steward (round 7 WP-9): the monthly cloud routine
+      # cannot reach security-tracker.debian.org (egress-blocked in its sandbox) and
+      # was renewing waivers on search-engine evidence; this runner can. Every waived
+      # CVE and every CVE the gate just reported as `not allowlisted` is looked up;
+      # an unreachable tracker reads `tracker unreachable` and never fails the job.
+      - name: Debian tracker status for every waived and every new finding
+        if: always() && steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 scripts/debian_tracker_status.py \
+            --allowlist .security/cve-allowlist.json --gate-output gate.txt \
+            --markdown tracker.md
+
       - name: Post the outcome on the month's review issue
+        if: always() && steps.build.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -94,8 +110,6 @@ jobs:
           TAG: ${{ steps.build.outputs.tag }}
         run: |
           set -euo pipefail
-          month=$(date -u +%Y-%m)
-          title="Dependency & CVE review $month"
           {
             echo "### Weekly image rebuild — \`$TAG\` — gate **$GATE_OUTCOME**"
             echo
@@ -103,11 +117,8 @@ jobs:
             echo
             echo '```'; cat gate.txt 2>/dev/null || echo "(no gate output)"; echo '```'
             echo
-            echo "Lines reading \`no longer matches any finding\` are waivers to RETIRE; \`not allowlisted\` lines are new findings a person (or the monthly steward) must review."
+            echo "Lines reading \`no longer matches any finding\` are waivers to RETIRE; \`not allowlisted\` lines are new findings a person (or the monthly steward) must review — each names the package and installed version to look up. Findings move between weekly rebuilds: write a waiver against the scan of the image about to ship, never against last week's report."
+            echo
+            cat tracker.md 2>/dev/null || echo "(Debian tracker status not gathered)"
           } > comment.md
-          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body-file comment.md
-          else
-            gh issue create --repo "$REPO" --title "$title" --label dependencies --body-file comment.md
-          fi
+          bash scripts/post_review_issue.sh comment.md
