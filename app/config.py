@@ -80,6 +80,7 @@ PLATFORM_SECRET_FIELD_MAP: dict[str, str] = {
     "LLM_MODEL_UPDATED": "llm_model_updated",
     "HCAPTCHA_SECRET_KEY": "hcaptcha_secret_key",  # nosec B105
     "HCAPTCHA_SITE_KEY": "hcaptcha_site_key",
+    "WIDGET_EMBED_URL": "widget_embed_url",
     "TWILIO_ACCOUNT_SID": "twilio_account_sid",
     "TWILIO_API_KEY_SID": "twilio_api_key_sid",
     "TWILIO_API_KEY_SECRET": "twilio_api_key_secret",  # nosec B105
@@ -397,7 +398,16 @@ class Settings(BaseSettings):
     # hCaptcha signup bot-protection (§3.7.1a). Empty -> verification is a no-op
     # (mock/CI/local); set in live mode to enforce siteverify on signup.
     hcaptcha_secret_key: str = ""
+    # The PUBLIC site key the signup/contact pages render the widget with. Served to
+    # the frontend by GET /api/v1/public/config (round 7 WP-7) — before that nothing
+    # read it and the frontend baked a literal in at build time.
     hcaptcha_site_key: str = ""
+    # The widget embed script customers paste onto their sites
+    # (https://<widget host>/v1/luciel.js), served by GET /api/v1/public/config so the
+    # dashboard's embed snippet follows the environment. ComputeStack injects
+    # LUCIEL_WIDGET_EMBED_URL; the platform secret's WIDGET_EMBED_URL fills it
+    # otherwise. Empty = not configured here (the frontend keeps its own fallback).
+    widget_embed_url: str = ""
     # Non-production ONLY: when True, the signup captcha check accepts the fixed
     # seed/live-test bypass token so the §10 harness can create synthetic accounts
     # through the real API in a live-configured dev/preprod. MUST remain False in prod

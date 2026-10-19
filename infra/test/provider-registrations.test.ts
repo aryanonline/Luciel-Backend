@@ -13,7 +13,7 @@ import { Template } from 'aws-cdk-lib/assertions';
 import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
-import { ComputeStack } from '../lib/compute-stack';
+import { ComputeStack, CONTROL_PLANE_PATH_PATTERNS } from '../lib/compute-stack';
 import { getEnvConfig, OFFERING_REGION, DOMAINS } from '../lib/env-config';
 import type { EnvName } from '../lib/env-config';
 
@@ -77,5 +77,29 @@ describe.each<EnvName>(['dev', 'prod'])('provider-facing origin (%s)', (envName)
     for (const endpoint of subscriptions) {
       expect(endpoint.startsWith(`${envValue(template, 'data-planeContainer', 'LUCIEL_PUBLIC_API_BASE_URL')}/`)).toBe(true);
     }
+  });
+});
+
+describe.each<EnvName>(['dev', 'prod'])('frontend runtime config (%s)', (envName) => {
+  const template = buildCompute(envName);
+
+  test.each(['data-planeContainer', 'control-planeContainer'])(
+    '%s carries the widget embed URL GET /api/v1/public/config serves',
+    (container) => {
+      expect(envValue(template, container, 'LUCIEL_WIDGET_EMBED_URL')).toBe(
+        `https://${DOMAINS.widget}/v1/luciel.js`,
+      );
+    },
+  );
+
+  test('GET /api/v1/public/config is forwarded to the control plane', () => {
+    // The route is mounted under app/main.py CONTROL_PLANE_PREFIXES; without its own
+    // pattern the ALB default (the data plane) would answer it.
+    expect(CONTROL_PLANE_PATH_PATTERNS.flat()).toContain('/api/v1/public/*');
+    const rules = Object.values(template.findResources('AWS::ElasticLoadBalancingV2::ListenerRule'));
+    const publicRules = rules.filter((r) =>
+      JSON.stringify((r as { Properties: unknown }).Properties).includes('/api/v1/public/*'),
+    );
+    expect(publicRules.length).toBeGreaterThanOrEqual(1);
   });
 });

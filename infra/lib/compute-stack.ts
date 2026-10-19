@@ -71,6 +71,8 @@ export interface ComputeStackProps extends StackProps {
 export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> = [
   ['/api/v1/admin/*', '/api/v1/auth/*', '/api/v1/dashboard/*', '/api/v1/connections/*', '/api/v1/exports/*'],
   ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
+  // The frontend's runtime public configuration (round 7 WP-7, GET /api/v1/public/config).
+  ['/api/v1/public/*'],
 ];
 
 /**
@@ -625,6 +627,10 @@ export class ComputeStack extends Stack {
           // api_base_url:unset in live). Same value the SNS subscriptions and the
           // SeedTest harness use, so a hostname move changes ONE constant.
           LUCIEL_PUBLIC_API_BASE_URL: publicApiBaseUrl,
+          // The widget embed script the dashboard's snippet names, served to the
+          // frontend by GET /api/v1/public/config (round 7 WP-7) — the CDN host
+          // WidgetStack publishes luciel.js under.
+          LUCIEL_WIDGET_EMBED_URL: `https://${DOMAINS.widget}/v1/luciel.js`,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
