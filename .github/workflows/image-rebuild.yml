@@ -115,7 +115,8 @@ jobs:
             echo
             echo "Fresh build of the release branch, scanned by ECR (run ${{ github.run_id }}). Not deployed."
             echo
-            echo '```'; cat gate.txt 2>/dev/null || echo "(no gate output)"; echo '```'
+            # The scan-wait poll lines are noise once the scan completed.
+            echo '```'; grep -v 'scan not ready' gate.txt 2>/dev/null || echo "(no gate output)"; echo '```'
             echo
             echo "Lines reading \`no longer matches any finding\` are waivers to RETIRE; \`not allowlisted\` lines are new findings a person (or the monthly steward) must review — each names the package and installed version to look up. Findings move between weekly rebuilds: write a waiver against the scan of the image about to ship, never against last week's report."
             echo
