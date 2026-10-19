@@ -703,18 +703,10 @@ export class ComputeStack extends Stack {
           //      topic in an environment whose cutover has not run.
           // Both are this account's own SES-only topics.
           SES_INBOUND_TOPIC_ARN: sesInboundTopicArns,
-          // The PUBLIC API origin external providers are pointed at: Twilio webhook
-          // auto-config + drift repair, SMS escalation links, export download links
-          // (app reads it as public_api_base_url). Left to the platform secret's
-          // API_BASE_URL alone it could be absent, and Twilio auto-config then
-          // silently degraded to manual guidance (round 7 WP-7, /healthz names
-          // api_base_url:unset in live). Same value the SNS subscriptions and the
-          // SeedTest harness use, so a hostname move changes ONE constant.
-          LUCIEL_PUBLIC_API_BASE_URL: publicApiBaseUrl,
           // The widget embed script the dashboard's snippet names, served to the
           // frontend by GET /api/v1/public/config (round 7 WP-7) — the CDN host
           // WidgetStack publishes luciel.js under.
-          LUCIEL_WIDGET_EMBED_URL: `https://${DOMAINS.widget}/v1/luciel.js`,
+          LUCIEL_WIDGET_EMBED_URL: `https://${names.embed}/v1/luciel.js`,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
@@ -1024,10 +1016,6 @@ export class ComputeStack extends Stack {
         // through the live API, never by sending directly.)
         SES_CONFIGURATION_SET: sesConfigurationSetName,
         SES_EVENTS_TOPIC_ARN: sesEventsTopic.topicArn,
-        // The public API origin — MUST match the app planes: the health sweep
-        // re-points every BYO Twilio number's webhooks at it (drift repair), and the
-        // export/escalation sweeps build customer-facing links on it.
-        LUCIEL_PUBLIC_API_BASE_URL: publicApiBaseUrl,
         // model_currency auto-swap targets (§3.4.3): WHERE to write the successor
         // model ID and WHICH services to redeploy so it takes effect. Absent in
         // local/CI runs, where the watchdog degrades to alert-only by design.

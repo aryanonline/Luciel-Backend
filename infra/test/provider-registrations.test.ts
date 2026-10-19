@@ -14,7 +14,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack, CONTROL_PLANE_PATH_PATTERNS } from '../lib/compute-stack';
-import { getEnvConfig, OFFERING_REGION, DOMAINS } from '../lib/env-config';
+import { getEnvConfig, OFFERING_REGION, hostnames, baseUrls } from '../lib/env-config';
 import type { EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
@@ -61,10 +61,10 @@ describe.each<EnvName>(['dev', 'prod'])('provider-facing origin (%s)', (envName)
   const template = buildCompute(envName);
 
   test.each(['data-planeContainer', 'control-planeContainer', 'SweepContainer'])(
-    '%s carries LUCIEL_PUBLIC_API_BASE_URL = https://<DOMAINS.api>',
+    '%s carries LUCIEL_PUBLIC_API_BASE_URL = the environment API base URL',
     (container) => {
       expect(envValue(template, container, 'LUCIEL_PUBLIC_API_BASE_URL')).toBe(
-        `https://${DOMAINS.api}`,
+        baseUrls(envName).api,
       );
     },
   );
@@ -87,7 +87,7 @@ describe.each<EnvName>(['dev', 'prod'])('frontend runtime config (%s)', (envName
     '%s carries the widget embed URL GET /api/v1/public/config serves',
     (container) => {
       expect(envValue(template, container, 'LUCIEL_WIDGET_EMBED_URL')).toBe(
-        `https://${DOMAINS.widget}/v1/luciel.js`,
+        `https://${hostnames(envName).embed}/v1/luciel.js`,
       );
     },
   );
