@@ -71,6 +71,17 @@ _OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 # The one-turn smoke a successor must pass before it is written anywhere (F113):
 # a listed model that cannot complete a trivial turn is not a successor.
 SMOKE_PROMPT = "Reply with the single word OK."
+# Output ceilings for that smoke turn, per provider (round 7 WP-6 item 1). Anthropic
+# takes ``max_tokens`` and answers "OK" in a couple of tokens. OpenAI's GPT-5.x
+# REJECTS ``max_tokens`` (unsupported_parameter — the same reason providers.py sends
+# ``max_completion_tokens``), and its hidden reasoning tokens count against that
+# ceiling: at 8 the whole budget is spent thinking and the answer comes back empty
+# with finish_reason=length, so every OpenAI successor used to fail its smoke and a
+# retired fallback pin could never be swapped. The ceiling sits well above a
+# trivial prompt's reasoning budget; the smoke runs once per retirement, so its cost
+# is nothing.
+SMOKE_MAX_TOKENS_ANTHROPIC = 16
+SMOKE_MAX_COMPLETION_TOKENS_OPENAI = 512
 
 # The newer-same-family nudge (audit round 3, Phase 7 — owner concern #6) goes
 # out at most on this weekday (Monday), keeping the module stateless (its
@@ -362,26 +373,55 @@ def _completion_text(provider: str, body: Any) -> str:
         return ""
 
 
+def _stop_reason(provider: str, body: Any) -> str:
+    """Why the provider stopped generating (``length`` / ``max_tokens`` name an
+    exhausted output budget), for the operator's alert line. Empty when absent."""
+    try:
+        if provider == "anthropic":
+            return str(body.get("stop_reason") or "")
+        return str(body["choices"][0].get("finish_reason") or "")
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def smoke_request(
+    provider: str, *, api_key: str, model_id: str
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """``(url, payload, headers)`` of the one-turn smoke for ``provider``.
+
+    The output-ceiling parameter is provider-specific (round 7 WP-6 item 1): OpenAI's
+    GPT-5.x refuses ``max_tokens`` and needs ``max_completion_tokens`` with room for
+    its reasoning tokens; Anthropic's Messages API takes ``max_tokens``."""
+    messages = [{"role": "user", "content": SMOKE_PROMPT}]
+    if provider == "anthropic":
+        return (
+            _ANTHROPIC_MESSAGES_URL,
+            {"model": model_id, "max_tokens": SMOKE_MAX_TOKENS_ANTHROPIC, "messages": messages},
+            {
+                "x-api-key": api_key,
+                "anthropic-version": _ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+        )
+    return (
+        _OPENAI_CHAT_URL,
+        {
+            "model": model_id,
+            "max_completion_tokens": SMOKE_MAX_COMPLETION_TOKENS_OPENAI,
+            "messages": messages,
+        },
+        {"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+    )
+
+
 async def _default_smoke(
     client: _Transport, *, provider: str, api_key: str, model_id: str
 ) -> str | None:
     """One real completion against the candidate through the same transport the
-    presence checks use. Any non-2xx, transport error or empty answer fails it."""
-    if provider == "anthropic":
-        url = _ANTHROPIC_MESSAGES_URL
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-    else:
-        url = _OPENAI_CHAT_URL
-        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
-    payload = {
-        "model": model_id,
-        "max_tokens": 8,
-        "messages": [{"role": "user", "content": SMOKE_PROMPT}],
-    }
+    presence checks use. Any non-2xx, transport error or empty answer fails it — a
+    200 whose completion is empty (the whole budget spent on reasoning) is NOT a
+    working successor, and the reason names the stop reason so the alert says why."""
+    url, payload, headers = smoke_request(provider, api_key=api_key, model_id=model_id)
     try:
         resp = await client.post(url, json=payload, headers=headers)
         status = getattr(resp, "status_code", 0)
@@ -390,7 +430,10 @@ async def _default_smoke(
         body = resp.json()
     except Exception as exc:  # noqa: BLE001 — any failure is a failed smoke, never a crash
         return type(exc).__name__
-    return None if _completion_text(provider, body) else "empty completion"
+    if _completion_text(provider, body):
+        return None
+    stop = _stop_reason(provider, body)
+    return f"empty completion (stop={stop})" if stop else "empty completion"
 
 
 # --- remediation seams (secret write + service restart) ------------------------ #
