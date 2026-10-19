@@ -19,7 +19,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
-import { getEnvConfig, OFFERING_REGION, DOMAINS } from '../lib/env-config';
+import { getEnvConfig, OFFERING_REGION, APEX_DOMAIN, baseUrls } from '../lib/env-config';
 import type { EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
@@ -107,7 +107,7 @@ describe.each<EnvName>(['dev', 'prod'])('SES events pipeline (%s)', (envName) =>
   test('the events topic has an HTTPS subscription to the events webhook', () => {
     template.hasResourceProperties('AWS::SNS::Subscription', {
       Protocol: 'https',
-      Endpoint: `https://${DOMAINS.api}/api/v1/webhooks/ses/events`,
+      Endpoint: `${baseUrls(envName).api}/api/v1/webhooks/ses/events`,
     });
   });
 
@@ -152,7 +152,7 @@ describe.each<EnvName>(['dev', 'prod'])('SES inbound codification (%s)', (envNam
       RuleSetName: `luciel-${envName}-inbound-v2`,
       Rule: Match.objectLike({
         Enabled: true,
-        Recipients: [`.reply.${DOMAINS.apex}`],
+        Recipients: [`.reply.${APEX_DOMAIN}`],
         Actions: [
           {
             // SNS action = full raw message inline in the notification ("content
@@ -173,7 +173,7 @@ describe.each<EnvName>(['dev', 'prod'])('SES inbound codification (%s)', (envNam
     });
     template.hasResourceProperties('AWS::SNS::Subscription', {
       Protocol: 'https',
-      Endpoint: `https://${DOMAINS.api}/api/v1/webhooks/ses/inbound`,
+      Endpoint: `${baseUrls(envName).api}/api/v1/webhooks/ses/inbound`,
     });
   });
 });

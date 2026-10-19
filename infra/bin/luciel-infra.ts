@@ -28,6 +28,7 @@ import { applyCostAllocationTags } from '../lib/cost-tags';
 import {
   getEnvConfig,
   applyContextOverrides,
+  apexOwner,
   OFFERING_REGION,
   CLOUDFRONT_CERT_REGION,
   EnvName,
@@ -38,6 +39,10 @@ const envName = (app.node.tryGetContext('env') as EnvName) ?? 'dev';
 // Cheap-idle pause switch: `-c paused=true` forces every ECS service to count 0.
 const paused = app.node.tryGetContext('paused') === 'true';
 const envConfig = applyContextOverrides(getEnvConfig(envName), paused);
+// Owner decision D6: exactly one environment serves the public names. A config that
+// gives them to two environments (or none, or to the ephemeral preprod) is refused
+// here, before any stack is built.
+apexOwner();
 const account = process.env.CDK_DEFAULT_ACCOUNT;
 const env: cdk.Environment = { account, region: OFFERING_REGION };
 // CloudFront certs MUST be in us-east-1 (the single sanctioned region deviation).
@@ -56,10 +61,6 @@ const data = new DataStack(app, `${prefix}-Data`, {
   cmk: sec.cmk,
 });
 
-// DNS + regional certs (created before compute so the api cert can attach to the
-// backend ALB's HTTPS listener). Only the existing hosted zone is referenced.
-const dns = new DnsStack(app, `${prefix}-Dns`, { env, envConfig });
-
 const compute = new ComputeStack(app, `${prefix}-Compute`, {
   env,
   envConfig,
@@ -71,17 +72,20 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   dbSecretArn: data.db.secret!.secretArn,
   platformSecretArn: sec.platformSecret.secretArn,
   redisUrl: data.redisUrl,
-  apiCert: dns.apiCert,
-  hostedZone: dns.hostedZone,
+  // The environment's hostnames (env-config.ts `hostnames`, D6): one certificate for
+  // every app + api name on the one ALB's HTTPS listener, and the api names' aliases.
+  publicDns: true,
 });
 
-// Frontend web service (SSR Next.js on ECS) — mirrors the backend compute pattern.
+// Frontend web service (SSR Next.js on ECS) on the environment's ONE ALB (round 7
+// WP-8b, owner decision D7): its target group joins Compute's listener behind the
+// app-host rule, and the app names' aliases point at that ALB.
 const web = new WebStack(app, `${prefix}-Web`, {
   env,
   envConfig,
   vpc: net.vpc,
-  webCert: dns.webCert,
-  hostedZone: dns.hostedZone,
+  ingress: compute.sharedIngress,
+  publicDns: true,
 });
 
 // Widget CDN: the cert must be in us-east-1 (CloudFront), the bucket+distribution
@@ -99,14 +103,24 @@ new WidgetStack(app, `${prefix}-Widget`, {
   crossRegionReferences: true,
 });
 
-new EdgeStack(app, `${prefix}-Edge`, {
+const edge = new EdgeStack(app, `${prefix}-Edge`, {
   env,
   envConfig,
+  // The one ALB: the API and the dashboard/marketing hosts (D7) share the WebACL.
   alb: compute.alb,
-  // The dashboard/marketing ALB gets the same WebACL — login + the anonymous
-  // contact form were previously outside the WAF entirely.
-  webAlb: web.alb,
 });
+// The deploy that retires the web ALB must drop its WebACL association BEFORE the
+// ALB is deleted: Edge (which used to depend on Web for that ALB) now deploys first.
+web.addStackDependency(edge, 'Edge drops the retired web ALB association before Web deletes it');
+
+// The environment's hostnames as stack exports (+ the zone handle). It deploys AFTER
+// Compute and Web on purpose: it used to own the regional certificates their
+// listeners held, and the deploy that moves those listeners onto ComputeStack's own
+// certificate is the same one that deletes the old certs here — which CloudFormation
+// can only do once nothing uses them.
+const dns = new DnsStack(app, `${prefix}-Dns`, { env, envConfig });
+dns.addStackDependency(compute, 'retired listener certificates are deleted after the listener moves');
+dns.addStackDependency(web, 'retired web certificate is deleted after the web ALB is gone');
 
 new ObservabilityStack(app, `${prefix}-Observability`, {
   env,

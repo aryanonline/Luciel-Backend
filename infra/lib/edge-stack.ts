@@ -13,8 +13,10 @@
  * website allowlist is data (instances.allowed_origins) and is enforced by the
  * widget data plane (app/api/v1/chat_widget._enforce_origin), which compares the
  * page origin of every bootstrap / send / history call; per-source and
- * per-tenant ceilings live in app/channels/rate_limit.py. One WebACL, two ALB
- * associations (API + dashboard/marketing).
+ * per-tenant ceilings live in app/channels/rate_limit.py. One WebACL, ONE ALB
+ * association: since round 7 WP-8b (owner decision D7) the environment has a single
+ * ALB serving the API AND the dashboard/marketing hosts (host-based routing), so the
+ * one association covers login and the anonymous contact form as well as the API.
  */
 import { Stack, StackProps } from 'aws-cdk-lib';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
@@ -24,14 +26,8 @@ import { EnvConfig } from './env-config';
 
 export interface EdgeStackProps extends StackProps {
   readonly envConfig: EnvConfig;
+  /** The environment's one ALB (ComputeStack): API + dashboard/marketing hosts (D7). */
   readonly alb: elbv2.IApplicationLoadBalancer;
-  /**
-   * The dashboard/marketing ALB (WebStack). Until this was passed, the WAF
-   * protected only the API ALB — the internet-facing SSR dashboard and the
-   * marketing site (with its anonymous contact form) had no managed rules and
-   * no per-IP rate ceiling at all. One WebACL, two associations.
-   */
-  readonly webAlb?: elbv2.IApplicationLoadBalancer;
 }
 
 export class EdgeStack extends Stack {
@@ -39,7 +35,7 @@ export class EdgeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: EdgeStackProps) {
     super(scope, id, props);
-    const { envConfig, alb, webAlb } = props;
+    const { envConfig, alb } = props;
 
     // WAF follows the environment's WAKEFULNESS in dev (owner cost mandate,
     // 2026-08-12): a paused environment's ALB serves nothing but 503s, so its
@@ -114,20 +110,12 @@ export class EdgeStack extends Stack {
       ],
     });
 
-    // Bind the WAF to the API ALB.
+    // Bind the WAF to the environment's one ALB. The web surface (login, the
+    // anonymous contact form) rides the same ALB since D7, so it stays firewalled —
+    // the separate web-ALB association this stack used to carry went with that ALB.
     new wafv2.CfnWebACLAssociation(this, 'WebAclAssoc', {
       resourceArn: alb.loadBalancerArn,
       webAclArn: this.webAcl.attrArn,
     });
-
-    // And to the dashboard/marketing ALB: same managed rules, same per-IP
-    // ceiling. The web surface fronts login + the anonymous contact form, so
-    // leaving it unfirewalled while the API is protected was a gap, not a tier.
-    if (webAlb) {
-      new wafv2.CfnWebACLAssociation(this, 'WebAlbAclAssoc', {
-        resourceArn: webAlb.loadBalancerArn,
-        webAclArn: this.webAcl.attrArn,
-      });
-    }
   }
 }

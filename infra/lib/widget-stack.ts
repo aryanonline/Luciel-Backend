@@ -1,9 +1,12 @@
 /**
- * Widget CDN layer — S3 + CloudFront for embed.vantagemind.ai (§5.6 / spec §3).
+ * Widget CDN layer — S3 + CloudFront for the environment's embed hosts (§5.6 / spec §3).
  *
  * apps/widget (Luciel-Frontend) is a fully static Vite library bundle
- * (dist/luciel.js …) served at embed.vantagemind.ai/v1/luciel.js. So unlike the
- * SSR web app, it is S3 + CloudFront, not ECS.
+ * (dist/luciel.js …) served at <embed host>/v1/luciel.js — embed-dev.vantagemind.ai
+ * for dev (owner decision D6, round 7 WP-8b) plus embed.vantagemind.ai while dev owns
+ * the public names; the customer-facing embed snippet keeps naming the public host
+ * until a production environment claims it. Unlike the SSR web app, it is S3 +
+ * CloudFront, not ECS.
  *
  * CROSS-REPO UPLOAD: the bundle is produced by the FRONTEND repo's CI; this CDK app
  * cannot see it at synth. So — like the web image — CDK owns ONLY the bucket +
@@ -11,7 +14,7 @@
  * CloudFront (no cross-repo BucketDeployment).
  *
  * Two stacks live here because a CloudFront cert MUST be in us-east-1:
- *   - WidgetCertStack (us-east-1): the ACM cert for embed.vantagemind.ai. This is
+ *   - WidgetCertStack (us-east-1): the ACM cert for the embed hosts. This is
  *     the ONE sanctioned region deviation (CLOUDFRONT_CERT_REGION) — a CloudFront
  *     cert is a global-edge artifact, not customer data, so residency holds (LD 21).
  *     It deliberately does NOT carry the ca-central-1 residency guard.
@@ -32,12 +35,27 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { EnvConfig, DOMAINS, HOSTED_ZONE, OFFERING_REGION } from './env-config';
+import { APEX_DOMAIN, EnvConfig, OFFERING_REGION, PUBLIC_HOSTNAMES, hostnames, recordIdFor } from './env-config';
+import { importPublicZone } from './dns-stack';
 import { ResidencyGuard } from './residency';
 
 export interface WidgetCertStackProps extends StackProps {
   readonly envConfig: EnvConfig;
 }
+
+/**
+ * The CloudFront distribution's ONE certificate (CloudFront takes a single cert, so it
+ * must cover every embed host the environment serves). A WILDCARD for the apex domain,
+ * deliberately, and only here: this cert lives in another region's stack, so a cert
+ * whose names changed would be REPLACED by a stack that deploys before the
+ * distribution lets go of the old one — and CloudFormation cannot delete a cert a
+ * distribution still holds. `*.vantagemind.ai` covers embed-dev / embed-preprod /
+ * embed under every D6 ownership, so the cutover never touches it. (The regional ALB
+ * certificate names its hosts explicitly: it lives beside its listener, where a
+ * replacement is safe — compute-stack.ts.) ACM keys are not exportable, so the wider
+ * name buys no extractable material.
+ */
+export const EMBED_CERT_DOMAIN = `*.${APEX_DOMAIN}`;
 
 /** us-east-1 ACM cert for the widget CloudFront distribution (required region). */
 export class WidgetCertStack extends Stack {
@@ -48,20 +66,29 @@ export class WidgetCertStack extends Stack {
 
     // NOTE: deliberately us-east-1 — CloudFront cert requirement. No ca-central-1
     // residency guard here (a CloudFront cert is not customer data; see file header).
-    const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
-      hostedZoneId: HOSTED_ZONE.id,
-      zoneName: HOSTED_ZONE.name,
-    });
-    this.cert = new acm.Certificate(this, 'WidgetCert', {
-      domainName: DOMAINS.widget,
+    const hostedZone = importPublicZone(this);
+    this.cert = new acm.Certificate(this, 'EmbedCert', {
+      domainName: EMBED_CERT_DOMAIN,
       validation: acm.CertificateValidation.fromDns(hostedZone),
     });
+
+    // RETIRING (round 7 WP-8b): dev's distribution held this embed.vantagemind.ai-only
+    // cert until the deploy that moves it to EmbedCert. This stack deploys BEFORE the
+    // distribution switches, so deleting it in that same deploy would hit a cert still
+    // in use. It stays, unreferenced, for that one deploy; remove it (and this block)
+    // in the next change. Unchanged properties, so this deploy does not touch it.
+    if (props.envConfig.envName === 'dev') {
+      new acm.Certificate(this, 'WidgetCert', {
+        domainName: PUBLIC_HOSTNAMES.embed,
+        validation: acm.CertificateValidation.fromDns(hostedZone),
+      });
+    }
   }
 }
 
 export interface WidgetStackProps extends StackProps {
   readonly envConfig: EnvConfig;
-  /** us-east-1 cert for embed.vantagemind.ai (from WidgetCertStack). */
+  /** us-east-1 cert covering every embed host (from WidgetCertStack). */
   readonly cert: acm.ICertificate;
 }
 
@@ -72,6 +99,7 @@ export class WidgetStack extends Stack {
   constructor(scope: Construct, id: string, props: WidgetStackProps) {
     super(scope, id, props);
     const { envConfig, cert } = props;
+    const names = hostnames(envConfig.envName);
 
     new ResidencyGuard(this, 'Residency');
 
@@ -127,38 +155,42 @@ export class WidgetStack extends Stack {
         responseHeadersPolicy:
           cloudfront.ResponseHeadersPolicy.CORS_ALLOW_ALL_ORIGINS_WITH_PREFLIGHT,
       },
-      domainNames: [DOMAINS.widget],
+      // Every embed host the environment serves (D6: embed-dev + the dual-host
+      // embed.vantagemind.ai while dev owns the public names).
+      domainNames: [...names.embedNames],
       certificate: cert,
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       defaultRootObject: 'index.html',
-      comment: `Luciel ${envConfig.envName} widget CDN (embed.vantagemind.ai)`,
+      // The frontend CI finds the distribution by the "Luciel <env> widget" prefix
+      // (Luciel-Frontend deploy.yml) — keep it.
+      comment: `Luciel ${envConfig.envName} widget CDN (${names.embed})`,
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
     });
 
-    // embed.vantagemind.ai -> CloudFront (A + AAAA ALIAS). Zone already exists.
-    const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
-      hostedZoneId: HOSTED_ZONE.id,
-      zoneName: HOSTED_ZONE.name,
-    });
+    // Every embed host -> CloudFront (A + AAAA ALIAS). Zone already exists.
+    // recordIdFor keeps embed.vantagemind.ai on its original WidgetA/WidgetAaaa ids,
+    // so the deployed records are updated in place, never re-created.
+    const zone = importPublicZone(this);
     const cfTarget = route53.RecordTarget.fromAlias(
       new route53targets.CloudFrontTarget(this.distribution),
     );
-    new route53.ARecord(this, 'WidgetA', {
-      zone,
-      recordName: DOMAINS.widget,
-      target: cfTarget,
-      ttl: Duration.minutes(5),
-    });
-    new route53.AaaaRecord(this, 'WidgetAaaa', {
-      zone,
-      recordName: DOMAINS.widget,
-      target: cfTarget,
-    });
+    for (const name of names.embedNames) {
+      const rid = recordIdFor(name);
+      // No ttl: Route 53 ignores it on an alias record (the alias carries the
+      // target's own TTL), and CDK warned at every synth.
+      new route53.ARecord(this, `${rid}A`, { zone, recordName: name, target: cfTarget });
+      new route53.AaaaRecord(this, `${rid}Aaaa`, {
+        zone,
+        recordName: name,
+        target: cfTarget,
+      });
+    }
 
     new CfnOutput(this, 'WidgetBucketName', { value: this.bucket.bucketName });
     new CfnOutput(this, 'WidgetDistributionId', {
       value: this.distribution.distributionId,
     });
     new CfnOutput(this, 'WidgetDomain', { value: this.distribution.distributionDomainName });
+    new CfnOutput(this, 'EmbedHost', { value: names.embed });
   }
 }

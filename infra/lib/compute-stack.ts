@@ -29,7 +29,15 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { EnvConfig, DOMAINS, SWEEP_ERROR_METRIC } from './env-config';
+import {
+  APEX_DOMAIN,
+  EnvConfig,
+  SWEEP_ERROR_METRIC,
+  baseUrls,
+  hostnames,
+  recordIdFor,
+} from './env-config';
+import { importPublicZone } from './dns-stack';
 import { scaleOnLoad } from './service-scaling';
 
 export interface ComputeStackProps extends StackProps {
@@ -53,14 +61,25 @@ export interface ComputeStackProps extends StackProps {
    */
   readonly redisUrl: string;
   /**
-   * Regional (ca-central-1) ACM cert for api.vantagemind.ai (from DnsStack). When
-   * provided, an HTTPS:443 listener is added to the ALB and an api.vantagemind.ai
-   * ALIAS record points at it. Optional so the stack still synthesizes standalone
-   * (e.g. unit tests) before DNS is wired.
+   * Serve the environment's hostnames (env-config.ts `hostnames`, owner decision D6):
+   * an HTTPS:443 listener with ONE certificate for every app and api name, and A/AAAA
+   * aliases for the api names. Off by default so the stack still synthesizes
+   * standalone (unit tests) without DNS; bin/luciel-infra.ts turns it on.
    */
-  readonly apiCert?: acm.ICertificate;
-  /** Existing hosted zone for the api ALIAS record (from DnsStack). */
-  readonly hostedZone?: route53.IHostedZone;
+  readonly publicDns?: boolean;
+}
+
+/**
+ * What the web tier needs to hang itself on this environment's ONE load balancer
+ * (round 7 WP-8b, owner decision D7): the listener its app-host rule joins and the
+ * ALB's security group (WebStack imports both in its own scope, so the SG rules and
+ * the listener rule live in WebStack and the Compute stack never points back at it).
+ */
+export interface SharedIngress {
+  readonly alb: elbv2.IApplicationLoadBalancer;
+  /** HTTPS when the environment serves DNS, otherwise the HTTP listener (unit synths). */
+  readonly listenerArn: string;
+  readonly securityGroupId: string;
 }
 
 /**
@@ -73,6 +92,49 @@ export const CONTROL_PLANE_PATH_PATTERNS: ReadonlyArray<ReadonlyArray<string>> =
   ['/api/v1/admin/*', '/api/v1/auth/*', '/api/v1/dashboard/*', '/api/v1/connections/*', '/api/v1/exports/*'],
   ['/api/v1/billing', '/api/v1/billing/*', '/api/v1/contact', '/api/v1/contact/*', '/api/v1/escalation-contact/*'],
 ];
+
+/**
+ * ALB quota: a rule's conditions may carry at most FIVE values in total (host-header
+ * and path-pattern values counted together). CONTROL_PLANE_PATH_PATTERNS is grouped in
+ * fives for the path-only rules it was written for; once every rule also names the
+ * environment's api hosts (round 7 WP-8b) the paths are re-grouped around them.
+ */
+export const MAX_CONDITION_VALUES_PER_RULE = 5;
+
+/**
+ * Listener-rule priority bands on the environment's one ALB (round 7 WP-8b, D7).
+ * Lower wins. The app hosts come first so the web tier answers its own paths (the
+ * dashboard's /api/... never reaches a plane by accident); then the control-plane
+ * path rules for the api hosts; then the api hosts' data-plane catch-all. The
+ * listener's DEFAULT action stays the data plane — a host or path nothing names is
+ * never dropped (the 2026-09-05 F067 rule).
+ */
+export const LISTENER_RULE_PRIORITY = {
+  /** App hostnames → the web target group (WebStack) / HTTP→HTTPS redirect (here). */
+  appHost: 5,
+  /** First of the api-host control-plane path rules (20, 21, ...). */
+  controlPlane: 20,
+  /** The api hosts' data-plane catch-all. */
+  apiHost: 60,
+} as const;
+
+/**
+ * CONTROL_PLANE_PATH_PATTERNS re-grouped so each rule fits the quota beside the
+ * ``hostCount`` api host values it also carries (dev's two api names → three paths a
+ * rule). The union is always exactly CONTROL_PLANE_PATH_PATTERNS.
+ */
+export function controlPlaneRuleGroups(hostCount: number): string[][] {
+  const perRule = MAX_CONDITION_VALUES_PER_RULE - hostCount;
+  if (perRule < 1) {
+    throw new Error(
+      `${hostCount} api hostnames leave no room for a path in a ${MAX_CONDITION_VALUES_PER_RULE}-value ALB rule`,
+    );
+  }
+  const all = CONTROL_PLANE_PATH_PATTERNS.flat();
+  const groups: string[][] = [];
+  for (let i = 0; i < all.length; i += perRule) groups.push(all.slice(i, i + perRule));
+  return groups;
+}
 
 /**
  * Every backend task runs on Graviton (round 7 WP-8, owner decision D7
@@ -92,6 +154,10 @@ export const GRAVITON_RUNTIME: ecs.RuntimePlatform = {
 
 export class ComputeStack extends Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
+  /** The HTTPS:443 listener (only when `publicDns`). */
+  public readonly httpsListener?: elbv2.ApplicationListener;
+  /** Where the web tier joins this environment's one ALB (D7). */
+  public readonly sharedIngress: SharedIngress;
   public readonly cluster: ecs.Cluster;
   /** The sweep task definition family — the ObservabilityStack's task-failure rule
    *  matches on it (2026-09-05 audit F034). */
@@ -99,7 +165,7 @@ export class ComputeStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, voiceAudioBucket, knowledgeOriginalsBucket, dbSecretArn, platformSecretArn, redisUrl, apiCert, hostedZone } =
+    const { envConfig, vpc, cmkArn, transcriptArchiveBucket, exportBucket, voiceAudioBucket, knowledgeOriginalsBucket, dbSecretArn, platformSecretArn, redisUrl, publicDns } =
       props;
     const dbSecret = secrets.Secret.fromSecretCompleteArn(this, 'ImportedDbSecret', dbSecretArn);
     // Import the CMK + platform secret by ARN: external (unowned) references, so
@@ -253,9 +319,9 @@ export class ComputeStack extends Stack {
           resources: [
             // Domain identity (covers every address under it), subdomain identities
             // (e.g. inbound.vantagemind.ai), and individually-verified addresses.
-            `arn:aws:ses:${this.region}:${this.account}:identity/${DOMAINS.apex}`,
-            `arn:aws:ses:${this.region}:${this.account}:identity/*.${DOMAINS.apex}`,
-            `arn:aws:ses:${this.region}:${this.account}:identity/*@${DOMAINS.apex}`,
+            `arn:aws:ses:${this.region}:${this.account}:identity/${APEX_DOMAIN}`,
+            `arn:aws:ses:${this.region}:${this.account}:identity/*.${APEX_DOMAIN}`,
+            `arn:aws:ses:${this.region}:${this.account}:identity/*@${APEX_DOMAIN}`,
             `arn:aws:ses:${this.region}:${this.account}:configuration-set/*`,
           ],
         }),
@@ -308,9 +374,9 @@ export class ComputeStack extends Stack {
         sid: 'SendPlatformEmail',
         actions: ['ses:SendEmail', 'ses:SendRawEmail'],
         resources: [
-          `arn:aws:ses:${this.region}:${this.account}:identity/${DOMAINS.apex}`,
-          `arn:aws:ses:${this.region}:${this.account}:identity/*.${DOMAINS.apex}`,
-          `arn:aws:ses:${this.region}:${this.account}:identity/*@${DOMAINS.apex}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/${APEX_DOMAIN}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/*.${APEX_DOMAIN}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/*@${APEX_DOMAIN}`,
           `arn:aws:ses:${this.region}:${this.account}:configuration-set/*`,
         ],
       }),
@@ -327,11 +393,20 @@ export class ComputeStack extends Stack {
     });
     grantAppPlaneAccess(sweepRole);
 
-    // The public API origin, composed exactly the way WebStack composes
-    // NEXT_PUBLIC_API_BASE_URL: `https://${DOMAINS.api}`. Both SNS webhook
-    // subscriptions below land on routes under this origin (the ALB HTTPS:443
-    // listener -> data plane, wired further down in this stack).
-    const publicApiBaseUrl = `https://${DOMAINS.api}`;
+    // The environment's OWN origins (env-config.ts `hostnames`, owner decision D6):
+    // dev → https://dev.vantagemind.ai + https://api-dev.vantagemind.ai, prod → the
+    // public names. WebStack composes NEXT_PUBLIC_API_BASE_URL from the same helper.
+    // Both SNS webhook subscriptions below land on routes under the API origin (the
+    // HTTPS:443 listener -> data plane, wired further down in this stack). Before
+    // round 7 WP-8b every environment composed the PUBLIC api name here, so a preprod
+    // rehearsal subscribed dev's API to its SES events.
+    const names = hostnames(envConfig.envName);
+    const urls = baseUrls(envConfig.envName);
+    const publicApiBaseUrl = urls.api;
+    // Every app origin the environment serves (the D6 dual-host included): the CORS
+    // allow-list the dashboard needs on each of them. JSON, as pydantic-settings
+    // reads a list[str] from the environment.
+    const dashboardOrigins = JSON.stringify(names.appNames.map((n) => `https://${n}`));
 
     // --- SES events pipeline (bounce/complaint) ------------------------------------
     // Outbound platform email (verification, reset, export links, dunning/billing
@@ -393,7 +468,7 @@ export class ComputeStack extends Stack {
     // in LIVE integration mode only. A mock environment deliberately leaves the
     // subscription unconfirmed (there is no live consumer to confirm it) — that
     // is correct standing state, not a deploy failure.
-    new sns.Subscription(this, 'SesEventsHttpsSubscription', {
+    const sesEventsSubscription = new sns.Subscription(this, 'SesEventsHttpsSubscription', {
       topic: sesEventsTopic,
       protocol: sns.SubscriptionProtocol.HTTPS,
       endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/events`,
@@ -478,7 +553,7 @@ export class ComputeStack extends Stack {
         enabled: true,
         // Leading dot = every address under the reply subdomain (the per-session
         // vm_* reply addresses), exactly what the console rule matched.
-        recipients: [`.reply.${DOMAINS.apex}`],
+        recipients: [`.reply.${APEX_DOMAIN}`],
         // SNS action = the full raw message delivered INLINE in the notification
         // ("content inline", matching the console rule), UTF-8 encoded. Only the
         // console-documented settings are codified — no scanEnabled/tlsPolicy
@@ -501,7 +576,7 @@ export class ComputeStack extends Stack {
     // Pending-confirmation semantics identical to the events subscription above:
     // the inbound route auto-confirms in live mode only; unconfirmed in mock
     // environments is the correct standing state.
-    new sns.Subscription(this, 'SesInboundHttpsSubscription', {
+    const sesInboundSubscription = new sns.Subscription(this, 'SesInboundHttpsSubscription', {
       topic: sesInboundTopic,
       protocol: sns.SubscriptionProtocol.HTTPS,
       endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/inbound`,
@@ -583,6 +658,14 @@ export class ComputeStack extends Stack {
           // client-written leftmost entry can never impersonate another visitor's IP
           // (per-IP abuse ceilings, §3.1.5).
           LUCIEL_TRUSTED_PROXY_CIDRS: vpc.vpcCidrBlock,
+          // The environment's own origins (round 7 WP-8b, D6), derived here rather
+          // than read from the platform secret, so a hostname move is one config
+          // change: APP_BASE_URL for customer-facing links (and, in app/config.py,
+          // the session cookie's registrable domain), the API origin for provider
+          // webhooks/export links, and every app origin for CORS.
+          LUCIEL_APP_BASE_URL: urls.app,
+          LUCIEL_PUBLIC_API_BASE_URL: urls.api,
+          LUCIEL_DASHBOARD_ORIGINS: dashboardOrigins,
           // Per-env, so a dev export can never be written to the prod bucket.
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
           // Transcript cold storage (Commitment #38) — same per-env naming rule.
@@ -782,13 +865,11 @@ export class ComputeStack extends Stack {
         // store exactly as the app does, not the in-memory degraded fallback.
         LUCIEL_REDIS_URL: redisUrl,
         // The API the harness drives (scripts/seed_and_livetest.py reads
-        // LUCIEL_API_BASE and otherwise defaults to the public hostname). Injected
-        // per environment (round 7 WP-8): without it the PREPROD rehearsal drove
-        // whatever the public hostname pointed at while reading preprod's own
-        // database — a harness proving one environment's behavior against
-        // another's rows. Derived from DOMAINS.api for now; the per-environment
-        // hostname move (owner console work) changes this ONE value and nothing
-        // in the harness.
+        // LUCIEL_API_BASE first). Injected per environment (round 7 WP-8): without it
+        // the PREPROD rehearsal drove whatever the public hostname pointed at while
+        // reading preprod's own database — a harness proving one environment's
+        // behavior against another's rows. Since WP-8b it is the environment's OWN
+        // api host (env-config.ts `hostnames`): api-dev / api-preprod / api.
         LUCIEL_API_BASE: publicApiBaseUrl,
       },
     });
@@ -879,6 +960,11 @@ export class ComputeStack extends Stack {
         // app, it would mark blocks reported that Stripe never received.
         LUCIEL_STRIPE_INTEGRATION_POSTURE: envConfig.stripeIntegrationPosture,
         LUCIEL_REDIS_URL: redisUrl,
+        // Same origins as the app planes (round 7 WP-8b): the billing-notice, dunning
+        // and daily-brief sweeps put links in email, and the number-webhook repair
+        // is a silent no-op without the API origin.
+        LUCIEL_APP_BASE_URL: urls.app,
+        LUCIEL_PUBLIC_API_BASE_URL: urls.api,
         // Both buckets, for the same reason the posture above is here: the sweeps are
         // the ONLY things that touch cold storage. transcript_archive writes the 90-day
         // offload, retention deletes the archived object at the 1-year boundary, and
@@ -1142,18 +1228,14 @@ export class ComputeStack extends Stack {
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
     });
 
-    // §0 two-plane split, made real at the edge (2026-09-05 audit F067). Before
-    // this, BOTH listeners forwarded every path to the data plane and the
-    // control-plane service received no traffic at all — which only mattered once
-    // the data-plane role was narrowed: admin flows that create tenant secrets,
-    // write export bundles or store knowledge originals must run on the plane whose
-    // role can. Admin authority (auth, admin, dashboard, billing, connections,
-    // exports, contact, escalation-contact) is answered by the CONTROL plane;
-    // everything else — the widget, channel + provider webhooks, /healthz — stays
-    // on the data plane, which remains the DEFAULT action so an unlisted path can
-    // never be dropped. app/main.py declares the same split (CONTROL_PLANE_PREFIXES)
-    // and its unit test refuses a router that is on neither list. One target group
-    // per service (the single-service-in-two-TGs deploy hang above does not apply).
+    // §0 two-plane split, made real at the edge (2026-09-05 audit F067). Admin
+    // authority (auth, admin, dashboard, billing, connections, exports, contact,
+    // escalation-contact) is answered by the CONTROL plane; everything else — the
+    // widget, channel + provider webhooks, /healthz — stays on the data plane, which
+    // remains the DEFAULT action so an unlisted path can never be dropped.
+    // app/main.py declares the same split (CONTROL_PLANE_PREFIXES) and its unit test
+    // refuses a router that is on neither list. One target group per service (the
+    // single-service-in-two-TGs deploy hang above does not apply).
     const controlPlaneTg = new elbv2.ApplicationTargetGroup(this, 'ControlPlaneTargets', {
       vpc,
       port: 8000,
@@ -1161,46 +1243,97 @@ export class ComputeStack extends Stack {
       targets: [controlService],
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
     });
-    const routeControlPlane = (l: elbv2.ApplicationListener, tag: string) => {
-      CONTROL_PLANE_PATH_PATTERNS.forEach((patterns, i) => {
-        l.addAction(`${tag}ControlPlane${i}`, {
-          priority: 10 + i,
-          conditions: [elbv2.ListenerCondition.pathPatterns([...patterns])],
+
+    // HOST-BASED routing on the environment's ONE ALB (round 7 WP-8b, owner decisions
+    // D6 + D7). The web tier's app hosts are WebStack's rule (priority band appHost);
+    // the api hosts are named here: the control-plane path rules carry the api host
+    // values too, so a control-plane path only reaches the control plane on an API
+    // name (on an app name it is the dashboard's own route; on an unknown name it
+    // falls to the data plane, which does not mount it), and the api hosts' data-plane
+    // catch-all makes every api name an explicit route. New construct ids and a new
+    // priority band (the path-only rules sat at 10/11): CloudFormation creates these
+    // before it deletes the old rules, so the deploy that switches never has a window
+    // where a control-plane path has no rule.
+    const apiHosts = [...names.apiNames];
+    const routeApiHosts = (l: elbv2.ApplicationListener, tag: string) => {
+      controlPlaneRuleGroups(apiHosts.length).forEach((patterns, i) => {
+        l.addAction(`${tag}ApiControl${i}`, {
+          priority: LISTENER_RULE_PRIORITY.controlPlane + i,
+          conditions: [
+            elbv2.ListenerCondition.hostHeaders(apiHosts),
+            elbv2.ListenerCondition.pathPatterns(patterns),
+          ],
           action: elbv2.ListenerAction.forward([controlPlaneTg]),
         });
       });
+      l.addAction(`${tag}ApiData`, {
+        priority: LISTENER_RULE_PRIORITY.apiHost,
+        conditions: [elbv2.ListenerCondition.hostHeaders(apiHosts)],
+        action: elbv2.ListenerAction.forward([dataPlaneTg]),
+      });
     };
-    routeControlPlane(listener, 'Http');
+    routeApiHosts(listener, 'Http');
 
-    // HTTPS:443 with the api.vantagemind.ai cert (spec §1: add the HTTPS listener to
-    // the EXISTING ALB; keep the existing HTTP routing above). Only wired when DNS
-    // has provided the regional cert. Forwards to the SAME data-plane target group
-    // (no second TG — see the comment above).
-    if (apiCert) {
+    if (publicDns) {
+      const zone = importPublicZone(this);
+      // ONE certificate for every name the one listener answers: the api names AND
+      // the app names (D7 moved the dashboard/marketing site onto this ALB), the D6
+      // dual-host aliases included. It lives HERE, beside the listener, so a change of
+      // names (the D6 cutover drops the public names from dev) replaces it in-stack:
+      // CloudFormation issues the new certificate, moves the listener, and only then
+      // deletes the old one. (The retired DnsStack certs had to be deleted by a stack
+      // that deployed BEFORE the listener moved off them.)
+      const listenerCert = new acm.Certificate(this, 'ListenerCert', {
+        domainName: names.api,
+        subjectAlternativeNames: [...names.apiNames.slice(1), ...names.appNames],
+        validation: acm.CertificateValidation.fromDns(zone),
+      });
+      // HTTPS:443 — the data plane is the default (same target group as HTTP).
       const https = this.alb.addListener('Https', {
         port: 443,
         open: true,
-        certificates: [apiCert],
+        certificates: [listenerCert],
         defaultTargetGroups: [dataPlaneTg],
       });
-      routeControlPlane(https, 'Https');
-    }
+      routeApiHosts(https, 'Https');
+      this.httpsListener = https;
 
-    // api.vantagemind.ai -> this ALB (A + AAAA ALIAS). Zone already exists (spec §1).
-    if (hostedZone) {
+      // The app hosts on plain HTTP go to HTTPS — what the retired web ALB's :80
+      // listener did. (The api hosts keep answering on :80 exactly as before.)
+      listener.addAction('HttpAppToHttps', {
+        priority: LISTENER_RULE_PRIORITY.appHost,
+        conditions: [elbv2.ListenerCondition.hostHeaders([...names.appNames])],
+        action: elbv2.ListenerAction.redirect({ protocol: 'HTTPS', port: '443', permanent: true }),
+      });
+
+      // Every api name -> this ALB (A + AAAA ALIAS). Zone already exists (spec §1).
+      // recordIdFor keeps api.vantagemind.ai on its original ApiA/ApiAaaa ids, so the
+      // deployed records are updated in place, never re-created under a second id.
       const albTarget = route53.RecordTarget.fromAlias(
         new route53targets.LoadBalancerTarget(this.alb),
       );
-      new route53.ARecord(this, 'ApiA', {
-        zone: hostedZone,
-        recordName: DOMAINS.api,
-        target: albTarget,
-      });
-      new route53.AaaaRecord(this, 'ApiAaaa', {
-        zone: hostedZone,
-        recordName: DOMAINS.api,
-        target: albTarget,
-      });
+      const apiRecords: Construct[] = [];
+      for (const name of names.apiNames) {
+        const rid = recordIdFor(name);
+        apiRecords.push(
+          new route53.ARecord(this, `${rid}A`, { zone, recordName: name, target: albTarget }),
+          new route53.AaaaRecord(this, `${rid}Aaaa`, { zone, recordName: name, target: albTarget }),
+        );
+      }
+      // SNS posts the SubscriptionConfirmation the moment a subscription is created;
+      // the live routes auto-confirm it. When the endpoint names a host this same
+      // deploy is creating (api-dev.*), the subscription must wait for the host to
+      // resolve and the listener to present a certificate, or the one confirmation
+      // attempt lands on NXDOMAIN and the subscription stays pending forever.
+      for (const sub of [sesEventsSubscription, sesInboundSubscription]) {
+        sub.node.addDependency(https, ...apiRecords);
+      }
     }
+
+    this.sharedIngress = {
+      alb: this.alb,
+      listenerArn: (this.httpsListener ?? listener).listenerArn,
+      securityGroupId: this.alb.connections.securityGroups[0].securityGroupId,
+    };
   }
 }

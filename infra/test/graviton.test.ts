@@ -18,8 +18,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack, GRAVITON_RUNTIME } from '../lib/compute-stack';
-import { DnsStack } from '../lib/dns-stack';
-import { WebStack } from '../lib/web-stack';
+import { buildComputeAndWeb } from './support/stacks';
 import { getEnvConfig, OFFERING_REGION, EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
@@ -53,17 +52,8 @@ function backendTaskDefs(envName: EnvName) {
 }
 
 function webTaskDefs() {
-  const app = new App();
-  const envConfig = getEnvConfig('dev');
-  const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig });
-  const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig });
-  const web = new WebStack(app, 'Web', {
-    env: ENV,
-    envConfig,
-    vpc: net.vpc,
-    webCert: dns.webCert,
-    hostedZone: dns.hostedZone,
-  });
+  // The web tier hangs on the ComputeStack ALB since round 7 WP-8b (D7).
+  const { web } = buildComputeAndWeb('dev');
   return Template.fromStack(web).findResources('AWS::ECS::TaskDefinition');
 }
 

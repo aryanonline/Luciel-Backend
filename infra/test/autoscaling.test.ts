@@ -8,46 +8,13 @@
  * and a paused environment carries no scalable target at all (a floor of 1 would
  * hold a task up under a service the pause set to zero).
  */
-import { App } from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
-import { NetworkingStack } from '../lib/networking-stack';
-import { SecurityStack } from '../lib/security-stack';
-import { DataStack } from '../lib/data-stack';
-import { ComputeStack } from '../lib/compute-stack';
-import { WebStack } from '../lib/web-stack';
-import { DnsStack } from '../lib/dns-stack';
 import { CPU_TARGET_PERCENT, MEMORY_TARGET_PERCENT } from '../lib/service-scaling';
-import { applyContextOverrides, EnvName, getEnvConfig, OFFERING_REGION } from '../lib/env-config';
-
-const ENV = { account: '111111111111', region: OFFERING_REGION };
+import { EnvName, getEnvConfig } from '../lib/env-config';
+import { buildComputeAndWeb } from './support/stacks';
 
 function build(envName: EnvName, paused = false) {
-  const app = new App();
-  const envConfig = applyContextOverrides(getEnvConfig(envName), paused);
-  const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig });
-  const sec = new SecurityStack(app, 'Sec', { env: ENV, envConfig });
-  const data = new DataStack(app, 'Data', { env: ENV, envConfig, vpc: net.vpc, cmk: sec.cmk });
-  const compute = new ComputeStack(app, 'Compute', {
-    env: ENV,
-    envConfig,
-    vpc: net.vpc,
-    cmkArn: sec.cmk.keyArn,
-    transcriptArchiveBucket: data.transcriptArchiveBucket,
-    exportBucket: data.exportBucket,
-    voiceAudioBucket: data.voiceAudioBucket,
-    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
-    dbSecretArn: data.db.secret!.secretArn,
-    platformSecretArn: sec.platformSecret.secretArn,
-    redisUrl: data.redisUrl,
-  });
-  const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig });
-  const web = new WebStack(app, 'Web', {
-    env: ENV,
-    envConfig,
-    vpc: net.vpc,
-    webCert: dns.webCert,
-    hostedZone: dns.hostedZone,
-  });
+  const { compute, web } = buildComputeAndWeb(envName, { paused });
   return { compute: Template.fromStack(compute), web: Template.fromStack(web) };
 }
 
@@ -81,14 +48,14 @@ describe('autoscaling is an environment knob, not a production-posture side effe
     const { compute, web } = build('dev');
     expect(bounds(compute, 'DataPlane')).toEqual([1, 2]);
     expect(bounds(compute, 'ControlPlane')).toEqual([1, 2]);
-    expect(bounds(web, 'WebService')).toEqual([1, 2]);
+    expect(bounds(web, 'WebApp')).toEqual([1, 2]);
   });
 
   test('prod keeps the ceilings production posture always had; the web tier gains its own', () => {
     const { compute, web } = build('prod');
     expect(bounds(compute, 'DataPlane')).toEqual([2, 6]);
     expect(bounds(compute, 'ControlPlane')).toEqual([1, 3]);
-    expect(bounds(web, 'WebService')).toEqual([2, 4]);
+    expect(bounds(web, 'WebApp')).toEqual([2, 4]);
   });
 
   test.each<EnvName>(['dev', 'preprod', 'prod'])(

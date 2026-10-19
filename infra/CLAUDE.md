@@ -26,8 +26,24 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   (preprod/prod) gates cost-bearing telemetry and the paused-WAF exception;
   autoscaling has its own `autoscaling` knob (CPU + memory target tracking on
   both planes and the web tier; dev 1..2, prod as before — round 7 WP-8b);
-  dev data stores are RETAIN + deletion-protected (only preprod is disposable); NO environment has VPC interface endpoints (env-gated, ~$73/mo —
-  NAT already carries that traffic; round 7 WP-8b).
+  dev data stores are RETAIN + deletion-protected (only preprod is disposable);
+  NO environment has VPC interface endpoints (env-gated, ~$73/mo — NAT already
+  carries that traffic; round 7 WP-8b).
+- Hostnames are per environment (owner decision D6, round 7 WP-8b): every name comes
+  from `hostnames(envName)` in env-config.ts — dev `dev.` / `api-dev.` /
+  `embed-dev.vantagemind.ai`, preprod the same with `preprod`, prod the public
+  names. EXACTLY ONE environment has `ownsPublicApex` (dev today, serving the apex,
+  www, api and embed names as a dual-host); `apexOwner()` refuses to synth otherwise
+  and deploy.yml refuses a prod deploy while prod does not own them. Never hard-code a
+  hostname in a stack, a workflow or a script — `npx ts-node bin/hostnames.ts <env>`
+  prints them. The public records keep their original logical ids (`recordIdFor`).
+- ONE ALB per environment (D7): the web tier's target group hangs on ComputeStack's
+  listener behind the app-host rule (WebStack owns that rule and the SG rules); the
+  api hosts carry the control-plane path rules (re-grouped to the ALB's five
+  condition values per rule) and a data-plane catch-all; the data plane stays the
+  default action. The listener's ONE certificate lives in ComputeStack beside it (a
+  name change replaces it in-stack); the CloudFront cert is the `*.vantagemind.ai`
+  wildcard (WidgetCertStack, us-east-1) so no ownership flip touches it.
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
 - Dev deploys run `scripts/smoke_probe.sh` + the §10 verify task after migrating and
