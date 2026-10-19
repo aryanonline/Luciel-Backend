@@ -140,6 +140,14 @@ def degraded_bindings() -> list[str]:
     # Mock/CI keep the in-process fake by design, so its absence is not degraded there.
     if live_mode() and not os.environ.get(EXPORT_BUCKET_ENV):
         degraded.append("export_store:unbound")
+    # Round 7 WP-6 item 7: the embedding provider's last N calls all failed (quota,
+    # outage, key) — every knowledge answer is a hand-off until it answers again. A
+    # read of a process-level flag (app/knowledge/embeddings.py); mock embeds locally.
+    if live_mode():
+        from app.knowledge.embeddings import embeddings_degraded  # noqa: PLC0415
+
+        if embeddings_degraded():
+            degraded.append("embeddings:degraded")
     return degraded
 
 
