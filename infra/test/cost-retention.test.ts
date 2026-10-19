@@ -22,8 +22,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
-import { DnsStack } from '../lib/dns-stack';
-import { WebStack } from '../lib/web-stack';
+import { buildComputeAndWeb } from './support/stacks';
 import { WidgetStack } from '../lib/widget-stack';
 import { PipelineStack } from '../lib/pipeline-stack';
 import { ObservabilityStack } from '../lib/observability-stack';
@@ -68,19 +67,8 @@ function buildData(envName: EnvName = 'dev') {
 }
 
 function buildWeb(envName: EnvName = 'dev') {
-  const app = new App();
-  const envConfig = getEnvConfig(envName);
-  const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig });
-  const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig });
-  return Template.fromStack(
-    new WebStack(app, 'Web', {
-      env: ENV,
-      envConfig,
-      vpc: net.vpc,
-      webCert: dns.webCert,
-      hostedZone: dns.hostedZone,
-    }),
-  );
+  // The web tier hangs on the ComputeStack ALB since round 7 WP-8b (D7).
+  return Template.fromStack(buildComputeAndWeb(envName).web);
 }
 
 function buildWidget(envName: EnvName = 'prod') {

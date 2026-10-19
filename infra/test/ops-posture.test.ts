@@ -2,7 +2,7 @@
  * 2026-09-05 audit WP7-B: operations posture.
  *  - alarms are armed in every environment and refuse to synth without an inbox (F045);
  *  - the app's EMF metrics have alarms and a failed sweep TASK pages by itself (F032/F034);
- *  - production posture scales on load; dev keeps one task (F009);
+ *  - every environment scales on load inside its own ceilings (F009, round 7 WP-8b);
  *  - dev data stores are as hard to destroy as prod's; only preprod is disposable (F003);
  *  - the data plane polls mailboxes in-process and the schedule is an hourly backstop;
  *  - the app planes log JSON.
@@ -124,18 +124,19 @@ describe("alarms on the app's own metrics and on sweep task failures (F032/F034)
   });
 });
 
-describe('capacity follows posture (F009)', () => {
-  test('production posture scales both planes on CPU; dev keeps one task', () => {
-    const prod = build('prod').compute;
-    prod.resourceCountIs('AWS::ApplicationAutoScaling::ScalableTarget', 2);
-    prod.hasResourceProperties('AWS::ApplicationAutoScaling::ScalingPolicy', {
-      PolicyType: 'TargetTrackingScaling',
-      TargetTrackingScalingPolicyConfiguration: Match.objectLike({
-        TargetValue: 60,
-        PredefinedMetricSpecification: { PredefinedMetricType: 'ECSServiceAverageCPUUtilization' },
-      }),
-    });
-    build('dev').compute.resourceCountIs('AWS::ApplicationAutoScaling::ScalableTarget', 0);
+describe('capacity follows load (F009, widened round 7 WP-8b)', () => {
+  test('every environment scales both planes on CPU (memory is pinned in autoscaling.test.ts)', () => {
+    for (const envName of ['dev', 'prod'] as const) {
+      const compute = build(envName).compute;
+      compute.resourceCountIs('AWS::ApplicationAutoScaling::ScalableTarget', 2);
+      compute.hasResourceProperties('AWS::ApplicationAutoScaling::ScalingPolicy', {
+        PolicyType: 'TargetTrackingScaling',
+        TargetTrackingScalingPolicyConfiguration: Match.objectLike({
+          TargetValue: 60,
+          PredefinedMetricSpecification: { PredefinedMetricType: 'ECSServiceAverageCPUUtilization' },
+        }),
+      });
+    }
   });
 });
 

@@ -10,17 +10,12 @@ import { App, Stack } from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as path from 'node:path';
-import { NetworkingStack } from '../lib/networking-stack';
-import { SecurityStack } from '../lib/security-stack';
-import { DataStack } from '../lib/data-stack';
-import { ComputeStack } from '../lib/compute-stack';
 import { DnsStack } from '../lib/dns-stack';
-import { WebStack } from '../lib/web-stack';
 import { WidgetStack, WidgetCertStack } from '../lib/widget-stack';
+import { buildCompute, buildComputeAndWeb } from './support/stacks';
 import { PipelineStack } from '../lib/pipeline-stack';
 import {
   getEnvConfig,
-  applyContextOverrides,
   OFFERING_REGION,
   CLOUDFRONT_CERT_REGION,
 } from '../lib/env-config';
@@ -34,17 +29,8 @@ function dnsTemplate() {
 }
 
 function buildWeb(envName: 'dev' | 'preprod' | 'prod' = 'dev', paused = false) {
-  const app = new App();
-  const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig: getEnvConfig(envName) });
-  const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig: getEnvConfig(envName) });
-  const web = new WebStack(app, 'Web', {
-    env: ENV,
-    envConfig: applyContextOverrides(getEnvConfig(envName), paused),
-    vpc: net.vpc,
-    webCert: dns.webCert,
-    hostedZone: dns.hostedZone,
-  });
-  return Template.fromStack(web);
+  // The web tier hangs on the ComputeStack ALB since round 7 WP-8b (D7).
+  return Template.fromStack(buildComputeAndWeb(envName, { paused, publicDns: true }).web);
 }
 
 function buildWidget() {
@@ -84,24 +70,35 @@ describe('Residency lock holds for new stacks (§4.2 / LD 21)', () => {
     });
     expect(certStack.region).toBe('us-east-1');
     const t = Template.fromStack(certStack);
-    // Exactly one ACM cert for embed.vantagemind.ai, and NO ca-central-1 condition.
+    // The distribution's cert covers every embed host (wildcard: see widget-stack.ts),
+    // and there is NO ca-central-1 condition.
     t.hasResourceProperties('AWS::CertificateManager::Certificate', {
-      DomainName: 'embed.vantagemind.ai',
+      DomainName: '*.vantagemind.ai',
     });
     expect(JSON.stringify(t.findConditions('*'))).not.toContain(OFFERING_REGION);
   });
 });
 
-describe('DNS / certs (spec §1)', () => {
-  test('regional certs for api + apex(+www) are DNS-validated', () => {
+describe('DNS / certs (spec §1, reshaped round 7 WP-8b)', () => {
+  test('the Dns stack publishes the hostnames and no longer owns a certificate', () => {
     const t = dnsTemplate();
-    t.hasResourceProperties('AWS::CertificateManager::Certificate', {
-      DomainName: 'api.vantagemind.ai',
-      ValidationMethod: 'DNS',
+    // The listener certificate lives beside the listener (ComputeStack) now.
+    t.resourceCountIs('AWS::CertificateManager::Certificate', 0);
+    t.hasOutput('ApiBaseUrl', {
+      Value: 'https://api-dev.vantagemind.ai',
+      Export: { Name: 'Luciel-dev-ApiBaseUrl' },
     });
+    t.hasOutput('AppBaseUrl', { Value: 'https://dev.vantagemind.ai' });
+    t.hasOutput('EmbedHost', { Value: 'embed-dev.vantagemind.ai' });
+  });
+
+  test('the one regional certificate is DNS-validated and covers the api + app names', () => {
+    const t = Template.fromStack(buildCompute('dev', { publicDns: true }).compute);
+    t.resourceCountIs('AWS::CertificateManager::Certificate', 1);
     t.hasResourceProperties('AWS::CertificateManager::Certificate', {
-      DomainName: 'vantagemind.ai',
-      SubjectAlternativeNames: Match.arrayWith(['www.vantagemind.ai']),
+      DomainName: 'api-dev.vantagemind.ai',
+      ValidationMethod: 'DNS',
+      SubjectAlternativeNames: Match.arrayWith(['vantagemind.ai', 'www.vantagemind.ai']),
     });
   });
 });
@@ -114,17 +111,28 @@ describe('Web service (spec §2 — mirrors backend ECS)', () => {
     });
   });
 
-  test('runs a Fargate service fronted by an ALB with an HTTPS:443 listener', () => {
+  test('runs ONE Fargate service and no load balancer of its own (D7)', () => {
     const t = buildWeb();
     t.resourceCountIs('AWS::ECS::Service', 1);
-    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', { Port: 443 });
-    // HTTP:80 redirects to HTTPS.
-    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
-      Port: 80,
-      DefaultActions: Match.arrayWith([
-        Match.objectLike({ Type: 'redirect', RedirectConfig: Match.objectLike({ Protocol: 'HTTPS' }) }),
-      ]),
-    });
+    t.resourceCountIs('AWS::ElasticLoadBalancingV2::LoadBalancer', 0);
+    t.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 0);
+    // Its target group joins the shared listener behind the app-host rule.
+    t.resourceCountIs('AWS::ElasticLoadBalancingV2::ListenerRule', 1);
+  });
+
+  test('plain-HTTP app hosts still redirect to HTTPS (the retired ALB :80 behavior)', () => {
+    Template.fromStack(buildCompute('dev', { publicDns: true }).compute).hasResourceProperties(
+      'AWS::ElasticLoadBalancingV2::ListenerRule',
+      {
+        Conditions: Match.arrayWith([
+          Match.objectLike({
+            Field: 'host-header',
+            HostHeaderConfig: { Values: ['dev.vantagemind.ai', 'vantagemind.ai', 'www.vantagemind.ai'] },
+          }),
+        ]),
+        Actions: [Match.objectLike({ Type: 'redirect', RedirectConfig: Match.objectLike({ Protocol: 'HTTPS' }) })],
+      },
+    );
   });
 
   test('health check targets the SSR root path', () => {
@@ -161,11 +169,11 @@ describe('Widget CDN (spec §3)', () => {
     });
   });
 
-  test('CloudFront serves embed.vantagemind.ai over TLS via OAC', () => {
+  test("CloudFront serves dev's embed hosts (embed-dev + the D6 dual-host) over TLS via OAC", () => {
     const t = buildWidget();
     t.hasResourceProperties('AWS::CloudFront::Distribution', {
       DistributionConfig: Match.objectLike({
-        Aliases: ['embed.vantagemind.ai'],
+        Aliases: ['embed-dev.vantagemind.ai', 'embed.vantagemind.ai'],
         ViewerCertificate: Match.objectLike({ MinimumProtocolVersion: 'TLSv1.2_2021' }),
       }),
     });
@@ -210,41 +218,19 @@ describe('Frontend deploy role (spec §4)', () => {
   });
 });
 
-describe('Backend ALB gains the api HTTPS listener (spec §1)', () => {
-  function buildCompute() {
-    const app = new App();
-    const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig: getEnvConfig('dev') });
-    const sec = new SecurityStack(app, 'Sec', { env: ENV, envConfig: getEnvConfig('dev') });
-    const data = new DataStack(app, 'Data', { env: ENV, envConfig: getEnvConfig('dev'), vpc: net.vpc, cmk: sec.cmk });
-    const dns = new DnsStack(app, 'Dns', { env: ENV, envConfig: getEnvConfig('dev') });
-    const compute = new ComputeStack(app, 'Compute', {
-      env: ENV,
-      envConfig: getEnvConfig('dev'),
-      vpc: net.vpc,
-      cmkArn: sec.cmk.keyArn,
-      transcriptArchiveBucket: data.transcriptArchiveBucket,
-      exportBucket: data.exportBucket, voiceAudioBucket: data.voiceAudioBucket,
-    knowledgeOriginalsBucket: data.knowledgeOriginalsBucket,
-      dbSecretArn: data.db.secret!.secretArn,
-      platformSecretArn: sec.platformSecret.secretArn,
-      redisUrl: data.redisUrl,
-      apiCert: dns.apiCert,
-      hostedZone: dns.hostedZone,
-    });
-    return Template.fromStack(compute);
-  }
-
+describe('Backend ALB carries the HTTPS listener and the api aliases (spec §1)', () => {
   test('compute adds a 443 listener and keeps the existing HTTP:80 routing', () => {
-    const t = buildCompute();
+    const t = Template.fromStack(buildCompute('dev', { publicDns: true }).compute);
     t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', { Port: 443 });
     t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', { Port: 80 });
   });
 
-  test('an api.vantagemind.ai ALIAS record points at the ALB', () => {
-    buildCompute().hasResourceProperties('AWS::Route53::RecordSet', {
-      Name: 'api.vantagemind.ai.',
-      Type: 'A',
-    });
+  test('api-dev.vantagemind.ai AND (dual-host) api.vantagemind.ai ALIAS records point at the ALB', () => {
+    const t = Template.fromStack(buildCompute('dev', { publicDns: true }).compute);
+    for (const name of ['api-dev.vantagemind.ai.', 'api.vantagemind.ai.']) {
+      t.hasResourceProperties('AWS::Route53::RecordSet', { Name: name, Type: 'A' });
+      t.hasResourceProperties('AWS::Route53::RecordSet', { Name: name, Type: 'AAAA' });
+    }
   });
 });
 

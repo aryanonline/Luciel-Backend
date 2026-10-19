@@ -4,15 +4,36 @@
  * apps/web (Luciel-Frontend) is a server-rendered Next.js app (force-dynamic +
  * per-request CSP middleware) — it must run as a long-lived Node server, NOT a
  * static export (see Luciel-Frontend/DEPLOY.md). So it deploys exactly like the
- * backend: an ECS Fargate service behind an ALB. apex vantagemind.ai + www ->
- * this ALB (no CloudFront in front of SSR; simplest correct entry per spec §1).
+ * backend: an ECS Fargate service behind an ALB.
+ *
+ * ONE ALB PER ENVIRONMENT (round 7 WP-8b, owner decision D7). This stack used to run
+ * its own internet-facing ALB (~$18/month standing, a second WAF association, a
+ * second certificate). The web service now registers its target group on the
+ * ComputeStack ALB behind a HOST rule — the environment's app hostnames
+ * (env-config.ts `hostnames`: dev.vantagemind.ai, plus the D6 dual-host apex/www
+ * while dev owns them) → this target group — and its A/AAAA aliases point at that
+ * ALB. The listener rule, the target group and both security-group rules live HERE
+ * (the shared listener and the ALB's security group are imported by id), so the
+ * Compute stack never points back at this one.
+ *
+ * THE SWITCH IS ONE DEPLOY, WITHOUT A DARK WINDOW. The service the old ALB served is
+ * replaced by a NEW service construct (`WebAppService`) rather than re-pointed: an
+ * ECS service moved from one target group to another drains its old target while
+ * the DNS still names the old ALB. CloudFormation instead (1) creates the target
+ * group + host rule on the shared ALB, (2) creates the new service and waits until
+ * its task is healthy behind that rule, (3) only then UPDATES the apex/www records
+ * in place (same logical ids — an alias-target change is an atomic Route 53 UPSERT)
+ * to the shared ALB, and (4) in its cleanup phase deletes the old service, the old
+ * listeners, target group and ALB — after the records have moved, so nothing is
+ * orphaned and no name ever points at an empty target group. bin/luciel-infra.ts
+ * orders EdgeStack (which drops the old ALB's WebACL association) before this stack.
  *
  * CROSS-REPO IMAGE: the web image is built from the FRONTEND repo (Dockerfile at
  * apps/web/Dockerfile, build context = frontend repo root), which this backend CDK
  * app cannot see at synth. So — like the backend — the image is built in CI and
  * pushed to an ECR repo this stack OWNS (luciel-<env>-web). The service references
  * the image by tag (`-c webImageTag=<sha>`, default `latest`); the frontend CI
- * pushes the tag then rolls the service. No Docker is needed at synth.
+ * pushes the tag then rolls every service in the cluster. No Docker is needed at synth.
  *
  * Region-locked ca-central-1 via the residency guard, like every in-region stack.
  */
@@ -22,31 +43,37 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
-import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { EnvConfig, DOMAINS } from './env-config';
+import { EnvConfig, baseUrls, hostnames, recordIdFor } from './env-config';
 import { ResidencyGuard } from './residency';
+import { scaleOnLoad } from './service-scaling';
+import { LISTENER_RULE_PRIORITY, SharedIngress } from './compute-stack';
+import { importPublicZone } from './dns-stack';
 
 export interface WebStackProps extends StackProps {
   readonly envConfig: EnvConfig;
   readonly vpc: ec2.IVpc;
-  /** Regional (ca-central-1) cert for vantagemind.ai (+www) — the web ALB listener. */
-  readonly webCert: acm.ICertificate;
-  /** Existing hosted zone (looked up in DnsStack) for the apex/www ALIAS records. */
-  readonly hostedZone: route53.IHostedZone;
+  /** The environment's ONE load balancer (ComputeStack.sharedIngress, D7). */
+  readonly ingress: SharedIngress;
+  /**
+   * Write the app hostnames' A/AAAA aliases (to the shared ALB). Off by default so
+   * the stack synthesizes standalone; bin/luciel-infra.ts turns it on.
+   */
+  readonly publicDns?: boolean;
 }
 
 export class WebStack extends Stack {
-  public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly service: ecs.FargateService;
+  public readonly targetGroup: elbv2.ApplicationTargetGroup;
   public readonly ecrRepo: ecr.Repository;
   public readonly cluster: ecs.Cluster;
 
   constructor(scope: Construct, id: string, props: WebStackProps) {
     super(scope, id, props);
-    const { envConfig, vpc, webCert, hostedZone } = props;
+    const { envConfig, vpc, ingress, publicDns } = props;
+    const names = hostnames(envConfig.envName);
 
     new ResidencyGuard(this, 'Residency');
 
@@ -111,8 +138,10 @@ export class WebStack extends Stack {
         NODE_ENV: 'production',
         PORT: '3000',
         // Public, non-secret. The image bakes NEXT_PUBLIC_* at build time, but we
-        // also set the runtime API base so server components resolve correctly.
-        NEXT_PUBLIC_API_BASE_URL: `https://${DOMAINS.api}`,
+        // also set the runtime API base so server components resolve correctly —
+        // the environment's OWN api origin (D6: api-dev.* for dev), derived from the
+        // same helper as the backend's API_BASE_URL.
+        NEXT_PUBLIC_API_BASE_URL: baseUrls(envConfig.envName).api,
         NEXT_PUBLIC_API_ADAPTER: 'http',
       },
       portMappings: [{ containerPort: 3000 }],
@@ -120,7 +149,10 @@ export class WebStack extends Stack {
 
     // Cheap-idle pause: desiredCount 0 across the env when paused (§ pause/resume).
     const baseCount = envConfig.multiAz ? 2 : 1;
-    this.service = new ecs.FargateService(this, 'WebService', {
+    // A NEW construct id on purpose (the old ALB's service was `WebService`): see the
+    // header — the replacement comes up healthy behind the shared ALB BEFORE the
+    // records move, and the old one is deleted only afterwards.
+    this.service = new ecs.FargateService(this, 'WebAppService', {
       cluster: this.cluster,
       taskDefinition: taskDef,
       desiredCount: envConfig.paused ? 0 : baseCount,
@@ -131,59 +163,66 @@ export class WebStack extends Stack {
       circuitBreaker: { rollback: true },
       minHealthyPercent: 100,
     });
+    // Same load-following policy as the backend planes (round 7 WP-8b): CPU and
+    // memory, floor = the base count, ceiling = the environment's maxWeb.
+    scaleOnLoad(envConfig, this.service, 'Web', baseCount, envConfig.autoscaling.maxWeb);
 
-    this.alb = new elbv2.ApplicationLoadBalancer(this, 'WebAlb', {
+    // The shared listener and the ALB's security group, imported in THIS stack's
+    // scope: the target-group registration then writes the ALB→task egress rule and
+    // the task's ingress rule here (allowAllOutbound:false is what lets the imported
+    // group take the egress rule), and ComputeStack never references this stack.
+    const albSg = ec2.SecurityGroup.fromSecurityGroupId(this, 'SharedAlbSg', ingress.securityGroupId, {
+      allowAllOutbound: false,
+    });
+    const sharedListener = elbv2.ApplicationListener.fromApplicationListenerAttributes(
+      this,
+      'SharedListener',
+      { listenerArn: ingress.listenerArn, securityGroup: albSg },
+    );
+
+    // The SSR container on 3000, health check on `/` (spec §2) — unchanged from the
+    // retired ALB's target group. A 30 s deregistration delay (the default is 300 s):
+    // an SSR request is short, and every web deploy waits out this drain.
+    this.targetGroup = new elbv2.ApplicationTargetGroup(this, 'WebAppTargets', {
       vpc,
-      internetFacing: true,
-    });
-
-    // HTTP:80 -> redirect to HTTPS (SSR app should always be TLS).
-    this.alb.addListener('Http', {
-      port: 80,
-      open: true,
-      defaultAction: elbv2.ListenerAction.redirect({
-        protocol: 'HTTPS',
-        port: '443',
-        permanent: true,
-      }),
-    });
-
-    // HTTPS:443 -> the SSR container on 3000, health check on `/` (spec §2).
-    const https = this.alb.addListener('Https', {
-      port: 443,
-      open: true,
-      certificates: [webCert],
-    });
-    https.addTargets('WebTargets', {
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [this.service],
+      deregistrationDelay: Duration.seconds(30),
       healthCheck: {
         path: '/',
         healthyHttpCodes: '200-399',
         interval: Duration.seconds(30),
       },
     });
+    // App hostnames → the web tier, ahead of every api rule (priority band appHost).
+    const hostRule = new elbv2.ApplicationListenerRule(this, 'WebAppHostRule', {
+      listener: sharedListener,
+      priority: LISTENER_RULE_PRIORITY.appHost,
+      conditions: [elbv2.ListenerCondition.hostHeaders([...names.appNames])],
+      targetGroups: [this.targetGroup],
+    });
 
-    // apex + www -> web ALB (A + AAAA ALIAS). Zone already exists (spec §1).
-    const albTarget = route53.RecordTarget.fromAlias(
-      new route53targets.LoadBalancerTarget(this.alb),
-    );
-    new route53.ARecord(this, 'ApexA', {
-      zone: hostedZone,
-      recordName: DOMAINS.apex,
-      target: albTarget,
-    });
-    new route53.AaaaRecord(this, 'ApexAaaa', {
-      zone: hostedZone,
-      recordName: DOMAINS.apex,
-      target: albTarget,
-    });
-    new route53.ARecord(this, 'WwwA', {
-      zone: hostedZone,
-      recordName: DOMAINS.www,
-      target: albTarget,
-    });
+    if (publicDns) {
+      // Every app name -> the SHARED ALB (A + AAAA ALIAS). recordIdFor keeps the
+      // apex and www on their original ApexA/ApexAaaa/WwwA ids so the deployed
+      // records are UPDATED in place (an atomic alias-target change), never deleted
+      // and re-created. Each record waits for the new service (and so its healthy
+      // target behind the host rule) before it moves.
+      const zone = importPublicZone(this);
+      const albTarget = route53.RecordTarget.fromAlias(
+        new route53targets.LoadBalancerTarget(ingress.alb),
+      );
+      for (const name of names.appNames) {
+        const rid = recordIdFor(name);
+        for (const rec of [
+          new route53.ARecord(this, `${rid}A`, { zone, recordName: name, target: albTarget }),
+          new route53.AaaaRecord(this, `${rid}Aaaa`, { zone, recordName: name, target: albTarget }),
+        ]) {
+          rec.node.addDependency(this.service, hostRule);
+        }
+      }
+    }
 
     new CfnOutput(this, 'WebEcrRepoUri', { value: this.ecrRepo.repositoryUri });
     new CfnOutput(this, 'WebServiceName', { value: this.service.serviceName });
@@ -195,6 +234,5 @@ export class WebStack extends Stack {
       value: this.cluster.clusterName,
       exportName: `Luciel-${envConfig.envName}-WebClusterName`,
     });
-    new CfnOutput(this, 'WebAlbDns', { value: this.alb.loadBalancerDnsName });
   }
 }

@@ -39,14 +39,24 @@ export const SWEEP_ERROR_METRIC = {
 } as const;
 
 /**
- * Founder-confirmed public domains (DEPLOY.md / DEVOPS §9). The founder owns
- * vantagemind.ai only — there is no .com.
+ * The registrable domain every environment's hostnames live under. The founder owns
+ * vantagemind.ai only — there is no .com (DEPLOY.md / DEVOPS §9). It is also the SES
+ * domain identity (one per account, shared by every environment).
  */
-export const DOMAINS = {
-  apex: 'vantagemind.ai',
-  www: 'www.vantagemind.ai',
-  api: 'api.vantagemind.ai',
-  widget: 'embed.vantagemind.ai',
+export const APEX_DOMAIN = 'vantagemind.ai';
+
+/**
+ * The PUBLIC product names — the ones customers, OAuth consoles and embed snippets
+ * know. Owner decision D6 (2026-09-14): exactly ONE environment serves them at a
+ * time, the one whose `ownsPublicApex` is true. Today that is dev (as a dual-host
+ * beside its own dev.* names); a production environment claims them by flipping both
+ * flags in one commit (see `hostnames` and the cutover order in deploy.yml).
+ */
+export const PUBLIC_HOSTNAMES = {
+  app: APEX_DOMAIN,
+  www: `www.${APEX_DOMAIN}`,
+  api: `api.${APEX_DOMAIN}`,
+  embed: `embed.${APEX_DOMAIN}`,
 } as const;
 
 /**
@@ -55,7 +65,7 @@ export const DOMAINS = {
  */
 export const HOSTED_ZONE = {
   id: 'Z0203683JUDTD67YTV93',
-  name: 'vantagemind.ai',
+  name: APEX_DOMAIN,
 } as const;
 
 export interface EnvConfig {
@@ -151,13 +161,45 @@ export interface EnvConfig {
   /**
    * Whether the VPC gets interface endpoints (Secrets Manager, ECR, ECR-Docker,
    * CloudWatch Logs, STS). They exist to keep that traffic off the NAT path, but
-   * five endpoints x two AZs is ~$73/month of standing cost — the single largest
-   * line item in an idle dev environment, which already has a NAT gateway that
-   * serves the same traffic for pennies at dev volume. So dev goes without and
-   * rides NAT; preprod/prod keep the endpoints for throughput and blast-radius
-   * isolation. The free S3 GATEWAY endpoint stays in every environment.
+   * five endpoints x two AZs is ~$73/month of standing cost whether or not a byte
+   * flows. FALSE in every environment since round 7 WP-8b: each environment
+   * already pays for NAT (one in dev, one per AZ in preprod/prod) and the NAT
+   * carries this exact traffic for metered pennies at our volume, so prod was
+   * paying for the same reachability twice. The endpoints are not a security
+   * control here — the tasks egress through NAT for the LLM/Twilio/Stripe calls
+   * anyway. The future option, if Secrets Manager reachability ever needs to
+   * survive a NAT outage, is the SECRETS MANAGER endpoint alone (~$15/month for
+   * two AZs), not the set of five. The free S3 GATEWAY endpoint stays in every
+   * environment (ECR layer pulls ride it).
    */
   readonly vpcInterfaceEndpoints: boolean;
+  /**
+   * Target-tracking autoscaling of the request-serving services (both backend
+   * planes and the web tier; lib/service-scaling.ts — CPU AND memory). Round 7
+   * WP-8b: the policy used to hide behind productionPosture, so dev — which serves
+   * the public product — pinned one task per plane and a busy hour simply queued.
+   * Dev now scales too, inside deliberately small ceilings (1..2) so a runaway
+   * cannot become a bill; preprod/prod keep the ceilings they had. The FLOOR is
+   * each service's base count (multi-AZ: 2 data-plane tasks, otherwise 1).
+   */
+  readonly autoscaling: {
+    readonly enabled: boolean;
+    readonly maxDataPlane: number;
+    readonly maxControlPlane: number;
+    readonly maxWeb: number;
+  };
+  /**
+   * Whether this environment ALSO serves the public product names
+   * (PUBLIC_HOSTNAMES: the apex, www, api, embed) — owner decision D6. EXACTLY ONE
+   * environment may own them (test/hostnames.test.ts; `apexOwner()` refuses to synth
+   * otherwise): two stacks cannot both hold the same Route 53 record or CloudFront
+   * alias, and two environments answering on one name would split a customer's
+   * session across two databases. Dev owns them today so nothing goes dark while no
+   * production environment exists; prod claims them by flipping BOTH flags in one
+   * commit (dev deploys first to release them, then prod — deploy.yml's prod job
+   * refuses to run while prod does not own them).
+   */
+  readonly ownsPublicApex: boolean;
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -188,6 +230,11 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     monthlyBudgetUsd: 250,
     imageRepoName: 'luciel-backend-dev',
     vpcInterfaceEndpoints: false,
+    // Small ceilings on purpose: dev may double under load, never more.
+    autoscaling: { enabled: true, maxDataPlane: 2, maxControlPlane: 2, maxWeb: 2 },
+    // D6: dev serves the public names as a dual-host until a production environment
+    // claims them (flip this and prod's together).
+    ownsPublicApex: true,
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate
@@ -219,7 +266,13 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     monthlyBudgetUsd: 400,
     // The release rehearsal runs the exact gated artifact prod will run.
     imageRepoName: 'luciel-backend-prod',
-    vpcInterfaceEndpoints: true,
+    // Mirrors prod (see the field doc): NAT carries the AWS-API traffic.
+    vpcInterfaceEndpoints: false,
+    // Prod-shaped, so the rehearsal runs the policy prod runs.
+    autoscaling: { enabled: true, maxDataPlane: 6, maxControlPlane: 3, maxWeb: 4 },
+    // Never: an ephemeral environment holding the public names would take them dark
+    // at every teardown. It rehearses on preprod.* / api-preprod.* / embed-preprod.*.
+    ownsPublicApex: false,
   },
   prod: {
     envName: 'prod',
@@ -241,14 +294,21 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // lists the gateway as degraded rather than implying billing reaches Stripe.
     stripeIntegrationPosture: 'mock',
     // Prod's standing run-rate is ~$750–900/mo before traffic (RDS r6g.large
-    // Multi-AZ ≈ $380, Fargate ≈ $180, interface endpoints ≈ $73, NAT ≈ $70,
-    // 2×ALB ≈ $36, Redis + misc). The previous 400 sat at roughly HALF that,
+    // Multi-AZ ≈ $380, Fargate ≈ $180, NAT ≈ $70, ALB ≈ $18, Redis + misc; the
+    // interface endpoints (≈ $73) and the second ALB (≈ $18) left in round 7 WP-8b). The previous 400 sat at roughly HALF that,
     // so the alarm would have fired permanently from day one and trained
     // alert-blindness. 1000 restores meaning: 80% (~$800) marks the top of
     // normal, 100% means something real changed.
     monthlyBudgetUsd: 1000,
     imageRepoName: 'luciel-backend-prod',
-    vpcInterfaceEndpoints: true,
+    // Round 7 WP-8b: NAT (one per AZ) already carries this traffic; paying ~$73/mo
+    // for five interface endpoints on top bought the same reachability twice.
+    vpcInterfaceEndpoints: false,
+    // The ceilings production posture always had (F009); web gains its own.
+    autoscaling: { enabled: true, maxDataPlane: 6, maxControlPlane: 3, maxWeb: 4 },
+    // Prod's names ARE the public names, but dev holds them until the cutover: flip
+    // this to true and dev's to false in the same commit when prod claims them.
+    ownsPublicApex: false,
   },
 };
 
@@ -267,4 +327,145 @@ export function getEnvConfig(envName: EnvName): EnvConfig {
  */
 export function applyContextOverrides(cfg: EnvConfig, paused: boolean): EnvConfig {
   return paused ? { ...cfg, paused: true } : cfg;
+}
+
+/**
+ * The ONE environment that serves the public names (D6). Throws unless exactly one
+ * config owns them and it is not the ephemeral preprod — bin/luciel-infra.ts calls it
+ * so a config that breaks the rule cannot even synthesize.
+ */
+export function apexOwner(): EnvName {
+  const owners = (Object.keys(CONFIGS) as EnvName[]).filter((e) => CONFIGS[e].ownsPublicApex);
+  if (owners.length !== 1) {
+    throw new Error(
+      `exactly one environment may own the public apex names; found ${owners.length} ` +
+        `(${owners.join(', ') || 'none'}) — flip the old owner and the new one in the same commit`,
+    );
+  }
+  if (owners[0] === 'preprod') {
+    throw new Error('preprod is torn down after every release; it may never own the public apex');
+  }
+  return owners[0];
+}
+
+/** Every hostname an environment answers on, by tier — the D6 naming in one place. */
+export interface EnvHostnames {
+  /** Primary dashboard/marketing host (APP_BASE_URL, the cookie's registrable domain). */
+  readonly app: string;
+  /** Primary API host (API_BASE_URL, NEXT_PUBLIC_API_BASE_URL, SeedTest, the smoke probe). */
+  readonly api: string;
+  /** Primary widget CDN host. */
+  readonly embed: string;
+  /** Every OTHER name the environment answers on (the dual-host), flattened. */
+  readonly aliases: readonly string[];
+  /** All names per tier, primary first: certificates, records and ALB host rules iterate these. */
+  readonly appNames: readonly string[];
+  readonly apiNames: readonly string[];
+  readonly embedNames: readonly string[];
+}
+
+/**
+ * The label a non-production environment's names carry: dev.vantagemind.ai,
+ * api-dev.vantagemind.ai, embed-dev.vantagemind.ai (owner decision D6). `null` = the
+ * environment's own names are the public ones (prod).
+ */
+const ENV_HOST_LABEL: Record<EnvName, string | null> = {
+  dev: 'dev',
+  preprod: 'preprod',
+  prod: null,
+};
+
+/**
+ * hostnames(envName) → { app, api, embed, aliases } (owner decision D6, 2026-09-14).
+ *
+ *   dev     → dev.vantagemind.ai / api-dev.vantagemind.ai / embed-dev.vantagemind.ai,
+ *             PLUS — while it owns the public apex — vantagemind.ai, www, api, embed
+ *             as aliases (the dual-host that keeps the public names lit until a
+ *             production environment claims them);
+ *   preprod → preprod.vantagemind.ai / api-preprod.vantagemind.ai / embed-preprod...
+ *             (its own names: the ephemeral rehearsal never touches the public ones);
+ *   prod    → vantagemind.ai (+ www) / api.vantagemind.ai / embed.vantagemind.ai.
+ *
+ * Replaces the old flat DOMAINS const, which every stack read unqualified — so dev,
+ * preprod and prod all claimed api.vantagemind.ai, and the preprod rehearsal could
+ * not even create its records while dev held them.
+ */
+export function hostnames(envName: EnvName): EnvHostnames {
+  return hostnamesFor(envName, getEnvConfig(envName).ownsPublicApex);
+}
+
+/**
+ * `hostnames` for an explicit ownership — the shape an environment takes on either
+ * side of the D6 cutover (dev without the public names, prod with them), so the
+ * cutover can be tested before the flags flip.
+ */
+export function hostnamesFor(envName: EnvName, ownsPublicApex: boolean): EnvHostnames {
+  const label = ENV_HOST_LABEL[envName];
+  if (label === null) {
+    // The environment's own names are the public ones.
+    return {
+      app: PUBLIC_HOSTNAMES.app,
+      api: PUBLIC_HOSTNAMES.api,
+      embed: PUBLIC_HOSTNAMES.embed,
+      aliases: [PUBLIC_HOSTNAMES.www],
+      appNames: [PUBLIC_HOSTNAMES.app, PUBLIC_HOSTNAMES.www],
+      apiNames: [PUBLIC_HOSTNAMES.api],
+      embedNames: [PUBLIC_HOSTNAMES.embed],
+    };
+  }
+  const own = {
+    app: `${label}.${APEX_DOMAIN}`,
+    api: `api-${label}.${APEX_DOMAIN}`,
+    embed: `embed-${label}.${APEX_DOMAIN}`,
+  };
+  const dual = ownsPublicApex;
+  const appAliases = dual ? [PUBLIC_HOSTNAMES.app, PUBLIC_HOSTNAMES.www] : [];
+  const apiAliases = dual ? [PUBLIC_HOSTNAMES.api] : [];
+  const embedAliases = dual ? [PUBLIC_HOSTNAMES.embed] : [];
+  return {
+    ...own,
+    aliases: [...appAliases, ...apiAliases, ...embedAliases],
+    appNames: [own.app, ...appAliases],
+    apiNames: [own.api, ...apiAliases],
+    embedNames: [own.embed, ...embedAliases],
+  };
+}
+
+/**
+ * True when an environment's own names are the public ones but it does not own them
+ * (prod before the D6 cutover). Its stacks would collide with the owner's records and
+ * CloudFront alias, and its smoke probe would be answered by the OWNER's API — a
+ * green probe proving the wrong environment. deploy.yml refuses such a deploy.
+ */
+export function servesUnownedPublicNames(envName: EnvName): boolean {
+  return ENV_HOST_LABEL[envName] === null && !getEnvConfig(envName).ownsPublicApex;
+}
+
+/** `https://` origins for the primary app and API hosts (the per-environment base URLs). */
+export function baseUrls(envName: EnvName): { readonly app: string; readonly api: string } {
+  const h = hostnames(envName);
+  return { app: `https://${h.app}`, api: `https://${h.api}` };
+}
+
+/**
+ * Stable construct id for a hostname's Route 53 records. The four public names keep
+ * the ids their records have always had (ApexA, WwwA, ApiA, WidgetA …) so the
+ * records already deployed are UPDATED in place — a new id would make CloudFormation
+ * create a second record set for the same name (which fails: it already exists)
+ * before deleting the old one. Every other name derives its id from its label:
+ * api-dev.vantagemind.ai → ApiDev.
+ */
+export function recordIdFor(hostname: string): string {
+  if (hostname === PUBLIC_HOSTNAMES.app) return 'Apex';
+  if (hostname === PUBLIC_HOSTNAMES.embed) return 'Widget';
+  const suffix = `.${APEX_DOMAIN}`;
+  if (!hostname.endsWith(suffix)) {
+    throw new Error(`${hostname} is not under ${APEX_DOMAIN}`);
+  }
+  const label = hostname.slice(0, -suffix.length);
+  return label
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1))
+    .join('');
 }

@@ -23,13 +23,38 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   environment and ObservabilityStack refuses to synth without `-c alarmEmail`/
   `-c budgetAlertEmail`; the app's EMF metrics (namespace `Luciel`) and ECS
   task-state rules for failed sweep tasks alarm too; `productionPosture`
-  (preprod/prod) gates cost-bearing telemetry, the paused-WAF exception and
-  autoscaling; dev data stores are RETAIN + deletion-protected (only preprod is
-  disposable); dev has NO VPC interface endpoints (env-gated, ~$73/mo).
+  (preprod/prod) gates cost-bearing telemetry and the paused-WAF exception;
+  autoscaling has its own `autoscaling` knob (CPU + memory target tracking on
+  both planes and the web tier; dev 1..2, prod as before — round 7 WP-8b);
+  dev data stores are RETAIN + deletion-protected (only preprod is disposable);
+  NO environment has VPC interface endpoints (env-gated, ~$73/mo — NAT already
+  carries that traffic; round 7 WP-8b).
+- Hostnames are per environment (owner decision D6, round 7 WP-8b): every name comes
+  from `hostnames(envName)` in env-config.ts — dev `dev.` / `api-dev.` /
+  `embed-dev.vantagemind.ai`, preprod the same with `preprod`, prod the public
+  names. EXACTLY ONE environment has `ownsPublicApex` (dev today, serving the apex,
+  www, api and embed names as a dual-host); `apexOwner()` refuses to synth otherwise
+  and deploy.yml refuses a prod deploy while prod does not own them. Never hard-code a
+  hostname in a stack, a workflow or a script — `npx ts-node bin/hostnames.ts <env>`
+  prints them. The public records keep their original logical ids (`recordIdFor`).
+- ONE ALB per environment (D7): the web tier's target group hangs on ComputeStack's
+  listener behind the app-host rule (WebStack owns that rule and the SG rules); the
+  api hosts carry the control-plane path rules (re-grouped to the ALB's five
+  condition values per rule) and a data-plane catch-all; the data plane stays the
+  default action. The listener's ONE certificate lives in ComputeStack beside it (a
+  name change replaces it in-stack); the CloudFront cert is the `*.vantagemind.ai`
+  wildcard (WidgetCertStack, us-east-1) so no ownership flip touches it.
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
-- Dev deploys run `scripts/smoke_probe.sh` + the §10 verify task after migrating and
-  roll the app services back to the recorded task definitions on failure.
+- Dev AND prod deploys (round 7 migrations review / WP-8b): apply the Pipeline stack's
+  grants first, record the serving task definitions, MIGRATE WITH THE NEW IMAGE BEFORE
+  THE ROLL (`scripts/migrate-before-roll.sh`: a registered revision of the current
+  MigrationTask with the image swapped, deregistered afterwards), deploy, re-run the
+  migration as a no-op safety, then `scripts/smoke_probe.sh <env>` + the §10 verify
+  task (+ on dev the strict D10 SeedTest gate when live) — rolling the SERVICES back
+  if any post-roll step fails. Migrations stay expand-first (old code runs on the new
+  schema for the length of the roll). The prod job refuses to run while prod does not
+  own the public names (D6).
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.

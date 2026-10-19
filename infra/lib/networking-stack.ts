@@ -51,11 +51,12 @@ export class NetworkingStack extends Stack {
     // ECR layer pulls.
     //
     // Interface endpoints are ENV-GATED (env-config.ts vpcInterfaceEndpoints): five
-    // endpoints x two AZs is ~$73/month whether or not a single request flows, which
-    // made them the largest line item in an idle dev environment. Dev rides its NAT
-    // gateway for this traffic instead (same reachability, metered pennies at dev
-    // volume); preprod/prod keep the endpoints. The S3 GATEWAY endpoint below is
-    // free and stays everywhere.
+    // endpoints x two AZs is ~$73/month whether or not a single request flows. Every
+    // environment rides its NAT gateway(s) for this traffic since round 7 WP-8b —
+    // same reachability, metered pennies at our volume, and prod was paying for NAT
+    // AND the endpoints at once. The construct stays so the flag can bring them back
+    // (the documented future option is Secrets Manager alone). The S3 GATEWAY
+    // endpoint below is free and stays everywhere.
     if (envConfig.vpcInterfaceEndpoints) {
       const interfaceEndpoints: Record<string, ec2.InterfaceVpcEndpointAwsService> = {
         SecretsManager: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,

@@ -4,15 +4,27 @@
 # data-plane service, so the migration task has the same SM/NAT reachability the
 # app already proved. Hand-rolling subnet/SG discovery was unreliable (tasks
 # timed out reaching Secrets Manager); copying the proven config is robust.
+#
+#   scripts/run-migration-task.sh <env> [task-definition-arn]
+#
+# The optional second argument runs a SPECIFIC revision instead of the stack's
+# exported MigrationTask: scripts/migrate-before-roll.sh registers a revision that
+# carries the NEW image and migrates with it before the Compute stack rolls the
+# services (round 7 migrations review).
 set -euo pipefail
 ENVIRONMENT="${1:-dev}"
+TASKDEF_OVERRIDE="${2:-}"
 REGION="${AWS_REGION:-ca-central-1}"
 PREFIX="Luciel-${ENVIRONMENT}"
 
 cluster=$(aws cloudformation list-exports --region "$REGION" \
   --query "Exports[?Name=='${PREFIX}-ClusterName'].Value" --output text)
-taskdef=$(aws cloudformation list-exports --region "$REGION" \
-  --query "Exports[?Name=='${PREFIX}-MigrationTaskArn'].Value" --output text)
+if [ -n "$TASKDEF_OVERRIDE" ]; then
+  taskdef="$TASKDEF_OVERRIDE"
+else
+  taskdef=$(aws cloudformation list-exports --region "$REGION" \
+    --query "Exports[?Name=='${PREFIX}-MigrationTaskArn'].Value" --output text)
+fi
 
 # Pull subnets + SG from a running service in the cluster (the data plane).
 svc=$(aws ecs list-services --region "$REGION" --cluster "$cluster" \
