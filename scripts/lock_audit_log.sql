@@ -157,6 +157,17 @@ GRANT DELETE ON admin_audit_log TO luciel_audit_owner;
 -- payloads (the function returns admin_id and nothing else).
 GRANT SELECT ON admin_audit_log TO luciel_auth;
 
+-- Round 7 WP-8b (migration 0075): that discovery filters on created_at alone, and every
+-- other index here leads with admin_id, so without this it is a weekly full scan of
+-- the one table that only grows. Built HERE because CREATE INDEX needs the table's
+-- owner, and once the ownership transfer above has run, the role alembic uses
+-- (luciel_app) is not one — that is the lock. IF NOT EXISTS: on a database whose
+-- alembic ran before its first lock (fresh environments, CI) migration 0075 already
+-- built it and this is a no-op. Placed after the transfer so the master role has
+-- just proved it may act as luciel_audit_owner. A plain build holds a SHARE lock on
+-- the table (audit INSERTs wait for it; sub-second at today's size).
+CREATE INDEX IF NOT EXISTS ix_audit_created_at ON admin_audit_log (created_at);
+
 -- admin_audit_log.seq defaults to nextval('admin_audit_log_seq'), so the append path
 -- still needs USAGE on that sequence after the grant reset above — the sequence is a
 -- separate object and `REVOKE ALL ON` the table does not touch it.
