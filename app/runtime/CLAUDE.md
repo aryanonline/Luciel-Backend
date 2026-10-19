@@ -204,3 +204,22 @@ make that state explicit and test it.
 - Embedding model retired (operator runbook): the pin is ALERT-ONLY (`MODEL_CURRENCY_ALERT`, the daily sweep raises); set `LUCIEL_KNOWLEDGE_EMBEDDING_MODEL` (app planes AND sweep task) to a current 1536-dim model and redeploy.
 - The knowledge_sync sweep then converges: `knowledge.service.reembed_outdated_chunks` rewrites chunks whose `embedding_model` differs (200/tenant/pass), and `verify_chunk_embeddings` (0065) re-checks vectors against their own text.
 - Until it moves every query embedding fails (`embeddings:degraded` on /healthz, KnowledgeRetrievalDegraded); never run that sweep from a mock-mode container.
+- Model swap mid-session (item 10): a pin is read ONCE per task (ECS injects the platform
+  secret at task start; `get_settings()` is cached) and each turn's router holds providers
+  built from that read. A swap therefore reaches only tasks started after it — the forced
+  ECS rolling deployment drains the old ones — and an in-flight turn (or any turn still
+  landing on an old task) finishes on the OLD pin; a retired old pin fails those calls
+  over to the fallback. Nothing stores the model per session, so one conversation may
+  span two models across turns (`tests/unit/test_round7_model_swap_mid_session.py`).
+- The watchdog (`model_currency.py`): the smoke turn speaks each provider's contract
+  (`smoke_request`: OpenAI `max_completion_tokens`=512, an empty 200 fails); `model_family`
+  treats `gpt-5`/`gpt-5.4` as one family; a swap's restart is owed in the
+  `LLM_MODEL_UPDATED` record (`restart: pending`) and alerts daily until a restart call
+  succeeds. ElevenLabs voice/model ids are Settings pins (alert-only, skipped without
+  `ELEVENLABS_API_KEY`); there is no STT factory (live STT is Twilio's transcript).
+- Cost and quota: providers read `usage` into `LLMResponse.usage` (input = UNCACHED prompt
+  on both vendors) and emit LLMInput/Output/CacheRead/CacheWriteTokens (Provider, Model;
+  full dimension set); `LLMRouter.turn()` logs one `llm_usage` line per turn. Both
+  providers down → `LLMUnavailable` (LlmUnavailableAlarm). The cap store is
+  `redis.asyncio`, awaited (`aadmit_llm_call`), and re-binds every 60 s while Redis is down;
+  the sync `with router.turn()` pays in the turn's first `complete()`.
