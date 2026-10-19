@@ -119,11 +119,41 @@ async def test_the_lock_step_builds_the_index_where_a_locked_log_lacks_it():
     must. Re-running the lock is idempotent, so it is also safe where it exists."""
     superuser_exec(f"DROP INDEX IF EXISTS {_INDEX}")
     assert await _index_def() is None
-    with open(_LOCK_SQL, encoding="utf-8") as fh:  # noqa: ASYNC230 — a test fixture file
-        lock_sql = fh.read()
-    superuser_exec(lock_sql)
+    _run_lock_script()
     assert await _index_def() is not None
     # And a second run is a no-op rather than an error.
-    superuser_exec(lock_sql)
+    _run_lock_script()
     assert await _index_def() is not None
     assert _log_owner() == "luciel_audit_owner"
+
+
+def _run_lock_script() -> None:
+    """Run scripts/lock_audit_log.sql as the superuser exactly the way the test DB's
+    provisioning does (tests/conftest.py): the SQL on STDIN with ON_ERROR_STOP. It is
+    too large — and too full of ``%`` — to survive a ``-c`` argument through a psql
+    shim."""
+    with open(_LOCK_SQL, encoding="utf-8") as fh:
+        body = fh.read()
+    env: dict[str, str] | None
+    if conftest._CI_PG:
+        argv = [
+            conftest._PSQL,
+            "-h",
+            conftest.PG_HOST,
+            "-p",
+            conftest.PG_PORT,
+            "-U",
+            conftest._SUPERUSER,
+            "-d",
+            conftest.TEST_DB,
+            "-v",
+            "ON_ERROR_STOP=1",
+        ]
+        env = dict(os.environ, PGPASSWORD=conftest._SUPERUSER_PW)
+    else:
+        argv = ["sudo", "-u", "postgres", "psql", "-d", conftest.TEST_DB, "-v", "ON_ERROR_STOP=1"]
+        env = None
+    done = subprocess.run(  # noqa: S603 — fixed argv, the test's own superuser path
+        argv, check=False, capture_output=True, env=env, input=body, text=True, timeout=120
+    )
+    assert done.returncode == 0, f"lock_audit_log.sql failed:\n{done.stderr[-4000:]}"
