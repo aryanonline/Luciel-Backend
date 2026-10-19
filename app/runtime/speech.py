@@ -132,6 +132,12 @@ class EchoTextToSpeech:
 class WhisperSpeechToText:
     """Live STT — OpenAI Whisper (§3.1.2 adapter table, §5.12 sub-processor register).
 
+    NOT CONSTRUCTED by any factory (round 7 WP-6 item 9): live speech-to-text is
+    Twilio's own ``<Gather input="speech">`` transcript (``SpeechResult``), so the
+    ``whisper-1`` construction in provider_factory was unreachable and is gone. The
+    class stays only because tests/unit/test_speech_live_providers.py imports it;
+    binding it again means lifting its model id into Settings and model_currency.PINS.
+
     ``audio_ref`` is the URL of the caller's recorded audio (e.g. Twilio's
     ``RecordingUrl``); the OpenAI Audio Transcriptions endpoint accepts a file-like
     object, so the recording is fetched and handed to the SDK as bytes. Maps
@@ -189,24 +195,39 @@ class ElevenLabsTextToSpeech:
     The API key is injected by the caller (provider_factory reads it from the
     platform secret via ``parse_platform_secret`` — never hardcoded here, Hard rule
     #2) and is used only for the Authorization header of the synthesis request.
+
+    The voice and the TTS model are platform settings (round 7 WP-6 item 9:
+    ``elevenlabs_voice_id`` / ``elevenlabs_model_id``, rotatable through the platform
+    secret and verified daily by model_currency) — the voice id used to be a literal
+    here and no ``model_id`` was sent, so ElevenLabs chose (and could change) it.
     """
 
     name = "elevenlabs"
 
     _BASE_URL = "https://api.elevenlabs.io/v1"
 
-    def __init__(self, *, api_key: str, voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> None:
+    def __init__(
+        self, *, api_key: str, voice_id: str | None = None, model_id: str | None = None
+    ) -> None:
+        if voice_id is None or model_id is None:
+            from app.config import get_settings  # noqa: PLC0415 — keep import light
+
+            settings = get_settings()
+            voice_id = voice_id if voice_id is not None else settings.elevenlabs_voice_id
+            model_id = model_id if model_id is not None else settings.elevenlabs_model_id
         self._api_key = api_key
         self._voice_id = voice_id
+        self._model_id = model_id
 
     async def synthesize(self, text: str) -> SynthesizedSpeech:
         import httpx  # noqa: PLC0415 — lazy import: no network dependency unless live
 
         url = f"{self._BASE_URL}/text-to-speech/{self._voice_id}"
         headers = {"xi-api-key": self._api_key, "Accept": "audio/mpeg"}
+        payload = {"text": text, "model_id": self._model_id}
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json={"text": text}, headers=headers, timeout=10)
+                resp = await client.post(url, json=payload, headers=headers, timeout=10)
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise SpeechError(f"elevenlabs_error:{type(exc).__name__}") from exc

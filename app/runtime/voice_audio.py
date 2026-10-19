@@ -37,7 +37,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from app.runtime.speech import SpeechError, SynthesizedSpeech, TextToSpeech
 
@@ -275,17 +275,15 @@ def build_hosted_voice_tts(
     ):
         return None
     try:
-        from app.runtime.provider_factory import build_speech_providers  # noqa: PLC0415
+        from app.runtime.provider_factory import build_text_to_speech  # noqa: PLC0415
 
-        _stt, tts = build_speech_providers(settings)
+        tts = build_text_to_speech(settings)
     except RuntimeError as exc:
         # Missing platform key: the honest degraded state is Twilio's <Say> voice.
         logger.warning("voice_audio_hosting_unavailable reason=%s", exc)
         return None
     return HostedAudioTts(
-        # The factory is duck-typed (tuple[object, object]); every provider it
-        # returns satisfies the TextToSpeech Protocol.
-        inner=cast("TextToSpeech", tts),
+        inner=tts,
         store=get_voice_audio_store(),
         admin_id=admin_id,
         instance_id=instance_id,

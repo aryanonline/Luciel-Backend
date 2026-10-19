@@ -471,3 +471,140 @@ def test_the_documented_reembed_path_exists_and_the_sweep_runs_it():
     (pin,) = [p for p in model_currency.PINS if p.setting == "knowledge_embedding_model"]
     assert pin.swappable is False
     assert pin.alert_only_reason == model_currency.EMBEDDING_RETIREMENT_RUNBOOK
+
+
+# --- item 9: the ElevenLabs ids are pinned, rotatable and watched (alert-only) ------ #
+
+_EL_KEY = {"ELEVENLABS_API_KEY": "el-fake"}
+_VOICE = "21m00Tcm4TlvDq8ikWAM"
+_EL_MODEL = "eleven_multilingual_v2"
+
+
+class ElevenLabsTransport(FakeTransport):
+    """The two ElevenLabs reads the watchdog makes: ``GET /v1/voices/{id}`` (400 with
+    a voice_not_found detail for a deleted voice) and the ``GET /v1/models`` list."""
+
+    def __init__(self, *, voices: set[str], models: set[str], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._voices = voices
+        self._models = models
+        self.elevenlabs_calls: list[tuple[str, dict | None]] = []
+
+    async def get(self, url: str, *, params=None, headers=None):
+        if "api.elevenlabs.io" not in url:
+            return await super().get(url, params=params, headers=headers)
+        self.elevenlabs_calls.append((url, headers))
+        if url.endswith("/v1/models"):
+            return _Resp([{"model_id": m, "name": m} for m in sorted(self._models)])  # type: ignore[arg-type]
+        voice_id = url.rsplit("/", 1)[1]
+        if voice_id in self._voices:
+            return _Resp({"voice_id": voice_id, "name": "Rachel"})
+        return _Resp(
+            {
+                "detail": {
+                    "status": "voice_not_found",
+                    "message": f"A voice with the voice_id {voice_id} was not found.",
+                }
+            },
+            status=400,
+        )
+
+
+def test_the_elevenlabs_ids_are_registered_alert_only():
+    pins = {p.setting: p for p in model_currency.PINS if p.provider == "elevenlabs"}
+    assert set(pins) == {"elevenlabs_voice_id", "elevenlabs_model_id"}
+    assert all(p.swappable is False for p in pins.values())
+    assert pins["elevenlabs_voice_id"].kind == "voice"
+    assert pins["elevenlabs_voice_id"].blob_key == "ELEVENLABS_VOICE_ID"
+    assert pins["elevenlabs_model_id"].blob_key == "ELEVENLABS_MODEL_ID"
+
+
+async def test_healthy_elevenlabs_ids_are_checked_with_a_voice_get_and_the_model_list():
+    transport = ElevenLabsTransport(
+        existing=set(ALL_PINS), voices={_VOICE}, models={_EL_MODEL, "eleven_flash_v2_5"}
+    )
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW, **_EL_KEY),
+        transport_factory=lambda: transport,
+        email_sender=RecordingSender(),
+        secret_writer=FakeWriter(),
+        restarter=FakeRestarter(),
+    )
+    assert {"elevenlabs_voice_id", "elevenlabs_model_id"} <= set(result["checked"])
+    assert result["skipped"] == []
+    urls = [url for url, _ in transport.elevenlabs_calls]
+    assert urls == [
+        f"https://api.elevenlabs.io/v1/voices/{_VOICE}",
+        "https://api.elevenlabs.io/v1/models",
+    ]
+    assert all(h == {"xi-api-key": "el-fake"} for _, h in transport.elevenlabs_calls)
+
+
+async def test_a_deleted_voice_alerts_and_is_never_swapped(caplog):
+    transport = ElevenLabsTransport(
+        existing=set(ALL_PINS), voices={"some-other-voice"}, models={_EL_MODEL}
+    )
+    sender, writer = RecordingSender(), FakeWriter()
+    with (
+        caplog.at_level(logging.ERROR, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError, match="model_currency"),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW, **_EL_KEY),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=FakeRestarter(),
+        )
+    assert writer.applied == []
+    ((_to, _subject, body),) = sender.sent
+    assert f"elevenlabs_voice_id = '{_VOICE}' is gone from elevenlabs" in body
+    assert "ELEVENLABS_VOICE_ID" in body and "<Say>" in body
+    assert "elevenlabs_model_id" not in body  # the model is still listed
+    assert any(MODEL_CURRENCY_ALERT in r.getMessage() for r in caplog.records)
+
+
+async def test_a_delisted_tts_model_alerts(caplog):
+    transport = ElevenLabsTransport(
+        existing=set(ALL_PINS), voices={_VOICE}, models={"eleven_flash_v2_5"}
+    )
+    sender = RecordingSender()
+    with pytest.raises(RuntimeError, match="model_currency"):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW, **_EL_KEY, ELEVENLABS_MODEL_ID=_EL_MODEL),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=FakeWriter(),
+            restarter=FakeRestarter(),
+        )
+    ((_to, _subject, body),) = sender.sent
+    assert f"elevenlabs_model_id = '{_EL_MODEL}' is gone from elevenlabs" in body
+    assert "ELEVENLABS_MODEL_ID" in body
+
+
+async def test_without_an_elevenlabs_key_the_ids_are_skipped_not_alerted():
+    """Premium voice audio is opt-in; a platform secret without the vendor key has
+    nothing to verify, and that is not a misconfiguration of the watchdog."""
+    transport = ElevenLabsTransport(existing=set(ALL_PINS), voices=set(), models=set())
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW),
+        transport_factory=lambda: transport,
+        email_sender=RecordingSender(),
+        secret_writer=FakeWriter(),
+        restarter=FakeRestarter(),
+    )
+    assert result["skipped"] == ["elevenlabs_voice_id", "elevenlabs_model_id"]
+    assert transport.elevenlabs_calls == []
+
+
+async def test_a_rotated_voice_id_is_what_the_watchdog_checks():
+    transport = ElevenLabsTransport(existing=set(ALL_PINS), voices={"v-new"}, models={_EL_MODEL})
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW, **_EL_KEY, ELEVENLABS_VOICE_ID="v-new"),
+        transport_factory=lambda: transport,
+        email_sender=RecordingSender(),
+        secret_writer=FakeWriter(),
+        restarter=FakeRestarter(),
+    )
+    assert "elevenlabs_voice_id" in result["checked"]
+    assert transport.elevenlabs_calls[0][0].endswith("/v1/voices/v-new")

@@ -314,6 +314,15 @@ class Settings(BaseSettings):
     # `vector(1536)` column, so the model can be swapped without a reindex migration.
     knowledge_embedding_model: str = "text-embedding-3-small"
 
+    # ElevenLabs TTS vendor ids (§3.1.2; round 7 WP-6 item 9). They were hard-coded in
+    # speech.py (the voice) or never sent (the model — ElevenLabs then picks its own
+    # default, which it can change under us), so a retired voice or model needed an
+    # image rebuild. Platform-controlled like the LLM pins: env (LUCIEL_ELEVENLABS_*) >
+    # platform secret (ELEVENLABS_VOICE_ID / ELEVENLABS_MODEL_ID) > default, verified
+    # daily by the model_currency watchdog (alert-only — a voice is a product choice).
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
+    elevenlabs_model_id: str = "eleven_multilingual_v2"
+
     # --- Knowledge-sync connector OAuth (Architecture §3.2.3 / §3.8.3) ---------
     # Client id/secret + redirect URI per OAuth-class knowledge-sync provider
     # (Google Drive, HubSpot, Salesforce). These are the APPLICATION's OAuth-client
@@ -525,6 +534,9 @@ class Settings(BaseSettings):
                 "LLM_OPENAI_FALLBACK_MODEL",
                 "llm_openai_fallback_model",
             ),
+            # Round 7 WP-6 item 9: the ElevenLabs vendor ids rotate the same way.
+            ("LUCIEL_ELEVENLABS_VOICE_ID", "ELEVENLABS_VOICE_ID", "elevenlabs_voice_id"),
+            ("LUCIEL_ELEVENLABS_MODEL_ID", "ELEVENLABS_MODEL_ID", "elevenlabs_model_id"),
         ):
             if os.environ.get(env_name):
                 continue  # pydantic already applied the env value; env wins

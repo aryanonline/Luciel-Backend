@@ -92,6 +92,7 @@ _NUDGE_WEEKDAY = 0
 
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+_ELEVENLABS_API = "https://api.elevenlabs.io/v1"
 _ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -102,13 +103,16 @@ class ModelPin:
     setting: str  # Settings attribute holding the model ID
     blob_key: str  # platform-secret key an auto-swap writes (config.py bridge)
     env_var: str  # env var that OUTRANKS the blob — set means we cannot remediate
-    provider: str  # "anthropic" | "openai"
+    provider: str  # "anthropic" | "openai" | "elevenlabs"
     # False = alert-only. The embedding model is never swapped: stored knowledge
     # vectors are model-specific, so a swap silently breaks retrieval until a
     # full re-embed — a migration, not a remediation.
     swappable: bool
     # What the operator does when an alert-only pin is gone (named in the alert).
     alert_only_reason: str = ""
+    # What the id names: "model" (a per-id retrieve, or ElevenLabs' model listing) or
+    # "voice" (ElevenLabs ``GET /v1/voices/{id}``).
+    kind: str = "model"
 
 
 # The embedding retirement runbook (round 7 WP-6 item 8). The functions named here are
@@ -123,6 +127,22 @@ EMBEDDING_RETIREMENT_RUNBOOK = (
     "embedding_model differs (200 per tenant per pass, F121), then "
     "verify_chunk_embeddings (migration 0065, F121b) re-checks each vector against a "
     "fresh embedding of its own text. Never run that sweep from a mock-mode container"
+)
+
+# The ElevenLabs ids (round 7 WP-6 item 9): lifted out of speech.py into Settings,
+# alert-only — a voice is a product choice, never auto-swapped. Checked only when the
+# platform secret carries ELEVENLABS_API_KEY (premium voice audio is opt-in).
+ELEVENLABS_VOICE_RUNBOOK = (
+    "ElevenLabs no longer serves this voice, so premium voice replies fall back to "
+    "Twilio's <Say> voice (never a dead call). Pick a current voice in the ElevenLabs "
+    "voice library, set ELEVENLABS_VOICE_ID in the platform secret "
+    "(LUCIEL_ELEVENLABS_VOICE_ID outranks it), then restart the app services"
+)
+ELEVENLABS_MODEL_RUNBOOK = (
+    "ElevenLabs no longer lists this TTS model, so synthesis fails and voice replies "
+    "fall back to Twilio's <Say> voice. Set ELEVENLABS_MODEL_ID in the platform secret "
+    "(LUCIEL_ELEVENLABS_MODEL_ID outranks it) to a current model id from "
+    "GET /v1/models, then restart the app services"
 )
 
 
@@ -156,7 +176,27 @@ PINS: tuple[ModelPin, ...] = (
         False,
         EMBEDDING_RETIREMENT_RUNBOOK,
     ),
+    ModelPin(
+        "elevenlabs_voice_id",
+        "ELEVENLABS_VOICE_ID",
+        "LUCIEL_ELEVENLABS_VOICE_ID",
+        "elevenlabs",
+        False,
+        ELEVENLABS_VOICE_RUNBOOK,
+        kind="voice",
+    ),
+    ModelPin(
+        "elevenlabs_model_id",
+        "ELEVENLABS_MODEL_ID",
+        "LUCIEL_ELEVENLABS_MODEL_ID",
+        "elevenlabs",
+        False,
+        ELEVENLABS_MODEL_RUNBOOK,
+    ),
 )
+# Providers whose platform key is optional: their pins are skipped (not alerted) when
+# the platform secret has no key for them.
+OPTIONAL_PROVIDERS = frozenset({"elevenlabs"})
 
 
 # --- HTTP seam (the refresh.py idiom: duck-typed transport, lazy httpx) -------- #
@@ -220,11 +260,46 @@ async def openai_models(client: _Transport, *, api_key: str) -> list[dict[str, A
     return list(resp.json().get("data") or [])
 
 
-async def model_exists(client: _Transport, *, provider: str, api_key: str, model_id: str) -> bool:
+def _elevenlabs_not_found(resp: Any) -> bool:
+    """ElevenLabs answers an unknown voice with 400/404 and a ``*_not_found`` detail."""
+    try:
+        body = json.dumps(resp.json()).lower()
+    except Exception:  # noqa: BLE001 — an unreadable body is not proof of absence
+        return False
+    return "not_found" in body or "not found" in body or "does not exist" in body
+
+
+async def elevenlabs_id_exists(
+    client: _Transport, *, api_key: str, vendor_id: str, kind: str
+) -> bool:
+    """ElevenLabs has no ``/v1/models/{id}`` retrieve (round 7 WP-6 item 9): a VOICE is
+    checked with ``GET /v1/voices/{id}``; a MODEL by membership in ``GET /v1/models``
+    (a plain list of ``{"model_id": ...}`` — ElevenLabs ids carry no aliases)."""
+    headers = {"xi-api-key": api_key}
+    if kind == "voice":
+        resp = await client.get(f"{_ELEVENLABS_API}/voices/{vendor_id}", headers=headers)
+        status = getattr(resp, "status_code", None)
+        if status == 404 or (status in (400, 422) and _elevenlabs_not_found(resp)):
+            return False
+        resp.raise_for_status()
+        return True
+    resp = await client.get(f"{_ELEVENLABS_API}/models", headers=headers)
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload if isinstance(payload, list) else list(payload.get("models") or [])
+    return any(isinstance(item, dict) and item.get("model_id") == vendor_id for item in items)
+
+
+async def model_exists(
+    client: _Transport, *, provider: str, api_key: str, model_id: str, kind: str = "model"
+) -> bool:
     """Per-id ground truth: ``GET /v1/models/{id}`` — 200 means the pin resolves
     (alias or dated id alike), 404 means it is genuinely gone. This is the ONLY
     honest presence check: a valid alias can be absent from the listing (live
-    finding 2026-08-17), so listing membership must never decide a retirement."""
+    finding 2026-08-17), so listing membership must never decide a retirement.
+    ElevenLabs ids go through ``elevenlabs_id_exists``."""
+    if provider == "elevenlabs":
+        return await elevenlabs_id_exists(client, api_key=api_key, vendor_id=model_id, kind=kind)
     if provider == "anthropic":
         url = f"{_ANTHROPIC_MODELS_URL}/{model_id}"
         headers = {"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION}
@@ -663,8 +738,11 @@ async def run_model_currency_check(
     keys = {
         "anthropic": secret.get("ANTHROPIC_API_KEY", ""),
         "openai": secret.get("OPENAI_API_KEY", ""),
+        "elevenlabs": secret.get("ELEVENLABS_API_KEY", ""),
     }
-    missing_keys = sorted(name for name, value in keys.items() if not value)
+    missing_keys = sorted(
+        name for name, value in keys.items() if not value and name not in OPTIONAL_PROVIDERS
+    )
     if missing_keys:
         # Misconfiguration, not unreachability: the check CANNOT run, loudly.
         logger.error(
@@ -678,6 +756,8 @@ async def run_model_currency_check(
     sender = email_sender or build_email_sender()
     operator = settings.platform_email_sender
     checked: list[str] = []
+    # Pins of an optional vendor whose key is absent (premium voice not configured).
+    skipped: list[str] = []
     swapped: list[dict[str, str]] = []
     alerts: list[str] = []
     nudges: list[dict[str, str]] = []
@@ -732,10 +812,17 @@ async def run_model_currency_check(
         for pin in PINS:
             if pin.provider in unreachable:
                 continue  # no verdicts against a provider we could not reach
+            if not keys[pin.provider]:
+                skipped.append(pin.setting)  # an optional vendor with no key: nothing to check
+                continue
             model_id = str(getattr(settings, pin.setting))
             try:
                 exists = await model_exists(
-                    client, provider=pin.provider, api_key=keys[pin.provider], model_id=model_id
+                    client,
+                    provider=pin.provider,
+                    api_key=keys[pin.provider],
+                    model_id=model_id,
+                    kind=pin.kind,
                 )
             except Exception as exc:  # noqa: BLE001 — unreachable ≠ retired; never false-alarm
                 status = _http_status(exc)
@@ -947,4 +1034,5 @@ async def run_model_currency_check(
         "swapped": swapped,
         "nudges": nudges,
         "unreachable": sorted(unreachable | {p for p, v in listings.items() if v is None}),
+        "skipped": skipped,
     }

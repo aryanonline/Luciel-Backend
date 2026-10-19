@@ -13,9 +13,13 @@ key is read and no network call is possible. Only ``live`` reads the platform se
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 from app.config import Settings, get_settings, parse_platform_secret
 from app.runtime.llm_router import LLMRouter
+
+if TYPE_CHECKING:
+    from app.runtime.speech import TextToSpeech
 
 
 def build_llm_router(
@@ -91,57 +95,43 @@ def _build_live_router(settings: Settings, *, admin_id: uuid.UUID | None) -> LLM
     return LLMRouter(primary=primary, fallback=fallback, admin_id=admin_id, fast=fast)
 
 
-# --- speech (STT/TTS) provider factory (§3.1.2 / §5.12) ------------------------ #
+# --- text-to-speech provider factory (§3.1.2 / §5.12) -------------------------- #
 # Mirrors build_llm_router's mode-aware wiring exactly: mock mode returns the
-# deterministic Echo doubles (no keys, no network — RUNTIME-UNCHANGED guarantee for
-# any existing voice_pipeline caller/test), live mode reads OPENAI_API_KEY (already
-# used for the LLM fallback) and the NEW ELEVENLABS_API_KEY from the platform secret
-# — never hardcoded (Hard rule #2).
+# deterministic Echo double (no keys, no network), live mode reads ELEVENLABS_API_KEY
+# from the platform secret — never hardcoded (Hard rule #2) — and the voice/model ids
+# from Settings (round 7 WP-6 item 9). There is no speech-to-text factory: live STT is
+# Twilio's own <Gather input="speech"> transcript, so the Whisper client this used to
+# construct (on OPENAI_API_KEY, pinned to whisper-1) was never called by anything.
 
 
-def build_speech_providers(
-    settings: Settings | None = None,
-) -> tuple[object, object]:
-    """Build ``(stt, tts)`` for the active integration mode.
+def build_text_to_speech(settings: Settings | None = None) -> TextToSpeech:
+    """Build the TTS provider for the active integration mode.
 
-    - ``mock`` (default): ``(EchoSpeechToText(), EchoTextToSpeech())`` — identical to
-      direct construction used throughout existing voice_pipeline tests; no keys, no
-      network.
-    - ``live``: ``(WhisperSpeechToText, ElevenLabsTextToSpeech)`` wired from the
-      platform secret (§5.12 sub-processor register: OpenAI Whisper STT, ElevenLabs
-      TTS).
+    - ``mock`` (default): ``EchoTextToSpeech()`` — no keys, no network.
+    - ``live``: ``ElevenLabsTextToSpeech`` with the platform ``ELEVENLABS_API_KEY``
+      and the platform-controlled ``elevenlabs_voice_id`` / ``elevenlabs_model_id``
+      (§5.12 sub-processor register: ElevenLabs TTS). A missing key fails loud.
     """
     settings = settings if settings is not None else get_settings()
 
-    if settings.integration_mode == "live":
-        return _build_live_speech_providers(settings)
+    if settings.integration_mode != "live":
+        from app.runtime.speech import EchoTextToSpeech  # noqa: PLC0415
 
-    from app.runtime.speech import EchoSpeechToText, EchoTextToSpeech  # noqa: PLC0415
+        return EchoTextToSpeech()
 
-    return EchoSpeechToText(), EchoTextToSpeech()
+    from app.runtime.speech import ElevenLabsTextToSpeech  # noqa: PLC0415
 
-
-def _build_live_speech_providers(settings: Settings) -> tuple[object, object]:
-    from app.runtime.speech import (  # noqa: PLC0415 — keep SDK-backed imports local
-        ElevenLabsTextToSpeech,
-        WhisperSpeechToText,
+    elevenlabs_key = parse_platform_secret(settings.platform_secret, live=True).get(
+        "ELEVENLABS_API_KEY", ""
     )
-
-    secret = parse_platform_secret(settings.platform_secret, live=True)
-    openai_key = secret.get("OPENAI_API_KEY", "")
-    elevenlabs_key = secret.get("ELEVENLABS_API_KEY", "")
-    if not openai_key or not elevenlabs_key:
-        # Fail loud at construction, same doctrine as _build_live_router: name which
-        # keys are missing, never echo any value.
-        missing = [
-            n
-            for n, v in (("OPENAI_API_KEY", openai_key), ("ELEVENLABS_API_KEY", elevenlabs_key))
-            if not v
-        ]
+    if not elevenlabs_key:
+        # Fail loud at construction, same doctrine as _build_live_router: name the
+        # missing key, never echo any value.
         raise RuntimeError(
-            f"integration_mode=live but platform secret is missing keys: {', '.join(missing)}"
+            "integration_mode=live but platform secret is missing keys: ELEVENLABS_API_KEY"
         )
-
-    stt = WhisperSpeechToText(api_key=openai_key)
-    tts = ElevenLabsTextToSpeech(api_key=elevenlabs_key)
-    return stt, tts
+    return ElevenLabsTextToSpeech(
+        api_key=elevenlabs_key,
+        voice_id=settings.elevenlabs_voice_id,
+        model_id=settings.elevenlabs_model_id,
+    )
