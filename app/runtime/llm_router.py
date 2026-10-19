@@ -15,13 +15,11 @@ bind in deployment behind the same interface.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import hashlib
 import logging
 import random
 import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -163,7 +161,10 @@ class LLMRouter:
     item 4): the orchestrator opens ``turn()`` once per inbound message, and every
     ``complete()`` inside it skips re-admission — a tool-using turn used to burn up
     to five of the fifty. A caller that never opens a turn (graph extraction at
-    ingest) is admitted per call, exactly as before."""
+    ingest) is admitted per call, exactly as before.
+
+    Admission is AWAITED (round 7 WP-6 item 6: the Redis store is ``redis.asyncio``;
+    the synchronous client blocked the event loop on every turn)."""
 
     def __init__(
         self,
@@ -181,39 +182,53 @@ class LLMRouter:
         # (None), routing is 100% unchanged from pre-fast-routing behavior — the
         # gate in .complete() below can never select fast without a bound provider.
         self._fast = fast
-        # True while a ``turn()`` is open: the cap was paid at the turn boundary.
+        # True while a ``turn()`` is open; ``_turn_paid`` once its ONE admission ran.
         self._in_turn = False
+        self._turn_paid = False
         # Token usage of the open turn, per (provider, model) — logged once as the
         # ``llm_usage`` line when the turn closes (round 7 WP-6 item 5).
         self._turn_usage: dict[tuple[str, str], list[int]] = {}
 
-    @contextlib.contextmanager
-    def turn(self) -> Iterator[None]:
+    def turn(self) -> _Turn:
         """Admit the tenant's per-minute cap ONCE for one customer turn (§9 C9).
 
-        Raises ``LLMCapExceeded`` at entry when the tenant is over cap — before any
-        model is called — so the orchestrator answers the turn honestly instead of
-        an exception reaching the transport. Inside the block ``complete()`` never
-        re-admits. No admin_id bound (tests, legacy construction) → no cap, as
-        before; a nested ``turn()`` is a no-op.
+        ``async with router.turn():`` pays the admission at entry; the synchronous
+        ``with router.turn():`` (the orchestrator's form) pays it in the turn's FIRST
+        ``complete()``, still before any provider is called (round 7 WP-6 item 6 —
+        an awaited Redis admission cannot run in a synchronous ``__enter__``). Either
+        way ``LLMCapExceeded`` is raised before any model is called, so the
+        orchestrator answers the turn honestly instead of an exception reaching the
+        transport, and the later calls inside the block never re-admit. No admin_id
+        bound (tests, legacy construction) → no cap, as before; a nested ``turn()``
+        is a no-op.
 
         Closing the turn logs ONE ``llm_usage`` line per provider/model it used — the
         per-turn token record the round report aggregates into cost per
         conversation (item 5)."""
-        if self._in_turn:
-            yield
-            return
-        if self._admin_id is not None:
-            from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415 — import cycle
+        return _Turn(self)
 
-            admit_llm_call(self._admin_id)
+    def _open_turn(self) -> bool:
+        """Open a turn; False when one is already open (a nested turn is a no-op)."""
+        if self._in_turn:
+            return False
         self._in_turn = True
+        self._turn_paid = False
         self._turn_usage = {}
-        try:
-            yield
-        finally:
-            self._in_turn = False
-            self._log_turn_usage()
+        return True
+
+    def _close_turn(self) -> None:
+        self._in_turn = False
+        self._turn_paid = False
+        self._log_turn_usage()
+
+    async def _pay_turn(self) -> None:
+        """The open turn's ONE admission (no-op once paid, or with no tenant bound)."""
+        if self._turn_paid or self._admin_id is None:
+            return
+        from app.runtime.llm_cap import aadmit_llm_call  # noqa: PLC0415 — import cycle
+
+        await aadmit_llm_call(self._admin_id)
+        self._turn_paid = True
 
     def _note_usage(self, resp: LLMResponse) -> None:
         if not self._in_turn or resp.usage is None:
@@ -271,14 +286,16 @@ class LLMRouter:
         on-primary failover behavior are unaffected either way.
         """
         effective_admin_id = admin_id if admin_id is not None else self._admin_id
-        # Inside an open ``turn()`` the cap was paid at the turn boundary; only a call
-        # on behalf of a DIFFERENT tenant (explicit admin_id) is admitted on its own.
-        already_paid = self._in_turn and effective_admin_id == self._admin_id
-        if effective_admin_id is not None and not already_paid:
-            # Circular import avoided: import inline, module is small + stable.
-            from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415
+        if self._in_turn and effective_admin_id == self._admin_id:
+            # Inside an open ``turn()`` the cap is paid ONCE: by the turn's first call
+            # (or at ``async with`` entry) — a no-op for every later call.
+            await self._pay_turn()
+        elif effective_admin_id is not None:
+            # Outside a turn, or a call on behalf of a DIFFERENT tenant (explicit
+            # admin_id): admitted on its own. Circular import avoided: import inline.
+            from app.runtime.llm_cap import aadmit_llm_call  # noqa: PLC0415
 
-            admit_llm_call(effective_admin_id)
+            await aadmit_llm_call(effective_admin_id)
 
         use_fast = self._fast is not None and should_route_fast(
             requires_tools=requires_tools,
@@ -323,3 +340,40 @@ class LLMRouter:
             resp.used_fallback = True
             self._note_usage(resp)
             return resp
+
+
+class _Turn:
+    """``router.turn()``: a sync AND async context manager over one customer turn.
+
+    ``with`` (the orchestrator's form) opens the turn and leaves the cap admission to
+    the turn's first ``complete()``; ``async with`` awaits it at entry. Exiting
+    closes the turn and logs its ``llm_usage`` line, on success or exception."""
+
+    __slots__ = ("_opened", "_router")
+
+    def __init__(self, router: LLMRouter) -> None:
+        self._router = router
+        self._opened = False
+
+    def __enter__(self) -> None:
+        self._opened = self._router._open_turn()
+
+    def __exit__(self, *exc: object) -> None:
+        if self._opened:
+            self._opened = False
+            self._router._close_turn()
+
+    async def __aenter__(self) -> None:
+        self._opened = self._router._open_turn()
+        if not self._opened:
+            return
+        try:
+            await self._router._pay_turn()
+        except BaseException:
+            # An exception in __aenter__ skips __aexit__: close the turn here.
+            self._opened = False
+            self._router._close_turn()
+            raise
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.__exit__(*exc)

@@ -162,11 +162,19 @@ async def test_a_turn_admits_the_cap_once_however_many_calls_it_makes(monkeypatc
     # Outside a turn (ingest-time callers) every call is admitted on its own, as before.
     await router.complete("sys", [{"role": "user", "content": "hi"}])
     assert store.current_count(str(admin)) == 2
-    # A call on behalf of ANOTHER tenant inside a turn pays under that tenant.
+    # A call on behalf of ANOTHER tenant inside a turn pays under that tenant. The
+    # turn's own admission is paid by its own first call (round 7 WP-6 item 6: the
+    # sync ``with`` cannot await the store at entry), so a turn that only ever called
+    # for another tenant charged its own tenant nothing.
     other = uuid.uuid4()
     with router.turn():
         await router.complete("sys", [{"role": "user", "content": "hi"}], admin_id=other)
     assert store.current_count(str(other)) == 1
+    assert store.current_count(str(admin)) == 2
+    with router.turn():
+        await router.complete("sys", [{"role": "user", "content": "hi"}], admin_id=other)
+        await router.complete("sys", [{"role": "user", "content": "hi"}])
+    assert store.current_count(str(other)) == 2
     assert store.current_count(str(admin)) == 3
 
 
@@ -206,3 +214,70 @@ def test_a_turn_without_a_bound_tenant_is_a_no_op(monkeypatch) -> None:
     with router.turn(), router.turn():  # nested is fine too
         pass
     assert store._calls == {}
+
+
+# ---------------------------------------------------------------------------
+# Admission is awaited (round 7 WP-6, item 6)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_async_with_turn_pays_at_entry_before_any_model_call(monkeypatch) -> None:
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    store = _bind_store(monkeypatch)
+    admin = uuid.uuid4()
+    router = LLMRouter(primary=EchoModel(), fallback=EchoModel(), admin_id=admin)
+    async with router.turn():
+        assert store.current_count(str(admin)) == 1  # paid at entry
+        for _ in range(3):
+            await router.complete("sys", [{"role": "user", "content": "hi"}])
+    assert store.current_count(str(admin)) == 1
+
+    for _ in range(LLM_CAP_PER_MINUTE - 1):
+        assert store.admit(str(admin)) is True
+    with pytest.raises(LLMCapExceeded):
+        async with router.turn():
+            raise AssertionError("an over-cap turn must not enter the block")
+    assert router._in_turn is False
+
+
+@pytest.mark.asyncio
+async def test_a_sync_turn_that_makes_no_model_call_costs_nothing(monkeypatch) -> None:
+    """The orchestrator's ``with`` form pays in the first ``complete()``: a turn that
+    ends before any model call (an exception, an early return) spends no admission."""
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    store = _bind_store(monkeypatch)
+    admin = uuid.uuid4()
+    router = LLMRouter(primary=EchoModel(), fallback=EchoModel(), admin_id=admin)
+    with router.turn():
+        pass
+    assert store.current_count(str(admin)) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_router_awaits_the_store_never_a_blocking_call(monkeypatch) -> None:
+    """A store whose SYNCHRONOUS admit blows up proves the request path only awaits."""
+    import app.runtime.llm_cap as llm_cap_module  # noqa: PLC0415
+    from app.runtime.llm_router import LLMRouter  # noqa: PLC0415
+    from app.runtime.testing import EchoModel  # noqa: PLC0415
+
+    class _AsyncOnly(InMemoryLLMCapStore):
+        awaited = 0
+
+        def admit(self, admin_id: str, *, cap: int = LLM_CAP_PER_MINUTE) -> bool:
+            raise AssertionError("the event loop must never block on a sync admission")
+
+        async def aadmit(self, admin_id: str, *, cap: int = LLM_CAP_PER_MINUTE) -> bool:
+            _AsyncOnly.awaited += 1
+            return True
+
+    monkeypatch.setattr(llm_cap_module, "_store", _AsyncOnly())
+    admin = uuid.uuid4()
+    router = LLMRouter(primary=EchoModel(), fallback=EchoModel(), admin_id=admin)
+    with router.turn():
+        await router.complete("sys", [{"role": "user", "content": "hi"}])
+        await router.complete("sys", [{"role": "user", "content": "hi"}])
+    await router.complete("sys", [{"role": "user", "content": "hi"}])  # outside a turn
+    assert _AsyncOnly.awaited == 2

@@ -522,7 +522,7 @@ async def test_a_large_sync_leaves_the_customers_their_share_of_the_llm_cap(monk
     assert len(res.graph_deferred) == cap - headroom
     # A customer turn right after the sync is still admitted (it used to be refused:
     # the sync alone drove the counter to the cap).
-    with LLMRouter(EchoModel(), EchoModel(), admin_id=admin).turn():
+    async with LLMRouter(EchoModel(), EchoModel(), admin_id=admin).turn():
         pass
 
     async def _rows() -> dict[str, tuple[str | None, set[str]]]:
