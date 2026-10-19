@@ -54,6 +54,16 @@ jobs:
           uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
           pip-audit --strict --desc -r /tmp/audit-reqs.txt 2>&1 | tee audit.txt
 
+      - name: pyproject range drift (uv.lock behind what its ranges allow)
+        continue-on-error: true
+        run: |
+          # The lock pins what installs, so a lock nobody moves goes stale INSIDE its
+          # ranges. uv re-resolves every range jointly and prints the moves an upgrade
+          # would make WITHOUT writing the lock; lock_drift.py tables them (direct deps
+          # with their range first). Advisory: never fails the job.
+          uv lock --upgrade --dry-run > lock-upgrade.txt 2>&1 || true
+          python3 scripts/lock_drift.py lock-upgrade.txt --markdown drift.md
+
       - name: Outdated Python packages (advisory)
         continue-on-error: true
         run: |
@@ -114,13 +124,18 @@ jobs:
             echo "## pip-audit — **$AUDIT_OUTCOME**"
             echo '```'; tail -n 40 audit.txt 2>/dev/null || echo "(no output)"; echo '```'
             echo
+            echo "## pyproject range drift (uv.lock behind the newest version its range allows)"
+            cat drift.md 2>/dev/null || echo "(not computed)"
+            echo
+            echo "Dependabot's weekly \`uv\` PR closes this gap; a direct dependency listed here two months running means its PR is failing CI or waiting on a person."
+            echo
             echo "## Image CVE waivers — **$EXPIRY_OUTCOME** (⚠️ = expires within 35 days)"
             cat expiry.md 2>/dev/null || echo "(no waivers file)"
             echo
             echo "## Latest dev image scan (severity counts)"
             echo '```'; cat ecr.txt 2>/dev/null || echo "(not read — AWS role unavailable to this run)"; echo '```'
             echo
-            echo "## Outdated (advisory)"
+            echo "## Newest on the index (advisory — includes versions OUTSIDE the ranges; a range bump is a person's call)"
             echo '```'; tail -n 60 outdated-python.txt 2>/dev/null || echo "(none)"; echo '```'
             echo '```'; tail -n 40 outdated-infra.txt 2>/dev/null || echo "(none)"; echo '```'
             echo
