@@ -19,6 +19,16 @@ conversations to convert several §10 rows from CI-proven to LIVE-proven:
 
 Each test prints PASS/FAIL with evidence; the process exits non-zero if ANY fails.
 
+MATRIX (``--matrix``, round 7 WP-12): the configuration COMBINATIONS the owner asked
+for, M1-M8, each on its own throwaway tenant with its own assertions and wall-clock —
+widget + pasted knowledge, widget channel off (D9), escalation (hot lead + ungrounded),
+takeover, leads (own vs third-party address), lifecycle (pause/resume/delete/restore),
+free cap (51st conversation + a counted one never cut), closure (reduced surface +
+reopen). ``--only M3,M8`` picks some; ``--cases`` adds T1-T7 (the default without
+``--matrix``); ``--list-matrix`` prints the catalogue and the manual live walk's items
+(configurations that need an OWNER asset: a Twilio number, a mailbox, Meta, a CRM, a
+calendar — never fabricated here).
+
 STRICT (``--strict``, or LUCIEL_SEEDTEST_STRICT=1 — the SeedTest task definition sets
 it, and scripts/run-seedtest-task.sh passes ``--strict`` unless told ``--no-strict``):
 a ``[SKIP]`` is otherwise non-fatal and invisible in the exit code, so a case that
@@ -39,6 +49,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -472,11 +483,15 @@ def usage_conversations(client: httpx.Client) -> int:
 # Seed one fully-provisioned synthetic tenant                                  #
 # --------------------------------------------------------------------------- #
 class Tenant:
-    def __init__(self, role: str) -> None:
+    def __init__(self, role: str, *, email: str | None = None) -> None:
         self.role = role
-        self.email = _email(role)
+        self.email = email or _email(role)
         self.client = httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True)
         self.embed_key: str = ""
+        # Resolved once seeded (the matrix reads rows in-process by tenant).
+        self.admin_id: uuid.UUID | None = None
+        # A persisted tenant (--persist) is never torn down.
+        self.persist = False
 
     def seed(self) -> None:
         signup(self.client, self.email)
@@ -991,11 +1006,1041 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
 
 
 # --------------------------------------------------------------------------- #
+# Matrix (--matrix): the owner's configuration COMBINATIONS                    #
+# --------------------------------------------------------------------------- #
+# Each combination runs on its OWN throwaway tenant (seeded through the real API path
+# exactly like the T-cases), drives one configuration over the wire, reads back what the
+# owner would see (the API) and what was persisted (in-process reads as luciel_app under
+# the tenant's RLS), and records ONE [PASS]/[FAIL] with its wall-clock and the evidence
+# of every check in it. ``drive`` does the I/O and returns plain observations; ``judge``
+# is pure (unit-tested table by table). A combination that needs an OWNER asset is not
+# in the matrix — MANUAL_WALK_ITEMS lists those for the manual live walk.
+
+HOT_UNGROUNDED_QUESTION = (
+    "We have a $5,000 budget and want to buy this week - what is the exact battery "
+    "capacity, in mAh, of the refurbished DJI Mavic 3 Pro drones you sell?"
+)
+#: The full hand-off ack in every variant. Mirrors ``orchestrator._HANDOFF_ACK_MARK``
+#: (a unit test pins the two together).
+HANDOFF_ACK_RE = re.compile(r"\b(?:flagged this for the team|passed this along to the team)\b")
+#: A real-time connection claim the doctrine forbids: an owner notification is never a
+#: person on the line (root CLAUDE.md, "Trust, grounding, and delivery").
+REALTIME_CLAIM_RE = re.compile(
+    r"\b(?:connecting you|connect you (?:with|to)|transferring you|transfer you"
+    r"|(?:is|are) joining (?:the|this) chat|live agent|on the line)\b",
+    re.IGNORECASE,
+)
+#: escalation.high_value_lead_reasons' phrases (the opportunity half of the row).
+LEAD_REASONS = ("named a budget", "wants it soon", "ready to buy or book")
+NOTIFICATION_EVENTS = (
+    "escalation_notification_sent",
+    "escalation_delivery_failed",
+    "escalation_owner_fallback",
+)
+#: Who the dispatcher pages (escalation_dispatch ``recipient_role``).
+CONTACT_ROLES = ("primary", "secondary")
+OWNER_ROLES = ("owner_fallback", "cc_owner_email", "owner_unverified_copy")
+#: Escalation rows still waiting on their off-turn notification.
+UNSETTLED_DELIVERY = ("pending",)
+
+#: The reduced surface a closed account keeps for 30 days (owner decision D5).
+CLOSED_REDUCED_ROUTES: tuple[tuple[str, str], ...] = (
+    ("GET", "/api/v1/admin/account"),
+    ("POST", "/api/v1/admin/account/export"),
+    ("POST", "/api/v1/admin/account/reopen"),
+)
+#: Everything else refuses a closed account with the typed 403 ``account_closed`` — the
+#: writes among them refused before they change anything.
+CLOSED_REFUSED_ROUTES: tuple[tuple[str, str, dict[str, object] | None], ...] = (
+    ("GET", "/api/v1/admin/luciel", None),
+    ("GET", "/api/v1/admin/luciel/status", None),
+    ("GET", "/api/v1/admin/knowledge/sources", None),
+    ("GET", "/api/v1/admin/connections", None),
+    ("GET", "/api/v1/admin/usage/overview", None),
+    ("GET", "/api/v1/dashboard/conversations", None),
+    ("GET", "/api/v1/dashboard/leads", None),
+    ("GET", "/api/v1/dashboard/escalations", None),
+    ("GET", "/api/v1/billing", None),
+    ("POST", "/api/v1/admin/luciel/pause", None),
+    ("POST", "/api/v1/admin/account/close", {"confirmDeleteLuciel": True}),
+)
+
+#: Configurations that need an OWNER asset the harness must never fabricate — they are
+#: the manual live walk's items, not matrix combinations.
+MANUAL_WALK_ITEMS: tuple[tuple[str, str], ...] = (
+    (
+        "SMS + voice (BYO Twilio number)",
+        "inbound text and a phone call answered on the owner's number; a takeover reply on "
+        "voice bridged to SMS; an SMS escalation contact confirmed by its 6-digit code and "
+        "its page reading sent -> delivered from the carrier receipt",
+    ),
+    (
+        "Email channel (BYO work mailbox)",
+        "an inbound email answered from the owner's own mailbox, a takeover reply in the "
+        "customer's thread, the first poll's history drained unprocessed",
+    ),
+    (
+        "Meta (WhatsApp + Messenger) and Instagram",
+        "each destination bound before it reads Connected; inbound message answered; a "
+        "takeover reply on the surface the customer wrote to",
+    ),
+    (
+        "CRM",
+        "a captured lead pushed and read back synced (T7 with LUCIEL_SEEDTEST_WEBHOOK_URL "
+        "covers the custom-webhook flavour); crm-retry and the one-time backfill",
+    ),
+    (
+        "Calendar",
+        "check_availability + book_appointment end to end on the owner's calendar, the "
+        "booking on the Today card",
+    ),
+)
+
+Check = tuple[str, bool, str]
+
+
+def verdict(checks: Sequence[Check]) -> tuple[bool, str]:
+    """All checks must hold; the evidence names every check and what it saw."""
+    ok = all(passed for _, passed, _ in checks)
+    evidence = " ".join(
+        f"{label}={'ok' if passed else 'FAIL'}[{detail}]" for label, passed, detail in checks
+    )
+    return ok, evidence
+
+
+def _api(
+    t: Tenant,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, object] | None = None,
+    params: dict[str, str] | None = None,
+) -> httpx.Response:
+    return t.client.request(method, f"{API_BASE}{path}", json=json_body, params=params)
+
+
+def _body(resp: httpx.Response) -> dict | list:
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict | list) else {}
+
+
+def _obj(resp: httpx.Response) -> dict:
+    body = _body(resp)
+    return body if isinstance(body, dict) else {}
+
+
+def _state_of(resp: httpx.Response) -> dict:
+    """A lifecycle call's JSON object, or ``{"state": "HTTP <code>: <message>"}``."""
+    body = _obj(resp)
+    if resp.status_code < 400:
+        return body
+    return {"state": f"HTTP {resp.status_code}: {str(body.get('message') or '')[:80]}"}
+
+
+def _reply(out: dict) -> str:
+    return str((out.get("reply") or {}).get("text") or "")
+
+
+def _require_admin_id(t: Tenant) -> uuid.UUID:
+    if t.admin_id is None:
+        raise RuntimeError(f"tenant '{t.role}' has no resolved admin_id")
+    return t.admin_id
+
+
+def widget_boot(client: httpx.Client, embed_key: str, *, session_id: str | None = None) -> dict:
+    """The widget bootstrap a visitor's page makes (``session_id``: the tab already holds a
+    conversation). Paced on 429 like the message send."""
+    body: dict[str, str] = {"embedKey": embed_key}
+    if session_id:
+        body["sessionId"] = str(session_id)
+    resp = _paced(
+        lambda: client.post(f"{API_BASE}/api/v1/chat-widget/bootstrap", json=body),
+        "widget_bootstrap",
+    )
+    return _check(resp, "widget_bootstrap")
+
+
+def widget_history(client: httpx.Client, embed_key: str, session_id: str) -> list[dict]:
+    """The widget's history poll — how a takeover reply reaches the visitor (§3.4.12)."""
+    resp = _paced(
+        lambda: client.get(
+            f"{API_BASE}/api/v1/chat-widget/sessions/{session_id}", params={"embedKey": embed_key}
+        ),
+        "widget_history",
+    )
+    data = _check(resp, "widget_history")
+    return [m for m in data if isinstance(m, dict)] if isinstance(data, list) else []
+
+
+def channel_off_served() -> bool:
+    """Whether THIS build's widget contract carries the D9 ``channel_off`` render state.
+    The harness runs the image the API runs, so its own wire vocabulary is the API's."""
+    from typing import get_args
+
+    from app.schemas_api.widget import WidgetRenderStateWire
+
+    return "channel_off" in get_args(WidgetRenderStateWire)
+
+
+def llm_calls_in_window(admin_id: uuid.UUID) -> int | None:
+    """The live router's per-minute model-call counter for this tenant (``llmcap:<admin>``,
+    shared Redis — the API process increments it on every turn that calls a model).
+    None when this process has no Redis-backed store (mock / in-memory: the API's calls
+    are invisible from here) or the read fails — never a fabricated 0."""
+    from app.runtime import llm_cap
+
+    store = llm_cap.get_llm_cap_store()
+    if not isinstance(store, llm_cap.RedisLLMCapStore):
+        return None
+    try:
+        raw = store._client.get(llm_cap.RedisLLMCapStore._key(str(admin_id)))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — unreadable is "no proof", never "zero calls"
+        return None
+    return int(raw) if raw is not None else 0
+
+
+def await_quiet_llm_window(
+    admin_id: uuid.UUID,
+    *,
+    timeout: float = 75.0,
+    poll: float = 2.0,
+    read: Callable[[uuid.UUID], int | None] = llm_calls_in_window,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> int | None:
+    """Wait (bounded) until the tenant's 60-second model-call window is empty, so a reading
+    after the next turn is that turn's own count. Returns the last reading (None: no
+    probe available)."""
+    deadline = clock() + timeout
+    while True:
+        calls = read(admin_id)
+        if calls is None or calls == 0 or clock() >= deadline:
+            return calls
+        sleep(poll)
+
+
+async def _escalation_delivery(
+    admin_id: uuid.UUID, session_id: str, *, timeout: float = 60.0
+) -> list[dict]:
+    """The session's escalation rows once their off-turn notification has settled (the
+    API process pages after the turn's commit), bounded."""
+    from app.db.session import tenant_session
+    from app.models.conversation import EscalationEvent
+    from sqlalchemy import select
+
+    deadline = time.monotonic() + timeout
+    while True:
+        async with tenant_session(admin_id) as s:
+            rows = (
+                (
+                    await s.execute(
+                        select(EscalationEvent).where(
+                            EscalationEvent.admin_id == admin_id,
+                            EscalationEvent.session_id == uuid.UUID(session_id),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            out = [
+                {"signal": r.signal, "status": r.delivery_status, "detail": r.delivery_detail}
+                for r in rows
+            ]
+        settled = bool(out) and all(o["status"] not in UNSETTLED_DELIVERY for o in out)
+        if settled or time.monotonic() >= deadline:
+            return out
+        await asyncio.sleep(2.0)
+
+
+async def _notification_audit(admin_id: uuid.UUID) -> list[dict]:
+    """What the dispatcher recorded doing (§3.5.5): who was paged, in which role, and
+    why a send was refused — the trail a delivery status must agree with."""
+    from app.db.session import tenant_session
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select
+
+    async with tenant_session(admin_id) as s:
+        rows = (
+            await s.execute(
+                select(AdminAuditLog.event_type, AdminAuditLog.event_payload)
+                .where(
+                    AdminAuditLog.admin_id == admin_id,
+                    AdminAuditLog.event_type.in_(NOTIFICATION_EVENTS),
+                )
+                .order_by(AdminAuditLog.created_at.asc())
+            )
+        ).all()
+    return [
+        {
+            "event": event,
+            "recipient": str((payload or {}).get("recipient") or "").lower(),
+            "role": (payload or {}).get("recipient_role"),
+            "failure": (payload or {}).get("failure_reason"),
+        }
+        for event, payload in rows
+    ]
+
+
+def judge_notification(
+    delivery: dict, audit: Sequence[dict], *, contact: str, owner: str
+) -> tuple[bool, str]:
+    """Does the escalation row's delivery status say what the dispatcher actually did?
+
+    ``delivered``/``sent`` needs a recorded send to the configured contact; ``owner_fallback``
+    a send to the owner and none to the contact; ``queued``/``failed`` a recorded refusal
+    and no send to the contact. Anything else (``pending`` never settled, ``unknown``, an
+    SMS-only ``unconfirmed`` on an email page, no row) is not an honest settled answer."""
+    status = str(delivery.get("status") or "missing")
+    detail = str(delivery.get("detail") or "")
+    sent = [a for a in audit if a.get("event") == "escalation_notification_sent"]
+    refused = [a for a in audit if a.get("event") == "escalation_delivery_failed"]
+    to_contact = [
+        a for a in sent if a.get("recipient") == contact and a.get("role") in CONTACT_ROLES
+    ]
+    to_owner = [a for a in sent if a.get("recipient") == owner and a.get("role") in OWNER_ROLES]
+    if status in ("delivered", "sent"):
+        ok = bool(to_contact) and detail.startswith("email:")
+    elif status == "owner_fallback":
+        ok = bool(to_owner) and not to_contact
+    elif status in ("queued", "failed"):
+        ok = bool(refused) and not to_contact
+    else:
+        ok = False
+    trail = ", ".join(
+        f"{str(a.get('event')).removeprefix('escalation_')}:{a.get('role')}"
+        + (f"({a.get('failure')})" if a.get("failure") else "")
+        for a in audit
+    )
+    return ok, f"row={status}/{detail or '-'} audit=[{trail}]"
+
+
+# --- M1 widget-only + pasted knowledge ---------------------------------------- #
+def m1_drive(t: Tenant) -> dict:
+    from app.config import get_settings
+    from app.runtime.orchestrator import AT_CAP_REPLY
+
+    first = widget_turn(t.client, t.embed_key, GROUNDED_QUESTION)
+    status = _check(_api(t, "GET", "/api/v1/admin/luciel/status"), "employee_status") or {}
+    cap = get_settings().free_allowance
+    counted = usage_conversations(t.client)
+    seeded = asyncio.run(seed_counted_conversations(t.email, max(cap - counted, 0)))
+    boot = widget_boot(t.client, t.embed_key)
+    counted_before = usage_conversations(t.client)
+    over = widget_turn(t.client, t.embed_key, "Do you have refurbished tablets in stock?")
+    return {
+        "render": first.get("renderState"),
+        "reply": _reply(first),
+        "today": status.get("today") or {},
+        "cap": cap,
+        "seeded": seeded,
+        "boot_render": boot.get("renderState"),
+        "counted_before": counted_before,
+        "over_render": over.get("renderState"),
+        "over_reply": _reply(over),
+        "counted_after": usage_conversations(t.client),
+        "at_cap_reply": AT_CAP_REPLY,
+    }
+
+
+def judge_m1(o: dict) -> tuple[bool, str]:
+    reply, over_reply = str(o["reply"]), str(o["over_reply"])
+    today = o.get("today") or {}
+    by_channel = today.get("byChannel") or {}
+    cap = int(o["cap"])
+    return verdict(
+        [
+            (
+                "grounded_answer",
+                o["render"] == "active"
+                and GROUNDED_TOKEN in reply
+                and not reply.startswith("Echo:"),
+                f"render={o['render']} reply={reply[:100]!r}",
+            ),
+            (
+                "today_card_counts",
+                int(today.get("conversations") or 0) >= 1
+                and int(by_channel.get("widget") or 0) >= 1,
+                f"today.conversations={today.get('conversations')} byChannel={by_channel}",
+            ),
+            (
+                "at_cap",
+                o["boot_render"] == "at_cap"
+                and o["over_render"] == "at_cap"
+                and over_reply.startswith(str(o["at_cap_reply"]))
+                and o["counted_before"] == o["counted_after"] == cap,
+                f"cap={cap} bootstrap={o['boot_render']} next={o['over_render']} "
+                f"counted {o['counted_before']}->{o['counted_after']} reply={over_reply[:60]!r}",
+            ),
+        ]
+    )
+
+
+# --- M2 widget + channel off (D9) ---------------------------------------------- #
+def m2_drive(t: Tenant) -> dict:
+    first = widget_turn(t.client, t.embed_key, GROUNDED_QUESTION)
+    sid = str(first.get("sessionId") or "")
+    luciel = _check(_api(t, "GET", "/api/v1/admin/luciel"), "luciel") or {}
+    channels = [
+        {"id": c["id"], "enabled": False if c["id"] == "widget" else bool(c.get("enabled"))}
+        for c in luciel.get("channels") or []
+        if isinstance(c, dict) and c.get("id")
+    ]
+    put = _api(t, "PUT", "/api/v1/admin/luciel/channels", json_body={"channels": channels})
+    saved = next(
+        (
+            c.get("enabled")
+            for c in _obj(put).get("channels") or []
+            if isinstance(c, dict) and c.get("id") == "widget"
+        ),
+        None,
+    )
+    boot = widget_boot(t.client, t.embed_key)  # a NEW visitor: no session in the tab
+    inflight = widget_turn(
+        t.client, t.embed_key, "Does the same return window apply to gifts?", session_id=sid
+    )
+    return {
+        "d9_served": channel_off_served(),
+        "put_status": put.status_code,
+        "widget_enabled_after": saved,
+        "boot_new": boot.get("renderState"),
+        "inflight_render": inflight.get("renderState"),
+        "inflight_reply": _reply(inflight),
+        "inflight_same_session": bool(sid) and str(inflight.get("sessionId")) == sid,
+    }
+
+
+def judge_m2(o: dict) -> tuple[bool, str]:
+    inflight = (
+        "in_flight_keeps_answering",
+        o["inflight_render"] == "active"
+        and bool(str(o["inflight_reply"]).strip())
+        and bool(o["inflight_same_session"]),
+        f"render={o['inflight_render']} same_session={o['inflight_same_session']} "
+        f"reply={str(o['inflight_reply'])[:60]!r}",
+    )
+    put_ok = int(o["put_status"]) < 400
+    if o["d9_served"]:
+        checks: list[Check] = [
+            (
+                "toggle_saved",
+                put_ok and o["widget_enabled_after"] is False,
+                f"status={o['put_status']} widget.enabled={o['widget_enabled_after']}",
+            ),
+            (
+                "new_visitor_channel_off",
+                o["boot_new"] == "channel_off",
+                f"bootstrap={o['boot_new']}",
+            ),
+            inflight,
+        ]
+        contract = "D9: this build serves renderState channel_off"
+    else:
+        checks = [
+            ("toggle_accepted", put_ok, f"status={o['put_status']}"),
+            (
+                "new_visitor_current_contract",
+                o["boot_new"] == "active",
+                f"bootstrap={o['boot_new']}",
+            ),
+            inflight,
+        ]
+        contract = (
+            "pre-D9: this build does not serve renderState channel_off (the widget is "
+            "always on), so the CURRENT contract was asserted - re-run after the D9 gate ships"
+        )
+    ok, evidence = verdict(checks)
+    return ok, f"{evidence} contract=[{contract}]"
+
+
+# --- M3 escalation: hot lead + ungrounded turn ---------------------------------- #
+def m3_drive(t: Tenant) -> dict:
+    # The escalation contact is the seed tenant's OWN synthetic address (our domain,
+    # routes nowhere real) — whatever the live tenant can deliver to, never a third
+    # party's mailbox.
+    contact = _email(f"{t.role}-contact").lower()
+    _check(
+        _api(
+            t,
+            "PUT",
+            "/api/v1/admin/luciel/escalation",
+            json_body={"primaryEmail": contact, "preferredChannel": "email"},
+        ),
+        "escalation contact",
+    )
+    out = widget_turn(t.client, t.embed_key, HOT_UNGROUNDED_QUESTION)
+    sid = str(out.get("sessionId") or "")
+    escalations = _check(_api(t, "GET", "/api/v1/dashboard/escalations"), "escalations") or []
+    rows = [e for e in escalations if isinstance(e, dict) and str(e.get("sessionId")) == sid]
+    admin_id = _require_admin_id(t)
+    delivery = run_async(lambda _clients: _escalation_delivery(admin_id, sid))
+    audit = run_async(lambda _clients: _notification_audit(admin_id))
+    return {
+        "render": out.get("renderState"),
+        "reply": _reply(out),
+        "rows": rows,
+        "delivery": delivery,
+        "audit": audit,
+        "contact": contact,
+        "owner": t.email.lower(),
+    }
+
+
+def judge_m3(o: dict) -> tuple[bool, str]:
+    reply = str(o["reply"])
+    rows = list(o["rows"])
+    row = rows[0] if len(rows) == 1 else {}
+    reasons = [str(x) for x in (row.get("reasons") or [])]
+    lead = [x for x in reasons if x in LEAD_REASONS]
+    answer = [x for x in reasons if "backed by your knowledge" in x or x.endswith("% sure")]
+    deliveries = list(o["delivery"])
+    notified, notified_detail = judge_notification(
+        deliveries[0] if len(deliveries) == 1 else {},
+        o["audit"],
+        contact=str(o["contact"]),
+        owner=str(o["owner"]),
+    )
+    return verdict(
+        [
+            (
+                "honest_handoff_ack",
+                o["render"] == "active"
+                and bool(HANDOFF_ACK_RE.search(reply))
+                and not REALTIME_CLAIM_RE.search(reply),
+                f"reply={reply[:140]!r}",
+            ),
+            (
+                "one_escalation_row",
+                len(rows) == 1 and len(deliveries) == 1,
+                f"rows={len(rows)} signals={[r.get('signal') for r in rows]}",
+            ),
+            (
+                "both_reasons",
+                row.get("signal") == "high_value_lead" and bool(lead) and bool(answer),
+                f"signal={row.get('signal')} reasons={reasons}",
+            ),
+            ("notification_honest", notified, notified_detail),
+        ]
+    )
+
+
+# --- M4 takeover ------------------------------------------------------------------ #
+def m4_drive(t: Tenant) -> dict:
+    first = widget_turn(t.client, t.embed_key, "Hi, do you sell refurbished laptops?")
+    sid = str(first.get("sessionId") or "")
+    take = _api(t, "POST", f"/api/v1/dashboard/conversations/{sid}/take-over")
+    human_text = f"Hi, this is the team picking this up (seedtest {RUN_ID})."
+    reply = _api(
+        t,
+        "POST",
+        f"/api/v1/dashboard/conversations/{sid}/messages",
+        json_body={"text": human_text},
+    )
+    reply_body = _obj(reply)
+    message_id = str((reply_body.get("message") or {}).get("messageId") or "")
+    stored = _body(_api(t, "GET", f"/api/v1/dashboard/conversations/{sid}/messages"))
+    poll = widget_history(t.client, t.embed_key, sid)
+    # A second conversation, ended by the widget's close beacon, then taken over.
+    second = widget_turn(t.client, t.embed_key, "Thanks, that is all for now.")
+    sid2 = str(second.get("sessionId") or "")
+    end = _api(
+        t, "POST", f"/api/v1/chat-widget/sessions/{sid2}/end", params={"embedKey": t.embed_key}
+    )
+    refused = _api(t, "POST", f"/api/v1/dashboard/conversations/{sid2}/take-over")
+    return {
+        "take_status": take.status_code,
+        "take_mode": _obj(take).get("mode"),
+        "reply_status": reply.status_code,
+        "delivered": reply_body.get("delivered"),
+        "delivery_detail": reply_body.get("deliveryDetail"),
+        "message_id": message_id,
+        "human_text": human_text,
+        "stored": [
+            {"messageId": str(m.get("messageId")), "role": m.get("role"), "text": m.get("text")}
+            for m in (stored if isinstance(stored, list) else [])
+            if isinstance(m, dict)
+        ],
+        "poll": [
+            {"messageId": str(m.get("messageId")), "role": m.get("role"), "text": m.get("text")}
+            for m in poll
+        ],
+        "end_status": end.status_code,
+        "refused_status": refused.status_code,
+        "refused_message": str(_obj(refused).get("message") or ""),
+    }
+
+
+def judge_m4(o: dict) -> tuple[bool, str]:
+    mid = str(o["message_id"])
+    stored = [m for m in o["stored"] if mid and m.get("messageId") == mid]
+    served = [m for m in o["poll"] if mid and m.get("messageId") == mid]
+    return verdict(
+        [
+            (
+                "take_over",
+                o["take_status"] == 200 and o["take_mode"] == "human_controlled",
+                f"status={o['take_status']} mode={o['take_mode']}",
+            ),
+            (
+                "human_reply_persisted_honestly",
+                o["reply_status"] == 200
+                and o["delivered"] is False
+                and o["delivery_detail"] == "widget_poll_only"
+                and len(stored) == 1
+                and stored[0].get("role") == "human_agent"
+                and stored[0].get("text") == o["human_text"],
+                f"status={o['reply_status']} delivered={o['delivered']} "
+                f"detail={o['delivery_detail']} stored_rows={len(stored)}",
+            ),
+            (
+                "served_by_widget_poll",
+                len(served) == 1
+                and served[0].get("role") == "human"
+                and served[0].get("text") == o["human_text"],
+                f"poll_roles={[m.get('role') for m in o['poll']]}",
+            ),
+            (
+                "ended_session_refused",
+                o["end_status"] == 204
+                and o["refused_status"] == 409
+                and "session_ended" in str(o["refused_message"]),
+                f"end={o['end_status']} take_over={o['refused_status']} "
+                f"message={str(o['refused_message'])[:80]!r}",
+            ),
+        ]
+    )
+
+
+# --- M5 leads: own vs third-party address ---------------------------------------- #
+def _lead_ids(lead: dict) -> set[str]:
+    return {str(lead.get(k) or "").lower() for k in ("contactIdentifier", "email", "phone")} - {""}
+
+
+def m5_drive(t: Tenant) -> dict:
+    own = _email(f"{t.role}-own").lower()
+    colleague = _email(f"{t.role}-colleague").lower()
+    out = widget_turn(
+        t.client,
+        t.embed_key,
+        f"Hi, I'm Jordan Lee. My email is {own}. Please also copy my colleague {colleague} "
+        "on the quote for a refurbished laptop.",
+    )
+    leads: list[dict] = []
+    for _ in range(10):
+        data = _check(_api(t, "GET", "/api/v1/dashboard/leads"), "leads")
+        leads = [lead for lead in data if isinstance(lead, dict)] if isinstance(data, list) else []
+        if any(own in _lead_ids(lead) for lead in leads):
+            break
+        time.sleep(1)
+    keep = ("leadId", "contactIdentifier", "email", "phone", "crmStatus", "crmDetail")
+    return {
+        "render": out.get("renderState"),
+        "own": own,
+        "colleague": colleague,
+        "leads": [{k: lead.get(k) for k in keep} for lead in leads],
+    }
+
+
+def judge_m5(o: dict) -> tuple[bool, str]:
+    own, colleague = str(o["own"]), str(o["colleague"])
+    leads = list(o["leads"])
+    mine = [lead for lead in leads if own in _lead_ids(lead)]
+    theirs = [lead for lead in leads if colleague in _lead_ids(lead)]
+    lead = mine[0] if len(mine) == 1 else {}
+    return verdict(
+        [
+            (
+                "own_email_is_the_identifier",
+                len(mine) == 1 and str(lead.get("contactIdentifier") or "").lower() == own,
+                f"leads={len(leads)} identifier={lead.get('contactIdentifier')!r}",
+            ),
+            (
+                "third_party_is_not",
+                not theirs,
+                f"leads_keyed_on_the_colleague={len(theirs)}",
+            ),
+            (
+                "crm_never_attempted",
+                lead.get("crmStatus") == "never_attempted"
+                and lead.get("crmDetail") == "crm_not_connected",
+                f"crmStatus={lead.get('crmStatus')} crmDetail={lead.get('crmDetail')}",
+            ),
+        ]
+    )
+
+
+# --- M6 lifecycle ----------------------------------------------------------------- #
+def m6_drive(t: Tenant) -> dict:
+    key0 = t.embed_key
+    paused = _state_of(_api(t, "POST", "/api/v1/admin/luciel/pause"))
+    boot_paused = widget_boot(t.client, key0)
+    send_paused = widget_turn(t.client, key0, "Hello, is anyone there?")
+    resumed = _state_of(_api(t, "POST", "/api/v1/admin/luciel/resume"))
+    boot_resumed = widget_boot(t.client, key0)
+    deleted = _state_of(_api(t, "POST", "/api/v1/admin/luciel/delete"))
+    boot_deleted = widget_boot(t.client, key0)
+    restored = _state_of(_api(t, "POST", "/api/v1/admin/luciel/restore"))
+    boot_restored = widget_boot(t.client, key0)
+    return {
+        "key0": key0,
+        "pause_state": paused.get("state"),
+        "boot_paused": boot_paused.get("renderState"),
+        "boot_paused_opening": boot_paused.get("openingMessage"),
+        "send_paused": send_paused.get("renderState"),
+        "send_paused_reply": _reply(send_paused),
+        "resume_state": resumed.get("state"),
+        "boot_resumed": boot_resumed.get("renderState"),
+        "delete_state": deleted.get("state"),
+        "grace_started": deleted.get("graceWindowStartedAt"),
+        "boot_deleted": boot_deleted.get("renderState"),
+        "restore_state": restored.get("state"),
+        "key_after": restored.get("embedKeyPublicId"),
+        "boot_restored": boot_restored.get("renderState"),
+    }
+
+
+def judge_m6(o: dict) -> tuple[bool, str]:
+    return verdict(
+        [
+            (
+                "pause_renders_nothing",
+                o["pause_state"] == "paused"
+                and o["boot_paused"] == "paused"
+                and not o["boot_paused_opening"]
+                and o["send_paused"] == "paused"
+                and not o["send_paused_reply"],
+                f"state={o['pause_state']} bootstrap={o['boot_paused']} "
+                f"send={o['send_paused']} reply={str(o['send_paused_reply'])[:40]!r}",
+            ),
+            (
+                "resume_active",
+                o["resume_state"] == "active" and o["boot_resumed"] == "active",
+                f"state={o['resume_state']} bootstrap={o['boot_resumed']}",
+            ),
+            (
+                "delete_grace_renders_nothing",
+                o["delete_state"] == "luciel_grace_window"
+                and bool(o["grace_started"])
+                and o["boot_deleted"] == "paused",
+                f"state={o['delete_state']} grace_started={bool(o['grace_started'])} "
+                f"bootstrap={o['boot_deleted']}",
+            ),
+            (
+                "restore_keeps_embed_key",
+                o["restore_state"] == "active"
+                and bool(o["key0"])
+                and o["key_after"] == o["key0"]
+                and o["boot_restored"] == "active",
+                f"state={o['restore_state']} key_kept={o['key_after'] == o['key0']} "
+                f"bootstrap={o['boot_restored']}",
+            ),
+        ]
+    )
+
+
+# --- M7 free cap ------------------------------------------------------------------ #
+def m7_drive(t: Tenant) -> dict:
+    from app.config import get_settings
+    from app.runtime.orchestrator import AT_CAP_REPLY
+
+    cap = get_settings().free_allowance
+    admin_id = _require_admin_id(t)
+    seeded = asyncio.run(seed_counted_conversations(t.email, cap - 1))
+    last_free = widget_turn(t.client, t.embed_key, "Question number fifty please")
+    fiftieth = str(last_free.get("sessionId") or "")
+    counted_at_cap = usage_conversations(t.client)
+    calls_before = await_quiet_llm_window(admin_id)
+    over = widget_turn(t.client, t.embed_key, "One more question over the cap?")
+    calls_after = llm_calls_in_window(admin_id) if calls_before is not None else None
+    counted_after_over = usage_conversations(t.client)
+    mid = widget_turn(
+        t.client,
+        t.embed_key,
+        "Sorry, one follow-up: how long is the return window?",
+        session_id=fiftieth,
+    )
+    return {
+        "cap": cap,
+        "seeded": seeded,
+        "last_free_render": last_free.get("renderState"),
+        "counted_at_cap": counted_at_cap,
+        "calls_before": calls_before,
+        "calls_after": calls_after,
+        "over_render": over.get("renderState"),
+        "over_reply": _reply(over),
+        "counted_after_over": counted_after_over,
+        "mid_render": mid.get("renderState"),
+        "mid_reply": _reply(mid),
+        "mid_same_session": bool(fiftieth) and str(mid.get("sessionId")) == fiftieth,
+        "counted_after_mid": usage_conversations(t.client),
+        "at_cap_reply": AT_CAP_REPLY,
+    }
+
+
+def judge_m7(o: dict) -> tuple[bool, str]:
+    cap = int(o["cap"])
+    at_cap_reply = str(o["at_cap_reply"])
+    over_reply, mid_reply = str(o["over_reply"]), str(o["mid_reply"])
+    before, after = o["calls_before"], o["calls_after"]
+    if before is None:
+        zero: Check = (
+            "zero_model_calls",
+            o["counted_after_over"] == o["counted_at_cap"],
+            "proof=counter-only (no Redis-backed LLM cap store in this process): the "
+            "fire-once counter did not advance",
+        )
+    else:
+        zero = (
+            "zero_model_calls",
+            after == before,
+            f"proof=llmcap window {before}->{after} (shared Redis, the API's own counter)",
+        )
+    return verdict(
+        [
+            (
+                "fiftieth_served",
+                o["last_free_render"] == "active" and o["counted_at_cap"] == cap,
+                f"render={o['last_free_render']} counted={o['counted_at_cap']}/{cap}",
+            ),
+            (
+                "fifty_first_at_cap",
+                o["over_render"] == "at_cap"
+                and over_reply.startswith(at_cap_reply)
+                and o["counted_after_over"] == cap,
+                f"render={o['over_render']} counted={o['counted_after_over']} "
+                f"reply={over_reply[:60]!r}",
+            ),
+            zero,
+            (
+                "counted_conversation_not_cut",
+                o["mid_render"] == "active"
+                and bool(mid_reply.strip())
+                and not mid_reply.startswith(at_cap_reply)
+                and bool(o["mid_same_session"])
+                and o["counted_after_mid"] == cap,
+                f"render={o['mid_render']} same_session={o['mid_same_session']} "
+                f"counted={o['counted_after_mid']} reply={mid_reply[:60]!r}",
+            ),
+        ]
+    )
+
+
+# --- M8 closure ------------------------------------------------------------------- #
+def m8_drive(t: Tenant) -> dict:
+    close = _api(t, "POST", "/api/v1/admin/account/close", json_body={"confirmDeleteLuciel": True})
+    # The pre-closure session: the closure bumped the epoch (security contract).
+    stale = _api(t, "GET", "/api/v1/admin/luciel")
+    login(t.client, t.email)  # a closed account still signs in, to its reduced surface
+    account = _api(t, "GET", "/api/v1/admin/account")
+    export = _api(t, "POST", "/api/v1/admin/account/export")
+    refused: dict[str, list[object]] = {}
+    for method, path, body in CLOSED_REFUSED_ROUTES:
+        resp = _api(t, method, path, json_body=body)
+        refused[f"{method} {path}"] = [resp.status_code, _obj(resp).get("code")]
+    reopen = _api(t, "POST", "/api/v1/admin/account/reopen")
+    luciel = _api(t, "GET", "/api/v1/admin/luciel")
+    leads = _api(t, "GET", "/api/v1/dashboard/leads")
+    boot = widget_boot(t.client, t.embed_key)
+    return {
+        "close_status": close.status_code,
+        "stale_status": stale.status_code,
+        "account_status": account.status_code,
+        "account": _obj(account),
+        "export_status": export.status_code,
+        "export_has_link": bool(_obj(export).get("downloadUrl")),
+        "refused": refused,
+        "reopen_status": reopen.status_code,
+        "reopen": _obj(reopen),
+        "luciel_status": luciel.status_code,
+        "luciel_state": _obj(luciel).get("state"),
+        "leads_status": leads.status_code,
+        "boot": boot.get("renderState"),
+    }
+
+
+def judge_m8(o: dict) -> tuple[bool, str]:
+    account, reopen = o.get("account") or {}, o.get("reopen") or {}
+    refused = o.get("refused") or {}
+    leaked = {route: got for route, got in refused.items() if list(got) != [403, "account_closed"]}
+    return verdict(
+        [
+            ("closed", o["close_status"] == 204, f"status={o['close_status']}"),
+            (
+                "old_session_revoked",
+                o["stale_status"] == 401,
+                f"status={o['stale_status']} (closure bumps the session epoch)",
+            ),
+            (
+                "reduced_surface_answers",
+                o["account_status"] == 200
+                and account.get("state") == "closed"
+                and account.get("canReopen") is True
+                and o["export_status"] == 200
+                and bool(o["export_has_link"]),
+                f"account={o['account_status']}/{account.get('state')} "
+                f"canReopen={account.get('canReopen')} export={o['export_status']} "
+                f"link={o['export_has_link']}",
+            ),
+            (
+                "everything_else_403_account_closed",
+                bool(refused) and not leaked,
+                f"routes={len(refused)} leaked={leaked}",
+            ),
+            (
+                "reopen",
+                o["reopen_status"] == 200
+                and reopen.get("state") == "verified"
+                and reopen.get("lucielRestored") is True,
+                f"status={o['reopen_status']} state={reopen.get('state')} "
+                f"lucielRestored={reopen.get('lucielRestored')}",
+            ),
+            (
+                "reopen_restores",
+                o["luciel_status"] == 200
+                and o["luciel_state"] == "active"
+                and o["leads_status"] == 200
+                and o["boot"] == "active",
+                f"luciel={o['luciel_status']}/{o['luciel_state']} leads={o['leads_status']} "
+                f"widget={o['boot']}",
+            ),
+        ]
+    )
+
+
+@dataclass(frozen=True)
+class Combination:
+    key: str
+    name: str
+    asserts: str
+    drive: Callable[[Tenant], dict]
+    judge: Callable[[dict], tuple[bool, str]]
+
+
+MATRIX: tuple[Combination, ...] = (
+    Combination(
+        "M1",
+        "widget-only+pasted-knowledge",
+        "a grounded widget answer; the Today card counts the conversation; at the cap the "
+        "bootstrap and the next NEW conversation are at_cap with the canned reply, uncounted",
+        m1_drive,
+        judge_m1,
+    ),
+    Combination(
+        "M2",
+        "widget+channel-off(D9)",
+        "widget toggled off: a new visitor's bootstrap reads channel_off (D9) - or, on a build "
+        "without D9, the current always-on contract, said so - and an in-flight session keeps "
+        "answering",
+        m2_drive,
+        judge_m2,
+    ),
+    Combination(
+        "M3",
+        "escalation:hot-lead+ungrounded",
+        "the honest hand-off ack (no real-time claim); ONE escalation row carrying the lead "
+        "AND the answer reasons; the notification row agrees with the dispatcher's audit trail",
+        m3_drive,
+        judge_m3,
+    ),
+    Combination(
+        "M4",
+        "takeover",
+        "take-over -> a human reply persisted (delivered=false, widget_poll_only) and served by "
+        "the widget poll as the team; take-over of an ENDED session refused session_ended",
+        m4_drive,
+        judge_m4,
+    ),
+    Combination(
+        "M5",
+        "leads:own-vs-third-party",
+        "a volunteered own email becomes the lead's identifier, a mentioned colleague's does "
+        "not; never_attempted / crm_not_connected with no CRM",
+        m5_drive,
+        judge_m5,
+    ),
+    Combination(
+        "M6",
+        "lifecycle:pause-resume-delete-restore",
+        "pause -> the widget renders nothing; resume -> active; delete -> grace (renders "
+        "nothing) -> restore -> active on the SAME embed key",
+        m6_drive,
+        judge_m6,
+    ),
+    Combination(
+        "M7",
+        "free-cap:51st+mid-conversation",
+        "the 51st conversation of a tenant at 50 gets the at-cap reply with ZERO model calls "
+        "(the API's own Redis call counter); the 50th conversation is not cut mid-way",
+        m7_drive,
+        judge_m7,
+    ),
+    Combination(
+        "M8",
+        "closure:close-reduced-surface-reopen",
+        "close -> the old session revoked, account read + export answer, every other admin "
+        "route 403 account_closed; reopen restores the account, the Luciel and the widget",
+        m8_drive,
+        judge_m8,
+    ),
+)
+MATRIX_KEYS = tuple(c.key for c in MATRIX)
+
+
+def run_combination(r: Results, combo: Combination, *, keep: bool = False) -> None:
+    """One combination on its own throwaway tenant: seed, drive, judge, record, purge."""
+    tenant = Tenant(combo.key.lower())
+    started = time.monotonic()
+    try:
+        tenant.seed()
+        tenant.admin_id = asyncio.run(_admin_id_for(tenant.email))
+        ok, evidence = combo.judge(combo.drive(tenant))
+    except Exception as exc:  # noqa: BLE001 — a combination that cannot run is a FAIL
+        ok, evidence = False, f"aborted: {type(exc).__name__}: {str(exc)[:300]}"
+    seconds = time.monotonic() - started
+    r.record(f"{combo.key} {combo.name}", ok, evidence, kind="matrix", seconds=seconds)
+    try:
+        if not keep:
+            asyncio.run(_teardown([tenant]))
+    finally:
+        tenant.client.close()
+
+
+def run_matrix(r: Results, keys: Sequence[str] = ()) -> None:
+    combos = [c for c in MATRIX if not keys or c.key in keys]
+    keep = os.environ.get("LUCIEL_SEEDTEST_KEEP") == "1"
+    print(f"[matrix] {len(combos)} combination(s): {' '.join(c.key for c in combos)}", flush=True)
+    for combo in combos:
+        run_combination(r, combo, keep=keep)
+    print_manual_walk_items()
+
+
+def print_manual_walk_items() -> None:
+    print(
+        "[matrix] NOT in the matrix (each needs an OWNER asset) - the manual live walk:", flush=True
+    )
+    for item, what in MANUAL_WALK_ITEMS:
+        print(f"[matrix]   - {item}: {what}", flush=True)
+
+
+def print_matrix_catalogue() -> None:
+    for c in MATRIX:
+        print(f"{c.key} {c.name}: {c.asserts}", flush=True)
+    print_manual_walk_items()
+
+
+# --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Options:
     strict: bool
+    cases: bool = True
+    matrix: bool = False
+    only: tuple[str, ...] = ()
+    list_matrix: bool = False
 
 
 def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Options:
@@ -1013,26 +2058,73 @@ def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Option
         help="fail the run on any skip outside the owner-gated allowlist",
     )
     p.add_argument("--no-strict", dest="strict", action="store_false", help="opt out of strict")
+    p.add_argument(
+        "--matrix",
+        action="store_true",
+        help="run the configuration combinations (M1-M8), each on its own throwaway tenant",
+    )
+    p.add_argument(
+        "--cases",
+        action="store_true",
+        help="run T1-T7 too (the default when --matrix is not given)",
+    )
+    p.add_argument(
+        "--only",
+        default="",
+        metavar="M1,M3",
+        help="with --matrix: run only these combinations",
+    )
+    p.add_argument(
+        "--list-matrix",
+        action="store_true",
+        help="print the combinations and the manual live walk's items, then exit",
+    )
     ns = p.parse_args(list(argv))
     strict = ns.strict if ns.strict is not None else env.get("LUCIEL_SEEDTEST_STRICT") == "1"
-    return Options(strict=bool(strict))
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    opts = parse_args(sys.argv[1:] if argv is None else argv)
-    print(
-        f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'}",
-        flush=True,
+    only = tuple(dict.fromkeys(k.strip().upper() for k in ns.only.split(",") if k.strip()))
+    unknown = [k for k in only if k not in MATRIX_KEYS]
+    if unknown:
+        p.error(f"unknown combination(s) {', '.join(unknown)}; known: {', '.join(MATRIX_KEYS)}")
+    if only and not ns.matrix:
+        p.error("--only selects matrix combinations; add --matrix")
+    return Options(
+        strict=bool(strict),
+        cases=ns.cases or not ns.matrix,
+        matrix=ns.matrix,
+        only=only,
+        list_matrix=ns.list_matrix,
     )
-    _harness_process_posture()
-    r = Results()
+
+
+def _guarded(r: Results, label: str, block: Callable[[Results], None]) -> None:
+    """Run one block; an exception that escapes it is a recorded FAIL, so an aborted
+    run still ends with its verdict and summary instead of a bare traceback exit."""
     try:
-        run_cases(r)
+        block(r)
     except Exception as exc:  # noqa: BLE001 — an aborted run still reports its verdict
         import traceback
 
         traceback.print_exc()
-        r.record("T-cases aborted", False, f"{type(exc).__name__}: {str(exc)[:300]}")
+        r.record(f"{label} aborted", False, f"{type(exc).__name__}: {str(exc)[:300]}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    opts = parse_args(sys.argv[1:] if argv is None else argv)
+    if opts.list_matrix:
+        print_matrix_catalogue()
+        return 0
+    print(
+        f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'} "
+        f"cases={'on' if opts.cases else 'off'} "
+        f"matrix={(','.join(opts.only) or 'all') if opts.matrix else 'off'}",
+        flush=True,
+    )
+    _harness_process_posture()
+    r = Results()
+    if opts.cases:
+        _guarded(r, "T-cases", run_cases)
+    if opts.matrix:
+        _guarded(r, "matrix", lambda results: run_matrix(results, opts.only))
     return finish(r, strict=opts.strict)
 
 
