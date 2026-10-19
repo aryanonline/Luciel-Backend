@@ -47,6 +47,8 @@ jobs:
     env:
       PGPASSWORD: postgres
       LUCIEL_COOKIE_SECURE: "false"
+      # uv sync builds .venv on the 3.12 line the image runs (python:3.12.x-slim).
+      UV_PYTHON: '3.12'
 
     steps:
       - uses: actions/checkout@v4
@@ -55,15 +57,25 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          # Pinned (round 7 WP-9): uv.lock was written by this version and the
+          # Dockerfile copies the same one (ghcr.io/astral-sh/uv:<version>). Bump the
+          # three together — ci.yml, dependency-review.yml, Dockerfile.
+          version: '0.12.23'
 
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install deps
+      - name: Install deps (the LOCKED set — uv.lock)
         run: |
-          uv venv .venv
-          . .venv/bin/activate
-          uv pip install -e ".[dev]" "psycopg[binary]" "pydantic[email]"
+          # The lock must match pyproject.toml: a range edited without re-locking
+          # fails HERE, not as a silently different install (`uv lock --check`
+          # re-resolves and refuses to write).
+          uv lock --check
+          # --frozen: install exactly uv.lock, never re-resolve. The image installs
+          # the same lock (`uv sync --frozen --no-dev`), so what this run tests is
+          # what the deploy ships (before the lock, both floated within the ranges).
+          uv sync --frozen --extra dev
 
       - name: Provision DB roles (the non-superuser app role + narrow auth role + audit owner)
         run: |
