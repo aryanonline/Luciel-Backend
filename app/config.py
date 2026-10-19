@@ -777,6 +777,14 @@ class Settings(BaseSettings):
             )
 
     @property
+    def platform_twilio_configured(self) -> bool:
+        """A PLATFORM Twilio account was intentionally configured (any of its three
+        settings). The customer-facing path is BYO; this one is the dev fallback."""
+        return bool(
+            self.twilio_account_sid or self.twilio_api_key_sid or self.twilio_api_key_secret
+        )
+
+    @property
     def ses_inbound_topic_arns(self) -> frozenset[str]:
         """The pinned SES inbound topics (``ses_inbound_topic_arn``, comma-separated)."""
         return frozenset(a.strip() for a in self.ses_inbound_topic_arn.split(",") if a.strip())

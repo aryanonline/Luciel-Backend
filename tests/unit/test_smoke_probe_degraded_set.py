@@ -77,3 +77,40 @@ def test_a_degraded_database_fails_the_probe(tmp_path: Path) -> None:
 def test_the_wrong_integration_mode_fails_the_probe(tmp_path: Path) -> None:
     body = {"status": "ok", "integrationMode": "mock", "degraded": []}
     assert _run(tmp_path, mode="live", posture="test", body=body) == 1
+
+
+_MOCK_STAND_INS = [
+    "platform_email:NullEmailSender",
+    "secret_store:LocalSecretStore",
+    "calendar_api:InMemoryCalendarApi",
+    "llm:EchoModel",
+]
+
+
+def _mock(degraded: list[str]) -> dict[str, object]:
+    return {"status": "ok", "integrationMode": "mock", "degraded": degraded}
+
+
+@pytest.mark.parametrize(
+    "degraded",
+    [_MOCK_STAND_INS, [*_MOCK_STAND_INS, "platform_sms:NullSmsSender"]],
+)
+def test_a_mock_deploy_passes_with_or_without_a_platform_twilio_account(
+    tmp_path: Path, degraded: list[str]
+) -> None:
+    """Round 7 WP-7: /healthz lists platform_sms only where the platform secret carries
+    a platform Twilio account, so the mock set accepts it present or absent."""
+    assert _run(tmp_path, mode="mock", posture="test", body=_mock(degraded)) == 0
+
+
+def test_a_mock_deploy_still_needs_every_required_stand_in(tmp_path: Path) -> None:
+    body = _mock([*_MOCK_STAND_INS[1:], "platform_sms:NullSmsSender"])
+    assert _run(tmp_path, mode="mock", posture="test", body=body) == 1
+
+
+def test_a_half_configured_platform_twilio_fails_a_live_deploy(tmp_path: Path) -> None:
+    """Optional in mock only: in live a listed platform_sms is a half-configured
+    account, a binding fault like any other."""
+    assert (
+        _run(tmp_path, mode="live", posture="test", body=_live(["platform_sms:NullSmsSender"])) == 1
+    )

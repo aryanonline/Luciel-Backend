@@ -269,8 +269,10 @@ async def test_send_email_tool_reports_ok_when_a_real_sender_is_bound(live, monk
 
 
 # --- loud integration mode ------------------------------------------------------- #
-def test_degraded_bindings_names_every_null_seam_in_mock_mode():
+def test_degraded_bindings_names_every_null_seam_in_mock_mode(monkeypatch):
     get_settings.cache_clear()  # type: ignore[attr-defined]
+    # A platform Twilio account configured: its sender is a seam (Null in mock).
+    monkeypatch.setattr(get_settings(), "twilio_account_sid", "AC_unit_test")
     degraded = degraded_bindings()
     seams = {entry.split(":", 1)[0] for entry in degraded}
     assert {"platform_email", "platform_sms", "secret_store"} <= seams
@@ -279,6 +281,36 @@ def test_degraded_bindings_names_every_null_seam_in_mock_mode():
     assert "meta_sender" not in seams
     # seam:ImplClass — a class NAME, never a value.
     assert all(entry.count(":") == 1 and entry.split(":", 1)[1] for entry in degraded)
+
+
+@pytest.mark.parametrize("mode", ["mock", "live"])
+def test_platform_sms_is_a_seam_only_when_a_platform_twilio_account_is_configured(
+    monkeypatch, mode
+):
+    """Round 7 WP-7: the platform Twilio sender is a dev fallback (BYO telephony sends
+    through the tenant's own account), so a deployment without a platform account
+    omits the seam instead of reporting it degraded forever; any one of the three
+    settings means one was intended, and its Null binding is then named."""
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    settings = get_settings()
+    monkeypatch.setattr(settings, "integration_mode", mode)
+    for name in ("twilio_account_sid", "twilio_api_key_sid", "twilio_api_key_secret"):
+        monkeypatch.setattr(settings, name, "")
+    assert not any(e.startswith("platform_sms:") for e in degraded_bindings())
+
+    # Any ONE of the three means an account was intended: half-configured (or mock)
+    # binds Null, and Null is named.
+    for name in ("twilio_account_sid", "twilio_api_key_sid", "twilio_api_key_secret"):
+        monkeypatch.setattr(settings, name, "set")
+        assert "platform_sms:NullSmsSender" in degraded_bindings()
+        monkeypatch.setattr(settings, name, "")
+
+    # Fully configured: mock still binds Null (named), live binds the real sender.
+    monkeypatch.setattr(settings, "twilio_account_sid", "AC123")
+    monkeypatch.setattr(settings, "twilio_api_key_sid", "SK123")
+    monkeypatch.setattr(settings, "twilio_api_key_secret", "unit-secret")
+    listed = any(e.startswith("platform_sms:") for e in degraded_bindings())
+    assert listed is (mode == "mock")
 
 
 def test_degraded_bindings_names_an_unbound_payg_price_in_a_real_stripe_posture(monkeypatch):

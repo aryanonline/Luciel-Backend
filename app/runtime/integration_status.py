@@ -89,12 +89,19 @@ def degraded_bindings() -> list[str]:
     # process-wide Meta binding to report on. Whether a given tenant can send is a
     # property of their channel_auth connection and surfaces on that connection's status,
     # not here — listing it would report every deployment as degraded forever.
-    seams: tuple[tuple[str, object], ...] = (
-        ("platform_email", build_email_sender()),
-        ("platform_sms", build_sms_sender()),
+    seams: list[tuple[str, object]] = [("platform_email", build_email_sender())]
+    # Round 7 WP-7: the PLATFORM Twilio sender is a dev/mock fallback with no live
+    # consumer that is not refused (BYO telephony sends through the tenant's own
+    # account), so an absent platform Twilio account is the normal posture — listing it
+    # made every deployment without one degraded forever. It is a seam only when a
+    # platform account was intentionally configured (any of its three settings), and
+    # then a Null binding (half-configured, or mock) is named like any other.
+    if settings.platform_twilio_configured:
+        seams.append(("platform_sms", build_sms_sender()))
+    seams += [
         ("secret_store", get_secret_store()),
         ("calendar_api", build_calendar_api()),
-    )
+    ]
     degraded = [f"{seam}:{type(obj).__name__}" for seam, obj in seams if is_degraded_binding(obj)]
     # The gateway singleton is read from config rather than built: constructing it here
     # would bind the process-wide instance as a side effect of a health check.
