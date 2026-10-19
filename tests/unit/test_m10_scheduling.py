@@ -277,6 +277,31 @@ async def test_without_a_zone_every_proposed_and_read_back_time_is_labelled_utc(
     assert link is not None and link["timezone"] == "UTC"
 
 
+def test_a_queued_callback_reads_back_its_time_with_the_zone_named():
+    """schedule_callback echoed the model's UTC instant with no label: the time it read
+    back to a zoneless business's customer was a bare hour. The read-back now carries
+    the instant on the business's clock with the zone named — UTC when none is set."""
+    zoneless = ToolContext(admin_id=uuid.uuid4(), instance_id=uuid.uuid4(), timezone=None)
+    out = catalog._callback_readback("2026-10-07T18:00:00Z", "sms", zoneless)
+    assert out["fireAt"] == "2026-10-07T18:00:00Z"  # the instant as asked, unchanged
+    assert out["fireAtBusinessTime"] == "2026-10-07T18:00:00+00:00"
+    assert out["timezone"] == "UTC"
+
+    # A naive instant is UTC, exactly as the deferred queue reads it.
+    naive = catalog._callback_readback("2026-10-07T18:00:00", "sms", zoneless)
+    assert naive["fireAtBusinessTime"] == "2026-10-07T18:00:00+00:00"
+
+    # With a zone the same instant is read back on the business's clock.
+    zoned = replace(zoneless, timezone=TORONTO)
+    local = catalog._callback_readback("2026-10-07T18:00:00Z", "email", zoned)
+    assert local["fireAtBusinessTime"] == "2026-10-07T14:00:00-04:00"
+    assert local["timezone"] == TORONTO
+
+    # An unparseable time claims no time at all (the queue sends it at once).
+    loose = catalog._callback_readback("tomorrow afternoon", "sms", zoneless)
+    assert "fireAtBusinessTime" not in loose and "timezone" not in loose
+
+
 # --- no business time zone: the Today card need ----------------------------------------
 
 

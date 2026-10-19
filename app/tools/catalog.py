@@ -462,13 +462,31 @@ class ScheduleCallbackTool:
         except Exception as exc:  # noqa: BLE001
             return c.failed(f"enqueue_failed:{type(exc).__name__}")
 
-        return c.ok(
-            {
-                "scheduled": True,
-                "fireAt": inputs["fire_at"],
-                "channel": channel,
-            }
-        )
+        return c.ok(_callback_readback(inputs["fire_at"], channel, context))
+
+
+def _callback_readback(fire_at: object, channel: str, context: ToolContext) -> dict[str, Any]:
+    """The confirming payload for a queued callback (round 7 M10).
+
+    ``fireAt`` stays the instant exactly as asked. Beside it, the same instant on the
+    business's clock with the zone NAMED — ``UTC`` when the business has set none —
+    so the time Luciel reads back is never a bare hour the customer would take for
+    their own. A naive value is read as UTC, as the queue reads it
+    (``deferred_queue``); a value that does not parse gains nothing (the queue then
+    sends at once, and no time is claimed for it here)."""
+    out: dict[str, Any] = {"scheduled": True, "fireAt": fire_at, "channel": channel}
+    try:
+        instant = datetime.fromisoformat(str(fire_at))
+    except ValueError:
+        return out
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    tz = business_zone(context.timezone)
+    return {
+        **out,
+        "fireAtBusinessTime": instant.astimezone(tz).isoformat(),
+        "timezone": zone_label(tz),
+    }
 
 
 class PushToCrmTool:

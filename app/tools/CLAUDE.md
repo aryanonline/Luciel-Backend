@@ -102,7 +102,9 @@ make that state explicit and test it.
 - Calendly link/reschedule end = the chosen event type's OWN length: the connection row's
   `eventTypeDurationMinutes` (written by PUT /connections/{id}/settings), else Calendly's
   event types, else NO end on the payload (never the 30-minute default).
-- No business zone: `stamp_zone` labels every confirming payload `timezone: "UTC"` and
-  check_availability carries `timezone` (zone name or `UTC`) — never a bare hour. The Today
+- No business zone: `stamp_zone` labels every confirming payload `timezone: "UTC"`,
+  check_availability carries `timezone` (zone name or `UTC`), and schedule_callback's ok
+  adds `fireAtBusinessTime` + `timezone` beside the raw `fireAt` (`_callback_readback`;
+  a naive instant is UTC, as the deferred queue reads it) — never a bare hour. The Today
   card's `timezone_unset` need (app/employee/status.py) tells the owner; never guessed.
   Tests: `tests/unit/test_m10_scheduling.py`, `tests/integration/test_m10_timezone_need.py`.

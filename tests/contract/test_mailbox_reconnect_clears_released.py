@@ -96,3 +96,42 @@ async def test_an_outlook_reconnect_clears_the_released_marker(client, monkeypat
     cfg = (await _row(admin_id)).non_secret_config or {}
     assert cfg[RELEASED_DESTINATION_KEY] == MAILBOX
     assert "destination" not in cfg
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_an_sms_re_verify_promotion_clears_a_released_marker():
+    """The re-verify path is a claim point too: a pending number that probes operable
+    becomes the routable claim, and a released copy left on the row (a row written
+    before attach consumed the marker) must not survive beside the live claim."""
+    from app.channels.number_operability import NullOperabilityProbe
+    from app.channels.phone_lifecycle import attach_sms_number, reverify_sms_number
+
+    from tests.integration.test_number_operability import NUM_A, _seed
+
+    admin = uuid.uuid4()
+    iid = await _seed(admin)
+    async with tenant_session(admin) as s:
+        conn = await attach_sms_number(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            e164_number=NUM_A,
+            probe=NullOperabilityProbe(operable_numbers=set()),
+        )
+        # The stale state: a pending (unproven) number with a released copy beside it.
+        conn.non_secret_config = {
+            **(conn.non_secret_config or {}),
+            RELEASED_DESTINATION_KEY: NUM_A,
+        }
+        await s.flush()
+        assert "destination" not in conn.non_secret_config
+
+        promoted = await reverify_sms_number(
+            s, admin_id=admin, instance_id=iid, probe=NullOperabilityProbe(operable_numbers={NUM_A})
+        )
+        assert promoted is not None
+        cfg = promoted.non_secret_config or {}
+        assert cfg["destination"] == NUM_A
+        assert "pending_destination" not in cfg
+        assert RELEASED_DESTINATION_KEY not in cfg
+        assert await routing.owner_of_destination(s, "sms_sender", NUM_A) == admin
