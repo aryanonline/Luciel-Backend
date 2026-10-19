@@ -6,6 +6,7 @@
 #   scripts/run-seedtest-task.sh dev                 # strict single run (T1-T7)
 #   scripts/run-seedtest-task.sh dev --matrix        # the configuration matrix (M1-M8)
 #   scripts/run-seedtest-task.sh dev --matrix --only M3,M8
+#   scripts/run-seedtest-task.sh dev --persist e2e-walk   # keep the walk tenant walkable
 #   scripts/run-seedtest-task.sh dev --no-strict     # the same, any skip tolerated
 #
 # Every argument after the environment is handed to scripts/seed_and_livetest.py as the

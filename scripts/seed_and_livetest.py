@@ -29,6 +29,19 @@ reopen). ``--only M3,M8`` picks some; ``--cases`` adds T1-T7 (the default withou
 (configurations that need an OWNER asset: a Twilio number, a mailbox, Meta, a CRM, a
 calendar — never fabricated here).
 
+PERSIST (``--persist NAME``): keep ONE named tenant for the orchestrator's customer-style
+walk. NAME is a seed-domain mailbox (``e2e-walk`` -> e2e-walk@seed.vantagemind.ai, the dev
+walk account). The harness cannot know that account's password, so it ADOPTS an existing
+account: a session minted in-process with the app's signing key at the account's current
+epoch (exactly as it already mints the verify link) — nothing about the account changes,
+the owner's own sign-in keeps working. It creates a Luciel + pasted knowledge only when
+the account has none, leaves an existing Luciel as it is, and records "P persist"
+readiness (verified, Luciel active, knowledge present, widget serving). A MISSING account
+is created through the real signup path with this run's random password (never printed;
+the next --persist run adopts it). The teardown purges only accounts THIS run minted, so
+the persisted tenant is never torn down. Refused outside dev (LUCIEL_ENV prod/preprod)
+and for any non-seed domain. ``--persist`` alone runs no T-cases; add ``--cases``.
+
 STRICT (``--strict``, or LUCIEL_SEEDTEST_STRICT=1 — the SeedTest task definition sets
 it, and scripts/run-seedtest-task.sh passes ``--strict`` unless told ``--no-strict``):
 a ``[SKIP]`` is otherwise non-fatal and invisible in the exit code, so a case that
@@ -2032,6 +2045,198 @@ def print_matrix_catalogue() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Persisted walk tenant (--persist NAME)                                       #
+# --------------------------------------------------------------------------- #
+# Every other tenant this harness touches is minted per run (seed+<RUN_ID>-<role>@...)
+# and purged. --persist keeps ONE named tenant for the orchestrator's customer-style
+# walk: an existing seed-domain account is ADOPTED (never re-created, never purged), a
+# missing one is created through the real signup path. Only the synthetic seed domain
+# may ever be adopted, and never outside dev.
+_PERSIST_NAME = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,62}$")
+PERSIST_REFUSED_ENVS = frozenset({"prod", "production", "preprod"})
+
+
+def persist_email(name: str) -> str:
+    """``e2e-walk`` -> ``e2e-walk@seed.vantagemind.ai``. A full address must already be on
+    the seed domain: --persist adopts an EXISTING account, and only a synthetic seed
+    account may ever be adopted — never a customer's."""
+    local, at, domain = (name or "").strip().lower().partition("@")
+    if at and domain != EMAIL_DOMAIN:
+        raise ValueError(f"--persist adopts only {EMAIL_DOMAIN} accounts, not {domain!r}")
+    if not _PERSIST_NAME.match(local):
+        raise ValueError(f"--persist name {name!r} is not a plain mailbox name")
+    return f"{local}@{EMAIL_DOMAIN}"
+
+
+def persist_allowed(env_name: str) -> bool:
+    return env_name.strip().lower() not in PERSIST_REFUSED_ENVS
+
+
+def minted_by_this_run(email: str) -> bool:
+    """Only the accounts THIS run signed up (``_email``) are ever purged."""
+    return email.lower().startswith(f"seed+{RUN_ID}-") and email.lower().endswith(
+        f"@{EMAIL_DOMAIN}"
+    )
+
+
+def teardown_plan(tenants: Sequence[Tenant]) -> tuple[list[Tenant], list[Tenant]]:
+    """(purge, keep). A persisted tenant is never purged, and neither is any account this
+    run did not mint itself (the walk account, another run's tenant) — whatever list it
+    ended up in."""
+    purge: list[Tenant] = []
+    keep: list[Tenant] = []
+    for tenant in tenants:
+        if tenant.persist or not minted_by_this_run(tenant.email):
+            keep.append(tenant)
+        elif tenant.embed_key or tenant.email:
+            purge.append(tenant)
+    return purge, keep
+
+
+async def _account_for(email: str) -> dict | None:
+    """What adoption needs to know about an existing account, or None if there is none."""
+    from app.auth.lookup import lookup_account_by_email
+    from app.db.engine import dispose_engine
+    from app.db.session import tenant_session, untenanted_session
+    from app.models.instance import Account
+    from sqlalchemy import select
+
+    try:
+        async with untenanted_session() as s:
+            found = await lookup_account_by_email(s, email)
+        if found is None:
+            return None
+        async with tenant_session(found.account_id) as s:
+            user_id = (
+                await s.execute(select(Account.user_id).where(Account.id == found.account_id))
+            ).scalar_one()
+        return {
+            "admin_id": found.account_id,
+            "user_id": user_id,
+            "epoch": int(found.session_epoch or 0),
+            "state": str(found.state),
+            "verified": bool(found.email_verified),
+        }
+    finally:
+        await dispose_engine()
+
+
+def adopt_session(t: Tenant, account: dict) -> None:
+    """Sign the harness in AS an existing seed account without its password: an ordinary
+    session token minted in-process with the app's own signing key at the account's
+    CURRENT epoch — the same in-process minting the harness already does for the verify
+    link (``mint_verify_token``). Nothing about the account changes (no password reset, no
+    epoch bump), so the owner's own sign-in keeps working."""
+    from urllib.parse import urlparse
+
+    from app.auth.tokens import mint_session_token
+    from app.config import get_settings
+
+    token = mint_session_token(account["admin_id"], account["user_id"], int(account["epoch"]))
+    t.client.cookies.set(
+        get_settings().session_cookie_name, token, domain=urlparse(API_BASE).hostname or ""
+    )
+
+
+def provision_persisted(t: Tenant) -> dict:
+    """Adopt (or create) the named tenant and make sure it can be walked: a Luciel with
+    knowledge whose widget serves. An existing Luciel is left exactly as it is."""
+    account = asyncio.run(_account_for(t.email))
+    created_account = account is None
+    if account is None:
+        # A fresh environment: the real signup path, with THIS run's random password
+        # (never printed). Later runs adopt it like any existing walk account.
+        t.seed()
+        account = asyncio.run(_account_for(t.email))
+        if account is None:
+            raise RuntimeError(f"{t.email} not found after signup")
+    elif account["state"] != "verified" or not account["verified"]:
+        return {
+            "email": t.email,
+            "adopted": True,
+            "account_state": account["state"],
+            "verified": account["verified"],
+            "created_luciel": False,
+            "luciel_state": None,
+            "embed_key": "",
+            "sources": 0,
+            "boot": None,
+        }
+    else:
+        adopt_session(t, account)
+    t.admin_id = account["admin_id"]
+    luciel = _check(_api(t, "GET", "/api/v1/admin/luciel"), "luciel")
+    created_luciel = False
+    if not luciel:
+        t.embed_key = create_luciel(t.client, "SeedTest walk")
+        paste_knowledge(t.client, KNOWN_FACT)
+        created_luciel = True
+        luciel = _check(_api(t, "GET", "/api/v1/admin/luciel"), "luciel") or {}
+    t.embed_key = str(luciel.get("embedKeyPublicId") or t.embed_key or "")
+    sources = _check(_api(t, "GET", "/api/v1/admin/knowledge/sources"), "knowledge sources")
+    boot = widget_boot(t.client, t.embed_key) if t.embed_key else {}
+    return {
+        "email": t.email,
+        "adopted": not created_account,
+        "account_state": account["state"],
+        "verified": account["verified"],
+        "created_luciel": created_luciel,
+        "luciel_state": luciel.get("state"),
+        "embed_key": t.embed_key,
+        "sources": len(sources) if isinstance(sources, list) else 0,
+        "boot": boot.get("renderState"),
+    }
+
+
+def judge_persist(o: dict) -> tuple[bool, str]:
+    return verdict(
+        [
+            (
+                "account_ready",
+                o["account_state"] == "verified" and o["verified"] is True,
+                f"{'adopted' if o['adopted'] else 'created'} state={o['account_state']} "
+                f"verified={o['verified']}",
+            ),
+            (
+                "luciel_active",
+                o["luciel_state"] == "active",
+                f"state={o['luciel_state']} created_now={o['created_luciel']}",
+            ),
+            ("knowledge_present", int(o["sources"]) >= 1, f"sources={o['sources']}"),
+            (
+                "widget_serving",
+                o["boot"] == "active",
+                f"bootstrap={o['boot']} embed_key={o['embed_key']}",
+            ),
+        ]
+    )
+
+
+def run_persist(r: Results, name: str) -> None:
+    """Provision the named walk tenant, record its readiness, and leave it in place."""
+    started = time.monotonic()
+    email = name
+    try:
+        email = persist_email(name)
+        env_name = os.environ.get("LUCIEL_ENV", "")
+        if not persist_allowed(env_name):
+            raise RuntimeError(f"--persist is a dev instrument; refused in LUCIEL_ENV={env_name}")
+        tenant = Tenant(f"persist-{email.partition('@')[0]}", email=email)
+        tenant.persist = True
+        try:
+            ok, evidence = judge_persist(provision_persisted(tenant))
+        finally:
+            tenant.client.close()
+    except Exception as exc:  # noqa: BLE001 — an unprovisioned walk tenant is a FAIL
+        ok, evidence = False, f"aborted: {type(exc).__name__}: {str(exc)[:300]}"
+    r.record(f"P persist {email}", ok, evidence, seconds=time.monotonic() - started)
+    print(
+        f"[persist] {email} is kept: this harness never purges a persisted tenant",
+        flush=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -2041,6 +2246,7 @@ class Options:
     matrix: bool = False
     only: tuple[str, ...] = ()
     list_matrix: bool = False
+    persist: str | None = None
 
 
 def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Options:
@@ -2079,7 +2285,18 @@ def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Option
         action="store_true",
         help="print the combinations and the manual live walk's items, then exit",
     )
+    p.add_argument(
+        "--persist",
+        metavar="NAME",
+        default=None,
+        help=f"adopt (or create) the tenant NAME@{EMAIL_DOMAIN}, make it walkable and keep it",
+    )
     ns = p.parse_args(list(argv))
+    if ns.persist is not None:
+        try:
+            persist_email(ns.persist)
+        except ValueError as exc:
+            p.error(str(exc))
     strict = ns.strict if ns.strict is not None else env.get("LUCIEL_SEEDTEST_STRICT") == "1"
     only = tuple(dict.fromkeys(k.strip().upper() for k in ns.only.split(",") if k.strip()))
     unknown = [k for k in only if k not in MATRIX_KEYS]
@@ -2089,10 +2306,11 @@ def parse_args(argv: Sequence[str], env: dict[str, str] | None = None) -> Option
         p.error("--only selects matrix combinations; add --matrix")
     return Options(
         strict=bool(strict),
-        cases=ns.cases or not ns.matrix,
+        cases=ns.cases or not (ns.matrix or ns.persist),
         matrix=ns.matrix,
         only=only,
         list_matrix=ns.list_matrix,
+        persist=ns.persist,
     )
 
 
@@ -2116,11 +2334,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'} "
         f"cases={'on' if opts.cases else 'off'} "
-        f"matrix={(','.join(opts.only) or 'all') if opts.matrix else 'off'}",
+        f"matrix={(','.join(opts.only) or 'all') if opts.matrix else 'off'} "
+        f"persist={opts.persist or 'off'}",
         flush=True,
     )
     _harness_process_posture()
     r = Results()
+    if opts.persist:
+        persist_name = opts.persist
+        _guarded(r, "persist", lambda results: run_persist(results, persist_name))
     if opts.cases:
         _guarded(r, "T-cases", run_cases)
     if opts.matrix:
@@ -2188,10 +2410,11 @@ async def _teardown(tenants: list[Tenant]) -> None:
     from app.models.instance import Account
     from sqlalchemy import delete as sa_delete
 
+    purge, keep = teardown_plan(tenants)
+    for tenant in keep:
+        print(f"[seedtest] teardown: kept '{tenant.role}' ({tenant.email})", flush=True)
     try:
-        for tenant in tenants:
-            if not tenant.embed_key and not tenant.email:
-                continue
+        for tenant in purge:
             try:
                 admin_id = await _admin_id_for(tenant.email)
             except Exception as exc:  # noqa: BLE001 — never seeded; nothing to purge
