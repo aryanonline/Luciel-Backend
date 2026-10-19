@@ -85,17 +85,17 @@ def test_live_mode_boots_with_a_fully_populated_blob():
     ("omitted", "attr"),
     [
         ("TWILIO_AUTH_TOKEN", "twilio_auth_token"),
-        ("META_APP_SECRET", "meta_app_secret"),
         ("PLATFORM_EMAIL_SENDER", "platform_email_sender"),
     ],
 )
 def test_live_mode_refuses_to_boot_without_a_delivery_secret(omitted: str, attr: str):
-    """P1-9/P1-10: these three default to "" and nothing downstream refuses.
+    """P1-9/P1-10: these default to "" and nothing downstream refuses.
 
-    An empty Twilio/Meta HMAC key makes ``verify_hmac_shared_secret`` succeed for a
-    forged webhook rather than skip verification, and an unset sender identity binds
-    ``NullEmailSender``, so every platform email is recorded and dropped. Neither is
-    visible from outside, so the refusal has to happen at boot.
+    An empty Twilio HMAC key verified a forged webhook rather than skipping
+    verification, and an unset sender identity binds ``NullEmailSender``, so every
+    platform email is recorded and dropped. Neither is visible from outside, so the
+    refusal has to happen at boot. (META_APP_SECRET is conditional on a provisioned
+    Meta app since round 7 WP-7 — tests/unit/test_meta_app_posture.py.)
     """
     blob = {k: v for k, v in REQUIRED_IN_LIVE_MODE.items() if k != omitted}
     with pytest.raises(RuntimeError, match=omitted):
@@ -165,6 +165,9 @@ def test_a_fully_provisioned_instagram_app_boots():
         INSTAGRAM_APP_ID="ig-cid",
         INSTAGRAM_APP_SECRET="ig-csecret",
         INSTAGRAM_REDIRECT_URI="https://api.example.com/cb",
+        # The Instagram app's webhook subscribes to the same GET /webhooks/meta
+        # handshake, so a provisioned Instagram app needs the verify token too.
+        META_VERIFY_TOKEN="unit-test-verify-token",
     )
     assert s.instagram_app_id == "ig-cid"
     assert s.instagram_app_secret == "ig-csecret"  # noqa: S105 — test fixture

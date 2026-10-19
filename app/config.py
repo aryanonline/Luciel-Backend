@@ -688,10 +688,9 @@ class Settings(BaseSettings):
         # reasons, both of which are silent in a running system:
         #
         #  * TWILIO_AUTH_TOKEN / META_APP_SECRET are the HMAC keys the inbound channel
-        #    webhooks verify with. Empty-string keys do not disable verification — they
-        #    make it succeed for anyone who can compute an HMAC with a key they also
-        #    know is "" (P1-9). A forged webhook is an inbound message attributed to a
-        #    tenant.
+        #    webhooks verify with (P1-9: an empty key once verified anyone's HMAC;
+        #    ``verify_hmac_shared_secret`` now refuses an empty key outright). A forged
+        #    webhook is an inbound message attributed to a tenant.
         #  * PLATFORM_EMAIL_SENDER decides whether ``build_email_sender`` binds SES or
         #    the Null sender. Unset, every platform email (verification, reset, dunning,
         #    escalation, export-ready) is recorded and dropped (P1-10).
@@ -700,11 +699,22 @@ class Settings(BaseSettings):
                 name
                 for name, value in (
                     ("TWILIO_AUTH_TOKEN", self.twilio_auth_token),
-                    ("META_APP_SECRET", self.meta_app_secret),
                     ("PLATFORM_EMAIL_SENDER", self.platform_email_sender),
                 )
                 if not value
             ]
+            # The Facebook Meta app (WhatsApp + Messenger) follows the same
+            # half-provisioned rule as Instagram/Microsoft below (round 7 WP-7). Absent
+            # entirely, it is honestly unconfigured: no authorize URL, and the inbound
+            # route refuses every signature because the HMAC key is empty. Provisioned,
+            # it needs its app secret (to redeem codes and verify webhooks) AND the
+            # webhook verify token — without the token Meta's GET handshake answers 403,
+            # the webhook subscription can never be saved, and every channel connects
+            # cleanly and then never receives a message.
+            if self.meta_app_configured and not self.meta_app_secret:
+                missing.append("META_APP_SECRET")
+            if self.meta_webhook_unconfigured:
+                missing.append("META_VERIFY_TOKEN")
             # INSTAGRAM_APP_SECRET is conditional, and the condition is the point. An
             # absent Instagram app is a supported posture — the connection reports
             # configured=false and the owner sees a disabled tile. A HALF-provisioned one
@@ -748,6 +758,27 @@ class Settings(BaseSettings):
                 "allow_captcha_bypass_token",
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
+
+    @property
+    def meta_app_configured(self) -> bool:
+        """The Facebook Meta app (WhatsApp + Messenger) is at least partly provisioned."""
+        return bool(self.meta_app_id or self.meta_redirect_uri)
+
+    @property
+    def instagram_app_configured(self) -> bool:
+        """The Instagram Business Login app is at least partly provisioned."""
+        return bool(self.instagram_app_id or self.instagram_redirect_uri)
+
+    @property
+    def meta_webhook_unconfigured(self) -> bool:
+        """A Meta-family app is provisioned but the webhook verify token is not.
+
+        Both apps (Facebook and Instagram) subscribe their webhooks to the ONE
+        ``GET /api/v1/webhooks/meta`` handshake, which answers 403 to every
+        ``hub.verify_token`` while META_VERIFY_TOKEN is empty — so the subscription can
+        never be saved and the channels never receive a message."""
+        provisioned = self.meta_app_configured or self.instagram_app_configured
+        return provisioned and not self.meta_verify_token
 
 
 class PlatformSecretError(RuntimeError):

@@ -105,7 +105,14 @@ def verify_hmac_shared_secret(secret: str, payload: bytes, header_signature: str
     """Generic HMAC-SHA256 verification (used for Meta X-Hub-Signature-256 too).
 
     Meta sends 'sha256=<hex>' in X-Hub-Signature-256 over the raw body.
+
+    An EMPTY key verifies nothing: an HMAC keyed with "" is computable by anyone, so
+    accepting it would accept a forged webhook (P1-9). Boot no longer demands
+    META_APP_SECRET when no Meta app is provisioned (round 7 WP-7), so the refusal
+    lives here, where every caller gets it.
     """
+    if not secret:
+        return False
     sig = header_signature or ""
     if sig.startswith("sha256="):
         sig = sig[len("sha256=") :]
