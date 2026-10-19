@@ -237,9 +237,14 @@ class Settings(BaseSettings):
     # TTL for escalation-contact confirmation links (round 5B item 13).
     escalation_contact_link_ttl_seconds: int = 7 * 24 * 3600
     # Public base URL used to build customer-facing links in emails (verify link,
-    # export download). Falls back to a dev localhost for local runs.
+    # export download). Falls back to a dev localhost for local runs. Deployed
+    # environments get it as task env (LUCIEL_APP_BASE_URL) derived from the
+    # environment's own hostname (infra env-config.ts `hostnames`, round 7 WP-8b:
+    # https://dev.vantagemind.ai for dev); the platform secret's APP_BASE_URL is the
+    # fallback when the task env does not set it.
     app_base_url: str = "http://127.0.0.1:3000"
-    # The PUBLIC API origin (https://api.vantagemind.ai in dev/prod) — what external
+    # The environment's PUBLIC API origin (https://api-dev.vantagemind.ai for dev,
+    # https://api.vantagemind.ai for prod — round 7 WP-8b) — what external
     # providers must be pointed at (Twilio webhook auto-config, c20). Distinct from
     # app_base_url (the FRONTEND origin used in customer-facing links). Empty default
     # = auto-config disabled (the attach falls back to manual webhook guidance);
@@ -483,8 +488,13 @@ class Settings(BaseSettings):
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
         # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
         # (the public frontend origin used in customer-facing links, e.g. the verify
-        # email link) must override the localhost default in deployed environments.
-        if blob.get("APP_BASE_URL"):
+        # email link) must override the localhost default in deployed environments —
+        # but NOT a value the environment set itself. Round 7 WP-8b: the CDK now injects
+        # LUCIEL_APP_BASE_URL derived from the environment's own hostname (dev →
+        # https://dev.vantagemind.ai), and a secret still holding the public apex must
+        # not quietly win over it. Same precedence public_api_base_url always had.
+        app_base_url_is_explicit = "app_base_url" in self.model_fields_set
+        if blob.get("APP_BASE_URL") and not app_base_url_is_explicit:
             object.__setattr__(self, "app_base_url", blob["APP_BASE_URL"])
         # The public API origin is bridged the same way (env var wins over the
         # secret; the secret wins over the empty default).
@@ -578,6 +588,11 @@ class Settings(BaseSettings):
             origins.extend(o.strip() for o in str(raw_origins).split(",") if o.strip())
         if blob.get("APP_BASE_URL"):
             origins.append(str(blob["APP_BASE_URL"]).rstrip("/"))
+        # The EFFECTIVE frontend origin as well, when the environment set it (task env,
+        # round 7 WP-8b): the dashboard served from that origin must pass the CORS
+        # preflight even if the secret still names another host.
+        if app_base_url_is_explicit and self.app_base_url:
+            origins.append(str(self.app_base_url).rstrip("/"))
 
         # Fold in the www<->apex counterpart of every https origin. CORS origin matching
         # is exact, so allowing https://vantagemind.ai does NOT allow
@@ -603,14 +618,18 @@ class Settings(BaseSettings):
             merged = list(dict.fromkeys([*origins, *self.dashboard_origins]))
             object.__setattr__(self, "dashboard_origins", merged)
 
-        # Derive the session-cookie parent domain from APP_BASE_URL when the frontend and
-        # API share a registrable domain but sit on different hosts (www./api.). Setting
-        # Domain=.<parent> lets BOTH hosts read the session cookie (same-site, so
-        # SameSite=Lax still applies) — otherwise the cookie is host-only to the API and
-        # the frontend bounces logged-in users back to /login. Skipped for localhost/IPs
-        # (no dotted registrable domain) and never overrides an explicit cookie_domain.
+        # Derive the session-cookie parent domain from the app hostname when the frontend
+        # and API share a registrable domain but sit on different hosts (www./api., or
+        # dev./api-dev.). Setting Domain=.<parent> lets BOTH hosts read the session
+        # cookie (same-site, so SameSite=Lax still applies) — otherwise the cookie is
+        # host-only to the API and the frontend bounces logged-in users back to /login.
+        # Derived from the EFFECTIVE app_base_url (round 7 WP-8b: the task env sets it
+        # per environment; the secret's APP_BASE_URL is only the fallback above), so
+        # dev.vantagemind.ai and the apex both yield .vantagemind.ai — unchanged for the
+        # apex. Skipped for localhost/IPs (the local default included: no dotted
+        # registrable domain) and never overrides an explicit cookie_domain.
         if not self.cookie_domain:
-            base = str(blob.get("APP_BASE_URL") or "").strip()
+            base = str(self.app_base_url or "").strip()
             host = base.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
             labels = host.split(".")
             is_ip = host.replace(".", "").isdigit()
