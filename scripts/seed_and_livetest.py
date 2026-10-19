@@ -17,7 +17,10 @@ conversations to convert several §10 rows from CI-proven to LIVE-proven:
                                     AI-identity disclosure is present.
   T7  CRM custom webhook (opt-in) — a captured lead reaches an owner-provided endpoint.
 
-Each test prints PASS/FAIL with evidence; the process exits non-zero if ANY fails.
+Each test prints PASS/FAIL with evidence; the process exits non-zero if ANY fails. The
+LAST line is always one summary (``[seedtest] SUMMARY result=... cases=... passed=...
+failed=... skipped=... matrix=... seconds=...``), which run-seedtest-task.sh repeats after
+the task and writes into the GitHub job summary.
 
 MATRIX (``--matrix``, round 7 WP-12): the configuration COMBINATIONS the owner asked
 for, M1-M8, each on its own throwaway tenant with its own assertions and wall-clock —
@@ -2331,6 +2334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if opts.list_matrix:
         print_matrix_catalogue()
         return 0
+    started = time.monotonic()
     print(
         f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={'on' if opts.strict else 'off'} "
         f"cases={'on' if opts.cases else 'off'} "
@@ -2347,11 +2351,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         _guarded(r, "T-cases", run_cases)
     if opts.matrix:
         _guarded(r, "matrix", lambda results: run_matrix(results, opts.only))
-    return finish(r, strict=opts.strict)
+    return finish(r, strict=opts.strict, seconds=time.monotonic() - started)
 
 
-def finish(r: Results, *, strict: bool) -> int:
-    """Print the verdict and return the process exit code."""
+#: The harness's LAST line. scripts/run-seedtest-task.sh finds it in the task's log and
+#: prints it again after the task (and into the GitHub job summary): keep it one line.
+SUMMARY_PREFIX = "[seedtest] SUMMARY"
+
+
+def summary_line(rows: Sequence[Row], *, strict: bool, seconds: float) -> str:
+    """One line: the verdict, every recorded check (T-cases, the persisted tenant, matrix
+    combinations) by outcome, the matrix's own tally, strict, and the wall-clock."""
+    passed = sum(1 for row in rows if row.status == "pass")
+    failed = sum(1 for row in rows if row.status == "fail")
+    skipped = sum(1 for row in rows if row.status == "skip")
+    matrix = [row for row in rows if row.kind == "matrix"]
+    matrix_passed = sum(1 for row in matrix if row.status == "pass")
+    result = "PASS" if exit_code(rows, strict=strict) == 0 else "FAIL"
+    return (
+        f"{SUMMARY_PREFIX} result={result} cases={len(rows)} passed={passed} failed={failed} "
+        f"skipped={skipped} matrix={len(matrix)} matrix_passed={matrix_passed} "
+        f"matrix_failed={len(matrix) - matrix_passed} strict={'on' if strict else 'off'} "
+        f"unexpected_skips={len(strict_violations(rows))} seconds={seconds:.1f}"
+    )
+
+
+def finish(r: Results, *, strict: bool, seconds: float = 0.0) -> int:
+    """Print the verdict, end with the one-line SUMMARY, return the process exit code."""
     print(f"[seedtest] {r.summary()}", flush=True)
     unexpected = strict_violations(r.rows)
     if strict and unexpected:
@@ -2366,6 +2392,7 @@ def finish(r: Results, *, strict: bool) -> int:
         print("::error::§10 live-behavior harness found FAIL(s)", flush=True)
     elif code == 0:
         print("[seedtest] §10 live-behavior harness: all checks PASS.", flush=True)
+    print(summary_line(r.rows, strict=strict, seconds=seconds), flush=True)
     return code
 
 

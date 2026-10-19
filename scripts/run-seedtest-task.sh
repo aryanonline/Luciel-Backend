@@ -95,13 +95,53 @@ echo "[seedtest] exit code: $code"
 # "(logs not yet available)" — the harness output never reached the workflow log).
 taskid="${arn##*/}"
 log_group="/luciel/${ENVIRONMENT}/seedtest"
+stream="luciel-seedtest/SeedTestContainer/${taskid}"
 echo "[seedtest] task definition: $taskdef"
-echo "[seedtest] log group: $log_group  stream: luciel-seedtest/SeedTestContainer/${taskid}"
-sleep 5
-aws logs get-log-events --region "$REGION" \
-  --log-group-name "$log_group" \
-  --log-stream-name "luciel-seedtest/SeedTestContainer/${taskid}" \
-  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available for $log_group)"
+echo "[seedtest] log group: $log_group  stream: $stream"
+# CloudWatch ingests a few seconds behind the container's exit, and the harness's LAST
+# line is its one-line SUMMARY: fetch (filter-log-events auto-paginates; get-log-events
+# returned one page of a long matrix log) until that line is in, bounded, then render
+# once — every message on its own line, the SUMMARY again at the end, and the same
+# SUMMARY plus every [FAIL]/[SKIP] into the GitHub job summary when there is one.
+logs='{"events": []}'
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  logs=$(aws logs filter-log-events --region "$REGION" --log-group-name "$log_group" \
+    --log-stream-names "$stream" --output json 2>/dev/null || echo '{"events": []}')
+  case "$logs" in *"[seedtest] SUMMARY"*) break ;; esac
+done
+report_py=$(cat <<'PY_REPORT'
+"""Render the harness log (stdin: filter-log-events JSON); argv = exit code, environment."""
+import json
+import os
+import sys
+
+PREFIX = "[seedtest] SUMMARY"
+code, environment = sys.argv[1], sys.argv[2]
+try:
+    events = json.loads(sys.stdin.read() or "{}").get("events") or []
+except ValueError:
+    events = []
+lines = [str(e.get("message", "")).rstrip("\r\n") for e in events if isinstance(e, dict)]
+for line in lines:
+    print(line)
+if not lines:
+    print("(no harness output in CloudWatch for this task yet)")
+summary = next((line for line in reversed(lines) if line.startswith(PREFIX)), None)
+if summary is None:
+    summary = f"{PREFIX} missing: the harness did not finish (task exit code {code})"
+print(summary)
+target = os.environ.get("GITHUB_STEP_SUMMARY")
+if target:
+    notable = [line for line in lines if line.startswith(("[FAIL]", "[SKIP]", "::error::"))]
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(f"### SeedTest ({environment})\n\n`{summary}`\n\nTask exit code: `{code}`\n\n")
+        for line in notable:
+            fh.write("- " + line[:400].replace("`", "'") + "\n")
+        fh.write("\n")
+PY_REPORT
+)
+printf '%s' "$logs" | python3 -c "$report_py" "$code" "$ENVIRONMENT"
 
 [ "$code" = "0" ] || { echo "::error::seedtest task FAILED (exit $code)"; exit 1; }
 echo "[seedtest] §10 live-behavior probe PASSED."
