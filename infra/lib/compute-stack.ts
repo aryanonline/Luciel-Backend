@@ -30,6 +30,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 import { EnvConfig, DOMAINS, SWEEP_ERROR_METRIC } from './env-config';
+import { scaleOnLoad } from './service-scaling';
 
 export interface ComputeStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -638,26 +639,20 @@ export class ComputeStack extends Stack {
       minHealthyPercent: 100,
     });
 
-    // 2026-09-05 audit F009: production posture scales on load instead of pinning a
-    // task count. Target-tracking on CPU; the floor is the multi-AZ count, the
-    // ceiling bounds cost. Dev keeps one task (it is single-AZ by design), and a
-    // paused environment has nothing to scale.
-    if (envConfig.productionPosture && !envConfig.paused) {
-      dataService
-        .autoScaleTaskCount({ minCapacity: dataCount, maxCapacity: 6 })
-        .scaleOnCpuUtilization('DataPlaneCpu', {
-          targetUtilizationPercent: 60,
-          scaleInCooldown: Duration.minutes(5),
-          scaleOutCooldown: Duration.minutes(2),
-        });
-      controlService
-        .autoScaleTaskCount({ minCapacity: controlCount, maxCapacity: 3 })
-        .scaleOnCpuUtilization('ControlPlaneCpu', {
-          targetUtilizationPercent: 60,
-          scaleInCooldown: Duration.minutes(5),
-          scaleOutCooldown: Duration.minutes(2),
-        });
-    }
+    // 2026-09-05 audit F009, widened round 7 WP-8b: every environment whose config
+    // enables it scales on load (CPU and memory, lib/service-scaling.ts) instead of
+    // pinning a task count. The floor is the base count above, the ceiling is the
+    // environment's (dev 1..2, prod as before); a paused environment has nothing to
+    // scale. It used to hide behind productionPosture, so dev — the environment
+    // that serves the public product today — never scaled at all.
+    scaleOnLoad(envConfig, dataService, 'DataPlane', dataCount, envConfig.autoscaling.maxDataPlane);
+    scaleOnLoad(
+      envConfig,
+      controlService,
+      'ControlPlane',
+      controlCount,
+      envConfig.autoscaling.maxControlPlane,
+    );
 
     // One-off MIGRATION task definition. The pipeline runs it AFTER this stack has
     // rolled the services (it carries the new image, so it cannot exist before the

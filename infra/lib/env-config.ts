@@ -163,6 +163,21 @@ export interface EnvConfig {
    * environment (ECR layer pulls ride it).
    */
   readonly vpcInterfaceEndpoints: boolean;
+  /**
+   * Target-tracking autoscaling of the request-serving services (both backend
+   * planes and the web tier; lib/service-scaling.ts — CPU AND memory). Round 7
+   * WP-8b: the policy used to hide behind productionPosture, so dev — which serves
+   * the public product — pinned one task per plane and a busy hour simply queued.
+   * Dev now scales too, inside deliberately small ceilings (1..2) so a runaway
+   * cannot become a bill; preprod/prod keep the ceilings they had. The FLOOR is
+   * each service's base count (multi-AZ: 2 data-plane tasks, otherwise 1).
+   */
+  readonly autoscaling: {
+    readonly enabled: boolean;
+    readonly maxDataPlane: number;
+    readonly maxControlPlane: number;
+    readonly maxWeb: number;
+  };
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -193,6 +208,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     monthlyBudgetUsd: 250,
     imageRepoName: 'luciel-backend-dev',
     vpcInterfaceEndpoints: false,
+    // Small ceilings on purpose: dev may double under load, never more.
+    autoscaling: { enabled: true, maxDataPlane: 2, maxControlPlane: 2, maxWeb: 2 },
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate
@@ -226,6 +243,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     imageRepoName: 'luciel-backend-prod',
     // Mirrors prod (see the field doc): NAT carries the AWS-API traffic.
     vpcInterfaceEndpoints: false,
+    // Prod-shaped, so the rehearsal runs the policy prod runs.
+    autoscaling: { enabled: true, maxDataPlane: 6, maxControlPlane: 3, maxWeb: 4 },
   },
   prod: {
     envName: 'prod',
@@ -257,6 +276,8 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // Round 7 WP-8b: NAT (one per AZ) already carries this traffic; paying ~$73/mo
     // for five interface endpoints on top bought the same reachability twice.
     vpcInterfaceEndpoints: false,
+    // The ceilings production posture always had (F009); web gains its own.
+    autoscaling: { enabled: true, maxDataPlane: 6, maxControlPlane: 3, maxWeb: 4 },
   },
 };
 

@@ -28,6 +28,7 @@ import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 import { EnvConfig, DOMAINS } from './env-config';
 import { ResidencyGuard } from './residency';
+import { scaleOnLoad } from './service-scaling';
 
 export interface WebStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -131,6 +132,9 @@ export class WebStack extends Stack {
       circuitBreaker: { rollback: true },
       minHealthyPercent: 100,
     });
+    // Same load-following policy as the backend planes (round 7 WP-8b): CPU and
+    // memory, floor = the base count, ceiling = the environment's maxWeb.
+    scaleOnLoad(envConfig, this.service, 'Web', baseCount, envConfig.autoscaling.maxWeb);
 
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'WebAlb', {
       vpc,

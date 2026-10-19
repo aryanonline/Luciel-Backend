@@ -23,9 +23,10 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   environment and ObservabilityStack refuses to synth without `-c alarmEmail`/
   `-c budgetAlertEmail`; the app's EMF metrics (namespace `Luciel`) and ECS
   task-state rules for failed sweep tasks alarm too; `productionPosture`
-  (preprod/prod) gates cost-bearing telemetry, the paused-WAF exception and
-  autoscaling; dev data stores are RETAIN + deletion-protected (only preprod is
-  disposable); NO environment has VPC interface endpoints (env-gated, ~$73/mo —
+  (preprod/prod) gates cost-bearing telemetry and the paused-WAF exception;
+  autoscaling has its own `autoscaling` knob (CPU + memory target tracking on
+  both planes and the web tier; dev 1..2, prod as before — round 7 WP-8b);
+  dev data stores are RETAIN + deletion-protected (only preprod is disposable); NO environment has VPC interface endpoints (env-gated, ~$73/mo —
   NAT already carries that traffic; round 7 WP-8b).
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
