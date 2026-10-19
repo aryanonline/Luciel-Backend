@@ -199,3 +199,8 @@ make that state explicit and test it.
 - An empty draft is never sent as silence: a tool does not ground words never written
   (the honest hand-off goes out), except a confirmed booking/move/cancel, read back from
   its payload ("Here are the details: …").
+
+## Model currency, quota and cost (round 7 WP-6, built 2026-10-19)
+- Embedding model retired (operator runbook): the pin is ALERT-ONLY (`MODEL_CURRENCY_ALERT`, the daily sweep raises); set `LUCIEL_KNOWLEDGE_EMBEDDING_MODEL` (app planes AND sweep task) to a current 1536-dim model and redeploy.
+- The knowledge_sync sweep then converges: `knowledge.service.reembed_outdated_chunks` rewrites chunks whose `embedding_model` differs (200/tenant/pass), and `verify_chunk_embeddings` (0065) re-checks vectors against their own text.
+- Until it moves every query embedding fails (`embeddings:degraded` on /healthz, KnowledgeRetrievalDegraded); never run that sweep from a mock-mode container.

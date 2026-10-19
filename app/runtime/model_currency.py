@@ -107,6 +107,23 @@ class ModelPin:
     # vectors are model-specific, so a swap silently breaks retrieval until a
     # full re-embed — a migration, not a remediation.
     swappable: bool
+    # What the operator does when an alert-only pin is gone (named in the alert).
+    alert_only_reason: str = ""
+
+
+# The embedding retirement runbook (round 7 WP-6 item 8). The functions named here are
+# the path that exists (tests/unit/test_round7_model_currency_wp6.py pins them).
+EMBEDDING_RETIREMENT_RUNBOOK = (
+    "the embedding model is never auto-swapped (stored vectors are model-specific), and "
+    "every query embedding fails until it moves (/healthz: embeddings:degraded). "
+    "Runbook: set LUCIEL_KNOWLEDGE_EMBEDDING_MODEL on the app planes AND the sweep task "
+    "to a current model that serves 1536 dimensions, redeploy, and let the "
+    "knowledge_sync sweep converge the re-embedding: "
+    "app.knowledge.service.reembed_outdated_chunks rewrites every chunk whose recorded "
+    "embedding_model differs (200 per tenant per pass, F121), then "
+    "verify_chunk_embeddings (migration 0065, F121b) re-checks each vector against a "
+    "fresh embedding of its own text. Never run that sweep from a mock-mode container"
+)
 
 
 PINS: tuple[ModelPin, ...] = (
@@ -137,6 +154,7 @@ PINS: tuple[ModelPin, ...] = (
         "LUCIEL_KNOWLEDGE_EMBEDDING_MODEL",
         "openai",
         False,
+        EMBEDDING_RETIREMENT_RUNBOOK,
     ),
 )
 
@@ -848,10 +866,7 @@ async def run_model_currency_check(
                 continue
 
             reason = (
-                "the embedding model is never auto-swapped (stored vectors are "
-                "model-specific). To move: set LUCIEL_KNOWLEDGE_EMBEDDING_MODEL, redeploy, "
-                "and the knowledge_sync sweep handles the re-embedding of every tenant's "
-                "chunks whose recorded embedding_model differs, in bounded batches (F121)"
+                pin.alert_only_reason or "this pin is alert-only"
                 if not pin.swappable
                 else "pinned by env var, which outranks the platform secret"
                 if env_pinned

@@ -405,3 +405,69 @@ async def test_a_settled_or_legacy_swap_record_owes_nothing():
             restarter=restarter,
         )
         assert restarter.attempts == 0 and result["swapped"] == []
+
+
+# --- item 8: a retired embedding model alerts, and the alert names the real path --- #
+
+
+async def test_a_retired_embedding_model_alerts_with_the_reembed_runbook(caplog):
+    """The embedding pin 404s (OpenAI retired text-embedding-3-small): never swapped —
+    stored vectors are model-specific — so the run logs MODEL_CURRENCY_ALERT at ERROR,
+    raises (the SweepErrors alarm), writes nothing, restarts nothing, and the alert
+    tells the operator the exact re-embed path."""
+    transport = FakeTransport(
+        existing=set(ALL_PINS) - {"text-embedding-3-small"},
+        openai_listing=_openai_listing(("gpt-5.4", 400), ("text-embedding-4-small", 900)),
+    )
+    sender, writer, restarter = RecordingSender(), FakeWriter(), FakeRestarter()
+    with (
+        caplog.at_level(logging.ERROR, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError, match="model_currency"),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=lambda: transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=restarter,
+        )
+    assert writer.applied == [] and restarter.restarts == 0 and transport.posts == []
+    assert transport.listing_calls("openai") == []  # no successor is even looked up
+    (error,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert MODEL_CURRENCY_ALERT in error.getMessage()
+    assert "knowledge_embedding_model = 'text-embedding-3-small' is gone" in error.getMessage()
+    ((_to, subject, body),) = sender.sent
+    assert "need attention" in subject
+    for step in (
+        "LUCIEL_KNOWLEDGE_EMBEDDING_MODEL",
+        "1536 dimensions",
+        "knowledge_sync",
+        "reembed_outdated_chunks",
+        "verify_chunk_embeddings",
+        "migration 0065",
+    ):
+        assert step in body, step
+
+
+def test_the_documented_reembed_path_exists_and_the_sweep_runs_it():
+    """The runbook names functions; they must exist and the knowledge_sync sweep must
+    call them, or the alert sends the operator down a path that is not there."""
+    import inspect
+
+    from app.knowledge import service, sweep
+
+    assert inspect.iscoroutinefunction(service.reembed_outdated_chunks)
+    assert inspect.iscoroutinefunction(service.verify_chunk_embeddings)
+    sweep_source = inspect.getsource(sweep)
+    assert "service.reembed_outdated_chunks(" in sweep_source
+    assert "service.verify_chunk_embeddings(" in sweep_source
+    # The re-embed pass selects on the recorded model label, so moving the pin is
+    # what makes every older vector a candidate.
+    assert "embedding_model.is_distinct_from(current)" in inspect.getsource(
+        service.reembed_outdated_chunks
+    )
+    # Migration 0065 is the verification column the second pass converges on.
+    assert "embedding_verified_at.is_(None)" in inspect.getsource(service.verify_chunk_embeddings)
+    (pin,) = [p for p in model_currency.PINS if p.setting == "knowledge_embedding_model"]
+    assert pin.swappable is False
+    assert pin.alert_only_reason == model_currency.EMBEDDING_RETIREMENT_RUNBOOK
