@@ -45,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -222,24 +223,41 @@ async def model_exists(client: _Transport, *, provider: str, api_key: str, model
 # --- successor resolution ------------------------------------------------------ #
 
 
-def model_family(model_id: str) -> str:
-    """The family a version-suffixed model ID belongs to.
+# A provider snapshot date at the END of an id — Anthropic's ``-20251001``, OpenAI's
+# ``-2025-08-07`` — names WHEN a model was frozen, never WHICH model it is.
+_DATE_SUFFIX = re.compile(r"-(?:\d{8}|\d{4}-\d{2}-\d{2})$")
+# A dotted version segment (``5.4``): its integer head is the generation.
+_DOTTED_VERSION = re.compile(r"^(\d+)\.\d+(?:\.\d+)*$")
 
-    Trailing PURELY-numeric segments are version/date suffixes
-    (``claude-sonnet-4-6`` → ``claude-sonnet``; ``claude-haiku-4-5-20251001`` →
-    ``claude-haiku``). A dotted final segment keeps its integer part as family
-    identity (``gpt-5.4`` → ``gpt-5``), so a retired 5.4 can move to 5.6 but
-    never silently to a 6-class model. A non-numeric segment (``4o``) is part of
-    the name and stays."""
-    parts = model_id.split("-")
-    while len(parts) > 1 and parts[-1].isdigit():
+
+def _undated(model_id: str) -> str:
+    return _DATE_SUFFIX.sub("", model_id)
+
+
+def _family_parts(model_id: str) -> list[str]:
+    parts = [_DOTTED_VERSION.sub(r"\1", part) for part in _undated(model_id).split("-")]
+    # Trailing numbers are versions — but an id is at least a NAME and a LINE: the
+    # number right after a lone name segment is the line itself (``gpt-5``), not a
+    # version to strip. ``claude-sonnet-5`` keeps two segments without it.
+    while len(parts) > 2 and parts[-1].isdigit():
         parts.pop()
-    last = parts[-1]
-    if "." in last:
-        head, _, tail = last.partition(".")
-        if head.isdigit() and tail.replace(".", "").isdigit():
-            parts[-1] = head
-    return "-".join(parts)
+    return parts
+
+
+def model_family(model_id: str) -> str:
+    """The family a versioned model ID belongs to.
+
+    A snapshot date is never identity (``claude-haiku-4-5-20251001``,
+    ``gpt-5-2025-08-07``). Trailing PURELY-numeric segments are versions
+    (``claude-sonnet-4-6`` and ``claude-sonnet-5`` → ``claude-sonnet``). A dotted
+    segment keeps its integer head (``gpt-5.4`` → ``gpt-5``), and a bare integer
+    right after a lone name segment is that same generation (``gpt-5`` → ``gpt-5``;
+    round 7 WP-6 item 2: it used to derive ``gpt``, so a retired ``gpt-5`` never
+    paired with ``gpt-5.4``). So a retired 5.4 can move to 5.6 but never silently to
+    a 6-class model. A non-numeric segment (``4o``, ``mini``) is part of the name and
+    stays: ``gpt-5-mini`` and ``gpt-5.4-mini`` are the ``gpt-5-mini`` family, never
+    ``gpt-5``."""
+    return "-".join(_family_parts(model_id))
 
 
 def _created_epoch(item: dict[str, Any]) -> int:
@@ -275,11 +293,13 @@ def pick_successor(retired_id: str, available: list[dict[str, Any]]) -> str | No
 
 def _version_tuple(model_id: str) -> tuple[int, ...]:
     """The numeric version behind the family: ``claude-sonnet-4-6`` → (4, 6);
-    ``gpt-5.4`` → (4,) (the family already kept the 5); ``claude-haiku-4-5-20251001``
-    → (4, 5, 20251001). Empty when the id carries no version at all."""
-    family = model_family(model_id)
-    rest = model_id[len(family) :] if model_id.startswith(family) else model_id
-    return tuple(int(piece) for piece in rest.replace(".", "-").split("-") if piece.isdigit())
+    ``gpt-5.4`` → (4,) (the family already kept the 5); ``gpt-5`` → ();
+    ``claude-haiku-4-5-20251001`` → (4, 5) — a snapshot date is not a version, so a
+    dated ``gpt-5-2025-08-07`` is never 'newer' than ``gpt-5.4``. Empty when the id
+    carries no version beyond its family."""
+    in_family = sum(1 for part in _family_parts(model_id) if part.isdigit())
+    numbers = [int(piece) for piece in re.split(r"[-.]", _undated(model_id)) if piece.isdigit()]
+    return tuple(numbers[in_family:])
 
 
 def pick_newer_successor(retired_id: str, available: list[dict[str, Any]]) -> str | None:
@@ -318,12 +338,14 @@ def _pin_epoch(model_id: str, available: list[dict[str, Any]]) -> int:
     An alias pin (``claude-sonnet-4-6``) may be absent from the listing while
     its dated snapshots (``claude-sonnet-4-6-20251101``) are present — those
     snapshots ARE the pin for age purposes. 0 = the pin has no listing footprint
-    at all, so no honest age comparison is possible."""
+    at all, so no honest age comparison is possible. Only a DATED snapshot of the
+    pin counts: ``gpt-5-mini`` starts with ``gpt-5-`` but is another model, and its
+    release date must not make every ``gpt-5.x`` look older than ``gpt-5``."""
     matches = [
         item
         for item in available
         if isinstance(item.get("id"), str)
-        and (item["id"] == model_id or item["id"].startswith(model_id + "-"))
+        and (item["id"] == model_id or _undated(item["id"]) == model_id)
     ]
     return max((_created_epoch(item) for item in matches), default=0)
 

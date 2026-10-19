@@ -22,6 +22,8 @@ from app.runtime import model_currency
 from app.runtime.model_currency import (
     SMOKE_MAX_COMPLETION_TOKENS_OPENAI,
     SMOKE_PROMPT,
+    model_family,
+    pick_newer_successor,
     run_model_currency_check,
     smoke_request,
 )
@@ -196,3 +198,74 @@ async def test_an_openai_successor_that_answers_empty_is_not_swapped():
     assert writer.applied == []
     ((_to, _subject, body),) = sender.sent
     assert "failed a smoke turn (empty completion (stop=length))" in body
+
+
+# --- item 2: dotted and bare-integer ids derive the same family ------------------- #
+
+
+@pytest.mark.parametrize(
+    ("model_id", "family"),
+    [
+        ("claude-sonnet-4-6", "claude-sonnet"),
+        ("claude-sonnet-5", "claude-sonnet"),
+        ("gpt-5", "gpt-5"),  # used to derive "gpt" — never paired with gpt-5.4
+        ("gpt-5.4", "gpt-5"),
+        ("gpt-5-mini", "gpt-5-mini"),
+        ("gpt-5.4-mini", "gpt-5-mini"),
+        ("gpt-5-2025-08-07", "gpt-5"),
+        ("gpt-5.4-2026-03-05", "gpt-5"),
+        ("gpt-5-mini-2025-08-07", "gpt-5-mini"),
+        ("claude-haiku-4-5-20251001", "claude-haiku"),
+        ("o3-2025-04-16", "o3"),
+        ("gpt-4o", "gpt-4o"),
+        ("gpt-6", "gpt-6"),
+        ("text-embedding-3-small", "text-embedding-3-small"),
+    ],
+)
+def test_model_family_table(model_id: str, family: str):
+    assert model_family(model_id) == family
+
+
+def test_a_retired_bare_generation_pairs_with_its_dotted_successor():
+    listing = [{"id": "gpt-5.4", "created": 300}, {"id": "gpt-6", "created": 900}]
+    assert pick_newer_successor("gpt-5", listing) == "gpt-5.4"
+    # ...and never the other way round: the bare generation is OLDER than 5.4.
+    assert pick_newer_successor("gpt-5.4", [{"id": "gpt-5", "created": 999}]) is None
+    # A dated snapshot of the bare generation is not a newer version either.
+    assert pick_newer_successor("gpt-5.4", [{"id": "gpt-5-2025-08-07", "created": 999}]) is None
+    # A different tier never stands in for the generation.
+    assert pick_newer_successor("gpt-5", [{"id": "gpt-5-mini", "created": 999}]) is None
+    # Claude's family spans majors (the existing doctrine): 4-6 → 5 pairs.
+    assert (
+        pick_newer_successor("claude-sonnet-4-6", [{"id": "claude-sonnet-5", "created": 900}])
+        == "claude-sonnet-5"
+    )
+
+
+def test_another_tiers_release_date_does_not_age_the_pin():
+    """``gpt-5-mini`` starts with ``gpt-5-``; counting it as a snapshot of ``gpt-5``
+    made every gpt-5.x released before the mini look older than the pin."""
+    listing = [
+        {"id": "gpt-5-2025-08-07", "created": 100},  # the pin's own dated snapshot
+        {"id": "gpt-5.4", "created": 300},
+        {"id": "gpt-5-mini", "created": 500},
+    ]
+    assert pick_newer_successor("gpt-5", listing) == "gpt-5.4"
+
+
+async def test_a_retired_gpt5_fallback_pin_swaps_to_gpt54():
+    transport = Gpt5ChatTransport(
+        existing=set(ALL_PINS) - {"gpt-5.4"},  # the gpt-5 pin 404s (it was never listed)
+        openai_listing=_openai_listing(("gpt-5-2025-08-07", 100), ("gpt-5.4", 400)),
+    )
+    writer = FakeWriter()
+    result = await run_model_currency_check(
+        settings=live_settings(**_SETTINGS_KW, LLM_OPENAI_FALLBACK_MODEL="gpt-5"),
+        transport_factory=lambda: transport,
+        email_sender=RecordingSender(),
+        secret_writer=writer,
+        restarter=FakeRestarter(),
+    )
+    assert result["swapped"] == [
+        {"setting": "llm_openai_fallback_model", "old": "gpt-5", "new": "gpt-5.4"}
+    ]
