@@ -39,6 +39,28 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
   owns refresh (on-demand + the health sweep's provider-dispatching refresher). Live
   mode only; mock falls back to the honest no-refresher.
 
+## Provider app registrations (round 7 WP-7, 2026-10-19)
+- Meta Graph version: ONE setting, `Settings.meta_graph_version` (default v23.0; env
+  `LUCIEL_META_GRAPH_VERSION` > platform secret `META_GRAPH_VERSION`). Build URLs with
+  `config.meta_graph_base(host)`; the registry stores `{meta_graph_version}` templates that
+  `get_provider` resolves on read. Never write a versioned graph URL anywhere else
+  (`tests/unit/test_meta_graph_version.py` scans app/).
+- Redirect URIs: `Settings.oauth_redirect_problems()` — each configured URI must end with
+  `/api/v1/connections/<oauth client label>/callback` (and equal `public_api_base_url` +
+  path when that is set). A bad one is logged at boot, makes `authorize_ready` false
+  (provider withheld, no authorize URL; refresh untouched) and shows on /healthz as
+  `oauth_redirect:<label>`. `config.OAUTH_REDIRECT_URI_FIELDS` mirrors the registry labels.
+- Login host: `ProviderSpec.login_hosts` (Salesforce: production, sandbox). The connect body's
+  `loginHost` is validated (`validated_login_host`) and stored as `non_secret_config.login_host`;
+  authorize (`build_authorize_start(login_host=)`), the callback's exchange
+  (`registry.login_host_scope`) and refresh (`resolve_provider_endpoint`) all read it.
+- Meta app posture: a provisioned Meta/Instagram app needs META_VERIFY_TOKEN (live boot
+  refuses; /healthz `meta_webhook:unconfigured`), and META_APP_SECRET only when the Meta app
+  is provisioned; an empty HMAC key verifies nothing (`signatures.verify_hmac_shared_secret`).
+- Platform-secret keys: `config.PLATFORM_SECRET_KEYS` is the one accepted list
+  (`scripts/merge_platform_secret.py` imports it; `--check` reports unread keys, redirect
+  problems and Meta webhook gaps for a blob before a deploy).
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.
