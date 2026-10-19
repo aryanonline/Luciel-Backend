@@ -17,6 +17,8 @@ IngestionStatusWire = Literal["pending", "ready", "error"]
 # Architecture §3.2.3 sync_status vocabulary. paused_reconnect_needed replaces the
 # former needs_reconnect (Axis4-F02); error surfaces non-revocation sync failures.
 KnowledgeSyncStatusWire = Literal["synced", "syncing", "paused_reconnect_needed", "error"]
+# ``knowledge_sources.deleted_by`` (migration 0056; knowledge.service.DELETED_BY_*).
+KnowledgeDeletedByWire = Literal["owner", "origin", "lifecycle"]
 
 
 class KnowledgeSourceOut(WireModel):
@@ -41,6 +43,15 @@ class KnowledgeSourceOut(WireModel):
     # The sync connection a live source belongs to (2026-09-05 audit: the pillar
     # confirms a refused shrink against the CONNECTION, not the source).
     connection_id: uuid.UUID | None = None
+    # Round 7 M10 (owner decision D10): when a revoked/expired grant paused this
+    # source (``knowledge_sources.paused_since``). It keeps answering for
+    # ``service.PAUSED_SERVING_DAYS`` from this instant, then stops until a clean
+    # sync — the dashboard says "stops answering on <date>" from it. Null = not paused.
+    paused_since: datetime | None = None
+    # Who tombstoned the source (``knowledge_sources.deleted_by``): ``owner`` (undo-able
+    # for 30 days), ``origin`` (gone at Drive / Notion / the site — never restorable
+    # here), ``lifecycle`` (comes back with the Luciel). Null on a live source.
+    deleted_by: KnowledgeDeletedByWire | None = None
 
 
 class KnowledgeChunkOut(WireModel):

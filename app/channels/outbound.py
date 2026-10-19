@@ -79,6 +79,7 @@ async def send_outbound_reply(
     sender_id: str | None = None,
     in_reply_to: str | None = None,
     author_role: str = AUTHOR_LUCIEL,
+    status_callback: str | None = None,
 ) -> OutboundResult:
     """Push one reply to the customer on ``channel``.
 
@@ -94,6 +95,10 @@ async def send_outbound_reply(
     ``human_agent`` — and decides which email footer the reply carries (round 7 WP-3b,
     item 3): a person's reply is never signed as written by an AI assistant.
 
+    ``status_callback`` (SMS only, round 7 M10): where Twilio should post the carrier's
+    delivery receipt for this message — the take-over route asks for one so a person's
+    reply can be stamped with the carrier's word, not only the API's accept.
+
     Never raises for a delivery problem — an undeliverable reply is reported as data so
     the caller can tell the admin the truth instead of failing the whole request after the
     transcript row is already written.
@@ -104,7 +109,9 @@ async def send_outbound_reply(
         return OutboundResult(channel=channel, delivered=False, detail="no_recipient")
 
     if channel in ("sms", "voice"):
-        receipt = await _send_sms(session, admin_id, instance_id, to=to, body=body)
+        receipt = await _send_sms(
+            session, admin_id, instance_id, to=to, body=body, status_callback=status_callback
+        )
     elif channel == "email":
         receipt = await _send_email(
             session,
@@ -150,9 +157,14 @@ async def _send_sms(
     *,
     to: str,
     body: str,
+    status_callback: str | None = None,
 ) -> DeliveryReceipt:
+    from dataclasses import replace
+
     from app.channels.sms_adapter import SmsAdapter
     from app.channels.tenant_twilio import build_tenant_sms_sender
+    from app.channels.twilio_bearer import TwilioBearerSmsSender
+    from app.channels.twilio_sender import TwilioSmsSender
     from app.connections.service import resolve_sms_number
     from app.runtime.integration_status import null_in_live
 
@@ -174,6 +186,9 @@ async def _send_sms(
     sender = await build_tenant_sms_sender(session, admin_id, instance_id)
     if null_in_live(sender):
         return _sender_not_provisioned("sms")
+    if status_callback and isinstance(sender, TwilioSmsSender | TwilioBearerSmsSender):
+        # A copy: the tenant's own sender object is never mutated (the notifier's rule).
+        sender = replace(sender, status_callback=status_callback)
     return await SmsAdapter(sender).send(
         OutboundMessage(channel="sms", to=to, body=body, metadata={"from_number": from_number})
     )

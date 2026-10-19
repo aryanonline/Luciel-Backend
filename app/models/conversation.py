@@ -151,6 +151,10 @@ class Transcript(Base, TenantMixin, TimestampMixin):
     delivery_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     delivery_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Round 7 M10 (migration 0076): the provider's id for a human reply (Twilio's
+    # MessageSid), so the carrier's delivery receipt can find THIS row and record its
+    # word on it (app/channels/reply_receipts.py). NULL when nothing was accepted.
+    delivery_provider_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # The admin flagged this answer for review (§3.4.13; migration 0070, round 7
     # WP-4c #8). The flag used to be audit-only, so the evidence read answered
