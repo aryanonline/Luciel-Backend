@@ -19,7 +19,36 @@ from app.connections import deferred_queue
 from app.models.deferred import DeferredAction
 from app.models.lead import Lead
 from app.tools import contract as c
+from app.tools.calendar_backend import SlotInPast, business_zone, zone_label
 from app.tools.contract import Outcome, Tool, ToolContext, ToolResult
+
+# --- failed reasons the scheduling tools return, with their read-back copy -------- #
+#: The slot was taken (or stopped being offered) between the read and the write.
+SLOT_CONFLICT = "slot_conflict"
+#: The slot's start time has already passed on the business's clock (round 7 M10).
+SLOT_IN_PAST = "slot_in_past"
+
+#: What a failed reason MEANS, in the words the model reads back with the result
+#: (orchestrator ``_tool_result_feedback`` → ``means``), so it never improvises an
+#: explanation: a time gone by used to come back as ``slot_conflict``, which the model
+#: told the customer as "someone else just took that time".
+FAILURE_READBACK: dict[str, str] = {
+    SLOT_CONFLICT: (
+        "That time is no longer open. Nothing was booked or moved. Tell the customer it "
+        "was just taken and offer other open times."
+    ),
+    SLOT_IN_PAST: (
+        "That time has already passed. Nothing was booked or moved. Tell the customer "
+        "that time has already gone by and ask which other time suits them."
+    ),
+}
+
+
+def failure_readback(reason: str | None) -> str | None:
+    """The read-back copy for a failed reason (``"token"`` or ``"token: detail"``)."""
+    token = (reason or "").split(":", 1)[0].strip()
+    return FAILURE_READBACK.get(token)
+
 
 # --- schedule_callback rate-limit caps (Architecture §3.3.5 / Decision #51) ---- #
 # schedule_callback is the one tool that creates FUTURE outbound sends, so it is
@@ -88,9 +117,12 @@ class CheckAvailabilityTool:
             slots = await self.backend.free_busy(context, inputs["window"])
         except Exception as exc:  # noqa: BLE001
             return c.failed(f"calendar_error: {type(exc).__name__}")
+        # The zone the times are stated in rides with them (round 7 M10): the business's
+        # zone, or ``UTC`` when none is set, so a proposed time is never a bare hour.
+        timezone = zone_label(business_zone(context.timezone))
         if not slots:
-            return c.empty({"window": inputs["window"]})
-        return c.ok({"slots": slots})
+            return c.empty({"window": inputs["window"], "timezone": timezone})
+        return c.ok({"slots": slots, "timezone": timezone})
 
 
 class BookAppointmentTool:
@@ -108,11 +140,14 @@ class BookAppointmentTool:
     async def execute(self, inputs: dict[str, Any], context: ToolContext) -> ToolResult:
         try:
             booking = await self.backend.book(context, inputs["slot"], inputs["email"])
+        except SlotInPast:
+            # The time has already gone by (round 7 M10): refused before any write.
+            return c.failed(SLOT_IN_PAST)
         except Exception as exc:  # noqa: BLE001
             return c.failed(f"calendar_error: {type(exc).__name__}")
         if booking is None:
             # slot taken between read and write — conflict (§3.3.6); never claim success.
-            return c.failed("slot_conflict")
+            return c.failed(SLOT_CONFLICT)
         return c.ok(booking)  # carries confirmed time + booking reference
 
 
@@ -173,12 +208,15 @@ class RescheduleAppointmentTool:
             return early if early is not None else c.failed("booking_unresolved")
         try:
             moved = await self.backend.reschedule(context, ref, inputs["slot"])
+        except SlotInPast:
+            # A move into a time already gone (round 7 M10): nothing was moved.
+            return c.failed(SLOT_IN_PAST)
         except Exception as exc:  # noqa: BLE001
             return c.failed(f"calendar_error: {type(exc).__name__}")
         if moved is None:
             # New slot taken between the read and the write — same conflict discipline as
             # book_appointment: never claim a move that did not happen (§3.3.6).
-            return c.failed("slot_conflict")
+            return c.failed(SLOT_CONFLICT)
         return c.ok(moved)
 
 

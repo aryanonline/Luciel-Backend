@@ -774,6 +774,7 @@ async def update_connection_settings(
     be read."""
     from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
     from app.tools.calendly_backend import (  # noqa: PLC0415
+        EVENT_DURATION_KEY,
         CalendlyCredentials,
         CalendlyUnavailable,
         build_calendly_api,
@@ -797,6 +798,7 @@ async def update_connection_settings(
             raise validation_error("Choose the event type customers should book.")
         cfg = dict(row.non_secret_config or {})
         name = (req.event_type_name or "").strip()
+        duration: int | None = None
         user_uri = str(cfg.get("userUri") or "")
         token = await ensure_fresh_access_token(
             s, subject.admin_id, row.instance_id, connection_type="calendar"
@@ -814,8 +816,16 @@ async def update_connection_settings(
             match = next((t for t in offered if t.uri == req.event_type_uri), None)
             if match is not None and not name:
                 name = match.name
+            if match is not None and match.duration_minutes > 0:
+                duration = match.duration_minutes
         cfg["eventTypeUri"] = req.event_type_uri
         cfg["eventTypeName"] = name
+        # Round 7 M10: a booking link's end is the event type's OWN length; recorded
+        # here so a booking need not ask Calendly (the backend asks when it is absent).
+        if duration is not None:
+            cfg[EVENT_DURATION_KEY] = duration
+        else:
+            cfg.pop(EVENT_DURATION_KEY, None)
         row.non_secret_config = cfg
         await s.flush()
         await audit.emit(

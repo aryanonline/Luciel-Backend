@@ -2297,6 +2297,14 @@ class Orchestrator:
             body["payload"] = result.payload
         else:  # failed
             body["reason"] = result.reason or "failed"
+            # What the reason means, from the tool catalog (round 7 M10): the model
+            # reads the result back instead of improvising ("someone else took it"
+            # for a time that had simply gone by).
+            from app.tools.catalog import failure_readback  # noqa: PLC0415
+
+            means = failure_readback(result.reason)
+            if means:
+                body["means"] = means
         text = json.dumps(body, default=str)
         if len(text) > TOOL_RESULT_CONTENT_CAP:
             text = text[:TOOL_RESULT_CONTENT_CAP] + '… (truncated)"}'
