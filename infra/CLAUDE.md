@@ -46,8 +46,15 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   wildcard (WidgetCertStack, us-east-1) so no ownership flip touches it.
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
-- Dev deploys run `scripts/smoke_probe.sh` + the §10 verify task after migrating and
-  roll the app services back to the recorded task definitions on failure.
+- Dev AND prod deploys (round 7 migrations review / WP-8b): apply the Pipeline stack's
+  grants first, record the serving task definitions, MIGRATE WITH THE NEW IMAGE BEFORE
+  THE ROLL (`scripts/migrate-before-roll.sh`: a registered revision of the current
+  MigrationTask with the image swapped, deregistered afterwards), deploy, re-run the
+  migration as a no-op safety, then `scripts/smoke_probe.sh <env>` + the §10 verify
+  task (+ on dev the strict D10 SeedTest gate when live) — rolling the SERVICES back
+  if any post-roll step fails. Migrations stay expand-first (old code runs on the new
+  schema for the length of the roll). The prod job refuses to run while prod does not
+  own the public names (D6).
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.

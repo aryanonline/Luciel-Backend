@@ -8,7 +8,8 @@
  *   npx ts-node bin/hostnames.ts <env> <field>                 -> one value
  *
  * Fields: app, api, embed, appBaseUrl, apiBaseUrl, aliases, appNames, apiNames,
- * embedNames (lists print space-separated), ownsPublicApex, servesUnownedPublicNames.
+ * embedNames (lists print space-separated), ownsPublicApex, servesUnownedPublicNames,
+ * stripeIntegrationPosture (the smoke probe's expected Stripe binding).
  * Exits non-zero on an unknown environment or field — a workflow must never fall
  * back to a guessed hostname.
  */
@@ -42,6 +43,7 @@ function main(argv: string[]): number {
     apiBaseUrl: urls.api,
     ownsPublicApex: getEnvConfig(envName).ownsPublicApex,
     servesUnownedPublicNames: servesUnownedPublicNames(envName),
+    stripeIntegrationPosture: getEnvConfig(envName).stripeIntegrationPosture,
   };
   if (field === undefined) {
     process.stdout.write(`${JSON.stringify(facts, null, 2)}\n`);

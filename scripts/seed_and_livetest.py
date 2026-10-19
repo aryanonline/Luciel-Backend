@@ -60,7 +60,29 @@ _bootstrap_db_env()
 
 import httpx  # noqa: E402
 
-API_BASE = os.environ.get("LUCIEL_API_BASE", "https://api.vantagemind.ai").rstrip("/")
+
+def _derive_api_base(environ: dict[str, str] | os._Environ[str] = os.environ) -> str:
+    """The API this run proves (round 7 WP-8b, owner decision D6).
+
+    ``LUCIEL_API_BASE`` wins — the SeedTest task definition injects the environment's
+    own API origin (infra/lib/env-config.ts ``hostnames``). Without it, the
+    environment's name derives the same D6 host (dev → api-dev.vantagemind.ai, preprod
+    → api-preprod, prod → the public api). There is deliberately NO public-host
+    default any more: that default is how a harness reading one environment's
+    database drives ANOTHER environment's API, and every check it then passes proves
+    the wrong system. Neither set → empty, and ``main`` refuses to run."""
+    explicit = (environ.get("LUCIEL_API_BASE") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    env_name = (environ.get("LUCIEL_ENV") or "").strip()
+    if env_name == "prod":
+        return "https://api.vantagemind.ai"
+    if env_name in ("dev", "preprod"):
+        return f"https://api-{env_name}.vantagemind.ai"
+    return ""
+
+
+API_BASE = _derive_api_base()
 RUN_ID = os.environ.get("LUCIEL_SEEDTEST_RUN_ID", str(int(time.time())))
 # Synthetic but syntactically-valid domain (the signup validator rejects reserved
 # TLDs like .invalid). seed.vantagemind.ai is ours and routes nowhere real.
@@ -80,18 +102,35 @@ def _email(role: str) -> str:
 # --------------------------------------------------------------------------- #
 # Result accounting                                                            #
 # --------------------------------------------------------------------------- #
+#: Why a T-case may be skipped. ``opt_in``: the case is opt-in BY DESIGN (it spends
+#: real model calls, or needs an owner-provided endpoint) and was not opted into — not
+#: running it is the harness doing what it was told. ``precondition``: something the
+#: environment SHOULD have is missing (a live key in a live environment).
+SKIP_OPT_IN = "opt_in"
+SKIP_PRECONDITION = "precondition"
+#: The only skip kinds ``--strict`` tolerates (owner decision D10: the SeedTest gate
+#: after every dev deploy). A precondition skip there is a FAIL — a missing live key
+#: in a live environment is exactly what the gate exists to catch.
+STRICT_ALLOWED_SKIPS = frozenset({SKIP_OPT_IN})
+
+
 class Results:
-    def __init__(self) -> None:
+    def __init__(self, *, strict: bool = False) -> None:
         self._rows: list[tuple[str, bool, str]] = []
+        self.strict = strict
 
     def record(self, name: str, ok: bool, evidence: str) -> None:
         self._rows.append((name, ok, evidence))
         status = "PASS" if ok else "FAIL"
         print(f"[{status}] {name}: {evidence}", flush=True)
 
-    def skip(self, name: str, reason: str) -> None:
-        # A skip is non-fatal but visible. Used only when a precondition (e.g. live
-        # keys) is genuinely unavailable; documented in the PR.
+    def skip(self, name: str, reason: str, *, kind: str) -> None:
+        # A skip is visible, and non-fatal only when it is allowed: outside --strict
+        # every skip is (the operator decides), under --strict only the opt-in kind.
+        if self.strict and kind not in STRICT_ALLOWED_SKIPS:
+            self._rows.append((name, False, f"SKIPPED under --strict ({kind}) — {reason}"))
+            print(f"[FAIL] {name}: skipped under --strict ({kind}): {reason}", flush=True)
+            return
         self._rows.append((name, True, f"SKIPPED — {reason}"))
         print(f"[SKIP] {name}: {reason}", flush=True)
 
@@ -407,6 +446,7 @@ def test_llm_cap_live(r: Results, admin_id: uuid.UUID) -> None:
             "T3b row1b-llm-cap-live",
             "set LUCIEL_SEEDTEST_LIVE_CAP=1 to spend 50 real model calls proving the "
             "router's per-minute cap",
+            kind=SKIP_OPT_IN,
         )
         return
     import app.runtime.llm_cap as cap_mod
@@ -589,6 +629,7 @@ def test_fallback_failover(r: Results) -> None:
             "T5 row8-primary-to-fallback",
             "no OPENAI_API_KEY in platform secret (mock mode); router unit failover is "
             "CI-proven in tests/unit",
+            kind=SKIP_PRECONDITION,
         )
         return
 
@@ -638,6 +679,7 @@ def test_crm_custom_webhook_live(r: Results, t: Tenant) -> None:
             "T7 crm-custom-webhook-live",
             "set LUCIEL_SEEDTEST_WEBHOOK_URL (and optionally LUCIEL_SEEDTEST_WEBHOOK_AUTH) "
             "to push a captured lead to a real endpoint",
+            kind=SKIP_OPT_IN,
         )
         return
     from urllib.parse import urlparse
@@ -774,9 +816,32 @@ def test_channel_parity_and_disclosure(r: Results, t: Tenant, admin_id: uuid.UUI
 # --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
-def main() -> int:
-    print(f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID}", flush=True)
-    r = Results()
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="§10 live-behavior SEED + TEST harness")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=os.environ.get("LUCIEL_SEEDTEST_STRICT") == "1",
+        help=(
+            "a skipped T-case FAILS the run unless its skip is an allowed kind "
+            f"({', '.join(sorted(STRICT_ALLOWED_SKIPS))}) — the D10 post-deploy gate"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if not API_BASE:
+        print(
+            "::error::seedtest: no API to prove — set LUCIEL_API_BASE (the SeedTest task "
+            "injects it) or LUCIEL_ENV (dev|preprod|prod); there is no public-host default",
+            flush=True,
+        )
+        return 2
+    print(
+        f"[seedtest] API_BASE={API_BASE} RUN_ID={RUN_ID} strict={args.strict}",
+        flush=True,
+    )
+    r = Results(strict=args.strict)
 
     # Seed two synthetic tenants: a primary (happy-path / parity / fail-safe) and a
     # dedicated free-cap tenant (driven to its conversation cap in T2).

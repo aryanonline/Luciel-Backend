@@ -3,7 +3,15 @@
 # the deploy intended BEFORE the deploy is called done — and if it does not, the
 # workflow rolls the services back to the task definitions that were serving.
 #
-#   scripts/smoke_probe.sh <api-base-url> <expected-integration-mode> [stripe-posture]
+#   scripts/smoke_probe.sh <env|api-base-url> <expected-integration-mode> [stripe-posture]
+#
+# The first argument is normally the ENVIRONMENT (dev|preprod|prod): the API origin
+# and the Stripe posture default are then read from infra's hostnames helper
+# (infra/bin/hostnames.ts — env-config.ts `hostnames`, round 7 WP-8b / owner decision
+# D6), so dev is probed at https://api-dev.vantagemind.ai and prod at the public api
+# host without a hostname written here. Needs infra's node_modules (deploy.yml runs
+# `npm ci` there first). An explicit https:// origin is still accepted (an operator
+# probing by hand); then the posture defaults to `test`, dev's.
 #
 # Public probes only (the runner is outside the VPC):
 #   1. /healthz reports status ok, the expected integrationMode and EXACTLY the
@@ -26,9 +34,27 @@
 #      the app — proof the default target group serves.
 set -euo pipefail
 
-BASE="${1:?api base url, e.g. https://api.vantagemind.ai}"
+TARGET="${1:?environment (dev|preprod|prod) or an https:// api base url}"
 MODE="${2:?expected integration mode: mock|live}"
-STRIPE_POSTURE="${3:-test}"
+case "$TARGET" in
+  dev|preprod|prod)
+    # Resolved, never guessed: a failure here fails the probe (set -e) rather than
+    # probing some other environment's API.
+    INFRA_DIR="$(cd "$(dirname "$0")/../infra" && pwd)"
+    hosts() { (cd "$INFRA_DIR" && npx --no-install ts-node --prefer-ts-exts bin/hostnames.ts "$TARGET" "$1"); }
+    BASE="$(hosts apiBaseUrl)"
+    STRIPE_POSTURE="${3:-$(hosts stripeIntegrationPosture)}"
+    ;;
+  https://*)
+    BASE="${TARGET%/}"
+    STRIPE_POSTURE="${3:-test}"
+    ;;
+  *)
+    echo "::error::smoke_probe: '$TARGET' is neither an environment (dev|preprod|prod) nor an https:// origin"
+    exit 2
+    ;;
+esac
+echo "[smoke] probing $BASE (mode $MODE, stripe posture $STRIPE_POSTURE)"
 TMP="$(mktemp -d)"
 
 probe() {

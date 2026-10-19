@@ -16,7 +16,12 @@ import { Stack, StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import { Construct } from 'constructs';
-import { EnvConfig } from './env-config';
+import { EnvConfig, EnvName } from './env-config';
+
+/** The GitHub Actions OIDC issuer host (the provider's URL, and its ARN's suffix). */
+export const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
+/** The environment whose PipelineStack owns the account's one GitHub OIDC provider. */
+export const OIDC_PROVIDER_OWNER: EnvName = 'dev';
 
 export interface PipelineStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -55,11 +60,23 @@ export class PipelineStack extends Stack {
       ],
     });
 
-    // GitHub OIDC provider (one per account; created here for the deploy role to trust).
-    const oidcProvider = new iam.OpenIdConnectProvider(this, 'GitHubOidc', {
-      url: 'https://token.actions.githubusercontent.com',
-      clientIds: ['sts.amazonaws.com'],
-    });
+    // GitHub OIDC provider: ONE per account and URL. Dev's PipelineStack created it
+    // (and owns it); every other environment's PipelineStack IMPORTS it by its
+    // deterministic ARN. Before round 7 WP-8b every environment created its own, so
+    // the prod PipelineStack — which creates luciel-prod-github-deploy, the role the
+    // whole prod release flow assumes — could never deploy (EntityAlreadyExists on
+    // the second provider for the same URL), and the prod jobs had no role at all.
+    const oidcProvider: iam.IOpenIdConnectProvider =
+      envConfig.envName === OIDC_PROVIDER_OWNER
+        ? new iam.OpenIdConnectProvider(this, 'GitHubOidc', {
+            url: `https://${GITHUB_OIDC_HOST}`,
+            clientIds: ['sts.amazonaws.com'],
+          })
+        : iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(
+            this,
+            'GitHubOidc',
+            `arn:${this.partition}:iam::${this.account}:oidc-provider/${GITHUB_OIDC_HOST}`,
+          );
 
     // The role GitHub Actions assumes via OIDC - scoped to this repo + branch.
     // This REPLACES the exposed static admin key for CI deploys (INFRA-SEC-01 fix).
@@ -133,6 +150,26 @@ export class PipelineStack extends Stack {
           'ecs:ListTasks',
           'ecs:ListServices',
           'ecs:DescribeServices',
+        ],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        // Round 7 migrations review: scripts/migrate-before-roll.sh migrates with the
+        // NEW image BEFORE the Compute stack rolls the services — it describes the
+        // current MigrationTask definition, registers a revision with only the image
+        // swapped (keeping the cost-allocation tags), runs it, and deregisters it.
+        // None of these ECS actions supports a resource ARN narrower than `*` at
+        // registration time; the region condition matches RunMigrationTask's, and
+        // what the revision may RUN AS is still bounded by PassTaskRoles below.
+        sid: 'MigrateBeforeRoll',
+        actions: [
+          'ecs:DescribeTaskDefinition',
+          'ecs:RegisterTaskDefinition',
+          'ecs:DeregisterTaskDefinition',
+          'ecs:TagResource',
         ],
         resources: ['*'],
         conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },

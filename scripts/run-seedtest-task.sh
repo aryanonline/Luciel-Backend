@@ -3,12 +3,26 @@
 # (mirrors run-verify-task.sh). Reuses the data-plane service's proven network
 # config so the task can reach the private API + RDS from inside the VPC.
 #
-#   scripts/run-seedtest-task.sh dev
+#   scripts/run-seedtest-task.sh dev [--strict]
 #
+# --strict (owner decision D10, round 7 WP-8b — the gate after every dev deploy and
+# the preprod release gate): the harness FAILS a skipped T-case unless the skip is an
+# allowed kind (opt-in cases not opted into; scripts/seed_and_livetest.py
+# STRICT_ALLOWED_SKIPS). It rides a container override of the task's command, so the
+# task definition itself stays the plain harness an operator can run by hand.
 set -euo pipefail
 ENVIRONMENT="${1:-dev}"
+STRICT="${2:-}"
 REGION="${AWS_REGION:-ca-central-1}"
 PREFIX="Luciel-${ENVIRONMENT}"
+overrides='{}'
+case "$STRICT" in
+  "") ;;
+  --strict)
+    overrides='{"containerOverrides":[{"name":"SeedTestContainer","command":["python3","scripts/seed_and_livetest.py","--strict"]}]}'
+    ;;
+  *) echo "::error::run-seedtest-task.sh: unknown option '$STRICT' (only --strict)"; exit 2 ;;
+esac
 
 cluster=$(aws cloudformation list-exports --region "$REGION" \
   --query "Exports[?Name=='${PREFIX}-ClusterName'].Value" --output text)
@@ -25,8 +39,9 @@ sgs=$(echo "$netcfg" | python3 -c "import sys,json;print(','.join(json.load(sys.
 arn=$(aws ecs run-task --region "$REGION" --cluster "$cluster" \
   --task-definition "$taskdef" --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$sgs],assignPublicIp=DISABLED}" \
+  --overrides "$overrides" \
   --query 'tasks[0].taskArn' --output text)
-echo "[seedtest] started $arn ; waiting..."
+echo "[seedtest] started $arn (strict=${STRICT:-off}) ; waiting..."
 aws ecs wait tasks-stopped --region "$REGION" --cluster "$cluster" --tasks "$arn"
 
 code=$(aws ecs describe-tasks --region "$REGION" --cluster "$cluster" --tasks "$arn" \

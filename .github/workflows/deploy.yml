@@ -6,9 +6,12 @@ name: deploy
 # destroy; ephemeral RDS deleted with NO final snapshot). preprod must NEVER be
 # left running (cost).
 #
-# Build+scan image -> push ECR (CVE gate) -> deploy stacks via the OIDC deploy
-# role (no static keys; INFRA-SEC-01 fix) -> run migrations as a one-off ECS task
-# INSIDE the VPC (RDS is private). The image is MULTI-ARCH (buildx, linux/amd64 +
+# Build+scan image -> push ECR (CVE gate) -> migrate with the NEW image as a one-off
+# ECS task INSIDE the VPC (RDS is private), BEFORE the services roll -> deploy stacks
+# via the OIDC deploy role (no static keys; INFRA-SEC-01 fix) -> a no-op post-roll
+# migration, the smoke probe, the §10 verify task (and on dev the strict D10 SeedTest
+# gate), rolling the SERVICES back if any of those fail. Every hostname comes from
+# infra/bin/hostnames.ts (owner decision D6). The image is MULTI-ARCH (buildx, linux/amd64 +
 # linux/arm64 under one tag) because every backend task definition runs on
 # Graviton (round 7 WP-8, D7); scripts/gate_image_scan.sh gates each platform child.
 #
@@ -167,6 +170,36 @@ jobs:
           echo "[pause] reusing gated image tag $TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      # Round 7 WP-8b (owner decision D6): every hostname this job touches comes from
+      # infra's hostnames helper (env-config.ts `hostnames`) — dev answers on
+      # api-dev.vantagemind.ai (plus the public names while it owns them), and a
+      # literal public hostname here would probe whichever environment owns it.
+      - name: Install infra dependencies + resolve the environment's hostnames
+        id: hosts
+        working-directory: infra
+        run: |
+          npm ci
+          api_base=$(npx ts-node --prefer-ts-exts bin/hostnames.ts dev apiBaseUrl)
+          echo "api_base=$api_base" >> "$GITHUB_OUTPUT"
+          echo "[hosts] dev API origin: $api_base"
+          npx ts-node --prefer-ts-exts bin/hostnames.ts dev
+
+      # The deploy role's own grants land BEFORE the steps that use them. The
+      # migrate-before-roll step below needs ecs:RegisterTaskDefinition et al.
+      # (PipelineStack MigrateBeforeRoll); deployed only in the main deploy, a new
+      # grant would arrive one run too late. A no-op when nothing changed.
+      - name: Apply the deploy role's grants first (Pipeline stack)
+        if: inputs.paused != 'true'
+        working-directory: infra
+        run: |
+          npx cdk deploy "Luciel-dev-Pipeline" --exclusively \
+            -c env=dev -c imageTag=$IMAGE_TAG \
+            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            --require-approval never
+
       # 2026-09-05 audit F008: remember what is serving BEFORE the deploy so a failed
       # smoke probe below can put it back. First deploy of an environment has nothing
       # to remember (had_previous=false) and simply skips the rollback.
@@ -186,13 +219,26 @@ jobs:
           echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
           echo "had_previous=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+      # Round 7 migrations review (2026-10-11): migrate with the NEW image BEFORE the
+      # Compute stack rolls the services. The MigrationTask definition lives in that
+      # stack and carries the image, so the only migration used to run AFTER the
+      # roll — a refused migration (0067 refuses on duplicate claims by design) left
+      # the NEW code serving the OLD schema until the rollback. The script registers a
+      # revision of the current MigrationTask with the gated image, runs it, and
+      # deregisters it; a refusal now stops the job while the old code still serves
+      # the old schema, so there is nothing to roll back. Migrations stay expand-first:
+      # for the length of the roll the OLD code runs on the NEW schema.
+      - name: Migrate with the NEW image before the services roll
+        id: migrate_preroll
+        if: inputs.paused != 'true'
+        env:
+          ECR: ${{ steps.ecr.outputs.registry }}
+        run: bash scripts/migrate-before-roll.sh dev "$ECR/luciel-backend-dev:$IMAGE_TAG"
 
       - name: Deploy infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         run: |
-          npm ci
+          # npm ci ran in the hostnames step above.
           # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
           # crossRegionReferences; the CDK app wires that, so naming both is enough.
           # Networking is named so VPC-shape changes (e.g. the env-gated interface
@@ -209,6 +255,7 @@ jobs:
           npx cdk deploy "Luciel-dev-Networking" "Luciel-dev-Data" "Luciel-dev-Compute" \
             "Luciel-dev-Edge" "Luciel-dev-Observability" "Luciel-dev-Budget" \
             "Luciel-dev-WidgetCert" "Luciel-dev-Widget" "Luciel-dev-Web" "Luciel-dev-Pipeline" \
+            "Luciel-dev-Dns" \
             -c env=dev -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
@@ -217,11 +264,12 @@ jobs:
 
       # Skipped when pausing: a pause run is taking the environment DOWN, so there is
       # nothing to migrate and a migration task would be the only thing still running.
-      # The migration runs AFTER the Compute stack has rolled the services (the
-      # migration task definition lives in that stack and carries the new image), so a
-      # refused migration (0067 refuses on duplicate claims by design) leaves the NEW
-      # code serving the OLD schema. That is the rollback case too (round 7 review).
-      - name: Run DB migrations as a one-off ECS task (inside the VPC)
+      # The schema already moved in the migrate-before-roll step; this run of the
+      # stack's own (now new-image) MigrationTask is a no-op safety (alembic is
+      # idempotent) that also covers the first deploy of an environment, where there
+      # was no MigrationTask to migrate with beforehand. A failure here still rolls the
+      # services back below.
+      - name: Re-run DB migrations after the roll (no-op safety; alembic is idempotent)
         id: migrate
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh dev
@@ -229,18 +277,39 @@ jobs:
       # 2026-09-05 audit F008: the deploy is not done until the live API answers the
       # way it was deployed to — healthz live with no degraded binding, both planes
       # reachable through the ALB (F067) — and the §10 probe passes as luciel_app.
+      # The probe resolves dev's OWN api origin (and Stripe posture) from the hostnames
+      # helper (round 7 WP-8b) — never the public host, which is the apex owner's.
       - name: Post-deploy smoke probe (healthz + both planes answer)
         id: smoke
         if: inputs.paused != 'true'
-        run: bash scripts/smoke_probe.sh https://api.vantagemind.ai ${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }}
+        run: bash scripts/smoke_probe.sh dev ${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }}
 
       - name: §10 live probe as luciel_app (one-off ECS task inside the VPC)
         id: verify
         if: inputs.paused != 'true'
         run: bash scripts/run-verify-task.sh dev
 
+      # Owner decision D10: the SeedTest live-behavior harness runs after EVERY dev
+      # deploy and fails the workflow on a non-zero exit — STRICT, so a skipped T-case
+      # is a failure unless the skip is an allowed kind (an opt-in case nobody opted
+      # into). A failure rolls the services back like the probes above. The harness
+      # proves LIVE behavior (a real grounded answer, the live fallback), so a mock
+      # deploy has nothing for it to prove: the next step says so out loud instead.
+      - name: D10 — SeedTest live-behavior gate (strict)
+        id: seedtest
+        if: inputs.paused != 'true' && (inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock') == 'live'
+        run: bash scripts/run-seedtest-task.sh dev --strict
+
+      - name: D10 — a mock deploy has no live behavior to gate (said, not skipped silently)
+        if: inputs.paused != 'true' && (inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock') != 'live'
+        run: echo "::notice::D10 SeedTest gate not run — this deploy is integration_mode=mock; the harness proves LIVE behavior (it would fail T1 by design). Deploy with integration_mode=live to gate on it."
+
+      # Restores SERVICES only: the schema moved before the roll (migrate-before-roll)
+      # and every migration is expand-first, so the previous task definitions run on
+      # it. A pre-roll migration failure never reaches here — the job stops before
+      # the Compute stack rolls anything.
       - name: Roll the app services back to the previous task definitions
-        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure' || steps.seedtest.outcome == 'failure')
         run: |
           cluster='${{ steps.previous.outputs.cluster }}'
           python3 - "$cluster" <<'PY'
@@ -252,7 +321,7 @@ jobs:
                               '--task-definition', svc['td'], '--force-new-deployment',
                               '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
           PY
-          echo "::error::the migration or a post-deploy probe failed; app services rolled back to the previous task definitions (the schema stays where the migration left it)"
+          echo "::error::the post-deploy migration, a post-deploy probe or the D10 SeedTest gate failed; app services rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
           exit 1
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----
@@ -279,6 +348,27 @@ jobs:
           # role can't exist before preprod is stood up (chicken-and-egg).
           role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      # Owner decision D6: prod's names ARE the public names, and exactly one
+      # environment may own them (env-config.ts ownsPublicApex; dev until the cutover).
+      # A prod deploy while dev still owns them would collide with dev's records and
+      # CloudFront alias — and the prod smoke probe would be answered by DEV's API, a
+      # green check proving the wrong environment. Refused here, before a preprod is
+      # stood up for a release that cannot land. Cutover: flip dev's and prod's flags
+      # in one commit, deploy DEV first (it releases the names), then release prod.
+      - name: Refuse a prod release while prod does not own the public names (D6)
+        working-directory: infra
+        run: |
+          npm ci
+          if [ "$(npx ts-node --prefer-ts-exts bin/hostnames.ts prod servesUnownedPublicNames)" != "false" ]; then
+            echo "::error::prod's hostnames are the public names but env-config.ts gives ownsPublicApex to another environment — flip both flags in one commit and deploy dev first (D6 cutover)."
+            exit 1
+          fi
+          npx ts-node --prefer-ts-exts bin/hostnames.ts prod
+          npx ts-node --prefer-ts-exts bin/hostnames.ts preprod
 
       - name: Login to ECR
         id: ecr
@@ -324,13 +414,12 @@ jobs:
           # on a tag that is not a multi-arch index.
           bash scripts/gate_image_scan.sh "$REPO" "$TAG"
 
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-
       - name: Stand up preprod (prod-shaped, gated image + live LLM)
         working-directory: infra
         run: |
-          npm ci
+          # npm ci ran in the D6 ownership check above. Preprod answers on its OWN
+          # names (preprod. / api-preprod. / embed-preprod.<apex>, round 7
+          # WP-8b): it used to claim the public api name, which dev's records held.
           # Full stack set: preprod is created from scratch each release. imageTag
           # points at the gated release artifact in the PROD repo (imageRepoName in
           # env-config.ts); integrationMode=live exercises real Anthropic/OpenAI for
@@ -362,10 +451,11 @@ jobs:
         run: |
           # Either probe exiting non-zero fails the job (set -e). Because prod-deploy
           # `needs` this job, a failure here BLOCKS the prod deploy. Teardown still
-          # runs (if: always()).
+          # runs (if: always()). The SeedTest gate is STRICT (D10): a skipped T-case
+          # fails the release unless it is an opt-in case nobody opted into.
           set -e
           bash scripts/run-verify-task.sh preprod
-          bash scripts/run-seedtest-task.sh preprod
+          bash scripts/run-seedtest-task.sh preprod --strict
           echo "[gate] preprod §10 verification PASSED — prod deploy unblocked."
 
   # 3) Deploy prod — ONLY runs if preprod-verify succeeded (default `needs` gating).
@@ -450,16 +540,71 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Deploy prod infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
+      # Same D6 refusal as preprod-standup (defense in depth: this job is what would
+      # write the public records), and prod's hostnames for the log.
+      - name: Install infra dependencies + refuse unless prod owns the public names (D6)
+        id: hosts
         working-directory: infra
         run: |
           npm ci
+          if [ "$(npx ts-node --prefer-ts-exts bin/hostnames.ts prod servesUnownedPublicNames)" != "false" ]; then
+            echo "::error::prod does not own the public names yet (env-config.ts ownsPublicApex) — D6 cutover first."
+            exit 1
+          fi
+          api_base=$(npx ts-node --prefer-ts-exts bin/hostnames.ts prod apiBaseUrl)
+          echo "api_base=$api_base" >> "$GITHUB_OUTPUT"
+          npx ts-node --prefer-ts-exts bin/hostnames.ts prod
+
+      # Round 7 migrations review: the prod job now has the dev job's whole shape —
+      # deploy-role grants first, record the serving task definitions, migrate with the
+      # NEW image BEFORE the roll, deploy, a no-op post-roll migration, the smoke probe
+      # and the §10 verify task against prod, and a rollback of the SERVICES when any
+      # post-roll step fails. Before this a refused migration left prod serving the new
+      # image against the old schema with no automatic way back.
+      - name: Apply the deploy role's grants first (Pipeline stack)
+        if: inputs.paused != 'true'
+        working-directory: infra
+        run: |
+          npx cdk deploy "Luciel-prod-Pipeline" --exclusively \
+            -c env=prod -c imageTag=$IMAGE_TAG \
+            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            --require-approval never
+
+      - name: Record the running task definitions (rollback target)
+        id: previous
+        if: inputs.paused != 'true'
+        run: |
+          cluster=$(aws cloudformation list-exports --query "Exports[?Name=='Luciel-prod-ClusterName'].Value" --output text)
+          if [ -z "$cluster" ] || [ "$cluster" = "None" ]; then
+            echo "[rollback] no cluster yet - first deploy, nothing to record"
+            echo "had_previous=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          services=$(aws ecs list-services --cluster "$cluster" --query 'serviceArns' --output text)
+          aws ecs describe-services --cluster "$cluster" --services $services \
+            --query 'services[].{name:serviceName,td:taskDefinition}' --output json > previous-services.json
+          cat previous-services.json
+          echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
+          echo "had_previous=true" >> "$GITHUB_OUTPUT"
+
+      - name: Migrate with the NEW image before the services roll
+        id: migrate_preroll
+        if: inputs.paused != 'true'
+        env:
+          ECR: ${{ steps.ecr.outputs.registry }}
+        run: bash scripts/migrate-before-roll.sh prod "$ECR/luciel-backend-prod:$IMAGE_TAG"
+
+      - name: Deploy prod infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
+        working-directory: infra
+        run: |
+          # npm ci ran in the hostnames step above.
           # Networking/Data/Budget are named for the same reasons as in the dev job:
           # VPC-shape changes must apply, the transcript-archive bucket's cross-stack
-          # export, and the cost ceiling.
+          # export, and the cost ceiling. Dns publishes the hostnames (and deploys after
+          # Compute/Web on purpose — see bin/luciel-infra.ts).
           npx cdk deploy "Luciel-prod-Networking" "Luciel-prod-Data" "Luciel-prod-Compute" \
             "Luciel-prod-Edge" "Luciel-prod-Observability" "Luciel-prod-Budget" \
             "Luciel-prod-WidgetCert" "Luciel-prod-Widget" "Luciel-prod-Web" \
+            "Luciel-prod-Dns" \
             -c env=prod -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'live' }} \
             -c paused=${{ inputs.paused || 'false' }} \
@@ -467,10 +612,39 @@ jobs:
             --require-approval never
 
       # See the dev job: a pause run takes the environment down, so there is nothing
-      # to migrate.
-      - name: Run DB migrations as a one-off ECS task (inside the VPC)
+      # to migrate; otherwise this is the no-op safety after the pre-roll migration.
+      - name: Re-run DB migrations after the roll (no-op safety; alembic is idempotent)
+        id: migrate
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh prod
+
+      # Prod's api origin and Stripe posture (mock — prod stays mock until the
+      # owner-gated cutover) come from the hostnames helper, like dev's.
+      - name: Post-deploy smoke probe (healthz + both planes answer)
+        id: smoke
+        if: inputs.paused != 'true'
+        run: bash scripts/smoke_probe.sh prod ${{ inputs.integration_mode || 'live' }}
+
+      - name: §10 live probe as luciel_app (one-off ECS task inside the VPC)
+        id: verify
+        if: inputs.paused != 'true'
+        run: bash scripts/run-verify-task.sh prod
+
+      - name: Roll the app services back to the previous task definitions
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
+        run: |
+          cluster='${{ steps.previous.outputs.cluster }}'
+          python3 - "$cluster" <<'PY'
+          import json, subprocess, sys
+          cluster = sys.argv[1]
+          for svc in json.load(open('previous-services.json')):
+              print(f"[rollback] {svc['name']} -> {svc['td']}", flush=True)
+              subprocess.run(['aws', 'ecs', 'update-service', '--cluster', cluster, '--service', svc['name'],
+                              '--task-definition', svc['td'], '--force-new-deployment',
+                              '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
+          PY
+          echo "::error::the post-deploy migration or a post-deploy probe failed; prod app services rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
+          exit 1
 
   # 4) ALWAYS tear down preprod — even if standup/verify/prod-deploy failed. The
   #    ephemeral RDS is deleted WITHOUT a final snapshot (removalPolicy DESTROY +
