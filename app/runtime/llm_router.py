@@ -17,11 +17,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import hashlib
+import logging
 import random
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 CONTEXT_TOKEN_BUDGET_FAST = 4000  # §7 #9
 
@@ -39,6 +43,27 @@ class ModelClass(str, enum.Enum):
 
 
 @dataclass
+class LLMUsage:
+    """The tokens ONE model call consumed, normalized across providers (round 7 WP-6
+    item 5) so per-model cost is one formula on every provider.
+
+    ``input_tokens`` is the UNCACHED prompt, billed at the model's base input rate:
+    Anthropic reports it that way; OpenAI's ``prompt_tokens`` includes the cached
+    part, so its provider subtracts ``cached_tokens``. ``cache_read_tokens`` is the
+    prompt-cache hit (Anthropic ``cache_read_input_tokens``, OpenAI
+    ``prompt_tokens_details.cached_tokens``); ``cache_write_tokens`` the cache
+    creation (Anthropic ``cache_creation_input_tokens``; OpenAI caches implicitly
+    and bills no write, so 0). ``provider`` is the vendor, ``model`` the pinned id."""
+
+    provider: str
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+@dataclass
 class LLMResponse:
     text: str
     provider: str
@@ -50,6 +75,16 @@ class LLMResponse:
     # block id / OpenAI tool_call id; synthesized for EchoModel) and MUST be echoed
     # back on the matching tool_result turn, or the provider APIs reject the thread.
     tool_calls: list[dict[str, object]] = field(default_factory=list)
+    # What the call cost in tokens (round 7 WP-6 item 5); None when the provider
+    # reported nothing (EchoModel, an SDK response without ``usage``).
+    usage: LLMUsage | None = None
+
+
+def admin_id_hash(admin_id: uuid.UUID | None) -> str:
+    """A stable, non-reversible tenant key for cost lines (``-`` when unbound)."""
+    if admin_id is None:
+        return "-"
+    return hashlib.sha256(str(admin_id).encode()).hexdigest()[:16]
 
 
 class LLMProvider(Protocol):
@@ -148,6 +183,9 @@ class LLMRouter:
         self._fast = fast
         # True while a ``turn()`` is open: the cap was paid at the turn boundary.
         self._in_turn = False
+        # Token usage of the open turn, per (provider, model) — logged once as the
+        # ``llm_usage`` line when the turn closes (round 7 WP-6 item 5).
+        self._turn_usage: dict[tuple[str, str], list[int]] = {}
 
     @contextlib.contextmanager
     def turn(self) -> Iterator[None]:
@@ -157,18 +195,53 @@ class LLMRouter:
         model is called — so the orchestrator answers the turn honestly instead of
         an exception reaching the transport. Inside the block ``complete()`` never
         re-admits. No admin_id bound (tests, legacy construction) → no cap, as
-        before; a nested ``turn()`` is a no-op."""
-        if self._in_turn or self._admin_id is None:
+        before; a nested ``turn()`` is a no-op.
+
+        Closing the turn logs ONE ``llm_usage`` line per provider/model it used — the
+        per-turn token record the round report aggregates into cost per
+        conversation (item 5)."""
+        if self._in_turn:
             yield
             return
-        from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415 — import cycle
+        if self._admin_id is not None:
+            from app.runtime.llm_cap import admit_llm_call  # noqa: PLC0415 — import cycle
 
-        admit_llm_call(self._admin_id)
+            admit_llm_call(self._admin_id)
         self._in_turn = True
+        self._turn_usage = {}
         try:
             yield
         finally:
             self._in_turn = False
+            self._log_turn_usage()
+
+    def _note_usage(self, resp: LLMResponse) -> None:
+        if not self._in_turn or resp.usage is None:
+            return
+        u = resp.usage
+        totals = self._turn_usage.setdefault((u.provider, u.model), [0, 0, 0, 0, 0])
+        for i, value in enumerate(
+            (1, u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens)
+        ):
+            totals[i] += value
+
+    def _log_turn_usage(self) -> None:
+        usage, self._turn_usage = self._turn_usage, {}
+        tenant = admin_id_hash(self._admin_id)
+        for (provider, model), (calls, inp, out, cache_read, cache_write) in usage.items():
+            # key=value in the message: the structured formatter renders no extras.
+            logger.info(
+                "llm_usage admin_id_hash=%s provider=%s model=%s calls=%d input=%d "
+                "output=%d cache_read=%d cache_write=%d",
+                tenant,
+                provider,
+                model,
+                calls,
+                inp,
+                out,
+                cache_read,
+                cache_write,
+            )
 
     async def complete(
         self,
@@ -219,6 +292,7 @@ class LLMRouter:
                 )
                 resp.model_class = ModelClass.fast
                 resp.used_fallback = False
+                self._note_usage(resp)
                 return resp
             except ProviderError:
                 # Fast provider failing is NOT the primary/fallback doctrine (§3.4.3
@@ -229,6 +303,7 @@ class LLMRouter:
         try:
             resp = await self._primary.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = False
+            self._note_usage(resp)
             return resp
         except ProviderError:
             # Immediate failover, NO retry on primary (§3.4.3). The neutral message
@@ -246,4 +321,5 @@ class LLMRouter:
                 await asyncio.sleep(_fallback_retry_delay())
                 resp = await self._fallback.complete(system_prompt, messages, tools=tools)
             resp.used_fallback = True
+            self._note_usage(resp)
             return resp

@@ -26,12 +26,82 @@ import re
 import uuid
 from typing import Any
 
+from app.observability.metrics import emit_metric
 from app.runtime.llm_router import (
     RETRYABLE_PROVIDER_STATUSES,
     LLMResponse,
+    LLMUsage,
     ModelClass,
     ProviderError,
 )
+
+# Per-call token metrics (round 7 WP-6 item 5), one datum each per model call with
+# dimensions Provider (vendor) + Model. These four opt into the FULL dimension set
+# (the round 7 WP-8 default publishes [Environment] only) so per-model cost and the
+# prompt-cache hit rate are queryable in CloudWatch, not just in Logs Insights.
+TOKEN_METRICS: tuple[tuple[str, str], ...] = (
+    ("LLMInputTokens", "input_tokens"),
+    ("LLMOutputTokens", "output_tokens"),
+    ("LLMCacheReadTokens", "cache_read_tokens"),
+    ("LLMCacheWriteTokens", "cache_write_tokens"),
+)
+
+
+def _tokens(value: object) -> int:
+    """A token count off an SDK usage object; anything that is not a real int → 0."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)
+
+
+def anthropic_usage(resp: object, *, model: str) -> LLMUsage | None:
+    """``usage`` off an Anthropic Messages response. ``input_tokens`` there is already
+    the uncached remainder; the cache hit and the cache write are reported apart."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return None
+    return LLMUsage(
+        provider="anthropic",
+        model=model,
+        input_tokens=_tokens(getattr(usage, "input_tokens", None)),
+        output_tokens=_tokens(getattr(usage, "output_tokens", None)),
+        cache_read_tokens=_tokens(getattr(usage, "cache_read_input_tokens", None)),
+        cache_write_tokens=_tokens(getattr(usage, "cache_creation_input_tokens", None)),
+    )
+
+
+def openai_usage(resp: object, *, model: str) -> LLMUsage | None:
+    """``usage`` off an OpenAI Chat Completions response. ``prompt_tokens`` INCLUDES
+    the cached prefix (``prompt_tokens_details.cached_tokens``), so the uncached input
+    is the difference; OpenAI's implicit cache bills no write."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = _tokens(getattr(details, "cached_tokens", None)) if details is not None else 0
+    prompt = _tokens(getattr(usage, "prompt_tokens", None))
+    return LLMUsage(
+        provider="openai",
+        model=model,
+        input_tokens=max(prompt - cached, 0),
+        output_tokens=_tokens(getattr(usage, "completion_tokens", None)),
+        cache_read_tokens=cached,
+        cache_write_tokens=0,
+    )
+
+
+def emit_usage_metrics(usage: LLMUsage | None) -> None:
+    """One datum per token metric for one model call. Never raises (emit_metric)."""
+    if usage is None:
+        return
+    dimensions = {"Provider": usage.provider, "Model": usage.model}
+    for name, attr in TOKEN_METRICS:
+        emit_metric(
+            name,
+            float(getattr(usage, attr)),
+            dimensions=dimensions,
+            full_dimensions=True,
+        )
 
 
 def _provider_error(prefix: str, exc: BaseException) -> ProviderError:
@@ -246,12 +316,15 @@ class AnthropicProvider:
                     }
                 )
         text, confidence = parse_confidence_tag("".join(text_parts))
+        usage = anthropic_usage(resp, model=self._model)
+        emit_usage_metrics(usage)
         return LLMResponse(
             text=text,
             provider=self.name,
             model_class=ModelClass.primary,
             confidence=confidence,
             tool_calls=tool_calls,
+            usage=usage,
         )
 
 
@@ -374,6 +447,8 @@ class OpenAIProvider:
                 }
             )
         text, confidence = parse_confidence_tag(text)
+        usage = openai_usage(resp, model=self._model)
+        emit_usage_metrics(usage)
         return LLMResponse(
             text=text,
             provider=self.name,
@@ -383,4 +458,5 @@ class OpenAIProvider:
             model_class=ModelClass.primary,
             confidence=confidence,
             tool_calls=tool_calls,
+            usage=usage,
         )

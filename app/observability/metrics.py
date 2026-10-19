@@ -13,6 +13,13 @@ ObservabilityStack alarms reference:
                          line and an llm_unavailable row
     LLMCapExceeded       a turn refused by the tenant's per-minute model-call cap
                          (round 7 WP-2 item 4; dim: Channel)
+    LLMInputTokens       per model call: uncached prompt tokens (base input rate)
+    LLMOutputTokens      per model call: generated tokens
+    LLMCacheReadTokens   per model call: prompt-cache hits
+    LLMCacheWriteTokens  per model call: prompt-cache creation (Anthropic only)
+                         — the four token metrics (round 7 WP-6 item 5; dims:
+                         Provider, Model) are the ones that opt into the full set,
+                         so per-model cost is queryable (app/runtime/providers.py)
     ConnectionUnhealthy  rows in error/expired after a tenant's health sweep
     ActiveSessions       open sessions after a tenant's finalize sweep
     SweepTenantFailure   a sweep's per-tenant work raised (dim: Sweep)
