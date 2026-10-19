@@ -1675,6 +1675,8 @@ class Orchestrator:
             if llm_failure == _LLM_FAILURE_CAP:
                 _LOG.warning("llm_cap_exceeded session=%s channel=%s", session_id, channel)
                 emit_metric("LLMCapExceeded", dimensions={"Channel": channel})
+            else:
+                emit_metric("LLMUnavailable", dimensions={"Channel": channel})
             await self._emit_llm_unavailable(session_id, resolved_lead_id, reasons=failure_reasons)
             ack = self._with_contact_ask(
                 "I'm having a brief technical issue — I've flagged this so a person "

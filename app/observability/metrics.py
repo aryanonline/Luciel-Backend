@@ -8,6 +8,11 @@ ObservabilityStack alarms reference:
     BudgetGateHit        a turn refused at the conversation cap (dim: Channel)
     EscalationFired      an escalation row written (dim: Signal)
     LLMFallbackUsed      the fallback model answered a turn
+    LLMUnavailable       NO model served a turn: both providers failed (round 7
+                         WP-6 item 4; dim: Channel) — the customer got the outage
+                         line and an llm_unavailable row
+    LLMCapExceeded       a turn refused by the tenant's per-minute model-call cap
+                         (round 7 WP-2 item 4; dim: Channel)
     ConnectionUnhealthy  rows in error/expired after a tenant's health sweep
     ActiveSessions       open sessions after a tenant's finalize sweep
     SweepTenantFailure   a sweep's per-tenant work raised (dim: Sweep)

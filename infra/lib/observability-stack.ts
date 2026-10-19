@@ -123,6 +123,17 @@ export class ObservabilityStack extends Stack {
         15,
         'The fallback LLM answered 5+ turns in 15 minutes: the primary provider is failing.',
       );
+      // Round 7 WP-6 item 4: BOTH providers failed a turn (primary, then the fallback
+      // and its one 429/529 retry). LlmFallbackAlarm stays silent through this — the
+      // fallback never answered — so a dual-provider outage had no operator signal at
+      // all. One datum is a customer who got the outage line instead of an answer.
+      emfAlarm(
+        'LlmUnavailableAlarm',
+        'LLMUnavailable',
+        1,
+        5,
+        'No model served a turn: both LLM providers failed (outage, quota, revoked key). Customers are getting the outage line; check provider status and the platform keys.',
+      );
       emfAlarm(
         'SweepTenantFailureAlarm',
         'SweepTenantFailure',
