@@ -161,10 +161,16 @@ class Results:
         return any(row.status == "fail" for row in self.rows)
 
     def summary(self) -> str:
-        # A skip counts as "passed" here, exactly as before --strict existed; the strict
-        # verdict and the one-line SUMMARY say what was skipped.
-        passed = sum(1 for row in self.rows if row.status != "fail")
-        return f"{passed}/{len(self.rows)} checks passed"
+        # A skip is NOT a pass: this line used to count skips as passed ("6/8 checks
+        # passed" over a run with 3 skips), contradicting the SUMMARY line under it.
+        counts = {s: sum(1 for row in self.rows if row.status == s) for s in STATUSES}
+        return (
+            f"{counts['pass']}/{len(self.rows)} checks passed, {counts['skip']} skipped, "
+            f"{counts['fail']} failed"
+        )
+
+
+STATUSES = ("pass", "fail", "skip")
 
 
 #: The ONLY skips ``--strict`` tolerates, as (case-name prefix, reason prefix): cases the

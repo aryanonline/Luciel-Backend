@@ -88,6 +88,26 @@ def test_the_harness_ends_with_the_summary(capsys: pytest.CaptureFixture[str]) -
     )
 
 
+def test_the_verdict_line_never_counts_a_skip_as_a_pass(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The local mock run printed "6/8 checks passed" over 3 passes, 3 skips and 2
+    failures, right above a SUMMARY saying passed=3: the two lines must agree."""
+    r = H.Results()
+    for name in ("T2 a", "T3 b", "T4 c"):
+        r.record(name, True, "ok")
+    for name in ("T1 d", "T6 e"):
+        r.record(name, False, "no")
+    r.skip("T3b row1b-llm-cap-live", "set LUCIEL_SEEDTEST_LIVE_CAP=1 to")
+    r.skip("T5 row8-primary-to-fallback", "no OPENAI_API_KEY")
+    r.skip("T7 crm-custom-webhook-live", "set LUCIEL_SEEDTEST_WEBHOOK_URL to push")
+    assert r.summary() == "3/8 checks passed, 3 skipped, 2 failed"
+    H.finish(r, strict=False, seconds=5.6)
+    out = capsys.readouterr().out
+    assert "[seedtest] 3/8 checks passed, 3 skipped, 2 failed" in out
+    assert "passed=3 failed=2 skipped=3" in out.strip().splitlines()[-1]
+
+
 # --- the runner's report --------------------------------------------------------- #
 SUMMARY = (
     "[seedtest] SUMMARY result=FAIL cases=9 passed=7 failed=1 skipped=1 matrix=8 "
