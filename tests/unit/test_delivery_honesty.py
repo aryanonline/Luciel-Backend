@@ -313,6 +313,36 @@ def test_platform_sms_is_a_seam_only_when_a_platform_twilio_account_is_configure
     assert listed is (mode == "mock")
 
 
+async def test_an_unset_public_api_origin_is_degraded_in_live_mode(live, monkeypatch):
+    """Round 7 WP-7: with no public API origin, Twilio webhook auto-config (and the
+    sweep's drift repair) resolve to the Null configurator — every BYO number attach
+    "succeeds" with manual guidance and nothing on /healthz says why."""
+    from app.channels import tenant_twilio
+    from app.channels.tenant_twilio import NullWebhookConfigurator
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "public_api_base_url", "")
+    assert "api_base_url:unset" in degraded_bindings()
+
+    # The condition the entry names: the configurator degrades before it even looks
+    # at the tenant's credentials.
+    configurator = await tenant_twilio.build_tenant_webhook_configurator(
+        None,  # type: ignore[arg-type] — never reached: the origin check comes first
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    assert isinstance(configurator, NullWebhookConfigurator)
+
+    monkeypatch.setattr(settings, "public_api_base_url", "https://api.example.test")
+    assert "api_base_url:unset" not in degraded_bindings()
+
+
+def test_an_unset_public_api_origin_is_not_degraded_in_mock_mode(monkeypatch):
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    monkeypatch.setattr(get_settings(), "public_api_base_url", "")
+    assert "api_base_url:unset" not in degraded_bindings()
+
+
 def test_degraded_bindings_names_an_unbound_payg_price_in_a_real_stripe_posture(monkeypatch):
     """Round 7 WP-1 #4: a real Stripe binding with no metered price can save cards and
     bill nothing — named ``stripe_payg_price:unset`` so /healthz shows it. Mock posture

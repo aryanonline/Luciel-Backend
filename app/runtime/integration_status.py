@@ -142,6 +142,12 @@ def degraded_bindings() -> list[str]:
     # receipt-rule topic, so an unset pin is inbound reply mail refused wholesale.
     if live_mode() and not settings.ses_inbound_topic_arns:
         degraded.append("ses_inbound_topic:unpinned")
+    # Round 7 WP-7: without the public API origin there is no URL to point a provider
+    # at — Twilio webhook auto-config and its drift repair silently fall back to
+    # manual guidance, and SMS/export links lose their host. Live mode only: mock never
+    # configures a provider.
+    if live_mode() and not settings.public_api_base_url:
+        degraded.append("api_base_url:unset")
     # §3.1.5 / §4.5: the abuse ceilings are only platform-wide when the Redis store is
     # bound. A live task counting in-process still enforces them, but per task and
     # reset on every deploy — a degraded binding this list exists to surface.
