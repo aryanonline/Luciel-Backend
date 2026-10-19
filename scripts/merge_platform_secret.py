@@ -4,7 +4,7 @@ Round 6 (2026-09-08) — the owner-at-the-keyboard half of every provider regist
 (Google, HubSpot, Salesforce, Calendly, Notion, Meta, Instagram, Microsoft, Twilio OAuth).
 The platform secret is ONE JSON object in Secrets Manager (``luciel/<env>/platform``,
 security-stack.ts) that ECS injects as LUCIEL_PLATFORM_SECRET; every key name the runtime
-reads is listed in app/config.py (parse_platform_secret's mapping). This script:
+reads is declared ONCE in app/config.py (``PLATFORM_SECRET_KEYS``). This script:
 
   1. reads KEY=VALUE pairs from stdin (one per line; blank lines and ``#`` comments
      ignored) — the owner pastes secrets here, never on a command line where a shell
@@ -30,29 +30,35 @@ import argparse
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 _KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 _REGION = "ca-central-1"  # residency lock (DEVOPS §2.1, LD 21)
 
+# Run as ``python scripts/merge_platform_secret.py`` the script directory, not the repo
+# root, is on sys.path; the accepted key set lives in the app package.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-_READ_RE = re.compile(r'(?:blob|secret|platform)(?:\.get\(|\[)\s*"([A-Z][A-Z0-9_]+)"')
-_MAP_RE = re.compile(r'"([A-Z][A-Z0-9_]+)":\s*"[a-z_]+"')
+
+def _known_keys() -> frozenset[str]:
+    """Every platform-secret key the runtime reads — the ONE explicit list in
+    app/config.py, not a scrape of the source.
+
+    The scrape this replaces matched only literal ``blob.get("KEY")`` reads, so the keys
+    config.py reads through a loop variable (STRIPE_WEBHOOK_SECRET and the three LLM
+    model pins) were refused as typos (round 7 WP-7)."""
+    from app.config import PLATFORM_SECRET_KEYS  # noqa: PLC0415 — keep import lazy
+
+    return PLATFORM_SECRET_KEYS
 
 
-def _known_keys() -> set[str]:
-    """Every platform-secret key the runtime reads: scanned from the app source (the
-    config.py blob->field mapping plus every direct ``blob.get("KEY")`` read)."""
-    from pathlib import Path  # noqa: PLC0415
-
-    root = Path(__file__).resolve().parent.parent / "app"
-    keys: set[str] = set()
-    for path in root.rglob("*.py"):
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        keys.update(_READ_RE.findall(text))
-        if path.name == "config.py":
-            keys.update(_MAP_RE.findall(text))
-    return keys
+def unknown_keys(pairs: dict[str, str]) -> list[str]:
+    """The pasted key names the runtime does not read, sorted (empty = all accepted)."""
+    known = _known_keys()
+    return sorted(k for k in pairs if k not in known)
 
 
 def _read_pairs(stream: Any) -> dict[str, str]:
@@ -92,6 +98,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    # Validate the paste BEFORE touching AWS: a typo is refused without reading the
+    # secret at all, and nothing is written.
+    pairs: dict[str, str] = {}
+    if not args.list:
+        pairs = _read_pairs(sys.stdin)
+        if not pairs:
+            raise SystemExit("nothing to merge: paste KEY=VALUE lines on stdin")
+        unknown = unknown_keys(pairs)
+        if unknown and not args.allow_unknown:
+            raise SystemExit(
+                "these keys are not read by the runtime (typo?): "
+                + ", ".join(unknown)
+                + " — see PLATFORM_SECRET_KEYS in app/config.py, or pass --allow-unknown"
+            )
+
     import boto3  # noqa: PLC0415 — keep the app import surface small
 
     sm = boto3.client("secretsmanager", region_name=args.region)
@@ -105,17 +126,6 @@ def main(argv: list[str] | None = None) -> int:
         for key in sorted(blob):
             print(key)
         return 0
-
-    pairs = _read_pairs(sys.stdin)
-    if not pairs:
-        raise SystemExit("nothing to merge: paste KEY=VALUE lines on stdin")
-    unknown = sorted(k for k in pairs if k not in _known_keys())
-    if unknown and not args.allow_unknown:
-        raise SystemExit(
-            "these keys are not read by the runtime (typo?): "
-            + ", ".join(unknown)
-            + " — see parse_platform_secret in app/config.py, or pass --allow-unknown"
-        )
 
     merged = {**blob, **pairs}
     resp = sm.put_secret_value(
