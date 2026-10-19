@@ -270,7 +270,10 @@ def test_the_runners_accept_the_preroll_revision_and_the_strict_flag() -> None:
     assert 'TASKDEF_OVERRIDE="${2:-}"' in migration
     assert 'taskdef="$TASKDEF_OVERRIDE"' in migration
     seedtest = (ROOT / "scripts" / "run-seedtest-task.sh").read_text(encoding="utf-8")
-    assert '"scripts/seed_and_livetest.py","--strict"' in seedtest
+    # The runner forwards every harness flag as a container command override and
+    # adds --strict unless the caller chose --strict or --no-strict (WP-12).
+    assert '"scripts/seed_and_livetest.py", *args' in seedtest
+    assert '"--strict" not in args and "--no-strict" not in args' in seedtest
     assert '--overrides "$overrides"' in seedtest
 
 

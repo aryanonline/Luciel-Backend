@@ -1,0 +1,288 @@
+"""SeedTest output (round 7 WP-12): one closing SUMMARY line, repeated by the runner.
+
+The harness ends with ``[seedtest] SUMMARY result=... cases=... passed=... failed=...
+skipped=... matrix=... seconds=...``; scripts/run-seedtest-task.sh finds that line in the
+task's CloudWatch log, prints it again after the task, and writes it (with every
+[FAIL]/[SKIP]) into the GitHub job summary when the step runs in Actions.
+
+The last test runs the REAL runner script end to end against a stub ``aws`` on PATH: the
+harness flags reach the container override (``--strict`` added), the waiter's 10-minute
+give-up is waited past, and the report repeats the SUMMARY and fills the job summary.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from tests.unit import seedtest_harness
+
+H = seedtest_harness.load()
+
+
+def _row(name: str, status: str, kind: str = "case", evidence: str = "e") -> object:
+    return H.Row(name, status, evidence, kind)
+
+
+T3B_SKIP = _row("T3b row1b-llm-cap-live", "skip", evidence="set LUCIEL_SEEDTEST_LIVE_CAP=1 to")
+T5_SKIP = _row("T5 row8-primary-to-fallback", "skip", evidence="no OPENAI_API_KEY")
+
+
+@pytest.mark.parametrize(
+    ("rows", "strict", "expected"),
+    [
+        (
+            [_row("T1 a", "pass"), T3B_SKIP],
+            True,
+            "result=PASS cases=2 passed=1 failed=0 skipped=1 matrix=0 matrix_passed=0 "
+            "matrix_failed=0 strict=on unexpected_skips=0",
+        ),
+        (
+            [_row("T1 a", "pass"), _row("M1 x", "pass", "matrix"), _row("M3 y", "fail", "matrix")],
+            True,
+            "result=FAIL cases=3 passed=2 failed=1 skipped=0 matrix=2 matrix_passed=1 "
+            "matrix_failed=1 strict=on unexpected_skips=0",
+        ),
+        (
+            [_row("T1 a", "pass"), T5_SKIP],
+            True,
+            "result=FAIL cases=2 passed=1 failed=0 skipped=1 matrix=0 matrix_passed=0 "
+            "matrix_failed=0 strict=on unexpected_skips=1",
+        ),
+        (
+            [_row("T1 a", "pass"), T5_SKIP],
+            False,
+            "result=PASS cases=2 passed=1 failed=0 skipped=1 matrix=0 matrix_passed=0 "
+            "matrix_failed=0 strict=off unexpected_skips=1",
+        ),
+        (
+            [],
+            True,
+            "result=PASS cases=0 passed=0 failed=0 skipped=0 matrix=0 matrix_passed=0 "
+            "matrix_failed=0 strict=on unexpected_skips=0",
+        ),
+    ],
+)
+def test_summary_line(rows: list[object], strict: bool, expected: str) -> None:
+    line = H.summary_line(rows, strict=strict, seconds=812.44)
+    assert line == f"[seedtest] SUMMARY {expected} seconds=812.4"
+    assert "\n" not in line and line.isascii()
+
+
+def test_the_harness_ends_with_the_summary(capsys: pytest.CaptureFixture[str]) -> None:
+    r = H.Results()
+    r.record("T1 live-LLM-happy-path", True, "grounded")
+    r.record("M4 takeover", True, "ok", kind="matrix", seconds=12.0)
+    r.skip("T7 crm-custom-webhook-live", "set LUCIEL_SEEDTEST_WEBHOOK_URL to push")
+    assert H.finish(r, strict=True, seconds=61.25) == 0
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last == (
+        "[seedtest] SUMMARY result=PASS cases=3 passed=2 failed=0 skipped=1 matrix=1 "
+        "matrix_passed=1 matrix_failed=0 strict=on unexpected_skips=0 seconds=61.2"
+    )
+
+
+def test_the_verdict_line_never_counts_a_skip_as_a_pass(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The local mock run printed "6/8 checks passed" over 3 passes, 3 skips and 2
+    failures, right above a SUMMARY saying passed=3: the two lines must agree."""
+    r = H.Results()
+    for name in ("T2 a", "T3 b", "T4 c"):
+        r.record(name, True, "ok")
+    for name in ("T1 d", "T6 e"):
+        r.record(name, False, "no")
+    r.skip("T3b row1b-llm-cap-live", "set LUCIEL_SEEDTEST_LIVE_CAP=1 to")
+    r.skip("T5 row8-primary-to-fallback", "no OPENAI_API_KEY")
+    r.skip("T7 crm-custom-webhook-live", "set LUCIEL_SEEDTEST_WEBHOOK_URL to push")
+    assert r.summary() == "3/8 checks passed, 3 skipped, 2 failed"
+    H.finish(r, strict=False, seconds=5.6)
+    out = capsys.readouterr().out
+    assert "[seedtest] 3/8 checks passed, 3 skipped, 2 failed" in out
+    assert "passed=3 failed=2 skipped=3" in out.strip().splitlines()[-1]
+
+
+# --- the runner's report --------------------------------------------------------- #
+SUMMARY = (
+    "[seedtest] SUMMARY result=FAIL cases=9 passed=7 failed=1 skipped=1 matrix=8 "
+    "matrix_passed=7 matrix_failed=1 strict=on unexpected_skips=0 seconds=640.0"
+)
+LOG_LINES = [
+    "[seedtest] API_BASE=https://api.vantagemind.ai RUN_ID=1 strict=on",
+    "[PASS] M1 widget-only+pasted-knowledge (60.1s): grounded_answer=ok[...]",
+    "[FAIL] M3 escalation:hot-lead+ungrounded (41.0s): honest_handoff_ack=FAIL[reply=`x`]",
+    "[SKIP] T7 crm-custom-webhook-live: set LUCIEL_SEEDTEST_WEBHOOK_URL to push",
+    "::error::§10 live-behavior harness found FAIL(s)",
+    SUMMARY,
+]
+
+
+def _events(lines: list[str]) -> str:
+    return json.dumps({"events": [{"message": line + "\n"} for line in lines]})
+
+
+def _report(stdin: str, tmp_path: Path, *, code: str = "1") -> tuple[str, str]:
+    step_summary = tmp_path / "step-summary.md"
+    env = {**os.environ, "GITHUB_STEP_SUMMARY": str(step_summary), "PYTHONUTF8": "1"}
+    out = subprocess.run(  # noqa: S603 — the interpreter running this test, fixed argv
+        [sys.executable, "-c", seedtest_harness.embedded_python("PY_REPORT"), code, "dev"],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        env=env,
+    ).stdout
+    return out, step_summary.read_text(encoding="utf-8") if step_summary.exists() else ""
+
+
+def test_the_report_prints_the_log_then_the_summary_again(tmp_path: Path) -> None:
+    out, step = _report(_events(LOG_LINES), tmp_path)
+    lines = out.splitlines()
+    assert lines[: len(LOG_LINES)] == LOG_LINES
+    assert lines[-1] == SUMMARY
+    assert "### SeedTest (dev)" in step and f"`{SUMMARY}`" in step
+    assert "Task exit code: `1`" in step
+    assert "- [FAIL] M3 escalation:hot-lead+ungrounded" in step
+    assert "reply='x'" in step  # backticks cannot break the markdown
+    assert "- [SKIP] T7 crm-custom-webhook-live" in step
+    assert "[PASS] M1" not in step
+
+
+def test_a_run_that_never_finished_says_so(tmp_path: Path) -> None:
+    out, step = _report(_events(LOG_LINES[:2]), tmp_path, code="137")
+    expected = "[seedtest] SUMMARY missing: the harness did not finish (task exit code 137)"
+    assert out.splitlines()[-1] == expected
+    assert expected in step
+
+
+@pytest.mark.parametrize("stdin", ["", "not json", '{"events": []}'])
+def test_no_logs_yet(stdin: str, tmp_path: Path) -> None:
+    out, _ = _report(stdin, tmp_path)
+    assert "(no harness output in CloudWatch for this task yet)" in out
+    assert out.splitlines()[-1].startswith("[seedtest] SUMMARY missing")
+
+
+def test_without_actions_there_is_no_step_summary(tmp_path: Path) -> None:
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", seedtest_harness.embedded_python("PY_REPORT"), "0", "dev"],
+        input=_events(LOG_LINES),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        env={**env, "PYTHONUTF8": "1"},
+    ).stdout
+    assert out.splitlines()[-1] == SUMMARY
+
+
+# --- the real runner, end to end against a stub aws ------------------------------ #
+FAKE_AWS = """#!/usr/bin/env bash
+echo "$*" >> "$FAKE_STATE/calls.log"
+case "$1 $2" in
+  "cloudformation list-exports")
+    case "$*" in
+      *ClusterName*) echo "luciel-cluster" ;;
+      *) echo "arn:aws:ecs:ca-central-1:1:task-definition/seedtest:9" ;;
+    esac ;;
+  "ecs list-services") echo "arn:aws:ecs:ca-central-1:1:service/luciel-cluster/data" ;;
+  "ecs describe-services") echo '{"subnets": ["subnet-1"], "securityGroups": ["sg-1"]}' ;;
+  "ecs run-task")
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--overrides" ]; then printf '%s' "$2" > "$FAKE_STATE/overrides.json"; fi
+      shift
+    done
+    echo "arn:aws:ecs:ca-central-1:1:task/luciel-cluster/abc123" ;;
+  "ecs wait")
+    n=$(cat "$FAKE_STATE/waits" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$FAKE_STATE/waits"
+    [ "$n" -ge 2 ] ;;
+  "ecs describe-tasks") echo "$FAKE_EXIT_CODE" ;;
+  "logs filter-log-events") cat "$FAKE_STATE/logs.json" ;;
+  *) echo "unexpected aws $*" >&2; exit 2 ;;
+esac
+"""
+FAKE_SLEEP = "#!/usr/bin/env bash\nexit 0\n"
+
+
+def _runner_available() -> bool:
+    bash = shutil.which("bash")
+    if bash is None:
+        return False
+    probe = subprocess.run(  # noqa: S603
+        [bash, "-c", "command -v python3 >/dev/null && python3 -c 'import json'"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(not _runner_available(), reason="needs bash and python3 on PATH")
+@pytest.mark.parametrize(("exit_code", "rc"), [("0", 0), ("1", 1)])
+def test_the_runner_end_to_end(tmp_path: Path, exit_code: str, rc: int) -> None:
+    fakebin = tmp_path / "bin"
+    state = tmp_path / "state"
+    fakebin.mkdir()
+    state.mkdir()
+    for name, body in (("aws", FAKE_AWS), ("sleep", FAKE_SLEEP)):
+        script = fakebin / name
+        script.write_bytes(body.encode())
+        script.chmod(0o755)
+    (state / "logs.json").write_text(_events(LOG_LINES), encoding="utf-8")
+    step_summary = tmp_path / "step-summary.md"
+    env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("LUCIEL_SEEDTEST_")},
+        "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "FAKE_STATE": str(state),
+        "FAKE_EXIT_CODE": exit_code,
+        "GITHUB_STEP_SUMMARY": str(step_summary),
+        "LUCIEL_SEEDTEST_LIVE_CAP": "1",
+        "PYTHONUTF8": "1",
+    }
+    done = subprocess.run(  # noqa: S603
+        [
+            str(shutil.which("bash")),
+            str(seedtest_harness.RUNNER),
+            "dev",
+            "--matrix",
+            "--only",
+            "M3",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        check=False,
+        timeout=120,
+    )
+    out = done.stdout
+    assert done.returncode == rc, done.stderr + out
+    overrides = json.loads((state / "overrides.json").read_text(encoding="utf-8"))
+    container = overrides["containerOverrides"][0]
+    assert container["command"] == [
+        "python3",
+        "scripts/seed_and_livetest.py",
+        "--strict",
+        "--matrix",
+        "--only",
+        "M3",
+    ]
+    assert container["environment"] == [{"name": "LUCIEL_SEEDTEST_LIVE_CAP", "value": "1"}]
+    assert (state / "waits").read_text().strip() == "2"  # waited past the waiter's give-up
+    assert "still running" in out
+    report = out[out.index("[seedtest] log group:") :]
+    assert SUMMARY in report.splitlines()
+    tail = [line for line in report.splitlines() if line.strip()]
+    if rc:
+        assert tail[-2] == SUMMARY and tail[-1].startswith("::error::seedtest task FAILED")
+    else:
+        assert tail[-2] == SUMMARY and "probe PASSED" in tail[-1]
+    assert f"`{SUMMARY}`" in step_summary.read_text(encoding="utf-8")

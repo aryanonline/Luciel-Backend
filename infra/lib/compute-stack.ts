@@ -901,6 +901,12 @@ export class ComputeStack extends Stack {
         // behavior against another's rows. Since WP-8b it is the environment's OWN
         // api host (env-config.ts `hostnames`): api-dev / api-preprod / api.
         LUCIEL_API_BASE: publicApiBaseUrl,
+        // STRICT by default wherever the task is started from (round 7 WP-12): a
+        // [SKIP] outside the owner-gated allowlist (LUCIEL_SEEDTEST_LIVE_CAP /
+        // LUCIEL_SEEDTEST_WEBHOOK_URL) fails the run instead of reading as PASS.
+        // run-seedtest-task.sh also passes --strict; `--no-strict` on its command
+        // line is the one opt-out.
+        LUCIEL_SEEDTEST_STRICT: '1',
       },
     });
     new cdk.CfnOutput(this, 'SeedTestTaskArn', {

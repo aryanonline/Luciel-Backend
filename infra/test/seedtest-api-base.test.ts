@@ -62,6 +62,22 @@ describe('SeedTest task knows which API it drives', () => {
       });
     },
   );
+
+  // Round 7 WP-12: a skip outside the owner-gated allowlist fails the run wherever
+  // the task is started from — the console, a script, the preprod gate.
+  test.each([['dev'], ['preprod'], ['prod']])(
+    '%s: the seedtest container runs strict by default (LUCIEL_SEEDTEST_STRICT=1)',
+    (envName) => {
+      buildCompute(envName as EnvName).hasResourceProperties('AWS::ECS::TaskDefinition', {
+        ContainerDefinitions: [
+          Match.objectLike({
+            Name: 'SeedTestContainer',
+            Environment: Match.arrayWith([{ Name: 'LUCIEL_SEEDTEST_STRICT', Value: '1' }]),
+          }),
+        ],
+      });
+    },
+  );
 });
 
 describe('the harness origin is per environment (D6)', () => {
