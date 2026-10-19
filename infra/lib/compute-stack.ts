@@ -737,10 +737,14 @@ export class ComputeStack extends Stack {
       envConfig.autoscaling.maxControlPlane,
     );
 
-    // One-off MIGRATION task definition. The pipeline runs it AFTER this stack has
-    // rolled the services (it carries the new image, so it cannot exist before the
-    // stack deploys): a failed migration therefore rolls the services back
-    // (deploy.yml), and every migration must be expand-first for that window.
+    // One-off MIGRATION task definition. It carries the image, so the revision this
+    // stack registers only exists once the stack has rolled the services. The
+    // pipeline therefore migrates BEFORE the roll with a revision of THIS definition
+    // whose image it swaps for the release's (scripts/migrate-before-roll.sh, round 7
+    // migrations review) and runs this one after the roll as a no-op safety. Every
+    // migration stays expand-first: the old code runs on the new schema for the
+    // length of the roll. Keep the container named MigrationContainer — the pre-roll
+    // swap refuses a definition where it cannot find exactly one.
     // Same image; entrypoint overridden to scripts/migrate.sh. Gets master creds +
     // app password from Secrets Manager. Run inside the VPC (RDS is private).
     const migrationTask = new ecs.FargateTaskDefinition(this, 'MigrationTask', {
