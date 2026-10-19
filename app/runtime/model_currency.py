@@ -547,6 +547,77 @@ _REMEDY = (
     "This alert repeats daily until resolved."
 )
 
+# --- the restart after a swap (round 7 WP-6 item 3) ----------------------------- #
+# A swap is only half done when the secret is written: ECS injects the platform
+# secret at TASK START, so every running task keeps calling the retired model until
+# the services are redeployed. The swap record (LAST_SWAP_BLOB_KEY) therefore carries
+# ``restart``: "pending" is written WITH the new pin, and flipped to "done" only after
+# a restart call succeeded. A failed or skipped restart is an ALERT (ERROR + raise),
+# and every later run that still reads "pending" retries the restart and alerts again
+# until one succeeds — a crash between the pin write and the restart is covered too.
+# A record without the field (written before this change) is treated as done.
+RESTART_PENDING = "pending"
+RESTART_DONE = "done"
+_RESTARTED = "restarted"
+_RESTART_SKIPPED = "restart_skipped_no_service_env"
+_RESTART_FAILED = "restart_failed"
+
+
+def pending_restart_record(raw: str) -> dict[str, Any] | None:
+    """The last swap record when its fleet restart is still owed, else None."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(record, dict) and record.get("restart") == RESTART_PENDING:
+        return record
+    return None
+
+
+async def _restart_fleet(restart: EcsServiceRestarter | None) -> str:
+    """Redeploy the app services: ``restarted``, or why not."""
+    if restart is None:
+        return _RESTART_SKIPPED
+    try:
+        await restart.restart()
+    except Exception as exc:  # noqa: BLE001 — reported as an alert by the caller
+        logger.warning("model_currency_restart_failed error=%s", type(exc).__name__)
+        return _RESTART_FAILED
+    return _RESTARTED
+
+
+async def _mark_restarted(writer: PlatformSecretWriter | None, record: dict[str, Any]) -> None:
+    """Flip the swap record to ``restart: done``. A failed write is a warning: the
+    fleet DID restart; the next run sees "pending", redeploys once more (harmless)
+    and tries the write again."""
+    if writer is None:
+        logger.warning("model_currency_restart_record_unwritable reason=no_secret_writer")
+        return
+    try:
+        await writer.apply({LAST_SWAP_BLOB_KEY: json.dumps({**record, "restart": RESTART_DONE})})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("model_currency_restart_record_write_failed error=%s", type(exc).__name__)
+
+
+def _restart_alert(record: dict[str, Any], note: str) -> str:
+    how = (
+        "no ECS cluster/services are configured for this sweep (LUCIEL_ECS_CLUSTER / "
+        "LUCIEL_ECS_SERVICES) — restart the app services by hand, then set "
+        f'"restart": "{RESTART_DONE}" in the platform secret\'s {LAST_SWAP_BLOB_KEY} record'
+        if note == _RESTART_SKIPPED
+        else "the ECS restart call failed — restart the app services (force a new "
+        "deployment); the watchdog also retries it on every run"
+    )
+    return (
+        f"{record.get('setting', 'a model pin')} was swapped '{record.get('from', '?')}' → "
+        f"'{record.get('to', '?')}' in the platform secret at {record.get('at', '?')}, but the "
+        f"app services have NOT restarted ({note}): running tasks still call the retired "
+        f"'{record.get('from', '?')}' until they do. {how}. This alert repeats daily until "
+        "the fleet has restarted"
+    )
+
 
 async def run_model_currency_check(
     *,
@@ -561,8 +632,10 @@ async def run_model_currency_check(
     """Verify every pinned model; auto-swap retired chat pins; alert what remains.
 
     Raises (⇒ sweep exits nonzero ⇒ alarm) iff something needs a human: a pin is
-    gone and could not be safely remediated. A completed auto-swap does NOT raise
-    — the condition is fixed and the operator was told."""
+    gone and could not be safely remediated, or a swap's fleet restart is still owed
+    (item 3 — the running tasks keep the retired pin until they restart). A completed
+    auto-swap WITH its restart does NOT raise — the condition is fixed and the
+    operator was told."""
     settings = settings or get_settings()
     if settings.integration_mode != "live":
         # Mock mode has no provider keys and nothing real to verify.
@@ -614,6 +687,28 @@ async def run_model_currency_check(
         return await _default_smoke(client, provider=provider, api_key=api_key, model_id=model_id)
 
     smoke_fn: SmokeTurn = smoke if smoke is not None else _smoke_default
+
+    # An earlier swap whose fleet restart is still owed (item 3): retry it first.
+    # Statelessness holds — the state is the swap record in the platform secret.
+    owed = pending_restart_record(settings.llm_model_updated)
+    if owed is not None:
+        note = await _restart_fleet(
+            restarter if restarter is not None else _default_restarter(settings)
+        )
+        if note == _RESTARTED:
+            logger.warning(
+                "%s setting=%s old=%s new=%s services=restarted (owed restart, retried)",
+                MODEL_CURRENCY_SWAP,
+                owed.get("setting"),
+                owed.get("from"),
+                owed.get("to"),
+            )
+            await _mark_restarted(
+                secret_writer if secret_writer is not None else _default_secret_writer(settings),
+                owed,
+            )
+        else:
+            alerts.append(_restart_alert(owed, note))
 
     async with factory() as client:
         for pin in PINS:
@@ -685,6 +780,9 @@ async def run_model_currency_check(
                     "setting": pin.setting,
                     "from": model_id,
                     "to": successor,
+                    # Owed until a restart call succeeds (item 3): written WITH the pin
+                    # so a crash before the restart is retried by the next run.
+                    "restart": RESTART_PENDING,
                 }
                 try:
                     await writer.apply(
@@ -699,16 +797,16 @@ async def run_model_currency_check(
                         f"but the platform-secret write failed"
                     )
                     continue
-                restart_note = "restarted"
-                restart = restarter if restarter is not None else _default_restarter(settings)
-                if restart is None:
-                    restart_note = "restart_skipped_no_service_env"
+                restart_note = await _restart_fleet(
+                    restarter if restarter is not None else _default_restarter(settings)
+                )
+                if restart_note == _RESTARTED:
+                    await _mark_restarted(writer, swap_record)
                 else:
-                    try:
-                        await restart.restart()
-                    except Exception as exc:  # noqa: BLE001 — swap persisted; recoverable
-                        logger.warning("model_currency_restart_failed error=%s", type(exc).__name__)
-                        restart_note = "restart_failed"
+                    # The secret holds the new pin but every running task still calls
+                    # the retired one: an ALERT (ERROR + raise), repeated by every run
+                    # until a restart succeeds — never a WARNING and exit 0.
+                    alerts.append(_restart_alert(swap_record, restart_note))
                 logger.warning(
                     "%s setting=%s old=%s new=%s services=%s",
                     MODEL_CURRENCY_SWAP,
@@ -732,12 +830,15 @@ async def run_model_currency_check(
                             "a smoke turn, wrote it to the platform secret, "
                             + (
                                 "and restarted the app services."
-                                if restart_note == "restarted"
-                                else f"but could not restart the app services ({restart_note}) "
-                                "— restart them when convenient."
+                                + "\n\nNo action is required; review the choice at your "
+                                "leisure. "
+                                if restart_note == _RESTARTED
+                                else f"but could NOT restart the app services ({restart_note})"
+                                ". Restart them now: until they restart, the running tasks "
+                                "keep calling the retired model. A separate alert repeats "
+                                "daily until the restart has happened.\n\n"
                             )
-                            + "\n\nNo action is required; review the choice at your leisure. "
-                            "The pin is never changed while it still exists — this happens "
+                            + "The pin is never changed while it still exists — this happens "
                             "only on a provider retirement (§3.4.3). Every account sees a "
                             "'model updated' notice on its next login and receives it by "
                             "email once, from the billing_notices sweep."

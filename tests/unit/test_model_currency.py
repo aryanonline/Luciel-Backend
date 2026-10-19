@@ -354,12 +354,17 @@ async def test_retired_chat_pin_auto_swaps_writes_restarts_emails_no_raise(caplo
             secret_writer=writer,
             restarter=restarter,
         )
-    (applied,) = writer.applied
+    applied, marked = writer.applied
     assert applied["LLM_ANTHROPIC_PRIMARY_MODEL"] == "claude-sonnet-4-8"
     # The same rotation records the swap for the admins' 'model updated' notice (F114).
     record = json.loads(applied["LLM_MODEL_UPDATED"])
     assert record["from"] == "claude-sonnet-4-6" and record["to"] == "claude-sonnet-4-8"
     assert record["setting"] == "llm_anthropic_primary_model" and record["at"]
+    # The restart is owed WITH the pin write and settled only once it succeeded
+    # (round 7 WP-6 item 3).
+    assert record["restart"] == "pending"
+    assert json.loads(marked["LLM_MODEL_UPDATED"]) == {**record, "restart": "done"}
+    assert set(marked) == {"LLM_MODEL_UPDATED"}
     # The successor answered a smoke turn BEFORE the secret was written (F113).
     ((smoke_url, smoke_payload),) = transport.posts
     assert "anthropic" in smoke_url and smoke_payload["model"] == "claude-sonnet-4-8"

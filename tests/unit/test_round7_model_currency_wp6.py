@@ -15,11 +15,14 @@ Each test models a live condition the 26834f1 review found:
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 import pytest
 from app.runtime import model_currency
 from app.runtime.model_currency import (
+    MODEL_CURRENCY_ALERT,
     SMOKE_MAX_COMPLETION_TOKENS_OPENAI,
     SMOKE_PROMPT,
     model_family,
@@ -35,6 +38,7 @@ from tests.unit.test_model_currency import (
     FakeTransport,
     FakeWriter,
     RecordingSender,
+    _anthropic_pages,
     _openai_listing,
     _Resp,
 )
@@ -269,3 +273,135 @@ async def test_a_retired_gpt5_fallback_pin_swaps_to_gpt54():
     assert result["swapped"] == [
         {"setting": "llm_openai_fallback_model", "old": "gpt-5", "new": "gpt-5.4"}
     ]
+
+
+# --- item 3: a swap without its restart is an alert, every day until it happens ---- #
+
+
+class FailingRestarter:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def restart(self) -> None:
+        self.attempts += 1
+        raise PermissionError("ecs:UpdateService denied")
+
+
+def _retired_primary_transport() -> FakeTransport:
+    return FakeTransport(
+        existing=set(ALL_PINS) - {"claude-sonnet-4-6"},
+        anthropic_pages=_anthropic_pages(("claude-sonnet-4-8", 500), ("claude-haiku-4-5", 200)),
+        openai_listing=_openai_listing(("gpt-5.4", 400)),
+    )
+
+
+@pytest.mark.parametrize("restart_mode", ["failed", "skipped"])
+async def test_a_swap_whose_restart_fails_or_is_skipped_alerts_and_raises(caplog, restart_mode):
+    """The live condition: the pin moved in the secret, but ECS injects the secret at
+    task start — every running task keeps calling the retired model. That used to be a
+    WARNING and exit 0, which the ERROR-only SweepErrors metric filter never saw."""
+    restarter = FailingRestarter() if restart_mode == "failed" else None
+    sender, writer = RecordingSender(), FakeWriter()
+    with (
+        caplog.at_level(logging.WARNING, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError, match="model_currency"),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW),
+            transport_factory=_retired_primary_transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=restarter,
+        )
+    # The pin moved and the restart is recorded as still owed — never marked done.
+    (applied,) = writer.applied
+    assert applied["LLM_ANTHROPIC_PRIMARY_MODEL"] == "claude-sonnet-4-8"
+    assert json.loads(applied["LLM_MODEL_UPDATED"])["restart"] == "pending"
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors and MODEL_CURRENCY_ALERT in errors[-1].getMessage()
+    assert "have NOT restarted" in errors[-1].getMessage()
+    swap_mail, alert_mail = sender.sent
+    assert "could NOT restart" in swap_mail[2] and "No action is required" not in swap_mail[2]
+    assert "need attention" in alert_mail[1]
+    assert "still call the retired 'claude-sonnet-4-6'" in alert_mail[2]
+    if restart_mode == "skipped":
+        assert "LUCIEL_ECS_CLUSTER" in alert_mail[2]
+    else:
+        assert restarter is not None and restarter.attempts == 1
+
+
+def _owed_record() -> dict[str, str]:
+    return {
+        "at": "2026-10-18T06:00:00+00:00",
+        "setting": "llm_anthropic_primary_model",
+        "from": "claude-sonnet-4-6",
+        "to": "claude-sonnet-4-8",
+        "restart": "pending",
+    }
+
+
+def _after_swap_transport() -> FakeTransport:
+    # Tomorrow the secret holds the successor, which exists: every retrieve is healthy.
+    return FakeTransport(existing=(set(ALL_PINS) - {"claude-sonnet-4-6"}) | {"claude-sonnet-4-8"})
+
+
+async def test_the_next_run_alerts_again_while_the_restart_is_still_owed(caplog):
+    """Tomorrow's sweep reads the NEW pin (it exists, so the retrieve is healthy) —
+    only the swap record knows the fleet never restarted. It retries and alerts."""
+    restarter = FailingRestarter()
+    sender, writer = RecordingSender(), FakeWriter()
+    with (
+        caplog.at_level(logging.ERROR, logger="app.runtime.model_currency"),
+        pytest.raises(RuntimeError, match="model_currency"),
+    ):
+        await run_model_currency_check(
+            settings=live_settings(
+                **_SETTINGS_KW,
+                LLM_ANTHROPIC_PRIMARY_MODEL="claude-sonnet-4-8",
+                LLM_MODEL_UPDATED=json.dumps(_owed_record()),
+            ),
+            transport_factory=_after_swap_transport,
+            email_sender=sender,
+            secret_writer=writer,
+            restarter=restarter,
+        )
+    assert restarter.attempts == 1 and writer.applied == []
+    ((_to, _subject, body),) = sender.sent
+    assert "'claude-sonnet-4-6' → 'claude-sonnet-4-8'" in body and "repeats daily" in body
+    assert any(MODEL_CURRENCY_ALERT in r.getMessage() for r in caplog.records)
+
+
+async def test_an_owed_restart_that_succeeds_settles_the_record_and_stops_alerting():
+    restarter, writer, sender = FakeRestarter(), FakeWriter(), RecordingSender()
+    result = await run_model_currency_check(
+        settings=live_settings(
+            **_SETTINGS_KW,
+            LLM_ANTHROPIC_PRIMARY_MODEL="claude-sonnet-4-8",
+            LLM_MODEL_UPDATED=json.dumps(_owed_record()),
+        ),
+        transport_factory=_after_swap_transport,
+        email_sender=sender,
+        secret_writer=writer,
+        restarter=restarter,
+    )
+    assert restarter.restarts == 1
+    (marked,) = writer.applied
+    assert set(marked) == {"LLM_MODEL_UPDATED"}
+    assert json.loads(marked["LLM_MODEL_UPDATED"]) == {**_owed_record(), "restart": "done"}
+    assert result["swapped"] == [] and sender.sent == []
+
+
+async def test_a_settled_or_legacy_swap_record_owes_nothing():
+    for record in (
+        {**_owed_record(), "restart": "done"},
+        {k: v for k, v in _owed_record().items() if k != "restart"},  # pre-WP-6 record
+    ):
+        restarter = FailingRestarter()
+        result = await run_model_currency_check(
+            settings=live_settings(**_SETTINGS_KW, LLM_MODEL_UPDATED=json.dumps(record)),
+            transport_factory=lambda: FakeTransport(existing=set(ALL_PINS)),
+            email_sender=RecordingSender(),
+            secret_writer=FakeWriter(),
+            restarter=restarter,
+        )
+        assert restarter.attempts == 0 and result["swapped"] == []
