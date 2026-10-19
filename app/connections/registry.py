@@ -20,9 +20,14 @@ never credential values. Per-tenant tokens continue to live only in the SecretSt
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app.config import get_settings
+
+#: The slot a registry endpoint carries where the Meta Graph API version goes. The
+#: version is a SETTING (``meta_graph_version``, round 7 WP-7), so the table stores the
+#: template and ``get_provider`` fills it at read time — no version literal lives here.
+GRAPH_VERSION_SLOT = "{meta_graph_version}"
 
 
 @dataclass(frozen=True)
@@ -352,8 +357,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         display_name="Meta",
         auth_kind=AUTH_OAUTH,
         authorize=ProviderAuthorize(
-            endpoint="https://www.facebook.com/v19.0/dialog/oauth",
-            exchange_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+            endpoint=f"https://www.facebook.com/{GRAPH_VERSION_SLOT}/dialog/oauth",
+            exchange_endpoint=f"https://graph.facebook.com/{GRAPH_VERSION_SLOT}/oauth/access_token",
             scopes="whatsapp_business_messaging,whatsapp_business_management,"
             "pages_messaging,pages_show_list,business_management",
             # Meta's dialog/oauth does not implement PKCE; state carries the CSRF proof.
@@ -363,7 +368,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             # this, WhatsApp/Messenger died an hour after connect and stayed dead
             # until the 6-hourly sweep happened to re-exchange — instagram below
             # always had its equivalent.
-            long_lived_endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+            long_lived_endpoint=f"https://graph.facebook.com/{GRAPH_VERSION_SLOT}/oauth/access_token",
             long_lived_grant_type="fb_exchange_token",  # noqa: S106 — a grant type
         ),
         client_id_setting="meta_app_id",
@@ -564,9 +569,45 @@ _ALSO_ACCEPTED: dict[str, frozenset[str]] = {
 }
 
 
+def resolve_endpoint(url: str) -> str:
+    """A registry endpoint with its setting-driven slots filled (the Graph version)."""
+    if GRAPH_VERSION_SLOT in url:
+        url = url.replace(GRAPH_VERSION_SLOT, get_settings().meta_graph_version)
+    return url
+
+
+def _resolved(spec: ProviderSpec) -> ProviderSpec:
+    """``spec`` with every authorize endpoint resolved against the running settings.
+
+    The table holds templates (``GRAPH_VERSION_SLOT``); what a caller reads must be a
+    real URL, so every lookup goes through here."""
+    authorize = spec.authorize
+    if authorize is None:
+        return spec
+    endpoint = resolve_endpoint(authorize.endpoint)
+    exchange = authorize.exchange_endpoint and resolve_endpoint(authorize.exchange_endpoint)
+    long_lived = authorize.long_lived_endpoint and resolve_endpoint(authorize.long_lived_endpoint)
+    if (endpoint, exchange, long_lived) == (
+        authorize.endpoint,
+        authorize.exchange_endpoint,
+        authorize.long_lived_endpoint,
+    ):
+        return spec
+    return replace(
+        spec,
+        authorize=replace(
+            authorize,
+            endpoint=endpoint,
+            exchange_endpoint=exchange,
+            long_lived_endpoint=long_lived,
+        ),
+    )
+
+
 def get_provider(provider: str) -> ProviderSpec | None:
-    """The spec for a provider id, or None if it is not registered."""
-    return PROVIDERS.get(canonical_provider(provider))
+    """The spec for a provider id (endpoints resolved), or None if it is not registered."""
+    spec = PROVIDERS.get(canonical_provider(provider))
+    return _resolved(spec) if spec is not None else None
 
 
 def providers_for(connection_type: str) -> list[ProviderSpec]:
@@ -576,8 +617,8 @@ def providers_for(connection_type: str) -> list[ProviderSpec]:
     registered for them, so the function is total over the catalog."""
     ordered = _ORDER.get(connection_type)
     if ordered is not None:
-        return [PROVIDERS[p] for p in ordered if p in PROVIDERS]
-    return [s for s in PROVIDERS.values() if s.connection_type == connection_type]
+        return [_resolved(PROVIDERS[p]) for p in ordered if p in PROVIDERS]
+    return [_resolved(s) for s in PROVIDERS.values() if s.connection_type == connection_type]
 
 
 def default_provider(connection_type: str) -> str | None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from app.config import meta_graph_base
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
 
@@ -781,7 +782,7 @@ def _fake_meta_transport(expected_code: str, monkeypatch):
 
         async def post(self, url, *, data=None, headers=None):
             self.calls.append((url, dict(data or {})))
-            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert url == f"{meta_graph_base()}/oauth/access_token"
             assert data["code"] == expected_code
             # The code redeems to a SHORT-lived (~1h) token (round 5B item 14) —
             # storing this one is exactly the bug the long-lived upgrade closes.
@@ -793,7 +794,7 @@ def _fake_meta_transport(expected_code: str, monkeypatch):
 
         async def get(self, url, *, params=None, headers=None):
             self.calls.append((url, dict(params or {})))
-            if url.startswith("https://graph.facebook.com/v19.0/me"):
+            if url.startswith(f"{meta_graph_base()}/me"):
                 # Round 6 WP-C: the post-exchange verifier proves the LONG-lived
                 # token against Graph /me and records who authorized.
                 assert (headers or {}).get("Authorization") == "Bearer meta-tok-1"
@@ -804,7 +805,7 @@ def _fake_meta_transport(expected_code: str, monkeypatch):
                 )
             # The mandatory fb_exchange_token upgrade (round 5B item 14): Meta's
             # own grant shape — client_id + the short token under fb_exchange_token.
-            assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+            assert url == f"{meta_graph_base()}/oauth/access_token"
             assert params["grant_type"] == "fb_exchange_token"
             assert params["fb_exchange_token"] == "meta-short-1"
             assert params.get("client_id"), "fb_exchange_token requires client_id"

@@ -32,7 +32,7 @@ from urllib.parse import urlencode
 import jwt
 
 from app.config import get_settings
-from app.connections.registry import PROVIDERS, ProviderAuthorize, oauth_client_config
+from app.connections.registry import ProviderAuthorize, get_provider, oauth_client_config
 
 STATE_TTL_SECONDS = 600  # a consent click-through is minutes, not hours
 STATE_TOKEN_TYPE = "oauth_state"  # noqa: S105 — a token-type discriminator, not a secret  # nosec B105
@@ -45,8 +45,9 @@ def authorize_spec(provider: str) -> ProviderAuthorize | None:
 
     The table used to live here; it now lives in ``connections.registry`` alongside the
     provider's credential source and health class, so registering a provider is one
-    entry rather than edits in three files."""
-    spec = PROVIDERS.get(provider)
+    entry rather than edits in three files. Read through ``get_provider`` so the
+    endpoints come back resolved (the Meta Graph version is a setting)."""
+    spec = get_provider(provider)
     return spec.authorize if spec is not None else None
 
 

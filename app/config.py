@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 
 from pydantic import Field
@@ -116,6 +117,7 @@ DEFAULTED_FIELD_PINS: tuple[tuple[str, str, str], ...] = (
         "llm_openai_fallback_model",
     ),
     ("LUCIEL_PLATFORM_CONTACT_INBOX", "PLATFORM_CONTACT_INBOX", "platform_contact_inbox"),
+    ("LUCIEL_META_GRAPH_VERSION", "META_GRAPH_VERSION", "meta_graph_version"),
 )
 
 # The Stripe webhook signing secret, first match wins. STRIPE_TEST_WEBHOOK_SECRET is an
@@ -489,6 +491,15 @@ class Settings(BaseSettings):
     # authorization-code flow for the WhatsApp / Instagram channel connect.
     meta_app_id: str = ""
     meta_redirect_uri: str = ""
+    # The Meta Graph API version EVERY Meta URL is built on (round 7 WP-7): the
+    # Facebook OAuth dialog, the token exchange/refresh, the WhatsApp/Messenger send,
+    # the asset lookup and the identity probe on graph.facebook.com, and the Instagram
+    # Login send/lookup/probe on graph.instagram.com. It was pinned at v19.0 in four
+    # files while Instagram ran on v23.0; Meta retires a version roughly two years
+    # after release, so this is the ONE place it changes. Override per environment
+    # with LUCIEL_META_GRAPH_VERSION or the platform secret's META_GRAPH_VERSION
+    # ("vNN.N"; a bare "NN.N" is accepted). Use ``meta_graph_base`` to build a URL.
+    meta_graph_version: str = "v23.0"
     # Instagram is a SEPARATE Meta app (the "Instagram API with Business Login for
     # Instagram" product), with its own app id/secret and its own OAuth host — the
     # Facebook dialog rejects the instagram_* scopes outright. Empty -> the Instagram
@@ -592,6 +603,9 @@ class Settings(BaseSettings):
                 continue  # pydantic already applied the env value; env wins
             if blob.get(blob_key):
                 object.__setattr__(self, field_name, blob[blob_key])
+        object.__setattr__(
+            self, "meta_graph_version", _normalized_graph_version(self.meta_graph_version)
+        )
 
         # JWT signing key: security-critical. Bridge it from the platform secret; it has
         # a KNOWN dev-default (published in source), so in live mode we must FAIL CLOSED
@@ -787,6 +801,39 @@ class Settings(BaseSettings):
         never be saved and the channels never receive a message."""
         provisioned = self.meta_app_configured or self.instagram_app_configured
         return provisioned and not self.meta_verify_token
+
+
+_GRAPH_VERSION_RE = re.compile(r"^v\d{1,3}\.\d{1,2}$")
+
+#: The Facebook Graph host (WhatsApp, Messenger, the Meta token endpoints).
+FACEBOOK_GRAPH_HOST = "graph.facebook.com"
+#: Instagram Login tokens are issued by, and only accepted at, Instagram's own host.
+INSTAGRAM_GRAPH_HOST = "graph.instagram.com"
+#: The Facebook OAuth consent dialog's host.
+FACEBOOK_DIALOG_HOST = "www.facebook.com"
+
+
+def _normalized_graph_version(raw: str) -> str:
+    """``vNN.N`` (a bare ``NN.N`` gains its ``v``); anything else refuses to boot.
+
+    Every Meta URL is built on this value, so a malformed pin would turn every Graph
+    call into a 4xx — a boot failure names the key instead (the value is not secret)."""
+    value = (raw or "").strip()
+    if value[:1].isdigit():
+        value = "v" + value
+    if not _GRAPH_VERSION_RE.match(value):
+        raise RuntimeError(
+            f"META_GRAPH_VERSION {raw!r} is not a Graph API version (expected e.g. 'v23.0')"
+        )
+    return value
+
+
+def meta_graph_base(host: str = FACEBOOK_GRAPH_HOST) -> str:
+    """``https://<host>/<pinned Graph version>`` — the root of every Meta Graph URL.
+
+    Read at call time (not at import) so the pinned ``meta_graph_version`` is the one
+    the running settings carry."""
+    return f"https://{host}/{get_settings().meta_graph_version}"
 
 
 class PlatformSecretError(RuntimeError):

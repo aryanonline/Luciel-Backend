@@ -35,6 +35,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from urllib.parse import quote, urlparse
 
+from app.config import INSTAGRAM_GRAPH_HOST, meta_graph_base
+
 GRAPH_ME_ENDPOINT = "https://graph.microsoft.com/v1.0/me"
 TWILIO_ACCOUNTS_ENDPOINT = "https://api.twilio.com/2010-04-01/Accounts.json"
 GOOGLE_TOKENINFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo"
@@ -43,8 +45,17 @@ NOTION_ME_ENDPOINT = "https://api.notion.com/v1/users/me"
 NOTION_VERSION = "2022-06-28"
 CALENDLY_ME_ENDPOINT = "https://api.calendly.com/users/me"
 CALENDLY_EVENT_TYPES_ENDPOINT = "https://api.calendly.com/event_types"
-META_ME_ENDPOINT = "https://graph.facebook.com/v19.0/me"
-INSTAGRAM_ME_ENDPOINT = "https://graph.instagram.com/v23.0/me"
+
+
+def meta_me_endpoint() -> str:
+    """Facebook Graph ``/me`` at the pinned version (``meta_graph_version``)."""
+    return f"{meta_graph_base()}/me"
+
+
+def instagram_me_endpoint() -> str:
+    """Instagram Login Graph ``/me`` at the pinned version."""
+    return f"{meta_graph_base(INSTAGRAM_GRAPH_HOST)}/me"
+
 
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
@@ -459,7 +470,7 @@ async def verify_meta_grant(
     _token, headers = _bearer(material, "Meta")
     me = await _get_json(
         transport,
-        f"{META_ME_ENDPOINT}?fields=id,name",
+        f"{meta_me_endpoint()}?fields=id,name",
         headers=headers,
         provider_label="Meta",
         what="the account",
@@ -486,7 +497,7 @@ async def verify_instagram_grant(
     _token, headers = _bearer(material, "Instagram")
     me = await _get_json(
         transport,
-        f"{INSTAGRAM_ME_ENDPOINT}?fields=id,username",
+        f"{instagram_me_endpoint()}?fields=id,username",
         headers=headers,
         provider_label="Instagram",
         what="the account",

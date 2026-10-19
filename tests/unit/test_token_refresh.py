@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from app.config import meta_graph_base
 from app.connections import refresh
 from app.connections.secrets import LocalSecretStore
 from app.models.connection import InstanceConnection
@@ -144,7 +145,7 @@ async def test_meta_long_lived_token_re_exchanges_with_app_credentials(monkeypat
 
     assert await refresher.refresh(_row("meta"), store) is not None
     url, params = transport.gets[0]
-    assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+    assert url == f"{meta_graph_base()}/oauth/access_token"
     assert params["grant_type"] == "fb_exchange_token"
     assert params["fb_exchange_token"] == "meta-old"
     assert params["client_id"] == "meta-cid"

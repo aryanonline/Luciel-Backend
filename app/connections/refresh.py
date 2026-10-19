@@ -132,7 +132,8 @@ REFRESH_SPECS: dict[str, RefreshSpec] = {
     # credentials; ~60-day life.
     "meta": RefreshSpec(
         style=STYLE_FB_EXCHANGE_GET,
-        endpoint="https://graph.facebook.com/v19.0/oauth/access_token",
+        # The Graph version is a setting (round 7 WP-7); resolved per call.
+        endpoint=f"https://graph.facebook.com/{registry.GRAPH_VERSION_SLOT}/oauth/access_token",
         default_lifetime_seconds=60 * 24 * 3600,
     ),
     # Twilio one-click connect (C10): standard refresh grant against the same
@@ -192,6 +193,7 @@ async def _refresh_material(
     error, provider rejection — because every failure means the same thing to
     the caller: this credential cannot be made fresh.
     """
+    endpoint = registry.resolve_endpoint(spec.endpoint)
     try:
         if spec.style == STYLE_REFRESH_TOKEN_POST:
             refresh_token = material.get("refresh_token", "")
@@ -208,14 +210,14 @@ async def _refresh_material(
             }
             if spec.scope:
                 data["scope"] = spec.scope
-            payload = _payload_of(await transport.post(spec.endpoint, data=data))
+            payload = _payload_of(await transport.post(endpoint, data=data))
         elif spec.style == STYLE_IG_REFRESH_GET:
             token = material.get("access_token", "")
             if not token:
                 return None
             payload = _payload_of(
                 await transport.get(
-                    spec.endpoint,
+                    endpoint,
                     params={"grant_type": "ig_refresh_token", "access_token": token},
                 )
             )
@@ -228,7 +230,7 @@ async def _refresh_material(
                 return None
             payload = _payload_of(
                 await transport.get(
-                    spec.endpoint,
+                    endpoint,
                     params={
                         "grant_type": "fb_exchange_token",
                         "client_id": client.client_id,

@@ -37,11 +37,11 @@ from app.connections.verify import (
     GOOGLE_TOKENINFO_ENDPOINT,
     GRAPH_ME_ENDPOINT,
     HUBSPOT_TOKEN_INFO_ENDPOINT,
-    INSTAGRAM_ME_ENDPOINT,
-    META_ME_ENDPOINT,
     NOTION_ME_ENDPOINT,
     NOTION_VERSION,
     TWILIO_ACCOUNTS_ENDPOINT,
+    instagram_me_endpoint,
+    meta_me_endpoint,
 )
 from app.models.connection import InstanceConnection
 
@@ -288,9 +288,9 @@ def liveness_request_for(
     if provider == "calendly":
         return LivenessRequest(CALENDLY_ME_ENDPOINT, bearer) if token else None
     if provider == "meta":
-        return LivenessRequest(f"{META_ME_ENDPOINT}?fields=id", bearer) if token else None
+        return LivenessRequest(f"{meta_me_endpoint()}?fields=id", bearer) if token else None
     if provider == "instagram":
-        return LivenessRequest(f"{INSTAGRAM_ME_ENDPOINT}?fields=id", bearer) if token else None
+        return LivenessRequest(f"{instagram_me_endpoint()}?fields=id", bearer) if token else None
     if provider == "outlook":
         return LivenessRequest(GRAPH_ME_ENDPOINT, bearer) if token else None
     if provider == "twilio":
