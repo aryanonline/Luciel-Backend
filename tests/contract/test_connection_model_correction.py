@@ -104,7 +104,7 @@ async def test_salesforce_crm_availability_follows_the_oauth_app(client, monkeyp
     settings = Settings(
         salesforce_consumer_key="sf-cid",
         salesforce_consumer_secret="sf-secret",  # noqa: S106 — test fixture
-        salesforce_redirect_uri="https://api.vantagemind.ai/sf-callback",
+        salesforce_redirect_uri="https://api.vantagemind.ai/api/v1/connections/salesforce/callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     crm2 = await client.get("/api/v1/admin/connections/providers?connectionType=crm")
@@ -124,7 +124,7 @@ async def test_the_chosen_provider_is_what_the_connect_flow_starts(client, monke
     settings = Settings(
         salesforce_consumer_key="sf-cid",
         salesforce_consumer_secret="sf-secret",  # noqa: S106 — test fixture, not a real secret
-        salesforce_redirect_uri="https://api.vantagemind.ai/sf-callback",
+        salesforce_redirect_uri="https://api.vantagemind.ai/api/v1/connections/salesforce/callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     await _ready_account_with_luciel(client)
@@ -417,10 +417,10 @@ def _configure_meta(monkeypatch) -> None:
     settings = Settings(
         meta_app_id="meta-cid",
         meta_app_secret="meta-csecret",  # noqa: S106 — test fixture, not a real secret
-        meta_redirect_uri="https://api.vantagemind.ai/meta-callback",
+        meta_redirect_uri="https://api.vantagemind.ai/api/v1/connections/meta/callback",
         instagram_app_id="ig-cid",
         instagram_app_secret="ig-csecret",  # noqa: S106 — test fixture, not a real secret
-        instagram_redirect_uri="https://api.vantagemind.ai/instagram-callback",
+        instagram_redirect_uri="https://api.vantagemind.ai/api/v1/connections/instagram/callback",
     )
     monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     monkeypatch.setattr(providers_module, "get_settings", lambda: settings)

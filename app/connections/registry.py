@@ -38,6 +38,10 @@ class OAuthClientConfig:
     client_id: str
     client_secret: str
     redirect_uri: str
+    # False when the configured redirect URI is not one the callback route serves
+    # (``Settings.oauth_redirect_problems``, round 7 WP-7): a consent started on it
+    # ends on a 404 or a refused redeem, so the provider is not offered.
+    redirect_valid: bool = True
 
     @property
     def configured(self) -> bool:
@@ -51,8 +55,9 @@ class OAuthClientConfig:
         consent also needs the registered redirect URI (oauth_flow refuses without
         it). Availability surfaces must use THIS, or a provider with id+secret and
         no redirect renders an enabled Connect button that dead-ends on the
-        placeholder URL (GAP-N3, round 4)."""
-        return self.configured and bool(self.redirect_uri)
+        placeholder URL (GAP-N3, round 4). A redirect URI the callback route cannot
+        serve counts as absent (round 7 WP-7)."""
+        return self.configured and bool(self.redirect_uri) and self.redirect_valid
 
 
 @dataclass(frozen=True)
@@ -761,10 +766,12 @@ def oauth_client_config(provider: str) -> OAuthClientConfig:
     def _read(name: str | None) -> str:
         return str(getattr(s, name, "") or "") if name else ""
 
+    label = oauth_client_label(spec.provider)
     return OAuthClientConfig(
         _read(spec.client_id_setting),
         _read(spec.client_secret_setting),
         _read(spec.redirect_uri_setting),
+        redirect_valid=label not in s.oauth_redirect_problems(),
     )
 
 

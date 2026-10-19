@@ -752,7 +752,7 @@ def _meta_settings():
     return Settings(
         meta_app_id="meta-cid",
         meta_app_secret="meta-csecret",  # noqa: S106 — test fixture, not a real secret
-        meta_redirect_uri="https://api.example.com/meta-callback",
+        meta_redirect_uri="https://api.example.com/api/v1/connections/meta/callback",
     )
 
 

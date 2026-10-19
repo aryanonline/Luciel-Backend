@@ -67,7 +67,9 @@ def _google_client(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_ID", "g-cid")
     monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_SECRET", "g-csecret")
-    monkeypatch.setenv("LUCIEL_GOOGLE_REDIRECT_URI", "https://api.example.com/cb")
+    monkeypatch.setenv(
+        "LUCIEL_GOOGLE_REDIRECT_URI", "https://api.example.com/api/v1/connections/google/callback"
+    )
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
@@ -98,7 +100,10 @@ async def test_outlook_rides_the_generic_table_with_scope_and_rotation(monkeypat
 
     monkeypatch.setenv("LUCIEL_MICROSOFT_CLIENT_ID", "ms-cid")
     monkeypatch.setenv("LUCIEL_MICROSOFT_CLIENT_SECRET", "ms-csecret")
-    monkeypatch.setenv("LUCIEL_MICROSOFT_REDIRECT_URI", "https://api.example.com/cb")
+    monkeypatch.setenv(
+        "LUCIEL_MICROSOFT_REDIRECT_URI",
+        "https://api.example.com/api/v1/connections/microsoft/callback",
+    )
     get_settings.cache_clear()  # type: ignore[attr-defined]
     store = LocalSecretStore()
     await store.put("vm/t/i/x", {"access_token": "old", "refresh_token": "rt-old"})
@@ -136,7 +141,9 @@ async def test_meta_long_lived_token_re_exchanges_with_app_credentials(monkeypat
 
     monkeypatch.setenv("LUCIEL_META_APP_ID", "meta-cid")
     monkeypatch.setenv("LUCIEL_META_APP_SECRET", "meta-csecret")
-    monkeypatch.setenv("LUCIEL_META_REDIRECT_URI", "https://api.example.com/cb")
+    monkeypatch.setenv(
+        "LUCIEL_META_REDIRECT_URI", "https://api.example.com/api/v1/connections/meta/callback"
+    )
     get_settings.cache_clear()  # type: ignore[attr-defined]
     store = LocalSecretStore()
     await store.put("vm/t/i/x", {"access_token": "meta-old"})

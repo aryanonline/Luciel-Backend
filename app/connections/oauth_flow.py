@@ -196,7 +196,9 @@ def build_authorize_start(
     client — see the module docstring for why that is a fallback and not an error."""
     spec = authorize_spec(provider)
     cfg = oauth_client_config(provider)
-    if spec is None or not cfg.configured or not cfg.redirect_uri:
+    # authorize_ready = id + secret + a redirect URI the callback route serves (an
+    # invalid one is logged at boot and named on /healthz, round 7 WP-7).
+    if spec is None or not cfg.authorize_ready:
         return AuthorizeStart(
             authorize_url=f"/api/v1/admin/connections/{connection_id}/authorize",
             unconfigured=True,

@@ -22,6 +22,9 @@ Usage (from the backend repo, with AWS credentials for the target account):
         python scripts/merge_platform_secret.py --env dev --redeploy
 
     python scripts/merge_platform_secret.py --env dev --list      # key names present, no values
+
+    # Pre-deploy: what the runtime will refuse or report degraded (no secret values).
+    python scripts/merge_platform_secret.py --env dev --check --api-base https://api.vantagemind.ai
 """
 
 from __future__ import annotations
@@ -61,6 +64,40 @@ def unknown_keys(pairs: dict[str, str]) -> list[str]:
     return sorted(k for k in pairs if k not in known)
 
 
+def check_blob(blob: dict[str, Any], *, api_base: str) -> list[str]:
+    """What this blob's PROVIDER posture will look like to the runtime — printed before a
+    deploy rather than discovered on /healthz after it (round 7 WP-7).
+
+    Returns one line per finding, naming keys and OAuth client labels. A redirect URI is
+    public (it travels in every authorize URL) so it may appear; no secret value does.
+    """
+    from app.config import PLATFORM_SECRET_KEYS, Settings  # noqa: PLC0415
+
+    findings = [
+        f"unread key (the runtime ignores it): {key}"
+        for key in sorted(blob)
+        if key not in PLATFORM_SECRET_KEYS
+    ]
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        integration_mode="mock",  # describe the posture; never fail on live-only guards
+        public_api_base_url=api_base,
+        platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
+    )
+    findings += [
+        f"oauth_redirect:{label} — {reason}"
+        for label, reason in sorted(settings.oauth_redirect_problems().items())
+    ]
+    if settings.meta_webhook_unconfigured:
+        findings.append(
+            "meta_webhook:unconfigured — a Meta/Instagram app is provisioned without "
+            "META_VERIFY_TOKEN (a live boot refuses this)"
+        )
+    if settings.meta_app_configured and not settings.meta_app_secret:
+        findings.append("META_APP_SECRET missing for a provisioned Meta app (live boot refuses)")
+    return findings
+
+
 def _read_pairs(stream: Any) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for raw in stream:
@@ -96,12 +133,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--allow-unknown", action="store_true", help="store a key the runtime does not read"
     )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="report unread keys, invalid OAuth redirect URIs and Meta webhook gaps, then exit",
+    )
+    ap.add_argument(
+        "--api-base",
+        default="",
+        help="with --check: the environment's public API origin (redirect URIs must sit on it)",
+    )
     args = ap.parse_args(argv)
+    read_only = args.list or args.check
 
     # Validate the paste BEFORE touching AWS: a typo is refused without reading the
     # secret at all, and nothing is written.
     pairs: dict[str, str] = {}
-    if not args.list:
+    if not read_only:
         pairs = _read_pairs(sys.stdin)
         if not pairs:
             raise SystemExit("nothing to merge: paste KEY=VALUE lines on stdin")
@@ -126,6 +174,12 @@ def main(argv: list[str] | None = None) -> int:
         for key in sorted(blob):
             print(key)
         return 0
+    if args.check:
+        findings = check_blob(blob, api_base=args.api_base)
+        for line in findings:
+            print(line)
+        print(f"{len(findings)} finding(s) in {secret_id}")
+        return 1 if findings else 0
 
     merged = {**blob, **pairs}
     resp = sm.put_secret_value(

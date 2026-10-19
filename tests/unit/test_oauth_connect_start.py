@@ -31,10 +31,10 @@ def configured(monkeypatch):
         google_redirect_uri="https://api.vantagemind.ai/api/v1/connections/google/callback",
         hubspot_client_id="hs-client",
         hubspot_client_secret="hs-secret",
-        hubspot_redirect_uri="https://api.vantagemind.ai/oauth/hubspot",
+        hubspot_redirect_uri="https://api.vantagemind.ai/api/v1/connections/hubspot/callback",
         salesforce_consumer_key="sf-key",
         salesforce_consumer_secret="sf-secret",
-        salesforce_redirect_uri="https://api.vantagemind.ai/oauth/salesforce",
+        salesforce_redirect_uri="https://api.vantagemind.ai/api/v1/connections/salesforce/callback",
     )
     monkeypatch.setattr(providers_module, "get_settings", lambda: settings)
     # The OAuth app credential for a provider is resolved through the provider REGISTRY

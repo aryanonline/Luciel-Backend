@@ -148,6 +148,12 @@ def degraded_bindings() -> list[str]:
     # configures a provider.
     if live_mode() and not settings.public_api_base_url:
         degraded.append("api_base_url:unset")
+    # Round 7 WP-7: a configured OAuth redirect URI the callback route cannot serve.
+    # The provider is withheld from the connect surface (a consent on it would end on a
+    # 404 or a refused redeem) and the reason was logged at boot; named here by label.
+    degraded.extend(
+        f"oauth_redirect:{label}" for label in sorted(settings.oauth_redirect_problems())
+    )
     # §3.1.5 / §4.5: the abuse ceilings are only platform-wide when the Redis store is
     # bound. A live task counting in-process still enforces them, but per task and
     # reset on every deploy — a degraded binding this list exists to surface.

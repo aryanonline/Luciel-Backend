@@ -157,14 +157,16 @@ def test_a_half_provisioned_instagram_app_refuses_to_boot_in_live_mode():
         live_settings(INSTAGRAM_APP_ID="ig-cid")
 
     with pytest.raises(RuntimeError, match="INSTAGRAM_APP_SECRET"):
-        live_settings(INSTAGRAM_REDIRECT_URI="https://api.example.com/cb")
+        live_settings(
+            INSTAGRAM_REDIRECT_URI="https://api.example.com/api/v1/connections/instagram/callback"
+        )
 
 
 def test_a_fully_provisioned_instagram_app_boots():
     s = live_settings(
         INSTAGRAM_APP_ID="ig-cid",
         INSTAGRAM_APP_SECRET="ig-csecret",
-        INSTAGRAM_REDIRECT_URI="https://api.example.com/cb",
+        INSTAGRAM_REDIRECT_URI="https://api.example.com/api/v1/connections/instagram/callback",
         # The Instagram app's webhook subscribes to the same GET /webhooks/meta
         # handshake, so a provisioned Instagram app needs the verify token too.
         META_VERIFY_TOKEN="unit-test-verify-token",
@@ -188,14 +190,16 @@ def test_a_half_provisioned_microsoft_app_refuses_to_boot_in_live_mode():
         live_settings(MICROSOFT_CLIENT_ID="ms-cid")
 
     with pytest.raises(RuntimeError, match="MICROSOFT_CLIENT_SECRET"):
-        live_settings(MICROSOFT_REDIRECT_URI="https://api.example.com/cb")
+        live_settings(
+            MICROSOFT_REDIRECT_URI="https://api.example.com/api/v1/connections/microsoft/callback"
+        )
 
 
 def test_a_fully_provisioned_microsoft_app_boots():
     s = live_settings(
         MICROSOFT_CLIENT_ID="ms-cid",
         MICROSOFT_CLIENT_SECRET="ms-csecret",
-        MICROSOFT_REDIRECT_URI="https://api.example.com/cb",
+        MICROSOFT_REDIRECT_URI="https://api.example.com/api/v1/connections/microsoft/callback",
     )
     assert s.microsoft_client_id == "ms-cid"
     assert s.microsoft_client_secret == "ms-csecret"  # noqa: S105 — test fixture

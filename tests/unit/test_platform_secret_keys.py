@@ -238,3 +238,26 @@ def test_the_script_uses_the_config_list_itself() -> None:
     script = _load_script()
     assert script._known_keys() is PLATFORM_SECRET_KEYS
     assert script.unknown_keys({"META_APP_ID": "1", "NOT_A_REAL_KEY": "2"}) == ["NOT_A_REAL_KEY"]
+
+
+def test_check_names_what_the_runtime_will_refuse_or_report_without_values(
+    monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager, capsys
+) -> None:
+    """--check (round 7 WP-7): the pre-deploy view of a blob — unread keys, redirect
+    URIs the callback route cannot serve, a Meta app without its verify token — so the
+    owner sees before a deploy what /healthz would otherwise report after it."""
+    fake_aws.blob = {
+        "HUBSPOT_REDIRECT_URI": "https://api.example.test/oauth/hubspot",
+        "GOOGLE_REDIRECT_URI": "https://api.example.test/api/v1/connections/google/callback",
+        "META_APP_ID": "fb-cid",
+        "META_APP_SECRET": "do-not-print-me",
+        "HUBSPOT_CLIENT_SECRT": "do-not-print-me-either",
+    }
+    assert _run(monkeypatch, "", "--check", "--api-base", "https://api.example.test") == 1
+    out = capsys.readouterr().out
+    assert "unread key (the runtime ignores it): HUBSPOT_CLIENT_SECRT" in out
+    assert "oauth_redirect:hubspot" in out
+    assert "oauth_redirect:google" not in out
+    assert "meta_webhook:unconfigured" in out
+    assert "do-not-print-me" not in out
+    assert fake_aws.writes == []

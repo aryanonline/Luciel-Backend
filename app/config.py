@@ -165,6 +165,27 @@ PLATFORM_SECRET_KEYS: frozenset[str] = frozenset(
 )
 
 
+#: Each OAuth app's redirect-URI setting -> the OAuth CLIENT label its callback is served
+#: under (``GET /api/v1/connections/<label>/callback``, app/api/v1/connections_callback.py).
+#: The label is ``connections.registry.oauth_client_label`` — Drive and Calendar share
+#: the one Google client, hence one URI. Kept here (config cannot import the registry)
+#: and proved equal to the registry by tests/unit/test_oauth_redirect_validation.py.
+OAUTH_REDIRECT_URI_FIELDS: dict[str, str] = {
+    "google_redirect_uri": "google",
+    "hubspot_redirect_uri": "hubspot",
+    "salesforce_redirect_uri": "salesforce",
+    "calendly_redirect_uri": "calendly",
+    "notion_redirect_uri": "notion",
+    "meta_redirect_uri": "meta",
+    "instagram_redirect_uri": "instagram",
+    "microsoft_redirect_uri": "microsoft",
+    "twilio_oauth_redirect_uri": "twilio",
+}
+
+#: The path every registered redirect URI must end with.
+OAUTH_CALLBACK_PATH = "/api/v1/connections/{label}/callback"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LUCIEL_", env_file=".env", extra="ignore")
 
@@ -710,6 +731,19 @@ class Settings(BaseSettings):
             if not getattr(self, attr, "") and blob.get(blob_key):
                 object.__setattr__(self, attr, blob[blob_key])
 
+        # Redirect URIs, checked once every source has been applied (round 7 WP-7). They
+        # were read raw: a URI registered at the wrong path sent the owner through a real
+        # consent screen to a 404 (or a redeem the provider refuses for a mismatched
+        # redirect_uri). Not a boot failure — the rest of the platform is fine — but the
+        # provider is unavailable until fixed (``oauth_redirect_problems`` is read by the
+        # registry and /healthz) and the reason is logged at ERROR here.
+        for label, reason in self.oauth_redirect_problems().items():
+            logger.error(
+                "oauth_redirect_invalid provider=%s %s — connect is unavailable until fixed",
+                label,
+                reason,
+            )
+
         # Delivery/verification secrets, checked AFTER the overlay bridge above so the
         # blob has already been applied. These fail closed in live mode for two distinct
         # reasons, both of which are silent in a running system:
@@ -785,6 +819,29 @@ class Settings(BaseSettings):
                 "allow_captcha_bypass_token",
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
+
+    def oauth_redirect_problems(self) -> dict[str, str]:
+        """``{oauth client label: reason}`` for every CONFIGURED redirect URI that the
+        callback route cannot serve; empty when all are well-formed.
+
+        A URI must end with ``/api/v1/connections/<label>/callback`` and, when the
+        public API origin is known, be exactly that origin plus the path. Computed on
+        read (not cached at boot) so it always describes the settings in effect. The
+        reason names the platform-secret key and the expected shape; a redirect URI is
+        public (it travels in every authorize URL), never secret material."""
+        base = (self.public_api_base_url or "").strip().rstrip("/")
+        problems: dict[str, str] = {}
+        for field_name, label in OAUTH_REDIRECT_URI_FIELDS.items():
+            uri = str(getattr(self, field_name, "") or "").strip()
+            if not uri:
+                continue
+            path = OAUTH_CALLBACK_PATH.format(label=label)
+            key = field_name.upper()
+            if not uri.endswith(path):
+                problems[label] = f"{key} must end with {path} (got {uri!r})"
+            elif base and uri != f"{base}{path}":
+                problems[label] = f"{key} must be {base}{path} (got {uri!r})"
+        return problems
 
     @property
     def platform_twilio_configured(self) -> bool:

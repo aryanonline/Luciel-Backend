@@ -484,7 +484,9 @@ async def test_ensure_fresh_access_token_refreshes_at_call_time(monkeypatch) -> 
 
     monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_ID", "g-cid")
     monkeypatch.setenv("LUCIEL_GOOGLE_CLIENT_SECRET", "g-csecret")
-    monkeypatch.setenv("LUCIEL_GOOGLE_REDIRECT_URI", "https://api.example.com/cb")
+    monkeypatch.setenv(
+        "LUCIEL_GOOGLE_REDIRECT_URI", "https://api.example.com/api/v1/connections/google/callback"
+    )
     get_settings.cache_clear()  # type: ignore[attr-defined]
     monkeypatch.setattr(refresh, "live_mode", lambda: True)
     transport = _Transport()
