@@ -1213,6 +1213,13 @@ async def complete_oauth_connect(
             )
         connection_type = conn.connection_type
         instance_id = await _instance_id(s, admin_id)
+        # Round 7 M10: the Meta ids a disconnect released on this row. A reconnect
+        # re-proves them against the NEW grant and re-claims them (or parks them).
+        released_meta = (
+            service.released_meta_destinations(conn.non_secret_config)
+            if connection_type in service.META_CLAIM_TYPES
+            else {}
+        )
         expected_jti = service.consume_oauth_state(conn)
         state_rejected = None
         try:
@@ -1295,7 +1302,19 @@ async def complete_oauth_connect(
                 )
                 raise OAuthExchangeRejected(str(exc)) from exc
 
+        # M10: which of the released Meta ids the NEW grant covers — asked here, with
+        # the fresh token and outside any DB transaction (the bind's posture: the
+        # Graph round-trip never runs under the claim lock). None = could not ask.
+        proven_assets = (
+            await _meta_assets_on_grant(
+                material=material, connection_type=connection_type, transport=transport
+            )
+            if released_meta
+            else None
+        )
+
     conflict_reason: str | None = None
+    reclaimed: dict[str, tuple[str, str]] = {}
     claimed_destination = ""
     shared_note: str | None = None
     async with tenant_session(admin_id) as s:
@@ -1326,6 +1345,11 @@ async def complete_oauth_connect(
                 )
                 cfg = dict(conn.non_secret_config or {})
                 cfg.update(verify_updates)
+                if destination:
+                    # The claim is live again (round 7 M10): the copy a disconnect
+                    # parked is consumed, or a later disconnect / restore would read
+                    # a stale "released" marker beside a live claim.
+                    cfg.pop(service.RELEASED_DESTINATION_KEY, None)
                 conn.non_secret_config = cfg
         # Generic token-expiry stamping (§3.8.5): every OAuth exchange that
         # states a lifetime gets its `token_expires_at` hint recorded, so the
@@ -1342,6 +1366,22 @@ async def complete_oauth_connect(
                     datetime.now(UTC) + timedelta(seconds=int(raw_lifetime))
                 ).isoformat()
                 conn.non_secret_config = cfg
+        if conflict_reason is None and released_meta:
+            # Round 7 M10: a disconnect released this Meta row's ids; the reconnect
+            # re-proves each against the new grant and re-claims it, or parks it
+            # (taken by another account meanwhile, or unproven) — never a silent
+            # resumption of a claim nobody re-proved.
+            reclaimed = await service.reclaim_released_meta(
+                s, conn, admin_id=admin_id, proven_assets=proven_assets
+            )
+            await _audit_meta_reclaim(
+                s,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                actor_user_id=actor_user_id,
+                conn=conn,
+                outcomes=reclaimed,
+            )
         if conflict_reason is None:
             # Verified and unclaimed: the staged credential becomes the live one. This
             # is the cutover instant — before it the previous credential still served.
@@ -1410,6 +1450,10 @@ async def complete_oauth_connect(
                 )
             if shared_note:
                 conn.status_detail = _with_note(conn.status_detail, shared_note)
+                await s.flush()
+            reclaim_note = _meta_reclaim_note(reclaimed)
+            if reclaim_note:
+                conn.status_detail = _with_note(conn.status_detail, reclaim_note)
                 await s.flush()
             return _connection_out(conn)
 
@@ -1550,6 +1594,94 @@ def _meta_bind_detail(current: str | None, *, proven: bool) -> str | None:
     return None if current == META_UNPROVEN_DETAIL else current
 
 
+# --- Round 7 M10: re-claiming released Meta ids on reconnect ------------------------ #
+_META_ASSET_LABELS: dict[str, str] = {
+    "whatsapp": "WhatsApp number",
+    "messenger": "Messenger Page",
+    "instagram": "Instagram account",
+    "": "Meta page or number",
+}
+#: The owner's own previous id, bound by another account while this one was
+#: disconnected. Telling the owner is not an enumeration oracle: the id is the one
+#: THEY released, never one they chose to probe.
+META_RECLAIM_TAKEN_DETAIL = (
+    "Your {label} was connected to another account while this connection was "
+    "disconnected, so it was not re-claimed and is not answering. Disconnect it there "
+    "first, then bind it again."
+)
+
+
+async def _meta_assets_on_grant(
+    *, material: dict[str, str], connection_type: str, transport: object
+) -> set[str] | None:
+    """The asset ids a freshly exchanged Meta grant covers, or None when Meta could
+    not be asked (no lister in this posture, or the lookup failed) — never a guess."""
+    lister = meta_assets.lister_for_posture()
+    if lister is None:
+        return None
+    try:
+        return await lister(material=material, connection_type=connection_type, transport=transport)
+    except meta_assets.AssetLookupFailed:
+        return None
+
+
+async def _audit_meta_reclaim(
+    s: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None,
+    conn: InstanceConnection,
+    outcomes: dict[str, tuple[str, str]],
+) -> None:
+    """One audit row per released id the reconnect re-claimed or parked, in the bind's
+    vocabulary; an id taken meanwhile is ALSO recorded as a refused claim under the
+    claimant (the claim-point convention), with only the id's suffix."""
+    for channel, (asset_id, outcome) in outcomes.items():
+        await audit.emit(
+            s,
+            admin_id=admin_id,
+            instance_id=instance_id,
+            actor_type=ActorType.admin_user,
+            actor_user_id=actor_user_id,
+            event_type="instance_configured",
+            payload={
+                "connection_id": str(conn.connection_id),
+                "connection_type": conn.connection_type,
+                "provider": conn.provider,
+                "action": "reclaim_destination",
+                "channel": channel or None,
+                "destination": asset_id,
+                "outcome": outcome,
+                "proven": outcome == service.RECLAIMED,
+            },
+        )
+        if outcome == service.PARKED_TAKEN:
+            await audit.emit(
+                s,
+                admin_id=admin_id,
+                instance_id=instance_id,
+                actor_type=ActorType.platform,
+                event_type="destination_claim_rejected",
+                payload={
+                    "connection_type": conn.connection_type,
+                    "destination_suffix": asset_id[-4:],
+                },
+            )
+
+
+def _meta_reclaim_note(outcomes: dict[str, tuple[str, str]]) -> str | None:
+    """The honest status note for ids a reconnect could not re-claim (None if all were)."""
+    notes = [
+        META_RECLAIM_TAKEN_DETAIL.format(label=_META_ASSET_LABELS.get(channel, "Meta id"))
+        for channel, (_id, outcome) in sorted(outcomes.items())
+        if outcome == service.PARKED_TAKEN
+    ]
+    if any(outcome == service.PARKED_UNPROVEN for _id, outcome in outcomes.values()):
+        notes.append(META_UNPROVEN_DETAIL)
+    return " ".join(notes) or None
+
+
 @router.put("/{connection_id}/destination", response_model=ConnectionOut)
 async def bind_destination(
     connection_id: uuid.UUID,
@@ -1656,6 +1788,15 @@ async def bind_destination(
                 cfg["pending_destinations"] = parked
             else:
                 cfg.pop("pending_destinations", None)
+            # M10: this bind is the re-proof for the channel — the copy a disconnect
+            # released for it is consumed, never left beside the new binding.
+            released = cfg.get(service.RELEASED_DESTINATIONS_KEY)
+            if isinstance(released, dict) and req.channel in released:
+                remaining = {k: v for k, v in released.items() if k != req.channel}
+                if remaining:
+                    cfg[service.RELEASED_DESTINATIONS_KEY] = remaining
+                else:
+                    cfg.pop(service.RELEASED_DESTINATIONS_KEY, None)
         else:
             previous = cfg.get("destination") or cfg.get("pending_destination")
             if proven:
@@ -1664,6 +1805,7 @@ async def bind_destination(
             else:
                 cfg["pending_destination"] = req.destination
                 cfg.pop("destination", None)
+            cfg.pop(service.RELEASED_DESTINATION_KEY, None)
         # New dict, not an in-place edit: the JSONB column is not a MutableDict, so
         # mutating the existing one would not be flushed.
         conn.non_secret_config = cfg
