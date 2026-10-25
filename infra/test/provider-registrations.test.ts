@@ -80,6 +80,19 @@ describe.each<EnvName>(['dev', 'prod'])('provider-facing origin (%s)', (envName)
   });
 });
 
+describe.each<EnvName>(['dev', 'prod'])('API origins the environment serves (%s)', (envName) => {
+  const template = buildCompute(envName);
+
+  test.each(['data-planeContainer', 'control-planeContainer', 'SweepContainer'])(
+    '%s carries LUCIEL_API_ORIGINS = every API hostname, so a redirect URI registered on any of them is valid',
+    (container) => {
+      const expected = hostnames(envName).apiNames.map((n) => `https://${n}`).join(',');
+      expect(envValue(template, container, 'LUCIEL_API_ORIGINS')).toBe(expected);
+      expect(expected.split(',')).toContain(baseUrls(envName).api);
+    },
+  );
+});
+
 describe.each<EnvName>(['dev', 'prod'])('frontend runtime config (%s)', (envName) => {
   const template = buildCompute(envName);
 

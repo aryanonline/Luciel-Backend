@@ -105,7 +105,12 @@ if stripe_posture != "test":
 # probe would roll back a healthy release because one owner's contact is unreachable.
 # It is reported here and left out of the set equality.
 all_degraded = set(degraded or [])
-operational = {d for d in all_degraded if d.startswith("escalation_backlog:")}
+# `embeddings:degraded` (round 7 WP-6) is the same kind of signal: the embeddings
+# vendor refused the last calls of THIS process. It alarms on its own; a release
+# unrelated to embeddings must not roll back over a vendor's bad minute.
+operational = {
+    d for d in all_degraded if d.startswith("escalation_backlog:") or d == "embeddings:degraded"
+}
 got = all_degraded - operational
 if operational:
     print(f"[smoke] operations signal (not gating the deploy): {sorted(operational)}")

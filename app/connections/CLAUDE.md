@@ -46,8 +46,13 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
   `get_provider` resolves on read. Never write a versioned graph URL anywhere else
   (`tests/unit/test_meta_graph_version.py` scans app/).
 - Redirect URIs: `Settings.oauth_redirect_problems()` — each configured URI must end with
-  `/api/v1/connections/<oauth client label>/callback` (and equal `public_api_base_url` +
-  path when that is set). A bad one is logged at boot, makes `authorize_ready` false
+  `/api/v1/connections/<oauth client label>/callback` and, when any API origin is known,
+  be one of `Settings.accepted_api_origins()` + path: the injected
+  `public_api_base_url`, every origin the environment serves (`LUCIEL_API_ORIGINS`, from
+  the CDK hostnames helper — dev serves api-dev AND the public api) and the secret's
+  `API_BASE_URL`. Never ONE exact origin: the provider consoles were registered on the
+  public name, and dev's move to api-dev would otherwise have withheld every OAuth
+  connect (Phase 3 review). A bad one is logged at boot, makes `authorize_ready` false
   (provider withheld, no authorize URL; refresh untouched) and shows on /healthz as
   `oauth_redirect:<label>`. `config.OAUTH_REDIRECT_URI_FIELDS` mirrors the registry labels.
 - Login host: `ProviderSpec.login_hosts` (Salesforce: production, sandbox). The connect body's

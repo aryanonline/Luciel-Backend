@@ -55,6 +55,15 @@ def test_an_undelivered_escalation_backlog_does_not_roll_back_a_healthy_release(
     assert _run(tmp_path, mode="live", posture="test", body=_live(["escalation_backlog:2"])) == 0
 
 
+def test_a_degraded_embedder_does_not_roll_back_a_healthy_release(tmp_path: Path) -> None:
+    """Round 7 WP-6: three consecutive failed embedding calls in one process raise
+    `embeddings:degraded`. It alarms on its own (an operations signal, like the
+    escalation backlog); the probe must not roll a release back over it."""
+    assert _run(tmp_path, mode="live", posture="test", body=_live(["embeddings:degraded"])) == 0
+    both = ["embeddings:degraded", "escalation_backlog:1"]
+    assert _run(tmp_path, mode="live", posture="test", body=_live(both)) == 0
+
+
 @pytest.mark.parametrize(
     "degraded",
     [

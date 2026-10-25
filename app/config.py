@@ -418,6 +418,16 @@ class Settings(BaseSettings):
     # = auto-config disabled (the attach falls back to manual webhook guidance);
     # deployed environments set it via the platform secret's API_BASE_URL.
     public_api_base_url: str = ""
+    # Every API origin this environment SERVES, comma-separated (round 7 WP-8b: the
+    # CDK injects LUCIEL_API_ORIGINS from the hostnames helper — dev serves
+    # https://api-dev.vantagemind.ai AND the public api name while it still owns it).
+    # A registered OAuth redirect URI is valid on any of them: the providers' consoles
+    # were registered on the public name before the per-environment names existed,
+    # and a callback on either origin reaches this app.
+    api_origins: str = ""
+    # The platform secret's own API_BASE_URL, kept beside the injected origin so a
+    # redirect URI registered on it stays valid after the task env moves to api-dev.
+    secret_api_base_url: str = ""
     # Dashboard page the provider's OAuth callback bounces the browser back to, relative
     # to app_base_url. Settable because the redirect URIs registered with the providers
     # are frozen but the frontend's route is not. Must name a route the frontend actually
@@ -632,6 +642,8 @@ class Settings(BaseSettings):
         # secret; the secret wins over the empty default).
         if blob.get("API_BASE_URL") and not self.public_api_base_url:
             object.__setattr__(self, "public_api_base_url", blob["API_BASE_URL"])
+        if blob.get("API_BASE_URL"):
+            object.__setattr__(self, "secret_api_base_url", str(blob["API_BASE_URL"]))
         # Round 5B item 13: the CDK sets these as PLAIN task env vars (no
         # LUCIEL_ prefix, matching the AWS-side names), so pydantic's prefixed
         # loader never sees them — bridge from os.environ, blob still filling
@@ -851,16 +863,36 @@ class Settings(BaseSettings):
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
 
+    def accepted_api_origins(self) -> tuple[str, ...]:
+        """The API origins a registered redirect URI may use, in precedence order:
+        the injected public origin, every origin the environment serves
+        (``LUCIEL_API_ORIGINS``) and the platform secret's API_BASE_URL. Empty when
+        none is known (local, tests): then only the path is validated."""
+        seen: list[str] = []
+        for raw in (
+            self.public_api_base_url,
+            *self.api_origins.split(","),
+            self.secret_api_base_url,
+        ):
+            origin = (raw or "").strip().rstrip("/")
+            if origin and origin not in seen:
+                seen.append(origin)
+        return tuple(seen)
+
     def oauth_redirect_problems(self) -> dict[str, str]:
         """``{oauth client label: reason}`` for every CONFIGURED redirect URI that the
         callback route cannot serve; empty when all are well-formed.
 
         A URI must end with ``/api/v1/connections/<label>/callback`` and, when the
-        public API origin is known, be exactly that origin plus the path. Computed on
-        read (not cached at boot) so it always describes the settings in effect. The
-        reason names the platform-secret key and the expected shape; a redirect URI is
-        public (it travels in every authorize URL), never secret material."""
-        base = (self.public_api_base_url or "").strip().rstrip("/")
+        environment's API origins are known, be one of them plus the path. Exactly
+        ONE origin used to be accepted — the injected one — which, the moment dev moved
+        to api-dev (round 7 WP-8b) while every provider console still named the
+        public api, would have listed eight problems on /healthz, withheld every OAuth
+        connect and rolled the deploy back (Phase 3 review). Computed on read (not
+        cached at boot) so it always describes the settings in effect. The reason
+        names the platform-secret key and the expected shape; a redirect URI is public
+        (it travels in every authorize URL), never secret material."""
+        origins = self.accepted_api_origins()
         problems: dict[str, str] = {}
         for field_name, label in OAUTH_REDIRECT_URI_FIELDS.items():
             uri = str(getattr(self, field_name, "") or "").strip()
@@ -870,8 +902,9 @@ class Settings(BaseSettings):
             key = field_name.upper()
             if not uri.endswith(path):
                 problems[label] = f"{key} must end with {path} (got {uri!r})"
-            elif base and uri != f"{base}{path}":
-                problems[label] = f"{key} must be {base}{path} (got {uri!r})"
+            elif origins and uri not in {f"{origin}{path}" for origin in origins}:
+                wanted = " or ".join(f"{origin}{path}" for origin in origins)
+                problems[label] = f"{key} must be {wanted} (got {uri!r})"
         return problems
 
     @property

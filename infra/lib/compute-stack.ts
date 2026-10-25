@@ -405,6 +405,9 @@ export class ComputeStack extends Stack {
     const names = hostnames(envConfig.envName);
     const urls = baseUrls(envConfig.envName);
     const publicApiBaseUrl = urls.api;
+    // Every API origin this environment serves (dev: api-dev plus the public api name
+    // while it still owns it): a registered OAuth redirect URI is valid on any of them.
+    const apiOrigins = names.apiNames.map((name) => `https://${name}`).join(',');
     // Every app origin the environment serves (the D6 dual-host included): the CORS
     // allow-list the dashboard needs on each of them. JSON, as pydantic-settings
     // reads a list[str] from the environment.
@@ -673,6 +676,7 @@ export class ComputeStack extends Stack {
           // webhooks/export links, and every app origin for CORS.
           LUCIEL_APP_BASE_URL: urls.app,
           LUCIEL_PUBLIC_API_BASE_URL: urls.api,
+          LUCIEL_API_ORIGINS: apiOrigins,
           LUCIEL_DASHBOARD_ORIGINS: dashboardOrigins,
           // Per-env, so a dev export can never be written to the prod bucket.
           LUCIEL_EXPORT_BUCKET: exportBucket.bucketName,
@@ -1001,6 +1005,7 @@ export class ComputeStack extends Stack {
         // is a silent no-op without the API origin.
         LUCIEL_APP_BASE_URL: urls.app,
         LUCIEL_PUBLIC_API_BASE_URL: urls.api,
+        LUCIEL_API_ORIGINS: apiOrigins,
         // Both buckets, for the same reason the posture above is here: the sweeps are
         // the ONLY things that touch cold storage. transcript_archive writes the 90-day
         // offload, retention deletes the archived object at the 1-year boundary, and

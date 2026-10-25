@@ -261,3 +261,46 @@ def test_check_names_what_the_runtime_will_refuse_or_report_without_values(
     assert "meta_webhook:unconfigured" in out
     assert "do-not-print-me" not in out
     assert fake_aws.writes == []
+
+
+def test_check_judges_redirect_uris_by_the_origins_the_environment_serves(
+    monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager, capsys
+) -> None:
+    """Phase 3 review (critical): dev is injected with api-dev while every provider
+    console still names the public api, which dev keeps serving. --check must judge a
+    blob the way the task does — on the environment's origin SET, defaulted from
+    --env — or it would report eight problems a deploy never sees (or none it does)."""
+    script = _load_script()
+    assert script.ENV_API_ORIGINS["dev"] == (
+        "https://api-dev.vantagemind.ai",
+        "https://api.vantagemind.ai",
+    )
+    fake_aws.blob = {
+        "HUBSPOT_REDIRECT_URI": "https://api.vantagemind.ai/api/v1/connections/hubspot/callback",
+        "GOOGLE_REDIRECT_URI": "https://api-dev.vantagemind.ai/api/v1/connections/google/callback",
+        "NOTION_REDIRECT_URI": "https://api.elsewhere.test/api/v1/connections/notion/callback",
+    }
+    assert _run(monkeypatch, "", "--check") == 1
+    out = capsys.readouterr().out
+    assert "oauth_redirect:hubspot" not in out
+    assert "oauth_redirect:google" not in out
+    assert "oauth_redirect:notion" in out
+    # An explicit --api-origins narrows the judgement to exactly those origins.
+    assert _run(monkeypatch, "", "--check", "--api-origins", "https://api-dev.vantagemind.ai") == 1
+    out = capsys.readouterr().out
+    assert "oauth_redirect:hubspot" in out
+    assert "oauth_redirect:google" not in out
+
+
+def test_check_names_a_graph_version_the_runtime_would_refuse_to_boot_on(
+    monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager, capsys
+) -> None:
+    """META_GRAPH_VERSION is normalised at boot and a malformed pin refuses to boot;
+    before the deploy --check says so by key rather than crashing (or rolling back)."""
+    monkeypatch.delenv("LUCIEL_META_GRAPH_VERSION", raising=False)
+    fake_aws.blob = {"META_GRAPH_VERSION": "latest"}
+    assert _run(monkeypatch, "", "--check") == 1
+    out = capsys.readouterr().out
+    assert "boot refused: META_GRAPH_VERSION 'latest' is not a Graph API version" in out
+    fake_aws.blob = {"META_GRAPH_VERSION": "23.0"}
+    assert _run(monkeypatch, "", "--check") == 0

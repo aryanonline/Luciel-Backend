@@ -24,7 +24,9 @@ Usage (from the backend repo, with AWS credentials for the target account):
     python scripts/merge_platform_secret.py --env dev --list      # key names present, no values
 
     # Pre-deploy: what the runtime will refuse or report degraded (no secret values).
-    python scripts/merge_platform_secret.py --env dev --check --api-base https://api.vantagemind.ai
+    # The API origins default to the environment's own (api-dev + the public api for
+    # dev, the public api for prod — infra/lib/env-config.ts `hostnames`).
+    python scripts/merge_platform_secret.py --env dev --check
 """
 
 from __future__ import annotations
@@ -64,7 +66,18 @@ def unknown_keys(pairs: dict[str, str]) -> list[str]:
     return sorted(k for k in pairs if k not in known)
 
 
-def check_blob(blob: dict[str, Any], *, api_base: str) -> list[str]:
+#: The API origins each environment serves, as infra/lib/env-config.ts ``hostnames``
+#: resolves them (owner decision D6): dev answers on its own name AND the public api
+#: name while it still owns the apex; prod on the public name. Pinned here so --check
+#: judges a redirect URI the way the deployed task will, without a Node toolchain.
+ENV_API_ORIGINS: dict[str, tuple[str, ...]] = {
+    "dev": ("https://api-dev.vantagemind.ai", "https://api.vantagemind.ai"),
+    "preprod": ("https://api-preprod.vantagemind.ai",),
+    "prod": ("https://api.vantagemind.ai",),
+}
+
+
+def check_blob(blob: dict[str, Any], *, api_base: str, api_origins: str = "") -> list[str]:
     """What this blob's PROVIDER posture will look like to the runtime — printed before a
     deploy rather than discovered on /healthz after it (round 7 WP-7).
 
@@ -78,12 +91,19 @@ def check_blob(blob: dict[str, Any], *, api_base: str) -> list[str]:
         for key in sorted(blob)
         if key not in PLATFORM_SECRET_KEYS
     ]
-    settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        integration_mode="mock",  # describe the posture; never fail on live-only guards
-        public_api_base_url=api_base,
-        platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
-    )
+    # A malformed META_GRAPH_VERSION refuses to boot (every Graph URL is built on it):
+    # say so here, by key, instead of letting the deploy roll back on it.
+    try:
+        settings = Settings(
+            _env_file=None,
+            integration_mode="mock",  # describe the posture; never fail on live-only guards
+            public_api_base_url=api_base,
+            api_origins=api_origins,
+            platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
+        )
+    except RuntimeError as exc:
+        findings.append(f"boot refused: {exc}")
+        return findings
     findings += [
         f"oauth_redirect:{label} — {reason}"
         for label, reason in sorted(settings.oauth_redirect_problems().items())
@@ -141,9 +161,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--api-base",
         default="",
-        help="with --check: the environment's public API origin (redirect URIs must sit on it)",
+        help="with --check: the API origin the task is injected with (default: the "
+        "environment's own, see ENV_API_ORIGINS)",
+    )
+    ap.add_argument(
+        "--api-origins",
+        default="",
+        help="with --check: every API origin the environment serves, comma-separated "
+        "(default: ENV_API_ORIGINS for --env); a redirect URI may sit on any of them",
     )
     args = ap.parse_args(argv)
+    if args.check:
+        origins = ENV_API_ORIGINS.get(args.env, ())
+        if not args.api_base:
+            args.api_base = origins[0] if origins else ""
+        if not args.api_origins:
+            args.api_origins = ",".join(origins)
     read_only = args.list or args.check
 
     # Validate the paste BEFORE touching AWS: a typo is refused without reading the
@@ -175,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
             print(key)
         return 0
     if args.check:
-        findings = check_blob(blob, api_base=args.api_base)
+        findings = check_blob(blob, api_base=args.api_base, api_origins=args.api_origins)
         for line in findings:
             print(line)
         print(f"{len(findings)} finding(s) in {secret_id}")

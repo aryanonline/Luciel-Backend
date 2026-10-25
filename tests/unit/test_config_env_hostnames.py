@@ -105,11 +105,15 @@ def test_the_cdk_injects_exactly_the_settings_this_module_reads():
     ignored and the secret's value wins after all."""
     source = _COMPUTE_STACK.read_text(encoding="utf-8")
     injected = set(
-        re.findall(r"\b(LUCIEL_(?:APP_BASE_URL|PUBLIC_API_BASE_URL|DASHBOARD_ORIGINS))\s*:", source)
+        re.findall(
+            r"\b(LUCIEL_(?:APP_BASE_URL|PUBLIC_API_BASE_URL|API_ORIGINS|DASHBOARD_ORIGINS))\s*:",
+            source,
+        )
     )
     assert injected == {
         "LUCIEL_APP_BASE_URL",
         "LUCIEL_PUBLIC_API_BASE_URL",
+        "LUCIEL_API_ORIGINS",
         "LUCIEL_DASHBOARD_ORIGINS",
     }
     for var in injected:

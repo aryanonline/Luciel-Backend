@@ -72,7 +72,7 @@ def test_a_well_formed_uri_is_not_a_problem() -> None:
     assert s.oauth_redirect_problems() == {}
 
 
-def test_with_a_known_origin_the_uri_must_be_exactly_origin_plus_path() -> None:
+def test_with_a_known_origin_the_uri_must_be_an_origin_this_environment_serves() -> None:
     other_host = "https://api.elsewhere.test/api/v1/connections/hubspot/callback"
     s = Settings(
         public_api_base_url="https://api.example.test/",
@@ -87,6 +87,45 @@ def test_with_a_known_origin_the_uri_must_be_exactly_origin_plus_path() -> None:
         platform_secret=json.dumps({"HUBSPOT_REDIRECT_URI": GOOD}),
     )
     assert ok.oauth_redirect_problems() == {}
+
+
+def test_a_uri_on_any_origin_the_environment_serves_is_fine() -> None:
+    """Phase 3 review (critical): dev moved to api-dev while every provider console
+    still names the public api, which dev keeps serving. The injected origin, the
+    environment's other API names and the secret's own API_BASE_URL are all valid;
+    a host the environment does not serve is not."""
+    on_public_name = "https://api.example.test/api/v1/connections/hubspot/callback"
+    s = Settings(
+        public_api_base_url="https://api-dev.example.test",
+        api_origins="https://api-dev.example.test,https://api.example.test/",
+        platform_secret=json.dumps({"HUBSPOT_REDIRECT_URI": on_public_name}),
+    )
+    assert s.accepted_api_origins() == (
+        "https://api-dev.example.test",
+        "https://api.example.test",
+    )
+    assert s.oauth_redirect_problems() == {}
+    # The secret's API_BASE_URL counts too, even when the task env names api-dev.
+    via_secret = Settings(
+        public_api_base_url="https://api-dev.example.test",
+        platform_secret=json.dumps(
+            {"API_BASE_URL": "https://api.example.test", "HUBSPOT_REDIRECT_URI": on_public_name}
+        ),
+    )
+    assert via_secret.public_api_base_url == "https://api-dev.example.test"
+    assert via_secret.oauth_redirect_problems() == {}
+    elsewhere = Settings(
+        public_api_base_url="https://api-dev.example.test",
+        api_origins="https://api.example.test",
+        platform_secret=json.dumps(
+            {
+                "HUBSPOT_REDIRECT_URI": "https://api.elsewhere.test/api/v1/connections/hubspot/callback"
+            }
+        ),
+    )
+    problem = elsewhere.oauth_redirect_problems()["hubspot"]
+    assert "https://api-dev.example.test/api/v1/connections/hubspot/callback" in problem
+    assert "https://api.example.test/api/v1/connections/hubspot/callback" in problem
 
 
 def test_an_unconfigured_provider_is_not_a_problem() -> None:
