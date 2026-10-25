@@ -175,6 +175,12 @@ _FIRST_PERSON_SUCCESS_CLAIM = re.compile(
 )
 
 
+#: The first reason on every row Luciel's own ``hand_to_team`` writes. A row relabelled
+#: to the signal that won its turn (M3, ``_relabel_handoff_row``) keeps it, so it is
+#: also how the once-per-conversation hand-off finds a hand-off under another label.
+HANDOFF_REASON = "Luciel asked for a person"
+
+
 # A HAND-OFF claim (round 7 WP-2, item 2): the reply tells the customer the team has
 # been (or will be) told — "I've flagged this for the team", "I'll pass this along",
 # "someone will reach out", "your request has been forwarded". The model has exactly
@@ -897,6 +903,28 @@ async def _session_already_escalated(
     return row is not None
 
 
+async def _session_already_handed_off(
+    session: AsyncSession, *, admin_id: uuid.UUID, session_id: uuid.UUID
+) -> bool:
+    """True when Luciel's own hand-off already fired in this session — under its own
+    label, or relabelled to the signal that won its turn (M3): the row then says
+    ``high_value_lead`` and the insert's (session, signal, gate) arbiter no longer sees
+    a hand-off, but the row still carries ``HANDOFF_REASON``. Once per conversation."""
+    row = (
+        await session.execute(
+            select(EscalationEvent.escalation_id)
+            .where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.gate == Gate.outcome.value,
+                EscalationEvent.reasons.contains([HANDOFF_REASON]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
 async def _append_escalation_reasons(
     session: AsyncSession,
     *,
@@ -938,6 +966,7 @@ async def _relabel_handoff_row(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
+    instance_id: uuid.UUID,
     session_id: uuid.UUID,
     signal: str,
     score: float | None,
@@ -971,9 +1000,7 @@ async def _relabel_handoff_row(
     ):
         return None
     merged = tuple(
-        dict.fromkeys(
-            [*reasons, "Luciel asked for a person", *(str(r) for r in (row.reasons or []))]
-        )
+        dict.fromkeys([*reasons, HANDOFF_REASON, *(str(r) for r in (row.reasons or []))])
     )
     try:
         async with session.begin_nested():
@@ -987,6 +1014,21 @@ async def _relabel_handoff_row(
             session, session_id=session_id, signal=signal, new_signal=handoff, score=None
         )
         return None
+    # The append-only history says the hand-off row BECAME the lead row. No second
+    # EscalationFired metric: it is one escalation, counted once when it fired.
+    await audit.emit(
+        session,
+        admin_id=admin_id,
+        instance_id=instance_id,
+        event_type="escalation_fired",
+        actor_type=ActorType.luciel_runtime,
+        payload={
+            "signal": signal,
+            "gate": Gate.outcome.value,
+            "session_id": str(session_id),
+            "relabelled_from": handoff,
+        },
+    )
     _LOG.info(
         "escalation relabelled: session=%s %s -> %s (one row, one page)",
         session_id,
@@ -1931,6 +1973,7 @@ class Orchestrator:
             await _relabel_handoff_row(
                 self.session,
                 admin_id=admin_id,
+                instance_id=instance_id,
                 session_id=session_id,
                 signal=winner.value,
                 score=outcome.score_or_confidence,
@@ -1972,7 +2015,7 @@ class Orchestrator:
                 Signal.luciel_requested_handoff,
                 Gate.outcome,
                 outcome.score_or_confidence,
-                ("Luciel asked for a person", *outcome.reasons),
+                (HANDOFF_REASON, *outcome.reasons),
                 answer_ungrounded=outcome.answer_ungrounded,
                 answer_reasons=outcome.answer_reasons,
             )
@@ -2069,7 +2112,7 @@ class Orchestrator:
                 Signal.luciel_requested_handoff,
                 Gate.outcome,
                 None,
-                ("Luciel asked for a person",),
+                (HANDOFF_REASON,),
             )
 
         # --- RESPOND (§3.4.2 channel arbiter) -------------------------------- #
@@ -2151,17 +2194,22 @@ class Orchestrator:
             # earlier hand_to_team call backs this claim too, and pages nobody twice.)
             emit_metric("HandoffClaimedWithoutTool", dimensions={"Channel": channel})
             promised = ("Luciel told the customer the team would follow up",)
-            await _record_escalation(
-                self.session,
-                admin_id=admin_id,
-                instance_id=instance_id,
-                session_id=session_id,
-                resolved_lead_id=resolved_lead_id,
-                signal=Signal.luciel_requested_handoff.value,
-                gate=Gate.outcome.value,
-                score=None,
-                reasons=list(promised),
-            )
+            # A hand-off relabelled to the signal that won its turn (M3) still backs
+            # this claim: the insert's arbiter cannot see it under that label.
+            if not await _session_already_handed_off(
+                self.session, admin_id=admin_id, session_id=session_id
+            ):
+                await _record_escalation(
+                    self.session,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    resolved_lead_id=resolved_lead_id,
+                    signal=Signal.luciel_requested_handoff.value,
+                    gate=Gate.outcome.value,
+                    score=None,
+                    reasons=list(promised),
+                )
             escalation = EscalationDecision(
                 True, Signal.luciel_requested_handoff, Gate.outcome, None, promised
             )
@@ -2667,8 +2715,12 @@ class Orchestrator:
         if session_id is None:
             return tool_contract.failed("no_session")
         reason = " ".join(str(inputs.get("reason") or "").split())[: self.HAND_TO_TEAM_REASON_CAP]
-        reasons = ["Luciel asked for a person", reason or "no reason given"]
-        written = await _record_escalation(
+        reasons = [HANDOFF_REASON, reason or "no reason given"]
+        # The insert's arbiter cannot see a hand-off row an earlier turn relabelled to
+        # the signal that won it (M3), so the session is asked first.
+        written = not await _session_already_handed_off(
+            self.session, admin_id=self.admin_id, session_id=session_id
+        ) and await _record_escalation(
             self.session,
             admin_id=self.admin_id,
             instance_id=self.instance_id,

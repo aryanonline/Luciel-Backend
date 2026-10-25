@@ -31,7 +31,7 @@ from app.notifications import email_notifier, escalation_dispatch
 from app.runtime import orchestrator as orch_mod
 from app.runtime.escalation import Signal
 from app.runtime.llm_router import LLMRouter
-from app.runtime.orchestrator import _HANDOFF_ACK_MARK, Orchestrator
+from app.runtime.orchestrator import _HANDOFF_ACK_MARK, HANDOFF_REASON, Orchestrator
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
@@ -46,7 +46,6 @@ HOT_UNGROUNDED = (
 )
 MODEL_REASON = "asked for a battery spec the knowledge does not carry"
 DRAFT = "I don't have that figure, so I've passed your question to the team."
-HANDOFF_REASON = "Luciel asked for a person"
 
 
 async def _unrelated_retriever(_q: str) -> list[str]:
@@ -64,10 +63,10 @@ def _hands_to_team() -> EchoModel:
     )
 
 
-def _orch(s, admin: uuid.UUID, iid: uuid.UUID) -> Orchestrator:
+def _orch(s, admin: uuid.UUID, iid: uuid.UUID, *, primary: EchoModel | None = None):
     return Orchestrator(
         session=s,
-        router=LLMRouter(primary=_hands_to_team(), fallback=EchoModel()),
+        router=LLMRouter(primary=primary or _hands_to_team(), fallback=EchoModel()),
         retriever=_unrelated_retriever,
         admin_id=admin,
         instance_id=iid,
@@ -76,13 +75,13 @@ def _orch(s, admin: uuid.UUID, iid: uuid.UUID) -> Orchestrator:
     )
 
 
-async def _turn(orch: Orchestrator, sid: uuid.UUID):
+async def _turn(orch: Orchestrator, sid: uuid.UUID, text: str = HOT_UNGROUNDED):
     return await orch.run_turn(
         session_id=sid,
         resolved_lead_id=None,
         channel="widget",
         mode="ai",
-        inbound_text=HOT_UNGROUNDED,
+        inbound_text=text,
         received_at=datetime.now(UTC),
     )
 
@@ -174,9 +173,19 @@ async def _audit(admin: uuid.UUID, event_type: str) -> list[AdminAuditLog]:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_a_hot_lead_luciel_hands_to_the_team_is_one_high_value_row_and_one_page(ses):
+async def test_a_hot_lead_luciel_hands_to_the_team_is_one_high_value_row_and_one_page(
+    ses, monkeypatch
+):
     admin, iid = uuid.uuid4(), uuid.uuid4()
     sid = await _seed_tenant(admin, iid)
+    metrics: list[tuple[str, dict[str, str]]] = []
+    real_emit = orch_mod.emit_metric
+
+    def recording_emit(name: str, *a: Any, **kw: Any) -> None:
+        metrics.append((name, dict(kw.get("dimensions") or {})))
+        real_emit(name, *a, **kw)
+
+    monkeypatch.setattr(orch_mod, "emit_metric", recording_emit)
 
     async with tenant_session(admin) as s:
         result = await _turn(_orch(s, admin, iid), sid)
@@ -230,6 +239,17 @@ async def test_a_hot_lead_luciel_hands_to_the_team_is_one_high_value_row_and_one
         assert row.delivery_status == "delivered"
         assert row.delivery_detail == "email:primary"
 
+    # The append-only history says the hand-off row became the lead row ...
+    fired = await _audit(admin, "escalation_fired")
+    assert [(a.event_payload["signal"], a.event_payload.get("relabelled_from")) for a in fired] == [
+        ("luciel_requested_handoff", None),
+        ("high_value_lead", "luciel_requested_handoff"),
+    ]
+    # ... and the escalation is counted once, when it fired.
+    assert [m for m in metrics if m[0] == "EscalationFired"] == [
+        ("EscalationFired", {"Signal": "luciel_requested_handoff"})
+    ]
+
 
 @pytest.fixture
 def paged(monkeypatch) -> list[str]:
@@ -256,7 +276,17 @@ async def test_a_row_that_cannot_be_relabelled_carries_the_lead_and_pages_nobody
     admin, iid = uuid.uuid4(), uuid.uuid4()
     sid = await _seed_tenant(admin, iid)
     if cause == "page_already_started":
-        monkeypatch.setattr(orch_mod, "relabel_scheduled_notification", lambda *a, **k: False)
+        real_hand_to_team = Orchestrator._hand_to_team
+
+        async def page_starts_at_dispatch(self, inputs, **kw: Any):
+            result = await real_hand_to_team(self, inputs, **kw)
+            # The after-commit hook consumes the queue and starts the hand-off page,
+            # exactly as it would have had the transaction committed here.
+            escalation_dispatch._start_notifications_after_commit(self.session.sync_session)
+            assert _queued_signals(self.session) == []
+            return result
+
+        monkeypatch.setattr(Orchestrator, "_hand_to_team", page_starts_at_dispatch)
     else:
         async with tenant_session(admin) as s:
             s.add(
@@ -296,7 +326,84 @@ async def test_a_row_that_cannot_be_relabelled_carries_the_lead_and_pages_nobody
         assert handoff[:2] == [HANDOFF_REASON, MODEL_REASON]
         assert "wants it soon" in handoff
         assert any("backed by your knowledge" in r for r in handoff)
-        assert _queued_signals(s) == ["luciel_requested_handoff"]
+        # Nothing new was queued: the hand-off's own page (already started, or still
+        # waiting for the commit) is the only one.
+        started = cause == "page_already_started"
+        assert _queued_signals(s) == ([] if started else ["luciel_requested_handoff"])
         assert DRAFT not in result.reply_text
     await escalation_dispatch.drain_background_notifications()
-    assert paged == ["luciel_requested_handoff"]
+    assert paged == ["luciel_requested_handoff"]  # exactly one page in total
+
+
+# --- a relabelled hand-off is still the conversation's one hand-off ----------------- #
+SHOWROOM_Q = "is the showroom open Saturdays?"
+SHOWROOM_ANSWER = "Our showroom is open Saturdays from 9 to 3 and closed on Sundays."
+PROMISED = (
+    f"{SHOWROOM_ANSWER} I've passed your question along to the team and someone will "
+    "get back to you."
+)
+#: Social turns: gate 2 never judges them as answers, and enough of them move the M3
+#: message out of the lead-signal context (the last five lead turns).
+FILLERS = ("thanks!", "ok thanks", "great, thanks", "thank you", "cheers")
+
+
+@pytest.mark.parametrize("later", ["hand_to_team_call", "handoff_claim_reply"])
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_relabelled_hand_off_is_still_the_conversations_one_hand_off(
+    paged: list[str], later: str
+):
+    """After the M3 turn the session has no ``luciel_requested_handoff`` row — it became
+    the ``high_value_lead`` row — so the insert's (session, signal, gate) arbiter no
+    longer deduplicates the hand-off. A later hand_to_team call, or a later reply that
+    promises a hand-off, used to write a NEW hand-off row and page the owner again."""
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    sid = await _seed_tenant(admin, iid)
+    async with tenant_session(admin) as s:
+        first = await _turn(_orch(s, admin, iid), sid)
+        assert first.escalation is not None
+        assert first.escalation.signal is Signal.high_value_lead
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["high_value_lead"]
+
+    if later == "hand_to_team_call":
+        # Next turn, a grounded answer — and the model hands the customer over again.
+        model = EchoModel(
+            confidence=1.0,
+            tool_call_script=[
+                [{"tool_id": "hand_to_team", "inputs": {"reason": "wants to order today"}}]
+            ],
+            fixed_reply=SHOWROOM_ANSWER,
+        )
+        async with tenant_session(admin) as s:
+            second = await _turn(_orch(s, admin, iid, primary=model), sid, SHOWROOM_Q)
+            assert second.tool_outcomes == ["ok"]
+            assert second.reply_text.startswith(SHOWROOM_ANSWER)
+    else:
+        # The promise backstop only runs on a turn no gate claimed, so the M3 message
+        # must first leave the lead-signal context.
+        for filler in FILLERS:
+            async with tenant_session(admin) as s:
+                await _turn(
+                    _orch(s, admin, iid, primary=EchoModel(fixed_reply="You're welcome!")),
+                    sid,
+                    filler,
+                )
+        async with tenant_session(admin) as s:
+            claim = await _turn(
+                _orch(s, admin, iid, primary=EchoModel(confidence=1.0, fixed_reply=PROMISED)),
+                sid,
+                SHOWROOM_Q,
+            )
+            # The backstop ran (no gate fired; the reply promised the team) ...
+            assert claim.escalation is not None
+            assert claim.escalation.signal is Signal.luciel_requested_handoff
+            assert "passed your question along to the team" in claim.reply_text
+
+    async with tenant_session(admin) as s:
+        rows = await _rows(s, sid)
+        # ... and the relabelled row backs it: one row, one page, for the conversation.
+        assert [r.signal for r in rows] == ["high_value_lead"]
+        assert HANDOFF_REASON in [str(r) for r in (rows[0].reasons or [])]
+        assert _queued_signals(s) == []
+    await escalation_dispatch.drain_background_notifications()
+    assert paged == ["high_value_lead"]

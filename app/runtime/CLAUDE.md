@@ -202,8 +202,11 @@ make that state explicit and test it.
   hand-off row that signal's row (both reason sets + Luciel's) and
   `relabel_scheduled_notification` re-keys its queued page; if the page is no longer
   queued or a racing turn wrote the row, the lead reasons ride on the hand-off row
-  instead. Never a second row or page. Every canned "passed to the team" line is backed
-  by a page: the ask bound and the unfounded-claim replacement use
+  instead. Never a second row or page. The relabelled row keeps `HANDOFF_REASON`, and
+  `_session_already_handed_off` finds it, so a later hand_to_team call or `_HANDOFF_CLAIM`
+  reply writes and pages nothing; the relabel is audited `escalation_fired` with
+  `relabelled_from` (no second EscalationFired metric). Every canned "passed to the
+  team" line is backed by a page: the ask bound and the unfounded-claim replacement use
   `record_or_extend_escalation`.
 - An empty draft is never sent as silence: a tool does not ground words never written
   (the honest hand-off goes out), except a confirmed booking/move/cancel, read back from
