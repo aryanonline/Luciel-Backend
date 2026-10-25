@@ -91,13 +91,17 @@ async def test_a_window_that_lost_its_expiry_is_repaired_on_the_next_admission(
     store, client = _store()
     admin = str(uuid.uuid4())
     key = f"llmcap:{admin}"
-    await store.aadmit(admin)
-    await client.persist(key)  # what a lost EXPIRE leaves behind
+    with caplog.at_level(logging.WARNING, logger="app.runtime.llm_cap"):
+        await store.aadmit(admin)  # a fresh window: nothing to repair, nothing logged
+    assert not caplog.records
+    await client.persist(key)  # what a lost INCR reply leaves behind
     assert await client.ttl(key) == -1
-    with caplog.at_level(logging.ERROR, logger="app.runtime.llm_cap"):
+    with caplog.at_level(logging.WARNING, logger="app.runtime.llm_cap"):
         assert await store.aadmit(admin) is True
     assert 0 < await client.ttl(key) <= LLM_CAP_WINDOW_SECONDS
-    assert any("had no expiry" in r.getMessage() for r in caplog.records)
+    repaired = [r for r in caplog.records if "had no expiry" in r.getMessage()]
+    assert repaired and repaired[0].levelno == logging.WARNING
+    assert admin not in repaired[0].getMessage()  # a hashed tenant, never the raw id
     # A window that still has its expiry is left alone (no log, no extension).
     await client.expire(key, 5)
     caplog.clear()

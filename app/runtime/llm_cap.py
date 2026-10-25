@@ -22,6 +22,7 @@ and tries to bind again every ``REDIS_REBIND_INTERVAL_SECONDS``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import time
@@ -105,6 +106,13 @@ async def _close_quietly(client: Any) -> None:
             await result
     except Exception:  # noqa: BLE001 — a dead client closing badly changes nothing
         logger.debug("LLM cap: closing the redis client failed", exc_info=True)
+
+
+def _tenant_hash(admin_id: str) -> str:
+    """A log-safe tenant handle: the same sha256[:16] of the id that llm_router's
+    ``admin_id_hash`` writes on cost lines, so one tenant is one handle across logs
+    (the raw id never enters a log line)."""
+    return hashlib.sha256(admin_id.encode()).hexdigest()[:16]
 
 
 class RedisLLMCapStore:
@@ -217,12 +225,12 @@ class RedisLLMCapStore:
         key = self._key(admin_id)
         try:
             # INCR and TTL in ONE round trip: the window must always carry an expiry.
-            # It used to be set only when the INCR returned 1, so an EXPIRE that failed
-            # right after a successful INCR (a 0.5 s socket timeout on a Redis latency
-            # blip, or a task dying between the two) left a key that counted forever:
-            # the tenant's 50th call EVER was refused, and every call after it, until an
-            # operator deleted the key by hand (Phase 3 review, 2026-10-19). Now every
-            # admission repairs a window without a TTL.
+            # It used to be set only when the INCR returned 1, so a key-creating INCR
+            # whose reply was lost (the 0.5 s socket timeout, a stalled loop, a dropped
+            # connection, a task dying before its EXPIRE) left a key that counted
+            # forever: the tenant's 50th call EVER was refused, and every call after it,
+            # until an operator deleted the key by hand (Phase 3 review, 2026-10-19).
+            # Now every admission repairs a window without a TTL.
             async with client.pipeline(transaction=False) as pipe:
                 pipe.incr(key)
                 pipe.ttl(key)
@@ -230,9 +238,12 @@ class RedisLLMCapStore:
             count = int(raw_count)
             if int(raw_ttl) < 0:  # -1: no expiry; -2: gone between the two (harmless)
                 if count > 1:
-                    logger.error(
-                        "LLM cap window for %s had no expiry (count=%d); repaired to %ss",
-                        key,
+                    # A heal, not a fault (and two admissions opening one window
+                    # concurrently can land here with count=2 before the first EXPIRE):
+                    # WARNING, never the ERROR the sweep's metric filter pages on.
+                    logger.warning(
+                        "LLM cap window for tenant %s had no expiry (count=%d); repaired to %ss",
+                        _tenant_hash(admin_id),
                         count,
                         int(LLM_CAP_WINDOW_SECONDS),
                     )
