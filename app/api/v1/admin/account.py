@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_account_owner, current_admin
 from app.api.errors import conflict, unauthorized
+from app.api.v1.auth import clear_session_cookie
 from app.audit import log as audit
 from app.config import get_settings
 from app.db.session import tenant_session
@@ -281,5 +282,11 @@ async def close_account(
             context="account_close",
         )
         await cascade.close_account(s, subject.admin_id, subject.user_id)
+    # The closure revoked every session (epoch bump); the cookie this browser holds
+    # is dead, so drop it like logout and a password reset do - a later page load then
+    # meets the plain login, not a 'your session expired' claim after a deliberate
+    # closure (live walk run 7, 2026-10-25). The dashboard navigates to its own
+    # closed-account login first; the cleared cookie covers every other tab.
+    clear_session_cookie(response)
     response.status_code = 204
     return response

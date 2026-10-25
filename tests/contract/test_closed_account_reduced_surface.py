@@ -79,8 +79,15 @@ async def test_closure_kills_the_old_session_and_a_fresh_login_reads_the_account
     before = datetime.now(UTC)
     r = await client.post("/api/v1/admin/account/close", json={"confirmDeleteLuciel": True})
     assert r.status_code == 204
+    # The closure revoked every session, so the response also drops the cookie this
+    # browser holds (as logout and a password reset do): a later page load meets the
+    # plain login, never a 'session expired' claim (live walk run 7, 2026-10-25).
+    cleared = r.headers.get("set-cookie", "")
+    assert "luciel_session=" in cleared
+    assert "Max-Age=0" in cleared or "expires=" in cleared.lower()
+    assert "luciel_session" not in client.cookies
 
-    # The cookie this client still holds predates the closure: revoked, not "closed".
+    # A cookie that predates the closure (another device) is revoked, not "closed".
     assert (await client.get("/api/v1/admin/account")).status_code == 401
 
     login = await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})

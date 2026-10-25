@@ -58,10 +58,16 @@ def _set_session_cookie(response: Response, token: str) -> None:
     )
 
 
-def _clear_session_cookie(response: Response) -> None:
+def clear_session_cookie(response: Response) -> None:
+    """Tell the browser to drop the session cookie: logout, a password reset and an
+    account closure (every one of which revokes the sessions) all end here, so the
+    next page load reaches the plain login instead of a 'session expired' claim."""
     s = get_settings()
     # Domain must match the one used when setting, or the browser won't clear it.
     response.delete_cookie(key=s.session_cookie_name, path="/", domain=s.cookie_domain or None)
+
+
+_clear_session_cookie = clear_session_cookie
 
 
 def _account_out(acct: Account, *, has_luciel: bool) -> AccountOut:
