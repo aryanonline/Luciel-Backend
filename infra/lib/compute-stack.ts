@@ -646,6 +646,11 @@ export class ComputeStack extends Stack {
         }),
         environment: {
           LUCIEL_ENV: envConfig.envName,
+          // The Environment dimension of every EMF metric (app/observability/metrics.py):
+          // the ObservabilityStack's alarms filter on exactly this value. Without it the
+          // app reported 'development' everywhere and no Luciel-namespace alarm could
+          // ever fire (WP-11 skeptic, 2026-10-25).
+          LUCIEL_ENVIRONMENT: envConfig.envName,
           LUCIEL_PLANE: name,
           // JSON lines with trace_id/admin_id (F035); CloudWatch extracts the EMF
           // metric lines from the same stream (F032).
@@ -902,6 +907,11 @@ export class ComputeStack extends Stack {
       },
       environment: {
         LUCIEL_ENV: envConfig.envName,
+        // The Environment dimension of every EMF metric (app/observability/metrics.py):
+        // the ObservabilityStack's alarms filter on exactly this value. Without it the
+        // app reported 'development' everywhere and no Luciel-namespace alarm could
+        // ever fire (WP-11 skeptic, 2026-10-25).
+        LUCIEL_ENVIRONMENT: envConfig.envName,
         // Same gated cutover flag as the app: 'live' exercises real Anthropic/OpenAI.
         LUCIEL_INTEGRATION_MODE: integrationMode,
         // Wire the real Redis so the cap tests (T2/T3) exercise the Redis-backed
@@ -998,6 +1008,11 @@ export class ComputeStack extends Stack {
       },
       environment: {
         LUCIEL_ENV: envConfig.envName,
+        // The Environment dimension of every EMF metric (app/observability/metrics.py):
+        // the ObservabilityStack's alarms filter on exactly this value. Without it the
+        // app reported 'development' everywhere and no Luciel-namespace alarm could
+        // ever fire (WP-11 skeptic, 2026-10-25).
+        LUCIEL_ENVIRONMENT: envConfig.envName,
         LUCIEL_PLANE: 'sweep',
         LUCIEL_LOG_FORMAT: 'json',
         LUCIEL_INTEGRATION_MODE: integrationMode,

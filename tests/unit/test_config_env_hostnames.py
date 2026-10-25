@@ -106,7 +106,7 @@ def test_the_cdk_injects_exactly_the_settings_this_module_reads():
     source = _COMPUTE_STACK.read_text(encoding="utf-8")
     injected = set(
         re.findall(
-            r"\b(LUCIEL_(?:APP_BASE_URL|PUBLIC_API_BASE_URL|API_ORIGINS|DASHBOARD_ORIGINS))\s*:",
+            r"\b(LUCIEL_(?:APP_BASE_URL|PUBLIC_API_BASE_URL|API_ORIGINS|DASHBOARD_ORIGINS|ENVIRONMENT))\s*:",
             source,
         )
     )
@@ -115,6 +115,7 @@ def test_the_cdk_injects_exactly_the_settings_this_module_reads():
         "LUCIEL_PUBLIC_API_BASE_URL",
         "LUCIEL_API_ORIGINS",
         "LUCIEL_DASHBOARD_ORIGINS",
+        "LUCIEL_ENVIRONMENT",
     }
     for var in injected:
         assert var.removeprefix("LUCIEL_").lower() in Settings.model_fields, var

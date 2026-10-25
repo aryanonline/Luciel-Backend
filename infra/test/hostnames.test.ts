@@ -364,11 +364,14 @@ describe('the per-environment origins reach the containers', () => {
       const env = containerEnv(compute, plane);
       expect(env.LUCIEL_APP_BASE_URL).toBe(urls.app);
       expect(env.LUCIEL_PUBLIC_API_BASE_URL).toBe(urls.api);
+      // The metrics' Environment dimension is the name the alarms filter on.
+      expect(env.LUCIEL_ENVIRONMENT).toBe(envName);
       expect(JSON.parse(env.LUCIEL_DASHBOARD_ORIGINS)).toEqual(h.appNames.map((n) => `https://${n}`));
     }
     const sweep = containerEnv(compute, 'SweepTask');
     expect(sweep.LUCIEL_APP_BASE_URL).toBe(urls.app);
     expect(sweep.LUCIEL_PUBLIC_API_BASE_URL).toBe(urls.api);
+    expect(sweep.LUCIEL_ENVIRONMENT).toBe(envName);
     expect(containerEnv(compute, 'SeedTestTask').LUCIEL_API_BASE).toBe(urls.api);
     expect(containerEnv(web, 'WebTask').NEXT_PUBLIC_API_BASE_URL).toBe(urls.api);
   });
