@@ -67,6 +67,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -76,6 +77,7 @@ from app.models.conversation import EscalationEvent, Session, Transcript
 from app.models.instance import Instance
 from app.notifications.escalation_dispatch import (
     has_configured_escalation_contact,
+    relabel_scheduled_notification,
     schedule_notification_after_commit,
 )
 from app.observability.metrics import emit_metric
@@ -930,6 +932,68 @@ async def _append_escalation_reasons(
     row.reasons = merged
     await session.flush()
     return True
+
+
+async def _relabel_handoff_row(
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    session_id: uuid.UUID,
+    signal: str,
+    score: float | None,
+    reasons: list[str],
+) -> tuple[str, ...] | None:
+    """Make the hand-off row written THIS turn the row of the signal that won the turn.
+
+    ``hand_to_team`` wrote its row and queued its page at dispatch; gate 2 then fired a
+    signal the session has not had yet (today ``high_value_lead``). Live SeedTest M3
+    (2026-10-25): a hot lead asking what the knowledge cannot answer wrote TWO rows and
+    paged the owner TWICE. One row for the turn (round 7 WP-2, item 1): relabelled to
+    the winner, its score, the outcome's reasons (lead + answer quality) then the
+    hand-off's own — and the queued page re-keyed to the new label. Returns the row's
+    reasons; None when nothing was relabelled — no hand-off row, no queued page left
+    to re-key (it already started: relabelling under it would orphan its delivery
+    stamp), or a racing turn wrote the winner's row first (the unique index is the
+    arbiter). The caller then rides on the hand-off row and pages nobody."""
+    handoff = Signal.luciel_requested_handoff.value
+    row = (
+        await session.execute(
+            select(EscalationEvent).where(
+                EscalationEvent.admin_id == admin_id,
+                EscalationEvent.session_id == session_id,
+                EscalationEvent.signal == handoff,
+                EscalationEvent.gate == Gate.outcome.value,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or not relabel_scheduled_notification(
+        session, session_id=session_id, signal=handoff, new_signal=signal, score=score
+    ):
+        return None
+    merged = tuple(
+        dict.fromkeys(
+            [*reasons, "Luciel asked for a person", *(str(r) for r in (row.reasons or []))]
+        )
+    )
+    try:
+        async with session.begin_nested():
+            row.signal = signal
+            row.score_or_confidence = score
+            row.reasons = list(merged)
+            await session.flush()
+    except IntegrityError:
+        await session.refresh(row)  # the savepoint rollback expired it
+        relabel_scheduled_notification(
+            session, session_id=session_id, signal=signal, new_signal=handoff, score=None
+        )
+        return None
+    _LOG.info(
+        "escalation relabelled: session=%s %s -> %s (one row, one page)",
+        session_id,
+        handoff,
+        signal,
+    )
+    return merged
 
 
 async def record_platform_escalation(
@@ -1850,7 +1914,49 @@ class Orchestrator:
             and r.payload.get("state") == HAND_TO_TEAM_RECORDED
             for call, r in resp.dispatched
         )
-        if outcome.fired and handoff_paged and outcome.signal is Signal.cannot_answer:
+        # A signal the session has not had yet (a hot lead whose question the
+        # knowledge cannot answer — live SeedTest M3, 2026-10-25) WINS the turn: the
+        # hand-off's row becomes its row with both reason sets, and the page already
+        # queued is re-keyed to it. It used to be a second row and a second page.
+        winner = (
+            outcome.signal
+            if outcome.fired and handoff_paged and outcome.signal is not Signal.cannot_answer
+            else None
+        )
+        if winner is not None and await _session_already_escalated(
+            self.session, admin_id=admin_id, session_id=session_id, signal=winner.value
+        ):
+            winner = None  # fired earlier this session: suppressed below as before
+        relabelled = (
+            await _relabel_handoff_row(
+                self.session,
+                admin_id=admin_id,
+                session_id=session_id,
+                signal=winner.value,
+                score=outcome.score_or_confidence,
+                reasons=list(outcome.reasons),
+            )
+            if winner is not None
+            else None
+        )
+        if winner is not None and relabelled is not None:
+            escalation = EscalationDecision(
+                True,
+                winner,
+                Gate.outcome,
+                outcome.score_or_confidence,
+                relabelled,
+                answer_ungrounded=outcome.answer_ungrounded,
+                answer_reasons=outcome.answer_reasons,
+            )
+        elif (
+            outcome.fired
+            and handoff_paged
+            and (outcome.signal is Signal.cannot_answer or winner is not None)
+        ):
+            # The cannot_answer news of this turn — or a winner the row could not be
+            # relabelled for (no queued page left, a racing turn) — rides on the
+            # hand-off row; nobody is paged again.
             await _append_escalation_reasons(
                 self.session,
                 admin_id=admin_id,

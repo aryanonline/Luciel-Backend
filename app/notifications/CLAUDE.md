@@ -52,6 +52,10 @@ make that state explicit and test it.
   reads it back and a rolled-back turn pages nobody. Tracked in
   `_BACKGROUND_NOTIFICATIONS`; `drain_background_notifications()` (tests) and
   `drain_background_work()` (the FastAPI lifespan shutdown in `app/main.py`) await it.
+- SQLAlchemy 2.0 dispatches `after_commit` on a SAVEPOINT release too; the hook ignores
+  it (`in_nested_transaction()`), so a `begin_nested()` inside a turn never starts a page
+  before the outer commit. `relabel_scheduled_notification` re-keys a still-queued page
+  when its row is relabelled in the same transaction (M3 one-row fix); it never schedules.
 - A test that asserts on delivery through the loop or `_record_escalation` must exit
   the session (commit) and then `await escalation_dispatch.drain_background_notifications()`;
   `tests/conftest.py` drains leftovers at teardown so no task outlives its loop.

@@ -493,8 +493,41 @@ def schedule_notification_after_commit(
         event.listen(sync, "after_commit", _start_notifications_after_commit)
 
 
+def relabel_scheduled_notification(
+    session: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    signal: str,
+    new_signal: str,
+    score: float | None,
+) -> bool:
+    """Re-key the page(s) this session queued for ``signal`` — not started yet, they
+    start at commit — so they are sent for ``new_signal`` with ``score``. For a row
+    relabelled in the same transaction (M3, live SeedTest 2026-10-25: Luciel's own
+    hand-off and a hot lead in one turn are ONE row and ONE page): the background
+    task reads the row back by signal, so the queue must name the row's new label.
+
+    Never schedules anything. False when no queued page matches (none was queued, or
+    it already started): the caller must then leave the row's label alone rather than
+    orphan a page in flight — and must not page again."""
+    queued: list[tuple[asyncio.AbstractEventLoop, dict[str, object]]] = (
+        session.sync_session.info.get(_AFTER_COMMIT_QUEUE) or []
+    )
+    matched = False
+    for _loop, kwargs in queued:
+        if kwargs["session_id"] == session_id and kwargs["signal"] == signal:
+            kwargs["signal"] = new_signal
+            kwargs["score"] = score
+            matched = True
+    return matched
+
+
 def _start_notifications_after_commit(sync_session: SyncSession) -> None:
     """SQLAlchemy ``after_commit`` hook: the row is durable, start the delivery tasks."""
+    if sync_session.in_nested_transaction():
+        # A SAVEPOINT release dispatches ``after_commit`` too (SQLAlchemy 2.0): nothing
+        # is durable yet, so the pages wait for the outermost commit.
+        return
     queued = sync_session.info.pop(_AFTER_COMMIT_QUEUE, [])
     for loop, kwargs in queued:
         task = loop.create_task(_notify_in_own_session(**kwargs))

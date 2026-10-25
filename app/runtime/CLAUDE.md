@@ -197,8 +197,14 @@ make that state explicit and test it.
   destination of that one send, never confirmed as the lead's own (`is_own_identifier`).
 - One page per turn for one piece of news: hand_to_team recorded this turn + a
   below-floor draft → the answer reasons ride on the hand-off row (no cannot_answer row,
-  no re-page). Every canned "passed to the team" line is backed by a page: the ask bound
-  and the unfounded-claim replacement use `record_or_extend_escalation`.
+  no re-page). hand_to_team recorded this turn + a gate-2 signal the session has not had
+  (high_value_lead; live SeedTest M3, 2026-10-25) → `_relabel_handoff_row` makes the
+  hand-off row that signal's row (both reason sets + Luciel's) and
+  `relabel_scheduled_notification` re-keys its queued page; if the page is no longer
+  queued or a racing turn wrote the row, the lead reasons ride on the hand-off row
+  instead. Never a second row or page. Every canned "passed to the team" line is backed
+  by a page: the ask bound and the unfounded-claim replacement use
+  `record_or_extend_escalation`.
 - An empty draft is never sent as silence: a tool does not ground words never written
   (the honest hand-off goes out), except a confirmed booking/move/cancel, read back from
   its payload ("Here are the details: …").
