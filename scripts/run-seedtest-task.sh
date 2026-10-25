@@ -104,7 +104,10 @@ echo "[seedtest] log group: $log_group  stream: $stream"
 # once — every message on its own line, the SUMMARY again at the end, and the same
 # SUMMARY plus every [FAIL]/[SKIP] into the GitHub job summary when there is one.
 logs='{"events": []}'
-for _ in 1 2 3 4 5 6; do
+# Up to two minutes: the 2026-10-25 Phase 3 deploy's strict run passed on exit code 0
+# but the stream was still empty 30 s after the task stopped, so the job summary
+# said 'SUMMARY missing' about a run that had passed.
+for _ in $(seq 1 24); do
   sleep 5
   logs=$(aws logs filter-log-events --region "$REGION" --log-group-name "$log_group" \
     --log-stream-names "$stream" --output json 2>/dev/null || echo '{"events": []}')

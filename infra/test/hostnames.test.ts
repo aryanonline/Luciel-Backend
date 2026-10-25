@@ -192,7 +192,9 @@ describe('certificates cover every name the environment answers on', () => {
     }
   });
 
-  test("dev keeps the retiring embed.vantagemind.ai cert for the one deploy that moves off it", () => {
+  test("dev holds only the wildcard embed cert now - the retiring embed.vantagemind.ai cert is gone", () => {
+    // Kept through the Phase 3 deploy (the distribution could not drop a cert still in
+    // use); retired on 2026-10-25 once the distribution was confirmed on EmbedCert.
     const app = new App();
     const t = Template.fromStack(
       new WidgetCertStack(app, 'WidgetCert', {
@@ -200,8 +202,8 @@ describe('certificates cover every name the environment answers on', () => {
         envConfig: getEnvConfig('dev'),
       }),
     );
-    t.resourceCountIs('AWS::CertificateManager::Certificate', 2);
-    t.hasResourceProperties('AWS::CertificateManager::Certificate', { DomainName: 'embed.vantagemind.ai' });
+    t.resourceCountIs('AWS::CertificateManager::Certificate', 1);
+    t.hasResourceProperties('AWS::CertificateManager::Certificate', { DomainName: '*.vantagemind.ai' });
   });
 });
 

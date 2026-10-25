@@ -75,6 +75,9 @@ describe('Residency lock holds for new stacks (§4.2 / LD 21)', () => {
     t.hasResourceProperties('AWS::CertificateManager::Certificate', {
       DomainName: '*.vantagemind.ai',
     });
+    // ONE certificate: the embed.vantagemind.ai-only cert dev held through the Phase 3
+    // deploy was retired on 2026-10-25.
+    t.resourceCountIs('AWS::CertificateManager::Certificate', 1);
     expect(JSON.stringify(t.findConditions('*'))).not.toContain(OFFERING_REGION);
   });
 });

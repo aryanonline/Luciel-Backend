@@ -35,7 +35,7 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-import { APEX_DOMAIN, EnvConfig, OFFERING_REGION, PUBLIC_HOSTNAMES, hostnames, recordIdFor } from './env-config';
+import { APEX_DOMAIN, EnvConfig, OFFERING_REGION, hostnames, recordIdFor } from './env-config';
 import { importPublicZone } from './dns-stack';
 import { ResidencyGuard } from './residency';
 
@@ -72,17 +72,9 @@ export class WidgetCertStack extends Stack {
       validation: acm.CertificateValidation.fromDns(hostedZone),
     });
 
-    // RETIRING (round 7 WP-8b): dev's distribution held this embed.vantagemind.ai-only
-    // cert until the deploy that moves it to EmbedCert. This stack deploys BEFORE the
-    // distribution switches, so deleting it in that same deploy would hit a cert still
-    // in use. It stays, unreferenced, for that one deploy; remove it (and this block)
-    // in the next change. Unchanged properties, so this deploy does not touch it.
-    if (props.envConfig.envName === 'dev') {
-      new acm.Certificate(this, 'WidgetCert', {
-        domainName: PUBLIC_HOSTNAMES.embed,
-        validation: acm.CertificateValidation.fromDns(hostedZone),
-      });
-    }
+    // The embed.vantagemind.ai-only cert dev's distribution used to hold was retired
+    // here on 2026-10-25, one deploy after the distribution moved to EmbedCert (the
+    // Phase 3 deploy; confirmed in use on the wildcard, the old one unreferenced).
   }
 }
 
