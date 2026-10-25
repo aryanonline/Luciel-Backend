@@ -92,12 +92,18 @@ export class EdgeStack extends Stack {
         },
         {
           // Per-IP rate ceiling - denial-of-wallet backstop at the edge (§3.1.5).
+          // The public product's limit (2000 per 5 min) applies to whichever environment
+          // serves the public names, not only to prod: dev owns them today (D6), and at
+          // 500 the live walk's dashboard session - and an office NAT of widget visitors
+          // - tripped it (walk run 6, 2026-10-25: the Delete request came back as a WAF
+          // 403 the browser reported as a CORS error). The app keeps its own per-IP
+          // buckets on the sensitive routes.
           name: 'RateLimitPerIp',
           priority: 3,
           action: { block: {} },
           statement: {
             rateBasedStatement: {
-              limit: envConfig.envName === 'prod' ? 2000 : 500,
+              limit: envConfig.envName === 'prod' || envConfig.ownsPublicApex ? 2000 : 500,
               aggregateKeyType: 'IP',
             },
           },

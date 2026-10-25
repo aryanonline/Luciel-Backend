@@ -171,6 +171,19 @@ describe('Edge layer / WAF (§5.6 — closes audit M2)', () => {
     });
   });
 
+  test("the per-IP ceiling is the public product's (2000 per 5 min) wherever the public names are served", () => {
+    // dev owns the public names today (D6): at 500 a dashboard session or an office
+    // NAT of widget visitors tripped the rule (live walk run 6, 2026-10-25).
+    buildEdge().hasResourceProperties('AWS::WAFv2::WebACL', {
+      Rules: Match.arrayWith([
+        Match.objectLike({
+          Name: 'RateLimitPerIp',
+          Statement: { RateBasedStatement: Match.objectLike({ Limit: 2000, AggregateKeyType: 'IP' }) },
+        }),
+      ]),
+    });
+  });
+
   test('WAF is associated to the ALB', () => {
     buildEdge().resourceCountIs('AWS::WAFv2::WebACLAssociation', 1);
   });
