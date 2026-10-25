@@ -26,7 +26,8 @@ Usage (from the backend repo, with AWS credentials for the target account):
     # Pre-deploy: what the runtime will refuse or report degraded (no secret values).
     # The API origins default to the environment's own (api-dev + the public api for
     # dev, the public api for prod — infra/lib/env-config.ts `hostnames`).
-    python scripts/merge_platform_secret.py --env dev --check
+    python scripts/merge_platform_secret.py --env dev --check          # posture
+    python scripts/merge_platform_secret.py --env dev --check --live   # + live-boot gates
 """
 
 from __future__ import annotations
@@ -77,7 +78,9 @@ ENV_API_ORIGINS: dict[str, tuple[str, ...]] = {
 }
 
 
-def check_blob(blob: dict[str, Any], *, api_base: str, api_origins: str = "") -> list[str]:
+def check_blob(
+    blob: dict[str, Any], *, api_base: str, api_origins: str = "", live: bool = False
+) -> list[str]:
     """What this blob's PROVIDER posture will look like to the runtime — printed before a
     deploy rather than discovered on /healthz after it (round 7 WP-7).
 
@@ -115,6 +118,23 @@ def check_blob(blob: dict[str, Any], *, api_base: str, api_origins: str = "") ->
         )
     if settings.meta_app_configured and not settings.meta_app_secret:
         findings.append("META_APP_SECRET missing for a provisioned Meta app (live boot refuses)")
+    if live:
+        # The live-only gates (JWT key, Stripe webhook secret, the required platform
+        # keys, a malformed blob): what a LIVE task would refuse to boot on. The
+        # refusal names keys, never values. A refused boot rolls the Compute stack
+        # back on its circuit breaker — better read here than there.
+        from app.config import PlatformSecretError  # noqa: PLC0415
+
+        try:
+            Settings(
+                _env_file=None,
+                integration_mode="live",
+                public_api_base_url=api_base,
+                api_origins=api_origins,
+                platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
+            )
+        except (RuntimeError, PlatformSecretError) as exc:
+            findings.append(f"live boot refused: {exc}")
     return findings
 
 
@@ -163,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="with --check: the API origin the task is injected with (default: the "
         "environment's own, see ENV_API_ORIGINS)",
+    )
+    ap.add_argument(
+        "--live",
+        action="store_true",
+        help="with --check: also say what a LIVE task would refuse to boot on (keys only)",
     )
     ap.add_argument(
         "--api-origins",
@@ -216,7 +241,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.check:
         print(f"redirect URIs judged against: {args.api_origins or args.api_base}")
-        findings = check_blob(blob, api_base=args.api_base, api_origins=args.api_origins)
+        findings = check_blob(
+            blob, api_base=args.api_base, api_origins=args.api_origins, live=args.live
+        )
         for line in findings:
             print(line)
         print(f"{len(findings)} finding(s) in {secret_id}")

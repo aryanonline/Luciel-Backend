@@ -307,6 +307,22 @@ def test_check_names_a_graph_version_the_runtime_would_refuse_to_boot_on(
     assert _run(monkeypatch, "", "--check") == 0
 
 
+def test_check_live_names_what_a_live_task_would_refuse_to_boot_on(
+    monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager, capsys
+) -> None:
+    """--check --live (Phase 3 infra review, owner step 3): the live-only gates are
+    read here, by key, instead of as a Compute rollback on the circuit breaker."""
+    monkeypatch.delenv("LUCIEL_JWT_SIGNING_KEY", raising=False)
+    fake_aws.blob = {"META_APP_ID": "fb-cid", "META_VERIFY_TOKEN": "do-not-print-me"}
+    assert _run(monkeypatch, "", "--check", "--live") == 1
+    out = capsys.readouterr().out
+    assert "live boot refused:" in out
+    assert "do-not-print-me" not in out
+    # The same blob without --live reports only the posture findings.
+    assert _run(monkeypatch, "", "--check") in (0, 1)
+    assert "live boot refused:" not in capsys.readouterr().out
+
+
 def test_check_refuses_to_judge_redirect_uris_against_nothing(
     monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager
 ) -> None:
