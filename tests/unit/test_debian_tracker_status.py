@@ -10,6 +10,7 @@ no-dsa note and a sid fix; and the tracker's 404 page).
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import sys
@@ -142,3 +143,39 @@ def test_the_shipped_allowlist_yields_one_target_per_waiver():
     waivers = json.loads(shipped.read_text(encoding="utf-8"))["allow"]
     targets = tracker.targets_from(shipped, [], [])
     assert [t.cve for t in targets] == [w["cve"] for w in waivers]
+
+
+def test_a_truncated_page_is_one_unreachable_row_not_a_lost_table(monkeypatch):
+    """http.client's IncompleteRead (and BadStatusLine, LineTooLong) is an
+    HTTPException, not an OSError: it used to escape fetch(), unwind to main() and
+    replace the WHOLE evidence table with "(not gathered ...)" (Phase 3 review)."""
+
+    class _Truncated:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"<html>")
+
+    monkeypatch.setattr(tracker.urllib.request, "urlopen", lambda *_a, **_k: _Truncated())
+    assert tracker.fetch("CVE-2026-85091", 1) == ("tracker unreachable", None)
+
+
+def test_a_fetcher_surprise_is_one_row_and_the_other_rows_survive():
+    targets = [
+        tracker.Target("CVE-2026-19499", "waived until 2026-11-16", "glibc"),
+        tracker.Target("CVE-2026-85091", "waived until 2026-10-31", "zlib"),
+    ]
+
+    def fetcher(cve: str) -> tuple[str, str | None]:
+        if cve == "CVE-2026-85091":
+            raise http.client.BadStatusLine("garbage")
+        return "ok", _page(cve)
+
+    report = tracker.build_report(targets, ("trixie", "forky", "sid"), fetcher, NOW)
+    zlib = next(line for line in report.splitlines() if "CVE-2026-85091" in line)
+    assert "tracker unreachable (BadStatusLine)" in zlib
+    assert "| glibc | trixie | 2.41-12+deb13u4 |" in report

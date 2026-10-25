@@ -50,7 +50,8 @@ def test_the_poster_uses_the_title_the_steward_reads_and_matches_it_exactly():
     script = (ROOT / POSTER).read_text(encoding="utf-8")
     assert 'title="Dependency & CVE review $month"' in script
     assert 'month="${REVIEW_MONTH:-$(date -u +%Y-%m)}"' in script
-    assert 'select(.title == \\"$title\\")' in script, "substring search needs an exact match"
+    assert '.title == \\"$title\\"' in script, "the list needs an exact-title match"
+    assert "select(.pull_request == null" in script, "the REST list carries pull requests too"
     assert "--label dependencies" in script
 
 
@@ -115,7 +116,7 @@ def test_the_poster_comments_on_the_open_issue_or_opens_one(tmp_path, existing, 
     fake.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "$*" >> "{log}"\n'
-        f'if [ "$1 $2" = "issue list" ]; then echo "{existing}"; fi\n',
+        f'if [ "$1" = "api" ]; then echo "{existing}"; fi\n',
         encoding="utf-8",
     )
     fake.chmod(0o755)
@@ -129,5 +130,26 @@ def test_the_poster_comments_on_the_open_issue_or_opens_one(tmp_path, existing, 
     }
     subprocess.run(["bash", str(ROOT / POSTER), str(body)], env=env, check=True)
     calls = log.read_text(encoding="utf-8").splitlines()
-    assert calls[0].startswith("issue list --repo o/r --state open --search")
+    # The REST issues list, never the search index (`issue list --search` AND
+    # `--label` both go through it): it is eventually consistent, and two posters
+    # firing on the same 1st would each open the month's issue.
+    assert calls[0].startswith("api --paginate --slurp repos/o/r/issues?state=open")
+    assert "--search" not in calls[0] and "--label" not in calls[0]
+    assert "issue list" not in calls[0]
     assert expected in calls[1]
+
+
+def test_the_monthly_review_posts_well_before_the_steward_reads_the_issue():
+    """The monthly steward routine (trig_018yawGTMcKu3vRbgVSy6SgQ, `0 13 1 * *`) reads
+    the month's issue at 13:00 UTC on the 1st, and GitHub fires this repository's
+    schedules 4-9 hours late. The review's cron must leave at least ten hours of
+    headroom, or its drift and tracker sections land after their reader has been
+    (2026-10-01: a 07:00 cron ran at 14:09Z)."""
+    review = _workflow("dependency-review.yml")
+    crons = [entry["cron"] for entry in review[True]["schedule"]]
+    assert crons, "the monthly review must stay scheduled"
+    for cron in crons:
+        minute, hour, day = cron.split()[:3]
+        assert day == "1", cron
+        assert int(hour) <= 3, f"{cron}: too close to the steward's 13:00 UTC read"
+        assert 0 <= int(minute) < 60, cron

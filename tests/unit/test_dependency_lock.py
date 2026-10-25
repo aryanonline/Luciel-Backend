@@ -128,3 +128,16 @@ def test_dependabot_maintains_the_lockfile_not_only_the_ranges():
     ecosystems = re.findall(r"package-ecosystem:\s*(\S+)", text)
     assert "uv" in ecosystems
     assert "pip" not in ecosystems, "the pip updater leaves uv.lock stale"
+
+
+def test_fastapis_deliberate_ceiling_is_kept_out_of_the_uv_group():
+    """The uv updater folds a pyproject range widening into the weekly group PR, whose
+    title the auto-merge classifier honours without its 0.x-is-major rule. fastapi's
+    ceiling is a person's call (a 0.137 bump once dropped include_router routes), so
+    it is excluded from the group and arrives standalone, classified and labelled
+    (Phase 3 review, 2026-10-19)."""
+    text = DEPENDABOT.read_text(encoding="utf-8")
+    uv_block = text.split("package-ecosystem: uv", 1)[1].split("package-ecosystem:", 1)[0]
+    m = re.search(r"exclude-patterns:\s*\[([^\]]*)\]", uv_block)
+    assert m, "the uv group must exclude fastapi"
+    assert "fastapi" in [p.strip().strip("'\"") for p in m.group(1).split(",")]

@@ -19,7 +19,12 @@ name: dependency-review
 
 on:
   schedule:
-    - cron: '0 7 1 * *'
+    # 02:00 UTC on the 1st: the monthly steward routine reads this issue at 13:00 UTC
+    # the same day, and GitHub fires this repository's schedules 4-9 hours late
+    # (the 2026-10-01 run started 14:09Z from a 07:00 cron - after the steward had
+    # read the month's issue). The headroom keeps the drift and tracker sections
+    # ahead of their reader (Phase 3 review, 2026-10-19).
+    - cron: '0 2 1 * *'
   workflow_dispatch: {}
 
 permissions:

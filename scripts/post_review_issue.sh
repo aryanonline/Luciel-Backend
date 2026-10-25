@@ -20,10 +20,15 @@ REPO="${REPO:-${GITHUB_REPOSITORY:?REPO or GITHUB_REPOSITORY}}"
 month="${REVIEW_MONTH:-$(date -u +%Y-%m)}"
 title="Dependency & CVE review $month"
 
-# Exact-title match: the search is a substring search, and a month's issue must not
-# be confused with a differently titled one that merely contains this text.
-existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" \
-  --json number,title --jq "[.[] | select(.title == \"$title\")][0].number")
+# Exact-title match over the REST issues list, which is read-after-write consistent.
+# `gh issue list --search`, and even `--label`, go through GitHub's search index,
+# which is eventually consistent: an issue another poster opened moments ago could
+# be missed and the month would get two issues (ci.yml's failure poster, the weekly
+# image-rebuild and this monthly review can all fire on the same 1st). The list
+# carries pull requests too, so they are filtered out; no label filter, so an issue
+# a person or the steward routine opened without one is still found.
+existing=$(gh api --paginate --slurp "repos/$REPO/issues?state=open&per_page=100" \
+  --jq "[.[][] | select(.pull_request == null and .title == \"$title\")][0].number")
 if [ -n "$existing" ] && [ "$existing" != "null" ]; then
   gh issue comment "$existing" --repo "$REPO" --body-file "$BODY"
   echo "commented on #$existing ($title)"

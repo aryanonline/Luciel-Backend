@@ -16,7 +16,12 @@
 # `uv lock --check` then fails the PR), and it never moves a locked version that is
 # already inside its range. PR titles keep the same shapes ("Bump X from A to B",
 # "Update X requirement from S to T", the grouped "minor-and-patch group") that
-# dependabot-auto-merge.yml classifies.
+# dependabot-auto-merge.yml classifies — but the GROUP's content changed: the uv
+# updater folds a pyproject range widening into the weekly group PR, where the
+# classifier honours the group title without its 0.x-is-major rule. A deliberate
+# 0.x ceiling (fastapi, pyproject.toml) is therefore kept OUT of the group so its
+# bumps arrive standalone, classified by the 0.x rule and labelled for a person
+# (Phase 3 review, 2026-10-19; the 2026-09-28 note in dependabot-auto-merge.yml).
 version: 2
 updates:
   - package-ecosystem: uv
@@ -32,6 +37,8 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+        # fastapi's 0.x ceiling is a person's call (see the header comment).
+        exclude-patterns: [fastapi]
 
   - package-ecosystem: github-actions
     directory: /

@@ -22,6 +22,7 @@ the exit code is always 0 — evidence gathering must not turn into an outage.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import sys
@@ -223,7 +224,17 @@ def fetch(cve: str, timeout: float) -> tuple[str, str | None]:
             return "ok", response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         return ("not in tracker" if exc.code == 404 else "tracker unreachable"), None
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    # http.client's IncompleteRead / BadStatusLine / LineTooLong are HTTPException,
+    # NOT OSError, and urllib re-raises only OSError as URLError: without this clause
+    # one truncated page unwound to main() and replaced the WHOLE table with
+    # "(not gathered ...)" (Phase 3 review, 2026-10-19).
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        OSError,
+        ValueError,
+    ):
         return "tracker unreachable", None
 
 
@@ -252,7 +263,10 @@ def build_report(
     ]
     for target in targets:
         lead = f"| [{target.cve}]({TRACKER}{target.cve}) | {_cell(target.why)} "
-        outcome, html = fetcher(target.cve)
+        try:
+            outcome, html = fetcher(target.cve)
+        except Exception as exc:  # one CVE's surprise is one row, never the whole table
+            outcome, html = f"tracker unreachable ({type(exc).__name__})", None
         if outcome != "ok" or html is None:
             lines.append(f"{lead}| {_cell(target.package or '')} | | | {outcome} | |")
             continue

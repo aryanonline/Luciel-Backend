@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
+
+from packaging.requirements import Requirement
 
 _ROOT = Path(__file__).parents[2]
 _SPEC = importlib.util.spec_from_file_location("lock_drift", _ROOT / "scripts" / "lock_drift.py")
@@ -70,7 +73,18 @@ def test_an_unreadable_input_never_fails_the_job(tmp_path, capsys):
 
 
 def test_the_shipped_pyproject_ranges_are_read():
-    ranges = drift.direct_ranges(_ROOT / "pyproject.toml")
-    assert ranges["fastapi"] == ">=0.138,<0.142"
-    assert ranges["psycopg"] == ">=3.2"
+    """The parser reads the ranges pyproject.toml ships TODAY, checked against an
+    independent parse (``packaging``) — never a literal. Dependabot's uv updater moves
+    the fastapi ceiling inside its weekly group PR, and a literal pin here turned every
+    such PR red with auto-merge silently "leaving it" (PR #72, 2026-10-19; Phase 3
+    review)."""
+    pyproject = _ROOT / "pyproject.toml"
+    ranges = drift.direct_ranges(pyproject)
+    project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+    shipped = {Requirement(raw).name: Requirement(raw).specifier for raw in project["dependencies"]}
+    for name in ("fastapi", "psycopg"):
+        assert set(ranges[name].split(",")) == {str(spec) for spec in shipped[name]}, name
+    # The deliberate fastapi ceiling (a 0.137 bump once dropped include_router routes)
+    # is still a ceiling, whatever version it names this week.
+    assert any(spec.operator == "<" for spec in shipped["fastapi"])
     assert ranges["ruff"].endswith("(dev)")
