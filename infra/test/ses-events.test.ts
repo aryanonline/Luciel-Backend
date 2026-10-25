@@ -19,7 +19,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
-import { getEnvConfig, OFFERING_REGION, APEX_DOMAIN, baseUrls } from '../lib/env-config';
+import { getEnvConfig, OFFERING_REGION, APEX_DOMAIN, hostnames } from '../lib/env-config';
 import type { EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
@@ -104,10 +104,14 @@ describe.each<EnvName>(['dev', 'prod'])('SES events pipeline (%s)', (envName) =>
     }
   });
 
-  test('the events topic has an HTTPS subscription to the events webhook', () => {
+  test('the events topic has an HTTPS subscription to the events webhook, on the API name that does not move', () => {
+    // SNS replaces a subscription whose endpoint changes and the route confirms only
+    // in live mode (Phase 3 infra review): the public api name while this environment
+    // serves it (dev today), its own name otherwise (prod).
+    const names = hostnames(envName).apiNames;
     template.hasResourceProperties('AWS::SNS::Subscription', {
       Protocol: 'https',
-      Endpoint: `${baseUrls(envName).api}/api/v1/webhooks/ses/events`,
+      Endpoint: `https://${names[names.length - 1]}/api/v1/webhooks/ses/events`,
     });
   });
 
@@ -194,9 +198,10 @@ describe.each<EnvName>(['dev', 'prod'])('SES inbound codification (%s)', (envNam
     template.hasResourceProperties('AWS::SNS::Topic', {
       TopicName: `luciel-${envName}-ses-inbound-v2`,
     });
+    const names = hostnames(envName).apiNames;
     template.hasResourceProperties('AWS::SNS::Subscription', {
       Protocol: 'https',
-      Endpoint: `${baseUrls(envName).api}/api/v1/webhooks/ses/inbound`,
+      Endpoint: `https://${names[names.length - 1]}/api/v1/webhooks/ses/inbound`,
     });
   });
 });

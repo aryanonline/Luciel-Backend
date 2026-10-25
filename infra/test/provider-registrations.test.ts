@@ -71,14 +71,20 @@ describe.each<EnvName>(['dev', 'prod'])('provider-facing origin (%s)', (envName)
     },
   );
 
-  test('it is the origin the SES SNS subscriptions are registered against', () => {
+  test('the SES SNS subscriptions are registered against an origin the environment serves (the one that does not move)', () => {
+    // SNS replaces a subscription whose endpoint changes, and the routes confirm only in
+    // live mode (Phase 3 infra review): the public api name while this environment
+    // serves it, its own name otherwise - always one of LUCIEL_API_ORIGINS.
     const subscriptions = Object.values(template.findResources('AWS::SNS::Subscription')).map(
       (s) => (s as { Properties: { Endpoint: string } }).Properties.Endpoint,
     );
     expect(subscriptions.length).toBeGreaterThan(0);
+    const served = String(envValue(template, 'data-planeContainer', 'LUCIEL_API_ORIGINS')).split(',');
+    const stable = served[served.length - 1];
     for (const endpoint of subscriptions) {
-      expect(endpoint.startsWith(`${envValue(template, 'data-planeContainer', 'LUCIEL_PUBLIC_API_BASE_URL')}/`)).toBe(true);
+      expect(endpoint.startsWith(`${stable}/`)).toBe(true);
     }
+    if (envName === 'dev') expect(stable).toBe('https://api.vantagemind.ai');
   });
 });
 
@@ -115,11 +121,16 @@ describe.each<EnvName>(['dev', 'prod'])('frontend runtime config (%s)', (envName
   const template = buildCompute(envName);
 
   test.each(['data-planeContainer', 'control-planeContainer'])(
-    '%s carries the widget embed URL GET /api/v1/public/config serves',
+    '%s carries the widget embed URL GET /api/v1/public/config serves: the PUBLIC host while the environment serves it',
     (container) => {
+      // widget-stack.ts (D6): the customer-facing snippet names the public host until
+      // a production environment claims it — a pasted dev-only host would keep
+      // loading dev's bundle after the cutover (Phase 3 infra review).
+      const embeds = hostnames(envName).embedNames;
       expect(envValue(template, container, 'LUCIEL_WIDGET_EMBED_URL')).toBe(
-        `https://${hostnames(envName).embed}/v1/luciel.js`,
+        `https://${embeds[embeds.length - 1]}/v1/luciel.js`,
       );
+      if (envName === 'dev') expect(embeds[embeds.length - 1]).toBe('embed.vantagemind.ai');
     },
   );
 

@@ -336,7 +336,10 @@ describe('records: every name aliases to the right target', () => {
     const { compute } = synth('dev');
     const apiRecords = Object.keys(compute.findResources('AWS::Route53::RecordSet'));
     for (const sub of Object.values(compute.findResources('AWS::SNS::Subscription')) as Res[]) {
-      expect(sub.Properties.Endpoint).toMatch(/^https:\/\/api-dev\.vantagemind\.ai\//);
+      // The endpoint stays on the public api name while dev serves it (SNS would
+      // replace a subscription whose endpoint moved - Phase 3 infra review); the
+      // records it waits for include that name's own.
+      expect(sub.Properties.Endpoint).toMatch(/^https:\/\/api\.vantagemind\.ai\//);
       expect(sub.DependsOn).toEqual(expect.arrayContaining(apiRecords));
     }
   });

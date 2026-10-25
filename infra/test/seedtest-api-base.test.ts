@@ -17,7 +17,7 @@ import { NetworkingStack } from '../lib/networking-stack';
 import { SecurityStack } from '../lib/security-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
-import { getEnvConfig, OFFERING_REGION, baseUrls, EnvName } from '../lib/env-config';
+import { getEnvConfig, OFFERING_REGION, baseUrls, hostnames, EnvName } from '../lib/env-config';
 
 const ENV = { account: '111111111111', region: OFFERING_REGION };
 
@@ -88,10 +88,12 @@ describe('the harness origin is per environment (D6)', () => {
   });
 
   test.each<EnvName>(['dev', 'prod'])(
-    '%s: the SES webhook subscriptions name the same origin the harness drives',
+    '%s: the SES webhook subscriptions name an origin the environment serves (the one that does not move)',
     (envName) => {
+      const names = hostnames(envName).apiNames;
+      expect(names.map((n) => `https://${n}`)).toContain(baseUrls(envName).api);
       buildCompute(envName).hasResourceProperties('AWS::SNS::Subscription', {
-        Endpoint: `${baseUrls(envName).api}/api/v1/webhooks/ses/events`,
+        Endpoint: `https://${names[names.length - 1]}/api/v1/webhooks/ses/events`,
       });
     },
   );

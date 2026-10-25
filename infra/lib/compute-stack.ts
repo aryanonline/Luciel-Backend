@@ -405,6 +405,12 @@ export class ComputeStack extends Stack {
     const names = hostnames(envConfig.envName);
     const urls = baseUrls(envConfig.envName);
     const publicApiBaseUrl = urls.api;
+    // SNS REPLACES a subscription whose endpoint changes (a new PendingConfirmation
+    // one; the confirmed one is deleted in the stack's cleanup) and the SES routes
+    // confirm only in live mode. The SES subscriptions therefore name the API origin
+    // that does not move with the dual-host step: the public api name while this
+    // environment serves it, its own name otherwise (Phase 3 infra review).
+    const sesCallbackOrigin = `https://${names.apiNames[names.apiNames.length - 1]}`;
     // Every API origin this environment serves (dev: api-dev plus the public api name
     // while it still owns it): a registered OAuth redirect URI is valid on any of them.
     const apiOrigins = names.apiNames.map((name) => `https://${name}`).join(',');
@@ -476,7 +482,7 @@ export class ComputeStack extends Stack {
     const sesEventsSubscription = new sns.Subscription(this, 'SesEventsHttpsSubscription', {
       topic: sesEventsTopic,
       protocol: sns.SubscriptionProtocol.HTTPS,
-      endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/events`,
+      endpoint: `${sesCallbackOrigin}/api/v1/webhooks/ses/events`,
     });
 
     // --- SES inbound for platform reply addresses (codified console state) ---------
@@ -584,7 +590,7 @@ export class ComputeStack extends Stack {
     const sesInboundSubscription = new sns.Subscription(this, 'SesInboundHttpsSubscription', {
       topic: sesInboundTopic,
       protocol: sns.SubscriptionProtocol.HTTPS,
-      endpoint: `${publicApiBaseUrl}/api/v1/webhooks/ses/inbound`,
+      endpoint: `${sesCallbackOrigin}/api/v1/webhooks/ses/inbound`,
     });
 
     // The inbound topics the app's SES inbound route pins (SES_INBOUND_TOPIC_ARN,
@@ -710,7 +716,10 @@ export class ComputeStack extends Stack {
           // The widget embed script the dashboard's snippet names, served to the
           // frontend by GET /api/v1/public/config (round 7 WP-7) — the CDN host
           // WidgetStack publishes luciel.js under.
-          LUCIEL_WIDGET_EMBED_URL: `https://${names.embed}/v1/luciel.js`,
+          // The customer-facing embed snippet keeps naming the PUBLIC host while this
+          // environment serves it (widget-stack.ts, D6): a site that pasted a dev-only
+          // host would keep loading dev's bundle after the cutover.
+          LUCIEL_WIDGET_EMBED_URL: `https://${names.embedNames[names.embedNames.length - 1]}/v1/luciel.js`,
         },
         secrets: {
           LUCIEL_DB_SECRET: ecs.Secret.fromSecretsManager(dbSecret),
