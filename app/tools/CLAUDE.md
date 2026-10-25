@@ -96,12 +96,16 @@ make that state explicit and test it.
 - `slot_in_past`: `calendar_backend.ensure_not_past` (both backends, before any read or
   write; the start is read on the business's clock; `PAST_SLOT_TOLERANCE` = 2 min of clock
   skew) raises `SlotInPast`, which Book/Reschedule map to `failed("slot_in_past")`. A slot
-  that started inside the tolerance books on Google and stays a `slot_conflict` on Calendly
-  (Calendly no longer offers it). `catalog.FAILURE_READBACK` is the reason → read-back copy
-  catalog; the orchestrator's `_tool_result_feedback` adds it as `means` beside `reason`.
-- Calendly link/reschedule end = the chosen event type's OWN length: the connection row's
-  `eventTypeDurationMinutes` (written by PUT /connections/{id}/settings), else Calendly's
-  event types, else NO end on the payload (never the 30-minute default).
+  that started inside the tolerance books on Google; on Calendly (which no longer offers
+  it) it is `slot_in_past` too — never a `slot_conflict` the model would explain as
+  "someone just took it" (Phase 3 review). `catalog.FAILURE_READBACK` is the reason →
+  read-back copy catalog; the orchestrator's `_tool_result_feedback` adds it as `means`
+  beside `reason`.
+- Calendly link/reschedule end = the chosen event type's OWN length: Calendly's event
+  types are asked FIRST (the owner may have re-timed the type since picking it), the
+  connection row's `eventTypeDurationMinutes` (written by PUT /connections/{id}/settings)
+  is the fallback when Calendly cannot answer, else NO end on the payload (never the
+  30-minute default).
 - No business zone: `stamp_zone` labels every confirming payload `timezone: "UTC"`,
   check_availability carries `timezone` (zone name or `UTC`), and schedule_callback's ok
   adds `fireAtBusinessTime` + `timezone` beside the raw `fireAt` (`_callback_readback`;

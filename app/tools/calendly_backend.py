@@ -214,18 +214,18 @@ class CalendlyBackend:
     async def _event_minutes(self, cred: CalendlyCredentials) -> int | None:
         """The chosen event type's OWN length (round 7 M10): a booking link's end used
         to be start + the generic 30-minute default whatever the event type was — a
-        60-minute consultation read back as ending half an hour early. The length on
-        file wins; else Calendly is asked; None when neither can say (the payload then
-        names no end rather than a guessed one)."""
-        if cred.event_duration_minutes:
-            return cred.event_duration_minutes
+        60-minute consultation read back as ending half an hour early. Calendly is
+        asked first (the owner may have re-timed the event type there since picking
+        it; the length recorded at pick time is a snapshot, not a source); the recorded
+        length is the fallback when Calendly cannot answer; None when neither can say
+        (the payload then names no end rather than a guessed one). Phase 3 review."""
         try:
             types = await self._api.event_types(cred, cred.user_uri)
         except CalendlyUnavailable:
-            return None
+            return cred.event_duration_minutes or None
         match = next((t for t in types if t.uri == cred.event_type_uri), None)
         if match is None or match.duration_minutes <= 0:
-            return None
+            return cred.event_duration_minutes or None
         return match.duration_minutes
 
     async def free_busy(self, ctx: ToolContext, window: str) -> list[str]:
@@ -258,7 +258,12 @@ class CalendlyBackend:
         # Gone by (beyond the clock-skew tolerance) -> failed("slot_in_past"), M10.
         calendar_backend.ensure_not_past(start)
         if start <= calendar_backend.now_utc():
-            return None  # started seconds ago: Calendly no longer offers it -> conflict
+            # Started seconds ago, inside the tolerance. Google can still write such a
+            # booking; Calendly cannot (available_times refuses a past start), and it
+            # used to come back as a CONFLICT the model explained as "someone just took
+            # it" - a fabricated reason. The honest one is that the time has gone by
+            # (Phase 3 review, 2026-10-19).
+            raise calendar_backend.SlotInPast(start)
         times = await self._api.available_times(
             cred, cred.event_type_uri, start, start + timedelta(minutes=1)
         )

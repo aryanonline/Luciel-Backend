@@ -168,12 +168,15 @@ async def test_calendly_a_past_slot_and_a_move_into_the_past_are_slot_in_past():
     assert moved.outcome is Outcome.failed
     assert moved.reason == catalog.SLOT_IN_PAST
 
-    # Started seconds ago (inside the skew tolerance): Calendly no longer offers it —
-    # that stays a conflict, never a link to a time already running.
+    # Started seconds ago (inside the skew tolerance): Google could still write it,
+    # Calendly cannot (it no longer offers the slot) — and that is the time having
+    # gone by, never a conflict the model would explain as "someone just took it"
+    # (Phase 3 review). No link to a time already running either way.
     started = await catalog.BookAppointmentTool(_Calendly(api)).execute(
         {"slot": (NOW - timedelta(seconds=30)).isoformat(), "email": LEAD}, ctx
     )
-    assert started.reason == catalog.SLOT_CONFLICT
+    assert started.outcome is Outcome.failed
+    assert started.reason == catalog.SLOT_IN_PAST
 
 
 # --- the read-back copy ---------------------------------------------------------------
@@ -216,10 +219,13 @@ async def test_calendly_the_link_end_is_the_event_types_own_length():
     assert link["end"] == "2026-10-08T16:00:00-04:00"  # 60 minutes, not the 30 default
     assert api.type_lookups == 1
 
-    # A length on file (recorded when the owner chose the event type) is used as is.
+    # A length on file (recorded when the owner chose the event type) is a snapshot,
+    # not a source: Calendly is asked again and its CURRENT length wins, so an event
+    # type the owner re-timed in Calendly reads back right without a re-pick
+    # (Phase 3 review).
     on_file = await _Calendly(api, minutes_on_file=45).book(ctx, "2026-10-08T15:00:00", LEAD)
-    assert on_file is not None and on_file["end"] == "2026-10-08T15:45:00-04:00"
-    assert api.type_lookups == 1
+    assert on_file is not None and on_file["end"] == "2026-10-08T16:00:00-04:00"
+    assert api.type_lookups == 2
 
     # The reschedule link's requested end follows the same length.
     event = cb.new_mock_event(start=three_pm, invitee_email=LEAD, minutes=60)
@@ -240,6 +246,10 @@ async def test_calendly_with_no_way_to_know_the_length_names_no_end():
     assert link is not None
     assert "end" not in link  # never a guessed end
     assert link["schedulingLink"]
+
+    # With Calendly unreachable, the length recorded at pick time is the fallback.
+    on_file = await _Calendly(_NoTypes(), minutes_on_file=45).book(ctx, "2026-10-08T15:00:00", LEAD)
+    assert on_file is not None and on_file["end"] == "2026-10-08T15:45:00-04:00"
 
 
 # --- no business time zone: the UTC label ----------------------------------------------
