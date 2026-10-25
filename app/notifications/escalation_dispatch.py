@@ -409,11 +409,20 @@ def _awaitable_here(tasks: set[asyncio.Task[None]]) -> list[asyncio.Task[None]]:
     how a full-suite CI run sat for 34 minutes in a drain (round 7, 2026-10-04). Such
     a task is abandoned work, not pending work: it is dropped from the registry and
     logged, so a drain is always bounded by tasks that can actually complete.
+
+    A task that has already FINISHED is dropped here too, silently: its ``discard``
+    done-callback is merely still queued (it finished in the loop iteration the
+    drain started in). Listing it would hand ``asyncio.gather`` only finished
+    futures, which completes eagerly without ever yielding — the drain's loop then
+    never let the event loop run the discard, and spun until the CI watchdog killed
+    the job (2026-10-19, teardown of the SES inbound routing test).
     """
     loop = asyncio.get_running_loop()
     here: list[asyncio.Task[None]] = []
     for task in list(tasks):
-        if task.get_loop() is loop:
+        if task.done():
+            tasks.discard(task)
+        elif task.get_loop() is loop:
             here.append(task)
         else:
             tasks.discard(task)
@@ -425,6 +434,7 @@ async def drain_background_retries() -> None:
     """Await every in-process retry ladder currently running (tests / shutdown)."""
     while pending := _awaitable_here(_BACKGROUND_RETRIES):
         await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)  # let the finished tasks' discard callbacks run
 
 
 # --- delivery OFF the customer's turn (round 7 WP-2, item 5; §3.5.4) ---------------- #
@@ -526,6 +536,7 @@ async def drain_background_notifications() -> None:
     """Await every off-turn notification currently running (tests / shutdown)."""
     while pending := _awaitable_here(_BACKGROUND_NOTIFICATIONS):
         await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)  # let the finished tasks' discard callbacks run
 
 
 async def drain_background_work() -> None:

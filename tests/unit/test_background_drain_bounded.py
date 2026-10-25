@@ -86,3 +86,58 @@ async def test_the_whole_shutdown_drain_survives_an_abandoned_task() -> None:
     finally:
         escalation_dispatch._BACKGROUND_NOTIFICATIONS.discard(foreign)
         await asyncio.to_thread(_dispose, loop, foreign)
+
+
+@pytest.mark.parametrize(
+    ("registry_name", "drain_name"),
+    [
+        ("_BACKGROUND_NOTIFICATIONS", "drain_background_notifications"),
+        ("_BACKGROUND_RETRIES", "drain_background_retries"),
+    ],
+)
+async def test_a_task_that_finished_before_its_discard_ran_does_not_spin_the_drain(
+    registry_name: str, drain_name: str
+) -> None:
+    """CI 2026-10-19 (run 39264798756): the teardown drain started in the very loop
+    iteration a notification task finished in, so the task was done but its ``discard``
+    done-callback was still queued. ``asyncio.gather`` over only-finished futures
+    completes eagerly and awaiting it never yields, so the ``while`` loop never let the
+    event loop run the discard: it spun inside gather until the watchdog killed the job,
+    and even ``wait_for``'s 60 s could not fire. A finished task is not pending work:
+    the drain drops it itself and yields once per round."""
+    registry = getattr(escalation_dispatch, registry_name)
+    drain = getattr(escalation_dispatch, drain_name)
+
+    async def _instant() -> None:
+        return None
+
+    task = asyncio.get_running_loop().create_task(_instant())
+    registry.add(task)
+    task.add_done_callback(registry.discard)
+    # One loop turn: the task runs to completion and queues its discard callback behind
+    # this test's own wake-up — exactly the state the teardown drain found.
+    await asyncio.sleep(0)
+    assert task.done()
+    assert task in registry, "precondition: the discard callback has not run yet"
+    try:
+        await asyncio.wait_for(drain(), timeout=2)
+    finally:
+        registry.discard(task)
+    assert task not in registry
+
+
+async def test_the_finished_task_is_dropped_by_the_selector_itself() -> None:
+    """The guard lives in ``_awaitable_here`` (both drains and the shutdown drain share
+    it), so a finished task never reaches gather in the first place."""
+    loop = asyncio.get_running_loop()
+    finished = loop.create_task(asyncio.sleep(0))
+    await asyncio.sleep(0)
+    await finished
+    pending = loop.create_task(asyncio.Event().wait())
+    registry = {finished, pending}
+    try:
+        assert escalation_dispatch._awaitable_here(registry) == [pending]
+        assert registry == {pending}
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
