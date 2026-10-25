@@ -65,6 +65,11 @@ describe('the deploy role can roll the sweep schedules back and prove the SES su
         Statement: Match.arrayWith([
           Match.objectLike({ Sid: 'ListSweepSchedules', Action: 'scheduler:ListSchedules' }),
           Match.objectLike({
+            Sid: 'SimulateSchedulerRole',
+            Action: 'iam:SimulatePrincipalPolicy',
+            Resource: `arn:aws:iam::111111111111:role/Luciel-${envName}-Compute-*`,
+          }),
+          Match.objectLike({
             Sid: 'RollbackSweepSchedules',
             Action: ['scheduler:GetSchedule', 'scheduler:UpdateSchedule'],
             Resource: `arn:aws:scheduler:${OFFERING_REGION}:111111111111:schedule/default/Luciel-${envName}-sweep-*`,
@@ -74,6 +79,21 @@ describe('the deploy role can roll the sweep schedules back and prove the SES su
             Sid: 'ProveSesSubscribers',
             Action: 'sns:ListSubscriptionsByTopic',
             Resource: `arn:aws:sns:${OFFERING_REGION}:111111111111:luciel-${envName}-ses-*`,
+          }),
+        ]),
+      }),
+    });
+  });
+});
+
+describe('the deploy role can read the stack revisions the reconcile step compares against', () => {
+  test.each<EnvName>(['dev', 'prod'])('%s: cloudformation DescribeStackResources', (envName) => {
+    pipeline(envName).hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Sid: 'CfnExports',
+            Action: Match.arrayWith(['cloudformation:DescribeStackResources']),
           }),
         ]),
       }),

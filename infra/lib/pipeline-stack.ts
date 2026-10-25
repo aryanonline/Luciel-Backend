@@ -125,7 +125,13 @@ export class PipelineStack extends Stack {
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'CfnExports',
-        actions: ['cloudformation:ListExports', 'cloudformation:DescribeStacks'],
+        // DescribeStackResources: scripts/reconcile_deployed_revisions.py reads the
+        // Compute stack's task-definition revisions after every deploy.
+        actions: [
+          'cloudformation:ListExports',
+          'cloudformation:DescribeStacks',
+          'cloudformation:DescribeStackResources',
+        ],
         resources: ['*'],
       }),
     );
@@ -191,6 +197,15 @@ export class PipelineStack extends Stack {
         actions: ['scheduler:ListSchedules'],
         resources: ['*'],
         conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        // The rollback asks IAM whether the scheduler role may RunTask the revision it
+        // is about to point the schedules at, and leaves them alone when it may not.
+        sid: 'SimulateSchedulerRole',
+        actions: ['iam:SimulatePrincipalPolicy'],
+        resources: [`arn:aws:iam::${this.account}:role/Luciel-${envConfig.envName}-Compute-*`],
       }),
     );
     this.deployRole.addToPolicy(

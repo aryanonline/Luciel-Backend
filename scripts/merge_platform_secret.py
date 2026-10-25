@@ -120,11 +120,10 @@ def check_blob(
         findings.append("META_APP_SECRET missing for a provisioned Meta app (live boot refuses)")
     if live:
         # The live-only gates (JWT key, Stripe webhook secret, the required platform
-        # keys, a malformed blob): what a LIVE task would refuse to boot on. The
-        # refusal names keys, never values. A refused boot rolls the Compute stack
-        # back on its circuit breaker — better read here than there.
-        from app.config import PlatformSecretError  # noqa: PLC0415
-
+        # keys): what a LIVE task would refuse to boot on. The refusal names keys,
+        # never values, and names the FIRST gate that refuses (the settings raise on
+        # it): fix it and run the check again until it is quiet. A refused boot
+        # rolls the Compute stack back on its circuit breaker — better read here.
         try:
             Settings(
                 _env_file=None,
@@ -133,8 +132,8 @@ def check_blob(
                 api_origins=api_origins,
                 platform_secret=json.dumps({str(k): str(v) for k, v in blob.items()}),
             )
-        except (RuntimeError, PlatformSecretError) as exc:
-            findings.append(f"live boot refused: {exc}")
+        except RuntimeError as exc:  # PlatformSecretError is one of these
+            findings.append(f"live boot refused (first gate; re-run after fixing it): {exc}")
     return findings
 
 

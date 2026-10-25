@@ -1072,7 +1072,19 @@ export class ComputeStack extends Stack {
     schedulerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ecs:RunTask'],
-        resources: [sweepTask.taskDefinitionArn],
+        // The FAMILY, not one revision: the deploy pipeline's rollback re-registers
+        // the previous SweepTask revision as a copy in this family and points the
+        // schedules at it (scripts/rollback_services.py). Scoped to the one revision
+        // the stack deployed, every sweep after such a rollback was denied RunTask
+        // and stopped silently (Phase 3 infra-fix review). The cluster condition
+        // stays; the task and execution roles are still the only ones passable.
+        resources: [
+          Stack.of(this).formatArn({
+            service: 'ecs',
+            resource: 'task-definition',
+            resourceName: `${sweepTask.family}:*`,
+          }),
+        ],
         conditions: { ArnEquals: { 'ecs:cluster': this.cluster.clusterArn } },
       }),
     );

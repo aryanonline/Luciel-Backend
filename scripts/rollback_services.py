@@ -120,9 +120,51 @@ def rollback_services(
         )
 
 
+def schedule_update_input(schedule: dict[str, Any], task_definition: str) -> str:
+    """The ``update-schedule`` input for ``schedule`` (a ``get-schedule`` body) with its ECS
+    target moved to ``task_definition``; the read-only fields are dropped."""
+    body = {k: v for k, v in schedule.items() if k not in _SCHEDULE_READ_ONLY}
+    body["Target"]["EcsParameters"]["TaskDefinitionArn"] = task_definition
+    return _cli_input(body)
+
+
+def scheduler_may_run(
+    role_arn: str, task_definition: str, cluster_arn: str, *, region: str, aws: Runner
+) -> bool:
+    """Whether ``role_arn`` (the schedules' role) is allowed ``ecs:RunTask`` on
+    ``task_definition`` in ``cluster_arn`` - asked of IAM, not assumed. The role's grant
+    used to name ONE revision; pointing the schedules at a re-registered copy then
+    stopped every sweep silently (Phase 3 infra-fix review)."""
+    result = json.loads(
+        aws(
+            [
+                "iam",
+                "simulate-principal-policy",
+                "--region",
+                region,
+                "--policy-source-arn",
+                role_arn,
+                "--action-names",
+                "ecs:RunTask",
+                "--resource-arns",
+                task_definition,
+                "--context-entries",
+                f"ContextKeyName=ecs:cluster,ContextKeyValues={cluster_arn},ContextKeyType=string",
+                "--query",
+                "EvaluationResults[0].EvalDecision",
+                "--output",
+                "json",
+            ]
+        )
+    )
+    return str(result) == "allowed"
+
+
 def rollback_sweeps(env: str, sweep_task: str, *, region: str, aws: Runner) -> int:
     """Point every ``Luciel-<env>-sweep-*`` schedule back at ``sweep_task`` (re-registered
-    when it is no longer ACTIVE). Returns how many schedules were updated."""
+    when it is no longer ACTIVE) - unless the schedules' role may not RunTask it, in
+    which case they are left on the deployed revision and that is said out loud.
+    Returns how many schedules were updated."""
     if not sweep_task:
         print("[rollback] no sweep task definition was recorded; schedules left as deployed")
         return 0
@@ -143,6 +185,8 @@ def rollback_sweeps(env: str, sweep_task: str, *, region: str, aws: Runner) -> i
             ]
         )
     )
+    checked = False
+    updated = 0
     for name in names:
         schedule = json.loads(
             aws(
@@ -158,21 +202,22 @@ def rollback_sweeps(env: str, sweep_task: str, *, region: str, aws: Runner) -> i
                 ]
             )
         )
-        for field in _SCHEDULE_READ_ONLY:
-            schedule.pop(field, None)
-        schedule["Target"]["EcsParameters"]["TaskDefinitionArn"] = target
-        aws(
-            [
-                "scheduler",
-                "update-schedule",
-                "--region",
-                region,
-                "--cli-input-json",
-                _cli_input(schedule),
-            ]
-        )
+        if not checked:
+            checked = True
+            role = schedule["Target"]["RoleArn"]
+            cluster_arn = schedule["Target"]["Arn"]
+            if not scheduler_may_run(role, target, cluster_arn, region=region, aws=aws):
+                print(
+                    f"::warning::[rollback] the scheduler role {role} may not RunTask {target}; "
+                    "the sweep schedules are LEFT on the deployed revision (the services were "
+                    "rolled back). Deploy a release whose SweepTask grant covers the family."
+                )
+                return 0
+        body = schedule_update_input(schedule, target)
+        aws(["scheduler", "update-schedule", "--region", region, "--cli-input-json", body])
         print(f"[rollback] schedule {name} -> {target}", flush=True)
-    return len(names)
+        updated += 1
+    return updated
 
 
 def main(argv: list[str] | None = None, *, aws: Runner = run_aws) -> int:
@@ -200,6 +245,10 @@ def main(argv: list[str] | None = None, *, aws: Runner = run_aws) -> int:
     rollback_services(args.cluster, previous, region=args.region, aws=aws)
     updated = rollback_sweeps(args.env, args.sweep_task, region=args.region, aws=aws)
     print(f"[rollback] {len(previous)} service(s) and {updated} sweep schedule(s) restored")
+    print(
+        "[rollback] NOTE: the Compute stack still records the revisions it deployed; the "
+        "next deploy's reconcile step moves the environment back onto them"
+    )
     return 0
 
 

@@ -104,6 +104,15 @@ def test_a_failure_after_the_roll_restores_the_services(job: str, gates: list[st
     assert "--sweep-task '${{ steps.previous.outputs.sweep_td }}'" in run
     previous = steps[_index(steps, step_id="previous")]
     assert "scheduler get-schedule" in _run(previous) and "sweep_td=" in _run(previous)
+    # The record step fails closed: a swallowed list-schedules left the schedules on
+    # the failed revision while the run claimed them restored.
+    assert "|| true" not in _run(previous) and "2>/dev/null" not in _run(previous)
+    # The reconcile step runs after the post-roll migration and before the probes, and
+    # is not a rollback trigger (a later gate still rolls back).
+    reconcile = _index(steps, step_id="reconcile")
+    assert _index(steps, step_id="migrate") < reconcile < _index(steps, step_id="smoke")
+    assert "scripts/reconcile_deployed_revisions.py" in _run(steps[reconcile])
+    assert "steps.reconcile.outcome" not in condition
     assert "SubscriptionArn" not in run  # the SNS check is its own, non-rolling step
     assert "steps.sns_confirmed.outcome" not in condition
 

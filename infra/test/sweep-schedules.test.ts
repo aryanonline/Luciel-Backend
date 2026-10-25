@@ -96,6 +96,22 @@ describe('Background sweep schedules (Legal §B5 / §A3)', () => {
     });
   });
 
+  test('RunTask is granted on the SweepTask FAMILY, so a rolled-back (re-registered) revision still runs', () => {
+    // Phase 3 infra-fix review: scoped to the one deployed revision, every sweep after
+    // a pipeline rollback was denied RunTask and stopped silently.
+    const template = buildCompute();
+    const statements = Object.values(template.findResources('AWS::IAM::Policy')).flatMap(
+      (p) => (p as any).Properties.PolicyDocument.Statement as any[],
+    );
+    const runTask = statements.find((s) => s.Action === 'ecs:RunTask');
+    expect(runTask).toBeDefined();
+    const resource = JSON.stringify(runTask.Resource);
+    // The family is `<stack id>SweepTask<hash>` (the test stack is 'Compute'); the grant
+    // must end in `:*`, every revision of it.
+    expect(resource).toMatch(/task-definition\/[A-Za-z]*ComputeSweepTask[0-9A-F]+:\*/);
+    expect(runTask.Condition).toEqual({ ArnEquals: { 'ecs:cluster': expect.anything() } });
+  });
+
   test('no two sweeps share a firing minute (round 7 WP-8: daily_brief vs knowledge_sync)', () => {
     // daily_brief shipped at :50 hourly, which is knowledge_sync's :50 every-6h
     // slot: four times a day two sweep tasks launched at the same instant and

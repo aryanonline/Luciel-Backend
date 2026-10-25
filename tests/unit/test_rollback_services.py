@@ -64,9 +64,13 @@ _DESCRIBED = {
 class _FakeAws:
     """Answers the CLI calls the script makes and records every argv."""
 
-    def __init__(self, *, active: set[str], schedules: list[str]) -> None:
+    def __init__(
+        self, *, active: set[str], schedules: list[str], scheduler_allowed: bool = True
+    ) -> None:
         self.active = active
         self.schedules = schedules
+        self.scheduler_allowed = scheduler_allowed
+        self.simulations: list[list[str]] = []
         self.calls: list[list[str]] = []
         self.registered: list[dict] = []
         self.updated_schedules: list[dict] = []
@@ -120,6 +124,9 @@ class _FakeAws:
                     },
                 }
             )
+        if (service, verb) == ("iam", "simulate-principal-policy"):
+            self.simulations.append(args)
+            return json.dumps("allowed" if self.scheduler_allowed else "implicitDeny")
         if (service, verb) == ("scheduler", "update-schedule"):
             path = args[args.index("--cli-input-json") + 1].removeprefix("file://")
             self.updated_schedules.append(json.loads(Path(path).read_text(encoding="utf-8")))
@@ -238,6 +245,27 @@ def test_the_sweep_schedules_are_pointed_back_at_the_recorded_revision(tmp_path:
         )
         assert not {"Arn", "CreationDate", "LastModificationDate"} & set(body)
         assert body["FlexibleTimeWindow"] == {"Mode": "OFF"} and body["Target"]["Input"]
+
+
+def test_schedules_are_left_alone_when_their_role_may_not_run_the_target(
+    tmp_path: Path, capsys
+) -> None:
+    """Infra-fix review (high): the scheduler role's RunTask grant used to name ONE
+    revision; pointing the schedules at a re-registered copy stopped every sweep
+    silently. The rollback asks IAM first and leaves the schedules on the deployed
+    revision, saying so, when the role may not run the target."""
+    previous = tmp_path / "previous-services.json"
+    previous.write_text("[]", encoding="utf-8")
+    aws = _FakeAws(active=set(), schedules=["Luciel-dev-sweep-deferred"], scheduler_allowed=False)
+    args = ["--env", "dev", "--cluster", "c", "--previous", str(previous)]
+    assert rollback.main([*args, "--sweep-task", f"{_TD}/sweep:40"], aws=aws) == 0
+    assert not aws.updated_schedules
+    sim = aws.simulations[0]
+    assert "ecs:RunTask" in sim and f"{_TD}/sweep:97" in sim
+    assert "arn:aws:iam::1:role/Luciel-dev-Compute-SweepSchedulerRole" in sim
+    out = capsys.readouterr().out
+    assert "::warning::" in out and "LEFT on the deployed revision" in out
+    assert "0 sweep schedule(s) restored" in out
 
 
 def test_no_recorded_sweep_revision_leaves_the_schedules_alone(tmp_path: Path, capsys) -> None:

@@ -220,7 +220,7 @@ jobs:
           # The sweeps' task definition too (Phase 3 infra review): the Compute stack moves
           # every schedule to the NEW SweepTask revision, and a rollback must point them
           # back. Best effort - an environment without schedules yet records nothing.
-          first=$(aws scheduler list-schedules --name-prefix "Luciel-dev-sweep-" --query 'Schedules[0].Name' --output text 2>/dev/null || true)
+          first=$(aws scheduler list-schedules --name-prefix "Luciel-dev-sweep-" --query 'Schedules[0].Name' --output text)
           sweep_td=""
           if [ -n "$first" ] && [ "$first" != "None" ]; then
             sweep_td=$(aws scheduler get-schedule --name "$first" --query 'Target.EcsParameters.TaskDefinitionArn' --output text)
@@ -285,6 +285,18 @@ jobs:
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh dev
 
+      # Phase 3 infra-fix review: the rollback below works OUT OF BAND (re-registered
+      # copies the Compute stack does not know about). A re-run of the same commit
+      # then synthesizes an identical template, cdk reports no changes, and the probes
+      # would pass against the rolled-back code. This puts every service and sweep
+      # schedule back onto the stack's revision of its family before anything is
+      # probed, so what passes is what the pipeline says it deployed. Not a rollback
+      # trigger: a later gate still rolls back.
+      - name: Services and sweeps run the revisions the Compute stack deployed
+        id: reconcile
+        if: inputs.paused != 'true'
+        run: python3 scripts/reconcile_deployed_revisions.py --env dev --cluster '${{ steps.previous.outputs.cluster }}'
+
       # 2026-09-05 audit F008: the deploy is not done until the live API answers the
       # way it was deployed to — healthz live with no degraded binding, both planes
       # reachable through the ALB (F067) — and the §10 probe passes as luciel_app.
@@ -340,7 +352,7 @@ jobs:
         run: |
           python3 scripts/rollback_services.py --env dev --cluster '${{ steps.previous.outputs.cluster }}' \
             --previous previous-services.json --sweep-task '${{ steps.previous.outputs.sweep_td }}'
-          echo "::error::the deploy, the post-deploy migration, a post-deploy probe or the D10 SeedTest gate failed; app services and sweep schedules rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
+          echo "::error::the deploy, the post-deploy migration, a post-deploy probe or the D10 SeedTest gate failed; the app services were rolled back to the previous task definitions and the sweep schedules as the lines above say (the schema stays where the migration left it — expand-first)"
           exit 1
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----
@@ -618,7 +630,7 @@ jobs:
           # The sweeps' task definition too (Phase 3 infra review): the Compute stack moves
           # every schedule to the NEW SweepTask revision, and a rollback must point them
           # back. Best effort - an environment without schedules yet records nothing.
-          first=$(aws scheduler list-schedules --name-prefix "Luciel-prod-sweep-" --query 'Schedules[0].Name' --output text 2>/dev/null || true)
+          first=$(aws scheduler list-schedules --name-prefix "Luciel-prod-sweep-" --query 'Schedules[0].Name' --output text)
           sweep_td=""
           if [ -n "$first" ] && [ "$first" != "None" ]; then
             sweep_td=$(aws scheduler get-schedule --name "$first" --query 'Target.EcsParameters.TaskDefinitionArn' --output text)
@@ -660,6 +672,18 @@ jobs:
         if: inputs.paused != 'true'
         run: bash scripts/run-migration-task.sh prod
 
+      # Phase 3 infra-fix review: the rollback below works OUT OF BAND (re-registered
+      # copies the Compute stack does not know about). A re-run of the same commit
+      # then synthesizes an identical template, cdk reports no changes, and the probes
+      # would pass against the rolled-back code. This puts every service and sweep
+      # schedule back onto the stack's revision of its family before anything is
+      # probed, so what passes is what the pipeline says it deployed. Not a rollback
+      # trigger: a later gate still rolls back.
+      - name: Services and sweeps run the revisions the Compute stack deployed
+        id: reconcile
+        if: inputs.paused != 'true'
+        run: python3 scripts/reconcile_deployed_revisions.py --env prod --cluster '${{ steps.previous.outputs.cluster }}'
+
       # Prod's api origin and Stripe posture (mock — prod stays mock until the
       # owner-gated cutover) come from the hostnames helper, like dev's.
       - name: Post-deploy smoke probe (healthz + both planes answer)
@@ -686,7 +710,7 @@ jobs:
         run: |
           python3 scripts/rollback_services.py --env prod --cluster '${{ steps.previous.outputs.cluster }}' \
             --previous previous-services.json --sweep-task '${{ steps.previous.outputs.sweep_td }}'
-          echo "::error::the deploy, the post-deploy migration or a post-deploy probe failed; prod app services and sweep schedules rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
+          echo "::error::the deploy, the post-deploy migration or a post-deploy probe failed; the prod app services were rolled back to the previous task definitions and the sweep schedules as the lines above say (the schema stays where the migration left it — expand-first)"
           exit 1
 
   # 4) ALWAYS tear down preprod — even if standup/verify/prod-deploy failed. The

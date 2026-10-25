@@ -316,11 +316,11 @@ def test_check_live_names_what_a_live_task_would_refuse_to_boot_on(
     fake_aws.blob = {"META_APP_ID": "fb-cid", "META_VERIFY_TOKEN": "do-not-print-me"}
     assert _run(monkeypatch, "", "--check", "--live") == 1
     out = capsys.readouterr().out
-    assert "live boot refused:" in out
+    assert "live boot refused (first gate; re-run after fixing it):" in out
     assert "do-not-print-me" not in out
     # The same blob without --live reports only the posture findings.
     assert _run(monkeypatch, "", "--check") in (0, 1)
-    assert "live boot refused:" not in capsys.readouterr().out
+    assert "live boot refused" not in capsys.readouterr().out
 
 
 def test_check_refuses_to_judge_redirect_uris_against_nothing(

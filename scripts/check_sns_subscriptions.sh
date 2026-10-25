@@ -12,7 +12,9 @@
 #   bash scripts/check_sns_subscriptions.sh <dev|preprod|prod>
 #
 # Topic names are the CDK's (`luciel-<env>-ses-events`, `luciel-<env>-ses-inbound-v2`);
-# no hostname is written here.
+# no hostname is written here. Only a real subscription ARN counts as confirmed: a
+# subscription unsubscribed before confirmation lists as 'Deleted' for a while, and
+# 'PendingConfirmation' is the state this check exists to catch.
 set -euo pipefail
 
 ENVIRONMENT="${1:?environment name (dev|preprod|prod)}"
@@ -28,7 +30,7 @@ for topic in "luciel-${ENVIRONMENT}-ses-events" "luciel-${ENVIRONMENT}-ses-inbou
     continue
   fi
   confirmed=$(aws sns list-subscriptions-by-topic --region "$REGION" --topic-arn "$arn" \
-    --query "length(Subscriptions[?Protocol=='https' && SubscriptionArn!='PendingConfirmation'])" \
+    --query "length(Subscriptions[?Protocol=='https' && starts_with(SubscriptionArn, 'arn:')])" \
     --output text)
   pending=$(aws sns list-subscriptions-by-topic --region "$REGION" --topic-arn "$arn" \
     --query "length(Subscriptions[?SubscriptionArn=='PendingConfirmation'])" --output text)
