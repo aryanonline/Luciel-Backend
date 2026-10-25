@@ -216,9 +216,26 @@ class RedisLLMCapStore:
             return self._fallback.admit(admin_id, cap=cap)
         key = self._key(admin_id)
         try:
-            count = int(await client.incr(key))
-            if count == 1:
-                # First call in this window — start the 60s expiry.
+            # INCR and TTL in ONE round trip: the window must always carry an expiry.
+            # It used to be set only when the INCR returned 1, so an EXPIRE that failed
+            # right after a successful INCR (a 0.5 s socket timeout on a Redis latency
+            # blip, or a task dying between the two) left a key that counted forever:
+            # the tenant's 50th call EVER was refused, and every call after it, until an
+            # operator deleted the key by hand (Phase 3 review, 2026-10-19). Now every
+            # admission repairs a window without a TTL.
+            async with client.pipeline(transaction=False) as pipe:
+                pipe.incr(key)
+                pipe.ttl(key)
+                raw_count, raw_ttl = await pipe.execute()
+            count = int(raw_count)
+            if int(raw_ttl) < 0:  # -1: no expiry; -2: gone between the two (harmless)
+                if count > 1:
+                    logger.error(
+                        "LLM cap window for %s had no expiry (count=%d); repaired to %ss",
+                        key,
+                        count,
+                        int(LLM_CAP_WINDOW_SECONDS),
+                    )
                 await client.expire(key, int(LLM_CAP_WINDOW_SECONDS))
         except Exception:  # noqa: BLE001 — any redis error → degrade, never fail open
             logger.warning(

@@ -13,6 +13,7 @@ schedule instead of latching the in-memory store for the life of the task.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 
 import fakeredis
@@ -78,6 +79,33 @@ async def test_expire_set_on_first_call() -> None:
     assert 0 < await client.ttl(f"llmcap:{admin}") <= 5
 
 
+async def test_a_window_that_lost_its_expiry_is_repaired_on_the_next_admission(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Phase 3 review (2026-10-19): the EXPIRE used to be sent only when the INCR
+    returned 1. An EXPIRE that failed right after a successful INCR (a 0.5 s socket
+    timeout on a latency blip, a task dying between the two) left a key that
+    counted forever: the tenant's 50th call EVER was refused, and every call after
+    it, until an operator deleted the key. Now every admission carries the TTL read
+    in the same round trip and repairs a window without one."""
+    store, client = _store()
+    admin = str(uuid.uuid4())
+    key = f"llmcap:{admin}"
+    await store.aadmit(admin)
+    await client.persist(key)  # what a lost EXPIRE leaves behind
+    assert await client.ttl(key) == -1
+    with caplog.at_level(logging.ERROR, logger="app.runtime.llm_cap"):
+        assert await store.aadmit(admin) is True
+    assert 0 < await client.ttl(key) <= LLM_CAP_WINDOW_SECONDS
+    assert any("had no expiry" in r.getMessage() for r in caplog.records)
+    # A window that still has its expiry is left alone (no log, no extension).
+    await client.expire(key, 5)
+    caplog.clear()
+    await store.aadmit(admin)
+    assert 0 < await client.ttl(key) <= 5
+    assert not caplog.records
+
+
 async def test_the_cap_holds_across_two_tasks_sharing_redis() -> None:
     """Two app tasks = two stores over one Redis: the cap is platform-wide."""
     server = fakeredis.FakeServer()
@@ -91,6 +119,9 @@ async def test_the_cap_holds_across_two_tasks_sharing_redis() -> None:
 
 # --- graceful degradation: Redis failure must NOT remove the cap -----------
 class _BrokenRedis:
+    def pipeline(self, *_a: object, **_k: object) -> object:
+        raise ConnectionError("redis down")
+
     async def incr(self, *_a: object, **_k: object) -> int:
         raise ConnectionError("redis down")
 
@@ -145,6 +176,13 @@ class _FlakyFactory:
                 if factory.down:
                     raise ConnectionError("connection reset")
                 return await super().incr(*a, **k)
+
+            def pipeline(self, *a: object, **k: object) -> object:
+                # The admission is one pipelined round trip now (INCR + TTL); an
+                # unreachable server fails it the same way it fails a lone INCR.
+                if factory.down:
+                    raise ConnectionError("connection reset")
+                return super().pipeline(*a, **k)
 
             async def aclose(self, *a: object, **k: object) -> None:
                 factory.closed += 1

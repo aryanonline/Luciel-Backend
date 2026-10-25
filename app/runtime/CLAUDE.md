@@ -116,7 +116,10 @@ make that state explicit and test it.
   loop); `LLMCapExceeded` is caught beside `ProviderError` and answers through the
   llm_unavailable path with its own reason and the `LLMCapExceeded` metric — never an
   exception to the transport (item 4). Ingest-time graph extraction passes `admin_id`
-  per call so it is capped under the ingesting tenant.
+  per call so it is capped under the ingesting tenant. The Redis store's admission is
+  ONE pipelined round trip (INCR + TTL) and repairs a window that has no expiry (an
+  EXPIRE lost to a socket timeout used to leave a key that counted forever and refused
+  the tenant for good — Phase 3 review); a window that has its expiry is never extended.
 - Owner notifications start after the turn's commit, in a background task (item 5; see
   app/notifications/CLAUDE.md). `ProviderError.retryable` (429/529) buys the FALLBACK
   leg one jittered retry; the primary still gets none (item 6).
