@@ -8,6 +8,8 @@
  * stack now injects LUCIEL_PUBLIC_API_BASE_URL into every plane that builds such a
  * URL, from the same constant its SNS subscriptions and the SeedTest harness use.
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { NetworkingStack } from '../lib/networking-stack';
@@ -91,6 +93,22 @@ describe.each<EnvName>(['dev', 'prod'])('API origins the environment serves (%s)
       expect(expected.split(',')).toContain(baseUrls(envName).api);
     },
   );
+});
+
+describe('scripts/merge_platform_secret.py judges redirect URIs against the origins this helper serves', () => {
+  // The pre-deploy --check carries a hand-written ENV_API_ORIGINS table (no Node
+  // toolchain at the owner's keyboard). It must say exactly what hostnames() says, or
+  // the check diverges from the deployed task again at the D6 cutover.
+  const source = readFileSync(join(__dirname, '..', '..', 'scripts', 'merge_platform_secret.py'), 'utf8');
+  const table = source.slice(source.indexOf('ENV_API_ORIGINS: dict'), source.indexOf('}', source.indexOf('ENV_API_ORIGINS: dict')));
+
+  test.each<EnvName>(['dev', 'preprod', 'prod'])('%s', (envName) => {
+    const line = table.split('\n').find((l) => l.trim().startsWith(`"${envName}":`));
+    expect(line).toBeDefined();
+    const listed = Array.from(line!.matchAll(/"(https:\/\/[^"]+)"/g)).map((m) => m[1]);
+    expect(listed).toEqual(hostnames(envName).apiNames.map((n) => `https://${n}`));
+    expect(listed[0]).toBe(baseUrls(envName).api);
+  });
 });
 
 describe.each<EnvName>(['dev', 'prod'])('frontend runtime config (%s)', (envName) => {

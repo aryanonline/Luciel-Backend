@@ -425,8 +425,11 @@ class Settings(BaseSettings):
     # were registered on the public name before the per-environment names existed,
     # and a callback on either origin reaches this app.
     api_origins: str = ""
-    # The platform secret's own API_BASE_URL, kept beside the injected origin so a
-    # redirect URI registered on it stays valid after the task env moves to api-dev.
+    # The platform secret's own API_BASE_URL, kept beside the injected origin. It is an
+    # accepted redirect origin ONLY while no LUCIEL_API_ORIGINS are injected (local,
+    # tests, a task definition older than round 7): once the CDK says which origins
+    # the environment serves, a stale apex in the secret must not keep a callback
+    # valid that would land on another environment after the D6 cutover.
     secret_api_base_url: str = ""
     # Dashboard page the provider's OAuth callback bounces the browser back to, relative
     # to app_base_url. Settable because the redirect URIs registered with the providers
@@ -865,15 +868,15 @@ class Settings(BaseSettings):
 
     def accepted_api_origins(self) -> tuple[str, ...]:
         """The API origins a registered redirect URI may use, in precedence order:
-        the injected public origin, every origin the environment serves
-        (``LUCIEL_API_ORIGINS``) and the platform secret's API_BASE_URL. Empty when
-        none is known (local, tests): then only the path is validated."""
+        the injected public origin and every origin the environment serves
+        (``LUCIEL_API_ORIGINS``); the platform secret's API_BASE_URL only when no
+        served set is injected. Empty when none is known (local, tests): then only
+        the path is validated."""
+        candidates = [self.public_api_base_url, *self.api_origins.split(",")]
+        if not self.api_origins.strip():
+            candidates.append(self.secret_api_base_url)
         seen: list[str] = []
-        for raw in (
-            self.public_api_base_url,
-            *self.api_origins.split(","),
-            self.secret_api_base_url,
-        ):
+        for raw in candidates:
             origin = (raw or "").strip().rstrip("/")
             if origin and origin not in seen:
                 seen.append(origin)

@@ -49,8 +49,9 @@ Manages BYO external-provider identities, OAuth, lifecycle state, health, deferr
   `/api/v1/connections/<oauth client label>/callback` and, when any API origin is known,
   be one of `Settings.accepted_api_origins()` + path: the injected
   `public_api_base_url`, every origin the environment serves (`LUCIEL_API_ORIGINS`, from
-  the CDK hostnames helper — dev serves api-dev AND the public api) and the secret's
-  `API_BASE_URL`. Never ONE exact origin: the provider consoles were registered on the
+  the CDK hostnames helper — dev serves api-dev AND the public api) and, only while no
+  served set is injected, the secret's `API_BASE_URL` (a stale apex there must not keep
+  a callback valid after the D6 cutover). Never ONE exact origin: the provider consoles were registered on the
   public name, and dev's move to api-dev would otherwise have withheld every OAuth
   connect (Phase 3 review). A bad one is logged at boot, makes `authorize_ready` false
   (provider withheld, no authorize URL; refresh untouched) and shows on /healthz as

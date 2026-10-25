@@ -282,6 +282,7 @@ def test_check_judges_redirect_uris_by_the_origins_the_environment_serves(
     }
     assert _run(monkeypatch, "", "--check") == 1
     out = capsys.readouterr().out
+    assert "judged against: https://api-dev.vantagemind.ai,https://api.vantagemind.ai" in out
     assert "oauth_redirect:hubspot" not in out
     assert "oauth_redirect:google" not in out
     assert "oauth_redirect:notion" in out
@@ -304,3 +305,16 @@ def test_check_names_a_graph_version_the_runtime_would_refuse_to_boot_on(
     assert "boot refused: META_GRAPH_VERSION 'latest' is not a Graph API version" in out
     fake_aws.blob = {"META_GRAPH_VERSION": "23.0"}
     assert _run(monkeypatch, "", "--check") == 0
+
+
+def test_check_refuses_to_judge_redirect_uris_against_nothing(
+    monkeypatch: pytest.MonkeyPatch, fake_aws: _FakeSecretsManager
+) -> None:
+    """An environment the origin table does not know, and no --api-base: the check
+    would otherwise fall back to the blob's own API_BASE_URL and pass what the task
+    refuses. It refuses to run instead."""
+    script = _load_script()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    with pytest.raises(SystemExit, match="--check needs the API origin"):
+        script.main(["--env", "nosuchenv", "--check"])
+    assert fake_aws.reads == 0

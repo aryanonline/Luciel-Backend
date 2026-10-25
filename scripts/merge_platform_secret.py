@@ -177,6 +177,13 @@ def main(argv: list[str] | None = None) -> int:
             args.api_base = origins[0] if origins else ""
         if not args.api_origins:
             args.api_origins = ",".join(origins)
+        if not args.api_base:
+            # Judging against nothing would silently fall back to the blob's own
+            # API_BASE_URL - a check that cannot see the mismatch it exists for.
+            raise SystemExit(
+                f"--check needs the API origin for --env {args.env!r}: pass --api-base "
+                "(and --api-origins), or add the environment to ENV_API_ORIGINS"
+            )
     read_only = args.list or args.check
 
     # Validate the paste BEFORE touching AWS: a typo is refused without reading the
@@ -208,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             print(key)
         return 0
     if args.check:
+        print(f"redirect URIs judged against: {args.api_origins or args.api_base}")
         findings = check_blob(blob, api_base=args.api_base, api_origins=args.api_origins)
         for line in findings:
             print(line)

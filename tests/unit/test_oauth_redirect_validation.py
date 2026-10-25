@@ -105,7 +105,8 @@ def test_a_uri_on_any_origin_the_environment_serves_is_fine() -> None:
         "https://api.example.test",
     )
     assert s.oauth_redirect_problems() == {}
-    # The secret's API_BASE_URL counts too, even when the task env names api-dev.
+    # The secret's API_BASE_URL counts while nothing says which origins the
+    # environment serves (local, tests, a pre-round-7 task definition).
     via_secret = Settings(
         public_api_base_url="https://api-dev.example.test",
         platform_secret=json.dumps(
@@ -126,6 +127,18 @@ def test_a_uri_on_any_origin_the_environment_serves_is_fine() -> None:
     problem = elsewhere.oauth_redirect_problems()["hubspot"]
     assert "https://api-dev.example.test/api/v1/connections/hubspot/callback" in problem
     assert "https://api.example.test/api/v1/connections/hubspot/callback" in problem
+    # Once the served set IS injected, a stale API_BASE_URL in the secret no longer
+    # keeps a callback valid: after the D6 cutover dev stops serving the apex, and
+    # an apex callback would land on prod.
+    post_cutover = Settings(
+        public_api_base_url="https://api-dev.example.test",
+        api_origins="https://api-dev.example.test",
+        platform_secret=json.dumps(
+            {"API_BASE_URL": "https://api.example.test", "HUBSPOT_REDIRECT_URI": on_public_name}
+        ),
+    )
+    assert post_cutover.accepted_api_origins() == ("https://api-dev.example.test",)
+    assert "hubspot" in post_cutover.oauth_redirect_problems()
 
 
 def test_an_unconfigured_provider_is_not_a_problem() -> None:
