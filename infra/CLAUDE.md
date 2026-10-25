@@ -52,9 +52,18 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   MigrationTask with the image swapped, deregistered afterwards), deploy, re-run the
   migration as a no-op safety, then `scripts/smoke_probe.sh <env>` + the §10 verify
   task (+ on dev the strict D10 SeedTest gate when live) — rolling the SERVICES back
-  if any post-roll step fails. Migrations stay expand-first (old code runs on the new
+  if the deploy or any post-roll step fails. The rollback is `scripts/rollback_services.py`
+  (Phase 3 infra review): the Compute cleanup DEREGISTERS the previous revisions and
+  ECS refuses to point a service at an INACTIVE one, so the script re-registers an
+  exact copy first, and points the `Luciel-<env>-sweep-*` schedules (recorded beside
+  the services) back too. A live deploy then proves each SES topic kept a CONFIRMED
+  https subscriber (`scripts/check_sns_subscriptions.sh`; SNS replaces a subscription
+  whose endpoint changes, so the subscriptions name the api origin that does not move
+  with the dual-host step). Migrations stay expand-first (old code runs on the new
   schema for the length of the roll). The prod job refuses to run while prod does not
-  own the public names (D6).
+  own the public names (D6) — and the cutover is a HANDOVER of the records and the
+  CloudFront alias, never 'deploy dev first' (which deletes them hours before prod
+  can create them).
 - Keep integration posture explicit and `/healthz`-visible; prod Stripe stays mock before owner-gated live cutover.
 - Preserve cost ceilings: logs 30d dev/90d prod, RDS backups 7d, ECR/bucket expiry, zero Redis snapshots, the transcript-archive bucket's 365d backstop, and the per-env AWS Budgets monthly ceiling (BudgetStack).
 - Deploy behind the ALB with backend proxy headers intact and per-tenant Secrets Manager `vm/` access.

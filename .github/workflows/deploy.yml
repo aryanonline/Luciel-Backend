@@ -217,6 +217,16 @@ jobs:
             --query 'services[].{name:serviceName,td:taskDefinition}' --output json > previous-services.json
           cat previous-services.json
           echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
+          # The sweeps' task definition too (Phase 3 infra review): the Compute stack moves
+          # every schedule to the NEW SweepTask revision, and a rollback must point them
+          # back. Best effort - an environment without schedules yet records nothing.
+          first=$(aws scheduler list-schedules --name-prefix "Luciel-dev-sweep-" --query 'Schedules[0].Name' --output text 2>/dev/null || true)
+          sweep_td=""
+          if [ -n "$first" ] && [ "$first" != "None" ]; then
+            sweep_td=$(aws scheduler get-schedule --name "$first" --query 'Target.EcsParameters.TaskDefinitionArn' --output text)
+          fi
+          echo "[rollback] sweep task definition: ${sweep_td:-none}"
+          echo "sweep_td=$sweep_td" >> "$GITHUB_OUTPUT"
           echo "had_previous=true" >> "$GITHUB_OUTPUT"
 
       # Round 7 migrations review (2026-10-11): migrate with the NEW image BEFORE the
@@ -237,6 +247,7 @@ jobs:
 
       - name: Deploy infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
+        id: deploy
         run: |
           # npm ci ran in the hostnames step above.
           # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
@@ -304,24 +315,32 @@ jobs:
         if: inputs.paused != 'true' && (inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock') != 'live'
         run: echo "::notice::D10 SeedTest gate not run — this deploy is integration_mode=mock; the harness proves LIVE behavior (it would fail T1 by design). Deploy with integration_mode=live to gate on it."
 
-      # Restores SERVICES only: the schema moved before the roll (migrate-before-roll)
-      # and every migration is expand-first, so the previous task definitions run on
-      # it. A pre-roll migration failure never reaches here — the job stops before
-      # the Compute stack rolls anything.
+      # Phase 3 infra review: SNS replaces a subscription whose endpoint changes (a new
+      # PendingConfirmation one; the confirmed one is deleted in the stack's cleanup),
+      # and the SES routes confirm only in live mode. A topic left with no confirmed
+      # subscriber drops every inbound reply and bounce event silently - so the run
+      # says so. Not a rollback trigger: rolling the services back restores nothing
+      # here; the subscription has to be confirmed (or re-created) by hand.
+      - name: SES topics keep a confirmed HTTPS subscriber (live only)
+        id: sns_confirmed
+        if: inputs.paused != 'true' && (inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock') == 'live'
+        run: bash scripts/check_sns_subscriptions.sh dev
+
+      # Restores the SERVICES and the sweep schedules: the schema moved before the roll
+      # (migrate-before-roll) and every migration is expand-first, so the previous task
+      # definitions run on it. A pre-roll migration failure never reaches here — the job
+      # stops before the Compute stack rolls anything. The deploy step itself is a
+      # trigger too (Phase 3 infra review): a cdk failure AFTER Compute (Web, Widget,
+      # Dns) leaves the new backend serving with no probe behind it. The previous
+      # revisions are INACTIVE by now (the Compute cleanup deregisters them), so the
+      # script re-registers exact copies before pointing the services (and the
+      # Luciel-dev-sweep-* schedules) at them.
       - name: Roll the app services back to the previous task definitions
-        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure' || steps.seedtest.outcome == 'failure')
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.deploy.outcome == 'failure' || steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure' || steps.seedtest.outcome == 'failure')
         run: |
-          cluster='${{ steps.previous.outputs.cluster }}'
-          python3 - "$cluster" <<'PY'
-          import json, subprocess, sys
-          cluster = sys.argv[1]
-          for svc in json.load(open('previous-services.json')):
-              print(f"[rollback] {svc['name']} -> {svc['td']}", flush=True)
-              subprocess.run(['aws', 'ecs', 'update-service', '--cluster', cluster, '--service', svc['name'],
-                              '--task-definition', svc['td'], '--force-new-deployment',
-                              '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
-          PY
-          echo "::error::the post-deploy migration, a post-deploy probe or the D10 SeedTest gate failed; app services rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
+          python3 scripts/rollback_services.py --env dev --cluster '${{ steps.previous.outputs.cluster }}' \
+            --previous previous-services.json --sweep-task '${{ steps.previous.outputs.sweep_td }}'
+          echo "::error::the deploy, the post-deploy migration, a post-deploy probe or the D10 SeedTest gate failed; app services and sweep schedules rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
           exit 1
 
   # ---- PROD RELEASE: stand up ephemeral prod-shaped preprod -> §10 HARD gate ----
@@ -357,8 +376,17 @@ jobs:
       # A prod deploy while dev still owns them would collide with dev's records and
       # CloudFront alias — and the prod smoke probe would be answered by DEV's API, a
       # green check proving the wrong environment. Refused here, before a preprod is
-      # stood up for a release that cannot land. Cutover: flip dev's and prod's flags
-      # in one commit, deploy DEV first (it releases the names), then release prod.
+      # stood up for a release that cannot land.
+      # THE CUTOVER IS A HANDOVER, NOT A DELETE-THEN-CREATE (Phase 3 infra review):
+      # flipping the flags and deploying dev first would delete the apex, www, api and
+      # embed records (and the CloudFront alias) in dev's cleanup, and nothing would
+      # answer on them until prod's release (preprod standup + verify + prod deploy)
+      # finished — hours of NXDOMAIN for the public product and every customer's
+      # widget. Before any flip: RETAIN dev's public records, have prod IMPORT or
+      # UPSERT them and take the CloudFront alias over (associate-alias), make this
+      # refusal check live Route 53 ownership, and migrate the customers' data (it
+      # lives in dev's database today) in the same runbook. Until that runbook
+      # exists, do not flip the flags.
       - name: Refuse a prod release while prod does not own the public names (D6)
         working-directory: infra
         run: |
@@ -587,6 +615,16 @@ jobs:
             --query 'services[].{name:serviceName,td:taskDefinition}' --output json > previous-services.json
           cat previous-services.json
           echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
+          # The sweeps' task definition too (Phase 3 infra review): the Compute stack moves
+          # every schedule to the NEW SweepTask revision, and a rollback must point them
+          # back. Best effort - an environment without schedules yet records nothing.
+          first=$(aws scheduler list-schedules --name-prefix "Luciel-prod-sweep-" --query 'Schedules[0].Name' --output text 2>/dev/null || true)
+          sweep_td=""
+          if [ -n "$first" ] && [ "$first" != "None" ]; then
+            sweep_td=$(aws scheduler get-schedule --name "$first" --query 'Target.EcsParameters.TaskDefinitionArn' --output text)
+          fi
+          echo "[rollback] sweep task definition: ${sweep_td:-none}"
+          echo "sweep_td=$sweep_td" >> "$GITHUB_OUTPUT"
           echo "had_previous=true" >> "$GITHUB_OUTPUT"
 
       - name: Migrate with the NEW image before the services roll
@@ -598,6 +636,7 @@ jobs:
 
       - name: Deploy prod infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
+        id: deploy
         run: |
           # npm ci ran in the hostnames step above.
           # Networking/Data/Budget are named for the same reasons as in the dev job:
@@ -633,20 +672,21 @@ jobs:
         if: inputs.paused != 'true'
         run: bash scripts/run-verify-task.sh prod
 
+      # See the dev job: the SES topics must keep a confirmed subscriber (live only).
+      - name: SES topics keep a confirmed HTTPS subscriber (live only)
+        id: sns_confirmed
+        if: inputs.paused != 'true' && (inputs.integration_mode || 'live') == 'live'
+        run: bash scripts/check_sns_subscriptions.sh prod
+
+      # Same rollback as dev's (Phase 3 infra review): the deploy step is a trigger, and
+      # the previous revisions are re-registered before the services and the
+      # Luciel-prod-sweep-* schedules are pointed back at them.
       - name: Roll the app services back to the previous task definitions
-        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: failure() && steps.previous.outputs.had_previous == 'true' && (steps.deploy.outcome == 'failure' || steps.migrate.outcome == 'failure' || steps.smoke.outcome == 'failure' || steps.verify.outcome == 'failure')
         run: |
-          cluster='${{ steps.previous.outputs.cluster }}'
-          python3 - "$cluster" <<'PY'
-          import json, subprocess, sys
-          cluster = sys.argv[1]
-          for svc in json.load(open('previous-services.json')):
-              print(f"[rollback] {svc['name']} -> {svc['td']}", flush=True)
-              subprocess.run(['aws', 'ecs', 'update-service', '--cluster', cluster, '--service', svc['name'],
-                              '--task-definition', svc['td'], '--force-new-deployment',
-                              '--query', 'service.deployments[0].status', '--output', 'text'], check=True)
-          PY
-          echo "::error::the post-deploy migration or a post-deploy probe failed; prod app services rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
+          python3 scripts/rollback_services.py --env prod --cluster '${{ steps.previous.outputs.cluster }}' \
+            --previous previous-services.json --sweep-task '${{ steps.previous.outputs.sweep_td }}'
+          echo "::error::the deploy, the post-deploy migration or a post-deploy probe failed; prod app services and sweep schedules rolled back to the previous task definitions (the schema stays where the migration left it — expand-first)"
           exit 1
 
   # 4) ALWAYS tear down preprod — even if standup/verify/prod-deploy failed. The

@@ -80,8 +80,8 @@ def test_the_migration_runs_from_the_new_image_before_the_services_roll(job: str
 @pytest.mark.parametrize(
     ("job", "gates"),
     [
-        ("dev", ["migrate", "smoke", "verify", "seedtest"]),
-        ("prod-deploy", ["migrate", "smoke", "verify"]),
+        ("dev", ["deploy", "migrate", "smoke", "verify", "seedtest"]),
+        ("prod-deploy", ["deploy", "migrate", "smoke", "verify"]),
     ],
 )
 def test_a_failure_after_the_roll_restores_the_services(job: str, gates: list[str]) -> None:
@@ -95,8 +95,38 @@ def test_a_failure_after_the_roll_restores_the_services(job: str, gates: list[st
         assert _index(steps, step_id=gate) < rollback_at
     # A pre-roll refusal never rolled anything: there is nothing to restore.
     assert "migrate_preroll" not in condition
-    # Services only — the schema is not reverted (migrations are expand-first).
-    assert "update-service" in _run(steps[rollback_at])
+    # Services and sweep schedules — the schema is not reverted (migrations are
+    # expand-first). The script re-registers a revision the Compute cleanup has
+    # already deregistered (Phase 3 infra review): a bare update-service to an
+    # INACTIVE revision is refused, which left the failed code serving.
+    run = _run(steps[rollback_at])
+    assert "scripts/rollback_services.py" in run and "update-service" not in run
+    assert "--sweep-task '${{ steps.previous.outputs.sweep_td }}'" in run
+    previous = steps[_index(steps, step_id="previous")]
+    assert "scheduler get-schedule" in _run(previous) and "sweep_td=" in _run(previous)
+    assert "SubscriptionArn" not in run  # the SNS check is its own, non-rolling step
+    assert "steps.sns_confirmed.outcome" not in condition
+
+
+@pytest.mark.parametrize(
+    ("job", "env", "mode_expr"),
+    [
+        ("dev", "dev", "vars.DEV_INTEGRATION_MODE"),
+        ("prod-deploy", "prod", "'live'"),
+    ],
+)
+def test_every_live_deploy_proves_the_ses_topics_kept_a_confirmed_subscriber(
+    job: str, env: str, mode_expr: str
+) -> None:
+    """Phase 3 infra review: SNS replaces a subscription whose endpoint changes and
+    the SES routes confirm only in live mode; a topic without a confirmed subscriber
+    drops inbound mail silently. The check runs after the probes, live only."""
+    steps = _steps(job)
+    check = steps[_index(steps, step_id="sns_confirmed")]
+    assert _run(check).strip() == f"bash scripts/check_sns_subscriptions.sh {env}"
+    assert mode_expr in str(check["if"]) and "== 'live'" in str(check["if"])
+    assert _index(steps, step_id="verify") < _index(steps, step_id="sns_confirmed")
+    assert _index(steps, step_id="sns_confirmed") < _index(steps, name="Roll the app services back")
 
 
 def test_the_prod_job_has_the_dev_jobs_whole_shape() -> None:

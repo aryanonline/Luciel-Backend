@@ -184,6 +184,44 @@ export class PipelineStack extends Stack {
     );
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
+        // Phase 3 infra review: the rollback (scripts/rollback_services.py) points
+        // every sweep schedule back at the previous SweepTask revision — the Compute
+        // stack moved them all to the new one. ListSchedules is not resource-scoped.
+        sid: 'ListSweepSchedules',
+        actions: ['scheduler:ListSchedules'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'RollbackSweepSchedules',
+        actions: ['scheduler:GetSchedule', 'scheduler:UpdateSchedule'],
+        resources: [
+          `arn:aws:scheduler:${this.region}:${this.account}:schedule/default/Luciel-${envConfig.envName}-sweep-*`,
+        ],
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        // scripts/check_sns_subscriptions.sh: after the deploy each SES topic must
+        // still have a CONFIRMED https subscriber (an unconfirmed one drops inbound
+        // mail and bounce events silently). ListTopics is not resource-scoped.
+        sid: 'ListTopics',
+        actions: ['sns:ListTopics'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:RequestedRegion': this.region } },
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ProveSesSubscribers',
+        actions: ['sns:ListSubscriptionsByTopic'],
+        resources: [`arn:aws:sns:${this.region}:${this.account}:luciel-${envConfig.envName}-ses-*`],
+      }),
+    );
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
         sid: 'PassTaskRoles',
         actions: ['iam:PassRole'],
         resources: [`arn:aws:iam::${this.account}:role/Luciel-${envConfig.envName}-Compute-*`],

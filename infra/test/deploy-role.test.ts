@@ -57,6 +57,30 @@ describe('the deploy role can migrate with the new image before the roll', () =>
   });
 });
 
+describe('the deploy role can roll the sweep schedules back and prove the SES subscribers', () => {
+  test.each<EnvName>(['dev', 'prod'])('%s: scheduler get/update on its own sweep schedules, SNS list on its own SES topics', (envName) => {
+    pipeline(envName).hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        // arrayWith matches in relative order: the statements as the stack adds them.
+        Statement: Match.arrayWith([
+          Match.objectLike({ Sid: 'ListSweepSchedules', Action: 'scheduler:ListSchedules' }),
+          Match.objectLike({
+            Sid: 'RollbackSweepSchedules',
+            Action: ['scheduler:GetSchedule', 'scheduler:UpdateSchedule'],
+            Resource: `arn:aws:scheduler:${OFFERING_REGION}:111111111111:schedule/default/Luciel-${envName}-sweep-*`,
+          }),
+          Match.objectLike({ Sid: 'ListTopics', Action: 'sns:ListTopics' }),
+          Match.objectLike({
+            Sid: 'ProveSesSubscribers',
+            Action: 'sns:ListSubscriptionsByTopic',
+            Resource: `arn:aws:sns:${OFFERING_REGION}:111111111111:luciel-${envName}-ses-*`,
+          }),
+        ]),
+      }),
+    });
+  });
+});
+
 describe('one GitHub OIDC provider per account', () => {
   test('dev owns (creates) it', () => {
     expect(OIDC_PROVIDER_OWNER).toBe('dev');

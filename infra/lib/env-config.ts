@@ -196,8 +196,10 @@ export interface EnvConfig {
    * alias, and two environments answering on one name would split a customer's
    * session across two databases. Dev owns them today so nothing goes dark while no
    * production environment exists; prod claims them by flipping BOTH flags in one
-   * commit (dev deploys first to release them, then prod — deploy.yml's prod job
-   * refuses to run while prod does not own them).
+   * commit (deploy.yml's prod job refuses to run while prod does not own them).
+   * The flip is a HANDOVER, never 'deploy dev first': dev's cleanup would delete
+   * the public records and CloudFront alias hours before prod could create them
+   * (Phase 3 infra review) — see the runbook note in deploy.yml's refusal step.
    */
   readonly ownsPublicApex: boolean;
 }
