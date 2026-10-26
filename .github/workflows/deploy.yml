@@ -318,6 +318,11 @@ jobs:
       # into). A failure rolls the services back like the probes above. The harness
       # proves LIVE behavior (a real grounded answer, the live fallback), so a mock
       # deploy has nothing for it to prove: the next step says so out loud instead.
+      # The gate passes only on exit 0 AND a "[seedtest] SUMMARY result=PASS" line read
+      # back from the task's CloudWatch stream (round 7 fact check, 2026-10-25: with no
+      # logs: grant on the deploy role, the read was refused, the refusal was
+      # discarded, and the gate passed on the exit code while printing "SUMMARY
+      # missing"). The ReadProbeLogs grant arrives in the Pipeline step above.
       - name: D10 — SeedTest live-behavior gate (strict)
         id: seedtest
         if: inputs.paused != 'true' && (inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock') == 'live'
