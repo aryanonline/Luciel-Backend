@@ -214,12 +214,16 @@ case "$1 $2" in
       ok) cat "$FAKE_STATE/logs.json" ;;
       denied)
         # What the deploy role got on every 2026-10-25 read: no logs: grant at all.
-        echo "An error occurred (AccessDeniedException) when calling the FilterLogEvents operation: User: arn:aws:sts::1:assumed-role/luciel-dev-github-deploy/GitHubActions is not authorized to perform: logs:FilterLogEvents" >&2
+        msg="An error occurred (AccessDeniedException) when calling the FilterLogEvents"
+        msg="$msg operation: User: arn:aws:sts::1:assumed-role/luciel-dev-github-deploy/"
+        msg="${msg}GitHubActions is not authorized to perform: logs:FilterLogEvents"
+        echo "$msg" >&2
         exit 254 ;;
       late)
         # The stream does not exist for the first two reads, then has the SUMMARY.
         if [ "$reads" -le 2 ]; then
-          echo "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log stream does not exist." >&2
+          msg="An error occurred (ResourceNotFoundException) when calling the FilterLogEvents"
+          echo "$msg operation: The specified log stream does not exist." >&2
           exit 254
         fi
         cat "$FAKE_STATE/logs.json" ;;
@@ -402,7 +406,12 @@ def test_a_stream_that_appears_late_is_waited_for(tmp_path: Path) -> None:
 @needs_runner
 def test_a_stream_with_no_summary_by_the_deadline_fails_the_strict_gate(tmp_path: Path) -> None:
     done, state, _ = _run_runner(
-        tmp_path, exit_code="0", log_lines=PASS_LINES[:2], wait_seconds="1"
+        # sleep is faked, so the 5 s deadline is a handful of fast re-reads; 1 s was
+        # shorter than one read on a slow Windows process spawn (a read-once flake).
+        tmp_path,
+        exit_code="0",
+        log_lines=PASS_LINES[:2],
+        wait_seconds="5",
     )
     out = done.stdout
     assert done.returncode == 1, out
