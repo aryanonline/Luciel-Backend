@@ -235,6 +235,25 @@ export class PipelineStack extends Stack {
         resources: [`arn:aws:sns:${this.region}:${this.account}:luciel-${envConfig.envName}-ses-*`],
       }),
     );
+    // scripts/run-seedtest-task.sh (the strict D10 gate) and run-verify-task.sh read
+    // their task's harness output back from CloudWatch. The role never had any logs:
+    // action, and both scripts sent the AccessDenied to /dev/null: every 2026-10-25
+    // dev deploy printed "SUMMARY missing" about a run whose stream held
+    // "SUMMARY result=PASS", and the gate passed on the exit code alone. The prod role
+    // also runs the ephemeral preprod's gate, so it reads preprod's groups too.
+    const probeEnvs = envConfig.envName === 'prod' ? ['prod', 'preprod'] : [envConfig.envName];
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadProbeLogs',
+        actions: ['logs:FilterLogEvents', 'logs:GetLogEvents', 'logs:DescribeLogStreams'],
+        resources: probeEnvs.flatMap((env) =>
+          ['seedtest', 'verify'].flatMap((probe) => [
+            `arn:aws:logs:${this.region}:${this.account}:log-group:/luciel/${env}/${probe}`,
+            `arn:aws:logs:${this.region}:${this.account}:log-group:/luciel/${env}/${probe}:*`,
+          ]),
+        ),
+      }),
+    );
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'PassTaskRoles',
