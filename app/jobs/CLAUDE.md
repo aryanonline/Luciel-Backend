@@ -43,6 +43,10 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
   preflight under one `asyncio.run` and sweep under a second, and died on its first query
   (`got Future ... attached to a different loop`) every Sunday 2026-09-27..10-25.
   `app.db.engine` now raises `EngineLoopMismatchError` on a second loop instead.
+  09-27 is only the oldest run /luciel/dev/sweep still holds (30-day retention): the
+  two-`asyncio.run` shape dates from 2f2af24 (2026-07-31, the preflight's introduction), and
+  no `{"sweep": "audit_retention", ...}` result line exists in the retained window, so treat
+  the weekly audit prune as never having completed on dev before this fix.
 - A sweep that raises is logged as `ERROR app.jobs sweep_failed sweep=<name>` (with the
   traceback) and exits 1: the SweepErrors filter counts the failure itself, not whatever a
   library happened to log on the way down. Tests: `tests/unit/test_sweep_entrypoint_one_loop.py`
