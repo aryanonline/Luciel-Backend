@@ -46,6 +46,7 @@ from app.connections import meta_assets, oauth_flow, registry, service
 from app.connections.secrets import get_secret_store, secret_ref_for
 from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
+from app.knowledge import sync_job as sync_jobs
 from app.knowledge.providers import (
     HttpTransport,
     OAuthExchangeError,
@@ -77,7 +78,7 @@ from app.schemas_api.connections import (
     TenantNumbersOut,
     UpdateConnectionSettingsRequest,
 )
-from app.schemas_api.knowledge import OAuthCallbackRequest
+from app.schemas_api.knowledge import OAuthCallbackRequest, SyncJobOut
 
 router = APIRouter(prefix="/api/v1/admin/connections", tags=["connections"])
 
@@ -120,6 +121,10 @@ def _connection_out(c: InstanceConnection) -> ConnectionOut:
             # already shows, so it never has to derive one from the raw provider
             # code (that derivation is what produced "Ses" instead of "Amazon SES").
             "displayName": _provider_display_name(c.provider),
+            # Round 7 walk run 8: the knowledge sync job on a knowledge_source row,
+            # read through the stale rule — the SAME record GET /sync-connections
+            # serves; None on every other row.
+            "syncJob": SyncJobOut.from_record(sync_jobs.effective_job(c)),
         }
     )
 

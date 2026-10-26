@@ -438,3 +438,86 @@ async def test_a_non_serving_luciel_is_not_synced(monkeypatch, state: LucielStat
         synced = await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW)
     assert synced == 0
     assert provider.calls == 0  # never reached the provider
+
+
+# --- Round 7 walk run 8: the scheduled sync stamps the same sync job -------------------
+# The manual sync became a job whose state lives on the connection (sync_job). The
+# sweep writes the same record with trigger "scheduled", and leaves a connection alone
+# while the owner's manual job is still running (two reconciles would race).
+
+
+async def _sync_job_of(admin: uuid.UUID, cid: uuid.UUID) -> dict | None:
+    async with tenant_session(admin) as s:
+        return (
+            await s.execute(
+                select(InstanceConnection.sync_job).where(InstanceConnection.connection_id == cid)
+            )
+        ).scalar_one()
+
+
+async def test_the_sweep_stamps_a_scheduled_job_synced_with_its_result(monkeypatch) -> None:
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(hours=12))
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    async with tenant_session(admin) as s:
+        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 1
+    job = await _sync_job_of(admin, cid)
+    assert job is not None
+    assert job["state"] == "synced"
+    assert job["trigger"] == "scheduled"
+    assert job["started_at"] and job["finished_at"]
+    assert job["error"] is None
+    assert job["result"]["added"] == [] and job["result"]["removed"] == []
+
+
+async def test_the_sweep_stamps_a_failed_job_on_an_unreachable_site(monkeypatch) -> None:
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2), provider="website_crawl")
+    monkeypatch.setattr(
+        knowledge_sweep, "provider_for_connection", lambda conn, store: _UnreachableSite()
+    )
+
+    async with tenant_session(admin) as s:
+        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 0
+    job = await _sync_job_of(admin, cid)
+    assert job is not None
+    assert job["state"] == "failed"
+    assert job["trigger"] == "scheduled"
+    assert job["error"] == "Sync unavailable: crawl fetched no pages: https://acme.example/"
+
+
+async def test_the_sweep_skips_a_connection_whose_manual_job_is_running(monkeypatch, caplog):
+    import logging
+
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    running = sync_job.syncing_stamp(started_at=datetime.now(UTC), trigger="manual")
+    assert await sync_job.stamp_job(admin, cid, running)
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    with caplog.at_level(logging.INFO, logger="app.knowledge.sweep"):
+        async with tenant_session(admin) as s:
+            assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 0
+    assert provider.calls == 0  # left alone this pass
+    assert await _sync_job_of(admin, cid) == running  # the manual job's record untouched
+    assert any("knowledge_sync_skipped_job_running" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_stale_syncing_record_does_not_block_the_sweep(monkeypatch) -> None:
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    stale = sync_job.syncing_stamp(
+        started_at=datetime.now(UTC) - timedelta(hours=2), trigger="manual"
+    )
+    assert await sync_job.stamp_job(admin, cid, stale)
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    async with tenant_session(admin) as s:
+        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 1
+    assert provider.calls == 1
+    job = await _sync_job_of(admin, cid)
+    assert job is not None and job["state"] == "synced" and job["trigger"] == "scheduled"

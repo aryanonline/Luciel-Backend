@@ -69,3 +69,25 @@ make that state explicit and test it.
   manual Re-sync) proceeds as before; restore's grace-window de-duplication remains the
   safety net for a manual run on a deleted one.
   Tests: `tests/integration/test_knowledge_sync_halts_when_not_serving.py`.
+
+## Round 7 walk run 8 (2026-10-25) — the manual sync is a JOB
+- Gotcha: `POST /admin/knowledge/sync-connections/{id}/sync` no longer runs the whole sync
+  inside the request (an 8-page crawl with one LLM graph call per page outlived the ALB's
+  60 s idle timeout; its CORS-less 504 read as "Network request failed."). `sync_job.py`:
+  the route waits `knowledge_sync_inline_wait_seconds` (20 s). Finished → **200**
+  `SyncResultOut` (or the same 409s: shrink, unreachable / dead credential; other failures
+  503 with the owner message). Still running → **202** `{connectionId, state: "syncing",
+  startedAt, finishedAt: null, result: null, error: null, shrink: null, trigger: "manual"}`.
+  Every job (manual or scheduled, inline or deferred) ends in a terminal state on
+  `instance_connections.sync_job` (migration 0077), served as `syncJob` on BOTH
+  GET /sync-connections and GET /connections (states syncing | synced | failed |
+  shrink_pending). A second start on a fresh `syncing` → 409. Stale rule: a `syncing`
+  older than `knowledge_sync_job_stale_seconds` (900) READS as failed ("interrupted"),
+  the row is not rewritten. The sweep stamps the same record (trigger `scheduled`) and
+  skips a connection whose job is fresh `syncing`. Jobs live in the API process
+  (`_RUNNING`); shutdown drains them (bounded) and stamps the rest "interrupted by a restart".
+- Graph extractor: the graph call passes `max_output_tokens=GRAPH_MAX_OUTPUT_TOKENS`
+  (4096) through `LLMRouter.complete` (None = unchanged for every other caller). A
+  `truncated` answer (stop_reason max_tokens / finish_reason length) keeps the grammar-only
+  graph AND bumps the revision (no endless re-extract); any other unparseable answer is
+  `llm_skipped` (re-extracted next pass), logged with `reason`.

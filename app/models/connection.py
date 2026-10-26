@@ -61,3 +61,9 @@ class InstanceConnection(Base, TenantMixin, TimestampMixin):
     # legacy rows that entered grace before the column existed.
     status_stashed: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status_detail_stashed: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The knowledge sync JOB (migration 0077, ``app.knowledge.sync_job``): the last
+    # manual or scheduled sync's state — ``state`` (syncing | synced | failed |
+    # shrink_pending), ``started_at``, ``finished_at``, ``result``, ``error``,
+    # ``shrink``, ``trigger``. Read through ``sync_job.effective_job`` (a "syncing"
+    # older than the stale window reads as failed). NULL on a row that never synced.
+    sync_job: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)

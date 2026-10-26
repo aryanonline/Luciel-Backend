@@ -599,6 +599,15 @@ class Settings(BaseSettings):
     # pages per crawl and link depth, robots.txt honoured (F123).
     website_crawl_max_pages: int = 40
     website_crawl_max_depth: int = 2
+    # The manual sync is a JOB (round 7, walk run 8): the request waits this long for
+    # it and then answers 202 while the job keeps running in the process. Below the
+    # load balancer's 60 s idle timeout with room to spare — an 8-page crawl with one
+    # LLM graph call per page outlived it and the ALB's CORS-less 504 read as
+    # "Network request failed." on a sync that was still working.
+    knowledge_sync_inline_wait_seconds: float = 20.0
+    # A ``sync_job`` still reading "syncing" after this long is READ as failed (the
+    # process that ran it is gone — a deploy, a crash); the row is not rewritten.
+    knowledge_sync_job_stale_seconds: int = 900
     # Retrieval relevance floor applied in live mode before a chunk is injected into the
     # prompt: an unrelated chunk is noise the model may answer from. Two rules, both
     # cosine DISTANCE: an absolute ceiling, and a band relative to the best hit. Mock

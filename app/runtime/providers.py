@@ -124,6 +124,14 @@ def _provider_error(prefix: str, exc: BaseException) -> ProviderError:
 TOOL_CALL_MAX_OUTPUT_TOKENS = 2048
 
 
+def _output_ceiling(default: int, override: int | None, tools: list[dict[str, Any]] | None) -> int:
+    """The call's output-token ceiling: the per-call ``override`` (round 7 walk run 8 —
+    the graph extractor's JSON outgrew the 1024 default) or the provider's default,
+    and never below ``TOOL_CALL_MAX_OUTPUT_TOKENS`` on a tool-bearing call."""
+    ceiling = override if override is not None else default
+    return max(ceiling, TOOL_CALL_MAX_OUTPUT_TOKENS) if tools else ceiling
+
+
 def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Neutral turns → Anthropic Messages shape.
 
@@ -263,6 +271,7 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         from anthropic import AnthropicError  # noqa: PLC0415 — lazy/guarded import
 
@@ -278,11 +287,7 @@ class AnthropicProvider:
             # Tool JSON shares the output budget: a tool_use block serialized into a
             # 1024-token ceiling can truncate mid-call, which surfaces as a malformed
             # tool proposal. Tool-bearing calls therefore get more headroom.
-            "max_tokens": (
-                max(self._max_output_tokens, TOOL_CALL_MAX_OUTPUT_TOKENS)
-                if tools
-                else self._max_output_tokens
-            ),
+            "max_tokens": _output_ceiling(self._max_output_tokens, max_output_tokens, tools),
             "system": system_blocks,
             "messages": _to_anthropic_messages(messages),
         }
@@ -325,6 +330,8 @@ class AnthropicProvider:
             confidence=confidence,
             tool_calls=tool_calls,
             usage=usage,
+            # The answer stopped at the output ceiling, mid-sentence or mid-JSON.
+            truncated=getattr(resp, "stop_reason", None) == "max_tokens",
         )
 
 
@@ -388,6 +395,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         from openai import OpenAIError  # noqa: PLC0415 — lazy/guarded import
 
@@ -401,10 +409,8 @@ class OpenAIProvider:
             # (verified live: gpt-5.4 returns unsupported_parameter for max_tokens).
             # Sending the wrong name silently breaks the FALLBACK path — the router
             # would error instead of gracefully failing over when Anthropic is down.
-            "max_completion_tokens": (
-                max(self._max_output_tokens, TOOL_CALL_MAX_OUTPUT_TOKENS)
-                if tools
-                else self._max_output_tokens
+            "max_completion_tokens": _output_ceiling(
+                self._max_output_tokens, max_output_tokens, tools
             ),
             "messages": api_messages,
         }
@@ -459,4 +465,5 @@ class OpenAIProvider:
             confidence=confidence,
             tool_calls=tool_calls,
             usage=usage,
+            truncated=getattr(choice, "finish_reason", None) == "length",
         )

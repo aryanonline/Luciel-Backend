@@ -31,7 +31,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -222,23 +222,43 @@ _LLM_SYSTEM_PROMPT = (
     "Take every type from the text's own vocabulary; there is no fixed list of types. "
     "Names are short noun phrases as written. Every edge source and target must be an "
     f"entity name from your list. At most {MAX_LLM_ENTITIES} entities and {MAX_LLM_EDGES} "
-    "edges — prefer the ones a customer would ask about. No prose, no markdown fences."
+    "edges — prefer the ones a customer would ask about. No prose, no markdown fences. "
+    "Write the JSON compactly on a single line: no indentation, no line breaks, no "
+    "whitespace outside string values."
 )
 
+#: The graph call's output ceiling (round 7 walk run 8). The providers' 1024 default
+#: truncated the JSON of every long page mid-object (a 1943-token /legal/terms stopped
+#: at output_tokens=1024) and the answer read as unparseable; 4096 holds the capped
+#: graph (``MAX_LLM_ENTITIES`` / ``MAX_LLM_EDGES``) with room to spare.
+GRAPH_MAX_OUTPUT_TOKENS = 4096
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+#: Why an answer could not be read (the ``reason`` on ``graph_extract.llm_unparseable``).
+UnparseableReason = Literal["no_json_object", "json_error", "not_a_dict"]
+
+
+def graph_json(raw: str) -> tuple[dict[str, Any] | None, UnparseableReason | None]:
+    """The model's JSON object (fence stripped, outermost ``{`` … ``}``) or why there is
+    none: ``no_json_object`` (no braces at all), ``json_error`` (the span does not
+    decode — a truncated answer lands here too), ``not_a_dict``."""
+    body = _FENCE_RE.sub("", (raw or "").strip())
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        return None, "no_json_object"
+    try:
+        data = json.loads(body[start : end + 1])
+    except ValueError:
+        return None, "json_error"
+    if not isinstance(data, dict):
+        return None, "not_a_dict"
+    return data, None
 
 
 def parse_llm_graph(raw: str) -> ExtractionResult | None:
     """Strict, capped parse of the model's JSON → ExtractionResult; None when unusable."""
-    body = _FENCE_RE.sub("", (raw or "").strip())
-    start, end = body.find("{"), body.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        data = json.loads(body[start : end + 1])
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
+    data, _reason = graph_json(raw)
+    if data is None:
         return None
 
     entities: dict[str, ExtractedEntity] = {}
@@ -364,17 +384,35 @@ class LlmGraphExtractor:
                 context_tokens=0,
                 complexity=0.0,
                 admin_id=admin_id,
+                max_output_tokens=GRAPH_MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:  # noqa: BLE001 — never let a vendor break ingest
             log.warning("graph_extract.llm_failed", extra={"error": type(exc).__name__})
             # A cap refusal (customer turns filled the window between the headroom
             # read and the admission) is the same budget skip: re-extract next pass.
             return replace(base, llm_skipped=isinstance(exc, LLMCapExceeded))
-        parsed = parse_llm_graph(getattr(resp, "text", "") or "")
-        if parsed is None:
-            log.warning("graph_extract.llm_unparseable")
+        raw = getattr(resp, "text", "") or ""
+        parsed = parse_llm_graph(raw)
+        if parsed is not None:
+            return merge_results(base, parsed)
+        if getattr(resp, "truncated", False):
+            # The answer hit the output ceiling mid-JSON. The same page would hit it
+            # again next pass, so this is NOT a skip: the grammar-only graph is kept
+            # and the revision marker bumps (no endless re-extract of a page that is
+            # simply too dense for the ceiling).
+            usage = getattr(resp, "usage", None)
+            log.warning(
+                "graph_extract.llm_truncated",
+                extra={"output_tokens": getattr(usage, "output_tokens", None)},
+            )
             return base
-        return merge_results(base, parsed)
+        # Any other unusable answer is treated like a budget skip (round 7 walk run 8):
+        # the grammar-only graph serves now and ``llm_skipped`` leaves the item's
+        # revision marker unbumped, so the next sync pass re-extracts it — it used to
+        # keep the grammar-only graph until the page's content happened to change.
+        _data, reason = graph_json(raw)
+        log.warning("graph_extract.llm_unparseable", extra={"reason": reason or "json_error"})
+        return replace(base, llm_skipped=True)
 
 
 def ingest_has_headroom(admin_id: uuid.UUID) -> bool:

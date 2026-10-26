@@ -18,11 +18,12 @@ from typing import cast
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
-from app.api.errors import conflict, not_found, validation_error
+from app.api.errors import ApiError, conflict, not_found, service_unavailable, validation_error
 from app.audit import log as audit
 from app.connections import oauth_flow, registry
 from app.connections import service as connections_service
@@ -31,6 +32,7 @@ from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFa
 from app.db.session import tenant_session
 from app.knowledge import scope as knowledge_scope
 from app.knowledge import service, sync
+from app.knowledge import sync_job as sync_jobs
 from app.knowledge.parsers import ParseError, parse_file
 from app.knowledge.providers import (
     CrawlUnreachable,
@@ -60,6 +62,8 @@ from app.schemas_api.knowledge import (
     SaveScopeRequest,
     ScopeCandidateOut,
     SyncConnectionOut,
+    SyncJobAcceptedOut,
+    SyncJobOut,
     SyncResultOut,
 )
 
@@ -244,49 +248,10 @@ async def restore_source(
         return _source_out(src, used.get(src.id, 0))
 
 
-_DEAD_CREDENTIAL_DETAIL = "knowledge sync could not use the stored credential — reconnect"
-
-
-async def _flag_dead_credential(admin_id: uuid.UUID, connection_id: uuid.UUID) -> None:
-    """Bookkeeping for a grant the provider just refused (round 7 WP-4c #7), in its
-    OWN transaction.
-
-    The manual routes used to pause the sources inside the request's
-    ``tenant_session`` and then raise the 409 — which rolled that transaction back,
-    so even the pause was lost — and never touched the connection row, so the
-    Configure page kept a green "Connected" chip on a dead credential. The sweep
-    does both halves (round 5B item 12: pause + ``mark_connection_broken`` → audit +
-    once-per-incident attention email); the routes now do the same, before the 409.
-    A row the owner never connected (unconfigured / pending) is paused but NOT
-    flipped: "error" would claim a grant it never had.
-    """
-    from app.connections.health import mark_connection_broken  # noqa: PLC0415
-
-    async with tenant_session(admin_id) as s:
-        conn = (
-            await s.execute(
-                select(InstanceConnection).where(
-                    InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.connection_id == connection_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if conn is None:
-            return
-        await sync.pause_sync_on_revocation(s, admin_id=admin_id, connection_id=connection_id)
-        if conn.status == "connected":
-            await mark_connection_broken(s, conn, detail=_DEAD_CREDENTIAL_DETAIL)
-
-
-async def _flag_unreachable_site(admin_id: uuid.UUID, connection_id: uuid.UUID) -> None:
-    """Bookkeeping for a crawl that reached no page (round 7 Phase 2 review,
-    knowledge #2), in its OWN transaction (the 409 unwinds the request's).
-
-    A website crawl holds no credential, so this is NOT ``_flag_dead_credential``:
-    the sources read the honest "error" sync state and nothing else changes — no
-    D10 stop clock, no pause notice, the connection row keeps its status."""
-    async with tenant_session(admin_id) as s:
-        await sync.mark_sync_error(s, admin_id=admin_id, connection_id=connection_id)
+# The dead-credential / unreachable-site bookkeeping moved beside the sync job that
+# also runs it (round 7 walk run 8); the names here are unchanged for resync_source.
+_flag_dead_credential = sync_jobs.flag_dead_credential
+_flag_unreachable_site = sync_jobs.flag_unreachable_site
 
 
 @router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
@@ -540,6 +505,7 @@ def _sync_connection_out(c: InstanceConnection) -> SyncConnectionOut:
             "status": c.status,
             "nonSecretConfig": c.non_secret_config,
             "statusDetail": c.status_detail,
+            "syncJob": SyncJobOut.from_record(sync_jobs.effective_job(c)),
         }
     )
 
@@ -654,79 +620,71 @@ async def create_sync_connection(
         return _sync_connection_out(connection)
 
 
-@router.post("/sync-connections/{connection_id}/sync", response_model=SyncResultOut)
+@router.post(
+    "/sync-connections/{connection_id}/sync",
+    response_model=SyncResultOut,
+    responses={
+        202: {
+            "model": SyncJobAcceptedOut,
+            "description": (
+                "The sync is still running after the inline wait; the connection's "
+                "syncJob carries its outcome."
+            ),
+        }
+    },
+)
 async def trigger_sync(
     connection_id: uuid.UUID,
     subject: Subject = Depends(current_admin),
     confirm_shrink: bool = Query(False, alias="confirmShrink"),
-) -> SyncResultOut:
+) -> SyncResultOut | JSONResponse:
     """Manually trigger a re-sync/crawl for one connection (§3.2.3 "manual
     re-sync ... always available for immediacy"). Reconciles the FULL connected
     scope through the connection's real ``SyncProvider`` — additions, changed-
-    revision updates, and source-side deletions all propagate in one call."""
-    try:
-        async with tenant_session(subject.admin_id) as s:
-            conn = (
-                await s.execute(
-                    select(InstanceConnection).where(
-                        InstanceConnection.admin_id == subject.admin_id,
-                        InstanceConnection.connection_id == connection_id,
-                        InstanceConnection.connection_type == "knowledge_source",
-                    )
-                )
-            ).scalar_one_or_none()
-            if conn is None:
-                raise not_found("Sync connection not found.")
-            if conn.status == "revoked":
-                raise conflict("Connection is revoked; reconnect before syncing.")
-            instance_id = await _instance_id(s, subject.admin_id)
-            # Round 5B item 12: refresh at call time — the manual Re-sync button ran
-            # on the raw stored token and failed on an hour-old Google token, landing
-            # the sources in a silent pause.
-            from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+    revision updates, and source-side deletions all propagate in one call.
 
-            await ensure_fresh_access_token(
-                s,
-                subject.admin_id,
-                instance_id,
-                connection_type="knowledge_source",
-                connection_id=conn.connection_id,
-            )
-            provider = provider_for_connection(conn, get_secret_store())
-            try:
-                result = await sync.sync_connection(
-                    s,
-                    admin_id=subject.admin_id,
-                    instance_id=instance_id,
-                    connection_id=conn.connection_id,
-                    origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                    provider=provider,
-                    allow_shrink=confirm_shrink,
-                )
-            except sync.SnapshotShrunk as exc:
-                # Nothing was deleted (F107). The owner confirms an intentional shrink
-                # by re-syncing with ?confirmShrink=true — the frontend offers exactly that.
-                raise conflict(
-                    f"The source now reports {exc.remote} item(s) where {exc.existing} are "
-                    "synced, so nothing was removed. If you did remove them at the source, "
-                    "sync again and confirm the shrink."
-                ) from exc
-            return SyncResultOut.model_validate(result.as_dict())
-    except CrawlUnreachable as exc:
-        # The site answered no page (round 7 Phase 2 review, knowledge #2): the same
-        # 409 the owner always saw, but the bookkeeping is a failed sync — never the
-        # revocation pause or the connection flipped to error on a credential-less row.
-        await _flag_unreachable_site(subject.admin_id, connection_id)
-        raise conflict(f"Sync unavailable: {exc}") from exc
-    except ProviderUnavailable as exc:
-        # No token on file (never connected / revoked / expired) or the provider's
-        # live call isn't reachable in this posture: surface a clean, structured
-        # error — never a 500 crash (§3.2.3 "never fabricate freshness"). The pause
-        # and the honest connection state are written in their OWN transaction,
-        # outside the request's (which this 409 unwinds) — round 7 WP-4c #7: the
-        # Configure chip stayed green on a credential the provider had refused.
-        await _flag_dead_credential(subject.admin_id, connection_id)
-        raise conflict(f"Sync unavailable: {exc}") from exc
+    The sync runs as a JOB (round 7 walk run 8: an 8-page crawl with one LLM graph
+    call per page outlived the load balancer's 60 s idle timeout). A job that
+    finishes within ``knowledge_sync_inline_wait_seconds`` answers exactly as before:
+    200 ``SyncResultOut``, or the same 409s for a refused shrink / an unreachable site
+    / a dead credential. One still running answers 202 ``SyncJobAcceptedOut``; its
+    outcome lands on the connection's ``syncJob`` (GET /sync-connections,
+    GET /connections). A second start while one is running is a 409."""
+    try:
+        outcome = await sync_jobs.start_sync_job(
+            admin_id=subject.admin_id,
+            connection_id=connection_id,
+            allow_shrink=confirm_shrink,
+            actor_user_id=subject.user_id,
+            # Resolved HERE, at call time, so the module-level seam stays patchable.
+            provider_factory=provider_for_connection,
+        )
+    except sync_jobs.SyncJobRefused as exc:
+        raise (not_found if exc.kind == "not_found" else conflict)(exc.message) from exc
+    if outcome.deferred:
+        # The syncing stamp always carries a state; read it straight into the 202 shape.
+        running = SyncJobOut.from_record(outcome.job) or SyncJobOut(state="syncing")
+        accepted = SyncJobAcceptedOut(**running.model_dump(), connection_id=connection_id)
+        return JSONResponse(
+            status_code=202, content=accepted.model_dump(mode="json", by_alias=True)
+        )
+    job = outcome.job
+    message = str(job.get("error") or sync_jobs.FAILED_GENERIC)
+    if outcome.outcome == "synced" and outcome.result is not None:
+        return SyncResultOut.model_validate(outcome.result.as_dict())
+    if outcome.outcome in ("shrink_pending", "unreachable", "dead_credential"):
+        # Nothing was deleted (F107) / the site answered no page / no usable
+        # credential: the same 409 bodies the owner always saw, the bookkeeping
+        # already written by the job in its own transactions.
+        raise conflict(message)
+    if outcome.outcome == "embedding":
+        # The same 503 the EmbeddingError handler serves on every other ingest path.
+        raise ApiError(503, message, sync_jobs.EMBEDDING_RETRY_AFTER_SECONDS)
+    # Any other failure used to escape as a bare 500 (no CORS headers on that path, so
+    # the dashboard read "Network request failed."). The sync's transaction unwound,
+    # nothing changed: a 503 with the owner's words (app.api.errors.service_unavailable
+    # — the frontend maps it to server_error, as it did the 500).
+    raise service_unavailable(message)
 
 
 # --- knowledge SCOPE selection (Decision #9) ------------------------------------ #

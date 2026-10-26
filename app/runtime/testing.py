@@ -71,6 +71,7 @@ class EchoModel:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        max_output_tokens: int | None = None,  # no ceiling to apply: never truncated
     ) -> LLMResponse:
         if self._raise:
             # Exercises immediate failover to the fallback provider (§3.4.3).

@@ -23,8 +23,10 @@ the connection row untouched).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.connections.secrets import get_secret_store
 from app.knowledge import service, sync
+from app.knowledge import sync_job as sync_jobs
+from app.knowledge.embeddings import EmbeddingError
 from app.knowledge.providers import (
     CrawlUnreachable,
     ProviderUnavailable,
@@ -293,6 +297,38 @@ async def sync_due_connections(
             newest = newest if newest.tzinfo else newest.replace(tzinfo=UTC)
             if now - newest < _cadence_for(conn.provider):
                 continue  # fresh enough under the origin's cadence
+        # Round 7 walk run 8: the owner's manual sync is a job that may still be running
+        # in the API process. Read the column fresh (a column select, never the
+        # identity-mapped row loaded at the start of this pass) and leave a fresh
+        # "syncing" alone this pass — two concurrent reconciles of one connection
+        # would race each other's writes.
+        current_job = (
+            await session.execute(
+                select(InstanceConnection.sync_job).where(
+                    InstanceConnection.admin_id == admin_id,
+                    InstanceConnection.connection_id == conn.connection_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if sync_jobs.is_fresh_syncing(current_job):
+            logger.info(
+                "knowledge_sync_skipped_job_running provider=%s trigger=%s",
+                conn.provider,
+                (current_job or {}).get("trigger") if isinstance(current_job, dict) else "-",
+            )
+            continue
+        # The scheduled pass stamps the same job record (trigger "scheduled"). The
+        # "syncing" stamp is its own short transaction (this pass has not written the
+        # row yet, so it cannot wait on our own lock) so a manual start sees it; the
+        # terminal stamp goes through THIS session — a token refresh below writes the
+        # row and holds its lock until the pass commits.
+        job_started = sync_jobs.syncing_stamp(
+            started_at=datetime.now(UTC), trigger=sync_jobs.TRIGGER_SCHEDULED
+        )
+        job_t0 = time.monotonic()
+        await sync_jobs.stamp_job(admin_id, conn.connection_id, job_started)
+        job_final: dict[str, Any] | None = None
+        job_outcome = "error"
         try:
             # Round 5B item 12: refresh the token at CALL time like every other
             # live consumer (calendar/CRM/outlook do this). Google tokens live
@@ -326,6 +362,10 @@ async def sync_due_connections(
                     provider=provider_for_connection(conn, get_secret_store()),
                 )
             synced += 1
+            job_outcome = "synced"
+            job_final = sync_jobs.terminal_stamp(
+                job_started, state=sync_jobs.SYNCED, result=result.job_dict()
+            )
             if result.refused:
                 # The quota refused part of the pass (knowledge #4): the sync itself
                 # succeeded and its audit row counts the refusals for the owner.
@@ -352,6 +392,10 @@ async def sync_due_connections(
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )
+            job_outcome = "unreachable"
+            job_final = sync_jobs.terminal_stamp(
+                job_started, state=sync_jobs.FAILED, error=sync_jobs.unavailable_message(exc)
+            )
         except ProviderUnavailable as exc:
             # Dead credential: pause + flag (§3.2.3) — never silently serve
             # stale content, never crash the rest of the tenant's connections.
@@ -372,6 +416,10 @@ async def sync_due_connections(
             logger.info(
                 "knowledge_sync_paused provider=%s error=%s", conn.provider, type(exc).__name__
             )
+            job_outcome = "dead_credential"
+            job_final = sync_jobs.terminal_stamp(
+                job_started, state=sync_jobs.FAILED, error=sync_jobs.unavailable_message(exc)
+            )
         except sync.SnapshotShrunk as exc:
             # The refusal already wrote its own durable evidence (error state + the
             # sync_refused_shrink audit row) before raising; a second failure row
@@ -381,6 +429,13 @@ async def sync_due_connections(
                 conn.provider,
                 exc.existing,
                 exc.remote,
+            )
+            job_outcome = "shrink_pending"
+            job_final = sync_jobs.terminal_stamp(
+                job_started,
+                state=sync_jobs.SHRINK_PENDING,
+                error=sync_jobs.shrink_message(remote=exc.remote, existing=exc.existing),
+                shrink={"remote": exc.remote, "existing": exc.existing},
             )
         except Exception as exc:  # noqa: BLE001 — one bad source must not stop the sweep
             # Non-credential failure (quota, parse, provider 500): the sources
@@ -398,6 +453,32 @@ async def sync_due_connections(
             )
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
+            )
+            job_outcome = "error"
+            job_final = sync_jobs.terminal_stamp(
+                job_started,
+                state=sync_jobs.FAILED,
+                error=(
+                    sync_jobs.EMBEDDING_DOWN
+                    if isinstance(exc, EmbeddingError)
+                    else sync_jobs.FAILED_GENERIC
+                ),
+            )
+        finally:
+            await sync_jobs.stamp_job(
+                admin_id,
+                conn.connection_id,
+                job_final
+                or sync_jobs.terminal_stamp(
+                    job_started, state=sync_jobs.FAILED, error=sync_jobs.FAILED_GENERIC
+                ),
+                session=session,
+            )
+            sync_jobs.record_job_outcome(
+                outcome=job_outcome,
+                trigger=sync_jobs.TRIGGER_SCHEDULED,
+                started_monotonic=job_t0,
+                result=(job_final or {}).get("result"),
             )
     # D10: the owner hears about a revoked connection on day 1 (what will stop, when)
     # and on day 7 (that it stopped) — once per incident, never silently.

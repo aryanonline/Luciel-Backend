@@ -13,7 +13,7 @@ import json
 import pytest
 from app.config import get_settings
 from app.knowledge import graph_extract as ge
-from app.runtime.llm_router import LLMResponse, ModelClass, ProviderError
+from app.runtime.llm_router import LLMResponse, LLMUsage, ModelClass, ProviderError
 
 PROSE = """
 Our Platform team is hiring a Senior Engineer who must know Python.
@@ -288,3 +288,132 @@ async def test_a_cap_refusal_is_a_budget_skip_but_a_vendor_failure_is_not(monkey
         "Trail Runner (Product): price=120", admin_id=admin
     )
     assert tiny.llm_skipped is False
+
+
+# --- round 7 walk run 8: the output ceiling, and an unusable answer ----------------- #
+# Four of one crawl's eight graph calls logged ``graph_extract.llm_unparseable``. A probe
+# against the live model found the cause: the long pages' JSON stopped at the
+# providers' 1024-token default ceiling, mid-object.
+
+
+class _TruncatedRouter(_FakeRouter):
+    def __init__(self, reply: str, *, output_tokens: int = 1024) -> None:
+        super().__init__(reply)
+        self.output_tokens = output_tokens
+
+    async def complete(self, system_prompt: str, messages: list[dict[str, object]], **kw: object):
+        self.calls.append({"system": system_prompt, "messages": messages, **kw})
+        return LLMResponse(
+            text=self.reply or "",
+            provider="fake",
+            model_class=ModelClass.fast,
+            confidence=1.0,
+            truncated=True,
+            usage=LLMUsage(provider="fake", model="m", output_tokens=self.output_tokens),
+        )
+
+
+async def test_the_graph_call_asks_for_a_4096_ceiling_and_compact_json():
+    router = _FakeRouter(_GOOD)
+    await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
+    call = router.calls[0]
+    assert call["max_output_tokens"] == ge.GRAPH_MAX_OUTPUT_TOKENS == 4096
+    assert "single line" in str(call["system"]) and "no indentation" in str(call["system"])
+
+
+_PRETTY = json.dumps(json.loads(_GOOD), indent=2)
+_ACCEPTED_REPLIES = [
+    pytest.param(_GOOD, id="compact"),
+    pytest.param(_PRETTY, id="pretty-printed"),
+    pytest.param("```json\n" + _PRETTY + "\n```", id="fenced-pretty"),
+    pytest.param("```JSON\n" + _GOOD + "\n```\n", id="upper-fence-trailing-newline"),
+    pytest.param("Here is the graph you asked for:\n" + _GOOD, id="leading-prose"),
+]
+
+
+@pytest.mark.parametrize("reply", _ACCEPTED_REPLIES)
+def test_the_compact_prompt_parser_still_accepts_pretty_and_fenced_answers(reply: str):
+    out = ge.parse_llm_graph(reply)
+    assert out is not None
+    assert {e.canonical: e.entity_type for e in out.entities} == {
+        "senior engineer": "Role",
+        "python": "Skill",
+        "platform": "Team",
+    }
+    assert {(e.src_name, e.relationship_type, e.dst_name) for e in out.edges} == {
+        ("Senior Engineer", "REQUIRES", "Python"),
+        ("Platform", "HIRING_FOR", "Senior Engineer"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason"),
+    [
+        pytest.param(_GOOD[: len(_GOOD) // 2], "json_error", id="truncated-object"),
+        pytest.param("```json\n" + _GOOD[:-10] + "\n```", "json_error", id="truncated-fence"),
+        pytest.param("I could not find any entities.", "no_json_object", id="prose-only"),
+        pytest.param("[1, 2]", "no_json_object", id="a-list-not-an-object"),
+        pytest.param("", "no_json_object", id="empty"),
+    ],
+)
+def test_an_unusable_answer_says_why(reply: str, reason: str):
+    # Nothing is guessed: a truncated object decodes nowhere.
+    assert ge.parse_llm_graph(reply) is None
+    assert ge.graph_json(reply) == (None, reason)
+
+
+async def test_an_unparseable_answer_is_a_skip_so_the_sync_re_extracts(caplog):
+    import logging
+
+    from app.knowledge import sync
+
+    # Braces, but not JSON (unquoted keys) — and the provider did NOT truncate it.
+    router = _FakeRouter("Here you go: {entities: [Senior Engineer], edges: []}")
+    with caplog.at_level(logging.WARNING, logger="app.knowledge.graph_extract"):
+        out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
+    assert out.llm_skipped is True
+    assert {e.name for e in out.entities} == {"Trail Runner"}  # the grammar still serves
+    record = next(r for r in caplog.records if r.getMessage() == "graph_extract.llm_unparseable")
+    assert getattr(record, "reason", None) == "json_error"
+    # The sync's per-item pass reads the flag (it leaves the revision marker unbumped).
+    graph = sync._GraphPass(ge.LlmGraphExtractor(router_factory=lambda: router))
+    await graph.aextract(PROSE)
+    assert graph.llm_skipped is True
+
+
+async def test_a_prose_only_answer_logs_no_json_object(caplog):
+    import logging
+
+    router = _FakeRouter("I could not find any entities in this text.")
+    with caplog.at_level(logging.WARNING, logger="app.knowledge.graph_extract"):
+        out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
+    assert out.llm_skipped is True
+    record = next(r for r in caplog.records if r.getMessage() == "graph_extract.llm_unparseable")
+    assert getattr(record, "reason", None) == "no_json_object"
+
+
+async def test_a_truncated_answer_keeps_the_grammar_and_is_not_deferred(caplog):
+    import logging
+
+    from app.knowledge import sync
+
+    router = _TruncatedRouter(_GOOD[: len(_GOOD) // 2], output_tokens=4096)
+    with caplog.at_level(logging.WARNING, logger="app.knowledge.graph_extract"):
+        out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
+    # The same page would hit the ceiling again next pass: NOT a skip, so the revision
+    # marker bumps and the sync does not re-extract it on every pass.
+    assert out.llm_skipped is False
+    assert {e.name for e in out.entities} == {"Trail Runner"}
+    assert "graph_extract.llm_unparseable" not in [r.getMessage() for r in caplog.records]
+    record = next(r for r in caplog.records if r.getMessage() == "graph_extract.llm_truncated")
+    assert getattr(record, "output_tokens", None) == 4096
+    graph = sync._GraphPass(ge.LlmGraphExtractor(router_factory=lambda: router))
+    await graph.aextract(PROSE)
+    assert graph.llm_skipped is False
+
+
+async def test_a_truncated_flag_on_a_complete_answer_still_merges():
+    router = _TruncatedRouter(_GOOD)
+    out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
+    assert out.llm_skipped is False
+    assert {e.canonical for e in out.entities} >= {"senior engineer", "python", "trail runner"}

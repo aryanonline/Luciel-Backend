@@ -113,7 +113,12 @@ async def test_list_shape_and_status(client):
         "createdAt",
         "providerAvailable",
         "displayName",
+        # Round 7 walk run 8: the knowledge sync job (None on every other row) — the
+        # manual sync answers 202 when it outlives the inline wait, and this is where
+        # its outcome is read afterwards.
+        "syncJob",
     }
+    assert c["syncJob"] is None  # a CRM row never runs a knowledge sync job
     assert c["connectionType"] == "crm"
     assert c["provider"] == "hubspot"
     assert c["status"] == "unconfigured"
@@ -243,6 +248,9 @@ async def test_no_secret_fields_ever_in_serialized_connection(client):
         "createdAt",
         "providerAvailable",
         "displayName",
+        # Round 7 walk run 8: the knowledge sync job record — states, instants, counts
+        # of external ids and owner-facing messages only; no credential slot.
+        "syncJob",
     }
     for c in rows:
         assert set(c.keys()) <= allowed, f"unexpected key in Connection: {set(c.keys()) - allowed}"

@@ -149,6 +149,22 @@ class SyncResult:
         # Not a failure: nothing is flagged, the next pass after a resume/restore
         # reconciles as usual.
         self.halted: str | None = None
+        # Items kept and flagged "error" this pass because the provider could not read
+        # them (``failed_ids``, F117) or never reached them (knowledge #3). Recorded on
+        # the sync job (``app.knowledge.sync_job``) for the owner; not on the 200 body.
+        self.failed: list[str] = []
+        self.unreached: list[str] = []
+
+    def job_dict(self) -> dict[str, object]:
+        """The full pass for the connection's ``sync_job.result`` (round 7 walk run 8):
+        the wire four plus what the audit row and the sweep log already carried."""
+        return {
+            **self.as_dict(),
+            "failed": self.failed,
+            "unreached": self.unreached,
+            "graph_deferred": self.graph_deferred,
+            "halted": self.halted,
+        }
 
     def as_dict(self) -> dict[str, list[str]]:
         # ``refused`` travels with the other three (round 7 Phase 2 review, knowledge
@@ -251,6 +267,8 @@ async def sync_connection(
     absent = {e for e in existing_by_ext if e not in remote_by_id and e not in failed_ids}
     unreached = absent if not snapshot.complete else absent & set(snapshot.unreached_ids)
     unvouched = failed_ids | unreached
+    result.failed = sorted(failed_ids)
+    result.unreached = sorted(unreached)
 
     # Floor guard (F107): a listing that lost more than half of what is synced — or
     # everything — is treated as a broken read, not a mass deletion. Nothing is
