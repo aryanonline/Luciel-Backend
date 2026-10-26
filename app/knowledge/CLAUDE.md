@@ -91,3 +91,9 @@ make that state explicit and test it.
   `truncated` answer (stop_reason max_tokens / finish_reason length) keeps the grammar-only
   graph AND bumps the revision (no endless re-extract); any other unparseable answer is
   `llm_skipped` (re-extracted next pass), logged with `reason`.
+- Known limit: a scheduled job's terminal stamp rides the sweep's own transaction (its
+  token refresh may hold the row lock); if that transaction rolls back, the row keeps
+  `syncing` until the stale rule reads it failed, and a manual start meanwhile is a 409.
+- Tests: `tests/contract/test_knowledge_sync_job.py`, `tests/integration/test_knowledge_sync_sweep.py`
+  (sweep stamps / skip), `tests/integration/test_migration_0077_connection_sync_job.py`,
+  `tests/unit/test_llm_output_ceiling.py`, `tests/unit/test_graph_extract_llm.py`.
