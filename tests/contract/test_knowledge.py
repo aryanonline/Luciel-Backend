@@ -37,7 +37,7 @@ async def test_quota_shape(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_the_source_list_pages_and_keeps_its_shape(client, monkeypatch):
+async def test_the_source_list_pages_and_keeps_its_shape(client):
     """WP-8 pagination audit: the list was one unbounded query."""
     await _ready_account_with_luciel(client)
     for name in ("Hours", "Parking"):
