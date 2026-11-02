@@ -415,6 +415,20 @@ jobs:
           npx ts-node --prefer-ts-exts bin/hostnames.ts prod
           npx ts-node --prefer-ts-exts bin/hostnames.ts preprod
 
+      # The deploy role's own grants land BEFORE the preprod gate that uses them. The
+      # strict SeedTest gate in preprod-verify reads /luciel/preprod/seedtest with this
+      # role (PipelineStack ReadProbeLogs) and fails on a refused read; prod-deploy, the
+      # other job that applies this stack, needs that gate to pass, so a role without the
+      # grant could never get it from a release. A no-op when nothing changed. No `paused`
+      # condition: unlike the prod job's steps, the preprod gate runs on a paused release.
+      - name: Apply the deploy role's grants first (Pipeline stack)
+        working-directory: infra
+        run: |
+          npx cdk deploy "Luciel-prod-Pipeline" --exclusively \
+            -c env=prod -c imageTag=${{ github.sha }} \
+            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            --require-approval never
+
       - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2

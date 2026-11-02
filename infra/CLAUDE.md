@@ -77,7 +77,7 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - GitHub workflow verification plus backend health and integration tests.
 
 ## Gotchas from the 2026-08-06 truth delta
-- Production release uses ephemeral prod-shaped preprod plus Verify and SeedTest hard gate, then always tears preprod down.
+- Production release uses ephemeral prod-shaped preprod plus Verify and SeedTest hard gate, then always tears preprod down. `preprod-standup` applies `Luciel-prod-Pipeline` first: the strict gate reads its logs with that role, and `prod-deploy` cannot run until the gate passes.
 - Pause sets services to zero intentionally; it is a reversible cost control, not account deletion or a runtime bypass.
 
 ## Change checklist

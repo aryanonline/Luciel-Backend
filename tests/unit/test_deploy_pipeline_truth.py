@@ -211,6 +211,26 @@ def test_the_d10_gate_can_read_the_harness_summary_and_fails_without_it() -> Non
     assert '"[seedtest] SUMMARY result=PASS "*) ;;' in seedtest
 
 
+def test_the_preprod_gate_runs_after_the_prod_deploy_roles_grants_land() -> None:
+    """preprod-verify runs the strict gate as luciel-prod-github-deploy, and a refused log
+    read fails it. prod-deploy applies the same stack but `needs` that gate, so without
+    this step a role that lacks the grant blocks every release and no release can fix it."""
+    standup = _steps("preprod-standup")
+    grants = _index(standup, name="deploy role's grants first")
+    assert '"Luciel-prod-Pipeline" --exclusively' in _run(standup[grants])
+    assert "-c env=prod" in _run(standup[grants])
+    # npm ci has run, and the grants land before anything else in the release uses them.
+    assert _index(standup, name="Refuse a prod release") < grants
+    assert grants < _index(standup, name="Stand up preprod")
+    # The gate runs on a paused release too, so the grant step may not be skipped by one.
+    assert "if" not in standup[grants]
+    jobs = _jobs()
+    assert "preprod-standup" in jobs["preprod-verify"]["needs"]  # type: ignore[operator]
+    gate = _steps("preprod-verify")
+    assert any("scripts/run-seedtest-task.sh preprod --strict" in _run(s) for s in gate)
+    assert "preprod-verify" in jobs["prod-deploy"]["needs"]  # type: ignore[operator]
+
+
 def test_a_prod_release_is_refused_before_preprod_while_prod_does_not_own_the_names() -> None:
     steps = _steps("preprod-standup")
     guard = _index(steps, name="Refuse a prod release")
