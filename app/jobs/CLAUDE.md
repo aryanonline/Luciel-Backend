@@ -48,9 +48,15 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
   no `{"sweep": "audit_retention", ...}` result line exists in the retained window, so treat
   the weekly audit prune as never having completed on dev before this fix.
 - A sweep that raises is logged as `ERROR app.jobs sweep_failed sweep=<name>` (with the
-  traceback) and exits 1: the SweepErrors filter counts the failure itself, not whatever a
-  library happened to log on the way down. Tests: `tests/unit/test_sweep_entrypoint_one_loop.py`
-  (every sweep in SWEEPS), `tests/integration/test_sweep_entrypoint_one_loop.py` (the real DB).
+  traceback) and exits 1. That is a named log line on top of an alert that was already there:
+  the F034 EventBridge rule `SweepTaskExitedNonZero` (`infra/lib/observability-stack.ts`) has
+  always emailed on any non-zero sweep exit, logged or not, so the audit crashes were never
+  silent. A failed pass therefore sends TWO emails for one failure: a SweepErrorAlarm email
+  (the filter counts `sweep_failed` itself, not whatever a library logged on the way down) and
+  a "stopped with a non-zero exit code" email. The audit-lock refusal exits 1 with no ERROR
+  token, so it sends only the exit-code email.
+  Tests: `tests/unit/test_sweep_entrypoint_one_loop.py` (every sweep in SWEEPS),
+  `tests/integration/test_sweep_entrypoint_one_loop.py` (the real DB).
 
 ## daily_brief (round 6 WP-F, 2026-09-07)
 - Hourly sweep; a tenant is due once its LOCAL clock (instances.timezone, UTC when unset)

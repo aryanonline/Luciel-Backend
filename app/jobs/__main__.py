@@ -143,10 +143,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     except Exception:  # noqa: BLE001 — reported, then a non-zero exit
-        # Logged at ERROR with the sweep's name so the SweepErrors metric filter counts
-        # the failed run ITSELF. An uncaught traceback carries no standalone ERROR token:
-        # the 2026-09-27..10-25 audit crashes alarmed only because SQLAlchemy's pool
-        # happened to log its own ERROR while tearing the dead loop's connection down.
+        # A named log line on top of the alert that already exists. The F034 EventBridge
+        # rule SweepTaskExitedNonZero (infra/lib/observability-stack.ts) emails on ANY
+        # non-zero exit of a sweep task, logged or not, so no crash here was ever silent.
+        # At ERROR, the SweepErrors filter counts the failed run itself rather than
+        # whatever a library logged on the way down (SQLAlchemy's pool, during the
+        # 2026-09-27..10-25 audit crashes). A failed pass sends two emails, one
+        # SweepErrorAlarm and one exit-code: one failure, not two.
         _LOG.exception("sweep_failed sweep=%s: the run did not complete", name)
         return 1
     print(json.dumps({"sweep": name, "result": result}, default=str))
