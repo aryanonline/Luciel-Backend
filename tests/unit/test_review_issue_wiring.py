@@ -11,10 +11,11 @@ tracker evidence both CVE reporters attach, and the review's per-platform scan.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -99,37 +100,90 @@ def test_the_review_reads_the_platform_children_not_the_multi_arch_tag():
     assert scan["continue-on-error"] is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell stub for gh")
-@pytest.mark.parametrize(
-    ("existing", "expected"),
+# A stand-in for gh that refuses what the real one refuses: `--slurp` with `--jq` is a
+# usage error in gh itself (2.97.0 prints exactly this and exits 1), before any request.
+# Every run of the three reporter workflows failed on it before this stub modelled it.
+FAKE_GH = """#!/usr/bin/env bash
+echo "$*" >> "$FAKE_GH_LOG"
+if [ "$1" = "api" ]; then
+  case " $* " in *" --slurp "*)
+    case " $* " in *" --jq "* | *" -q "* | *" --template "* | *" -t "*)
+      echo 'the `--slurp` option is not supported with `--jq` or `--template`' >&2
+      exit 1 ;;
+    esac ;;
+  esac
+  if [ -n "${FAKE_GH_API_FAILS:-}" ]; then
+    echo "HTTP 502: Bad Gateway" >&2
+    exit 1
+  fi
+  cat "$FAKE_GH_PAGES"
+fi
+"""
+THE_TITLE = "Dependency & CVE review 2026-10"
+# What `gh api --paginate --slurp` prints: one array per page.
+SECOND_PAGE_HOLDS_IT = [
     [
-        ("64", "issue comment 64 --repo o/r --body-file"),
-        ("null", "issue create --repo o/r --title Dependency & CVE review 2026-10 --label"),
+        # A pull request is in the REST issues list too, and may carry the same title.
+        {"number": 7, "title": THE_TITLE, "pull_request": {"url": "u"}},
+        {"number": 8, "title": f"{THE_TITLE} (old)"},
     ],
-)
-def test_the_poster_comments_on_the_open_issue_or_opens_one(tmp_path, existing, expected):
-    if shutil.which("bash") is None:
-        pytest.skip("bash unavailable")
+    [{"number": 64, "title": THE_TITLE}],
+]
+NO_ISSUE_ONLY_LOOKALIKES = [
+    [
+        {"number": 7, "title": THE_TITLE, "pull_request": {"url": "u"}},
+        {"number": 8, "title": "Dependency & CVE review 2026-09"},
+    ]
+]
+
+
+def _run_poster(
+    tmp_path: Path, pages: list[list[dict]], *, api_fails: bool = False
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    bash, jq = shutil.which("bash"), shutil.which("jq")
+    if bash is None or jq is None:
+        pytest.skip("needs bash and jq on PATH (GitHub's runners have both)")
     log = tmp_path / "gh.log"
+    pages_file = tmp_path / "pages.json"
+    pages_file.write_text(json.dumps(pages), encoding="utf-8")
     fake = tmp_path / "bin" / "gh"
     fake.parent.mkdir()
-    fake.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "$*" >> "{log}"\n'
-        f'if [ "$1" = "api" ]; then echo "{existing}"; fi\n',
-        encoding="utf-8",
-    )
+    fake.write_bytes(FAKE_GH.encode())
     fake.chmod(0o755)
     body = tmp_path / "body.md"
     body.write_text("hello", encoding="utf-8")
     env = {
         **os.environ,
         "PATH": f"{fake.parent}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_LOG": str(log),
+        "FAKE_GH_PAGES": str(pages_file),
         "REPO": "o/r",
         "REVIEW_MONTH": "2026-10",
     }
-    subprocess.run(["bash", str(ROOT / POSTER), str(body)], env=env, check=True)
-    calls = log.read_text(encoding="utf-8").splitlines()
+    if api_fails:
+        env["FAKE_GH_API_FAILS"] = "1"
+    done = subprocess.run(  # noqa: S603 — fixed argv, the repo's own script
+        [bash, str(ROOT / POSTER), str(body)],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    return done, log.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    ("pages", "expected"),
+    [
+        (SECOND_PAGE_HOLDS_IT, "issue comment 64 --repo o/r --body-file"),
+        (NO_ISSUE_ONLY_LOOKALIKES, f"issue create --repo o/r --title {THE_TITLE} --label"),
+        ([[]], f"issue create --repo o/r --title {THE_TITLE} --label"),
+    ],
+)
+def test_the_poster_comments_on_the_open_issue_or_opens_one(tmp_path, pages, expected):
+    done, calls = _run_poster(tmp_path, pages)
+    assert done.returncode == 0, done.stderr
     # The REST issues list, never the search index (`issue list --search` AND
     # `--label` both go through it): it is eventually consistent, and two posters
     # firing on the same 1st would each open the month's issue.
@@ -137,6 +191,59 @@ def test_the_poster_comments_on_the_open_issue_or_opens_one(tmp_path, existing, 
     assert "--search" not in calls[0] and "--label" not in calls[0]
     assert "issue list" not in calls[0]
     assert expected in calls[1]
+    assert len(calls) == 2
+
+
+def test_a_failed_issue_list_opens_no_issue(tmp_path):
+    """A list that failed is not a month with no issue: posting anyway would open a
+    second one for the steward to miss."""
+    done, calls = _run_poster(tmp_path, [[]], api_fails=True)
+    assert done.returncode != 0
+    assert len(calls) == 1 and calls[0].startswith("api ")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'gh api --paginate --slurp "repos/o/r/issues" --jq ".[][]"',
+        "gh api --slurp repos/o/r/issues -q .",
+    ],
+)
+def test_the_stub_refuses_what_the_real_gh_refuses(tmp_path, command):
+    """The stub is the only gh these tests have, so its refusal is pinned on its own."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("needs bash on PATH")
+    fake = tmp_path / "gh"
+    fake.write_bytes(FAKE_GH.encode())
+    fake.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_LOG": str(tmp_path / "gh.log"),
+        "FAKE_GH_PAGES": str(tmp_path / "unread.json"),
+    }
+    done = subprocess.run(  # noqa: S603 — fixed argv
+        [bash, "-c", command], env=env, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 1
+    assert "--slurp` option is not supported with `--jq`" in done.stderr
+
+
+def _shell_commands(text: str) -> list[str]:
+    """Commands with their backslash continuations joined, one per entry."""
+    return text.replace("\r\n", "\n").replace("\\\n", " ").splitlines()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [*sorted(WORKFLOWS.glob("*.yml")), *sorted((ROOT / "scripts").glob("*.sh"))],
+    ids=lambda p: p.name,
+)
+def test_no_gh_call_combines_slurp_with_a_jq_or_template_filter(path):
+    for command in _shell_commands(path.read_text(encoding="utf-8")):
+        if "gh api" in command and "--slurp" in command:
+            assert not re.search(r"\s(--jq|-q|--template|-t)\s", command.split("|")[0]), command
 
 
 def test_the_monthly_review_posts_well_before_the_steward_reads_the_issue():

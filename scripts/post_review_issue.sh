@@ -27,8 +27,11 @@ title="Dependency & CVE review $month"
 # image-rebuild and this monthly review can all fire on the same 1st). The list
 # carries pull requests too, so they are filtered out; no label filter, so an issue
 # a person or the steward routine opened without one is still found.
-existing=$(gh api --paginate --slurp "repos/$REPO/issues?state=open&per_page=100" \
-  --jq "[.[][] | select(.pull_request == null and .title == \"$title\")][0].number")
+# jq is a separate process because gh refuses --slurp together with --jq, and --slurp is
+# what makes the pages one array. pipefail (above) stops the script if the list fails, so
+# a refused read can never open a second issue.
+existing=$(gh api --paginate --slurp "repos/$REPO/issues?state=open&per_page=100" |
+  jq -r "[.[][] | select(.pull_request == null and .title == \"$title\")][0].number")
 if [ -n "$existing" ] && [ "$existing" != "null" ]; then
   gh issue comment "$existing" --repo "$REPO" --body-file "$BODY"
   echo "commented on #$existing ($title)"
