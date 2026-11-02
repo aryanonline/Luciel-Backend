@@ -44,9 +44,10 @@ from app.db.session import tenant_session
 from app.knowledge import service, sync, sync_job
 from app.knowledge.embeddings import EMBEDDING_DOWN, EmbeddingError
 from app.knowledge.graph_extract import ExtractionResult, LlmGraphExtractor
-from app.knowledge.providers import CrawlUnreachable
+from app.knowledge.providers import CrawlUnreachable, ProviderUnavailable
 from app.knowledge.sync import RemoteItem, RemoteSnapshot
 from app.models.connection import InstanceConnection
+from app.models.instance import Instance, LucielState
 from app.models.knowledge import KnowledgeSource
 from sqlalchemy import select, update
 
@@ -216,7 +217,8 @@ async def test_a_fast_sync_still_answers_200_and_the_row_records_it(api):
     assert job["startedAt"] and job["finishedAt"]
     assert job["error"] is None and job["shrink"] is None
     assert sorted(job["result"]["added"]) == [f"{SITE}/", f"{SITE}/contact"]
-    assert set(job["result"]) == {"added", "updated", "removed", "refused"}
+    assert set(job["result"]) == {"added", "updated", "removed", "refused", "halted"}
+    assert job["result"]["halted"] is None
 
 
 async def test_a_slow_sync_answers_202_and_the_row_then_reads_synced(api, monkeypatch):
@@ -463,7 +465,9 @@ async def test_a_down_embedder_is_the_shared_503_inline_and_failed_deferred(api,
     assert job["finishedAt"]
 
 
-async def test_the_row_keeps_the_whole_pass_and_the_wire_serves_four_lists(api, monkeypatch):
+async def test_the_row_keeps_the_whole_pass_and_the_wire_serves_four_lists_and_halted(
+    api, monkeypatch
+):
     class _BudgetSkipped:
         def extract(self, text: str) -> ExtractionResult:
             return ExtractionResult(entities=[], edges=[])
@@ -503,7 +507,8 @@ async def test_the_row_keeps_the_whole_pass_and_the_wire_serves_four_lists(api, 
     }
     served = await _job(client, cid)
     assert served is not None
-    assert set(served["result"]) == {"added", "updated", "removed", "refused"}
+    assert set(served["result"]) == {"added", "updated", "removed", "refused", "halted"}
+    assert served["result"]["halted"] is None
 
 
 async def test_data_stamp_and_lock_release_become_visible_together(api, monkeypatch):
@@ -1115,3 +1120,122 @@ async def test_resync_source_deferred_is_a_202_and_inline_is_the_refreshed_sourc
     await _finish(cid)
     assert (await _job(client, cid))["startedAt"] == body["startedAt"]
     assert (await _job(client, cid))["state"] == "synced"
+
+
+# --- a lock refusal leaves no false failure on the row ----------------------------------- #
+async def test_a_start_the_lock_refuses_answers_409_and_leaves_no_failure_on_the_row(api):
+    """The owner removed a crawl and added it back while another run still held the lock
+    (the record is NULL, so the start is admitted). That holder's stamp is keyed on its own
+    ``started_at`` and could never replace a failure written here, so the row would read
+    "Last sync failed: already running" long after nothing ran."""
+    client, plan = api
+    admin, cid = await _ready(client)
+
+    async with _held_lock(admin, cid):
+        r = await _sync(client, cid)
+        assert r.status_code == 409
+        assert r.json()["message"] == sync_job.ALREADY_RUNNING
+        assert await _raw_job(admin, cid) is None
+    assert plan.calls == 0
+    assert await _job(client, cid) is None
+    # Nothing is stuck: the next start runs.
+    assert (await _sync(client, cid)).status_code == 200
+
+
+# --- a removal is reported as a removal, whatever the sync raised ------------------------ #
+@pytest.mark.parametrize(
+    "error",
+    [ProviderUnavailable("No access token on file"), CrawlUnreachable("crawl fetched no pages")],
+    ids=["no-credential", "no-page"],
+)
+async def test_a_removal_that_surfaces_as_a_provider_failure_is_the_removal_409(api, error):
+    """A disconnect deletes the secret, so a snapshot that starts after one raises
+    ProviderUnavailable before the sync's first status look. That is the removal, not a
+    dead credential: no "Sync unavailable" 409, and no D10 clock on the kept sources."""
+    client, plan = api
+    admin, cid = await _ready(client)
+    assert (await _sync(client, cid)).status_code == 200
+
+    async def _remove() -> None:
+        assert (await _disconnect(client, cid)).status_code == 200
+
+    plan.during_snapshot = _remove
+    plan.error = error
+    r = await _sync(client, cid)
+
+    assert r.status_code == 409
+    assert r.json()["message"] == sync_job.STOPPED_BY_REMOVAL
+    assert await _raw_job(admin, cid) is None
+    kept = await _sources_of(admin, cid)
+    assert len(kept) == 1
+    assert kept[0].paused_since is None
+    assert kept[0].sync_status == "synced"
+
+
+async def test_the_dead_credential_flag_never_pauses_a_removed_row(api):
+    client, _plan = api
+    admin, cid = await _ready(client)
+    await _seed_job(admin, cid, None, status="not_connected")
+    async with tenant_session(admin) as s:
+        s.add(
+            KnowledgeSource(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=(await s.execute(select(Instance.id))).scalar_one(),
+                name="Kept",
+                origin="website_crawl",
+                source_origin="website_crawl",
+                external_id="kept",
+                connection_id=uuid.UUID(cid),
+                ingestion_status="ready",
+                sync_status="synced",
+            )
+        )
+
+    await sync_job.flag_dead_credential(admin, uuid.UUID(cid))
+
+    kept = await _sources_of(admin, cid)
+    assert [k.paused_since for k in kept] == [None]
+    async with tenant_session(admin) as s:
+        status = (
+            await s.execute(
+                select(InstanceConnection.status).where(
+                    InstanceConnection.connection_id == uuid.UUID(cid)
+                )
+            )
+        ).scalar_one()
+    assert status == "not_connected"
+
+
+# --- a run halted by a pause says so ------------------------------------------------------ #
+async def test_a_sync_halted_by_a_pause_says_so_on_the_wire(api, capsys):
+    client, plan = api
+    admin, cid = await _ready(client)
+    assert (await _sync(client, cid)).status_code == 200
+
+    async def _pause() -> None:
+        async with tenant_session(admin) as s:
+            await s.execute(update(Instance).values(state=LucielState.paused))
+
+    plan.during_snapshot = _pause
+    plan.pages = ["/", "/changed"]
+    capsys.readouterr()
+    r = await _sync(client, cid)
+
+    assert r.status_code == 200
+    assert r.json() == {
+        "added": [],
+        "updated": [],
+        "removed": [],
+        "refused": [],
+        "halted": "instance_not_serving",
+    }
+    job = await _job(client, cid)
+    assert job is not None
+    assert job["result"]["halted"] == "instance_not_serving"
+    outcomes = [
+        json.loads(line[line.find('{"_aws"') :])["Outcome"]
+        for line in capsys.readouterr().out.splitlines()
+        if '{"_aws"' in line and "KnowledgeSyncJob" in line
+    ]
+    assert outcomes == ["halted"]

@@ -36,8 +36,9 @@ The contract:
   and raises ``SyncStoppedByOwner``; the savepoint unwinds, nothing is kept, outcome
   ``stopped``. A removed row serves no job at all.
 - The scheduled sync (``app.knowledge.sweep``) stamps the same record with trigger
-  ``scheduled``. Its data commits with the whole tenant's pass, so its lock is held until
-  then and its terminal stamps are written right after that commit.
+  ``scheduled`` and runs each connection through the same transaction shape: nothing of
+  one connection waits on another's work, so a removal never loses to a commit minutes
+  later.
 - ``drain_sync_jobs`` runs first in the API process's shutdown (bounded); a job still
   running when the bound ends is cancelled and stamped "interrupted".
 
@@ -52,7 +53,7 @@ import contextlib
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -122,6 +123,7 @@ Outcome = Literal[
     "interrupted",
     "stopped",
     "already_running",
+    "halted",
 ]
 
 
@@ -362,8 +364,9 @@ async def stamp_syncing_if_unchanged(
     seen: object,
 ) -> bool:
     """The sweep's ``syncing`` stamp, in its own short transaction: UPDATE ... RETURNING,
-    only while the row still holds the record the sweep judged dead. False (the record
-    moved, or the write failed) means this connection is not the sweep's this pass."""
+    only while the row still holds the record the sweep judged dead and the source was not
+    removed. False (the record moved, the source went, or the write failed) means this
+    connection is not the sweep's this pass."""
     seen_started_at = seen.get("started_at") if isinstance(seen, dict) else None
     unchanged = (
         or_(InstanceConnection.sync_job.is_(None), _record_started_at().is_(None))
@@ -378,6 +381,8 @@ async def stamp_syncing_if_unchanged(
                 .where(
                     InstanceConnection.admin_id == admin_id,
                     InstanceConnection.connection_id == connection_id,
+                    # Never a syncing record on a source the owner removed since the read.
+                    InstanceConnection.status.not_in(sync.REMOVED_STATUSES),
                     unchanged,
                 )
                 .values(sync_job=stamp)
@@ -422,33 +427,45 @@ def record_job_outcome(
 
 
 # --- bookkeeping the manual routes and the job share --------------------------------- #
-async def flag_dead_credential(admin_id: uuid.UUID, connection_id: uuid.UUID) -> None:
+async def flag_dead_credential(
+    admin_id: uuid.UUID, connection_id: uuid.UUID, *, now: datetime | None = None
+) -> None:
     """Bookkeeping for a grant the provider just refused (round 7 WP-4c #7), in its
-    OWN transaction.
+    OWN short transaction, so the row lock of the status flip ends with the flip.
 
     The manual routes used to pause the sources inside the request's
     ``tenant_session`` and then raise the 409 — which rolled that transaction back,
     so even the pause was lost — and never touched the connection row, so the
     Configure page kept a green "Connected" chip on a dead credential. The sweep
     does both halves (round 5B item 12: pause + ``mark_connection_broken`` → audit +
-    once-per-incident attention email); the routes now do the same, before the 409.
+    once-per-incident attention email), and so do the routes, before the 409.
     A row the owner never connected (unconfigured / pending) is paused but NOT
     flipped: "error" would claim a grant it never had.
+
+    A row the owner removed gets neither: a disconnect deletes the credential, so a
+    "dead credential" on one is the removal itself, and pausing would start the D10 clock
+    and the "will stop answering" emails about a source they took away. The row is read
+    fresh and locked, so a removal cannot land between the look and the flip.
     """
     from app.connections.health import mark_connection_broken  # noqa: PLC0415
 
     async with tenant_session(admin_id) as s:
+        await s.execute(text(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'"))
         conn = (
             await s.execute(
-                select(InstanceConnection).where(
+                select(InstanceConnection)
+                .where(
                     InstanceConnection.admin_id == admin_id,
                     InstanceConnection.connection_id == connection_id,
                 )
+                .with_for_update(key_share=True)  # FOR NO KEY UPDATE
             )
         ).scalar_one_or_none()
-        if conn is None:
+        if conn is None or conn.status in sync.REMOVED_STATUSES:
             return
-        await sync.pause_sync_on_revocation(s, admin_id=admin_id, connection_id=connection_id)
+        await sync.pause_sync_on_revocation(
+            s, admin_id=admin_id, connection_id=connection_id, now=now
+        )
         if conn.status == "connected":
             await mark_connection_broken(s, conn, detail=_DEAD_CREDENTIAL_DETAIL)
 
@@ -464,7 +481,7 @@ async def flag_unreachable_site(admin_id: uuid.UUID, connection_id: uuid.UUID) -
         await sync.mark_sync_error(s, admin_id=admin_id, connection_id=connection_id)
 
 
-async def _best_effort(label: str, coro: Any) -> None:
+async def best_effort(label: str, coro: Any) -> None:
     try:
         await coro
     except Exception:  # noqa: BLE001 — the job still stamps its outcome
@@ -554,7 +571,7 @@ async def start_sync_job(
 
 
 @dataclass(frozen=True)
-class _Settled:
+class Settled:
     """How a job ended. ``job`` is what the route reads; ``value`` is what the row gets
     (``None`` clears it: a stopped job leaves no record on a removed source)."""
 
@@ -564,38 +581,41 @@ class _Settled:
     result: sync.SyncResult | None = None
 
 
-def _ended(
+def ended(
     outcome: Outcome, stamp: dict[str, Any], *, error: str, shrink: dict[str, int] | None = None
-) -> _Settled:
+) -> Settled:
     state = SHRINK_PENDING if shrink is not None else FAILED
     job = terminal_stamp(stamp, state=state, error=error, shrink=shrink)
-    return _Settled(outcome=outcome, job=job, value=job)
+    return Settled(outcome=outcome, job=job, value=job)
 
 
-def _stopped(stamp: dict[str, Any]) -> _Settled:
+def stopped(stamp: dict[str, Any]) -> Settled:
     job = terminal_stamp(stamp, state=FAILED, error=STOPPED_BY_REMOVAL)
-    return _Settled(outcome="stopped", job=job, value=None)
+    return Settled(outcome="stopped", job=job, value=None)
+
+
+def _refused_by_lock(stamp: dict[str, Any]) -> Settled:
+    """Another reconcile holds the lock, so nothing ran. The route still answers 409, but
+    the row keeps no failure: the holder's own stamp is keyed on ITS ``started_at`` and
+    could never replace this one, so "Last sync failed: already running" would outlive
+    the sync it names. Clearing is conditional on this job's own record."""
+    job = terminal_stamp(stamp, state=FAILED, error=ALREADY_RUNNING)
+    return Settled(outcome="already_running", job=job, value=None)
 
 
 async def _settle_failure(
     exc: Exception, stamp: dict[str, Any], *, admin_id: uuid.UUID, connection_id: uuid.UUID
-) -> _Settled:
-    """The outcome of a sync that raised, its evidence written.
+) -> Settled:
+    """The outcome of a manual sync that raised, its evidence written.
 
     Runs AFTER the savepoint rolled back and BEFORE the stamp: at this point the job's
     outer transaction holds no row lock (rolling back to the savepoint released those the
     sync took, and the job never wrote the connection row), so an evidence writer in its
     own transaction can touch the sources and the connection without deadlocking on it."""
-    if isinstance(exc, sync.SyncStoppedByOwner):
-        return _stopped(stamp)
-    if isinstance(exc, sync.SyncAlreadyRunning):
-        # Lost a race the start check could not see. Nothing ran; if the winner's stamp
-        # already replaced this job's record, the conditional stamp leaves it alone.
-        return _ended("already_running", stamp, error=ALREADY_RUNNING)
     if isinstance(exc, sync.SnapshotShrunk):
         # Nothing was deleted (F107); the refusal wrote its own evidence. The owner
         # confirms an intentional shrink by syncing again with ?confirmShrink=true.
-        return _ended(
+        return ended(
             "shrink_pending",
             stamp,
             error=shrink_message(remote=exc.remote, existing=exc.existing),
@@ -603,21 +623,21 @@ async def _settle_failure(
         )
     if isinstance(exc, CrawlUnreachable):
         # The site answered no page: a failed sync, not a dead credential.
-        await _best_effort("unreachable", flag_unreachable_site(admin_id, connection_id))
-        return _ended("unreachable", stamp, error=unavailable_message(exc))
+        await best_effort("unreachable", flag_unreachable_site(admin_id, connection_id))
+        return ended("unreachable", stamp, error=unavailable_message(exc))
     if isinstance(exc, ProviderUnavailable):
         # No usable credential: the pause + the honest connection state (WP-4c #7).
-        await _best_effort("dead_credential", flag_dead_credential(admin_id, connection_id))
-        return _ended("dead_credential", stamp, error=unavailable_message(exc))
+        await best_effort("dead_credential", flag_dead_credential(admin_id, connection_id))
+        return ended("dead_credential", stamp, error=unavailable_message(exc))
     if isinstance(exc, EmbeddingError):
         # The same page the request-path handler raises (E2E-12).
         emit_metric("KnowledgeRetrievalDegraded", dimensions={"Reason": f"ingest:{exc}"[:120]})
-        return _ended("embedding", stamp, error=EMBEDDING_DOWN)
+        return ended("embedding", stamp, error=EMBEDDING_DOWN)
     logger.error("knowledge_sync_job_failed", exc_info=exc)
-    return _ended("error", stamp, error=FAILED_GENERIC)
+    return ended("error", stamp, error=FAILED_GENERIC)
 
 
-async def _refresh_token(admin_id: uuid.UUID, connection_id: uuid.UUID) -> uuid.UUID:
+async def refresh_token(admin_id: uuid.UUID, connection_id: uuid.UUID) -> uuid.UUID:
     """The checks and the token refresh, committed on their own BEFORE the reconcile's
     transaction, so the reconcile holds no row lock on the connection (a disconnect must
     not wait out a crawl). Returns the instance id.
@@ -654,6 +674,102 @@ async def _refresh_token(admin_id: uuid.UUID, connection_id: uuid.UUID) -> uuid.
     return instance_id
 
 
+SettleFailure = Callable[[Exception, dict[str, Any]], Awaitable[Settled]]
+
+
+async def reconcile_in_transaction(
+    s: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    instance_id: uuid.UUID | None,
+    stamp: dict[str, Any],
+    factory: ProviderFactory,
+    settle: SettleFailure,
+    allow_shrink: bool = False,
+    failure: Exception | None = None,
+) -> tuple[Settled, bool]:
+    """One connection's reconcile inside the caller's transaction, whose lock is already
+    held (the manual job and the sweep both come through here): SAVEPOINT around the sync,
+    the settled outcome, the stamp under its own savepoint. The caller commits, so data,
+    stamp and lock release become visible together.
+
+    ``failure`` is what already went wrong before the sync could start. Returns the
+    outcome and whether the stamp went through (False: the caller retries it after the
+    commit). Raises ``SyncStoppedByOwner`` to unwind the transaction when a disconnect
+    committed after the sync's last look: its data must not outlive "no longer crawled"."""
+    from app.knowledge.sweep import PROVIDER_TO_ORIGIN  # noqa: PLC0415 — sweep imports us
+
+    result: sync.SyncResult | None = None
+    if failure is None and instance_id is not None:
+        try:
+            async with s.begin_nested():
+                conn = (
+                    await s.execute(
+                        select(InstanceConnection).where(
+                            InstanceConnection.admin_id == admin_id,
+                            InstanceConnection.connection_id == connection_id,
+                            InstanceConnection.connection_type == "knowledge_source",
+                        )
+                    )
+                ).scalar_one_or_none()
+                if conn is None:
+                    raise ProviderUnavailable("the connection is no longer connected")
+                result = await sync.sync_connection(
+                    s,
+                    admin_id=admin_id,
+                    instance_id=instance_id,
+                    connection_id=connection_id,
+                    origin=PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
+                    provider=factory(conn, get_secret_store()),
+                    allow_shrink=allow_shrink,
+                )
+        except Exception as exc:  # noqa: BLE001 — unwound; the job stamps its outcome
+            failure = exc
+            result = None
+    settled: Settled
+    if isinstance(failure, sync.SyncAlreadyRunning):
+        settled = _refused_by_lock(stamp)
+    elif failure is not None:
+        # A disconnect deletes the credential, so a snapshot that started after one raises
+        # ProviderUnavailable before the sync's first status look. Whatever the sync raised,
+        # on a removed source the truth is "removed": no pause, no flip, no failure record.
+        if isinstance(failure, sync.SyncStoppedByOwner) or await sync.connection_removed(
+            s, admin_id=admin_id, connection_id=connection_id
+        ):
+            settled = stopped(stamp)
+        else:
+            settled = await settle(failure, stamp)
+    else:
+        assert result is not None  # no failure: the sync returned
+        job = terminal_stamp(stamp, state=SYNCED, result=result.job_dict())
+        # A halted run wrote nothing and compared nothing: its record says so (``result.
+        # halted``), and its outcome word is not "synced".
+        settled = Settled(
+            outcome="halted" if result.halted else "synced", job=job, value=job, result=result
+        )
+    stamped = False
+    try:
+        async with s.begin_nested():
+            landed = await _conditional_stamp(
+                s, admin_id, connection_id, settled.value, str(stamp["started_at"])
+            )
+            # The record is gone: if a disconnect committed since the sync's last look,
+            # its data must not outlive "no longer crawled" either.
+            if (
+                not landed
+                and settled.outcome == "synced"
+                and await sync.connection_removed(s, admin_id=admin_id, connection_id=connection_id)
+            ):
+                raise sync.SyncStoppedByOwner(str(connection_id))
+        stamped = True
+    except sync.SyncStoppedByOwner:
+        raise
+    except Exception:  # noqa: BLE001 — the data still commits; the stamp is retried
+        logger.warning("knowledge_sync_job_stamp_failed", exc_info=True)
+    return settled, stamped
+
+
 async def _reconcile(
     *,
     admin_id: uuid.UUID,
@@ -661,90 +777,41 @@ async def _reconcile(
     allow_shrink: bool,
     stamp: dict[str, Any],
     factory: ProviderFactory,
-) -> tuple[_Settled, bool]:
-    """The outer transaction: lock, SAVEPOINT around the sync, the stamp, commit — so data,
-    stamp and lock release become visible together. Returns the outcome and whether the
-    stamp already went through that commit (False: the caller retries it)."""
-    from app.knowledge.sweep import PROVIDER_TO_ORIGIN  # noqa: PLC0415 — sweep imports us
+) -> tuple[Settled, bool]:
+    """The manual job's transactions: the refresh on its own, then lock, reconcile, commit.
+    Returns the outcome and whether the stamp already went through that commit."""
 
-    own_started_at = str(stamp["started_at"])
+    async def _settle(exc: Exception, started: dict[str, Any]) -> Settled:
+        return await _settle_failure(exc, started, admin_id=admin_id, connection_id=connection_id)
+
     failure: Exception | None = None
     instance_id: uuid.UUID | None = None
     try:
-        instance_id = await _refresh_token(admin_id, connection_id)
+        instance_id = await refresh_token(admin_id, connection_id)
     except Exception as exc:  # noqa: BLE001 — a job always ends in a stamped state
         failure = exc
-
-    settled: _Settled | None = None
-    stamped = False
     try:
         async with tenant_session(admin_id) as s:
             # Before the savepoint: rolling it back must not release the lock (the stamp
-            # below still has to commit together with its release).
+            # still has to commit together with its release).
             if failure is None and not await sync.claim_sync_lock(s, connection_id):
                 failure = sync.SyncAlreadyRunning(str(connection_id))
-            result: sync.SyncResult | None = None
-            if failure is None and instance_id is not None:
-                try:
-                    async with s.begin_nested():
-                        conn = (
-                            await s.execute(
-                                select(InstanceConnection).where(
-                                    InstanceConnection.admin_id == admin_id,
-                                    InstanceConnection.connection_id == connection_id,
-                                    InstanceConnection.connection_type == "knowledge_source",
-                                )
-                            )
-                        ).scalar_one_or_none()
-                        if conn is None:
-                            raise ProviderUnavailable("the connection is no longer connected")
-                        result = await sync.sync_connection(
-                            s,
-                            admin_id=admin_id,
-                            instance_id=instance_id,
-                            connection_id=connection_id,
-                            origin=PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                            provider=factory(conn, get_secret_store()),
-                            allow_shrink=allow_shrink,
-                        )
-                except Exception as exc:  # noqa: BLE001 — unwound; the job stamps its outcome
-                    failure = exc
-                    result = None
-            if failure is not None:
-                settled = await _settle_failure(
-                    failure, stamp, admin_id=admin_id, connection_id=connection_id
-                )
-            else:
-                assert result is not None  # no failure: the sync returned
-                job = terminal_stamp(stamp, state=SYNCED, result=result.job_dict())
-                settled = _Settled(outcome="synced", job=job, value=job, result=result)
-            try:
-                async with s.begin_nested():
-                    landed = await _conditional_stamp(
-                        s, admin_id, connection_id, settled.value, own_started_at
-                    )
-                    # The record is gone: if a disconnect committed since the sync's last
-                    # look, its data must not outlive "no longer crawled" either.
-                    if (
-                        not landed
-                        and settled.outcome == "synced"
-                        and await sync.connection_removed(
-                            s, admin_id=admin_id, connection_id=connection_id
-                        )
-                    ):
-                        raise sync.SyncStoppedByOwner(str(connection_id))
-                stamped = True
-            except sync.SyncStoppedByOwner:
-                raise
-            except Exception:  # noqa: BLE001 — the data still commits; the stamp is retried
-                logger.warning("knowledge_sync_job_stamp_failed", exc_info=True)
+            return await reconcile_in_transaction(
+                s,
+                admin_id=admin_id,
+                connection_id=connection_id,
+                instance_id=instance_id,
+                stamp=stamp,
+                factory=factory,
+                settle=_settle,
+                allow_shrink=allow_shrink,
+                failure=failure,
+            )
     except sync.SyncStoppedByOwner:
-        return _stopped(stamp), False
+        return stopped(stamp), False
     except Exception:  # noqa: BLE001 — the outer transaction itself failed: nothing kept
         logger.exception("knowledge_sync_job_failed")
-        return _ended("error", stamp, error=FAILED_GENERIC), False
-    assert settled is not None  # the block above assigned it or returned
-    return settled, stamped
+        return ended("error", stamp, error=FAILED_GENERIC), False
 
 
 async def _run_sync_job(
@@ -764,7 +831,7 @@ async def _run_sync_job(
     del actor_user_id  # carried for the call shape; the audit trail is unchanged
     t0 = time.monotonic()
     own_started_at = str(stamp["started_at"])
-    settled: _Settled | None = None
+    settled: Settled | None = None
     try:
         settled, stamped = await _reconcile(
             admin_id=admin_id,

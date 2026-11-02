@@ -33,7 +33,7 @@ ObservabilityStack alarms reference:
                          walk run 8; app/knowledge/sync_job.py; dim: Outcome —
                          synced | shrink_pending | unreachable | dead_credential |
                          embedding | error | interrupted | stopped |
-                         already_running; opts into the full set)
+                         already_running | halted; opts into the full set)
 
 Dimension sets (round 7 WP-8): by default a datum publishes ONE dimension set,
 ``[Environment]`` — the set every ObservabilityStack alarm reads

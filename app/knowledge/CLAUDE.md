@@ -115,14 +115,30 @@ make that state explicit and test it.
   is live (`clear_job_on_reconnect`); `effective_job` serves None on removed rows; a start on
   not_connected is a 409 "This source was removed — connect it again to sync it." Known limit: a
   disconnect AND a reconnect between two of the job's looks lets the running job finish.
-- The sweep stamps the same record (trigger `scheduled`). Order per connection: skip if live;
-  take the lock OUTSIDE the savepoint (refused: skip, no stamp); a conditional `syncing` stamp in
-  its own transaction (no row or a failed write: skip); refresh in its own transaction; SAVEPOINT
-  + sync. Its data commits with the tenant's whole pass, so its lock is held until then and a
-  finished connection reads `syncing` until that commit, which is true. Terminal stamps are
-  collected and written right after the commit (`sweeps.run_knowledge_sync`,
-  `write_pending_stamps`); a rolled-back pass writes none and its rows read interrupted once the
-  lock is gone. `sync_due_connections` without `pending_stamps` (tests) writes no terminal stamp.
+- The sweep stamps the same record (trigger `scheduled`) and commits EACH CONNECTION ON ITS OWN
+  (`sweep._sync_one_connection`, through the job's `reconcile_in_transaction`): fresh status and
+  job read (not `connected`: skip; the pass's list is stale by then); skip if live; lock OUTSIDE
+  the savepoint (refused: skip, no stamp); a conditional `syncing` stamp in its own transaction,
+  refused on a removed row (no row or a failed write: skip); refresh in its own transaction;
+  SAVEPOINT + sync; evidence; stamp; commit. The first design held every connection's data until
+  the tenant's whole pass committed, so a crawl removed while the pass worked on the next
+  connection (or on the maintenance passes) got its pages minutes after "no longer crawled". The
+  tenant's own transaction now holds only the sweep's lock and runs the maintenance passes, each
+  under a SAVEPOINT: they swallow their failures, and a database error there would otherwise turn
+  the tenant's COMMIT into a silent ROLLBACK. If a connection's transaction is lost at its commit,
+  the row is stamped `failed` afterwards (nothing kept, and that is what it says).
+- A removal is reported as a removal, whatever the sync raised: a disconnect deletes the secret,
+  so a snapshot after one raises ProviderUnavailable before the first status look.
+  `reconcile_in_transaction` checks `connection_removed` before settling a failure, and
+  `flag_dead_credential` re-reads the row locked: no status flip, no pause, no D10 clock on a
+  removed row. A dead-credential mark is its own short transaction on both paths, so its row lock
+  never outlives the flip. `ensure_fresh_access_token` re-reads the row locked after its HTTP call
+  and discards the rotation on a removed row (no live token behind `secret_deleted`).
+- A start the lock refuses (the record was NULL, so the start was admitted) answers 409 and CLEARS
+  its own record: the holder's stamp is keyed on its own `started_at` and could never replace a
+  failure written here. A run halted by a pause (`result.halted = "instance_not_serving"`) has
+  outcome `halted`, not `synced`, and carries `halted` on `SyncResultOut` (omitted when None) and on
+  `syncJob.result` (null when it ran): its empty lists mean "not compared".
 - Shutdown (`app/main.py`): ECS `stopTimeout` 60 s = uvicorn `--timeout-graceful-shutdown` 22 +
   `drain_sync_jobs` 5 + 6, FIRST + poller 10 + background 15. A SIGKILL still leaves no orphan
   lock: the row reads interrupted past the grace.

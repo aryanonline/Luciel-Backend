@@ -352,8 +352,9 @@ async def ensure_fresh_access_token(
     expiry is stale rather than immortal — persists the rotation + new hint,
     and returns the fresh token. In mock, or for a provider with no spec, the
     stored token is returned untouched (there is nothing hermetic or possible
-    to refresh). ``None`` means the connection needs reconnecting; the caller
-    must refuse its operation honestly. Never flips connection status — that
+    to refresh). ``None`` means the connection needs reconnecting (or was removed while
+    the refresh was on the wire); the caller must refuse its operation honestly. Never flips
+    connection status — that
     belongs to the health worker and the callers, which know what the failure
     interrupted.
     """
@@ -403,9 +404,26 @@ async def ensure_fresh_access_token(
     if refreshed is None:
         return None
     rotated, new_expiry = refreshed
+    # The HTTP call took up to 15 s and held no lock, and a disconnect deletes the secret
+    # after writing the row. Look again with the row locked: a removal that committed
+    # meanwhile discards the rotation (writing it back would leave a live refresh token
+    # behind a disconnect that reported secret_deleted, §3.6.3), and one still to come
+    # waits for this commit and then deletes what was written here.
+    current = (
+        await session.execute(
+            select(InstanceConnection.status, InstanceConnection.non_secret_config)
+            .where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == conn.connection_id,
+            )
+            .with_for_update(key_share=True)  # FOR NO KEY UPDATE
+        )
+    ).first()
+    if current is None or current.status in ("not_connected", "revoked"):
+        return None
     # Rotation durable BEFORE the new token is used (the Outlook rule, §3.8.5).
     await backing.put(secret_ref, rotated)
-    cfg = dict(conn.non_secret_config or {})
+    cfg = dict(current.non_secret_config or {})
     cfg["token_expires_at"] = new_expiry.isoformat()
     conn.non_secret_config = cfg
     return rotated["access_token"]

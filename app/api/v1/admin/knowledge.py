@@ -275,7 +275,7 @@ def _accepted(outcome: sync_jobs.JobOutcome, connection_id: uuid.UUID) -> JSONRe
 
 def _raise_unless_synced(outcome: sync_jobs.JobOutcome) -> None:
     """A job that finished inside the inline wait without syncing answers as it always did."""
-    if outcome.outcome == "synced" and outcome.result is not None:
+    if outcome.outcome in ("synced", "halted") and outcome.result is not None:
         return
     message = str(outcome.job.get("error") or sync_jobs.FAILED_GENERIC)
     if outcome.outcome in (
@@ -660,6 +660,8 @@ async def create_sync_connection(
 @router.post(
     "/sync-connections/{connection_id}/sync",
     response_model=SyncResultOut,
+    # ``halted`` only when a run halted: every other 200 keeps its four lists.
+    response_model_exclude_none=True,
     responses={
         202: {
             "model": SyncJobAcceptedOut,
@@ -692,7 +694,9 @@ async def trigger_sync(
         return _accepted(outcome, connection_id)
     _raise_unless_synced(outcome)
     assert outcome.result is not None  # _raise_unless_synced let only a synced job through
-    return SyncResultOut.model_validate(outcome.result.as_dict())
+    return SyncResultOut.model_validate(
+        {**outcome.result.as_dict(), "halted": outcome.result.halted}
+    )
 
 
 # --- knowledge SCOPE selection (Decision #9) ------------------------------------ #
