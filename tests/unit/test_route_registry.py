@@ -75,6 +75,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("PUT", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("GET", "/api/v1/admin/knowledge/sources/{source_id}/chunks"),
+        # Round 7 walk run 8: same method + path; a connection-backed re-sync is the sync job
+        # too, so it may answer 202 (state "syncing") like the sync route below.
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/resync"),
         # 2026-09-05 audit F109: an owner delete is undo-able for 30 days.
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/restore"),
