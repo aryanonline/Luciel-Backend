@@ -39,10 +39,22 @@ log_group="/luciel/${ENVIRONMENT}/verify"
 echo "[verify] task definition: $taskdef"
 echo "[verify] log group: $log_group  stream: luciel-verify/VerifyContainer/${taskid}"
 sleep 5
-aws logs get-log-events --region "$REGION" \
+# The read's error is kept (as run-seedtest-task.sh keeps it): a stream that does not
+# exist yet is expected, but a refused read must say so, or the probe's output goes
+# missing with no reason given. Either way this only reports: the verdict below is the
+# task's exit code.
+log_err_file=$(mktemp)
+if ! aws logs get-log-events --region "$REGION" \
   --log-group-name "$log_group" \
   --log-stream-name "luciel-verify/VerifyContainer/${taskid}" \
-  --query 'events[].message' --output text 2>/dev/null || echo "(logs not yet available for $log_group)"
+  --query 'events[].message' --output text 2>"$log_err_file"; then
+  log_err=$(tr '\r\n' '  ' <"$log_err_file" | cut -c1-400)
+  case "$log_err" in
+    *ResourceNotFoundException*) echo "(logs not yet available for $log_group)" ;;
+    *) echo "::warning::[verify] cannot read the probe log: ${log_err}" ;;
+  esac
+fi
+rm -f "$log_err_file"
 
 [ "$code" = "0" ] || { echo "::error::verify task FAILED (exit $code)"; exit 1; }
 echo "[verify] §10 live probe PASSED."

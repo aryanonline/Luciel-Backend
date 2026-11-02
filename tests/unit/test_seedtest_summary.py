@@ -239,6 +239,24 @@ case "$1 $2" in
         fi
         cat "$FAKE_STATE/logs.json" ;;
     esac ;;
+  "logs get-log-events")
+    case "$*" in
+      *"--log-group-name /luciel/dev/verify "*) ;;
+      *) echo "An error occurred (ResourceNotFoundException): no such log group" >&2; exit 254 ;;
+    esac
+    case "$*" in
+      *"--log-stream-name luciel-verify/VerifyContainer/abc123 "*) ;;
+      *) echo "An error occurred (ResourceNotFoundException): no such log stream" >&2; exit 254 ;;
+    esac
+    case "${FAKE_LOGS:-ok}" in
+      ok) echo "[verify] probe output" ;;
+      denied)
+        echo "An error occurred (AccessDeniedException) when calling GetLogEvents" >&2
+        exit 254 ;;
+      late)
+        echo "An error occurred (ResourceNotFoundException): log stream not there yet" >&2
+        exit 254 ;;
+    esac ;;
   *) echo "unexpected aws $*" >&2; exit 2 ;;
 esac
 """
@@ -276,11 +294,14 @@ def _run_runner(
     log_lines: list[str],
     logs: str = "ok",
     wait_seconds: str = "30",
+    runner: Path = seedtest_harness.RUNNER,
+    waits_already: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     fakebin = tmp_path / "bin"
     state = tmp_path / "state"
     fakebin.mkdir()
     state.mkdir()
+    (state / "waits").write_text(str(waits_already), encoding="utf-8")
     for name, body in (("aws", FAKE_AWS), ("sleep", FAKE_SLEEP)):
         script = fakebin / name
         script.write_bytes(body.encode())
@@ -299,7 +320,7 @@ def _run_runner(
         "PYTHONUTF8": "1",
     }
     done = subprocess.run(  # noqa: S603
-        [str(shutil.which("bash")), str(seedtest_harness.RUNNER), "dev", *args],
+        [str(shutil.which("bash")), str(runner), "dev", *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -465,3 +486,53 @@ def test_a_summary_that_is_not_a_pass_fails_even_on_exit_zero(tmp_path: Path, mo
         "::error::seedtest gate FAILED: the task exited 0 but the harness SUMMARY is not a "
         f"PASS: {SUMMARY}"
     )
+
+
+# --- the §10 verify runner keeps its log read's error; its verdict is the exit code --- #
+VERIFY_RUNNER = seedtest_harness.ROOT / "scripts" / "run-verify-task.sh"
+
+
+@needs_runner
+@pytest.mark.parametrize(
+    ("logs", "exit_code", "rc", "expected"),
+    [
+        ("ok", "0", 0, "[verify] probe output"),
+        ("late", "0", 0, "(logs not yet available for /luciel/dev/verify)"),
+        (
+            "denied",
+            "0",
+            0,
+            "::warning::[verify] cannot read the probe log: An error occurred "
+            "(AccessDeniedException) when calling GetLogEvents",
+        ),
+        (
+            "denied",
+            "1",
+            1,
+            "::warning::[verify] cannot read the probe log: An error occurred "
+            "(AccessDeniedException) when calling GetLogEvents",
+        ),
+        ("ok", "1", 1, "[verify] probe output"),
+    ],
+)
+def test_the_verify_runner_says_why_it_has_no_log_and_gates_on_the_exit_code(
+    tmp_path: Path, logs: str, exit_code: str, rc: int, expected: str
+) -> None:
+    done, _, _ = _run_runner(
+        tmp_path,
+        exit_code=exit_code,
+        log_lines=[],
+        logs=logs,
+        runner=VERIFY_RUNNER,
+        waits_already=1,  # the fake's first wait is the waiter's give-up; verify has no retry
+    )
+    out = done.stdout
+    assert done.returncode == rc, done.stderr + out
+    assert expected in [line.rstrip() for line in out.splitlines()]
+    tail = _tail(out)[-1]
+    if rc:
+        assert tail == f"::error::verify task FAILED (exit {exit_code})"
+    else:
+        assert tail == "[verify] §10 live probe PASSED."
+    if logs != "denied":
+        assert "::warning::" not in out
