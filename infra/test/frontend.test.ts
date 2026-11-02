@@ -123,21 +123,6 @@ describe('Web service (spec §2 — mirrors backend ECS)', () => {
     t.resourceCountIs('AWS::ElasticLoadBalancingV2::ListenerRule', 1);
   });
 
-  test('plain-HTTP app hosts still redirect to HTTPS (the retired ALB :80 behavior)', () => {
-    Template.fromStack(buildCompute('dev', { publicDns: true }).compute).hasResourceProperties(
-      'AWS::ElasticLoadBalancingV2::ListenerRule',
-      {
-        Conditions: Match.arrayWith([
-          Match.objectLike({
-            Field: 'host-header',
-            HostHeaderConfig: { Values: ['dev.vantagemind.ai', 'vantagemind.ai', 'www.vantagemind.ai'] },
-          }),
-        ]),
-        Actions: [Match.objectLike({ Type: 'redirect', RedirectConfig: Match.objectLike({ Protocol: 'HTTPS' }) })],
-      },
-    );
-  });
-
   test('health check targets the SSR root path', () => {
     buildWeb().hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
       HealthCheckPath: '/',
@@ -222,10 +207,38 @@ describe('Frontend deploy role (spec §4)', () => {
 });
 
 describe('Backend ALB carries the HTTPS listener and the api aliases (spec §1)', () => {
-  test('compute adds a 443 listener and keeps the existing HTTP:80 routing', () => {
+  test('compute adds a 443 listener; :80 only redirects to it (Arch "HTTPS-only")', () => {
     const t = Template.fromStack(buildCompute('dev', { publicDns: true }).compute);
     t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', { Port: 443 });
-    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', { Port: 80 });
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 80,
+      DefaultActions: [
+        Match.objectLike({
+          Type: 'redirect',
+          RedirectConfig: { Protocol: 'HTTPS', Port: '443', StatusCode: 'HTTP_301' },
+        }),
+      ],
+    });
+    // No forward rule, on any host: api hosts used to answer plain HTTP through these.
+    const [http80] = Object.entries(t.findResources('AWS::ElasticLoadBalancingV2::Listener')).find(
+      ([, l]) => l.Properties.Port === 80,
+    )!;
+    const rulesOn80 = Object.values(t.findResources('AWS::ElasticLoadBalancingV2::ListenerRule')).filter(
+      (r) => r.Properties.ListenerArn.Ref === http80,
+    );
+    expect(rulesOn80).toHaveLength(0);
+  });
+
+  test('without a certificate (no domain) :80 stays the forwarding listener', () => {
+    const t = Template.fromStack(buildCompute('dev').compute);
+    t.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 1);
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 80,
+      DefaultActions: [Match.objectLike({ Type: 'forward' })],
+    });
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::ListenerRule', {
+      Actions: [Match.objectLike({ Type: 'forward' })],
+    });
   });
 
   test('api-dev.vantagemind.ai AND (dual-host) api.vantagemind.ai ALIAS records point at the ALB', () => {

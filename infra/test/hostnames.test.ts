@@ -240,25 +240,31 @@ describe('one ALB per environment, routed by host (D7)', () => {
   });
 
   test.each(ENVS)(
-    '%s: every api host routes the control-plane paths on BOTH listeners; data is its catch-all',
+    '%s: every api host routes the control-plane paths on the HTTPS listener; data is its catch-all',
     (envName) => {
       const { compute } = synth(envName);
       const h = hostnames(envName);
-      const listeners = Object.keys(compute.findResources('AWS::ElasticLoadBalancingV2::Listener'));
+      const listeners = Object.entries(compute.findResources('AWS::ElasticLoadBalancingV2::Listener')) as [
+        string,
+        Res,
+      ][];
       expect(listeners).toHaveLength(2);
-      for (const listener of listeners) {
-        const onListener = rules(compute).filter((r) => r.Properties.ListenerArn.Ref === listener);
-        const apiRules = onListener.filter((r) => hostValues(r).length && hostValues(r)[0] === h.api);
-        for (const r of apiRules) expect(hostValues(r)).toEqual(h.apiNames);
-        const control = apiRules.filter((r) => pathValues(r).length > 0);
-        expect(control.flatMap(pathValues).sort()).toEqual(CONTROL_PLANE_PATH_PATTERNS.flat().slice().sort());
-        const catchAll = apiRules.filter((r) => pathValues(r).length === 0);
-        expect(catchAll).toHaveLength(1);
-        expect(catchAll[0].Properties.Priority).toBe(LISTENER_RULE_PRIORITY.apiHost);
-        for (const r of control) {
-          expect(r.Properties.Priority).toBeGreaterThanOrEqual(LISTENER_RULE_PRIORITY.controlPlane);
-          expect(r.Properties.Priority).toBeLessThan(LISTENER_RULE_PRIORITY.apiHost);
-        }
+      const [http] = listeners.filter(([, l]) => l.Properties.Port === 80);
+      const [https] = listeners.filter(([, l]) => l.Properties.Port === 443);
+      // :80 forwards nothing on any host: the api names used to answer plain HTTP here.
+      expect(rules(compute).filter((r) => r.Properties.ListenerArn.Ref === http[0])).toHaveLength(0);
+      const listener = https[0];
+      const onListener = rules(compute).filter((r) => r.Properties.ListenerArn.Ref === listener);
+      const apiRules = onListener.filter((r) => hostValues(r).length && hostValues(r)[0] === h.api);
+      for (const r of apiRules) expect(hostValues(r)).toEqual(h.apiNames);
+      const control = apiRules.filter((r) => pathValues(r).length > 0);
+      expect(control.flatMap(pathValues).sort()).toEqual(CONTROL_PLANE_PATH_PATTERNS.flat().slice().sort());
+      const catchAll = apiRules.filter((r) => pathValues(r).length === 0);
+      expect(catchAll).toHaveLength(1);
+      expect(catchAll[0].Properties.Priority).toBe(LISTENER_RULE_PRIORITY.apiHost);
+      for (const r of control) {
+        expect(r.Properties.Priority).toBeGreaterThanOrEqual(LISTENER_RULE_PRIORITY.controlPlane);
+        expect(r.Properties.Priority).toBeLessThan(LISTENER_RULE_PRIORITY.apiHost);
       }
     },
   );
@@ -279,12 +285,21 @@ describe('one ALB per environment, routed by host (D7)', () => {
     expect(() => controlPlaneRuleGroups(MAX_CONDITION_VALUES_PER_RULE)).toThrow(/no room/);
   });
 
-  test('the listeners keep the data plane as the default action (an unnamed host is never dropped)', () => {
-    const { compute } = synth('dev');
-    for (const l of Object.values(compute.findResources('AWS::ElasticLoadBalancingV2::Listener')) as Res[]) {
-      expect(l.Properties.DefaultActions[0].Type).toBe('forward');
-    }
-  });
+  test.each(ENVS)(
+    '%s: HTTPS keeps the data plane as the default action (an unnamed host is never dropped); :80 redirects',
+    (envName) => {
+      const { compute } = synth(envName);
+      const listeners = Object.values(compute.findResources('AWS::ElasticLoadBalancingV2::Listener')) as Res[];
+      const byPort = (port: number) => listeners.filter((l) => l.Properties.Port === port);
+      expect(byPort(443)[0].Properties.DefaultActions[0].Type).toBe('forward');
+      expect(byPort(80)[0].Properties.DefaultActions).toEqual([
+        expect.objectContaining({
+          Type: 'redirect',
+          RedirectConfig: expect.objectContaining({ Protocol: 'HTTPS', StatusCode: 'HTTP_301' }),
+        }),
+      ]);
+    },
+  );
 });
 
 describe('records: every name aliases to the right target', () => {

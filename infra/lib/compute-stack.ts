@@ -1293,13 +1293,16 @@ export class ComputeStack extends Stack {
       internetFacing: true,
     });
     const listener = this.alb.addListener('Http', { port: 80, open: true });
-    // ONE target group for the data plane, shared by both the HTTP and HTTPS
-    // listeners. Registering a single-task dev service into two separate target
-    // groups made the rolling deployment unable to satisfy minHealthy across both
-    // groups, causing an endless register/drain loop (the service never reached
-    // steady state and the CFN update hung). One TG + multiple listeners forwarding
-    // to it is the correct ALB pattern.
-    const dataPlaneTg = listener.addTargets('DataPlaneTargets', {
+    // ONE target group for the data plane, shared by whichever listeners forward to
+    // it. Registering a single-task dev service into two separate target groups made
+    // the rolling deployment unable to satisfy minHealthy across both groups, causing
+    // an endless register/drain loop (the service never reached steady state and the
+    // CFN update hung). One TG + multiple listeners forwarding to it is the correct
+    // ALB pattern. Scoped under the HTTP listener with this id because that is where
+    // listener.addTargets() put it: a new logical id would REPLACE the deployed target
+    // group, and the service registered in it, now that :80 no longer forwards.
+    const dataPlaneTg = new elbv2.ApplicationTargetGroup(listener, 'DataPlaneTargetsGroup', {
+      vpc,
       port: 8000,
       targets: [dataService],
       healthCheck: { path: '/healthz', interval: Duration.seconds(30) },
@@ -1349,7 +1352,6 @@ export class ComputeStack extends Stack {
         action: elbv2.ListenerAction.forward([dataPlaneTg]),
       });
     };
-    routeApiHosts(listener, 'Http');
 
     if (publicDns) {
       const zone = importPublicZone(this);
@@ -1375,11 +1377,14 @@ export class ComputeStack extends Stack {
       routeApiHosts(https, 'Https');
       this.httpsListener = https;
 
-      // The app hosts on plain HTTP go to HTTPS — what the retired web ALB's :80
-      // listener did. (The api hosts keep answering on :80 exactly as before.)
-      listener.addAction('HttpAppToHttps', {
-        priority: LISTENER_RULE_PRIORITY.appHost,
-        conditions: [elbv2.ListenerCondition.hostHeaders([...names.appNames])],
+      // With HTTPS available nothing is served on plain HTTP, on any host: the :80
+      // listener's only action is a permanent redirect and it carries no forward rules
+      // (the api hosts answered on :80 until round 7; Arch "HTTPS-only"). A target
+      // group health check goes to the target directly and is unaffected. Nothing in
+      // this repo calls the API over http://; every webhook and SNS subscription the
+      // platform registers is built from the https origin. smoke_probe.sh proves the
+      // redirect after each deploy.
+      listener.addAction('HttpToHttps', {
         action: elbv2.ListenerAction.redirect({ protocol: 'HTTPS', port: '443', permanent: true }),
       });
 
@@ -1405,6 +1410,11 @@ export class ComputeStack extends Stack {
       for (const sub of [sesEventsSubscription, sesInboundSubscription]) {
         sub.node.addDependency(https, ...apiRecords);
       }
+    } else {
+      // No certificate (a synth with no domain, unit stacks): :80 is the only listener
+      // there is, so it forwards as the HTTPS listener would.
+      listener.addTargetGroups('DataPlaneTargets', { targetGroups: [dataPlaneTg] });
+      routeApiHosts(listener, 'Http');
     }
 
     this.sharedIngress = {

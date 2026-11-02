@@ -1,6 +1,6 @@
 /**
  * 2026-09-05 audit F067: the two-plane split is real at the ALB. Admin authority
- * is forwarded to the control-plane service on BOTH listeners; the data plane is
+ * is forwarded to the control-plane service on every forwarding listener; the data plane is
  * the default action, so an unlisted path is never dropped.
  */
 import { App } from 'aws-cdk-lib';
