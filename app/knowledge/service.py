@@ -16,7 +16,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -237,7 +237,7 @@ async def list_sources(
 ) -> list[KnowledgeSource]:
     """Active sources, newest first; then, when asked, the ones a sync found gone at their
     origin, most recently removed first. One query, so a page can span the two."""
-    visible = KnowledgeSource.soft_deleted_at.is_(None)
+    visible: ColumnElement[bool] = KnowledgeSource.soft_deleted_at.is_(None)
     if include_removed_at_origin:
         visible = or_(visible, KnowledgeSource.deleted_by == DELETED_BY_ORIGIN)
     statement = (
