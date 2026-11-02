@@ -11,6 +11,13 @@ reply the mailbox poll could not deliver). The owner notification for it is a
 background task that starts after the tenant's commit; this process is the only
 thing that can let it finish, so the sweep is not done until those tasks are
 (``_run_sweep``). The API process does the same at lifespan shutdown.
+
+The whole process runs under ONE event loop (``_main``): the audit-lock preflight, the
+sweep, the notification drain and the engine dispose. The database engine is a
+module-level singleton whose asyncpg pool belongs to the loop that opened it; the
+audit sweep used to preflight under one ``asyncio.run`` and sweep under a second, so
+its first query pre-pinged a connection from the closed first loop and died with
+``got Future ... attached to a different loop`` (every Sunday, 2026-09-27 to 10-25).
 """
 
 from __future__ import annotations
@@ -85,6 +92,31 @@ async def _preflight_audit_lock() -> list[str]:
         return lock_failures(await audit_lock_results(session))
 
 
+class _LockNotApplied(Exception):
+    """The audit sweep's preflight found the audit-log lock missing."""
+
+    def __init__(self, failed: list[str]) -> None:
+        super().__init__(", ".join(failed))
+        self.failed = failed
+
+
+async def _main(name: str) -> object:
+    """Everything the process does with the database, under one event loop.
+
+    The engine is disposed in the same loop before it closes, so no pooled connection
+    outlives the loop that owns it (and the process exits with no "Event loop is
+    closed" noise from a pool torn down by the garbage collector).
+    """
+    from app.db.engine import dispose_engine
+
+    try:
+        if name == AUDIT_RETENTION and (failed := await _preflight_audit_lock()):
+            raise _LockNotApplied(failed)
+        return await _run_sweep(name)
+    finally:
+        await dispose_engine()
+
+
 def main(argv: list[str] | None = None) -> int:
     # Nothing else configures logging in the sweep container, so without this,
     # ERROR-level lines go through Python's lastResort handler with NO level token
@@ -98,18 +130,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     name = args[0]
 
-    if name == AUDIT_RETENTION and (failed := asyncio.run(_preflight_audit_lock())):
+    try:
+        result: object = asyncio.run(_main(name))
+    except _LockNotApplied as refused:
         from app.lifecycle.audit_retention import AUDIT_LOCK_REMEDY
 
         print(
             f"[{name}] refusing to run: the audit-log lock is not applied.\n"
-            + "".join(f"  FAIL {check}\n" for check in failed)
+            + "".join(f"  FAIL {check}\n" for check in refused.failed)
             + AUDIT_LOCK_REMEDY,
             file=sys.stderr,
         )
         return 1
-
-    result: object = asyncio.run(_run_sweep(name))
+    except Exception:  # noqa: BLE001 — reported, then a non-zero exit
+        # A named log line on top of the alert that already exists. The F034 EventBridge
+        # rule SweepTaskExitedNonZero (infra/lib/observability-stack.ts) emails on ANY
+        # non-zero exit of a sweep task, logged or not, so no crash here was ever silent.
+        # At ERROR, the SweepErrors filter counts the failed run itself rather than
+        # whatever a library logged on the way down (SQLAlchemy's pool, during the
+        # 2026-09-27..10-25 audit crashes). A failed pass sends two emails, one
+        # SweepErrorAlarm and one exit-code: one failure, not two.
+        _LOG.exception("sweep_failed sweep=%s: the run did not complete", name)
+        return 1
     print(json.dumps({"sweep": name, "result": result}, default=str))
     return 0
 

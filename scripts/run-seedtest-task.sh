@@ -18,11 +18,28 @@
 # caller's environment (nothing could reach the task with them before). Note: container
 # overrides are visible to anyone who can ecs:DescribeTasks in the account.
 #
+# The verdict (round 7 fact check, 2026-10-25):
+#   strict (the default, and what deploy.yml runs): the gate passes only when the task
+#     exited 0 AND its CloudWatch stream's "[seedtest] SUMMARY result=PASS ..." line was
+#     read. A SUMMARY that was never read FAILS the gate — the task's exit code alone is
+#     not evidence: every 2026-10-25 dev deploy passed on exit 0 while printing
+#     "SUMMARY missing", because the deploy role could not read the log group and the
+#     AccessDenied went to /dev/null.
+#   --no-strict: a missing SUMMARY is a ::warning:: and the gate falls back to the task's
+#     exit code (a hand run that tolerates skips, or one without log access).
+#   Either mode: a non-zero exit code, or a SUMMARY that says anything but result=PASS,
+#   fails. SEEDTEST_LOG_WAIT_SECONDS (default 120) bounds the wait for the SUMMARY line;
+#   a refused read (AccessDenied, expired credentials) stops waiting at once and says so.
+#
 set -euo pipefail
 # Git Bash on Windows: keep /luciel/<env>/seedtest a log-group name, not a file path.
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
 ENVIRONMENT="${1:-dev}"
 if [ "$#" -gt 0 ]; then shift; fi
+strict=1
+for arg in "$@"; do
+  if [ "$arg" = "--no-strict" ]; then strict=0; fi
+done
 REGION="${AWS_REGION:-ca-central-1}"
 PREFIX="Luciel-${ENVIRONMENT}"
 
@@ -103,24 +120,65 @@ echo "[seedtest] log group: $log_group  stream: $stream"
 # returned one page of a long matrix log) until that line is in, bounded, then render
 # once — every message on its own line, the SUMMARY again at the end, and the same
 # SUMMARY plus every [FAIL]/[SKIP] into the GitHub job summary when there is one.
+#
+# Every read's error is KEPT, never sent to /dev/null: 75018f4 waited two minutes for a
+# line it could never see — the deploy role had no logs: grant, each call was an
+# AccessDenied, and `2>/dev/null || echo '{"events": []}'` turned that into "no events
+# yet" (the stream held "SUMMARY result=PASS ... seconds=46.3" 33 s before the first
+# read on 2026-10-25). A stream that does not exist yet, or has no SUMMARY yet, is
+# retried until the deadline; a refused read is not something waiting fixes.
 logs='{"events": []}'
-# Up to two minutes: the 2026-10-25 Phase 3 deploy's strict run passed on exit code 0
-# but the stream was still empty 30 s after the task stopped, so the job summary
-# said 'SUMMARY missing' about a run that had passed.
-for _ in $(seq 1 24); do
+log_note=""
+log_wait_seconds="${SEEDTEST_LOG_WAIT_SECONDS:-120}"
+log_deadline=$(($(date +%s) + log_wait_seconds))
+log_err_file=$(mktemp)
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  if fetched=$(aws logs filter-log-events --region "$REGION" --log-group-name "$log_group" \
+    --log-stream-names "$stream" --output json 2>"$log_err_file"); then
+    logs="$fetched"
+    case "$logs" in *"[seedtest] SUMMARY"*)
+      log_note=""
+      break
+      ;;
+    esac
+    log_note="no SUMMARY line in the task's stream after ${attempt} read(s) over ${log_wait_seconds} s"
+  else
+    log_err=$(tr '\r\n' '  ' <"$log_err_file" | cut -c1-400)
+    case "$log_err" in
+      *ResourceNotFoundException*)
+        log_note="the task's log stream did not appear within ${log_wait_seconds} s"
+        ;;
+      *AccessDenied* | *UnauthorizedOperation* | *UnrecognizedClient* | *InvalidClientTokenId* | *ExpiredToken*)
+        log_note="CloudWatch refused the read of ${log_group}"
+        echo "::error::[seedtest] cannot read the harness log: ${log_err}"
+        break
+        ;;
+      *)
+        log_note="CloudWatch read failed: ${log_err}"
+        ;;
+    esac
+  fi
+  if [ "$(date +%s)" -ge "$log_deadline" ]; then break; fi
   sleep 5
-  logs=$(aws logs filter-log-events --region "$REGION" --log-group-name "$log_group" \
-    --log-stream-names "$stream" --output json 2>/dev/null || echo '{"events": []}')
-  case "$logs" in *"[seedtest] SUMMARY"*) break ;; esac
 done
+rm -f "$log_err_file"
+if [ -n "$log_note" ]; then echo "[seedtest] harness log: $log_note"; fi
 report_py=$(cat <<'PY_REPORT'
-"""Render the harness log (stdin: filter-log-events JSON); argv = exit code, environment."""
+"""Render the harness log (stdin: filter-log-events JSON).
+
+argv = exit code, environment[, why the log could not be read]. The LAST line printed is
+always the SUMMARY (the harness's own, or a "SUMMARY missing: ..." one): the runner's
+verdict reads it.
+"""
 import json
 import os
 import sys
 
 PREFIX = "[seedtest] SUMMARY"
 code, environment = sys.argv[1], sys.argv[2]
+log_note = sys.argv[3] if len(sys.argv) > 3 else ""
 try:
     events = json.loads(sys.stdin.read() or "{}").get("events") or []
 except ValueError:
@@ -131,7 +189,9 @@ for line in lines:
 if not lines:
     print("(no harness output in CloudWatch for this task yet)")
 summary = next((line for line in reversed(lines) if line.startswith(PREFIX)), None)
-if summary is None:
+if summary is None and log_note:
+    summary = f"{PREFIX} missing: {log_note} (task exit code {code})"
+elif summary is None:
     summary = f"{PREFIX} missing: the harness did not finish (task exit code {code})"
 print(summary)
 target = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -144,7 +204,26 @@ if target:
         fh.write("\n")
 PY_REPORT
 )
-printf '%s' "$logs" | python3 -c "$report_py" "$code" "$ENVIRONMENT"
+report=$(printf '%s' "$logs" | python3 -c "$report_py" "$code" "$ENVIRONMENT" "$log_note")
+printf '%s\n' "$report"
+summary="${report##*$'\n'}"
 
-[ "$code" = "0" ] || { echo "::error::seedtest task FAILED (exit $code)"; exit 1; }
+[ "$code" = "0" ] || {
+  echo "::error::seedtest task FAILED (exit $code)"
+  exit 1
+}
+case "$summary" in
+  "[seedtest] SUMMARY result=PASS "*) ;;
+  "[seedtest] SUMMARY missing"*)
+    if [ "$strict" = "1" ]; then
+      echo "::error::seedtest strict gate FAILED: the task exited 0 but its SUMMARY line was never read (${log_note:-no SUMMARY in the stream}); an exit code is not evidence the harness ran"
+      exit 1
+    fi
+    echo "::warning::seedtest --no-strict: no SUMMARY line was read (${log_note:-no SUMMARY in the stream}); gating on the task's exit code 0 alone"
+    ;;
+  *)
+    echo "::error::seedtest gate FAILED: the task exited 0 but the harness SUMMARY is not a PASS: $summary"
+    exit 1
+    ;;
+esac
 echo "[seedtest] §10 live-behavior probe PASSED."

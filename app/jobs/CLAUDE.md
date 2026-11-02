@@ -36,6 +36,28 @@ Runs scheduled platform sweeps for lifecycle, retention, reconciliation, dunning
   (SweepErrors alarms) and keeps the exit code. Notifications only — never the retry ladder, and
   never inside `_per_tenant` (the API process's in-process mailbox poller shares it).
 
+## One event loop per sweep process (round 7 fact check, 2026-10-25)
+- `main` makes exactly ONE `asyncio.run(_main(name))`: the audit-lock preflight, the sweep,
+  the notification drain and `dispose_engine()` all run on that loop. The engine is a module
+  singleton whose asyncpg pool belongs to the loop that opened it; the audit sweep used to
+  preflight under one `asyncio.run` and sweep under a second, and died on its first query
+  (`got Future ... attached to a different loop`) every Sunday 2026-09-27..10-25.
+  `app.db.engine` now raises `EngineLoopMismatchError` on a second loop instead.
+  09-27 is only the oldest run /luciel/dev/sweep still holds (30-day retention): the
+  two-`asyncio.run` shape dates from 2f2af24 (2026-07-31, the preflight's introduction), and
+  no `{"sweep": "audit_retention", ...}` result line exists in the retained window, so treat
+  the weekly audit prune as never having completed on dev before this fix.
+- A sweep that raises is logged as `ERROR app.jobs sweep_failed sweep=<name>` (with the
+  traceback) and exits 1. That is a named log line on top of an alert that was already there:
+  the F034 EventBridge rule `SweepTaskExitedNonZero` (`infra/lib/observability-stack.ts`) has
+  always emailed on any non-zero sweep exit, logged or not, so the audit crashes were never
+  silent. A failed pass therefore sends TWO emails for one failure: a SweepErrorAlarm email
+  (the filter counts `sweep_failed` itself, not whatever a library logged on the way down) and
+  a "stopped with a non-zero exit code" email. The audit-lock refusal exits 1 with no ERROR
+  token, so it sends only the exit-code email.
+  Tests: `tests/unit/test_sweep_entrypoint_one_loop.py` (every sweep in SWEEPS),
+  `tests/integration/test_sweep_entrypoint_one_loop.py` (the real DB).
+
 ## daily_brief (round 6 WP-F, 2026-09-07)
 - Hourly sweep; a tenant is due once its LOCAL clock (instances.timezone, UTC when unset)
   passes 07:00 and no `brief:<date>` row exists in `notice_deliveries`. Body from

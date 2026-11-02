@@ -132,3 +132,33 @@ describe('one GitHub OIDC provider per account', () => {
     }
   });
 });
+
+describe('the deploy role can read back the probe tasks it runs (round 7 fact check)', () => {
+  // scripts/run-seedtest-task.sh (strict D10) and run-verify-task.sh print their task's
+  // CloudWatch stream. With no logs: grant every read was AccessDenied, swallowed, and
+  // the strict gate reported "SUMMARY missing" on runs whose stream said PASS.
+  const arns = (env: string) =>
+    ['seedtest', 'verify'].flatMap((probe) => [
+      `arn:aws:logs:${OFFERING_REGION}:111111111111:log-group:/luciel/${env}/${probe}`,
+      `arn:aws:logs:${OFFERING_REGION}:111111111111:log-group:/luciel/${env}/${probe}:*`,
+    ]);
+
+  test.each<[EnvName, string[]]>([
+    ['dev', arns('dev')],
+    // The prod role also runs the ephemeral preprod's Verify + SeedTest gate.
+    ['prod', [...arns('prod'), ...arns('preprod')]],
+  ])('%s: FilterLogEvents/GetLogEvents on exactly its probe log groups', (envName, resources) => {
+    pipeline(envName).hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Sid: 'ReadProbeLogs',
+            Effect: 'Allow',
+            Action: ['logs:FilterLogEvents', 'logs:GetLogEvents', 'logs:DescribeLogStreams'],
+            Resource: resources,
+          }),
+        ]),
+      }),
+    });
+  });
+});

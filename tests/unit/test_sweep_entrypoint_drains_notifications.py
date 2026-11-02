@@ -108,7 +108,7 @@ async def test_a_notification_that_never_finishes_is_abandoned_after_the_bound(
 
 
 async def test_pages_already_scheduled_still_go_out_when_the_sweep_then_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     delivered: list[str] = []
 
@@ -122,9 +122,14 @@ async def test_pages_already_scheduled_still_go_out_when_the_sweep_then_fails(
 
     monkeypatch.setitem(SWEEPS, SESSION_FINALIZE, _sweep)
 
-    # The failure still surfaces (a non-zero exit for the schedule's retry policy) ...
-    with pytest.raises(RuntimeError, match="candidate lookup failed"):
-        await _run_entry_point()
+    # The failure still surfaces: a non-zero exit, and an ERROR line naming the sweep
+    # (the level the SweepErrors metric filter counts) with the traceback under it ...
+    with caplog.at_level(logging.ERROR, logger="app.jobs"):
+        assert await _run_entry_point() == 1
+    failed = [r for r in caplog.records if "sweep_failed" in r.getMessage()]
+    assert len(failed) == 1 and failed[0].levelno == logging.ERROR
+    assert f"sweep={SESSION_FINALIZE}" in failed[0].getMessage()
+    assert failed[0].exc_info and "candidate lookup failed" in str(failed[0].exc_info[1])
     # ... and the page for the tenant that had already committed was not lost with it.
     assert delivered == ["owner paged"]
 

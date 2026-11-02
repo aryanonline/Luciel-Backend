@@ -188,6 +188,49 @@ def test_d10_runs_the_seedtest_gate_strictly_after_every_live_dev_deploy() -> No
     )
 
 
+def test_the_d10_gate_can_read_the_harness_summary_and_fails_without_it() -> None:
+    """Round 7 fact check (2026-10-25): every dev deploy that day printed "[seedtest]
+    SUMMARY missing: the harness did not finish (task exit code 0)" and PASSED, while the
+    task's stream held "SUMMARY result=PASS". The deploy role had no logs: grant, the
+    runner sent the AccessDenied to /dev/null, and a missing SUMMARY fell back to the
+    exit code. The grant (PipelineStack ReadProbeLogs, pinned in
+    infra/test/deploy-role.test.ts) must land BEFORE the gate reads, and the runner must
+    neither swallow a refused read nor pass a strict run on an unread SUMMARY."""
+    steps = _steps("dev")
+    grants = _index(steps, name="deploy role's grants first")
+    assert grants < _index(steps, step_id="seedtest")
+    seedtest = (ROOT / "scripts" / "run-seedtest-task.sh").read_text(encoding="utf-8")
+    logs_read = seedtest[seedtest.index("aws logs filter-log-events") :]
+    logs_read = logs_read[: logs_read.index("\n", logs_read.index("--output json"))]
+    assert "/dev/null" not in logs_read, "the CloudWatch read's error must be kept"
+    strict_missing = seedtest[seedtest.index('"[seedtest] SUMMARY missing"*)') :]
+    strict_missing = strict_missing[: strict_missing.index(";;")]
+    assert 'if [ "$strict" = "1" ]; then' in strict_missing
+    assert "strict gate FAILED" in strict_missing and "exit 1" in strict_missing
+    # Only a SUMMARY that says PASS lets an exit-0 run through.
+    assert '"[seedtest] SUMMARY result=PASS "*) ;;' in seedtest
+
+
+def test_the_preprod_gate_runs_after_the_prod_deploy_roles_grants_land() -> None:
+    """preprod-verify runs the strict gate as luciel-prod-github-deploy, and a refused log
+    read fails it. prod-deploy applies the same stack but `needs` that gate, so without
+    this step a role that lacks the grant blocks every release and no release can fix it."""
+    standup = _steps("preprod-standup")
+    grants = _index(standup, name="deploy role's grants first")
+    assert '"Luciel-prod-Pipeline" --exclusively' in _run(standup[grants])
+    assert "-c env=prod" in _run(standup[grants])
+    # npm ci has run, and the grants land before anything else in the release uses them.
+    assert _index(standup, name="Refuse a prod release") < grants
+    assert grants < _index(standup, name="Stand up preprod")
+    # The gate runs on a paused release too, so the grant step may not be skipped by one.
+    assert "if" not in standup[grants]
+    jobs = _jobs()
+    assert "preprod-standup" in jobs["preprod-verify"]["needs"]  # type: ignore[operator]
+    gate = _steps("preprod-verify")
+    assert any("scripts/run-seedtest-task.sh preprod --strict" in _run(s) for s in gate)
+    assert "preprod-verify" in jobs["prod-deploy"]["needs"]  # type: ignore[operator]
+
+
 def test_a_prod_release_is_refused_before_preprod_while_prod_does_not_own_the_names() -> None:
     steps = _steps("preprod-standup")
     guard = _index(steps, name="Refuse a prod release")
