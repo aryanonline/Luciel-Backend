@@ -16,13 +16,16 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - The CVE gate is `scripts/check_image_scan.py` + `.security/cve-allowlist.json`
   (governed, expiring exceptions; fails CLOSED on scan unavailability). Pause runs
   skip the build and reuse the deployed tag — taking an env down never needs a build.
-- Fifteen sweep schedules (incl. the daily `model_currency` watchdog; `mailbox_poll`
+- Sixteen sweep schedules (incl. the daily `model_currency` watchdog; `mailbox_poll`
   is an HOURLY backstop since 2026-09-05 — the data plane polls in-process every
   5 min via `LUCIEL_INPROCESS_MAILBOX_POLL_SECONDS`); ERROR-level sweep log lines
   feed the `SweepErrors` metric filter (ComputeStack); alarms are armed in EVERY
   environment and ObservabilityStack refuses to synth without `-c alarmEmail`/
   `-c budgetAlertEmail`; the app's EMF metrics (namespace `Luciel`) and ECS
-  task-state rules for failed sweep tasks alarm too; `productionPosture`
+  task-state rules for failed sweep tasks alarm too; both publish to the Alarms topic,
+  whose policy must name BOTH principals, because any topic policy replaces SNS's
+  implicit default (`test/alarm-topic-policy.test.ts`; from 2026-09-06 no alarm action
+  could publish); `productionPosture`
   (preprod/prod) gates cost-bearing telemetry and the paused-WAF exception;
   autoscaling has its own `autoscaling` knob (CPU + memory target tracking on
   both planes and the web tier; dev 1..2, prod as before — round 7 WP-8b);
@@ -46,11 +49,19 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   wildcard (WidgetCertStack, us-east-1) so no ownership flip touches it.
 - Two-plane ALB routing (2026-09-05): `CONTROL_PLANE_PATH_PATTERNS` forward admin
   authority to the control-plane service; the data plane is the default action.
+- HTTPS only: wherever the HTTPS listener exists, :80's default action is a permanent
+  redirect and it has no forward rules, on any host. Only a synth with no domain keeps
+  :80 forwarding. `scripts/smoke_probe.sh` proves the redirect, and the 404s on
+  `/openapi.json` and `/docs`, after each deploy.
+- ECS services copy their cost tags onto their tasks (`SERVICE_TASK_TAGGING` in
+  `lib/cost-tags.ts`), so a tag-filtered budget can see Fargate once the owner activates
+  the tags. Scheduled sweep tasks stay untagged on purpose.
 - Dev AND prod deploys (round 7 migrations review / WP-8b): apply the Pipeline stack's
   grants first, record the serving task definitions, MIGRATE WITH THE NEW IMAGE BEFORE
   THE ROLL (`scripts/migrate-before-roll.sh`: a registered revision of the current
   MigrationTask with the image swapped, deregistered afterwards), deploy, re-run the
-  migration as a no-op safety, then `scripts/smoke_probe.sh <env>` + the §10 verify
+  migration as a no-op safety, then `scripts/smoke_probe.sh <env>` (health, both planes,
+  HTTPS-only edge) + the §10 verify
   task (+ on dev the strict D10 SeedTest gate when live) — rolling the SERVICES back
   if the deploy or any post-roll step fails. The rollback is `scripts/rollback_services.py`
   (Phase 3 infra review): the Compute cleanup DEREGISTERS the previous revisions and

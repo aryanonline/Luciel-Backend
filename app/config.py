@@ -188,6 +188,10 @@ OAUTH_REDIRECT_URI_FIELDS: dict[str, str] = {
 #: The path every registered redirect URI must end with.
 OAUTH_CALLBACK_PATH = "/api/v1/connections/{label}/callback"
 
+#: Settings.environment on a developer's own checkout: the default, and the value in
+#: .env.example. Every deployed task is given dev, preprod or prod instead.
+LOCAL_ENVIRONMENT = "development"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LUCIEL_", env_file=".env", extra="ignore")
@@ -336,7 +340,9 @@ class Settings(BaseSettings):
     grace_window_days: int = 30
     export_link_ttl_days: int = 7
 
-    environment: str = "development"
+    # Which environment this process serves. Deployed tasks get dev, preprod or prod from
+    # ComputeStack (LUCIEL_ENVIRONMENT); only a local checkout keeps LOCAL_ENVIRONMENT.
+    environment: str = LOCAL_ENVIRONMENT
 
     # --- LLM integration mode (GATE 2 cutover — Architecture §3.4.3) ---------
     # The single runtime gate between the deterministic EchoModel plane and the

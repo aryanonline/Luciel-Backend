@@ -2545,8 +2545,10 @@ class Orchestrator:
         last: LLMResponse | None = None
         iterations = 0
         try:
-            # ONE cap admission for the whole turn (item 4): raises LLMCapExceeded at
-            # entry when the tenant is over its per-minute cap — no model is called.
+            # ONE cap admission for the whole turn (item 4). This synchronous form pays it
+            # in the block's FIRST complete(), not on entering it (an awaited Redis
+            # admission cannot run in __enter__): that call raises LLMCapExceeded when the
+            # tenant is over its per-minute cap, before any model is called.
             with self.router.turn():
                 for _ in range(MAX_ITERATIONS):
                     iterations += 1

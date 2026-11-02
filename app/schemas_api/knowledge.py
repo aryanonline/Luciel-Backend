@@ -241,13 +241,18 @@ class ScopeSelectionIn(WireModel):
     name: str | None = None
 
 
+# GET /scope echoes what was saved, so this is that read's bound too. The picker offers one
+# provider page (100) at a time; ten times that is past any owner's hand-picked list.
+SCOPE_SELECTIONS_MAX = 1000
+
+
 class SaveScopeRequest(WireModel):
     """PUT /sync-connections/{id}/scope body.
 
     An EMPTY ``selections`` list clears the scope, which means the WHOLE connected
     account — the pre-Decision-#9 behavior — not "nothing"."""
 
-    selections: list[ScopeSelectionIn]
+    selections: list[ScopeSelectionIn] = Field(max_length=SCOPE_SELECTIONS_MAX)
 
 
 class KnowledgeScopeOut(WireModel):

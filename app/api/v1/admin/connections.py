@@ -40,6 +40,7 @@ from app.api.errors import (
     service_unavailable,
     validation_error,
 )
+from app.api.paging import PAGE_MAX
 from app.audit import log as audit
 from app.channels import routing
 from app.connections import meta_assets, oauth_flow, registry, service
@@ -186,10 +187,13 @@ def _email_provisioning_out(c: InstanceConnection) -> EmailProvisioningOut:
 
 @router.get("", response_model=list[ConnectionOut])
 async def list_connections(
+    limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[ConnectionOut]:
     async with tenant_session(subject.admin_id) as s:
-        rows = await service.list_connections(s, subject.admin_id)
+        # Paged because knowledge_source connections are many per tenant (migration 0058).
+        rows = await service.list_connections(s, subject.admin_id, limit=limit, offset=offset)
         live_keys = await sync_jobs.live_keys_for(s, rows)
         return [_connection_out(c, live_keys) for c in rows]
 

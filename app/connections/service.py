@@ -239,7 +239,9 @@ async def _single_active(
     ).scalar_one_or_none()
 
 
-async def list_connections(session: AsyncSession, admin_id: uuid.UUID) -> list[InstanceConnection]:
+async def list_connections(
+    session: AsyncSession, admin_id: uuid.UUID, *, limit: int | None = None, offset: int = 0
+) -> list[InstanceConnection]:
     """The tenant's connections as Overview lists them: every row that is serving or
     reconnectable. Revoked rows are retained but not surfaced (§3.8.4), and a Luciel
     in its delete drain hides its ``quiescing`` rows the same way (round 7 phase 2,
@@ -249,20 +251,17 @@ async def list_connections(session: AsyncSession, admin_id: uuid.UUID) -> list[I
     status the moment the Luciel is restored. ``_single_active`` is deliberately NOT
     narrowed the same way: a re-attach during grace must still find the draining
     row, which ``uq_conn_active_type`` still counts as the type's single slot."""
-    return list(
-        (
-            await session.execute(
-                select(InstanceConnection)
-                .where(
-                    InstanceConnection.admin_id == admin_id,
-                    InstanceConnection.status.not_in(sorted(NOT_SERVING_STATUSES)),
-                )
-                .order_by(InstanceConnection.created_at)
-            )
+    statement = (
+        select(InstanceConnection)
+        .where(
+            InstanceConnection.admin_id == admin_id,
+            InstanceConnection.status.not_in(sorted(NOT_SERVING_STATUSES)),
         )
-        .scalars()
-        .all()
+        .order_by(InstanceConnection.created_at, InstanceConnection.connection_id)
     )
+    if limit is not None:
+        statement = statement.offset(offset).limit(limit)
+    return list((await session.execute(statement)).scalars().all())
 
 
 async def start_connection(

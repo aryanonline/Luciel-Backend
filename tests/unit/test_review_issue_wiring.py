@@ -89,6 +89,26 @@ def test_the_tracker_step_runs_after_the_gate_and_can_never_fail_the_rebuild():
     assert steps[tracker]["continue-on-error"] is True
 
 
+def test_the_weekly_tag_cannot_collide_on_the_immutable_repo():
+    """Run 39272257053 failed because `weekly-20261019` already existed: ECR tags are
+    immutable there, so a second run that day, or a re-run, needs a tag of its own."""
+    steps = _workflow("image-rebuild.yml")["jobs"]["rebuild"]["steps"]
+    build = next(s for s in steps if s.get("id") == "build")
+    assert "${{ github.run_id }}-${{ github.run_attempt }}" in build["run"]
+    assert 'TAG="weekly-' in build["run"]
+
+
+def test_the_audit_headings_outcome_is_the_audits_not_tees():
+    """The step's outcome becomes the issue's "pip-audit — **outcome**" heading. A `run:`
+    with no `shell:` is `bash -e`: without pipefail `pip-audit | tee` reports tee's exit."""
+    steps = _workflow("dependency-review.yml")["jobs"]["review"]["steps"]
+    audit = next(s for s in steps if s.get("id") == "audit")
+    assert "shell" not in audit
+    run = audit["run"]
+    assert "| tee audit.txt" in run
+    assert run.index("set -o pipefail") < run.index("pip-audit --strict")
+
+
 def test_the_review_reads_the_platform_children_not_the_multi_arch_tag():
     """describe-image-scan-findings on the index TAG always said ScanNotFoundException."""
     review = _workflow("dependency-review.yml")

@@ -7,6 +7,7 @@ take-over/hand-back mode transitions, escalations list, lead erase/prune/archive
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.db.session import tenant_session
@@ -362,6 +363,50 @@ async def test_take_over_then_hand_back(client):
     assert rt.json()["mode"] == "human_controlled"
     rh = await client.post(f"/api/v1/dashboard/conversations/{sid}/hand-back")
     assert rh.json()["mode"] == "ai"
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_transcript_pages_and_keeps_its_shape(client):
+    """WP-8 pagination audit: the transcript read was one unbounded query."""
+    admin = await _signup_verify_login(client)
+    _iid, sid, mid = await _seed_conversation(admin)
+    url = f"/api/v1/dashboard/conversations/{sid}/messages"
+    assert (await client.get(url, params={"limit": 1})).json()[0]["messageId"] == str(mid)
+    assert (await client.get(url, params={"limit": 1, "offset": 1})).json() == []
+    assert (await client.get(url, params={"limit": 501})).status_code == 422
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_transcript_past_the_page_ceiling_still_shows_its_newest_messages(client):
+    """The takeover view polls this route with no parameters: the customer's next message
+    must appear on a session past 500 rows, in order, and the cut must be readable."""
+    admin = await _signup_verify_login(client)
+    iid, sid, _mid = await _seed_conversation(admin)
+    start = datetime.now(UTC) - timedelta(days=30)
+    async with tenant_session(admin) as s:
+        for n in range(502):
+            s.add(
+                Transcript(
+                    admin_id=admin,
+                    instance_id=iid,
+                    session_id=sid,
+                    role="lead",
+                    text=f"message {n}",
+                    at=start + timedelta(minutes=n),
+                )
+            )
+    r = await client.get(f"/api/v1/dashboard/conversations/{sid}/messages")
+    assert r.status_code == 200
+    assert r.headers["X-Total-Count"] == "503"
+    texts = [m["text"] for m in r.json()]
+    assert len(texts) == 500
+    assert texts[-1] == "Our intro call is free."  # the seeded row is the newest: at = now()
+    assert texts[-2] == "message 501"
+    assert texts[0] == "message 3"
+    older = await client.get(
+        f"/api/v1/dashboard/conversations/{sid}/messages", params={"offset": 500}
+    )
+    assert [m["text"] for m in older.json()] == ["message 0", "message 1", "message 2"]
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")

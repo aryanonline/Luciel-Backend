@@ -16,7 +16,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -227,21 +227,47 @@ async def _store_graph(
     return id_by_canonical
 
 
-async def list_sources(session: AsyncSession, admin_id: uuid.UUID) -> list[KnowledgeSource]:
-    return list(
-        (
-            await session.execute(
-                select(KnowledgeSource)
-                .where(
-                    KnowledgeSource.admin_id == admin_id,
-                    KnowledgeSource.soft_deleted_at.is_(None),
-                )
-                .order_by(KnowledgeSource.created_at.desc())
-            )
+def _listed(include_removed_at_origin: bool) -> ColumnElement[bool]:
+    visible: ColumnElement[bool] = KnowledgeSource.soft_deleted_at.is_(None)
+    if include_removed_at_origin:
+        visible = or_(visible, KnowledgeSource.deleted_by == DELETED_BY_ORIGIN)
+    return visible
+
+
+async def list_sources(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    *,
+    include_removed_at_origin: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[KnowledgeSource]:
+    """Active sources, newest first; then, when asked, the ones a sync found gone at their
+    origin, most recently removed first. One query, so a page can span the two."""
+    statement = (
+        select(KnowledgeSource)
+        .where(KnowledgeSource.admin_id == admin_id, _listed(include_removed_at_origin))
+        .order_by(
+            KnowledgeSource.soft_deleted_at.is_not(None),
+            KnowledgeSource.soft_deleted_at.desc(),
+            KnowledgeSource.created_at.desc(),
+            KnowledgeSource.id.desc(),
         )
-        .scalars()
-        .all()
     )
+    if limit is not None:
+        statement = statement.offset(offset).limit(limit)
+    return list((await session.execute(statement)).scalars().all())
+
+
+async def count_listed_sources(session: AsyncSession, admin_id: uuid.UUID) -> int:
+    """How many rows the owner's list has in all, active and removed at origin."""
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(KnowledgeSource)
+            .where(KnowledgeSource.admin_id == admin_id, _listed(True))
+        )
+    ).scalar_one()
 
 
 async def sources_by_id(

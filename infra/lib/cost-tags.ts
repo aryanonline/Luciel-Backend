@@ -20,6 +20,7 @@
  * reads $0 — so the activation is part of shipping this, not an optional tidy-up.
  */
 import { Stack, Tags } from 'aws-cdk-lib';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
 import { EnvConfig } from './env-config';
 
 export const COST_TAG_ENVIRONMENT = 'Environment';
@@ -31,6 +32,21 @@ export function environmentCostFilter(envConfig: EnvConfig): string {
   // Explorer; the `$` separates key from value in a TagKeyValue filter term.
   return `user:${COST_TAG_ENVIRONMENT}$${envConfig.envName}`;
 }
+
+/**
+ * ECS does not copy a service's tags to its tasks unless asked, and Fargate bills the
+ * TASK, so without this a tag-filtered budget never sees Fargate however the tags are
+ * activated. Spread into every long-running FargateService. Applies to tasks started
+ * after the setting lands, so running tasks gain the tags at their next roll.
+ *
+ * The scheduled sweep tasks are left untagged on purpose: they run for minutes, and
+ * tagging at RunTask needs extra permissions on the EventBridge Scheduler role. Their
+ * Fargate spend stays outside the tag filter.
+ */
+export const SERVICE_TASK_TAGGING = {
+  propagateTags: ecs.PropagatedTagSource.SERVICE,
+  enableECSManagedTags: true,
+} as const;
 
 /** Stack-level tags; CloudFormation propagates them to every taggable resource. */
 export function applyCostAllocationTags(stack: Stack, envConfig: EnvConfig, component: string): void {
