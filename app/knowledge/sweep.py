@@ -397,7 +397,8 @@ async def _sync_one_connection(
                 failure=failure,
             )
     except sync.SyncStoppedByOwner:
-        assert job_started is not None  # raised only after the stamp
+        if job_started is None:  # raised only after the stamp
+            return False
         settled = sync_jobs.stopped(job_started)
     except Exception:  # noqa: BLE001 — one bad source must not stop the sweep
         logger.warning("knowledge_sync_failed provider=%s", conn.provider, exc_info=True)
@@ -406,7 +407,8 @@ async def _sync_one_connection(
         settled = sync_jobs.ended("error", job_started, error=sync_jobs.FAILED_GENERIC)
         # The transaction died, its commit included, so a stamp written inside it died too.
         stamped = False
-    assert job_started is not None  # every path without one has returned
+    if job_started is None:  # every path without one has returned
+        return False
     if settled.outcome == "stopped":
         # The owner removed the source mid-run: its savepoint unwound, nothing kept.
         logger.info("knowledge_sync_stopped_by_owner provider=%s", conn.provider)

@@ -699,7 +699,8 @@ async def trigger_sync(
     if outcome.deferred:
         return _accepted(outcome, connection_id)
     _raise_unless_synced(outcome)
-    assert outcome.result is not None  # _raise_unless_synced let only a synced job through
+    if outcome.result is None:  # _raise_unless_synced lets only a synced job through
+        raise service_unavailable(sync_jobs.FAILED_GENERIC)
     return SyncResultOut.model_validate(
         {**outcome.result.as_dict(), "halted": outcome.result.halted}
     )

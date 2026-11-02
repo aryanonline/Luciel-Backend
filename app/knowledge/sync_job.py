@@ -241,7 +241,8 @@ def job_is_live(
         return True
     if sync.sync_lock_k2(connection_id) in live_keys:
         return True
-    assert isinstance(record, dict)  # _says_syncing narrowed it
+    if not isinstance(record, dict):  # _says_syncing narrowed it
+        return False
     started = _parse(record.get("started_at"))
     grace = timedelta(seconds=get_settings().knowledge_sync_job_start_grace_seconds)
     return started is not None and (now or _now()) - started < grace
@@ -741,7 +742,8 @@ async def reconcile_in_transaction(
         else:
             settled = await settle(failure, stamp)
     else:
-        assert result is not None  # no failure: the sync returned
+        if result is None:  # no failure means the sync returned
+            raise RuntimeError("the sync ended with neither a result nor a failure")
         job = terminal_stamp(stamp, state=SYNCED, result=result.job_dict())
         # A halted run wrote nothing and compared nothing: its record says so (``result.
         # halted``), and its outcome word is not "synced".
