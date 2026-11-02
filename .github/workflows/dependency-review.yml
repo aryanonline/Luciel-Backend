@@ -63,6 +63,9 @@ jobs:
         id: audit
         continue-on-error: true
         run: |
+          # pipefail: a `run:` with no `shell:` is `bash -e`, so without it this step's
+          # outcome was tee's and the issue's heading read "success" over a failed audit.
+          set -o pipefail
           . .venv/bin/activate
           uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
           pip-audit --strict --desc -r /tmp/audit-reqs.txt 2>&1 | tee audit.txt

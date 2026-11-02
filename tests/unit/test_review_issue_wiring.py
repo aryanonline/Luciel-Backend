@@ -97,6 +97,17 @@ def test_the_weekly_tag_cannot_collide_on_the_immutable_repo():
     assert 'TAG="weekly-' in build["run"]
 
 
+def test_the_audit_headings_outcome_is_the_audits_not_tees():
+    """The step's outcome becomes the issue's "pip-audit — **outcome**" heading. A `run:`
+    with no `shell:` is `bash -e`: without pipefail `pip-audit | tee` reports tee's exit."""
+    steps = _workflow("dependency-review.yml")["jobs"]["review"]["steps"]
+    audit = next(s for s in steps if s.get("id") == "audit")
+    assert "shell" not in audit
+    run = audit["run"]
+    assert "| tee audit.txt" in run
+    assert run.index("set -o pipefail") < run.index("pip-audit --strict")
+
+
 def test_the_review_reads_the_platform_children_not_the_multi_arch_tag():
     """describe-image-scan-findings on the index TAG always said ScanNotFoundException."""
     review = _workflow("dependency-review.yml")
