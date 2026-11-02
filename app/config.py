@@ -605,9 +605,10 @@ class Settings(BaseSettings):
     # LLM graph call per page outlived it and the ALB's CORS-less 504 read as
     # "Network request failed." on a sync that was still working.
     knowledge_sync_inline_wait_seconds: float = 20.0
-    # A ``sync_job`` still reading "syncing" after this long is READ as failed (the
-    # process that ran it is gone — a deploy, a crash); the row is not rewritten.
-    knowledge_sync_job_stale_seconds: int = 900
+    # A job's lock (pg_locks) is what says it is alive; this covers the gap between the
+    # "syncing" stamp's commit and the job taking the lock. A "syncing" with no lock past
+    # this READS as failed (its process is gone); the row is not rewritten.
+    knowledge_sync_job_start_grace_seconds: int = 60
     # Retrieval relevance floor applied in live mode before a chunk is injected into the
     # prompt: an unrelated chunk is noise the model may answer from. Two rules, both
     # cosine DISTANCE: an absolute ceiling, and a band relative to the best hit. Mock

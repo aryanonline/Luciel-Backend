@@ -147,8 +147,8 @@ class SyncResultOut(WireModel):
     refused: list[str] = []
 
 
-#: ``SyncJobOut.state`` vocabulary. ``syncing`` — the job is running (a "syncing" older
-#: than ``knowledge_sync_job_stale_seconds`` is served as ``failed``); ``synced`` — it
+#: ``SyncJobOut.state`` vocabulary. ``syncing`` — the job is running (a "syncing" with no
+#: job behind it is served as ``failed``, interrupted); ``synced`` — it
 #: finished and ``result`` says what changed; ``failed`` — it ended without changing
 #: anything and ``error`` says why in the owner's words; ``shrink_pending`` — the
 #: source reported far fewer items than are synced, nothing was removed, and ``shrink``
@@ -180,7 +180,7 @@ class SyncJobOut(WireModel):
     @classmethod
     def from_record(cls, job: dict[str, Any] | None) -> SyncJobOut | None:
         """The wire view of an ``instance_connections.sync_job`` record already read
-        through ``app.knowledge.sync_job.effective_job`` (the stale rule). ``result``
+        through ``app.knowledge.sync_job.effective_job`` (liveness). ``result``
         carries the wire's four lists; the row keeps the rest of the pass."""
         if not job or not job.get("state"):
             return None

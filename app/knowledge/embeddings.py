@@ -96,6 +96,15 @@ def _retry_delay() -> float:
     return max(0.0, min(delay, ceiling))
 
 
+#: What the owner reads when the embedding provider is down: one sentence, served by the
+#: EmbeddingError handler (app.api.errors) and by the sync job (app.knowledge.sync_job).
+EMBEDDING_DOWN = (
+    "Your knowledge couldn't be indexed right now — the embedding provider "
+    "isn't answering. Nothing was saved; please try again in a few minutes."
+)
+EMBEDDING_RETRY_AFTER_SECONDS = 300
+
+
 class EmbeddingError(RuntimeError):
     """Embedding backend failure — surfaces as a failed ingestion/retrieval, never as
     a silent fallback to a different vector space (mixing spaces would corrupt every

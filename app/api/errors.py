@@ -174,7 +174,11 @@ def register_error_handlers(app: FastAPI) -> None:
     # "Network request failed." The write rolls back with the tenant session
     # (nothing half-indexed), the owner reads what actually happened, and the
     # operator is paged through the same metric the retrieval alarm watches.
-    from app.knowledge.embeddings import EmbeddingError  # noqa: PLC0415
+    from app.knowledge.embeddings import (  # noqa: PLC0415
+        EMBEDDING_DOWN,
+        EMBEDDING_RETRY_AFTER_SECONDS,
+        EmbeddingError,
+    )
     from app.observability.metrics import emit_metric  # noqa: PLC0415
 
     @app.exception_handler(EmbeddingError)
@@ -183,10 +187,7 @@ def register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=503,
             content={
-                "message": (
-                    "Your knowledge couldn't be indexed right now — the embedding provider "
-                    "isn't answering. Nothing was saved; please try again in a few minutes."
-                ),
-                "retryAfterSeconds": 300,
+                "message": EMBEDDING_DOWN,
+                "retryAfterSeconds": EMBEDDING_RETRY_AFTER_SECONDS,
             },
         )

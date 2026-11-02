@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import logging
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
@@ -39,6 +40,7 @@ from app.knowledge.graph_extract import (
     get_extractor,
 )
 from app.models.audit import ActorType
+from app.models.connection import InstanceConnection
 from app.models.instance import NON_SERVING_STATES, Instance
 from app.models.knowledge import KnowledgeSource
 
@@ -47,6 +49,95 @@ logger = logging.getLogger(__name__)
 #: ``SyncResult.halted`` when the Luciel stopped serving while the provider fetch was
 #: on the wire (paused or deleted meanwhile): the run ended before any write.
 HALTED_NOT_SERVING = "instance_not_serving"
+
+#: A connection in one of these states was taken away by the owner. A sync that finds
+#: one mid-run stops and keeps nothing (``SyncStoppedByOwner``); ``error``, ``connected``
+#: and the rest keep syncing, because the owner did not ask for anything to stop.
+REMOVED_STATUSES = frozenset({"not_connected", "revoked"})
+
+#: The advisory-lock namespace of "one reconcile per connection" (the first int4 key).
+SYNC_LOCK_K1 = zlib.crc32(b"knowledge_sync_job") - 2**31
+
+
+def sync_lock_k2(connection_id: uuid.UUID) -> int:
+    """The second int4 key: the connection. Derived in Python, like the sweeps' keys
+    (``hashtext`` is not stable across Postgres versions)."""
+    return int.from_bytes(connection_id.bytes[:4], "big") - 2**31
+
+
+async def claim_sync_lock(session: AsyncSession, connection_id: uuid.UUID) -> bool:
+    """Claim this connection's reconcile for the current transaction, or report it taken.
+
+    ``knowledge_sources`` has no unique (connection_id, external_id), so two overlapping
+    reconciles of one connection each ingest the pages the other has not committed and
+    leave duplicates. The lock is the database's own word on "a sync is running": it
+    dies with the transaction, on commit, rollback or a killed process, so an orphan
+    cannot exist. Reentrant inside one transaction. A lock FIRST taken inside a SAVEPOINT
+    is released when that savepoint rolls back, so a caller that must keep it past a
+    failed sync takes it before its savepoint."""
+    return bool(
+        (
+            await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(:k1, :k2)"),
+                {"k1": SYNC_LOCK_K1, "k2": sync_lock_k2(connection_id)},
+            )
+        ).scalar_one()
+    )
+
+
+async def live_sync_lock_keys(session: AsyncSession) -> frozenset[int]:
+    """The ``sync_lock_k2`` of every reconcile running right now, in this database.
+
+    ``pg_locks`` shows a two-key advisory lock as classid = k1, objid = k2, objsubid = 2,
+    each an unsigned ``oid`` holding the bits of the signed int4, so k1 is converted to
+    unsigned going in and every k2 back to signed coming out. Not tenant data: the keys
+    are bare integers and the caller only ever tests its own connection's."""
+    rows = await session.execute(
+        text(
+            "SELECT CAST(objid AS bigint) FROM pg_locks "
+            "WHERE locktype = 'advisory' AND objsubid = 2 AND granted "
+            "AND classid = CAST(CAST(:k1 AS bigint) AS oid) "
+            "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+        ),
+        {"k1": SYNC_LOCK_K1 & 0xFFFFFFFF},
+    )
+    return frozenset(
+        unsigned - 2**32 if unsigned >= 2**31 else unsigned for (unsigned,) in rows.all()
+    )
+
+
+class SyncAlreadyRunning(Exception):
+    """Another reconcile of this connection holds its lock; this one ran nothing."""
+
+
+class SyncStoppedByOwner(Exception):
+    """The owner removed the connection while this reconcile ran. The caller rolls back
+    to its savepoint, so nothing from the run is kept."""
+
+
+async def connection_removed(
+    session: AsyncSession, *, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> bool:
+    """Whether the owner has taken this connection away, read from the database.
+
+    A column select, not an entity load: under READ COMMITTED this sees a disconnect
+    another transaction committed a moment ago. A missing row is not "removed" here."""
+    status = (
+        await session.execute(
+            select(InstanceConnection.status).where(
+                InstanceConnection.admin_id == admin_id,
+                InstanceConnection.connection_id == connection_id,
+            )
+        )
+    ).scalar_one_or_none()
+    return status in REMOVED_STATUSES
+
+
+async def _stop_if_removed(
+    session: AsyncSession, *, admin_id: uuid.UUID, connection_id: uuid.UUID
+) -> None:
+    if await connection_removed(session, admin_id=admin_id, connection_id=connection_id):
+        raise SyncStoppedByOwner(str(connection_id))
 
 
 @dataclass
@@ -228,10 +319,22 @@ async def sync_connection(
     reconciles as usual. A run the owner started on a Luciel that was ALREADY paused
     (the manual Re-sync while preparing knowledge) proceeds as before: nothing
     changed under it.
+
+    One reconcile per connection (round 7 walk run 8): the advisory lock is the first
+    statement, whichever of the three callers started this, and a refusal raises
+    ``SyncAlreadyRunning`` having done nothing.
+
+    Removing a source stops its sync: the connection's status is re-read after the
+    snapshot, before each item's ingest and once more before returning. Not connected
+    or revoked raises ``SyncStoppedByOwner``; the caller's savepoint unwinds the run, so
+    no page lands after "no longer crawled".
     """
+    if not await claim_sync_lock(session, connection_id):
+        raise SyncAlreadyRunning(str(connection_id))
     result = SyncResult()
     serving_at_start = await _instance_serving(session, admin_id=admin_id, instance_id=instance_id)
     snapshot = await provider.snapshot(connection_id)
+    await _stop_if_removed(session, admin_id=admin_id, connection_id=connection_id)
     if serving_at_start and not await _instance_serving(
         session, admin_id=admin_id, instance_id=instance_id
     ):
@@ -314,6 +417,8 @@ async def sync_connection(
     # the page — so a synced page could grow past every limit unnoticed.
     for ext_id, item in remote_by_id.items():
         prior = existing_by_ext.get(ext_id)
+        if prior is None or prior.original_object_key != item.revision:
+            await _stop_if_removed(session, admin_id=admin_id, connection_id=connection_id)
         graph = _GraphPass(get_extractor())
         if prior is None:
             try:
@@ -413,6 +518,7 @@ async def sync_connection(
             "unreached": sorted(unreached),
         },
     )
+    await _stop_if_removed(session, admin_id=admin_id, connection_id=connection_id)
     return result
 
 

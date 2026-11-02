@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,7 +36,7 @@ from app.audit import log as audit
 from app.connections.secrets import get_secret_store
 from app.knowledge import service, sync
 from app.knowledge import sync_job as sync_jobs
-from app.knowledge.embeddings import EmbeddingError
+from app.knowledge.embeddings import EMBEDDING_DOWN, EmbeddingError
 from app.knowledge.providers import (
     CrawlUnreachable,
     ProviderUnavailable,
@@ -245,14 +246,49 @@ def _cadence_for(provider: str) -> timedelta:
     return CRAWL_CADENCE if provider == "website_crawl" else DELTA_CADENCE
 
 
+@dataclass(frozen=True)
+class PendingStamp:
+    """A connection's terminal stamp, waiting for the tenant's transaction to commit.
+    ``value`` None clears the record (a stopped job on a removed source)."""
+
+    connection_id: uuid.UUID
+    own_started_at: str
+    value: dict[str, Any] | None
+    outcome: str
+    started_monotonic: float
+
+
+async def write_pending_stamps(admin_id: uuid.UUID, stamps: list[PendingStamp]) -> None:
+    """Called right after the tenant's commit. Own short transactions, conditional on each
+    job's own ``started_at``, so a record cleared or superseded meanwhile is left alone."""
+    for pending in stamps:
+        await sync_jobs.stamp_with_retry(
+            admin_id, pending.connection_id, pending.value, pending.own_started_at
+        )
+        sync_jobs.record_job_outcome(
+            outcome=pending.outcome,
+            trigger=sync_jobs.TRIGGER_SCHEDULED,
+            started_monotonic=pending.started_monotonic,
+            result=(pending.value or {}).get("result"),
+        )
+
+
 async def sync_due_connections(
-    session: AsyncSession, *, admin_id: uuid.UUID, now: datetime | None = None
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    now: datetime | None = None,
+    pending_stamps: list[PendingStamp] | None = None,
 ) -> int:
     """Sync every due, CONNECTED knowledge connection for one tenant.
 
     Due-ness is the newest ``last_synced_at`` across the connection's live
     sources: absent (never synced through the sweep) counts as due. Returns the
     number of connections synced (the sweep log's "did anything happen").
+
+    ``pending_stamps`` collects the terminal stamps for ``write_pending_stamps``, which
+    the owner of the transaction runs after its commit (``sweeps.run_knowledge_sync``).
+    A caller that passes none writes none: the rows read interrupted once its locks go.
     """
     now = now or datetime.now(UTC)
     # A paused / mid-grace / deleted Luciel is not answering anyone (§3.6.2), so
@@ -299,9 +335,9 @@ async def sync_due_connections(
                 continue  # fresh enough under the origin's cadence
         # Round 7 walk run 8: the owner's manual sync is a job that may still be running
         # in the API process. Read the column fresh (a column select, never the
-        # identity-mapped row loaded at the start of this pass) and leave a fresh
-        # "syncing" alone this pass — two concurrent reconciles of one connection
-        # would race each other's writes.
+        # identity-mapped row loaded at the start of this pass) and leave a live job
+        # alone this pass — two concurrent reconciles of one connection would duplicate
+        # every new item. The same liveness as the manual start.
         current_job = (
             await session.execute(
                 select(InstanceConnection.sync_job).where(
@@ -310,41 +346,52 @@ async def sync_due_connections(
                 )
             )
         ).scalar_one_or_none()
-        if sync_jobs.is_fresh_syncing(current_job):
+        if await sync_jobs.record_is_live(session, conn.connection_id, current_job):
             logger.info(
                 "knowledge_sync_skipped_job_running provider=%s trigger=%s",
                 conn.provider,
                 (current_job or {}).get("trigger") if isinstance(current_job, dict) else "-",
             )
             continue
-        # The scheduled pass stamps the same job record (trigger "scheduled"). The
-        # "syncing" stamp is its own short transaction (this pass has not written the
-        # row yet, so it cannot wait on our own lock) so a manual start sees it; the
-        # terminal stamp goes through THIS session — a token refresh below writes the
-        # row and holds its lock until the pass commits.
+        # The lock outlives this connection's savepoint: it is released, with the data it
+        # guards, when the tenant's pass commits or rolls back.
+        if not await sync.claim_sync_lock(session, conn.connection_id):
+            logger.info("knowledge_sync_skipped_job_running provider=%s", conn.provider)
+            continue
+        # The scheduled pass stamps the same job record (trigger "scheduled"), in its own
+        # short transaction, so a manual start and the owner's row see it: only over the
+        # record judged dead above, and no stamp means no pass for this connection.
         job_started = sync_jobs.syncing_stamp(
             started_at=datetime.now(UTC), trigger=sync_jobs.TRIGGER_SCHEDULED
         )
         job_t0 = time.monotonic()
-        await sync_jobs.stamp_job(admin_id, conn.connection_id, job_started)
-        job_final: dict[str, Any] | None = None
-        job_outcome = "error"
+        if not await sync_jobs.stamp_syncing_if_unchanged(
+            admin_id, conn.connection_id, job_started, seen=current_job
+        ):
+            logger.warning("knowledge_sync_skipped_stamp_refused provider=%s", conn.provider)
+            continue
+        job_final: dict[str, Any] | None
+        job_outcome: str
         try:
             # Round 5B item 12: refresh the token at CALL time like every other
             # live consumer (calendar/CRM/outlook do this). Google tokens live
             # ~1h; the sync only worked because the schedule happened to run ten
             # minutes after the health sweep, and the manual Re-sync button had
             # no such luck. The refreshed token is persisted, so the provider's
-            # store read below picks it up.
+            # store read below picks it up. Its own short transaction: the row lock of
+            # a write here would otherwise last the tenant's whole pass, and a disconnect
+            # waiting on it could neither answer the owner nor stop this sync.
             from app.connections.refresh import ensure_fresh_access_token  # noqa: PLC0415
+            from app.db.session import tenant_session  # noqa: PLC0415 — avoids a db↔knowledge cycle
 
-            await ensure_fresh_access_token(
-                session,
-                admin_id,
-                conn.instance_id,
-                connection_type="knowledge_source",
-                connection_id=conn.connection_id,
-            )
+            async with tenant_session(admin_id) as refresh_session:
+                await ensure_fresh_access_token(
+                    refresh_session,
+                    admin_id,
+                    conn.instance_id,
+                    connection_type="knowledge_source",
+                    connection_id=conn.connection_id,
+                )
             # One SAVEPOINT per connection (round 7 WP-4c #3): a failure mid-sync
             # (embedder down, provider 500 on page 3, a DB error) used to leave the
             # already-flushed ``pending`` KnowledgeSource row — no chunks, never
@@ -374,6 +421,15 @@ async def sync_due_connections(
                     conn.provider,
                     len(result.refused),
                 )
+        except sync.SyncAlreadyRunning:
+            # This pass holds the lock, so only a caller that changed that lands here.
+            logger.info("knowledge_sync_skipped_job_running provider=%s", conn.provider)
+            continue
+        except sync.SyncStoppedByOwner:
+            # The owner removed the source mid-run: its savepoint unwound, nothing kept.
+            logger.info("knowledge_sync_stopped_by_owner provider=%s", conn.provider)
+            job_outcome = "stopped"
+            job_final = None
         except CrawlUnreachable as exc:
             # The site answered no page (maintenance 503, a bot wall's 403, a dead
             # host) — round 7 Phase 2 review, knowledge #2. A crawl holds no
@@ -454,31 +510,22 @@ async def sync_due_connections(
             logger.warning(
                 "knowledge_sync_failed provider=%s error=%s", conn.provider, type(exc).__name__
             )
-            job_outcome = "error"
+            embedding_down = isinstance(exc, EmbeddingError)
+            job_outcome = "embedding" if embedding_down else "error"
             job_final = sync_jobs.terminal_stamp(
                 job_started,
                 state=sync_jobs.FAILED,
-                error=(
-                    sync_jobs.EMBEDDING_DOWN
-                    if isinstance(exc, EmbeddingError)
-                    else sync_jobs.FAILED_GENERIC
-                ),
+                error=EMBEDDING_DOWN if embedding_down else sync_jobs.FAILED_GENERIC,
             )
-        finally:
-            await sync_jobs.stamp_job(
-                admin_id,
-                conn.connection_id,
-                job_final
-                or sync_jobs.terminal_stamp(
-                    job_started, state=sync_jobs.FAILED, error=sync_jobs.FAILED_GENERIC
-                ),
-                session=session,
-            )
-            sync_jobs.record_job_outcome(
-                outcome=job_outcome,
-                trigger=sync_jobs.TRIGGER_SCHEDULED,
-                started_monotonic=job_t0,
-                result=(job_final or {}).get("result"),
+        if pending_stamps is not None:
+            pending_stamps.append(
+                PendingStamp(
+                    connection_id=conn.connection_id,
+                    own_started_at=str(job_started["started_at"]),
+                    value=job_final,
+                    outcome=job_outcome,
+                    started_monotonic=job_t0,
+                )
             )
     # D10: the owner hears about a revoked connection on day 1 (what will stop, when)
     # and on day 7 (that it stopped) — once per incident, never silently.

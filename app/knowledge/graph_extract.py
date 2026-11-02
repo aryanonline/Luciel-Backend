@@ -61,10 +61,11 @@ class ExtractionResult:
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge]
     # True when the LLM pass was owed but deliberately not run (the tenant's per-minute
-    # budget was spoken for — see INGEST_HEADROOM_FRACTION): the result is grammar-only
-    # and the sync leaves the source's revision marker unbumped so the next pass
-    # re-extracts it. A pass that was never owed (a short source, the deterministic
-    # extractor) or that the model answered unusably is not "skipped".
+    # budget was spoken for — see INGEST_HEADROOM_FRACTION — or the cap refused the call):
+    # the result is grammar-only and the sync leaves the source's revision marker unbumped
+    # so the next pass re-extracts it. A pass that was never owed (a short source, the
+    # deterministic extractor) or that the model answered unusably is not "skipped": the
+    # same page would get the same answer, at one LLM call and one re-embed per pass.
     llm_skipped: bool = False
 
 
@@ -235,24 +236,22 @@ GRAPH_MAX_OUTPUT_TOKENS = 4096
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 #: Why an answer could not be read (the ``reason`` on ``graph_extract.llm_unparseable``).
-UnparseableReason = Literal["no_json_object", "json_error", "not_a_dict"]
+UnparseableReason = Literal["no_json_object", "json_error"]
 
 
 def graph_json(raw: str) -> tuple[dict[str, Any] | None, UnparseableReason | None]:
     """The model's JSON object (fence stripped, outermost ``{`` … ``}``) or why there is
     none: ``no_json_object`` (no braces at all), ``json_error`` (the span does not
-    decode — a truncated answer lands here too), ``not_a_dict``."""
+    decode — a truncated answer lands here too). A span that decodes is an object: it
+    starts at a ``{``."""
     body = _FENCE_RE.sub("", (raw or "").strip())
     start, end = body.find("{"), body.rfind("}")
     if start < 0 or end <= start:
         return None, "no_json_object"
     try:
-        data = json.loads(body[start : end + 1])
+        return json.loads(body[start : end + 1]), None
     except ValueError:
         return None, "json_error"
-    if not isinstance(data, dict):
-        return None, "not_a_dict"
-    return data, None
 
 
 def parse_llm_graph(raw: str) -> ExtractionResult | None:
@@ -395,24 +394,20 @@ class LlmGraphExtractor:
         parsed = parse_llm_graph(raw)
         if parsed is not None:
             return merge_results(base, parsed)
+        # An unusable answer is NOT a skip, truncated or not: the same page would earn it
+        # again next pass, so re-extracting would cost an LLM call and a re-embed on every
+        # sync and report the page "updated" with nothing changed. The grammar-only graph
+        # is kept and the revision marker bumps; the graph catches up when the page changes.
         if getattr(resp, "truncated", False):
-            # The answer hit the output ceiling mid-JSON. The same page would hit it
-            # again next pass, so this is NOT a skip: the grammar-only graph is kept
-            # and the revision marker bumps (no endless re-extract of a page that is
-            # simply too dense for the ceiling).
             usage = getattr(resp, "usage", None)
             log.warning(
                 "graph_extract.llm_truncated",
                 extra={"output_tokens": getattr(usage, "output_tokens", None)},
             )
             return base
-        # Any other unusable answer is treated like a budget skip (round 7 walk run 8):
-        # the grammar-only graph serves now and ``llm_skipped`` leaves the item's
-        # revision marker unbumped, so the next sync pass re-extracts it — it used to
-        # keep the grammar-only graph until the page's content happened to change.
         _data, reason = graph_json(raw)
         log.warning("graph_extract.llm_unparseable", extra={"reason": reason or "json_error"})
-        return replace(base, llm_skipped=True)
+        return base
 
 
 def ingest_has_headroom(admin_id: uuid.UUID) -> bool:

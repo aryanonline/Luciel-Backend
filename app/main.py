@@ -200,17 +200,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # The budget, inside the ECS stopTimeout of 60 s (infra/lib/compute-stack.ts):
+        # uvicorn's --timeout-graceful-shutdown 22 (a POST in its 20 s inline sync wait),
+        # then here 5 + 6 (sync jobs) + 10 (the poller) + 15 (background work) = 58.
         stop.set()
-        if poller is not None:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(poller, timeout=10)
-        # Round 7 walk run 8: a manual knowledge sync is a job in this process. Give the
-        # running ones a bounded moment, then cancel the rest — each stamps "interrupted
-        # by a restart" on its connection instead of reading "syncing" until stale.
+        # Round 7 walk run 8: a manual knowledge sync is a job in this process. FIRST: give
+        # the running ones a bounded moment, then cancel the rest — each stamps "interrupted
+        # by a restart" on its connection, whatever a slower step below does to the clock.
         from app.knowledge.sync_job import drain_sync_jobs  # noqa: PLC0415
 
         with contextlib.suppress(Exception):
-            await drain_sync_jobs(timeout=10)
+            await drain_sync_jobs()
+        if poller is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(poller, timeout=10)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(drain_background_work(), timeout=15)
 

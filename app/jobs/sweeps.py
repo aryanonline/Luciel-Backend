@@ -150,12 +150,14 @@ async def _per_tenant(
     kind: str,
     work: Callable[..., Awaitable[object]],
     now: datetime | None,
+    after_commit: Callable[[uuid.UUID], Awaitable[None]] | None = None,
 ) -> list[str]:
     """Run ``work`` for each candidate in its OWN tenant-scoped transaction.
 
     Returns the admin_ids where the work reported a change (truthy result), which is
     what the job log surfaces as "what this run actually did". A tenant another run
-    already holds is skipped rather than waited for (P2-7).
+    already holds is skipped rather than waited for (P2-7). ``after_commit`` runs once
+    the tenant's transaction has COMMITTED; a rolled-back pass never reaches it.
     """
     now = now or datetime.now(UTC)
     acted: list[str] = []
@@ -171,6 +173,8 @@ async def _per_tenant(
             logger.error("sweep_tenant_failed kind=%s admin_id=%s", kind, admin_id, exc_info=True)
             emit_metric("SweepTenantFailure", dimensions={"Sweep": kind})
             continue
+        if after_commit is not None:
+            await after_commit(admin_id)
         if result:
             acted.append(str(admin_id))
     return acted
@@ -390,12 +394,6 @@ async def run_mailbox_poll(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(MAILBOX_POLL, _poll_mailboxes, now)
 
 
-async def _sync_knowledge(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
-    from app.knowledge.sweep import sync_due_connections  # noqa: PLC0415 — lazy import
-
-    return await sync_due_connections(session, admin_id=admin_id, now=now)
-
-
 async def run_knowledge_sync(*, now: datetime | None = None) -> list[str]:
     """Re-sync due live-sync knowledge connections + re-crawl websites (§3.2.3).
 
@@ -403,8 +401,29 @@ async def run_knowledge_sync(*, now: datetime | None = None) -> list[str]:
     existed but was reachable only from the two MANUAL dashboard routes, so a
     "kept in sync" source was in truth synced exactly as often as the owner
     remembered to click. Cadence per origin: API-delta providers every 6h,
-    website crawl (full re-fetch + diff, the expensive one) every 24h."""
-    return await _per_tenant(KNOWLEDGE_SYNC, _sync_knowledge, now)
+    website crawl (full re-fetch + diff, the expensive one) every 24h.
+
+    The terminal stamps wait for the tenant's commit: until then the pass's data is
+    invisible and its locks are held, so "syncing" is the truth. Written after it, in
+    their own transaction, they hold no row lock over the rest of the pass; a rolled-back
+    pass writes none, and its rows read interrupted, which is also the truth."""
+    from app.knowledge.sweep import (  # noqa: PLC0415
+        PendingStamp,
+        sync_due_connections,
+        write_pending_stamps,
+    )
+
+    pending: dict[uuid.UUID, list[PendingStamp]] = {}
+
+    async def _sync_knowledge(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
+        return await sync_due_connections(
+            session, admin_id=admin_id, now=now, pending_stamps=pending.setdefault(admin_id, [])
+        )
+
+    async def _stamp_after_commit(admin_id: uuid.UUID) -> None:
+        await write_pending_stamps(admin_id, pending.pop(admin_id, []))
+
+    return await _per_tenant(KNOWLEDGE_SYNC, _sync_knowledge, now, after_commit=_stamp_after_commit)
 
 
 async def _deliver_billing_notices(

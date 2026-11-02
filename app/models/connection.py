@@ -64,6 +64,9 @@ class InstanceConnection(Base, TenantMixin, TimestampMixin):
     # The knowledge sync JOB (migration 0077, ``app.knowledge.sync_job``): the last
     # manual or scheduled sync's state — ``state`` (syncing | synced | failed |
     # shrink_pending), ``started_at``, ``finished_at``, ``result``, ``error``,
-    # ``shrink``, ``trigger``. Read through ``sync_job.effective_job`` (a "syncing"
-    # older than the stale window reads as failed). NULL on a row that never synced.
-    sync_job: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # ``shrink``, ``trigger``. Read through ``sync_job.effective_job`` (a "syncing" with
+    # no job behind it reads as failed). NULL on a row that never synced or was removed;
+    # none_as_null: a Python None must store SQL NULL, not the JSON value null.
+    sync_job: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )

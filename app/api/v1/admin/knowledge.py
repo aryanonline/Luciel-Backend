@@ -31,11 +31,11 @@ from app.connections.secrets import get_secret_store
 from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
 from app.knowledge import scope as knowledge_scope
-from app.knowledge import service, sync
+from app.knowledge import service
 from app.knowledge import sync_job as sync_jobs
+from app.knowledge.embeddings import EMBEDDING_RETRY_AFTER_SECONDS
 from app.knowledge.parsers import ParseError, parse_file
 from app.knowledge.providers import (
-    CrawlUnreachable,
     HttpTransport,
     OAuthExchangeError,
     ProviderUnavailable,
@@ -248,96 +248,129 @@ async def restore_source(
         return _source_out(src, used.get(src.id, 0))
 
 
-# The dead-credential / unreachable-site bookkeeping moved beside the sync job that
-# also runs it (round 7 walk run 8); the names here are unchanged for resync_source.
-_flag_dead_credential = sync_jobs.flag_dead_credential
-_flag_unreachable_site = sync_jobs.flag_unreachable_site
+async def _start_job(
+    subject: Subject, connection_id: uuid.UUID, *, confirm_shrink: bool
+) -> sync_jobs.JobOutcome:
+    """Start the connection's sync job for a manual route; a refusal becomes its 404 / 409."""
+    try:
+        return await sync_jobs.start_sync_job(
+            admin_id=subject.admin_id,
+            connection_id=connection_id,
+            allow_shrink=confirm_shrink,
+            actor_user_id=subject.user_id,
+            # Resolved HERE, at call time, so the module-level seam stays patchable.
+            provider_factory=provider_for_connection,
+        )
+    except sync_jobs.SyncJobRefused as exc:
+        raise (not_found if exc.kind == "not_found" else conflict)(exc.message) from exc
 
 
-@router.post("/sources/{source_id}/resync", response_model=KnowledgeSourceOut)
+def _accepted(outcome: sync_jobs.JobOutcome, connection_id: uuid.UUID) -> JSONResponse:
+    """The 202: the job is still running; the connection's ``syncJob`` carries its outcome."""
+    # The syncing stamp always carries a state; read it straight into the 202 shape.
+    running = SyncJobOut.from_record(outcome.job) or SyncJobOut(state="syncing")
+    accepted = SyncJobAcceptedOut(**running.model_dump(), connection_id=connection_id)
+    return JSONResponse(status_code=202, content=accepted.model_dump(mode="json", by_alias=True))
+
+
+def _raise_unless_synced(outcome: sync_jobs.JobOutcome) -> None:
+    """A job that finished inside the inline wait without syncing answers as it always did."""
+    if outcome.outcome == "synced" and outcome.result is not None:
+        return
+    message = str(outcome.job.get("error") or sync_jobs.FAILED_GENERIC)
+    if outcome.outcome in (
+        "shrink_pending",
+        "unreachable",
+        "dead_credential",
+        "stopped",
+        "already_running",
+    ):
+        # Nothing was deleted (F107) / the site answered no page / no usable credential /
+        # the owner removed the source mid-run / another run held the connection: a 409 in
+        # the owner's words, the bookkeeping already written by the job.
+        raise conflict(message)
+    if outcome.outcome == "embedding":
+        # The same 503 the EmbeddingError handler serves on every other ingest path.
+        raise ApiError(503, message, EMBEDDING_RETRY_AFTER_SECONDS)
+    # Any other failure used to escape as a bare 500 (no CORS headers on that path, so the
+    # dashboard read "Network request failed."). The sync's work unwound, nothing changed.
+    # A 503 here is a real failure: the frontend's still-syncing branch keys on its own
+    # marker, never on the status.
+    raise service_unavailable(message)
+
+
+@router.post(
+    "/sources/{source_id}/resync",
+    response_model=KnowledgeSourceOut,
+    responses={
+        202: {
+            "model": SyncJobAcceptedOut,
+            "description": (
+                "The sync is still running after the inline wait; the connection's "
+                "syncJob carries its outcome."
+            ),
+        }
+    },
+)
 async def resync_source(
     source_id: uuid.UUID,
     subject: Subject = Depends(current_admin),
     confirm_shrink: bool = Query(False, alias="confirmShrink"),
-) -> KnowledgeSourceOut:
+) -> KnowledgeSourceOut | JSONResponse:
     """Manual re-sync (Architecture §3.2.3: "the Admin can ... trigger a manual
     re-sync"). For a live-sync source this actually re-pulls via the source's
     connector's ``SyncProvider`` (not just a last_synced_at stamp) — the whole
     connection's scope is reconciled (add/update/remove) so a manual resync behaves
     identically to the scheduled sync worker. For a one-time source (upload/paste/
     csv, no connection_id) this is a no-op refresh: there's nothing to re-pull.
-    """
-    dead_connection: uuid.UUID | None = None
-    try:
-        async with tenant_session(subject.admin_id) as s:
-            src = (
-                await s.execute(
-                    select(KnowledgeSource).where(
-                        KnowledgeSource.admin_id == subject.admin_id,
-                        KnowledgeSource.id == source_id,
-                    )
+
+    A connection-backed re-sync is the connection's sync JOB, like
+    POST /sync-connections/{id}/sync: the refreshed source when it finishes inside the
+    inline wait, 202 ``SyncJobAcceptedOut`` when it is still running, 409 when one
+    already is. It reconciles the whole connection, so it is exactly as long as that."""
+    async with tenant_session(subject.admin_id) as s:
+        src = (
+            await s.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == subject.admin_id,
+                    KnowledgeSource.id == source_id,
                 )
-            ).scalar_one_or_none()
-            if src is None:
-                raise not_found("Source not found.")
-            if src.connection_id is not None:
-                conn = (
-                    await s.execute(
-                        select(InstanceConnection).where(
-                            InstanceConnection.admin_id == subject.admin_id,
-                            InstanceConnection.connection_id == src.connection_id,
-                        )
-                    )
-                ).scalar_one_or_none()
-                if conn is None:
-                    raise not_found("Connection not found.")
-                dead_connection = conn.connection_id
-                provider = provider_for_connection(conn, get_secret_store())
-                try:
-                    await sync.sync_connection(
-                        s,
-                        admin_id=subject.admin_id,
-                        instance_id=src.instance_id,
-                        connection_id=conn.connection_id,
-                        origin=_PROVIDER_TO_ORIGIN.get(conn.provider, conn.provider),
-                        provider=provider,
-                        allow_shrink=confirm_shrink,
-                    )
-                except sync.SnapshotShrunk as exc:
-                    # Nothing was deleted (F107); the owner confirms with ?confirmShrink=true.
-                    raise conflict(
-                        f"The source now reports {exc.remote} item(s) where {exc.existing} are "
-                        "synced, so nothing was removed. If you did remove them at the source, "
-                        "sync again and confirm the shrink."
-                    ) from exc
-                refreshed = (
-                    await s.execute(
-                        select(KnowledgeSource).where(
-                            KnowledgeSource.admin_id == subject.admin_id,
-                            KnowledgeSource.id == source_id,
-                        )
-                    )
-                ).scalar_one_or_none()
-                if refreshed is None:
-                    # The source itself was removed by the sync (deleted at origin) —
-                    # honest 404 rather than fabricating a stale response (§3.2.3).
-                    raise not_found("Source no longer exists at the sync origin.")
-                return _source_out(refreshed)
+            )
+        ).scalar_one_or_none()
+        if src is None:
+            raise not_found("Source not found.")
+        connection_id = src.connection_id
+        if connection_id is None:
             # One-time ingest: no connector to re-pull from; nothing to do.
             return _source_out(src)
-    except CrawlUnreachable as exc:
-        # The site answered no page: a failed sync, not a dead credential.
-        if dead_connection is not None:
-            await _flag_unreachable_site(subject.admin_id, dead_connection)
-        raise conflict(f"Sync unavailable: {exc}") from exc
-    except ProviderUnavailable as exc:
-        # Same clean-error rule as trigger_sync: a revoked/expired/never-connected
-        # credential surfaces a structured 409, never a crash. Caught OUTSIDE the
-        # request transaction (which the 409 unwinds) so the pause + the honest
-        # connection state land in their own (round 7 WP-4c #7).
-        if dead_connection is not None:
-            await _flag_dead_credential(subject.admin_id, dead_connection)
-        raise conflict(f"Sync unavailable: {exc}") from exc
+        known = (
+            await s.execute(
+                select(InstanceConnection.connection_id).where(
+                    InstanceConnection.admin_id == subject.admin_id,
+                    InstanceConnection.connection_id == connection_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if known is None:
+            raise not_found("Connection not found.")
+    outcome = await _start_job(subject, connection_id, confirm_shrink=confirm_shrink)
+    if outcome.deferred:
+        return _accepted(outcome, connection_id)
+    _raise_unless_synced(outcome)
+    async with tenant_session(subject.admin_id) as s:
+        refreshed = (
+            await s.execute(
+                select(KnowledgeSource).where(
+                    KnowledgeSource.admin_id == subject.admin_id,
+                    KnowledgeSource.id == source_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if refreshed is None:
+            # The source itself was removed by the sync (deleted at origin) —
+            # honest 404 rather than fabricating a stale response (§3.2.3).
+            raise not_found("Source no longer exists at the sync origin.")
+        return _source_out(refreshed)
 
 
 @router.put("/sources/{source_id}", response_model=KnowledgeSourceOut)
@@ -497,7 +530,9 @@ async def ingest_csv(
 
 
 # --- live-sync connectors (§3.2.3): create + list + trigger --------------------- #
-def _sync_connection_out(c: InstanceConnection) -> SyncConnectionOut:
+def _sync_connection_out(
+    c: InstanceConnection, live_keys: frozenset[int] = frozenset()
+) -> SyncConnectionOut:
     return SyncConnectionOut.model_validate(
         {
             "connectionId": c.connection_id,
@@ -505,7 +540,7 @@ def _sync_connection_out(c: InstanceConnection) -> SyncConnectionOut:
             "status": c.status,
             "nonSecretConfig": c.non_secret_config,
             "statusDetail": c.status_detail,
-            "syncJob": SyncJobOut.from_record(sync_jobs.effective_job(c)),
+            "syncJob": SyncJobOut.from_record(sync_jobs.effective_job(c, live_keys)),
         }
     )
 
@@ -529,7 +564,8 @@ async def list_sync_connections(
             .scalars()
             .all()
         )
-        return [_sync_connection_out(c) for c in rows]
+        live_keys = await sync_jobs.live_keys_for(s, rows)
+        return [_sync_connection_out(c, live_keys) for c in rows]
 
 
 @router.post("/sync-connections", response_model=SyncConnectionOut, status_code=201)
@@ -583,6 +619,7 @@ async def create_sync_connection(
                     old_status = row.status
                     row.status = "connected"
                     row.status_detail = None
+                    await sync_jobs.clear_job_on_reconnect(s, row)
                     await s.flush()
                     await audit.emit(
                         s,
@@ -599,7 +636,7 @@ async def create_sync_connection(
                         },
                     )
                 response.status_code = 200
-                return _sync_connection_out(row)
+                return _sync_connection_out(row, await sync_jobs.live_keys_for(s, [row]))
         connection, _result = await connections_service.start_connection(
             s,
             admin_id=subject.admin_id,
@@ -650,41 +687,12 @@ async def trigger_sync(
     / a dead credential. One still running answers 202 ``SyncJobAcceptedOut``; its
     outcome lands on the connection's ``syncJob`` (GET /sync-connections,
     GET /connections). A second start while one is running is a 409."""
-    try:
-        outcome = await sync_jobs.start_sync_job(
-            admin_id=subject.admin_id,
-            connection_id=connection_id,
-            allow_shrink=confirm_shrink,
-            actor_user_id=subject.user_id,
-            # Resolved HERE, at call time, so the module-level seam stays patchable.
-            provider_factory=provider_for_connection,
-        )
-    except sync_jobs.SyncJobRefused as exc:
-        raise (not_found if exc.kind == "not_found" else conflict)(exc.message) from exc
+    outcome = await _start_job(subject, connection_id, confirm_shrink=confirm_shrink)
     if outcome.deferred:
-        # The syncing stamp always carries a state; read it straight into the 202 shape.
-        running = SyncJobOut.from_record(outcome.job) or SyncJobOut(state="syncing")
-        accepted = SyncJobAcceptedOut(**running.model_dump(), connection_id=connection_id)
-        return JSONResponse(
-            status_code=202, content=accepted.model_dump(mode="json", by_alias=True)
-        )
-    job = outcome.job
-    message = str(job.get("error") or sync_jobs.FAILED_GENERIC)
-    if outcome.outcome == "synced" and outcome.result is not None:
-        return SyncResultOut.model_validate(outcome.result.as_dict())
-    if outcome.outcome in ("shrink_pending", "unreachable", "dead_credential"):
-        # Nothing was deleted (F107) / the site answered no page / no usable
-        # credential: the same 409 bodies the owner always saw, the bookkeeping
-        # already written by the job in its own transactions.
-        raise conflict(message)
-    if outcome.outcome == "embedding":
-        # The same 503 the EmbeddingError handler serves on every other ingest path.
-        raise ApiError(503, message, sync_jobs.EMBEDDING_RETRY_AFTER_SECONDS)
-    # Any other failure used to escape as a bare 500 (no CORS headers on that path, so
-    # the dashboard read "Network request failed."). The sync's transaction unwound,
-    # nothing changed: a 503 with the owner's words (app.api.errors.service_unavailable
-    # — the frontend maps it to server_error, as it did the 500).
-    raise service_unavailable(message)
+        return _accepted(outcome, connection_id)
+    _raise_unless_synced(outcome)
+    assert outcome.result is not None  # _raise_unless_synced let only a synced job through
+    return SyncResultOut.model_validate(outcome.result.as_dict())
 
 
 # --- knowledge SCOPE selection (Decision #9) ------------------------------------ #
@@ -926,6 +934,7 @@ async def oauth_callback(
         old_status = conn.status
         conn.status = "connected"
         conn.status_detail = None
+        await sync_jobs.clear_job_on_reconnect(s, conn)
         if verify_updates:
             cfg = dict(conn.non_secret_config or {})
             cfg.update(verify_updates)
@@ -945,4 +954,4 @@ async def oauth_callback(
                 "reason": "oauth_callback_token_exchanged",
             },
         )
-        return _sync_connection_out(conn)
+        return _sync_connection_out(conn, await sync_jobs.live_keys_for(s, [conn]))
