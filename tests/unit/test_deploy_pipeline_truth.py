@@ -242,6 +242,16 @@ def test_every_deploy_runs_the_edge_check_and_a_failure_rolls_back(job: str) -> 
     assert "steps.smoke.outcome == 'failure'" in condition
 
 
+def test_no_message_tells_the_operator_to_deploy_dev_first() -> None:
+    """Deploying dev first deletes the public records hours before prod can create them
+    (the D6 handover rule): the refusal must not advise exactly that."""
+    assert "deploy dev first" not in "\n".join(
+        _run(step)
+        for job in _jobs().values()
+        for step in job.get("steps", [])  # type: ignore[union-attr]
+    )
+
+
 def test_d10_runs_the_seedtest_gate_strictly_after_every_live_dev_deploy() -> None:
     steps = _steps("dev")
     seedtest_at = _index(steps, step_id="seedtest")

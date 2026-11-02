@@ -405,7 +405,7 @@ jobs:
         run: |
           npm ci
           if [ "$(npx ts-node --prefer-ts-exts bin/hostnames.ts prod servesUnownedPublicNames)" != "false" ]; then
-            echo "::error::prod's hostnames are the public names but env-config.ts gives ownsPublicApex to another environment — flip both flags in one commit and deploy dev first (D6 cutover)."
+            echo "::error::prod's hostnames are the public names but env-config.ts gives ownsPublicApex to another environment. The cutover is a handover of the records and the CloudFront alias, run from its own runbook (see the comment on this step); do not flip the flags without it."
             exit 1
           fi
           npx ts-node --prefer-ts-exts bin/hostnames.ts prod
