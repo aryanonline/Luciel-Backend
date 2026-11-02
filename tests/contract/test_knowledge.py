@@ -54,6 +54,7 @@ async def test_the_source_list_pages_and_keeps_its_shape(client):
     assert too_many.status_code == 422
 
 
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_paste_while_the_embedder_is_down_is_an_honest_503_and_saves_nothing(
     client, monkeypatch, capsys
 ):
