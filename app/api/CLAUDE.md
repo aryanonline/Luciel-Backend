@@ -13,6 +13,12 @@ Defines FastAPI v1 routes, dependencies, error behavior, and the control/data-pl
 - Keep dashboard/admin routes cookie-authenticated and widget routes free of ambient cookie authority.
 - Verify provider signatures before tenant lookup and before runtime work.
 - Add every intentional route to the frozen route registry test.
+- `/docs`, `/redoc` and `/openapi.json` are served only when `settings.environment` is
+  `LOCAL_ENVIRONMENT` (`development`, the unset default); deployed tasks get dev, preprod
+  or prod and answer 404. `app.openapi()` keeps working in tests in either mode.
+- An array-returning GET takes `limit` (ceiling `PAGE_MAX`, `paging.py`) and `offset`, or
+  names why not in `tests/unit/test_list_endpoints_bounded.py`. A list the dashboard reads
+  whole defaults to the ceiling, so it is cut only past 500 rows until the client pages.
 
 ## Testing pointers
 - `tests/contract/` for wire contracts and public flows.

@@ -113,7 +113,7 @@ export const MAX_CONDITION_VALUES_PER_RULE = 5;
  * never dropped (the 2026-09-05 F067 rule).
  */
 export const LISTENER_RULE_PRIORITY = {
-  /** App hostnames → the web target group (WebStack) / HTTP→HTTPS redirect (here). */
+  /** App hostnames → the web target group (WebStack). */
   appHost: 5,
   /** First of the api-host control-plane path rules (20, 21, ...). */
   controlPlane: 20,
