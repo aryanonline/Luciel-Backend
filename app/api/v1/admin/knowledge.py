@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
+from app.api.paging import PAGE_MAX
 from app.audit import log as audit
 from app.connections import oauth_flow, registry
 from app.connections import service as connections_service
@@ -147,31 +148,22 @@ async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
 
 # --- frozen contract methods ------------------------------------------------ #
 @router.get("/sources", response_model=list[KnowledgeSourceOut])
-async def list_sources(subject: Subject = Depends(current_admin)) -> list[KnowledgeSourceOut]:
+async def list_sources(
+    limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
+    subject: Subject = Depends(current_admin),
+) -> list[KnowledgeSourceOut]:
     async with tenant_session(subject.admin_id) as s:
-        sources = await service.list_sources(s, subject.admin_id)
         # Round 7 M10: a source the sync found GONE at its origin is listed (with
         # ``deletedBy: "origin"``) until the retention pass purges it, so the owner
         # reads "removed at its source — not restorable" on the list itself instead of
         # discovering it through a failed restore. Owner-deleted tombstones stay off
         # the list (their undo lives on the delete confirmation, unchanged).
-        removed_at_origin = (
-            (
-                await s.execute(
-                    select(KnowledgeSource)
-                    .where(
-                        KnowledgeSource.admin_id == subject.admin_id,
-                        KnowledgeSource.soft_deleted_at.is_not(None),
-                        KnowledgeSource.deleted_by == service.DELETED_BY_ORIGIN,
-                    )
-                    .order_by(KnowledgeSource.soft_deleted_at.desc())
-                )
-            )
-            .scalars()
-            .all()
+        sources = await service.list_sources(
+            s, subject.admin_id, include_removed_at_origin=True, limit=limit, offset=offset
         )
         used = await _used_by_questions_7d(s, subject.admin_id)
-        return [_source_out(x, used.get(x.id, 0)) for x in [*sources, *removed_at_origin]]
+        return [_source_out(x, used.get(x.id, 0)) for x in sources]
 
 
 @router.get("/sources/{source_id}/chunks", response_model=KnowledgeChunkPageOut)
@@ -546,18 +538,25 @@ def _sync_connection_out(c: InstanceConnection) -> SyncConnectionOut:
 
 @router.get("/sync-connections", response_model=list[SyncConnectionOut])
 async def list_sync_connections(
+    limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[SyncConnectionOut]:
-    """All non-revoked knowledge_source connections for this tenant (§3.2.3/§3.8)."""
+    """Non-revoked knowledge_source connections for this tenant (§3.2.3/§3.8), paged.
+    Migration 0058 lets a tenant hold many, so the type's unique index no longer caps them."""
     async with tenant_session(subject.admin_id) as s:
         rows = (
             (
                 await s.execute(
-                    select(InstanceConnection).where(
+                    select(InstanceConnection)
+                    .where(
                         InstanceConnection.admin_id == subject.admin_id,
                         InstanceConnection.connection_type == "knowledge_source",
                         InstanceConnection.status != "revoked",
                     )
+                    .order_by(InstanceConnection.connection_id)
+                    .offset(offset)
+                    .limit(limit)
                 )
             )
             .scalars()

@@ -365,6 +365,17 @@ async def test_take_over_then_hand_back(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_transcript_pages_and_keeps_its_shape(client):
+    """WP-8 pagination audit: the transcript read was one unbounded query."""
+    admin = await _signup_verify_login(client)
+    _iid, sid, mid = await _seed_conversation(admin)
+    url = f"/api/v1/dashboard/conversations/{sid}/messages"
+    assert (await client.get(url, params={"limit": 1})).json()[0]["messageId"] == str(mid)
+    assert (await client.get(url, params={"limit": 1, "offset": 1})).json() == []
+    assert (await client.get(url, params={"limit": 501})).status_code == 422
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_human_reply_requires_takeover_first(client):
     """§3.4.12: outside human_controlled, Luciel owns the reply. Letting the admin
     interleave would make the transcript lie about who is speaking."""

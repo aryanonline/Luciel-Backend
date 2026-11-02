@@ -227,21 +227,32 @@ async def _store_graph(
     return id_by_canonical
 
 
-async def list_sources(session: AsyncSession, admin_id: uuid.UUID) -> list[KnowledgeSource]:
-    return list(
-        (
-            await session.execute(
-                select(KnowledgeSource)
-                .where(
-                    KnowledgeSource.admin_id == admin_id,
-                    KnowledgeSource.soft_deleted_at.is_(None),
-                )
-                .order_by(KnowledgeSource.created_at.desc())
-            )
+async def list_sources(
+    session: AsyncSession,
+    admin_id: uuid.UUID,
+    *,
+    include_removed_at_origin: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[KnowledgeSource]:
+    """Active sources, newest first; then, when asked, the ones a sync found gone at their
+    origin, most recently removed first. One query, so a page can span the two."""
+    visible = KnowledgeSource.soft_deleted_at.is_(None)
+    if include_removed_at_origin:
+        visible = or_(visible, KnowledgeSource.deleted_by == DELETED_BY_ORIGIN)
+    statement = (
+        select(KnowledgeSource)
+        .where(KnowledgeSource.admin_id == admin_id, visible)
+        .order_by(
+            KnowledgeSource.soft_deleted_at.is_not(None),
+            KnowledgeSource.soft_deleted_at.desc(),
+            KnowledgeSource.created_at.desc(),
+            KnowledgeSource.id.desc(),
         )
-        .scalars()
-        .all()
     )
+    if limit is not None:
+        statement = statement.offset(offset).limit(limit)
+    return list((await session.execute(statement)).scalars().all())
 
 
 async def sources_by_id(

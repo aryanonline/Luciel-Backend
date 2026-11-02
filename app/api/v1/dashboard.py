@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import ApiError, conflict, not_found, service_unavailable, validation_error
+from app.api.paging import PAGE_DEFAULT, PAGE_MAX
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
@@ -64,13 +65,6 @@ router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
 
 # --- conversations ------------------------------------------------------------ #
-# 2026-09-05 audit WP7: every list endpoint is bounded. The defaults keep the
-# existing clients whole (they never asked for more than a page fits); the cap
-# stops one tenant's history from being one unbounded query.
-PAGE_DEFAULT = 200
-PAGE_MAX = 500
-
-
 def _page(limit: int, offset: int) -> tuple[int, int]:
     return max(1, min(limit, PAGE_MAX)), max(0, offset)
 
@@ -190,9 +184,14 @@ async def _require_session(
 
 @router.get("/conversations/{session_id}/messages", response_model=list[MessageOut])
 async def get_messages(
-    session_id: uuid.UUID, subject: Subject = Depends(current_admin)
+    session_id: uuid.UUID,
+    limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
+    offset: int = Query(0, ge=0),
+    subject: Subject = Depends(current_admin),
 ) -> list[MessageOut]:
-    """The full transcript for one session (§3.4.6 within-session memory).
+    """One session's transcript, oldest first, paged (§3.4.6 within-session memory).
+
+    A transcript longer than PAGE_MAX needs ``offset`` to reach its later messages.
 
     Sessions past the 90-day hot boundary (Commitment #38) have no Transcript rows —
     their transcript moved to S3 cold storage. The read-through below serves those
@@ -208,7 +207,9 @@ async def get_messages(
                         Transcript.admin_id == subject.admin_id,
                         Transcript.session_id == session_id,
                     )
-                    .order_by(Transcript.at.asc())
+                    .order_by(Transcript.at.asc(), Transcript.id.asc())
+                    .offset(offset)
+                    .limit(limit)
                 )
             )
             .scalars()
@@ -216,7 +217,7 @@ async def get_messages(
         )
         if not rows and sess.archive_object_key:
             archived = await _archived_rows(s, admin_id=subject.admin_id, session_id=session_id)
-            return [_archived_message_out(r) for r in archived]
+            return [_archived_message_out(r) for r in archived[offset : offset + limit]]
         return [_message_out(r) for r in rows]
 
 

@@ -37,6 +37,23 @@ async def test_quota_shape(client):
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_the_source_list_pages_and_keeps_its_shape(client, monkeypatch):
+    """WP-8 pagination audit: the list was one unbounded query."""
+    await _ready_account_with_luciel(client)
+    for name in ("Hours", "Parking"):
+        r = await client.post(
+            "/api/v1/admin/knowledge/sources/paste",
+            json={"name": name, "text": f"{name} are listed on the website."},
+        )
+        assert r.status_code < 300, r.text
+    assert len((await client.get("/api/v1/admin/knowledge/sources")).json()) == 2
+    newest = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 1})
+    older = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 1, "offset": 1})
+    assert [s["name"] for s in newest.json() + older.json()] == ["Parking", "Hours"]
+    too_many = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 501})
+    assert too_many.status_code == 422
+
+
 async def test_paste_while_the_embedder_is_down_is_an_honest_503_and_saves_nothing(
     client, monkeypatch, capsys
 ):
