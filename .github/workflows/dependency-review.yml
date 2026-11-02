@@ -64,7 +64,9 @@ jobs:
         continue-on-error: true
         run: |
           # pipefail: a `run:` with no `shell:` is `bash -e`, so without it this step's
-          # outcome was tee's and the issue's heading read "success" over a failed audit.
+          # outcome is tee's and the heading built from it says "success" over a failed
+          # audit (run 41289873330 found 7 vulnerabilities and logged success; its post
+          # step failed on the poster's gh flags, so that heading never reached an issue).
           set -o pipefail
           . .venv/bin/activate
           uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
