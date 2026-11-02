@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.errors import register_error_handlers
+from app.api.paging import TOTAL_COUNT_HEADER
 from app.config import LOCAL_ENVIRONMENT, get_settings
 from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
 from app.knowledge.pgvector import installed_version as _pgvector_installed_version
@@ -105,6 +106,7 @@ class PlaneAwareCORS:
             # credential-safe. Origin is still strictly allow-listed
             # (dashboard_origins), so this does not broaden origin access.
             allow_headers=["*"],
+            expose_headers=[TOTAL_COUNT_HEADER],
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

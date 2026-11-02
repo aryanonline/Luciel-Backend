@@ -227,6 +227,13 @@ async def _store_graph(
     return id_by_canonical
 
 
+def _listed(include_removed_at_origin: bool) -> ColumnElement[bool]:
+    visible: ColumnElement[bool] = KnowledgeSource.soft_deleted_at.is_(None)
+    if include_removed_at_origin:
+        visible = or_(visible, KnowledgeSource.deleted_by == DELETED_BY_ORIGIN)
+    return visible
+
+
 async def list_sources(
     session: AsyncSession,
     admin_id: uuid.UUID,
@@ -237,12 +244,9 @@ async def list_sources(
 ) -> list[KnowledgeSource]:
     """Active sources, newest first; then, when asked, the ones a sync found gone at their
     origin, most recently removed first. One query, so a page can span the two."""
-    visible: ColumnElement[bool] = KnowledgeSource.soft_deleted_at.is_(None)
-    if include_removed_at_origin:
-        visible = or_(visible, KnowledgeSource.deleted_by == DELETED_BY_ORIGIN)
     statement = (
         select(KnowledgeSource)
-        .where(KnowledgeSource.admin_id == admin_id, visible)
+        .where(KnowledgeSource.admin_id == admin_id, _listed(include_removed_at_origin))
         .order_by(
             KnowledgeSource.soft_deleted_at.is_not(None),
             KnowledgeSource.soft_deleted_at.desc(),
@@ -253,6 +257,17 @@ async def list_sources(
     if limit is not None:
         statement = statement.offset(offset).limit(limit)
     return list((await session.execute(statement)).scalars().all())
+
+
+async def count_listed_sources(session: AsyncSession, admin_id: uuid.UUID) -> int:
+    """How many rows the owner's list has in all, active and removed at origin."""
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(KnowledgeSource)
+            .where(KnowledgeSource.admin_id == admin_id, _listed(True))
+        )
+    ).scalar_one()
 
 
 async def sources_by_id(

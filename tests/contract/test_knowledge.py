@@ -46,11 +46,13 @@ async def test_the_source_list_pages_and_keeps_its_shape(client):
             json={"name": name, "text": f"{name} are listed on the website."},
         )
         assert r.status_code < 300, r.text
-    assert len((await client.get("/api/v1/admin/knowledge/sources")).json()) == 2
+    whole = await client.get("/api/v1/admin/knowledge/sources")
+    assert len(whole.json()) == 2
+    assert whole.headers["X-Total-Count"] == "2"
     newest = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 1})
     older = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 1, "offset": 1})
     assert [s["name"] for s in newest.json() + older.json()] == ["Parking", "Hours"]
-    too_many = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 501})
+    too_many = await client.get("/api/v1/admin/knowledge/sources", params={"limit": 10_001})
     assert too_many.status_code == 422
 
 

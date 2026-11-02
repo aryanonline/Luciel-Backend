@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import conflict, not_found, validation_error
-from app.api.paging import PAGE_MAX
+from app.api.paging import PAGE_MAX, SOURCES_MAX, TOTAL_COUNT_HEADER
 from app.audit import log as audit
 from app.connections import oauth_flow, registry
 from app.connections import service as connections_service
@@ -149,10 +149,15 @@ async def _instance_id(s: AsyncSession, admin_id: uuid.UUID) -> uuid.UUID:
 # --- frozen contract methods ------------------------------------------------ #
 @router.get("/sources", response_model=list[KnowledgeSourceOut])
 async def list_sources(
-    limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
+    response: Response,
+    limit: int = Query(SOURCES_MAX, ge=1, le=SOURCES_MAX),
     offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[KnowledgeSourceOut]:
+    """Every source the owner can act on, up to SOURCES_MAX; ``X-Total-Count`` says how
+    many there are. This page has no pager and is the only place a source can be viewed,
+    renamed or deleted, so the ceiling sits well above what a sync adds rather than at
+    PAGE_MAX. Past it, the rows removed at origin are cut first, as they sort last."""
     async with tenant_session(subject.admin_id) as s:
         # Round 7 M10: a source the sync found GONE at its origin is listed (with
         # ``deletedBy: "origin"``) until the retention pass purges it, so the owner
@@ -162,6 +167,8 @@ async def list_sources(
         sources = await service.list_sources(
             s, subject.admin_id, include_removed_at_origin=True, limit=limit, offset=offset
         )
+        total = await service.count_listed_sources(s, subject.admin_id)
+        response.headers[TOTAL_COUNT_HEADER] = str(total)
         used = await _used_by_questions_7d(s, subject.admin_id)
         return [_source_out(x, used.get(x.id, 0)) for x in sources]
 

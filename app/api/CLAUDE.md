@@ -17,8 +17,17 @@ Defines FastAPI v1 routes, dependencies, error behavior, and the control/data-pl
   `LOCAL_ENVIRONMENT` (`development`, the unset default); deployed tasks get dev, preprod
   or prod and answer 404. `app.openapi()` keeps working in tests in either mode.
 - An array-returning GET takes `limit` (ceiling `PAGE_MAX`, `paging.py`) and `offset`, or
-  names why not in `tests/unit/test_list_endpoints_bounded.py`. A list the dashboard reads
-  whole defaults to the ceiling, so it is cut only past 500 rows until the client pages.
+  names why not in `tests/unit/test_list_endpoints_bounded.py`, which also accounts for
+  every top-level array in an object response. A list the dashboard reads whole defaults
+  to its ceiling until the client pages. Two of those are not a plain first page:
+  - The transcript is windowed from the newest end, and `offset` counts back from the
+    newest message, because the takeover view polls it. Past 500 rows the oldest are out.
+  - Knowledge sources have their own ceiling (`SOURCES_MAX`, 10,000), since that page is
+    the only place to view, rename or delete a source. Past it, rows removed at origin go
+    first.
+  Both answer `X-Total-Count` (CORS-exposed on the control plane). The dashboard does not
+  read it yet, so nothing on screen says a list was cut. Connections and sync connections
+  stay at 500 with no total: each row is a connection an owner made.
 
 ## Testing pointers
 - `tests/contract/` for wire contracts and public flows.

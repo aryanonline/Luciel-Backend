@@ -20,12 +20,12 @@ from datetime import UTC, datetime
 from typing import cast
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import ColumnElement, and_, select
+from sqlalchemy import ColumnElement, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Subject, current_admin
 from app.api.errors import ApiError, conflict, not_found, service_unavailable, validation_error
-from app.api.paging import PAGE_DEFAULT, PAGE_MAX
+from app.api.paging import PAGE_DEFAULT, PAGE_MAX, TOTAL_COUNT_HEADER
 from app.audit import log as audit
 from app.channels import outbound
 from app.db.session import tenant_session
@@ -185,13 +185,19 @@ async def _require_session(
 @router.get("/conversations/{session_id}/messages", response_model=list[MessageOut])
 async def get_messages(
     session_id: uuid.UUID,
+    response: Response,
     limit: int = Query(PAGE_MAX, ge=1, le=PAGE_MAX),
     offset: int = Query(0, ge=0),
     subject: Subject = Depends(current_admin),
 ) -> list[MessageOut]:
-    """One session's transcript, oldest first, paged (§3.4.6 within-session memory).
+    """One session's transcript, oldest first within the page (§3.4.6 within-session
+    memory).
 
-    A transcript longer than PAGE_MAX needs ``offset`` to reach its later messages.
+    The page is cut from the NEWEST end, and ``offset`` counts back from the newest
+    message: the takeover view polls this route with no parameters, and a window on the
+    oldest rows would freeze it once a session passed PAGE_MAX, hiding the customer's next
+    message and the owner's own reply. Past PAGE_MAX the oldest messages are what a
+    no-parameter read leaves out; ``X-Total-Count`` carries the whole transcript's length.
 
     Sessions past the 90-day hot boundary (Commitment #38) have no Transcript rows —
     their transcript moved to S3 cold storage. The read-through below serves those
@@ -199,15 +205,16 @@ async def get_messages(
     moved; only its storage tier changed."""
     async with tenant_session(subject.admin_id) as s:
         sess = await _require_session(s, admin_id=subject.admin_id, session_id=session_id)
+        of_this_session = (
+            Transcript.admin_id == subject.admin_id,
+            Transcript.session_id == session_id,
+        )
         rows = (
             (
                 await s.execute(
                     select(Transcript)
-                    .where(
-                        Transcript.admin_id == subject.admin_id,
-                        Transcript.session_id == session_id,
-                    )
-                    .order_by(Transcript.at.asc(), Transcript.id.asc())
+                    .where(*of_this_session)
+                    .order_by(Transcript.at.desc(), Transcript.id.desc())
                     .offset(offset)
                     .limit(limit)
                 )
@@ -217,8 +224,14 @@ async def get_messages(
         )
         if not rows and sess.archive_object_key:
             archived = await _archived_rows(s, admin_id=subject.admin_id, session_id=session_id)
-            return [_archived_message_out(r) for r in archived[offset : offset + limit]]
-        return [_message_out(r) for r in rows]
+            response.headers[TOTAL_COUNT_HEADER] = str(len(archived))
+            end = max(0, len(archived) - offset)
+            return [_archived_message_out(r) for r in archived[max(0, end - limit) : end]]
+        total = (
+            await s.execute(select(func.count()).select_from(Transcript).where(*of_this_session))
+        ).scalar_one()
+        response.headers[TOTAL_COUNT_HEADER] = str(total)
+        return [_message_out(r) for r in reversed(rows)]
 
 
 async def _archived_rows(
