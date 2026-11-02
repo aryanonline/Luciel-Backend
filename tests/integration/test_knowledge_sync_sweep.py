@@ -20,12 +20,14 @@ import pytest
 from app.db.session import tenant_session
 from app.jobs import sweeps
 from app.knowledge import sweep as knowledge_sweep
+from app.knowledge import sync
+from app.knowledge.embeddings import EMBEDDING_DOWN, EmbeddingError
 from app.knowledge.providers import CrawlUnreachable, ProviderUnavailable
-from app.knowledge.sync import RemoteItem, RemoteSnapshot
+from app.knowledge.sync import RemoteItem, RemoteSnapshot, SnapshotShrunk
 from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeSource
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -442,8 +444,9 @@ async def test_a_non_serving_luciel_is_not_synced(monkeypatch, state: LucielStat
 
 # --- Round 7 walk run 8: the scheduled sync stamps the same sync job -------------------
 # The manual sync became a job whose state lives on the connection (sync_job). The
-# sweep writes the same record with trigger "scheduled", and leaves a connection alone
-# while the owner's manual job is still running (two reconciles would race).
+# sweep writes the same record with trigger "scheduled": "syncing" first, in its own
+# transaction; the terminal stamp right after the tenant's commit. It leaves a connection
+# alone while a job holds its lock (two reconciles would duplicate every new item).
 
 
 async def _sync_job_of(admin: uuid.UUID, cid: uuid.UUID) -> dict | None:
@@ -455,13 +458,31 @@ async def _sync_job_of(admin: uuid.UUID, cid: uuid.UUID) -> dict | None:
         ).scalar_one()
 
 
+async def _seed_job(admin: uuid.UUID, cid: uuid.UUID, record: dict | None) -> None:
+    async with tenant_session(admin) as s:
+        await s.execute(
+            update(InstanceConnection)
+            .where(InstanceConnection.connection_id == cid)
+            .values(sync_job=record)
+        )
+
+
+class _Raises:
+    origin = "google_drive"
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+        raise self._exc
+
+
 async def test_the_sweep_stamps_a_scheduled_job_synced_with_its_result(monkeypatch) -> None:
     admin, _, cid = await _seed(last_synced_at=NOW - timedelta(hours=12))
     provider = _StableProvider()
     monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
 
-    async with tenant_session(admin) as s:
-        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 1
+    assert str(admin) in await sweeps.run_knowledge_sync(now=NOW)
     job = await _sync_job_of(admin, cid)
     assert job is not None
     assert job["state"] == "synced"
@@ -471,14 +492,82 @@ async def test_the_sweep_stamps_a_scheduled_job_synced_with_its_result(monkeypat
     assert job["result"]["added"] == [] and job["result"]["removed"] == []
 
 
+async def test_syncing_is_visible_from_another_session_while_the_provider_runs(monkeypatch):
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(hours=12))
+    seen: list[dict | None] = []
+
+    class _Watching(_StableProvider):
+        async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+            seen.append(await _sync_job_of(admin, cid))
+            return await super().snapshot(connection_id)
+
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: _Watching())
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["state"] == "syncing" and seen[0]["trigger"] == "scheduled"
+
+
+@pytest.mark.parametrize(
+    ("exc", "state", "error", "outcome"),
+    [
+        pytest.param(
+            SnapshotShrunk(existing=4, remote=1),
+            "shrink_pending",
+            (
+                "The source now reports 1 item(s) where 4 are synced, so nothing was removed. "
+                "If you did remove them at the source, sync again and confirm the shrink."
+            ),
+            "shrink_pending",
+            id="shrunk",
+        ),
+        pytest.param(
+            ProviderUnavailable("revoked"),
+            "failed",
+            "Sync unavailable: revoked",
+            "dead_credential",
+            id="dead-credential",
+        ),
+        pytest.param(
+            EmbeddingError("openai_error:RateLimitError"),
+            "failed",
+            EMBEDDING_DOWN,
+            "embedding",
+            id="embedding",
+        ),
+    ],
+)
+async def test_the_sweep_stamps_every_terminal_state(
+    monkeypatch, exc: Exception, state: str, error: str, outcome: str
+) -> None:
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda c, s: _Raises(exc))
+    outcomes: list[str] = []
+    real = sync_job.record_job_outcome
+
+    def _recording(**kwargs: object) -> None:
+        outcomes.append(str(kwargs["outcome"]))
+        real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sync_job, "record_job_outcome", _recording)
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    job = await _sync_job_of(admin, cid)
+    assert job is not None
+    assert job["state"] == state and job["error"] == error and job["trigger"] == "scheduled"
+    assert outcomes == [outcome]
+
+
 async def test_the_sweep_stamps_a_failed_job_on_an_unreachable_site(monkeypatch) -> None:
     admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2), provider="website_crawl")
     monkeypatch.setattr(
         knowledge_sweep, "provider_for_connection", lambda conn, store: _UnreachableSite()
     )
 
-    async with tenant_session(admin) as s:
-        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 0
+    await sweeps.run_knowledge_sync(now=NOW)
     job = await _sync_job_of(admin, cid)
     assert job is not None
     assert job["state"] == "failed"
@@ -486,38 +575,238 @@ async def test_the_sweep_stamps_a_failed_job_on_an_unreachable_site(monkeypatch)
     assert job["error"] == "Sync unavailable: crawl fetched no pages: https://acme.example/"
 
 
-async def test_the_sweep_skips_a_connection_whose_manual_job_is_running(monkeypatch, caplog):
+async def test_a_terminal_stamp_is_written_only_after_the_tenants_commit(monkeypatch) -> None:
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(hours=12))
+    monkeypatch.setattr(
+        knowledge_sweep, "provider_for_connection", lambda conn, store: _StableProvider()
+    )
+    pending: list[knowledge_sweep.PendingStamp] = []
+
+    async with tenant_session(admin) as s:
+        await knowledge_sweep.sync_due_connections(
+            s, admin_id=admin, now=NOW, pending_stamps=pending
+        )
+        # The pass has not committed: its data is invisible and it holds no new row lock.
+        assert (await _sync_job_of(admin, cid))["state"] == "syncing"
+        async with tenant_session(admin) as other:
+            await other.execute(text("SET LOCAL lock_timeout = '200ms'"))
+            await other.execute(
+                select(InstanceConnection)
+                .where(InstanceConnection.connection_id == cid)
+                .with_for_update(nowait=True)
+            )
+            # ... and the job is live: its lock is held until that commit.
+            assert sync.sync_lock_k2(cid) in await sync.live_sync_lock_keys(other)
+    assert (await _sync_job_of(admin, cid))["state"] == "syncing"
+    assert [p.connection_id for p in pending] == [cid]
+
+    await knowledge_sweep.write_pending_stamps(admin, pending)
+    assert (await _sync_job_of(admin, cid))["state"] == "synced"
+
+
+async def test_a_rolled_back_pass_writes_no_stamp_and_the_row_reads_interrupted(monkeypatch):
+    from app.config import get_settings
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(hours=12))
+    monkeypatch.setattr(
+        knowledge_sweep, "provider_for_connection", lambda conn, store: _StableProvider()
+    )
+
+    async def _boom(*a: object, **k: object) -> None:
+        raise RuntimeError("the pass failed after the sync")
+
+    candidates = [admin]
+
+    async def _candidates(kind: str) -> list[uuid.UUID]:
+        return candidates
+
+    async def _work(session, *, admin_id, now):  # noqa: ANN001, ANN202
+        pending: list[knowledge_sweep.PendingStamp] = []
+        await knowledge_sweep.sync_due_connections(
+            session, admin_id=admin_id, now=now, pending_stamps=pending
+        )
+        await _boom()
+
+    after_commit: list[uuid.UUID] = []
+
+    async def _after(admin_id: uuid.UUID) -> None:
+        after_commit.append(admin_id)
+
+    monkeypatch.setattr(sweeps, "sweep_candidates", _candidates)
+    assert await sweeps._per_tenant("test", _work, NOW, after_commit=_after) == []
+
+    assert after_commit == []
+    raw = await _sync_job_of(admin, cid)
+    assert raw is not None and raw["state"] == "syncing"  # no terminal stamp was written
+    monkeypatch.setattr(get_settings(), "knowledge_sync_job_start_grace_seconds", 0)
+    async with tenant_session(admin) as s:
+        conn = (
+            await s.execute(
+                select(InstanceConnection).where(InstanceConnection.connection_id == cid)
+            )
+        ).scalar_one()
+        reading = sync_job.effective_job(conn, await sync_job.live_keys_for(s, [conn]))
+    assert reading is not None and reading["state"] == "failed"
+    assert reading["error"] == sync_job.INTERRUPTED_STALE
+
+
+async def test_the_sweep_skips_a_connection_whose_lock_is_held(monkeypatch, caplog):
     import logging
 
     from app.knowledge import sync_job
 
     admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
-    running = sync_job.syncing_stamp(started_at=datetime.now(UTC), trigger="manual")
-    assert await sync_job.stamp_job(admin, cid, running)
+    # Past any age, and no fresh stamp either: only the lock says this job is alive.
+    running = sync_job.syncing_stamp(
+        started_at=datetime.now(UTC) - timedelta(days=1), trigger="manual"
+    )
+    await _seed_job(admin, cid, running)
     provider = _StableProvider()
     monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
 
     with caplog.at_level(logging.INFO, logger="app.knowledge.sweep"):
-        async with tenant_session(admin) as s:
-            assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 0
+        async with tenant_session(admin) as holder:
+            assert await sync.claim_sync_lock(holder, cid)
+            await sweeps.run_knowledge_sync(now=NOW)
     assert provider.calls == 0  # left alone this pass
-    assert await _sync_job_of(admin, cid) == running  # the manual job's record untouched
+    assert await _sync_job_of(admin, cid) == running  # the job's record untouched
     assert any("knowledge_sync_skipped_job_running" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_stale_syncing_record_does_not_block_the_sweep(monkeypatch) -> None:
-    from app.knowledge import sync_job
+async def test_the_sweep_skips_on_a_lock_it_cannot_take_and_stamps_nothing(monkeypatch, caplog):
+    import logging
 
     admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
-    stale = sync_job.syncing_stamp(
-        started_at=datetime.now(UTC) - timedelta(hours=2), trigger="manual"
-    )
-    assert await sync_job.stamp_job(admin, cid, stale)
     provider = _StableProvider()
     monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
 
-    async with tenant_session(admin) as s:
-        assert await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=NOW) == 1
+    with caplog.at_level(logging.INFO, logger="app.knowledge.sweep"):
+        async with tenant_session(admin) as holder:
+            assert await sync.claim_sync_lock(holder, cid)
+            await sweeps.run_knowledge_sync(now=NOW)
+    assert provider.calls == 0
+    assert await _sync_job_of(admin, cid) is None
+    assert any("knowledge_sync_skipped_job_running" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_syncing_stamp_inside_the_start_grace_is_also_left_alone(monkeypatch):
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    running = sync_job.syncing_stamp(started_at=datetime.now(UTC), trigger="manual")
+    await _seed_job(admin, cid, running)
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    assert provider.calls == 0
+    assert await _sync_job_of(admin, cid) == running
+
+
+async def test_a_refused_syncing_stamp_skips_the_connection(monkeypatch, caplog):
+    """The conditional stamp: a manual start committed between the sweep's read and its
+    stamp, so the sweep's stamp matches nothing and the sweep does not run."""
+    import logging
+
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+    theirs = sync_job.syncing_stamp(started_at=datetime.now(UTC), trigger="manual")
+    real = sync_job.stamp_syncing_if_unchanged
+
+    async def _manual_start_first(*a: object, **k: object) -> bool:
+        await _seed_job(admin, cid, theirs)
+        return await real(*a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sync_job, "stamp_syncing_if_unchanged", _manual_start_first)
+    with caplog.at_level(logging.WARNING, logger="app.knowledge.sweep"):
+        await sweeps.run_knowledge_sync(now=NOW)
+
+    assert provider.calls == 0
+    assert await _sync_job_of(admin, cid) == theirs
+    assert any("knowledge_sync_skipped_stamp_refused" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_stamp_that_could_not_be_written_skips_the_connection(monkeypatch):
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    async def _false(*a: object, **k: object) -> bool:
+        return False
+
+    monkeypatch.setattr(knowledge_sweep.sync_jobs, "stamp_syncing_if_unchanged", _false)
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    assert provider.calls == 0
+    assert await _sync_job_of(admin, cid) is None
+
+
+async def test_an_orphaned_syncing_record_does_not_block_the_sweep(monkeypatch) -> None:
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    orphan = sync_job.syncing_stamp(
+        started_at=datetime.now(UTC) - timedelta(hours=2), trigger="manual"
+    )
+    await _seed_job(admin, cid, orphan)
+    provider = _StableProvider()
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda conn, store: provider)
+
+    await sweeps.run_knowledge_sync(now=NOW)
     assert provider.calls == 1
     job = await _sync_job_of(admin, cid)
     assert job is not None and job["state"] == "synced" and job["trigger"] == "scheduled"
+
+
+async def test_a_terminal_stamp_leaves_a_record_it_does_not_own(monkeypatch) -> None:
+    from app.knowledge import sync_job
+
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+    newer = sync_job.syncing_stamp(
+        started_at=datetime.now(UTC) + timedelta(seconds=30), trigger="manual"
+    )
+
+    class _Superseded(_StableProvider):
+        async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+            await _seed_job(admin, cid, newer)
+            return await super().snapshot(connection_id)
+
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda c, s: _Superseded())
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    assert await _sync_job_of(admin, cid) == newer
+
+
+async def test_removing_the_source_mid_pass_keeps_nothing_and_leaves_no_record(monkeypatch):
+    admin, _, cid = await _seed(last_synced_at=NOW - timedelta(days=2))
+
+    class _Removed(_StableProvider):
+        async def snapshot(self, connection_id: uuid.UUID) -> RemoteSnapshot:
+            async with tenant_session(admin) as s:
+                await s.execute(
+                    update(InstanceConnection)
+                    .where(InstanceConnection.connection_id == cid)
+                    .values(status="not_connected", sync_job=None)
+                )
+            snapshot = await super().snapshot(connection_id)
+            snapshot.items.append(
+                RemoteItem(external_id="drive-2", name="New.pdf", text="new", revision="r1")
+            )
+            return snapshot
+
+    monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda c, s: _Removed())
+    await sweeps.run_knowledge_sync(now=NOW)
+
+    assert await _sync_job_of(admin, cid) is None
+    async with tenant_session(admin) as s:
+        names = (
+            (await s.execute(select(KnowledgeSource.name).where(KnowledgeSource.admin_id == admin)))
+            .scalars()
+            .all()
+        )
+    assert list(names) == ["Playbook.pdf"]

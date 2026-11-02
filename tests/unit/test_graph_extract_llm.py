@@ -352,7 +352,7 @@ def test_the_compact_prompt_parser_still_accepts_pretty_and_fenced_answers(reply
         pytest.param(_GOOD[: len(_GOOD) // 2], "json_error", id="truncated-object"),
         pytest.param("```json\n" + _GOOD[:-10] + "\n```", "json_error", id="truncated-fence"),
         pytest.param("I could not find any entities.", "no_json_object", id="prose-only"),
-        pytest.param("[1, 2]", "no_json_object", id="a-list-not-an-object"),
+        pytest.param("[1, 2]", "no_json_object", id="a-bare-list-has-no-braces"),
         pytest.param("", "no_json_object", id="empty"),
     ],
 )
@@ -362,7 +362,7 @@ def test_an_unusable_answer_says_why(reply: str, reason: str):
     assert ge.graph_json(reply) == (None, reason)
 
 
-async def test_an_unparseable_answer_is_a_skip_so_the_sync_re_extracts(caplog):
+async def test_an_unparseable_answer_keeps_the_grammar_and_is_not_deferred(caplog):
     import logging
 
     from app.knowledge import sync
@@ -371,14 +371,14 @@ async def test_an_unparseable_answer_is_a_skip_so_the_sync_re_extracts(caplog):
     router = _FakeRouter("Here you go: {entities: [Senior Engineer], edges: []}")
     with caplog.at_level(logging.WARNING, logger="app.knowledge.graph_extract"):
         out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
-    assert out.llm_skipped is True
+    # The same page would earn the same answer next pass: NOT a skip, so the marker bumps.
+    assert out.llm_skipped is False
     assert {e.name for e in out.entities} == {"Trail Runner"}  # the grammar still serves
     record = next(r for r in caplog.records if r.getMessage() == "graph_extract.llm_unparseable")
     assert getattr(record, "reason", None) == "json_error"
-    # The sync's per-item pass reads the flag (it leaves the revision marker unbumped).
     graph = sync._GraphPass(ge.LlmGraphExtractor(router_factory=lambda: router))
     await graph.aextract(PROSE)
-    assert graph.llm_skipped is True
+    assert graph.llm_skipped is False
 
 
 async def test_a_prose_only_answer_logs_no_json_object(caplog):
@@ -387,7 +387,7 @@ async def test_a_prose_only_answer_logs_no_json_object(caplog):
     router = _FakeRouter("I could not find any entities in this text.")
     with caplog.at_level(logging.WARNING, logger="app.knowledge.graph_extract"):
         out = await ge.LlmGraphExtractor(router_factory=lambda: router).aextract(PROSE)
-    assert out.llm_skipped is True
+    assert out.llm_skipped is False
     record = next(r for r in caplog.records if r.getMessage() == "graph_extract.llm_unparseable")
     assert getattr(record, "reason", None) == "no_json_object"
 
