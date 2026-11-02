@@ -7,9 +7,9 @@ name: image-rebuild
 # it". Before this workflow nothing rebuilt the image on a schedule, so a Debian fix
 # reached the running service only when somebody happened to dispatch a deploy.
 # This job rebuilds the image from the release branch every Monday, pushes it under
-# a `weekly-<date>` tag (the repo's lifecycle policy expires it), waits for the ECR
-# scan, runs the SAME governed gate the deploy uses in REPORT mode, and posts the
-# outcome — remaining CRITICAL/HIGH findings and waivers that no longer match, plus
+# a `weekly-<date>-<run id>-<attempt>` tag (the repo's lifecycle policy expires it),
+# waits for the ECR scan, runs the SAME governed gate the deploy uses in REPORT mode, and
+# posts the outcome — remaining CRITICAL/HIGH findings and waivers that no longer match, plus
 # the Debian tracker status of every waived and every new CVE — on the month's
 # "Dependency & CVE review YYYY-MM" issue (scripts/post_review_issue.sh, the one title
 # ci.yml and dependency-review.yml post to as well). The monthly steward reads that
@@ -67,7 +67,12 @@ jobs:
           REPO: luciel-backend-dev
         run: |
           set -euo pipefail
-          TAG="weekly-$(date -u +%Y%m%d)"
+          # The repo's tags are IMMUTABLE, so the tag must differ per attempt: a second
+          # run on the same day (run 39272257053: `weekly-20261019` already existed) or
+          # a re-run of this one would otherwise fail at the push. Nothing parses the
+          # tag; the steps below read it from this step's output, and the lifecycle
+          # policy keeps the last 20 tagged images regardless of their name.
+          TAG="weekly-$(date -u +%Y%m%d)-${{ github.run_id }}-${{ github.run_attempt }}"
           docker buildx build --pull --platform linux/amd64,linux/arm64 \
             --provenance=false --sbom=false \
             -t "$ECR/$REPO:$TAG" --push .
