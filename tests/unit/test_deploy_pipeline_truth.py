@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -165,6 +166,80 @@ def test_every_hostname_is_derived_never_written_into_a_command() -> None:
     dev = _steps("dev")
     assert "scripts/smoke_probe.sh dev " in _run(dev[_index(dev, step_id="smoke")])
     assert "bin/hostnames.ts dev" in _run(dev[_index(dev, step_id="hosts")])
+
+
+_SMOKE = ROOT / "scripts" / "smoke_probe.sh"
+
+
+def _edge_check(curl_answers: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Run the probe's own edge block (extracted, so the two cannot drift) against a
+    stand-in curl that answers each URL with the given ``-w`` output."""
+    text = _SMOKE.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index("# --- edge check")
+    block = text[start : text.index("# --- end edge check", start)]
+    cases = "\n".join(
+        f"    {url}) printf '%s' '{answer}' ;;" for url, answer in curl_answers.items()
+    )
+    harness = (
+        "set -euo pipefail\n"
+        "BASE=https://api.example\n"
+        "sleep() { :; }\n"
+        'curl() {\n  local url="${@: -1}"\n  case "$url" in\n'
+        f"{cases}\n"
+        "    *) echo unexpected-url >&2; exit 9 ;;\n  esac\n}\n"
+        f"{block}\n"
+    )
+    bash = shutil.which("bash")
+    assert bash, "the probe is a bash script"
+    return subprocess.run(  # noqa: S603 — fixed argv, script text from this repo
+        [bash, "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+_EDGE_OK = {
+    "http://api.example/healthz": "301 https://api.example:443/healthz",
+    "https://api.example/openapi.json": "404",
+    "https://api.example/docs": "404",
+}
+
+
+def test_the_probe_accepts_the_edge_the_docs_promise() -> None:
+    result = _edge_check(_EDGE_OK)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::error::" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("broken", "answer", "said"),
+    [
+        ("http://api.example/healthz", "200 ", "plain HTTP is answered"),
+        ("http://api.example/healthz", "000 ", "plain HTTP is answered"),
+        ("http://api.example/healthz", "301 http://elsewhere.example/", "redirects to"),
+        ("https://api.example/openapi.json", "200", "the API schema is exposed"),
+        ("https://api.example/docs", "200", "the API schema is exposed"),
+    ],
+)
+def test_a_broken_edge_fails_the_probe_with_a_clear_line(
+    broken: str, answer: str, said: str
+) -> None:
+    result = _edge_check({**_EDGE_OK, broken: answer})
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert any(
+        line.startswith("::error::") and said in line and broken.split("//")[1] in line
+        for line in result.stdout.splitlines()
+    ), result.stdout
+
+
+@pytest.mark.parametrize("job", ["dev", "prod-deploy"])
+def test_every_deploy_runs_the_edge_check_and_a_failure_rolls_back(job: str) -> None:
+    steps = _steps(job)
+    assert "scripts/smoke_probe.sh" in _run(steps[_index(steps, step_id="smoke")])
+    assert "edge_failures" in _SMOKE.read_text(encoding="utf-8")
+    condition = str(steps[_index(steps, name="Roll the app services back")].get("if", ""))
+    assert "steps.smoke.outcome == 'failure'" in condition
 
 
 def test_d10_runs_the_seedtest_gate_strictly_after_every_live_dev_deploy() -> None:

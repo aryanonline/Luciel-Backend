@@ -34,6 +34,9 @@
 #      broken listener rule or an unhealthy control-plane target looks like (F067).
 #   3. The data-plane widget bootstrap refuses an unknown embed key with a 4xx from
 #      the app — proof the default target group serves.
+#   4. The edge is HTTPS-only and the API schema is not published (round 7):
+#      http://<api host>/healthz answers 301 to https (ComputeStack's :80 listener),
+#      and https://<api host>/openapi.json and /docs answer 404 (app/main.py).
 set -euo pipefail
 
 TARGET="${1:?environment (dev|preprod|prod) or an https:// api base url}"
@@ -138,4 +141,43 @@ case "$code" in
   *) echo "::error::data-plane route /api/v1/chat-widget/bootstrap answered HTTP $code (expected a 4xx from the app)"; exit 1 ;;
 esac
 
-echo "[smoke] PASS: healthz ok/$MODE with exactly the expected degraded set; control plane answered 401; data plane answered $code."
+data_plane_code="$code"
+
+# 4) HTTPS-only edge, schema not published. Retried like healthz: a task still draining
+# from the roll can answer the old way for a moment.
+# --- edge check (tests/unit/test_deploy_pipeline_truth.py runs this block) ---
+edge_failures() {
+  # Prints one line per broken promise; nothing means the edge is as documented.
+  local host="${BASE#https://}" out code location path
+  out="$(curl -sS -m 20 -o /dev/null -w '%{http_code} %{redirect_url}' "http://$host/healthz" || true)"
+  code="${out%% *}"
+  location="${out#* }"
+  if [ "$code" != "301" ]; then
+    echo "plain HTTP is answered: http://$host/healthz gave HTTP ${code:-none} (expected a 301 to https)"
+  else
+    case "$location" in
+      "https://$host/"*|"https://$host:443/"*) ;;
+      *) echo "http://$host/healthz redirects to '$location' (expected https://$host/...)" ;;
+    esac
+  fi
+  for path in /openapi.json /docs; do
+    code="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "$BASE$path" || true)"
+    if [ "$code" != "404" ]; then
+      echo "the API schema is exposed: $BASE$path gave HTTP ${code:-none} (expected 404)"
+    fi
+  done
+}
+edge_failed=""
+for i in $(seq 1 8); do
+  edge_failed="$(edge_failures)"
+  [ -z "$edge_failed" ] && break
+  echo "[smoke] edge not as documented yet (attempt $i/8) - waiting 15s"
+  sleep 15
+done
+if [ -n "$edge_failed" ]; then
+  while IFS= read -r line; do echo "::error::$line"; done <<<"$edge_failed"
+  exit 1
+fi
+# --- end edge check ---
+
+echo "[smoke] PASS: healthz ok/$MODE with exactly the expected degraded set; control plane answered 401; data plane answered $data_plane_code; plain HTTP redirects to https; /openapi.json and /docs answer 404."

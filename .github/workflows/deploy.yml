@@ -301,8 +301,9 @@ jobs:
       # way it was deployed to — healthz live with no degraded binding, both planes
       # reachable through the ALB (F067) — and the §10 probe passes as luciel_app.
       # The probe resolves dev's OWN api origin (and Stripe posture) from the hostnames
-      # helper (round 7 WP-8b) — never the public host, which is the apex owner's.
-      - name: Post-deploy smoke probe (healthz + both planes answer)
+      # helper (round 7 WP-8b) — never the public host, which is the apex owner's. It
+      # also proves the edge: plain HTTP redirects to https, and the API schema is 404.
+      - name: Post-deploy smoke probe (healthz, both planes, HTTPS-only edge)
         id: smoke
         if: inputs.paused != 'true'
         run: bash scripts/smoke_probe.sh dev ${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }}
@@ -686,7 +687,7 @@ jobs:
 
       # Prod's api origin and Stripe posture (mock — prod stays mock until the
       # owner-gated cutover) come from the hostnames helper, like dev's.
-      - name: Post-deploy smoke probe (healthz + both planes answer)
+      - name: Post-deploy smoke probe (healthz, both planes, HTTPS-only edge)
         id: smoke
         if: inputs.paused != 'true'
         run: bash scripts/smoke_probe.sh prod ${{ inputs.integration_mode || 'live' }}
