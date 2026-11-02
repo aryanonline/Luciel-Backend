@@ -25,7 +25,7 @@ from app.db.engine import dispose_engine
 from app.db.session import tenant_session, untenanted_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, insert, select, text, update
 
 from tests.conftest import APP_USER, superuser_exec
 
@@ -138,9 +138,11 @@ async def _seed(admin: uuid.UUID, *, embed_key: str) -> uuid.UUID:
 
 
 async def _mailbox_row(admin: uuid.UUID, iid: uuid.UUID, destination: str) -> None:
+    # Core, not the entity: these run below head, and the entity names every column of the
+    # head schema (``sync_job`` belongs to 0077, later in the chain).
     async with tenant_session(admin) as s:
-        s.add(
-            InstanceConnection(
+        await s.execute(
+            insert(InstanceConnection).values(
                 connection_id=uuid.uuid4(),
                 admin_id=admin,
                 instance_id=iid,
@@ -155,20 +157,19 @@ async def _mailbox_row(admin: uuid.UUID, iid: uuid.UUID, destination: str) -> No
                 },
             )
         )
-        await s.flush()
 
 
 async def _destination(admin: uuid.UUID) -> str | None:
     async with tenant_session(admin) as s:
-        row = (
+        config = (
             await s.execute(
-                select(InstanceConnection).where(
+                select(InstanceConnection.non_secret_config).where(
                     InstanceConnection.admin_id == admin,
                     InstanceConnection.connection_type == "email_sender",
                 )
             )
         ).scalar_one()
-        return (row.non_secret_config or {}).get("destination")
+        return (config or {}).get("destination")
 
 
 async def _cleanup(admins: list[uuid.UUID]) -> None:
