@@ -106,6 +106,29 @@ async def test_the_container_entry_point_prunes_the_aged_rows_and_exits_zero(
     assert await _event_types(admin_id) == ["data_retention_hard_delete"]
 
 
+async def test_the_seedtest_shape_of_many_loops_each_disposing_runs_against_the_real_db() -> None:
+    """scripts/seed_and_livetest.py's asyncio.run blocks each open a session and dispose
+    the engine in a finally, also when a sync caller built the engine first."""
+    await db_engine.dispose_engine()
+
+    async def _block() -> None:
+        try:
+            assert await jobs_main._preflight_audit_lock() == []
+        finally:
+            await db_engine.dispose_engine()
+
+    def _harness() -> None:
+        db_engine.get_engine()
+        for _ in range(3):
+            asyncio.run(_block())
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_harness), 60)
+        assert db_engine._engine is None and db_engine._engine_loop is None
+    finally:
+        db_engine.reset_engine_cache()
+
+
 async def test_the_old_two_loop_sequencing_is_refused_by_name_not_four_frames_down() -> None:
     """The exact pre-fix sequence (preflight under one loop, sweep under another) now
     fails at the engine with an error that says what is wrong, instead of an asyncpg

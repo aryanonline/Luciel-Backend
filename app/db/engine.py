@@ -7,7 +7,8 @@ So a process that touches the database runs ONE event loop for its whole life (t
 sweep CLI, ``app/jobs/__main__.py``) or disposes the engine inside each loop before
 that loop closes (the SeedTest harness). ``get_engine`` refuses a second loop by name
 instead of letting the pool fail four frames down (the weekly ``audit_retention`` sweep
-crashed exactly that way every Sunday from 2026-09-27 to 2026-10-25).
+crashed exactly that way every Sunday from 2026-09-27 to 2026-10-25). An engine built
+with no loop running binds to the first loop that asks for it.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from app.config import get_settings
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
-# The loop the cached engine was built under (None when it was built outside one).
+# The loop the cached engine belongs to: the one it was built under or, when it was built
+# outside any loop, the first loop that asked for it. None until then.
 _engine_loop: asyncio.AbstractEventLoop | None = None
 
 
@@ -42,15 +44,21 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 def _refuse_a_second_loop() -> None:
+    global _engine_loop
     running = _running_loop()
-    if _engine is not None and _engine_loop is not None and running is not None:
-        if running is not _engine_loop:
-            raise EngineLoopMismatchError(
-                "the database engine was built under a different event loop than the "
-                "running one; its pooled connections belong to that loop. Run the whole "
-                "process under ONE asyncio.run(), or `await dispose_engine()` before each "
-                "loop closes (app/db/engine.py)."
-            )
+    if _engine is None or running is None:
+        return
+    if _engine_loop is None:
+        # Built with no loop running (a sync caller): it binds to the first loop that
+        # asks for it, because that is the loop its pooled connections will belong to.
+        _engine_loop = running
+    elif running is not _engine_loop:
+        raise EngineLoopMismatchError(
+            "the database engine is bound to a different event loop than the running one; "
+            "its pooled connections belong to that loop. Run the whole process under ONE "
+            "asyncio.run(), or `await dispose_engine()` before each loop closes "
+            "(app/db/engine.py)."
+        )
 
 
 def get_engine() -> AsyncEngine:
@@ -90,11 +98,14 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 async def dispose_engine() -> None:
     global _engine, _sessionmaker, _engine_loop
-    if _engine is not None:
-        await _engine.dispose()
-    _engine = None
-    _sessionmaker = None
-    _engine_loop = None
+    try:
+        if _engine is not None:
+            await _engine.dispose()
+    finally:
+        # Also when the close raises: a dead engine must not keep the next loop refused.
+        _engine = None
+        _sessionmaker = None
+        _engine_loop = None
 
 
 def reset_engine_cache() -> None:

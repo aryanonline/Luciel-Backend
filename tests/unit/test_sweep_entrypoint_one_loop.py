@@ -136,16 +136,61 @@ def test_the_engine_refuses_a_second_loop_by_name() -> None:
         db_engine.reset_engine_cache()
 
 
-def test_an_engine_built_outside_any_loop_is_not_refused() -> None:
-    """Synchronous callers (scripts, a sync fixture) build the engine with no running
-    loop; there is no loop to have bound it to, so nothing is refused."""
+def test_an_engine_built_outside_any_loop_is_refused_on_the_second_loop_that_uses_it() -> None:
+    """A sync caller can build the engine with no running loop. Its pool still fills under
+    the first loop that uses it, so a second loop is the shape that crashed every Sunday:
+    it binds to that first loop and refuses the second."""
     db_engine.reset_engine_cache()
+
+    async def _use() -> None:
+        db_engine.get_sessionmaker()
+
     try:
         db_engine.get_engine()
-
-        async def _use() -> None:
-            db_engine.get_sessionmaker()
-
         asyncio.run(_use())
+        with pytest.raises(db_engine.EngineLoopMismatchError, match="different event loop"):
+            asyncio.run(_use())
+    finally:
+        db_engine.reset_engine_cache()
+
+
+def test_a_loop_that_disposes_in_a_finally_leaves_the_next_loop_free() -> None:
+    """scripts/seed_and_livetest.py's shape: many asyncio.run blocks, each disposing the
+    engine in a finally. dispose_engine must release the bound loop, however the engine
+    was built, or the second block of the D10 gate would be refused."""
+    db_engine.reset_engine_cache()
+
+    async def _block() -> None:
+        try:
+            db_engine.get_sessionmaker()
+        finally:
+            await db_engine.dispose_engine()
+
+    try:
+        asyncio.run(_block())
+        assert db_engine._engine_loop is None
+        db_engine.get_engine()  # built outside a loop between two blocks
+        asyncio.run(_block())
+        asyncio.run(_block())
+        assert db_engine._engine is None and db_engine._engine_loop is None
+    finally:
+        db_engine.reset_engine_cache()
+
+
+def test_a_dispose_that_raises_still_releases_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    db_engine.reset_engine_cache()
+
+    async def _refused(_self: object) -> None:
+        raise OSError("connection reset while closing")
+
+    async def _block() -> None:
+        db_engine.get_engine()
+        await db_engine.dispose_engine()
+
+    monkeypatch.setattr(db_engine.AsyncEngine, "dispose", _refused)
+    try:
+        with pytest.raises(OSError, match="connection reset"):
+            asyncio.run(_block())
+        assert db_engine._engine is None and db_engine._engine_loop is None
     finally:
         db_engine.reset_engine_cache()
