@@ -46,6 +46,7 @@ from app.connections import meta_assets, oauth_flow, registry, service
 from app.connections.secrets import get_secret_store, secret_ref_for
 from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 from app.db.session import tenant_session
+from app.knowledge import sync_job as sync_jobs
 from app.knowledge.providers import (
     HttpTransport,
     OAuthExchangeError,
@@ -77,7 +78,7 @@ from app.schemas_api.connections import (
     TenantNumbersOut,
     UpdateConnectionSettingsRequest,
 )
-from app.schemas_api.knowledge import OAuthCallbackRequest
+from app.schemas_api.knowledge import OAuthCallbackRequest, SyncJobOut
 
 router = APIRouter(prefix="/api/v1/admin/connections", tags=["connections"])
 
@@ -98,7 +99,9 @@ def _provider_display_name(provider: str) -> str:
     return spec.display_name if spec is not None else provider
 
 
-def _connection_out(c: InstanceConnection) -> ConnectionOut:
+def _connection_out(
+    c: InstanceConnection, live_keys: frozenset[int] = frozenset()
+) -> ConnectionOut:
     # Build EXPLICITLY from non-secret fields only (§3.8.3). secret_ref / auth_class
     # are intentionally NOT mapped — the wire model has no slot for them anyway.
     return ConnectionOut.model_validate(
@@ -120,6 +123,11 @@ def _connection_out(c: InstanceConnection) -> ConnectionOut:
             # already shows, so it never has to derive one from the raw provider
             # code (that derivation is what produced "Ses" instead of "Amazon SES").
             "displayName": _provider_display_name(c.provider),
+            # Round 7 walk run 8: the knowledge sync job on a knowledge_source row,
+            # read through liveness — the SAME record GET /sync-connections serves; None
+            # on every other row. ``live_keys`` matters only to a row that says syncing:
+            # the routes that can serve one pass ``sync_jobs.live_keys_for``.
+            "syncJob": SyncJobOut.from_record(sync_jobs.effective_job(c, live_keys)),
         }
     )
 
@@ -182,7 +190,8 @@ async def list_connections(
 ) -> list[ConnectionOut]:
     async with tenant_session(subject.admin_id) as s:
         rows = await service.list_connections(s, subject.admin_id)
-        return [_connection_out(c) for c in rows]
+        live_keys = await sync_jobs.live_keys_for(s, rows)
+        return [_connection_out(c, live_keys) for c in rows]
 
 
 @router.get("/email", response_model=EmailProvisioningOut | None)
@@ -451,7 +460,7 @@ async def submit_credentials(
             raise validation_error(str(exc)) from exc
         if conn is None:
             raise not_found("Connection not found.")
-        return _connection_out(conn)
+        return _connection_out(conn, await sync_jobs.live_keys_for(s, [conn]))
 
 
 @router.post("/{connection_id}/reconnect", response_model=StartConnectionResult)
@@ -1453,6 +1462,7 @@ async def complete_oauth_connect(
                 else:
                     conn.status = "connected"
                     conn.status_detail = None
+                    await sync_jobs.clear_job_on_reconnect(s, conn)
                 await s.flush()
                 await audit.emit(
                     s,
@@ -1475,7 +1485,7 @@ async def complete_oauth_connect(
             if reclaim_note:
                 conn.status_detail = _with_note(conn.status_detail, reclaim_note)
                 await s.flush()
-            return _connection_out(conn)
+            return _connection_out(conn, await sync_jobs.live_keys_for(s, [conn]))
 
     # Destination conflict: fail exactly like a failed verify — previous sender stays
     # live (its credential was never overwritten), the owner gets an actionable

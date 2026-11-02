@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, HttpUrl
 
@@ -129,6 +129,10 @@ class SyncConnectionOut(WireModel):
     status: str
     non_secret_config: dict[str, object] | None = None
     status_detail: str | None = None
+    # The last manual or scheduled sync of this source (round 7 walk run 8): what the
+    # dashboard reads after a POST .../sync answered 202, and on every later visit.
+    # ``None`` when the source never ran a sync job.
+    sync_job: SyncJobOut | None = None
 
 
 class SyncResultOut(WireModel):
@@ -141,6 +145,78 @@ class SyncResultOut(WireModel):
     updated: list[str]
     removed: list[str]
     refused: list[str] = []
+    # Set when the run stopped before comparing anything because the Luciel stopped serving
+    # while the fetch was on the wire ("instance_not_serving"): the empty lists then mean
+    # "not compared", never "nothing changed". None on a sync that ran.
+    halted: str | None = None
+
+
+#: ``SyncJobOut.state`` vocabulary. ``syncing`` — the job is running (a "syncing" with no
+#: job behind it is served as ``failed``, interrupted); ``synced`` — it
+#: finished and ``result`` says what changed; ``failed`` — it ended without changing
+#: anything and ``error`` says why in the owner's words; ``shrink_pending`` — the
+#: source reported far fewer items than are synced, nothing was removed, and ``shrink``
+#: carries the counts the owner confirms with ``?confirmShrink=true``.
+SyncJobState = Literal["syncing", "synced", "failed", "shrink_pending"]
+
+
+class SyncJobShrinkOut(WireModel):
+    remote: int
+    existing: int
+
+
+class SyncJobOut(WireModel):
+    """The knowledge sync JOB on a connection (``instance_connections.sync_job``).
+
+    A manual sync answers 200 ``SyncResultOut`` when it finishes within the inline
+    wait, and 202 ``SyncJobAcceptedOut`` when it is still running; either way this
+    record on the connection is the durable answer."""
+
+    state: SyncJobState
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    result: SyncResultOut | None = None
+    error: str | None = None
+    shrink: SyncJobShrinkOut | None = None
+    # 'manual' (the owner's Sync now) | 'scheduled' (the knowledge sweep).
+    trigger: Literal["manual", "scheduled"] | None = None
+
+    @classmethod
+    def from_record(cls, job: dict[str, Any] | None) -> SyncJobOut | None:
+        """The wire view of an ``instance_connections.sync_job`` record already read
+        through ``app.knowledge.sync_job.effective_job`` (liveness). ``result``
+        carries the wire's four lists and ``halted``; the row keeps the rest of the pass."""
+        if not job or not job.get("state"):
+            return None
+        result = job.get("result")
+        return cls.model_validate(
+            {
+                "state": job["state"],
+                "startedAt": job.get("started_at"),
+                "finishedAt": job.get("finished_at"),
+                "result": (
+                    {
+                        **{
+                            k: result.get(k) or []
+                            for k in ("added", "updated", "removed", "refused")
+                        },
+                        "halted": result.get("halted"),
+                    }
+                    if isinstance(result, dict)
+                    else None
+                ),
+                "error": job.get("error"),
+                "shrink": job.get("shrink"),
+                "trigger": job.get("trigger"),
+            }
+        )
+
+
+class SyncJobAcceptedOut(SyncJobOut):
+    """The 202 body of POST /sync-connections/{id}/sync: the job is running and the
+    connection's ``syncJob`` will carry its outcome. Never a success claim."""
+
+    connection_id: uuid.UUID
 
 
 # --- Knowledge SCOPE selection (Decision #9) --------------------------------- #
@@ -198,3 +274,6 @@ class OAuthCallbackRequest(WireModel):
 
     code: str
     state: str | None = None
+
+
+SyncConnectionOut.model_rebuild()

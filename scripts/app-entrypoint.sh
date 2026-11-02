@@ -30,4 +30,6 @@ PY
 # uvicorn's 5s default the ALB reuses connections uvicorn has already closed ->
 # instant 502 with no app-side log (live-caught 2026-08-18: Twilio error 11200 on
 # /voice/turn — the caller's question died between the ALB and us).
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "${LUCIEL_TRUSTED_PROXY_CIDRS:-*}" --timeout-keep-alive 75
+# --timeout-graceful-shutdown 22: bounds the wait for in-flight requests (a POST in its
+# 20 s inline sync wait), so the app's own drain still fits ECS's stopTimeout of 60 s.
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "${LUCIEL_TRUSTED_PROXY_CIDRS:-*}" --timeout-keep-alive 75 --timeout-graceful-shutdown 22

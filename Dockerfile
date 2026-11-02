@@ -63,4 +63,5 @@ EXPOSE 8000
 # Falls back to "*" only where no proxy exists (local docker run).
 # --timeout-keep-alive 75: MUST exceed the ALB idle timeout (60s default); the 5s
 # uvicorn default made the ALB reuse dead connections -> 502s (2026-08-18).
-CMD uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "${LUCIEL_TRUSTED_PROXY_CIDRS:-*}" --timeout-keep-alive 75
+# --timeout-graceful-shutdown 22: see scripts/app-entrypoint.sh.
+CMD uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "${LUCIEL_TRUSTED_PROXY_CIDRS:-*}" --timeout-keep-alive 75 --timeout-graceful-shutdown 22

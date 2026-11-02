@@ -76,6 +76,11 @@ class LLMResponse:
     # What the call cost in tokens (round 7 WP-6 item 5); None when the provider
     # reported nothing (EchoModel, an SDK response without ``usage``).
     usage: LLMUsage | None = None
+    # The provider stopped at the output ceiling (Anthropic ``stop_reason ==
+    # "max_tokens"``, OpenAI ``finish_reason == "length"``): ``text`` is cut short.
+    # Round 7 walk run 8 — the graph extractor's JSON was truncated at the 1024-token
+    # default and read as "unparseable". False for EchoModel and every fake.
+    truncated: bool = False
 
 
 def admin_id_hash(admin_id: uuid.UUID | None) -> str:
@@ -111,6 +116,7 @@ class LLMProvider(Protocol):
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse: ...
 
 
@@ -268,6 +274,7 @@ class LLMRouter:
         context_tokens: int = CONTEXT_TOKEN_BUDGET_FAST + 1,
         complexity: float = 1.0,
         tools: list[dict[str, Any]] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         """Complete with per-admin_id LLM concurrency cap enforcement (§9 C9).
 
@@ -284,7 +291,18 @@ class LLMRouter:
         only when a fast provider is bound (``fast=`` at construction), can route to
         the fast model. Anthropic-primary/OpenAI-fallback doctrine and the NO-retry-
         on-primary failover behavior are unaffected either way.
+
+        ``max_output_tokens`` overrides the provider's output ceiling for this call
+        (round 7 walk run 8: the graph extractor's JSON outgrew the 1024 default).
+        ``None`` (every existing caller) passes nothing on, so those calls stay
+        byte-identical; a tool-bearing call still gets at least
+        ``TOOL_CALL_MAX_OUTPUT_TOKENS``.
         """
+        # Only forwarded when set: a provider (or a test fake) that predates the
+        # override keeps its exact call shape.
+        extra: dict[str, Any] = (
+            {} if max_output_tokens is None else {"max_output_tokens": max_output_tokens}
+        )
         effective_admin_id = admin_id if admin_id is not None else self._admin_id
         if self._in_turn and effective_admin_id == self._admin_id:
             # Inside an open ``turn()`` the cap is paid ONCE: by the turn's first call
@@ -305,7 +323,7 @@ class LLMRouter:
         if use_fast:
             try:
                 resp = await self._fast.complete(  # type: ignore[union-attr]
-                    system_prompt, messages, tools=tools
+                    system_prompt, messages, tools=tools, **extra
                 )
                 resp.model_class = ModelClass.fast
                 resp.used_fallback = False
@@ -318,7 +336,7 @@ class LLMRouter:
                 pass
 
         try:
-            resp = await self._primary.complete(system_prompt, messages, tools=tools)
+            resp = await self._primary.complete(system_prompt, messages, tools=tools, **extra)
             resp.used_fallback = False
             self._note_usage(resp)
             return resp
@@ -326,7 +344,7 @@ class LLMRouter:
             # Immediate failover, NO retry on primary (§3.4.3). The neutral message
             # shape replays any tool turns correctly through the other provider.
             try:
-                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools, **extra)
             except ProviderError as exc:
                 if not exc.retryable:
                     raise
@@ -336,7 +354,7 @@ class LLMRouter:
                 # and hand the customer the outage line. Anything else — auth, a bad
                 # request, a timeout — still fails immediately.
                 await asyncio.sleep(_fallback_retry_delay())
-                resp = await self._fallback.complete(system_prompt, messages, tools=tools)
+                resp = await self._fallback.complete(system_prompt, messages, tools=tools, **extra)
             resp.used_fallback = True
             self._note_usage(resp)
             return resp

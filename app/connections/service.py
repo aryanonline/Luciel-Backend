@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.audit import log as audit
 from app.channels.email_routing import MxDelegationProbe, MxDelegationResult
@@ -202,6 +203,24 @@ async def record_exchange_failure(
         ).scalar_one_or_none()
         if conn is not None:
             conn.status_detail = f"oauth_exchange_failed: {detail}"
+
+
+def clear_sync_job_on_removal(connection: InstanceConnection) -> None:
+    """A removed source keeps no sync job: not the failure of a source the owner took away,
+    and not a ``syncing`` a job could stamp over. Marked modified so the NULL is written
+    even when this session loaded the row before a job's stamp committed (the job's
+    conditional stamp then finds nothing of its own to overwrite)."""
+    if connection.connection_type == "knowledge_source":
+        connection.sync_job = None
+        flag_modified(connection, "sync_job")
+
+
+async def _clear_sync_job_on_connected(
+    session: AsyncSession, connection: InstanceConnection
+) -> None:
+    from app.knowledge.sync_job import clear_job_on_reconnect  # noqa: PLC0415 — import cycle
+
+    await clear_job_on_reconnect(session, connection)
 
 
 async def _single_active(
@@ -802,6 +821,7 @@ async def submit_credentials(
     else:
         connection.status = "connected"
         connection.status_detail = None
+        await _clear_sync_job_on_connected(session, connection)
     await session.flush()
 
     # Credentials-after-number order (c20): a destination already on file means the
@@ -1294,6 +1314,7 @@ async def confirm_reconnect(
         else:
             connection.status = "connected"
             connection.status_detail = None
+            await _clear_sync_job_on_connected(session, connection)
         await session.flush()
         await audit.emit(
             session,
@@ -1364,6 +1385,7 @@ async def revoke(
     old_status = connection.status
     connection.status = "revoked"
     connection.status_detail = "revoked by admin"
+    clear_sync_job_on_removal(connection)
     await session.flush()
 
     # §3.6.3 secret cleanup: delete the secret material (idempotent — safe even if
@@ -1682,6 +1704,7 @@ async def disconnect(
     connection.status = NOT_CONNECTED
     connection.status_detail = DISCONNECTED_DETAIL
     connection.last_health_check_at = None
+    clear_sync_job_on_removal(connection)
     await session.flush()
 
     deleted = False

@@ -75,6 +75,8 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("PUT", "/api/v1/admin/knowledge/sources/{source_id}"),
         ("GET", "/api/v1/admin/knowledge/sources/{source_id}/chunks"),
+        # Round 7 walk run 8: same method + path; a connection-backed re-sync is the sync job
+        # too, so it may answer 202 (state "syncing") like the sync route below.
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/resync"),
         # 2026-09-05 audit F109: an owner delete is undo-able for 30 days.
         ("POST", "/api/v1/admin/knowledge/sources/{source_id}/restore"),
@@ -84,6 +86,9 @@ EXPECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # registry as part of the KNOWLEDGE workstream (Arc 11b sync connectors).
         ("GET", "/api/v1/admin/knowledge/sync-connections"),
         ("POST", "/api/v1/admin/knowledge/sync-connections"),
+        # Round 7 walk run 8: same method + path; the route now runs the sync as a job
+        # and answers 202 (state "syncing") when it outlives the inline wait. No new
+        # route — the outcome is read from GET /sync-connections' syncJob.
         ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/sync"),
         ("POST", "/api/v1/admin/knowledge/sync-connections/{connection_id}/oauth-callback"),
         # Knowledge SCOPE selection (Decision #9): which folders/pages Luciel may read.

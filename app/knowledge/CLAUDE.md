@@ -69,3 +69,88 @@ make that state explicit and test it.
   manual Re-sync) proceeds as before; restore's grace-window de-duplication remains the
   safety net for a manual run on a deleted one.
   Tests: `tests/integration/test_knowledge_sync_halts_when_not_serving.py`.
+
+## Round 7 walk run 8 (2026-10-25) — the manual sync is a JOB
+- Gotcha: `POST /admin/knowledge/sync-connections/{id}/sync` and, for a connection-backed
+  source, `POST /admin/knowledge/sources/{id}/resync` no longer run the whole sync inside the
+  request (an 8-page crawl with one LLM graph call per page outlived the ALB's 60 s idle
+  timeout; its CORS-less 504 read as "Network request failed."). `sync_job.py`: the route
+  waits `knowledge_sync_inline_wait_seconds` (20 s). Finished → **200** (`SyncResultOut`; the
+  refreshed source on /resync) or the same 409s (shrink, unreachable / dead credential; other
+  failures 503 with the owner message, a real failure). Still running → **202** `{connectionId,
+  state: "syncing", startedAt, finishedAt: null, result: null, error: null, shrink: null,
+  trigger: "manual"}`. Every job ends in a terminal state on `instance_connections.sync_job`
+  (migration 0077), served as `syncJob` on BOTH GET /sync-connections and GET /connections
+  (states syncing | synced | failed | shrink_pending).
+- LIVENESS IS A DATABASE LOCK, NOT AN AGE. `sync.sync_connection` takes
+  `pg_try_advisory_xact_lock(SYNC_LOCK_K1, sync_lock_k2(connection))` as its first statement
+  and raises `SyncAlreadyRunning` on refusal, so no two reconciles of one connection overlap,
+  whichever of the callers started them (`knowledge_sources` has no unique (connection_id,
+  external_id): overlap duplicates sources). A `syncing` record is live when the connection is
+  in `_RUNNING`, its key is in `pg_locks` (`sync.live_sync_lock_keys`: mind signed int4 vs
+  unsigned oid), or it is younger than `knowledge_sync_job_start_grace_seconds` (60 s, the gap
+  between the stamp's commit and the job taking the lock). Otherwise it READS as failed
+  ("interrupted"); the row is not rewritten. A job past any age reads syncing and a second start
+  is a 409; an orphan past the grace reads interrupted and admits a start at once. The start, the
+  sweep's skip and both lists use this one rule; a list reads `pg_locks` at most once, only when
+  a row says syncing (`live_keys_for`). A lock first taken inside a SAVEPOINT is released when
+  it rolls back: a caller that must keep it past a failed sync takes it first (the job, the sweep).
+- THE TERMINAL STAMP COMMITS WITH THE OUTCOME. Token refresh is its own short transaction (the
+  reconcile holds no row lock on the connection; a disconnect answers mid-sync). Then: outer
+  transaction, lock, SAVEPOINT around `sync_connection`, evidence writers, the stamp in its own
+  savepoint, commit: data, stamp and lock release become visible together. Evidence writers
+  (`flag_unreachable_site`, `flag_dead_credential`) run AFTER the savepoint rollback released
+  the sync's row locks and BEFORE the stamp, so they cannot deadlock against the outer
+  transaction; the shrink refusal writes its evidence before any write of the sync. The stamp is
+  conditional on `sync_job->>'started_at'`: a cleared or superseded record is never overwritten.
+  A failed stamp rolls back its savepoint, the data commits, and it retries in short
+  transactions with backoff for up to 60 s (`knowledge_sync_job_stamp_lost` at ERROR after).
+- REMOVING A SOURCE STOPS ITS SYNC. `sync_connection` re-reads the status (a column select) after
+  the snapshot, before each item's ingest and before returning; not_connected / revoked raises
+  `SyncStoppedByOwner`, the savepoint unwinds, nothing is kept, outcome `stopped`, inline 409
+  "This source was removed while it was syncing — nothing from that sync was kept." A sync
+  already past its last look also unwinds if its stamp finds the record gone on a removed row.
+  Every path to not_connected / revoked clears `sync_job` (`connections.service.
+  clear_sync_job_on_removal`); every path back to connected clears a terminal record unless a job
+  is live (`clear_job_on_reconnect`); `effective_job` serves None on removed rows; a start on
+  not_connected is a 409 "This source was removed — connect it again to sync it." Known limit: a
+  disconnect AND a reconnect between two of the job's looks lets the running job finish.
+- The sweep stamps the same record (trigger `scheduled`) and commits EACH CONNECTION ON ITS OWN
+  (`sweep._sync_one_connection`, through the job's `reconcile_in_transaction`): fresh status and
+  job read (not `connected`: skip; the pass's list is stale by then); skip if live; lock OUTSIDE
+  the savepoint (refused: skip, no stamp); a conditional `syncing` stamp in its own transaction,
+  refused on a removed row (no row or a failed write: skip); refresh in its own transaction;
+  SAVEPOINT + sync; evidence; stamp; commit. The first design held every connection's data until
+  the tenant's whole pass committed, so a crawl removed while the pass worked on the next
+  connection (or on the maintenance passes) got its pages minutes after "no longer crawled". The
+  tenant's own transaction now holds only the sweep's lock and runs the maintenance passes, each
+  under a SAVEPOINT: they swallow their failures, and a database error there would otherwise turn
+  the tenant's COMMIT into a silent ROLLBACK. If a connection's transaction is lost at its commit,
+  the row is stamped `failed` afterwards (nothing kept, and that is what it says).
+- A removal is reported as a removal, whatever the sync raised: a disconnect deletes the secret,
+  so a snapshot after one raises ProviderUnavailable before the first status look.
+  `reconcile_in_transaction` checks `connection_removed` before settling a failure, and
+  `flag_dead_credential` re-reads the row locked: no status flip, no pause, no D10 clock on a
+  removed row. A dead-credential mark is its own short transaction on both paths, so its row lock
+  never outlives the flip. `ensure_fresh_access_token` re-reads the row locked after its HTTP call
+  and discards the rotation on a removed row (no live token behind `secret_deleted`).
+- A start the lock refuses (the record was NULL, so the start was admitted) answers 409 and CLEARS
+  its own record: the holder's stamp is keyed on its own `started_at` and could never replace a
+  failure written here. A run halted by a pause (`result.halted = "instance_not_serving"`) has
+  outcome `halted`, not `synced`, and carries `halted` on `SyncResultOut` (omitted when None) and on
+  `syncJob.result` (null when it ran): its empty lists mean "not compared".
+- Shutdown (`app/main.py`): ECS `stopTimeout` 60 s = uvicorn `--timeout-graceful-shutdown` 22 +
+  `drain_sync_jobs` 5 + 6, FIRST + poller 10 + background 15. A SIGKILL still leaves no orphan
+  lock: the row reads interrupted past the grace.
+- Graph extractor: the graph call passes `max_output_tokens=GRAPH_MAX_OUTPUT_TOKENS`
+  (4096) through `LLMRouter.complete` (None = unchanged for every other caller). An unusable
+  answer, `truncated` (stop_reason max_tokens / finish_reason length) or simply unparseable, keeps
+  the grammar-only graph AND bumps the revision: re-extracting would cost an LLM call and a
+  re-embed per pass and report the page "updated" with nothing changed. WARNING
+  `graph_extract.llm_truncated` / `llm_unparseable` (extra `reason`). `llm_skipped` is only the
+  budget and cap skips.
+- Tests: `tests/contract/test_knowledge_sync_job.py`, `tests/integration/test_knowledge_sync_lock.py`,
+  `tests/integration/test_knowledge_sync_sweep.py` (sweep stamps / skip / commit order),
+  `tests/integration/test_migration_0077_connection_sync_job.py`,
+  `tests/unit/test_llm_output_ceiling.py`, `tests/unit/test_graph_extract_llm.py`,
+  `tests/unit/test_proxy_headers_launch.py` (the shutdown budget).

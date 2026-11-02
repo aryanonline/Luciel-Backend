@@ -211,7 +211,8 @@ async def test_the_sweep_run_halts_without_marking_the_sources_failed(monkeypatc
     monkeypatch.setattr(knowledge_sweep, "provider_for_connection", lambda c, store: provider)
     later = datetime.now(UTC) + timedelta(days=1)
     async with tenant_session(admin) as s:
-        await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=later)
+        halted = await knowledge_sweep.sync_due_connections(s, admin_id=admin, now=later)
+    assert halted == 0  # compared nothing, so not counted as synced
     assert provider.calls == 1
     assert await _state(admin) == before
 

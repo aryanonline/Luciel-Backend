@@ -390,12 +390,6 @@ async def run_mailbox_poll(*, now: datetime | None = None) -> list[str]:
     return await _per_tenant(MAILBOX_POLL, _poll_mailboxes, now)
 
 
-async def _sync_knowledge(session: AsyncSession, *, admin_id: uuid.UUID, now: datetime) -> int:
-    from app.knowledge.sweep import sync_due_connections  # noqa: PLC0415 — lazy import
-
-    return await sync_due_connections(session, admin_id=admin_id, now=now)
-
-
 async def run_knowledge_sync(*, now: datetime | None = None) -> list[str]:
     """Re-sync due live-sync knowledge connections + re-crawl websites (§3.2.3).
 
@@ -403,8 +397,13 @@ async def run_knowledge_sync(*, now: datetime | None = None) -> list[str]:
     existed but was reachable only from the two MANUAL dashboard routes, so a
     "kept in sync" source was in truth synced exactly as often as the owner
     remembered to click. Cadence per origin: API-delta providers every 6h,
-    website crawl (full re-fetch + diff, the expensive one) every 24h."""
-    return await _per_tenant(KNOWLEDGE_SYNC, _sync_knowledge, now)
+    website crawl (full re-fetch + diff, the expensive one) every 24h.
+
+    Each connection commits on its own, with its stamp (``sweep._sync_one_connection``); this
+    per-tenant transaction holds the sweep's lock and runs the maintenance passes."""
+    from app.knowledge.sweep import sync_due_connections  # noqa: PLC0415
+
+    return await _per_tenant(KNOWLEDGE_SYNC, sync_due_connections, now)
 
 
 async def _deliver_billing_notices(

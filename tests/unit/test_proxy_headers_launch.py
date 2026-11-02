@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 
 import pytest
+from app.config import get_settings
+from app.knowledge import sync_job
 
 _ROOT = Path(__file__).resolve().parents[2]
 _LAUNCH_FILES = {
@@ -67,3 +69,16 @@ def test_ecs_runs_the_entrypoint_that_was_asserted_above():
     """Pins the assumption that makes the entrypoint the production-critical file."""
     stack = (_ROOT / "infra" / "lib" / "compute-stack.ts").read_text(encoding="utf-8")
     assert "scripts/app-entrypoint.sh" in stack
+
+
+@pytest.mark.parametrize("name", sorted(_LAUNCH_FILES))
+def test_uvicorns_graceful_wait_is_bounded_and_outlasts_the_inline_sync_wait(name: str):
+    """Unbounded, a slow request would eat the app's shutdown drain; under 20 s, it would
+    cut a POST in its inline sync wait. Plus the drain, it fits ECS's stopTimeout."""
+    line = _uvicorn_launch_line(_LAUNCH_FILES[name])
+    match = re.search(r"--timeout-graceful-shutdown (\d+)", line)
+    assert match is not None, name
+    graceful = int(match.group(1))
+    assert graceful > get_settings().knowledge_sync_inline_wait_seconds
+    drain = sync_job.DRAIN_WAIT_SECONDS + sync_job.DRAIN_STAMP_SECONDS + 10 + 15
+    assert graceful + drain <= 60

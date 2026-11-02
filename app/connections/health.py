@@ -486,6 +486,11 @@ async def _transition(
     connection.status = new_status
     connection.status_detail = detail
     connection.last_health_check_at = now
+    if new_status == "connected" and old_status != "connected":
+        # Back to connected: the failed sync that said "reconnect it" is over.
+        from app.knowledge.sync_job import clear_job_on_reconnect  # noqa: PLC0415
+
+        await clear_job_on_reconnect(session, connection)
     if new_status != old_status:
         await _audit_status_change(
             session,

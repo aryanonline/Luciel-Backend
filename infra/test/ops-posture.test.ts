@@ -102,6 +102,15 @@ describe("alarms on the app's own metrics and on sweep task failures (F032/F034)
     });
   });
 
+  test('the API containers get 60 s from SIGTERM to SIGKILL, room for the shutdown drain', () => {
+    const { compute } = build('dev');
+    const apiContainers = Object.values(compute.findResources('AWS::ECS::TaskDefinition'))
+      .map((td: any) => td.Properties.ContainerDefinitions[0])
+      .filter((c: any) => c.Command?.includes('scripts/app-entrypoint.sh'));
+    expect(apiContainers).toHaveLength(2); // the control plane and the data plane
+    for (const container of apiContainers) expect(container.StopTimeout).toBe(60);
+  });
+
   test('a sweep task that exits non-zero or never starts is an EventBridge event to the topic', () => {
     const { obs } = build('dev');
     obs.resourceCountIs('AWS::Events::Rule', 2);

@@ -31,7 +31,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +61,11 @@ class ExtractionResult:
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge]
     # True when the LLM pass was owed but deliberately not run (the tenant's per-minute
-    # budget was spoken for — see INGEST_HEADROOM_FRACTION): the result is grammar-only
-    # and the sync leaves the source's revision marker unbumped so the next pass
-    # re-extracts it. A pass that was never owed (a short source, the deterministic
-    # extractor) or that the model answered unusably is not "skipped".
+    # budget was spoken for — see INGEST_HEADROOM_FRACTION — or the cap refused the call):
+    # the result is grammar-only and the sync leaves the source's revision marker unbumped
+    # so the next pass re-extracts it. A pass that was never owed (a short source, the
+    # deterministic extractor) or that the model answered unusably is not "skipped": the
+    # same page would get the same answer, at one LLM call and one re-embed per pass.
     llm_skipped: bool = False
 
 
@@ -222,23 +223,41 @@ _LLM_SYSTEM_PROMPT = (
     "Take every type from the text's own vocabulary; there is no fixed list of types. "
     "Names are short noun phrases as written. Every edge source and target must be an "
     f"entity name from your list. At most {MAX_LLM_ENTITIES} entities and {MAX_LLM_EDGES} "
-    "edges — prefer the ones a customer would ask about. No prose, no markdown fences."
+    "edges — prefer the ones a customer would ask about. No prose, no markdown fences. "
+    "Write the JSON compactly on a single line: no indentation, no line breaks, no "
+    "whitespace outside string values."
 )
 
+#: The graph call's output ceiling (round 7 walk run 8). The providers' 1024 default
+#: truncated the JSON of every long page mid-object (a 1943-token /legal/terms stopped
+#: at output_tokens=1024) and the answer read as unparseable; 4096 holds the capped
+#: graph (``MAX_LLM_ENTITIES`` / ``MAX_LLM_EDGES``) with room to spare.
+GRAPH_MAX_OUTPUT_TOKENS = 4096
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+#: Why an answer could not be read (the ``reason`` on ``graph_extract.llm_unparseable``).
+UnparseableReason = Literal["no_json_object", "json_error"]
+
+
+def graph_json(raw: str) -> tuple[dict[str, Any] | None, UnparseableReason | None]:
+    """The model's JSON object (fence stripped, outermost ``{`` … ``}``) or why there is
+    none: ``no_json_object`` (no braces at all), ``json_error`` (the span does not
+    decode — a truncated answer lands here too). A span that decodes is an object: it
+    starts at a ``{``."""
+    body = _FENCE_RE.sub("", (raw or "").strip())
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        return None, "no_json_object"
+    try:
+        return json.loads(body[start : end + 1]), None
+    except ValueError:
+        return None, "json_error"
 
 
 def parse_llm_graph(raw: str) -> ExtractionResult | None:
     """Strict, capped parse of the model's JSON → ExtractionResult; None when unusable."""
-    body = _FENCE_RE.sub("", (raw or "").strip())
-    start, end = body.find("{"), body.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        data = json.loads(body[start : end + 1])
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
+    data, _reason = graph_json(raw)
+    if data is None:
         return None
 
     entities: dict[str, ExtractedEntity] = {}
@@ -364,17 +383,31 @@ class LlmGraphExtractor:
                 context_tokens=0,
                 complexity=0.0,
                 admin_id=admin_id,
+                max_output_tokens=GRAPH_MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:  # noqa: BLE001 — never let a vendor break ingest
             log.warning("graph_extract.llm_failed", extra={"error": type(exc).__name__})
             # A cap refusal (customer turns filled the window between the headroom
             # read and the admission) is the same budget skip: re-extract next pass.
             return replace(base, llm_skipped=isinstance(exc, LLMCapExceeded))
-        parsed = parse_llm_graph(getattr(resp, "text", "") or "")
-        if parsed is None:
-            log.warning("graph_extract.llm_unparseable")
+        raw = getattr(resp, "text", "") or ""
+        parsed = parse_llm_graph(raw)
+        if parsed is not None:
+            return merge_results(base, parsed)
+        # An unusable answer is NOT a skip, truncated or not: the same page would earn it
+        # again next pass, so re-extracting would cost an LLM call and a re-embed on every
+        # sync and report the page "updated" with nothing changed. The grammar-only graph
+        # is kept and the revision marker bumps; the graph catches up when the page changes.
+        if getattr(resp, "truncated", False):
+            usage = getattr(resp, "usage", None)
+            log.warning(
+                "graph_extract.llm_truncated",
+                extra={"output_tokens": getattr(usage, "output_tokens", None)},
+            )
             return base
-        return merge_results(base, parsed)
+        _data, reason = graph_json(raw)
+        log.warning("graph_extract.llm_unparseable", extra={"reason": reason or "json_error"})
+        return base
 
 
 def ingest_has_headroom(admin_id: uuid.UUID) -> bool:

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import log as audit
 from app.billing import dunning
+from app.connections.service import clear_sync_job_on_removal
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount
 from app.models.connection import NOT_SERVING_STATUSES, QUIESCING, InstanceConnection
@@ -441,6 +442,7 @@ async def restore(session: AsyncSession, admin_id: uuid.UUID, actor_user_id: uui
             # many-active type (knowledge_source) or hand-edited data reaches here.
             if c.status == QUIESCING:
                 c.status = "revoked"
+                clear_sync_job_on_removal(c)
                 c.status_stashed = None
                 c.status_detail_stashed = None
             continue

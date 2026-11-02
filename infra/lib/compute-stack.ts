@@ -640,6 +640,9 @@ export class ComputeStack extends Stack {
         // Entrypoint builds the luciel_app (non-superuser) DB URL from the secret
         // so RLS binds, then execs uvicorn.
         command: ['bash', 'scripts/app-entrypoint.sh'],
+        // SIGTERM to SIGKILL. Fargate's default 30 s would kill the shutdown drain partway:
+        // uvicorn's graceful 22 s + the app's 36 s (app/main.py _lifespan) = 58 s.
+        stopTimeout: Duration.seconds(60),
         logging: ecs.LogDrivers.awsLogs({
           streamPrefix: `luciel-${name}`,
           logGroup: logGroupFor(name),

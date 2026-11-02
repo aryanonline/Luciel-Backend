@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 
 from app.schemas_api.common import WireModel
+from app.schemas_api.knowledge import SyncJobOut
 
 EmailProvisioningModeWire = Literal["own_domain", "vm_subdomain"]
 # The OUT view carries one more mode than the request accepts, deliberately:
@@ -103,6 +104,9 @@ class ConnectionOut(WireModel):
     # to the raw provider string only for a provider absent from the registry
     # entirely (dropped from the catalog) so the field is never empty.
     display_name: str = ""
+    # The knowledge sync job on a knowledge_source row (round 7 walk run 8) — the SAME
+    # record ``SyncConnectionOut.syncJob`` carries; ``None`` on every other row.
+    sync_job: SyncJobOut | None = None
 
 
 class StartConnectionRequest(WireModel):
