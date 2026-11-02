@@ -10,6 +10,7 @@ import * as cw from 'aws-cdk-lib/aws-cloudwatch';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
@@ -61,6 +62,27 @@ export class ObservabilityStack extends Stack {
     if (alertEmail) {
       alarmTopic.addSubscription(new subs.EmailSubscription(alertEmail));
     }
+    // CloudWatch Alarms must be named on this topic's policy. Giving a topic ANY policy
+    // replaces SNS's implicit default, and `targets.SnsTopic` below gives it one naming
+    // only events.amazonaws.com. From 2026-09-06 every alarm action on this topic was
+    // refused ("CloudWatch Alarms is not authorized to perform: SNS:Publish"): an alarm
+    // changed state and nobody was told, while only the raw sweep-exit rule delivered.
+    // Scoped to this account's alarms, so no other AWS customer's alarm can publish here.
+    alarmTopic.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowCloudWatchAlarmsPublish',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
+        actions: ['sns:Publish'],
+        resources: [alarmTopic.topicArn],
+        conditions: {
+          StringEquals: { 'aws:SourceAccount': this.account },
+          ArnLike: {
+            'aws:SourceArn': `arn:${this.partition}:cloudwatch:${this.region}:${this.account}:alarm:*`,
+          },
+        },
+      }),
+    );
 
     if (envConfig.alarmsArmed) {
       // 5xx from the ALB target group - user-facing errors.
