@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.errors import register_error_handlers
-from app.config import get_settings
+from app.config import LOCAL_ENVIRONMENT, get_settings
 from app.jobs.inprocess import mailbox_poll_loop, should_run_inprocess_mailbox_poll
 from app.knowledge.pgvector import installed_version as _pgvector_installed_version
 from app.knowledge.pgvector import too_old_reason as _pgvector_too_old_reason
@@ -213,7 +213,20 @@ def create_app() -> FastAPI:
     install_log_redaction()
     install_structured_logging(settings.log_format)
     install_metrics_logger()
-    app = FastAPI(title="Luciel Backend", version="0.1.0", lifespan=_lifespan)
+    # The API schema and its two viewers exist for a developer's own checkout. Deployed,
+    # they published every admin and webhook path to anyone (a scanner fetched them
+    # 2026-10-29). Any value but the local one serves none of them, so a mistyped
+    # environment stays closed. app.openapi() still works: it reads the routes, not these
+    # URLs. scripts/smoke_probe.sh proves the 404s after each deploy.
+    is_local = settings.environment == LOCAL_ENVIRONMENT
+    app = FastAPI(
+        title="Luciel Backend",
+        version="0.1.0",
+        lifespan=_lifespan,
+        docs_url="/docs" if is_local else None,
+        redoc_url="/redoc" if is_local else None,
+        openapi_url="/openapi.json" if is_local else None,
+    )
 
     # Outermost: every line logged while serving the request carries its trace id.
     app.add_middleware(TraceContext)
