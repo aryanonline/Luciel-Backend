@@ -49,6 +49,7 @@ import { Construct } from 'constructs';
 import { EnvConfig, baseUrls, hostnames, recordIdFor } from './env-config';
 import { ResidencyGuard } from './residency';
 import { scaleOnLoad } from './service-scaling';
+import { SERVICE_TASK_TAGGING } from './cost-tags';
 import { LISTENER_RULE_PRIORITY, SharedIngress } from './compute-stack';
 import { importPublicZone } from './dns-stack';
 
@@ -158,6 +159,7 @@ export class WebStack extends Stack {
       desiredCount: envConfig.paused ? 0 : baseCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      ...SERVICE_TASK_TAGGING,
       // Auto-rollback on a failed deploy (DEVOPS §5.5) — same protection as the
       // backend services (PR #17). Without it a bad/missing image churns for hours.
       circuitBreaker: { rollback: true },

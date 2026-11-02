@@ -39,6 +39,7 @@ import {
 } from './env-config';
 import { importPublicZone } from './dns-stack';
 import { scaleOnLoad } from './service-scaling';
+import { SERVICE_TASK_TAGGING } from './cost-tags';
 
 export interface ComputeStackProps extends StackProps {
   readonly envConfig: EnvConfig;
@@ -749,6 +750,7 @@ export class ComputeStack extends Stack {
       desiredCount: dataCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      ...SERVICE_TASK_TAGGING,
       // Auto-rollback on a failed deploy (DEVOPS §5.5). Without this, a deploy whose
       // tasks never reach healthy churns for up to 3h instead of failing fast.
       circuitBreaker: { rollback: true },
@@ -762,6 +764,7 @@ export class ComputeStack extends Stack {
       desiredCount: controlCount,
       securityGroups: [appSg],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      ...SERVICE_TASK_TAGGING,
       circuitBreaker: { rollback: true },
       minHealthyPercent: 100,
     });
