@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -210,6 +211,16 @@ case "$1 $2" in
     reads=$(cat "$FAKE_STATE/log_reads" 2>/dev/null || echo 0)
     reads=$((reads + 1))
     echo "$reads" > "$FAKE_STATE/log_reads"
+    # Only the log group and stream the task definition writes exist (F174: a lookup that
+    # asked for anything else silently matched nothing).
+    case "$*" in
+      *"--log-group-name /luciel/dev/seedtest "*) ;;
+      *) echo "An error occurred (ResourceNotFoundException): no such log group" >&2; exit 254 ;;
+    esac
+    case "$*" in
+      *"--log-stream-names luciel-seedtest/SeedTestContainer/abc123 "*) ;;
+      *) echo "An error occurred (ResourceNotFoundException): no such log stream" >&2; exit 254 ;;
+    esac
     case "${FAKE_LOGS:-ok}" in
       ok) cat "$FAKE_STATE/logs.json" ;;
       denied)
@@ -344,6 +355,30 @@ def test_the_runner_end_to_end(
     else:
         assert tail[-2] == summary and "probe PASSED" in tail[-1]
     assert f"`{summary}`" in step_summary.read_text(encoding="utf-8")
+
+
+def test_the_runner_reads_the_log_group_and_stream_the_task_definition_writes() -> None:
+    """An awslogs stream is <streamPrefix>/<container name>/<task id>. Rename either half
+    in compute-stack.ts and the strict gate reads nothing and fails a healthy release."""
+    stack = (seedtest_harness.ROOT / "infra" / "lib" / "compute-stack.ts").read_text(
+        encoding="utf-8"
+    )
+    found = re.search(
+        r"seedTestTask\.addContainer\('(?P<container>\w+)'.*?"
+        r"streamPrefix: '(?P<prefix>[\w-]+)'.*?"
+        r"logGroup: logGroupFor\('(?P<group>\w+)'\)",
+        stack,
+        re.DOTALL,
+    )
+    assert found is not None, "the SeedTest container's log configuration moved"
+    assert "logGroupName: `/luciel/${envConfig.envName}/${name}`" in stack
+    runner = seedtest_harness.RUNNER.read_text(encoding="utf-8")
+    assert f'log_group="/luciel/${{ENVIRONMENT}}/{found["group"]}"' in runner
+    assert f'stream="{found["prefix"]}/{found["container"]}/${{taskid}}"' in runner
+    # And the fake aws answers only for that pair, for the dev environment and task abc123.
+    assert f"--log-group-name /luciel/dev/{found['group']} " in FAKE_AWS
+    stream = f"{found['prefix']}/{found['container']}/abc123"
+    assert f"--log-stream-names {stream} " in FAKE_AWS
 
 
 # --- the strict gate reads the SUMMARY or fails (round 7 fact check, 2026-10-25) ---- #
