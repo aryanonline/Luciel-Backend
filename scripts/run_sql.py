@@ -9,10 +9,10 @@ Everything else is plain SQL executed as one script (autocommit, ON_ERROR_STOP).
 Usage:
   run_sql.py --dsn <libpq-dsn> --file scripts/bootstrap_roles.sql [--app-password PW]
 """
+
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 
 import psycopg

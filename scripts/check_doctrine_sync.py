@@ -78,8 +78,9 @@ def check_anchors_present() -> list[str]:
 
 
 def changed_files(base: str) -> list[str]:
-    out = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}...HEAD"],
+    # Fixed argv (no shell); `git` resolves from PATH on the CI runner.
+    out = subprocess.run(  # noqa: S603
+        ["git", "diff", "--name-only", f"{base}...HEAD"],  # noqa: S607
         cwd=ROOT,
         capture_output=True,
         text=True,
