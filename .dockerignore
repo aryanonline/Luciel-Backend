@@ -11,6 +11,9 @@ tests
 htmlcov
 .coverage
 *.log
-AUDIT_FINDINGS.md
 .env
 .secrets.baseline
+.claude
+# The CDK app (synth output, account context, node_modules) is never read inside the
+# image; the smoke probe that uses infra/ runs on the CI runner.
+infra
