@@ -211,10 +211,11 @@ jobs:
   # no one. It now lands on the month's "Dependency & CVE review YYYY-MM" issue, the
   # one the monthly steward routine reads (same title as image-rebuild.yml and
   # dependency-review.yml, via scripts/post_review_issue.sh). Only a scheduled run
-  # that did not succeed posts; pushes and PRs report on themselves.
+  # in which quality-gate or infra did not succeed posts; pushes and PRs report on
+  # themselves.
   report-scheduled-failure:
-    needs: quality-gate
-    if: always() && github.event_name == 'schedule' && needs.quality-gate.result != 'success'
+    needs: [quality-gate, infra]
+    if: always() && github.event_name == 'schedule' && (needs.quality-gate.result != 'success' || needs.infra.result != 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -232,16 +233,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          RESULT: ${{ needs.quality-gate.result }}
+          GATE_RESULT: ${{ needs.quality-gate.result }}
+          INFRA_RESULT: ${{ needs.infra.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           # The run is still in progress (this job is part of it), so read the
-          # finished quality-gate JOB through the API rather than `gh run view --log`.
+          # finished quality-gate and infra JOBS through the API rather than
+          # `gh run view --log`.
           jobs=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" || echo '{"jobs":[]}')
-          failed=$(jq -r '.jobs[] | select(.name == "quality-gate") | .steps[]
-                          | select(.conclusion == "failure") | "- " + .name' <<<"$jobs" || true)
-          job=$(jq -r '[.jobs[] | select(.name == "quality-gate")][0].id // empty' <<<"$jobs" || true)
+          failed=$(jq -r '.jobs[] | select(.name == "quality-gate" or .name == "infra")
+                          | .name as $job | .steps[]
+                          | select(.conclusion == "failure") | "- " + $job + ": " + .name' <<<"$jobs" || true)
+          # The first of the two jobs that did not succeed supplies the log excerpt.
+          job=$(jq -r '[.jobs[] | select((.name == "quality-gate" or .name == "infra")
+                          and .conclusion != "success")][0].id // empty' <<<"$jobs" || true)
           # The 40 log lines before the first error annotation: the failing step's tail
           # (pip-audit's vulnerable package, bandit's finding, the failing test).
           # curl, not `gh api`: the log carries ANSI colour codes, which gh refuses to
@@ -254,9 +260,9 @@ jobs:
                     | sed -E 's/^[0-9-]+T[0-9:.]+Z //; s/\x1b\[[0-9;]*m//g' | cut -c1-300 || true)
           fi
           {
-            echo "### Daily CI (scheduled) — **$RESULT** — $(date -u +%Y-%m-%d)"
+            echo "### Daily CI (scheduled) — quality-gate **$GATE_RESULT**, infra **$INFRA_RESULT** — $(date -u +%Y-%m-%d)"
             echo
-            echo "The daily run of the release branch did not pass ([run $RUN_ID]($RUN_URL)). It runs pip-audit, bandit and the secret scan every day so a CVE published on a quiet week is caught without a push; fix it, or record the review here."
+            echo "The daily run of the release branch did not pass ([run $RUN_ID]($RUN_URL)). It runs pip-audit, bandit, the secret scan and the CDK assertions every day so a CVE published on a quiet week is caught without a push; fix it, or record the review here."
             echo
             echo "Failed step(s):"
             echo "${failed:-"- (none recorded — cancelled or timed out?)"}"

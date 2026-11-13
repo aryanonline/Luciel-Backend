@@ -59,13 +59,20 @@ def test_the_poster_uses_the_title_the_steward_reads_and_matches_it_exactly():
 def test_ci_posts_only_a_scheduled_run_that_did_not_succeed():
     ci = _workflow("ci.yml")
     job = ci["jobs"]["report-scheduled-failure"]
-    assert job["needs"] == "quality-gate"
+    # Both jobs the daily schedule runs: a red infra-only run must post too.
+    assert job["needs"] == ["quality-gate", "infra"]
     condition = job["if"]
     assert "always()" in condition
     assert "github.event_name == 'schedule'" in condition
     assert "needs.quality-gate.result != 'success'" in condition
+    assert "needs.infra.result != 'success'" in condition
+    run = "\n".join(step.get("run", "") for step in job["steps"])
+    assert '.name == "quality-gate" or .name == "infra"' in run, "jq must read both jobs"
+    env = next(step["env"] for step in job["steps"] if step.get("env"))
+    assert env["GATE_RESULT"] == "${{ needs.quality-gate.result }}"
+    assert env["INFRA_RESULT"] == "${{ needs.infra.result }}"
     assert job["permissions"] == {"contents": "read", "actions": "read", "issues": "write"}
-    # The workflow's other job keeps the default token: no workflow-level grant.
+    # The workflow's other jobs keep the default token: no workflow-level grant.
     assert "permissions" not in ci
     assert "17 6 * * *" in [entry["cron"] for entry in ci[True]["schedule"]]
 
