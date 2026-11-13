@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -10,3 +12,7 @@ dist/
 build/
 .coverage
 htmlcov/
+.DS_Store
+*.log
+# Claude Code worktrees and local settings
+.claude/
