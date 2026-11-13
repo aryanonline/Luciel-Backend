@@ -1,8 +1,9 @@
 """Email channel adapter — per-tenant sender identity + inbound resolution (§3.1.6a).
 
 The adapter must send FROM the tenant's provisioned address (threaded via
-``OutboundMessage.metadata["sender_identity"]``), not the hardcoded platform
-fallback. Two tenants therefore send from two different addresses. Inbound
+``OutboundMessage.metadata["sender_identity"]``); there is no platform fallback
+address, so a message without one fails closed before the provider is called. Two
+tenants therefore send from two different addresses. Inbound
 resolution keys on the recipient address, resolved to exactly one tenant (§3.1.3).
 """
 
@@ -54,7 +55,6 @@ async def test_send_uses_per_tenant_identity_not_fallback():
         )
     )
     assert sender.sent[0][0] == "acme@acme.example"
-    assert sender.sent[0][0] != adapter._fallback_identity
 
 
 async def test_two_tenants_send_from_two_addresses():
@@ -69,10 +69,18 @@ async def test_two_tenants_send_from_two_addresses():
     assert senders == {"t1@one.example", "t2@two.example"}
 
 
-async def test_send_falls_back_only_when_no_identity_configured():
+@pytest.mark.parametrize("metadata", [{}, {"sender_identity": ""}, {"sender_identity": None}])
+async def test_send_without_a_sender_identity_fails_closed(metadata: dict[str, object]) -> None:
     adapter, sender = _adapter()
-    await adapter.send(OutboundMessage(channel="email", to="lead@x.com", body="hi"))
-    assert sender.sent[0][0] == adapter._fallback_identity
+    receipt = await adapter.send(
+        OutboundMessage(channel="email", to="lead@x.com", body="hi", metadata=metadata)
+    )
+    # No platform fallback address: nothing reaches the provider and the receipt says
+    # why, with no provider message id to mistake for a send.
+    assert sender.sent == []
+    assert receipt.accepted is False
+    assert receipt.provider_message_id is None
+    assert receipt.detail == "no_sender_identity"
 
 
 async def test_inbound_resolves_recipient_to_tenant():

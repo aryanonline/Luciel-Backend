@@ -314,5 +314,12 @@ async def test_email_adapter_send():
     adapter = EmailAdapter(
         FakeSes(), sns_verifier=type("V", (), {"verify": lambda self, m: True})()
     )
-    receipt = await adapter.send(OutboundMessage(channel="email", to="lead@x.com", body="hello"))
+    receipt = await adapter.send(
+        OutboundMessage(
+            channel="email",
+            to="lead@x.com",
+            body="hello",
+            metadata={"sender_identity": "frontdesk@acme.example"},
+        )
+    )
     assert receipt.accepted and receipt.provider_message_id == "ses-msg-1"

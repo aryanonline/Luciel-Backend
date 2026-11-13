@@ -5,9 +5,11 @@ address resolves to the tenant (§3.1.3). SPF/DKIM/DMARC results from SES are
 carried in metadata; a matching From address NEVER authorizes PII disclosure
 (§3.4.9). Outbound: sent via SES on the TENANT'S provisioned sender identity — the
 per-tenant address stored on the email_sender connection (§3.1.6a / Decision #49),
-threaded in via ``OutboundMessage.metadata["sender_identity"]``. The hardcoded
-platform address is only a last-resort fallback when no address is configured; the
-tenant's configured address always wins.
+threaded in via ``OutboundMessage.metadata["sender_identity"]``. There is no
+platform fallback address: a message without a sender identity fails closed
+(``DeliveryReceipt(accepted=False, detail="no_sender_identity")``) and never reaches
+the provider, because a reply from a platform address would be unreplyable and
+unrecognizable to the customer.
 
 The SES/SNS HTTP/SDK calls are abstracted behind an injected sender so the adapter
 is testable; real binding happens in deployment.
@@ -74,10 +76,6 @@ class EmailAdapter:
     def __init__(self, sender: EmailSender, sns_verifier: SnsVerifier) -> None:
         self._sender = sender
         self._sns = sns_verifier
-        # Last-resort fallback ONLY (§3.1.6a): the authoritative sender is the tenant's
-        # provisioned address, passed per-message via metadata["sender_identity"]. This
-        # default is used only when a tenant has no email address configured.
-        self._fallback_identity: str = "luciel@inbound.vantagemind.com"
 
     async def verify_inbound(self, request: dict[str, Any]) -> InstanceContext:
         # request carries the parsed SNS envelope + resolver callback.
@@ -124,9 +122,12 @@ class EmailAdapter:
         )
 
     async def send(self, message: OutboundMessage) -> DeliveryReceipt:
-        # The tenant's provisioned address (§3.1.6a) wins; the platform default is a
-        # fallback used only when no per-tenant identity was threaded through.
-        sender = message.metadata.get("sender_identity") or self._fallback_identity
+        # The tenant's provisioned address (§3.1.6a) is the only FROM identity. Without
+        # one the send fails closed before the provider is called: live delivery never
+        # falls back to a platform address (honest delivery, no silent SES fallback).
+        sender = message.metadata.get("sender_identity")
+        if not sender:
+            return DeliveryReceipt(accepted=False, detail="no_sender_identity")
         subject = message.metadata.get("subject", "Re: your inquiry")
         # True threading on the legacy SES path (round 7 WP-3b, item 2): the reply
         # hangs under the customer's own message when its Message-ID is known.
