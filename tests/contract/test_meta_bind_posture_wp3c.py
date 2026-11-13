@@ -36,7 +36,7 @@ from tests.contract.test_connection_lifecycle import (
     _resolves_to,
 )
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 class _EveryId(set):

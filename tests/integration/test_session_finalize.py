@@ -20,8 +20,6 @@ from app.models.instance import Instance, LucielState
 from app.runtime.session_close import finalize_due_sessions, finalize_session
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)
 
 

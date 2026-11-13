@@ -15,8 +15,6 @@ import logging
 import pytest
 from app.notifications import escalation_dispatch
 
-pytestmark = [pytest.mark.asyncio]
-
 _LOGGER = "app.notifications.escalation_dispatch"
 
 

@@ -26,7 +26,7 @@ import httpx
 import pytest
 from app.config import INSTAGRAM_GRAPH_HOST, meta_graph_base
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 CALLBACK = "/api/v1/connections/instagram/callback"
 RETURN_URL = "http://127.0.0.1:3000/dashboard/configure"

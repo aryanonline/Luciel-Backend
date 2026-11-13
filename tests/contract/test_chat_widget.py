@@ -17,7 +17,7 @@ from app.db.session import tenant_session
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime import budget
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _seed_active_instance(*, personality: dict | None = None) -> tuple[uuid.UUID, str]:

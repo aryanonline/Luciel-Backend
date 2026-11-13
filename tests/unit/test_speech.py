@@ -16,8 +16,6 @@ from app.runtime.speech import (
     Transcription,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def test_echo_stt_treats_audio_ref_as_transcript():
     # Twilio supplies a server-side transcript (SpeechResult); the Echo STT models that

@@ -33,7 +33,7 @@ from app.models.voice import VoiceCallRecord
 from app.runtime.voice_pipeline import VOICE_UNAVAILABLE_REPLY
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 BYO_NUMBER = "+14155550188"
 CALLER = "+16045550107"

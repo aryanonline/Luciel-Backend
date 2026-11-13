@@ -14,8 +14,6 @@ import pytest
 from app.connections import registry, verify
 from app.connections.verify import POST_EXCHANGE_VERIFIERS, PostExchangeVerifyFailed
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class _Resp:
     def __init__(self, status: int, payload: Any) -> None:

@@ -16,8 +16,6 @@ from app.knowledge import sync
 from app.knowledge.sync import RemoteItem, RemoteSnapshot, SyncAlreadyRunning
 from sqlalchemy import text
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _uuid_with_prefix(prefix: str) -> uuid.UUID:
     return uuid.UUID(prefix + uuid.uuid4().hex[8:])

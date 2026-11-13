@@ -23,8 +23,6 @@ from app.runtime import memory, provider_factory
 from app.runtime.llm_cap import LLMCapExceeded
 from app.runtime.llm_router import LLMResponse, ModelClass, ProviderError
 
-pytestmark = [pytest.mark.asyncio]
-
 ADMIN = uuid.uuid4()
 
 

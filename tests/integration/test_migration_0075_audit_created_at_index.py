@@ -25,8 +25,6 @@ from sqlalchemy import text
 from tests import conftest
 from tests.conftest import superuser_exec
 
-pytestmark = [pytest.mark.asyncio]
-
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _REVISION = "0075_audit_created_at_index"
 _INDEX = "ix_audit_created_at"

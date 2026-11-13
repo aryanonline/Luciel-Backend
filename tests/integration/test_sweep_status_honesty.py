@@ -27,8 +27,6 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 # Round 7 WP-4a item 3 (owner ruling 2026-09-14): pending_carrier_registration and
 # not_operable_hosting_required moved to the sweep's PROBE-ONLY allowlist — the
 # credential behind them is re-checked (a text can leave on a pending row), but a

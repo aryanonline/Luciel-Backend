@@ -27,8 +27,6 @@ from app.notifications import email_notifier
 from app.notifications.escalation_dispatch import ESCALATION_RETRY_ACTION, notify_escalation
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 # ``notify_escalation`` enqueues on the wall clock, so the sweep clock is derived from
 # it rather than pinned to a literal date that would never be due.
 SETTLED = timedelta(seconds=5)

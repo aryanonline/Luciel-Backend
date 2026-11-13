@@ -24,8 +24,6 @@ from app.models.conversation import Session as ConvSession
 from app.models.instance import Instance, LucielState
 from sqlalchemy import func, select, update
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin_id: uuid.UUID, instance_id: uuid.UUID) -> None:
     async with tenant_session(admin_id) as s:

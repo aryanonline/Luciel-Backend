@@ -16,8 +16,6 @@ from app.tools.broker import ToolBroker
 from app.tools.contract import Outcome
 from app.tools.registry import build_tool
 
-pytestmark = [pytest.mark.asyncio]
-
 EVENT_TYPE = "https://api.calendly.com/event_types/ET-walk"
 USER = "https://api.calendly.com/users/U-walk"
 # A week ahead of the wall clock: find_bookings searches forward from now, so a fixed

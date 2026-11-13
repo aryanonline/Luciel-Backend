@@ -18,7 +18,7 @@ from app.lifecycle.export_store import LocalExportStore
 from app.models.audit import AdminAuditLog
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_verify_login(client) -> uuid.UUID:

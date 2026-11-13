@@ -30,8 +30,6 @@ from app.runtime.sessions import participant_key_for
 from app.schemas_api.conversations import HumanReplyRequest
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 PHONE_A = "+14165550111"  # the number Jane's record is keyed on
 PHONE_B = "+14165550222"  # the number this conversation is on
 TENANT_NUMBER = "+15550001111"

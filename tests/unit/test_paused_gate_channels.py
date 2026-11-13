@@ -23,8 +23,6 @@ from app.models.conversation import Session as ConvSession
 from app.models.instance import Instance, LucielState, is_paused
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 NON_SERVING = (
     LucielState.paused,
     LucielState.luciel_grace_window,

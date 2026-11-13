@@ -25,8 +25,6 @@ from app.connections.probes import (
 )
 from app.models.connection import InstanceConnection
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _conn(
     provider: str,

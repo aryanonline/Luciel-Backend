@@ -29,8 +29,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime.budget import current_billing_period_start
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 PERIOD_START = datetime.combine(current_billing_period_start(), time.min, tzinfo=UTC)
 
 

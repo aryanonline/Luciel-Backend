@@ -34,8 +34,6 @@ from app.models.knowledge import KnowledgeSource
 from app.models.notice_delivery import NoticeDelivery
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 GRAPH_TEXT = """
 Platform (Department)

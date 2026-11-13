@@ -30,8 +30,6 @@ from app.tools.broker import ToolBroker
 from app.tools.contract import ToolContext, ToolResult
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 PHONE = "+15551234567"
 EMAIL = "jane@example.com"
 SLOT = "2026-10-01T14:00:00+00:00"

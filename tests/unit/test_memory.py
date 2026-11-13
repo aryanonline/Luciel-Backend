@@ -10,8 +10,6 @@ from app.models.conversation import Transcript
 from app.runtime import memory
 from app.runtime.sessions import can_carry_cross_session_memory
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _t(role: str, text: str) -> Transcript:
     return Transcript(

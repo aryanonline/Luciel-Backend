@@ -28,8 +28,6 @@ from app.models.internal_access import InternalAccessLog
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 
-pytestmark = [pytest.mark.asyncio]
-
 AUDIT_TABLES = ["admin_audit_log", "internal_access_log"]
 
 

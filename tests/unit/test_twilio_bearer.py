@@ -9,7 +9,6 @@ UNKNOWN / False), never a fabricated success.
 
 from __future__ import annotations
 
-import pytest
 from app.channels.number_operability import OperabilityResult
 from app.channels.tenant_twilio import WebhookUrls
 from app.channels.twilio_bearer import (
@@ -19,8 +18,6 @@ from app.channels.twilio_bearer import (
     list_incoming_numbers,
     resource_exists,
 )
-
-pytestmark = [pytest.mark.asyncio]
 
 ACCOUNT = "AC" + "9" * 32
 

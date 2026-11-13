@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 from app.config import get_settings
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 ROUTE = "/api/v1/public/config"
 KEYS = {"hcaptchaSiteKey", "appBaseUrl", "apiBaseUrl", "widgetEmbedUrl"}

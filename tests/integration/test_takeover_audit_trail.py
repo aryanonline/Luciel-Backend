@@ -24,8 +24,6 @@ from app.runtime.budget import count_session_once
 from app.runtime.session_close import finalize_due_sessions
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
 
 

@@ -30,8 +30,6 @@ from app.runtime import handoff
 from app.runtime.orchestrator import AT_CAP_REPLY
 from sqlalchemy import func, select, update
 
-pytestmark = [pytest.mark.asyncio]
-
 TEXT_CHANNELS = ["sms", "email", "whatsapp", "messenger", "instagram"]
 
 

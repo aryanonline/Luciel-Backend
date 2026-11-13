@@ -26,8 +26,6 @@ from app.knowledge.providers import (
     WebsiteCrawlProvider,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 PUBLIC_BY_HOST = {
     "acme.example": "93.184.216.34",
     "www.acme.example": "93.184.216.35",

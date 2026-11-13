@@ -29,8 +29,6 @@ from app.runtime.orchestrator import AT_CAP_REPLY, LoopResult, Orchestrator
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class CountingEcho(EchoModel):
     """EchoModel that counts how many times the loop actually reached the model."""

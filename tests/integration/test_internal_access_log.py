@@ -28,8 +28,6 @@ from app.models.audit import AdminAuditLog
 from app.models.internal_access import InternalAccessLog
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_emit_internal_access_persists_row():

@@ -29,8 +29,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 FIRST = [
     RemoteItem(external_id="doc1", name="Hours", text="open weekdays nine to five", revision="r1"),
     RemoteItem(external_id="doc2", name="Prices", text="consultation costs 120", revision="r1"),

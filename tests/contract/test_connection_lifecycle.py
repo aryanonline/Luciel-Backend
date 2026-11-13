@@ -20,7 +20,7 @@ import uuid
 import pytest
 from app.config import meta_graph_base
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account_with_luciel(client) -> None:

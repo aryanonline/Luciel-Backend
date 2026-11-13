@@ -21,7 +21,7 @@ from app.models.instance import Instance, LucielState
 from app.runtime import budget as budget_runtime
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_verify_login(client) -> uuid.UUID:

@@ -20,7 +20,7 @@ from app.config import get_settings
 from app.db.session import tenant_session
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 BYO_NUMBER = "+14155550123"
 URL = "http://test/api/v1/webhooks/twilio/sms"

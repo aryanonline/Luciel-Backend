@@ -16,8 +16,6 @@ from app.models.instance import Instance, LucielState
 from app.models.knowledge import KnowledgeChunk
 from sqlalchemy import select, update
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

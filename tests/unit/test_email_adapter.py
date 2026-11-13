@@ -15,8 +15,6 @@ import pytest
 from app.channels.base import InstanceContext, OutboundMessage
 from app.channels.email_adapter import EmailAdapter
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class _CapturingSender:
     def __init__(self) -> None:

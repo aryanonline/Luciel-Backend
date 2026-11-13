@@ -25,7 +25,7 @@ from app.db.session import tenant_session
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select, update
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 PASSWORD = "pw-123456"  # noqa: S105 — test fixture credential
 

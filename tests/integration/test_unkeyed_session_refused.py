@@ -33,8 +33,6 @@ from app.models.instance import Instance, LucielState
 from app.runtime.sessions import SessionUnkeyable, resolve_or_open_session
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 TRANSPORT_KEYED_CHANNELS = ("sms", "email", "whatsapp", "messenger", "instagram", "voice")
 
 

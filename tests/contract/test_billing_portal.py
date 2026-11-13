@@ -39,7 +39,7 @@ from app.models.instance import Instance, LucielState
 from app.runtime.budget import current_billing_period_start
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_verify_login(client) -> uuid.UUID:

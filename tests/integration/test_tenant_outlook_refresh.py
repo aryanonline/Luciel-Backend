@@ -28,8 +28,6 @@ from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 
 

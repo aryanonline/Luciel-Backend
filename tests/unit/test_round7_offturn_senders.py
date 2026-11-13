@@ -11,11 +11,8 @@ from __future__ import annotations
 
 import threading
 
-import pytest
 from app.channels.twilio_sender import TwilioSmsSender
 from app.notifications.email_sender import SesEmailSender
-
-pytestmark = [pytest.mark.asyncio]
 
 
 class _FakeSesClient:

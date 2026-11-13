@@ -41,8 +41,6 @@ from app.tools import crm_backend
 from app.tools.registry import make_tool_resolver
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 SMS_FROM = "+14165550143"
 
 

@@ -27,8 +27,6 @@ from app.tools.contract import Outcome
 from app.tools.registry import CONNECTION_GATED_TOOL_IDS, build_tool
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @dataclass
 class _Toggle:

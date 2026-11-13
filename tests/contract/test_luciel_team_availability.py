@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 PUT = "/api/v1/admin/luciel/team-availability"
 

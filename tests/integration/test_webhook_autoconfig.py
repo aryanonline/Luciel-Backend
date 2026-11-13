@@ -31,8 +31,6 @@ from app.models.audit import AdminAuditLog
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NUM = "+16045550190"
 BASE = "https://api.vantagemind.test"
 

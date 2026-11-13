@@ -19,8 +19,6 @@ from app.models.conversation import Session as ConvSession
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 PAGE_ID = "page-4242"
 PSID = "psid-9001"
 

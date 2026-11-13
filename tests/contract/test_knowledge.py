@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account_with_luciel(client) -> uuid.UUID:

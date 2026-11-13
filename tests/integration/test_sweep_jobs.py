@@ -18,7 +18,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from app.auth import reaper
 from app.billing import dunning
 from app.db.session import tenant_session
@@ -30,8 +29,6 @@ from app.models.connection import InstanceConnection
 from app.models.conversation import Transcript
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
-
-pytestmark = [pytest.mark.asyncio]
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 

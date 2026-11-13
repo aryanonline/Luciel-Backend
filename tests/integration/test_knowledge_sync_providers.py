@@ -17,8 +17,6 @@ from app.knowledge import service, sync
 from app.knowledge.providers import HubSpotProvider, WebsiteCrawlProvider
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class FakeSecretStore:
     def __init__(self, material: dict[str, dict[str, str]] | None = None) -> None:

@@ -30,8 +30,6 @@ from app.runtime.speech import (
 
 from tests.unit.live_settings import live_settings
 
-pytestmark = [pytest.mark.asyncio]
-
 
 # --- WhisperSpeechToText ---------------------------------------------------- #
 async def test_whisper_stt_transcribes_via_mocked_openai_client():

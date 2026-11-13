@@ -22,8 +22,6 @@ from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _no_chunks(_q: str) -> list[str]:
     return []

@@ -23,8 +23,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeSource
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class FakeSecretStore:
     def __init__(self) -> None:

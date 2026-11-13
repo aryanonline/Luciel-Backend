@@ -18,8 +18,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin_id: uuid.UUID) -> uuid.UUID:
     async with tenant_session(admin_id) as s:

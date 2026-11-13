@@ -14,7 +14,7 @@ import uuid
 import pytest
 from app.channels import rate_limit
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 def _email() -> str:

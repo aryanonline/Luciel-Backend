@@ -18,8 +18,6 @@ from app.connections import service
 from app.db.session import tenant_session
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_tenant(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

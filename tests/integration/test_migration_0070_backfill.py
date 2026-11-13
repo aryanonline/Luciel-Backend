@@ -25,8 +25,6 @@ from sqlalchemy import text
 
 from tests.conftest import APP_USER, _admin_psql
 
-pytestmark = [pytest.mark.asyncio]
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PREVIOUS = "0069_sms_contact_confirmation"
 

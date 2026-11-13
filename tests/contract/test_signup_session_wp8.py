@@ -12,8 +12,6 @@ import uuid
 import pytest
 from app.config import get_settings
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _email() -> str:
     return f"wp8-{uuid.uuid4().hex[:10]}@example.com"

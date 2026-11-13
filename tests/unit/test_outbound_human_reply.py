@@ -16,8 +16,6 @@ from app.connections.secrets import secret_ref_for
 from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_sms_sender(admin: uuid.UUID, instance: uuid.UUID, number: str) -> None:
     async with tenant_session(admin) as s:

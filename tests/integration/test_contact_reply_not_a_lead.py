@@ -40,8 +40,6 @@ from sqlalchemy import func, select
 
 from tests.conftest import superuser_exec
 
-pytestmark = [pytest.mark.asyncio]
-
 BYO_NUMBER = "+15551239999"
 PRIMARY_CONTACT = "+15550000009"
 AFTER_HOURS_CONTACT = "+15550000010"

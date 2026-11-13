@@ -40,8 +40,6 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 # Every (connection_type, provider) the owner can actually pick (display order).
 _TYPES = (
     "calendar",

@@ -17,7 +17,7 @@ from app.db.session import tenant_session
 from app.lifecycle import state_machine
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _seed() -> tuple[uuid.UUID, str]:

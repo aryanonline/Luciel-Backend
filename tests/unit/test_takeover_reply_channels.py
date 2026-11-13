@@ -23,8 +23,6 @@ from app.connections.secrets import secret_ref_for
 from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 
-pytestmark = [pytest.mark.asyncio]
-
 LEAD_EMAIL = "dana@lead.example"
 TENANT_EMAIL = "hello@acmepatios.example"
 PAGE_ID = "page-77"

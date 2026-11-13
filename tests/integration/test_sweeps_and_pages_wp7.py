@@ -21,8 +21,6 @@ from app.models.conversation import Session as SessionModel
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead, LeadState
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

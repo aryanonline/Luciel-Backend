@@ -5,15 +5,12 @@ tests/integration/test_number_operability.py's SMS probe coverage.
 
 from __future__ import annotations
 
-import pytest
 from app.channels.email_routing import (
     DnsMxProbe,
     MxDelegationResult,
     NullMxProbe,
     build_mx_probe,
 )
-
-pytestmark = [pytest.mark.asyncio]
 
 _EXPECTED_MX = "inbound.vantagemind.ai"
 

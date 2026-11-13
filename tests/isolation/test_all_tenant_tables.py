@@ -18,7 +18,7 @@ from app.db.rls import tenant_table_names
 from app.db.session import tenant_session
 from sqlalchemy import select, text
 
-pytestmark = [pytest.mark.isolation, pytest.mark.asyncio]
+pytestmark = [pytest.mark.isolation]
 
 
 def _tenant_models() -> list[type]:

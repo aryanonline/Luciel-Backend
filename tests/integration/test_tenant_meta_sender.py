@@ -31,8 +31,6 @@ from app.models.connection import InstanceConnection
 
 from tests.unit.live_settings import LIVE_PLATFORM_SECRET
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.fixture
 def live(monkeypatch: pytest.MonkeyPatch):

@@ -21,7 +21,7 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _seed_capability_tenant(number: str) -> uuid.UUID:

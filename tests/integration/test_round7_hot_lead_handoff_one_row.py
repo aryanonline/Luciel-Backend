@@ -35,8 +35,6 @@ from app.runtime.orchestrator import _HANDOFF_ACK_MARK, HANDOFF_REASON, Orchestr
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 OWNER_EMAIL = "owner@drones.example"
 CONTACT = "sales@drones.example"
 #: The SeedTest M3 message (scripts/seed_and_livetest.py HOT_UNGROUNDED_QUESTION).

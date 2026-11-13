@@ -21,8 +21,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import escalation_dispatch
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
     async with tenant_session(admin) as s:

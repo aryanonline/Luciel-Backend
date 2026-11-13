@@ -28,7 +28,7 @@ from tests.contract.test_outlook_mailbox_connect import (
     _row,
 )
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _connect_outlook(client) -> str:

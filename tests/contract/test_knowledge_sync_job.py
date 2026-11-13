@@ -55,7 +55,6 @@ from tests.contract.test_dashboard import _signup_verify_login
 
 pytestmark = [
     pytest.mark.contract,
-    pytest.mark.asyncio,
     pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset"),
 ]
 

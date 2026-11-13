@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_verify_login(client) -> str:

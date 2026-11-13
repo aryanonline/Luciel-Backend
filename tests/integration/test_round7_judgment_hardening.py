@@ -34,8 +34,6 @@ from app.tools import contract as tool_contract
 from app.tools.contract import ToolResult
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 UNCOVERED = "do you also do crown lengthening?"
 GUESS = "Yes — crown lengthening is $650 and takes about an hour."
 

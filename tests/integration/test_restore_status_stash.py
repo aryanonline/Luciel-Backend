@@ -18,8 +18,6 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_instance(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

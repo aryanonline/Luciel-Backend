@@ -28,8 +28,6 @@ from app.notifications.escalation_dispatch import notify_escalation
 from app.runtime.orchestrator import ASK_ATTEMPT_BOUND
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 OWNER_EMAIL = "owner@acme.example"
 
 

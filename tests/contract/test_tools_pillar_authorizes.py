@@ -16,7 +16,7 @@ from app.db.session import tenant_session
 from app.models.tool_auth import InstanceToolAuthorization
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_and_create(client) -> uuid.UUID:

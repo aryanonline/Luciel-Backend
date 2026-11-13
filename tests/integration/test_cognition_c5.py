@@ -28,8 +28,6 @@ from app.runtime.speech import EchoSpeechToText, EchoTextToSpeech
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _empty_retriever(_q: str) -> list[str]:
     return []

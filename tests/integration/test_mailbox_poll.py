@@ -23,8 +23,6 @@ from app.models.conversation import Session as ConvSession
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 MAILBOX = "owner@fabrikam.example"
 

@@ -12,7 +12,7 @@ import uuid
 import pytest
 from app.channels.tenant_twilio import MOCK_TENANT_NUMBERS
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 # A number the mock Twilio account holds, so the operability probe confirms it.
 NUMBER = MOCK_TENANT_NUMBERS[0].phone_number

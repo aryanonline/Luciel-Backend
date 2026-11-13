@@ -21,8 +21,6 @@ from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_account_with_luciel(admin_id: uuid.UUID) -> uuid.UUID:
     async with tenant_session(admin_id) as s:

@@ -40,7 +40,7 @@ from tests.contract.test_takeover_truth import (
     _take_over_and_reply,
 )
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 RECEIPTS = "/api/v1/webhooks/twilio/notifications/status"
 

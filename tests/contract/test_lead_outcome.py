@@ -15,7 +15,7 @@ from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account(client) -> uuid.UUID:

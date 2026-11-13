@@ -21,8 +21,6 @@ from app.models.instance import Instance, LucielState
 from app.runtime.llm_router import LLMResponse, LLMRouter, ModelClass
 from app.runtime.orchestrator import Orchestrator
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class CapturingModel:
     """LLMProvider double that records the message list each completion received."""

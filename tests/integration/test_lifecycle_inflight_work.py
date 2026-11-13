@@ -53,8 +53,6 @@ from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime.now(UTC)
 
 

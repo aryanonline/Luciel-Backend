@@ -12,8 +12,6 @@ from app.lifecycle.transcript_store import (
     transcript_prefix_for,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 ADMIN = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 OTHER = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
 IID = uuid.uuid4()

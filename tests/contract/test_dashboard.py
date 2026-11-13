@@ -16,7 +16,7 @@ from app.models.conversation import Session as SessionModel
 from app.models.lead import Lead, LeadState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _signup_verify_login(client) -> uuid.UUID:

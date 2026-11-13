@@ -33,8 +33,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-pytestmark = [pytest.mark.asyncio]
-
 MAILBOX = "owner@fabrikam.example"
 MAILBOX_CAPS = "Owner@Fabrikam.Example"
 

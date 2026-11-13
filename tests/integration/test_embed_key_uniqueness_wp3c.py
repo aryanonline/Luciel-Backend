@@ -21,8 +21,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _account(admin: uuid.UUID) -> None:
     async with tenant_session(admin) as s:

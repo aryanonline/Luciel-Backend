@@ -43,8 +43,6 @@ from app.tools.contract import Outcome
 from app.tools.registry import build_tool
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 TORONTO = "America/Toronto"
 ZONE = ZoneInfo(TORONTO)
 EVENT_TYPE = "https://api.calendly.com/event_types/ET-clock"

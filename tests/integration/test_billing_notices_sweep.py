@@ -21,7 +21,6 @@ import logging
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
-import pytest
 from app.billing.notice_delivery import deliver_due_notices
 from app.config import get_settings
 from app.db.session import tenant_session
@@ -31,8 +30,6 @@ from app.models.budget import ConversationBudget
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.notice_delivery import NoticeDelivery
 from sqlalchemy import select
-
-pytestmark = [pytest.mark.asyncio]
 
 NOW = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
 

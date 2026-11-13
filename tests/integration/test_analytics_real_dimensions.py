@@ -19,8 +19,6 @@ from app.models.knowledge import KnowledgeSource
 from app.models.lead import Lead
 from app.models.trace import RetrievalTraceEvent
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def current_billing_period_start() -> date:
     """The calendar-month anchor (the no-card fallback of ``period_start_for``).

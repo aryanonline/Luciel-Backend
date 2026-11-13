@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account_with_luciel(client) -> None:

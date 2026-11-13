@@ -30,8 +30,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeSource
 from sqlalchemy import select, text, update
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
 
 

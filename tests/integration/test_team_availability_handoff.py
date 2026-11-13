@@ -17,8 +17,6 @@ from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
 
-pytestmark = [pytest.mark.asyncio]
-
 WEEKDAYS_9_TO_5 = {
     "enabled": True,
     "weekly": [{"day": d, "start": "09:00", "end": "17:00"} for d in range(5)],

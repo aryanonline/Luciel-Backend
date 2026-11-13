@@ -48,7 +48,7 @@ from app.models.lead import Lead, LeadIdentifier, LeadState
 from app.runtime.sessions import participant_key_for
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 LEAD_EMAIL = "dana@lead.example"
 LEAD_PHONE = "+15557778888"

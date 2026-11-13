@@ -27,8 +27,6 @@ from app.runtime.sessions import participant_key_for
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @dataclass
 class _Sent:

@@ -18,7 +18,7 @@ from app.db.session import tenant_session
 from app.models.audit import AdminAuditLog
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 BYO_NUMBER = "+16045550100"
 CONTACT = "+16045551234"

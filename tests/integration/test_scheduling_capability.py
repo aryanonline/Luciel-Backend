@@ -26,8 +26,6 @@ from app.tools import catalog
 from app.tools.broker import ToolBroker
 from app.tools.contract import Outcome
 
-pytestmark = [pytest.mark.asyncio]
-
 _BOOKING = {"bookingRef": "bk-1", "start": "2026-08-01T14:00Z", "email": "lead@x.com"}
 
 

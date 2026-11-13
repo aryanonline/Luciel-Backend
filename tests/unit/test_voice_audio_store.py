@@ -31,8 +31,6 @@ from app.runtime.voice_audio import (
     voice_audio_key_for,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 ADMIN = uuid.uuid4()
 INSTANCE = uuid.uuid4()
 

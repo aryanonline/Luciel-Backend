@@ -38,8 +38,6 @@ from sqlalchemy import func, select, text
 
 from tests import conftest
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _account(admin: uuid.UUID) -> Account:
     return Account(

@@ -26,8 +26,6 @@ from sqlalchemy import select, text
 
 from tests.conftest import superuser_exec
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_seq_is_populated_and_monotonic():

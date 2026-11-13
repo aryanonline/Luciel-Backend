@@ -34,8 +34,6 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import text
 
-pytestmark = [pytest.mark.asyncio]
-
 NUM_A = "+14155550111"
 NUM_B = "+14155550222"
 

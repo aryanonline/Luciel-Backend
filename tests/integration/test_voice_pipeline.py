@@ -30,8 +30,6 @@ from app.runtime.voice_pipeline import (
 )
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 _ACTION_URL = "https://api.vantagemind.com/voice/turn"
 
 

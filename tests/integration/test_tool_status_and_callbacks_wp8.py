@@ -14,8 +14,6 @@ from app.tools import contract as c
 from app.tools.catalog import ScheduleCallbackTool
 from app.tools.contract import Outcome, ToolContext
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_tools_carry_their_live_connection_status():

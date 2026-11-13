@@ -76,8 +76,6 @@ from tests.integration.test_deletion_cascade_completeness import (
     _instantiate,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 #: Tables that legitimately still hold rows for a swept tenant. These are the same

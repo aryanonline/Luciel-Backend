@@ -14,8 +14,6 @@ from app.connections import sandbox
 from app.knowledge import providers
 from app.knowledge.providers import ProviderUnavailable, WebsiteCrawlProvider
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class _Resp:
     text = "<html><body>Pricing: from $10</body></html>"

@@ -35,7 +35,7 @@ from app.models.lead import Lead, LeadState
 from app.models.voice import VoiceCallRecord
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")]
+pytestmark = [pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")]
 
 
 @pytest.fixture

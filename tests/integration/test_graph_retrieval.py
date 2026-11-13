@@ -22,8 +22,6 @@ from app.models.knowledge import KnowledgeEdge, KnowledgeEntity
 from app.runtime.knowledge_retrieval import hybrid_retrieve
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 # Recruiting-vertical graph: Platform HAS Senior Engineer REQUIRES Python (2-hop chain).
 GRAPH_TEXT = """
 Platform (Department)

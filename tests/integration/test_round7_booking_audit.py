@@ -35,8 +35,6 @@ from app.tools.contract import Outcome
 from app.tools.registry import build_tool
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 EVENT_TYPE = "https://api.calendly.com/event_types/ET-audit"
 USER = "https://api.calendly.com/users/U-audit"
 TOKEN = "cal-token"

@@ -14,7 +14,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from app.knowledge.original_store import (
     ListedOriginal,
     LocalOriginalStore,
@@ -24,8 +23,6 @@ from app.knowledge.original_store import (
     original_prefix_for,
 )
 from app.lifecycle.retention import ORIGINAL_ORPHAN_MIN_AGE, orphaned_original_keys
-
-pytestmark = [pytest.mark.asyncio]
 
 NOW = datetime(2026, 9, 20, 3, 0, tzinfo=UTC)
 LONG_AGO = NOW - timedelta(days=40)

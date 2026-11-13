@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 CALLBACK = "/api/v1/connections/notion/callback"
 

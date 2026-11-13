@@ -26,8 +26,6 @@ from app.models.instance import Instance, LucielState
 from app.models.lead import Lead
 from app.runtime.budget import count_session_once
 
-pytestmark = [pytest.mark.asyncio]
-
 # The clock is TODAY's date, not a fixed one. ``count_session_once`` counts into the
 # billing period the WALL CLOCK is in, while the status read takes ``now`` — with a
 # hard-coded September date the two agreed only during September 2026, and the

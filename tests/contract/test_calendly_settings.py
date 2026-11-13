@@ -11,7 +11,7 @@ from app.models.connection import InstanceConnection
 from app.tools import calendly_backend as cb
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 USER = "https://api.calendly.com/users/U-set"
 ET_A = "https://api.calendly.com/event_types/A"

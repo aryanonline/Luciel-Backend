@@ -13,8 +13,6 @@ from app.models.budget import ConversationBudget
 from app.runtime import budget
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_count_session_once_is_idempotent_per_session():

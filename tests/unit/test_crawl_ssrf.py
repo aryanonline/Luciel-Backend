@@ -18,8 +18,6 @@ from app.knowledge.providers import ProviderUnavailable, WebsiteCrawlProvider
 from app.schemas_api.knowledge import CreateSyncConnectionRequest
 from pydantic import ValidationError
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def test_the_metadata_endpoint_is_refused_without_needing_an_allowlist():
     """The crawl case has no allowlist to check — an admin may crawl any site they own —

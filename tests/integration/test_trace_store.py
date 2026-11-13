@@ -28,8 +28,6 @@ from app.tools.broker import ToolBroker
 from app.tools.contract import ToolContext, ToolResult
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class _FakeTool:
     requires_connection: str | None = None

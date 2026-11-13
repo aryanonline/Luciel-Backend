@@ -26,8 +26,6 @@ from app.runtime.llm_router import (
 from app.runtime.providers import AnthropicProvider, OpenAIProvider
 from app.runtime.testing import EchoModel
 
-pytestmark = [pytest.mark.asyncio]
-
 MSG = [{"role": "user", "content": "hi"}]
 
 

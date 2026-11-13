@@ -39,9 +39,6 @@ from app.runtime.model_currency import (
 
 from tests.unit.live_settings import live_settings
 
-pytestmark = [pytest.mark.asyncio]
-
-
 # --- fakes --------------------------------------------------------------------- #
 
 

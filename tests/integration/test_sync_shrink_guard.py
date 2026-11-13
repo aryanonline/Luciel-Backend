@@ -21,8 +21,6 @@ from app.models.instance import Instance, LucielState
 from app.models.knowledge import KnowledgeSource
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class Provider:
     origin = "google_drive"

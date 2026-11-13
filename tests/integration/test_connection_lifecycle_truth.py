@@ -22,8 +22,6 @@ from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
 ACCOUNT_SID = "AC" + "4" * 32
 

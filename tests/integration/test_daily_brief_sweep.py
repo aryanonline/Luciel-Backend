@@ -18,8 +18,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.notice_delivery import NoticeDelivery
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 # 2026-09-08 12:00 UTC = 08:00 EDT (Toronto): past the 07:00 local send hour.
 MORNING = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
 # 2026-09-08 09:00 UTC = 05:00 EDT: too early locally, even though UTC says 09:00.

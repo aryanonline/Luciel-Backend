@@ -20,8 +20,6 @@ from app.channels.meta_messaging_adapter import MetaMessagingAdapter
 from app.channels.pipeline import OptOutHandled
 from app.channels.whatsapp_adapter import NullMetaSender, WhatsAppAdapter
 
-pytestmark = [pytest.mark.asyncio]
-
 CTX = InstanceContext(admin_id=uuid.uuid4(), instance_id=uuid.uuid4())
 
 

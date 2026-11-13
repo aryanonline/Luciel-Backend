@@ -31,7 +31,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 NUMBER = "+14155550188"
 

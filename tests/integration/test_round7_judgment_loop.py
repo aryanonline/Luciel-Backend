@@ -30,8 +30,6 @@ from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 HOT_LEAD = "I have a $5000 budget and want to book a deck build today"
 FABRICATED = "Absolutely — we can start Monday and a deck that size runs $4,800 all in."
 

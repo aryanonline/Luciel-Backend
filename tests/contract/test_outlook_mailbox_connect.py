@@ -26,7 +26,7 @@ from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"  # noqa: S105
 GRAPH_ME = "https://graph.microsoft.com/v1.0/me"

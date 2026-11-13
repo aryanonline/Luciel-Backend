@@ -10,8 +10,6 @@ from app.models.conversation import Session as SessionModel
 from app.runtime import budget, handoff
 from app.runtime.handoff import ConversationMode
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def test_loop_runs_only_in_ai_mode():
     # human_controlled STOPS the loop (§3.4.12).

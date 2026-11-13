@@ -13,8 +13,6 @@ from app.tools import catalog
 from app.tools.broker import ToolBroker
 from app.tools.contract import Outcome
 
-pytestmark = [pytest.mark.asyncio]
-
 
 # --- fake backends exercising each outcome --------------------------------- #
 class FakeCalendar:

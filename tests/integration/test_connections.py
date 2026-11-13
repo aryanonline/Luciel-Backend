@@ -24,8 +24,6 @@ from app.models.connection import InstanceConnection
 from app.models.deferred import DeferredAction
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_tenant(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

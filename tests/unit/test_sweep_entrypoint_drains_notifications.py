@@ -28,8 +28,6 @@ from app.jobs import __main__ as jobs_main
 from app.jobs.sweeps import SESSION_FINALIZE, SWEEPS
 from app.notifications import escalation_dispatch
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _schedule(
     coro: Coroutine[Any, Any, None], registry: set[asyncio.Task[None]] | None = None

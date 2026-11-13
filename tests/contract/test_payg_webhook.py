@@ -26,7 +26,6 @@ from app.runtime.budget import current_billing_period_start
 # signed-webhook test here runs in the "test" posture with the fake injected.
 pytestmark = [
     pytest.mark.contract,
-    pytest.mark.asyncio,
     pytest.mark.usefixtures("stripe_test_posture"),
 ]
 

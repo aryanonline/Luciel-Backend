@@ -29,8 +29,6 @@ from sqlalchemy import delete, insert, select, text, update
 
 from tests.conftest import APP_USER, superuser_exec
 
-pytestmark = [pytest.mark.asyncio]
-
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 0067's own down_revision since the round-7 Phase 2 chain was linearised
 # (0065 -> 0066 -> 0067 -> 0068 -> 0069 -> 0070): the downgrade also unwinds the

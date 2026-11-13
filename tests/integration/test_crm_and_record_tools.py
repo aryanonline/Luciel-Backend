@@ -32,8 +32,6 @@ from app.tools.contract import Outcome
 from app.tools.registry import build_tool
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 LIVE_RECORD_URL = "https://records.acme.example/lookup"
 
 LEAD_KEY = "jordan@acme.test"

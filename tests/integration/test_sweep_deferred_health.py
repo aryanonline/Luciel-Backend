@@ -16,7 +16,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from app.connections import deferred_queue
 from app.connections.secrets import LocalSecretStore
 from app.db.session import tenant_session
@@ -26,8 +25,6 @@ from app.models.deferred import DeferredAction
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead
 from sqlalchemy import select
-
-pytestmark = [pytest.mark.asyncio]
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 

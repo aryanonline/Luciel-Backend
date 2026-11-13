@@ -26,8 +26,6 @@ from app.runtime.orchestrator import (
 from app.runtime.testing import EchoModel
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 REFUND_CHUNK = "Our refund policy allows a full refund within 30 days of purchase."
 QUESTION = "what is your refund policy?"
 

@@ -12,8 +12,6 @@ from app.connections.sandbox import (
 )
 from app.tools.contract import Outcome
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def test_egress_blocks_non_allowlisted_host():
     assert is_egress_allowed("https://evil.com/hook", frozenset({"hooks.acme.com"})) is False

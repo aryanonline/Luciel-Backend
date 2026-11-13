@@ -35,8 +35,6 @@ from app.models.trace import ToolTraceEvent
 from app.notifications import email_notifier, escalation_dispatch
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 OWNER_EMAIL = "owner@acme.example"
 CONTACT = "sales@acme.example"
 

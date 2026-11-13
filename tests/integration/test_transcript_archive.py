@@ -24,8 +24,6 @@ from app.models.conversation import Transcript
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)
 
 

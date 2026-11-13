@@ -19,8 +19,6 @@ from sqlalchemy import select
 
 from tests.integration.test_employee_status import _seed
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime.now(UTC)
 
 

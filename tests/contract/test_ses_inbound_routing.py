@@ -21,7 +21,7 @@ from app.models.conversation import Session as ConvSession
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _seed_active_instance() -> tuple[uuid.UUID, uuid.UUID]:

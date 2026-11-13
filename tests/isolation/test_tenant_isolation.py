@@ -24,7 +24,7 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.lead import Lead
 from sqlalchemy import func, select, text
 
-pytestmark = [pytest.mark.isolation, pytest.mark.asyncio]
+pytestmark = [pytest.mark.isolation]
 
 
 async def _seed_account(session, admin_id: uuid.UUID, email: str) -> Account:

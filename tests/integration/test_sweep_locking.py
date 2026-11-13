@@ -22,8 +22,6 @@ from app.jobs import sweeps
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 

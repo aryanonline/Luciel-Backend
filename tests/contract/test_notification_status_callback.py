@@ -29,7 +29,7 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import email_notifier
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 ROUTE = "/api/v1/webhooks/twilio/notifications/status"
 OWNER_EMAIL = "owner@acme.example"

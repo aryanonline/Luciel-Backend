@@ -29,8 +29,6 @@ from app.runtime.testing import EchoModel
 from app.runtime.voice_pipeline import handle_turn
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 _ACTION_URL = "https://api.vantagemind.com/voice/turn"
 NEAR_CHUNK = "Our refund policy allows a full refund within 30 days of purchase."
 FAR_CHUNK = "The car park behind the building closes at 8pm on weekdays."

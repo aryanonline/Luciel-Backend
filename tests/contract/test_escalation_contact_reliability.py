@@ -18,7 +18,7 @@ from app.db.session import tenant_session
 from app.models.email_incident import EmailDeliveryIncident, is_suppressed
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account_with_luciel(client) -> uuid.UUID:

@@ -18,7 +18,7 @@ import pytest
 from app.auth.tokens import decode_token
 from app.notifications.email_dispatcher import DeliveryOutcome
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 def _email() -> str:

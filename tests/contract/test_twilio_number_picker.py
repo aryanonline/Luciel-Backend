@@ -16,7 +16,7 @@ import uuid
 import pytest
 from app.channels.tenant_twilio import MOCK_TENANT_NUMBERS
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready_account_with_luciel(client) -> None:

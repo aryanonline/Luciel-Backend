@@ -24,8 +24,6 @@ from app.tools.broker import ToolBroker
 from app.tools.contract import Outcome
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin, *, authorize, opted_out: bool) -> tuple[uuid.UUID, uuid.UUID]:
     async with tenant_session(admin) as s:

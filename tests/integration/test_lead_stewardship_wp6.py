@@ -36,8 +36,6 @@ from app.tools.contract import Outcome
 from app.tools.registry import build_tool, make_tool_resolver
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.fixture(autouse=True)
 def fresh_mock_crm():

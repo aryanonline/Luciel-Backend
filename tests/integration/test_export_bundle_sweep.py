@@ -32,8 +32,6 @@ from app.models.audit import AdminAuditLog
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin_id: uuid.UUID) -> None:
     async with tenant_session(admin_id) as s:

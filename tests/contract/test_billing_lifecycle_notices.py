@@ -34,7 +34,7 @@ from app.notifications import email_dispatcher, sms_notifier
 from app.notifications.email_sender import NullEmailSender
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 SMS_NUMBER = "+16045551234"
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)

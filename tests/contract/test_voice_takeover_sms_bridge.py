@@ -21,7 +21,7 @@ from app.models.lead import Lead, LeadIdentifier, LeadState
 from app.models.voice import VoiceCallRecord
 from app.runtime.sessions import participant_key_for
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 CALLER = "+15557778888"
 # The lead's OTHER phone: the number its record is keyed on when the call came from a

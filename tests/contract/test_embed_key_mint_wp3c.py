@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from tests.contract.test_connection_lifecycle import _admin_id, _ready_account_with_luciel
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _holder_of(key: str) -> uuid.UUID:

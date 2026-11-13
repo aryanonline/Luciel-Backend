@@ -19,7 +19,7 @@ from app.db.session import untenanted_session
 from app.models.contact import ContactSubmission
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 _BODY = {
     "name": "Dana Prospect",

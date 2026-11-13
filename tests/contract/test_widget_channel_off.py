@@ -22,7 +22,7 @@ import uuid
 import pytest
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 BOOT = "/api/v1/chat-widget/bootstrap"
 SEND = "/api/v1/chat-widget/messages"

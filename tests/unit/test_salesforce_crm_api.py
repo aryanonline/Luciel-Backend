@@ -12,8 +12,6 @@ from __future__ import annotations
 import pytest
 from app.tools.crm_backend import CrmUnavailable, SalesforceCrmApi, _soql_quote
 
-pytestmark = [pytest.mark.asyncio]
-
 INSTANCE = "https://acme.my.salesforce.com"
 
 

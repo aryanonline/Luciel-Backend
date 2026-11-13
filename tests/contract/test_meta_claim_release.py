@@ -32,7 +32,7 @@ from sqlalchemy import select
 
 from tests.contract.test_connection_lifecycle import _admin_id, _connected_meta
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 PASSWORD = "pw-123456"
 

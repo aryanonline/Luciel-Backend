@@ -22,8 +22,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.models.knowledge import KnowledgeChunk, KnowledgeSource
 from app.runtime.embeddings import EMBED_DIM
 
-pytestmark = [pytest.mark.asyncio]
-
 # Deliberately disjoint vocabularies per concept: the query wording shares no token with
 # the document wording, so a lexical matcher has nothing to go on.
 _CONCEPTS: dict[str, set[str]] = {

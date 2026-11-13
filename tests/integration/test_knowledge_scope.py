@@ -18,8 +18,6 @@ from app.knowledge.providers import GoogleDriveProvider, NotionProvider, provide
 from app.models.connection import InstanceConnection
 from app.models.instance import Account, AccountState, Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class FakeSecretStore:
     def __init__(self, material=None) -> None:

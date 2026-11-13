@@ -10,7 +10,6 @@ unchanged regardless of whether a fast provider is bound.
 
 from __future__ import annotations
 
-import pytest
 from app.config import Settings
 from app.runtime.llm_router import (
     CONTEXT_TOKEN_BUDGET_FAST,
@@ -23,8 +22,6 @@ from app.runtime.providers import AnthropicProvider
 from app.runtime.testing import EchoModel
 
 from tests.unit.live_settings import live_settings
-
-pytestmark = [pytest.mark.asyncio]
 
 
 def test_should_route_fast_gate_requires_all_three_conditions() -> None:

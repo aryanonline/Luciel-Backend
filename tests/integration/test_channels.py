@@ -22,8 +22,6 @@ from app.models.audit import AdminAuditLog
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import func, select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 def _operable(*numbers: str) -> NullOperabilityProbe:
     """A mock probe that reports the given numbers as Twilio-operable."""

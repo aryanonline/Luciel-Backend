@@ -32,8 +32,6 @@ from app.tools import contract as c
 from app.tools.contract import ToolContext, ToolResult
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 TOOL_ID = "book_appointment"
 
 

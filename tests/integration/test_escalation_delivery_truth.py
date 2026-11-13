@@ -36,8 +36,6 @@ from app.runtime.integration_status import escalation_backlog
 from app.runtime.orchestrator import _record_escalation
 from sqlalchemy import select, update
 
-pytestmark = [pytest.mark.asyncio]
-
 OWNER_EMAIL = "owner@acme.example"
 CONTACT = "sales@acme.example"
 

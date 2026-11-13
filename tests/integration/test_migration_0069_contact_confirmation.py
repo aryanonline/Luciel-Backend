@@ -18,8 +18,6 @@ from sqlalchemy import text
 
 from tests.conftest import superuser_exec
 
-pytestmark = [pytest.mark.asyncio]
-
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 

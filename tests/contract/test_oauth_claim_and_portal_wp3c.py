@@ -39,7 +39,7 @@ from tests.contract.test_outlook_mailbox_connect import (
     _swap_to_outlook,
 )
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 HUBSPOT_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"  # noqa: S105 — an endpoint
 PORTAL = "424242"

@@ -22,8 +22,6 @@ from app.models.knowledge import KnowledgeChunk
 from app.runtime.embeddings import EMBED_DIM
 from sqlalchemy import select, update
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()

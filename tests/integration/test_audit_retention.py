@@ -25,8 +25,6 @@ from app.models.instance import Account, AccountState
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 
-pytestmark = [pytest.mark.asyncio]
-
 AGED = timedelta(days=400)
 RECENT = timedelta(days=30)
 

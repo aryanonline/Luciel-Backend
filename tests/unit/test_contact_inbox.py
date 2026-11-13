@@ -10,12 +10,9 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 from app.api.v1 import contact as contact_module
 from app.api.v1.contact import ContactIn, _notify
 from app.config import Settings, get_settings
-
-pytestmark = pytest.mark.asyncio
 
 
 class _CapturingSender:

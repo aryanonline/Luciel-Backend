@@ -21,8 +21,6 @@ from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 LEAD = "dana@lead.example"
 
 

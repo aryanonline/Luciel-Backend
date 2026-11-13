@@ -21,7 +21,7 @@ from app.models.conversation import Transcript
 from app.models.instance import Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=UTC)
 

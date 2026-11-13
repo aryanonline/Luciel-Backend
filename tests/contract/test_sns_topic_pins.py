@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 from app.config import get_settings
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 OURS = "arn:aws:sns:ca-central-1:111111111111:luciel-dev-ses-inbound"
 THEIRS = "arn:aws:sns:us-east-1:222222222222:someone-elses-topic"

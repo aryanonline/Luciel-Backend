@@ -10,10 +10,7 @@ email property on every PATCH, reverting a tenant's in-CRM correction.
 from __future__ import annotations
 
 import httpx
-import pytest
 from app.tools.crm_backend import HubSpotCrmApi, SalesforceCrmApi
-
-pytestmark = [pytest.mark.asyncio]
 
 
 class _CapturingTransport:

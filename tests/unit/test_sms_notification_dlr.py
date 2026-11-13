@@ -30,8 +30,6 @@ from app.notifications.sms_notifier import (
     notification_status_callback_url,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 ADMIN, INSTANCE = uuid.uuid4(), uuid.uuid4()
 CALLBACK = "https://api.example/api/v1/webhooks/twilio/notifications/status"
 

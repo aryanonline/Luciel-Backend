@@ -19,8 +19,6 @@ from app.connections import refresh
 from app.connections.secrets import LocalSecretStore
 from app.models.connection import InstanceConnection
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class _Response:
     def __init__(self, status_code: int = 200, payload: dict[str, Any] | None = None) -> None:

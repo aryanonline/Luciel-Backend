@@ -40,8 +40,6 @@ from app.runtime.testing import EchoModel
 from app.tools import contract as tool_contract
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 CONTACT = "frontdesk@brightsmile.example"
 # A statement, not a question: the model's draft is a guess with no knowledge behind it,
 # so the below-floor replacement runs (a bare clarifying question would ship as-is, F100).

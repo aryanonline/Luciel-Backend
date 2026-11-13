@@ -22,8 +22,6 @@ from app.runtime import handoff
 from app.runtime.session_close import finalize_due_sessions, finalize_session
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(
     admin: uuid.UUID,

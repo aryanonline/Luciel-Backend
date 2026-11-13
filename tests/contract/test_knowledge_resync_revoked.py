@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 from tests.contract.test_dashboard import _signup_verify_login
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _ready(client) -> uuid.UUID:

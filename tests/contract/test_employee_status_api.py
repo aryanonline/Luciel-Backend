@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _login(client, *, with_luciel: bool = True) -> None:

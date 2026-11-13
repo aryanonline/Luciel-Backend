@@ -31,8 +31,6 @@ from app.schemas_api.leads import LeadPatchRequest
 from app.tools import crm_backend
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.fixture(autouse=True)
 def fresh_mock_crm():

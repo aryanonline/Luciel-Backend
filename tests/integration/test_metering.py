@@ -22,8 +22,6 @@ from app.models.instance import Account, AccountState, Instance, LucielState
 from app.runtime import budget
 from app.runtime.budget import current_billing_period_start
 
-pytestmark = [pytest.mark.asyncio]
-
 # The Stripe anchor and the counter row must name the SAME period (P0-4) — a report keyed
 # on a period the counter was not written under reads an empty counter.
 STRIPE_PERIOD_START = datetime.combine(current_billing_period_start(), time.min, tzinfo=UTC)

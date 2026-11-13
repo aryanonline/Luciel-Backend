@@ -229,7 +229,9 @@ def test_forged_state_is_rejected(configured):
     jti = uuid.uuid4().hex
     forged = jwt.encode(
         {"typ": "oauth_state", "sub": str(admin_id), "cid": str(connection_id), "jti": jti},
-        "not-the-platform-key",
+        # A foreign key of full HMAC strength (>= 32 bytes), so the only thing under
+        # test is the signature mismatch, not PyJWT's short-key warning.
+        "not-the-platform-key-but-32-bytes-long",
         algorithm=get_settings().jwt_algorithm,
     )
     with pytest.raises(oauth_flow.StateRejected):

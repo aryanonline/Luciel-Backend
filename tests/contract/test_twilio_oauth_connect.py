@@ -21,7 +21,7 @@ from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 TOKEN_URL = "https://oauth.twilio.com/v2/token"  # noqa: S105
 ACCOUNTS_URL = "https://api.twilio.com/2010-04-01/Accounts.json"

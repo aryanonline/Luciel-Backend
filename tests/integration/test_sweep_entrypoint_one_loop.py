@@ -39,8 +39,6 @@ from app.models.audit import ActorType, AdminAuditLog
 from app.models.instance import Account, AccountState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 AGED = timedelta(days=400)
 
 

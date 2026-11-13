@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.config import get_settings
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 
 async def _login(client):

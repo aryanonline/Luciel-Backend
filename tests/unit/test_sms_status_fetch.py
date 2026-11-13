@@ -19,8 +19,6 @@ from app.channels.twilio_sender import NullSmsSender, TwilioSmsSender
 from app.notifications import sms_notifier
 from app.notifications.sms_notifier import SmsStatus, fetch_sms_status
 
-pytestmark = [pytest.mark.asyncio]
-
 ACCOUNT = "AC" + "9" * 32
 SID = "SM" + "a" * 32
 ADMIN, INSTANCE = uuid.uuid4(), uuid.uuid4()

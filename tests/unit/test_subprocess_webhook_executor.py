@@ -20,8 +20,6 @@ from app.connections.sandbox import (
 )
 from app.tools.contract import Outcome
 
-pytestmark = [pytest.mark.asyncio]
-
 _THIS_MODULE = "tests.unit.test_subprocess_webhook_executor"
 
 

@@ -24,7 +24,7 @@ from app.channels.voice_adapter import (
 )
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 PERSONALITY = "/api/v1/admin/luciel/personality"
 

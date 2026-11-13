@@ -28,8 +28,6 @@ from app.runtime.lead_capture import capture_or_update_lead
 from app.tools import crm_backend
 from app.tools.registry import make_tool_resolver
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.fixture(autouse=True)
 def fresh_mock_crm():

@@ -20,8 +20,6 @@ from app.db.session import tenant_session
 from app.models.connection import InstanceConnection
 from app.models.instance import Instance, LucielState
 
-pytestmark = [pytest.mark.asyncio]
-
 LEAD_EMAIL = "dana@lead.example"
 TENANT_EMAIL = "hello@acmepatios.example"
 TENANT_NUMBER = "+15550001111"

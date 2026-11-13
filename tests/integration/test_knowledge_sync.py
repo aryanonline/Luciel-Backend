@@ -17,8 +17,6 @@ from app.knowledge.sync import RemoteItem, RemoteSnapshot
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 class FakeDriveProvider:
     origin = "google_drive"

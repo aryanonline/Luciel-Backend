@@ -29,8 +29,6 @@ from app.models.audit import ActorType
 from app.models.instance import Account, AccountState, Instance, LucielState
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed(luciel: LucielState | None) -> uuid.UUID:
     admin = uuid.uuid4()

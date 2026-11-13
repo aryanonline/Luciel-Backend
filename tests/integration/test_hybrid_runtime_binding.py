@@ -23,8 +23,6 @@ from app.runtime.llm_router import LLMRouter
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
 
-pytestmark = [pytest.mark.asyncio]
-
 KNOWLEDGE = """
 Our refund policy allows returns within thirty days of purchase for a full refund.
 Refund (Policy): window=30 days

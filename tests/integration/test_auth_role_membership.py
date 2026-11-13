@@ -15,8 +15,6 @@ from app.db.session import untenanted_session
 from app.lifecycle import audit_retention
 from sqlalchemy import text
 
-pytestmark = [pytest.mark.asyncio]
-
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_app_role_cannot_set_role_to_the_bypassrls_role():

@@ -23,7 +23,7 @@ from app.models.email_incident import EscalationContactConfirmation
 from app.notifications import sms_notifier
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
+pytestmark = [pytest.mark.contract]
 
 BYO_NUMBER = "+16045550100"
 CONTACT = "+16045551234"

@@ -22,8 +22,6 @@ from app.models.lead import Lead, LeadState
 from app.runtime.lead_capture import capture_or_update_lead
 from sqlalchemy import select
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def _seed_tenant(admin: uuid.UUID) -> uuid.UUID:
     iid = uuid.uuid4()
