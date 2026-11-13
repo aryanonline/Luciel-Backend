@@ -195,6 +195,7 @@ the fixtures create and wipe the test database through it.
 ```bash
 docker compose up -d db redis
 uv sync --frozen --extra dev        # the locked set CI installs; or: pip install -e ".[dev]"
+source .venv/bin/activate           # Windows: .venv\Scripts\activate (puts pytest and alembic on PATH)
 export LUCIEL_SUPERUSER_TCP=1       # superuser psql over TCP (else: sudo -u postgres psql)
 export PGPASSWORD=postgres
 export LUCIEL_INTEGRATION_MODE=mock
