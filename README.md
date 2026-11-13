@@ -1,125 +1,280 @@
 # Luciel — Backend
 
-Luciel is an AI assistant that a business runs on its own knowledge. This service is
-everything behind it: the API for the owner dashboard, the public chat API used by the
-website widget, the webhooks for other customer channels, knowledge ingestion, grounded
-answering with honest escalation, billing, scheduled lifecycle jobs, and the AWS
-infrastructure that runs it.
+Luciel, by VantageMind, is an AI front-desk employee for small businesses. It answers a
+business's customers on its website and on the business's own email, SMS, voice, WhatsApp,
+Messenger and Instagram accounts, using that business's own knowledge. When it cannot answer
+confidently it hands the conversation to the team instead of guessing, and the owner runs it
+from a dashboard. This repository is the backend: the FastAPI service behind the dashboard and
+the website widget, the channel webhooks, knowledge ingestion and retrieval, the grounded answer
+loop, billing, scheduled jobs, and the AWS CDK infrastructure for the whole product. The
+dashboard, marketing site and widget live in the companion Luciel-Frontend repository.
 
-One account has one Luciel and one login. The business connects its own accounts
-(mailbox, Twilio number, Meta pages, knowledge sources), and Luciel answers across those
-channels from that knowledge.
+## Highlights
 
-## How a customer message is handled
+- **Tenant isolation in PostgreSQL.** Every tenant table gets forced row-level security and a
+  tenant policy, generated from the ORM metadata so no table is missed (`app/db/rls.py`). The app
+  role is neither superuser nor `BYPASSRLS`, and the isolation suite (`tests/isolation/`), a
+  separate CI step, checks that every tenant table has forced RLS and a tenant policy, and that
+  one tenant cannot see or change another tenant's rows.
+- **Grounding gate.** Each answer stores a grounding score: the share of its content words that
+  the retrieved knowledge supports (`app/runtime/grounding.py`). Unless a tool result backs it, a
+  draft below 0.50 grounding or 0.6 self-reported confidence becomes an honest hand-off to the
+  team (`app/runtime/escalation.py`). Tests pin the rule as an OR, never an AND.
+- **Two planes from one image.** One container image runs as two ECS services: the control plane
+  (owner API, cookie sessions, credentialed CORS) and the data plane (widget, webhooks and
+  `/healthz`; no cookies, a narrower IAM role). ALB path rules split them, and tests on both
+  sides pin the same prefix list (`app/main.py`, `infra/lib/compute-stack.ts`).
+- **Honest delivery.** In live mode an unconfigured sender returns no message ID, so nothing can
+  report a send that did not happen, and `/healthz` names every degraded binding
+  (`tests/unit/test_delivery_honesty.py`). Provider webhooks are verified before any runtime work
+  (Twilio by signature or a per-connection capability token); Stripe events are also replay-gated.
+- **Knowledge sync as a job.** A manual sync answers within 20 seconds or returns 202 and keeps
+  running. Liveness is a PostgreSQL advisory lock on the connection, not a timestamp, so two syncs
+  of one source never overlap and a killed job reads as interrupted (`app/knowledge/sync_job.py`).
+- **Append-only audit log.** A post-migration superuser step gives the audit tables to a role the
+  app cannot assume and adds row and `TRUNCATE` guards (`scripts/lock_audit_log.sql`). CI applies
+  it, and every migration task and a post-deploy probe verify it.
+- **Governed CVE gate.** Both platform images of the multi-arch build are gated on their ECR
+  scans (`scripts/check_image_scan.py`): a CRITICAL or HIGH finding fails unless
+  `.security/cve-allowlist.json` waives it with a reason and an expiry date, and an expired waiver
+  or an incomplete scan fails too.
+- **Deploys gated on live behaviour.** After each dev deploy, a smoke probe, an in-VPC database
+  probe and, in live mode, a strict harness that drives a throwaway tenant through the real API
+  (`scripts/seed_and_livetest.py`) must pass, or the services roll back (a production release
+  runs the harness on preprod before deploying).
 
-1. **Ingress.** A message arrives from the widget or a channel webhook. Twilio, SES and
-   Meta requests are signature-checked before any tenant lookup or AI work.
-2. **Tenant context.** The request is bound to one tenant, and PostgreSQL row-level
-   security keeps every query inside it.
-3. **Runtime.** The orchestrator resolves the session, applies safety checks, retrieves
-   evidence from the tenant's knowledge (vector and graph retrieval) and drafts an answer.
-4. **Grounding gate.** A grounding score is stored with every answer. Low grounding *or*
-   low confidence (floor 0.50) leads to a refusal or a hand-off to the team, never a guess.
-5. **Delivery.** The reply goes out through the channel's own provider. Delivery fails
-   closed: no faked sends, provider IDs or hand-offs.
-6. **Afterwards.** Sessions end deterministically and are summarized, usage is metered
-   for billing, and audit events are appended.
+## Architecture
+
+```mermaid
+flowchart LR
+    visitor["Customer's browser<br/>(widget)"]
+    owner["Owner's browser<br/>(dashboard)"]
+    hooks["Provider webhooks<br/>Twilio, Meta, Stripe, SES via SNS"]
+    subgraph aws ["AWS, one environment"]
+        cdn["CloudFront + S3<br/>widget bundle"]
+        alb["ALB with WAF<br/>host and path rules"]
+        web["Web service<br/>Next.js, from Luciel-Frontend"]
+        subgraph backend ["Backend: one image, three task roles"]
+            cp["Control plane<br/>owner API"]
+            dp["Data plane<br/>widget API, webhooks, /healthz"]
+            sweeps["Sweep tasks<br/>EventBridge Scheduler, 16 schedules"]
+        end
+        subgraph stores ["Data"]
+            rds[("RDS PostgreSQL<br/>pgvector, row-level security")]
+            redis[("ElastiCache Redis<br/>LLM caps, abuse counters")]
+            s3[("S3<br/>archives, exports, files, audio")]
+            secrets["Secrets Manager + KMS<br/>per-tenant credentials"]
+        end
+    end
+    ext["External APIs<br/>Anthropic, OpenAI, Stripe, Twilio, Meta, SES,<br/>Microsoft Graph, Google, Notion, HubSpot, Salesforce,<br/>Calendly, ElevenLabs, hCaptcha"]
+    visitor -->|luciel.js| cdn
+    visitor --> alb
+    owner --> alb
+    hooks --> alb
+    alb -->|app hostnames| web
+    alb -->|owner API paths| cp
+    alb -->|all other paths| dp
+    backend --> stores
+    backend --> ext
+```
+
+Each environment is one VPC in `ca-central-1`: the CDK app pins every stack to that region and
+the data buckets deny requests from any other region; only the CloudFront certificate lives in
+`us-east-1`. One ALB serves every app and API hostname (the widget's embed hostnames are served
+by CloudFront): app hostnames go to the frontend's Next.js service, owner-API paths on the API
+hostnames go to the control plane, and everything else falls through to the data plane. Backend
+tasks run on Graviton (arm64) in private subnets, with RDS and Redis in isolated subnets, and
+scheduled work runs as one-off ECS tasks from the same image. No secrets are committed: tenant
+credentials live in Secrets Manager under a `vm/` prefix and the database stores only pointers.
+
+A customer message goes through four steps:
+
+1. **Ingress:** the widget's embed key and site origin allowlist, or the provider webhook's
+   verification, are checked first; every query then runs under that tenant's RLS policy.
+2. **Answer:** session, input safety checks, retrieval (vector search, plus graph facts for
+   structured questions) and a draft from Anthropic, failing over to OpenAI.
+3. **Gate and delivery:** the grounding gate turns a weak draft into a recorded hand-off, and the
+   reply leaves through the channel's own provider, as the business, failing closed.
+4. **Afterwards:** sessions close and are summarized, billable conversations are reported to
+   Stripe as deltas, and audit events are appended.
 
 ## Tech stack
 
-- **API:** Python 3.12, FastAPI, Uvicorn, Pydantic
-- **Data:** PostgreSQL with pgvector, SQLAlchemy 2 (async, asyncpg), Alembic migrations, Redis
-- **AI:** Anthropic Claude as the primary model with an OpenAI fallback; OpenAI
-  `text-embedding-3-small` embeddings; vector plus knowledge-graph retrieval
-- **Knowledge sources:** file uploads (PDF, Word), Google Drive, Notion, website crawl,
-  HubSpot and Salesforce
-- **Channels:** website widget, email from the business's own Outlook mailbox, SMS and
-  voice on the business's own Twilio number, WhatsApp and Messenger (Meta), Instagram
-- **Tools:** calendar booking (including Calendly), CRM and record lookups through a
-  typed tool broker
-- **Billing:** Stripe Billing Meters, pay-as-you-go
-- **Infrastructure:** AWS (ECS Fargate, RDS, ElastiCache, S3, CloudFront, SES), defined
-  with the AWS CDK in TypeScript under [`infra/`](infra)
+| Area | Technology |
+| --- | --- |
+| API | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
+| Data | PostgreSQL with pgvector (RDS PostgreSQL 16 in AWS, PostgreSQL 17 locally and in CI), SQLAlchemy 2 async on asyncpg, Alembic (77 migrations), Redis |
+| AI | Anthropic Claude as the primary model, OpenAI as fallback, OpenAI embeddings; default model IDs are pinned in `app/config.py` (a deployed environment can override them through the platform secret), and a daily sweep checks them against the providers and swaps a retired chat model for its successor |
+| Channels | Website widget; the business's own Outlook mailbox (Microsoft Graph) and Twilio account (SMS, voice); WhatsApp and Messenger through one Meta connection; Instagram |
+| Knowledge and tools | File upload (PDF, DOCX, CSV, text), Google Drive, Notion, website crawl, HubSpot, Salesforce; Google Calendar and Calendly booking |
+| Billing | Stripe Billing Meters, pay-as-you-go |
+| Infrastructure | AWS CDK v2 in TypeScript: ECS Fargate on Graviton, ALB, WAF, RDS, ElastiCache, S3, CloudFront, Secrets Manager with KMS, EventBridge Scheduler, CloudWatch, SNS, SES, AWS Budgets |
+| Tooling | uv, ruff, mypy, bandit, pip-audit, detect-secrets, pytest, Jest |
 
 ## Repository layout
 
-| Path | What lives there |
+| Path | Contents |
 | --- | --- |
-| `app/main.py` | FastAPI app factory, plane-aware CORS, `/healthz`, router wiring |
-| `app/api/` | Versioned HTTP routes and the control-plane / data-plane boundary |
-| `app/auth/` | Accounts, passwords and tokens, CAPTCHA |
-| `app/runtime/` | The AI loop: sessions, safety, retrieval, grounding, hand-off, model providers, voice |
-| `app/knowledge/` | Ingestion, sync and scope, chunking, embeddings, graph, retrieval inputs |
-| `app/channels/` | Widget, email, SMS, voice and Meta ingress, plus outbound delivery |
-| `app/connections/` | Connection lifecycle for the customer's own providers: OAuth, health, secrets |
-| `app/tools/` | Tool authorization, catalog, broker and result contract |
-| `app/billing/` | Metering, Stripe gateway and webhooks, dunning, billing notices |
-| `app/lifecycle/` | Pause, delete with a 30-day restore window, close, exports, retention |
-| `app/jobs/` | Scheduled sweeps: lifecycle, retention, reconciliation, deferred health checks |
-| `app/analytics/`, `app/audit/`, `app/notifications/`, `app/policy/`, `app/employee/` | Owner analytics, append-only audit log, notifications, entitlements, status and morning brief |
-| `app/models/`, `app/schemas_api/`, `app/db/`, `app/migrations/` | Persistence models, API schemas, database session and RLS context, Alembic history |
-| `infra/` | CDK stacks: networking, data, compute, web, widget CDN, DNS, edge, security, observability, pipeline, budgets |
-| `scripts/` | Database bootstrap, migration, verification, sweep and deploy helpers |
-| `tests/` | Unit, integration, contract and tenant-isolation suites |
-
-Each module has its own `CLAUDE.md` with its key files, the rules it owns, its tests
-and known pitfalls. Read it before changing that module.
+| `app/main.py`, `app/config.py` | App factory (plane-aware CORS, trace IDs, `/healthz`, routers); settings and default model pins |
+| `app/api/` | Versioned routes (`v1/admin`, auth, widget, billing, webhooks), auth dependencies, paging, error contract |
+| `app/runtime/` | The conversation loop: sessions, input safety, retrieval, grounding, escalation and hand-off, LLM router and providers, voice |
+| `app/knowledge/` | File parsing, provider sync and sync jobs, chunking, embeddings, knowledge graph |
+| `app/channels/`, `app/connections/` | Channel ingress, signature checks and outbound delivery; customer-owned provider connections (OAuth, verification, health, secrets) |
+| `app/tools/`, `app/billing/` | Tool catalog, authorization, broker and calendar backends; conversation metering, Stripe gateway and webhooks, dunning, notices |
+| `app/lifecycle/`, `app/jobs/` | Pause, delete with a 30-day restore window, close and reopen, exports, retention, transcript archive; the sweep entrypoint (`python -m app.jobs <sweep>`) |
+| `app/auth/`, `app/notifications/`, `app/employee/` | Accounts and sessions; owner notifications and escalation dispatch; status and the morning brief |
+| `app/analytics/`, `app/audit/`, `app/policy/`, `app/observability/` | Owner analytics, append-only audit log, entitlements, structured logs and metrics |
+| `app/models/`, `app/schemas_api/`, `app/db/`, `app/migrations/` | ORM models, wire schemas, engine, sessions and RLS helpers, Alembic history |
+| `infra/` | CDK app: `bin/` entrypoint, `lib/` stacks, `test/` Jest assertions |
+| `scripts/` | Database bootstrap and audit lock, ECS task runners, CVE gate, smoke probe, rollback, SeedTest harness |
+| `tests/` | `unit/`, `integration/`, `contract/` (frontend wire contracts) and `isolation/` suites |
+| `.github/workflows/`, `.security/` | CI, deploy and maintenance workflows; dated, expiring waivers for the image CVE gate |
+| `Dockerfile`, `docker-compose.yml`, `pyproject.toml`, `uv.lock` | Multi-stage, non-root image; local PostgreSQL and Redis; dependencies, tool configuration and the lock that CI tests and the image installs |
 
 ## Local development
 
-Requirements: Python 3.12, Docker (for PostgreSQL with pgvector, and Redis).
+Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/) (CI and the image pin 0.12.23),
+Docker, and a `psql` client for the test suite. The CDK app in `infra/` uses Node.js 20, as the
+deploy workflow does.
 
 ```bash
-docker compose up -d                # PostgreSQL 17 + pgvector, and Redis
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env                # then fill in the values
+docker compose up -d db redis        # PostgreSQL 17 + pgvector 0.8.0 and Redis 7; first start creates roles and database
+uv sync --frozen --extra dev --python 3.12
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+cp .env.example .env                 # mock mode against the local database
 ```
 
-`.env.example` lists every setting. Keep `LUCIEL_INTEGRATION_MODE=mock` locally. Live
-mode talks to real providers and must be chosen on purpose.
-
-Database setup follows the same three steps as production (`scripts/migrate.sh`):
-
-1. `scripts/bootstrap_roles.sql`, as a superuser: creates the application role and the audit-log owner
-2. `alembic upgrade head`, as the application role: schema, row-level security and grants
-3. `scripts/lock_audit_log.sql`, as a superuser: makes the audit log append-only
-
-Then start the API:
+Prepare the database with the steps `scripts/migrate.sh` runs in AWS, then start the API:
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+SUPER="host=127.0.0.1 port=5432 dbname=luciel_dev user=postgres password=postgres"
+python scripts/run_sql.py --dsn "$SUPER" --file scripts/bootstrap_roles.sql   # roles and grants
+alembic upgrade head                                                          # schema, RLS, grants, as luciel_app
+python scripts/run_sql.py --dsn "$SUPER" --file scripts/lock_audit_log.sql    # append-only audit log
+uvicorn app.main:app --reload --port 8080
 ```
 
-## Tests
+`LUCIEL_INTEGRATION_MODE=mock` (the default) uses a deterministic model and fake senders with no
+external keys; `live` calls real providers and has to be chosen on purpose. With the default
+`LUCIEL_ENVIRONMENT=development` the OpenAPI docs are at `http://localhost:8080/docs`; deployed
+environments return 404 there. To run the Luciel-Frontend dashboard against this backend, set
+`LUCIEL_COOKIE_SECURE=false` here and point the frontend's HTTP adapter at `http://localhost:8080`.
+
+## Tests and quality checks
+
+The suites need PostgreSQL with pgvector (the compose database works) and `psql` on the `PATH`.
+The test session creates its own `luciel_test` database as the superuser, migrates it and
+applies the audit lock; the isolation suite and most integration and contract tests also assert,
+before each test, that the app role is neither superuser nor `BYPASSRLS`.
 
 ```bash
-export LUCIEL_INTEGRATION_MODE=mock
-export LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432   # point at a PostgreSQL with pgvector
-python -m pytest
+export LUCIEL_SUPERUSER_TCP=1 LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432
+export LUCIEL_SUPERUSER=postgres PGPASSWORD=postgres LUCIEL_INTEGRATION_MODE=mock
+python -m pytest tests/isolation                               # tenant-isolation suite
+python -m pytest tests/unit tests/integration tests/contract   # everything else
+ruff check app tests && ruff format --check app tests && mypy app
 ```
 
-The suite has about 1,300 tests. Markers separate the tenant-isolation suite, which can't
-be overridden in CI, and the frontend wire-contract tests. CI (`.github/workflows/ci.yml`)
-also runs ruff, strict mypy, bandit, pip-audit and detect-secrets, applies and rolls back
-the migrations, and checks the audit-log lock. The deploy workflow scans the container
-image for CVEs against a dated allowlist whose waivers expire.
+The latest CI run on `main` (2026-11-13) passed 8 isolation tests and 3,899 unit, integration and
+contract tests. CI (`.github/workflows/ci.yml`) runs on every pull request, every push to `main`,
+daily and on demand. The daily run makes a newly published CVE fail the build without a push, and
+a failed daily run is posted to the month's dependency-review issue.
+
+| CI step | What it enforces |
+| --- | --- |
+| Locked install | `uv lock --check`, then `uv sync --frozen`: CI tests exactly the dependency set the image installs |
+| Lint and types | `ruff check`, `ruff format --check`, and `mypy` in strict mode over `app/` |
+| Security | `bandit`; `pip-audit --strict`, which fails on any vulnerability that has a fix; `detect-secrets` against `.secrets.baseline` |
+| Migrations | `alembic upgrade head`, `downgrade base`, `upgrade head`, then the audit-log lock as superuser |
+| Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |
+
+The CDK stacks have their own Jest assertions in `infra/test/` (28 files; run `npm ci && npm test`
+in `infra/`). They are not part of the CI gate.
 
 ## Deployment
 
-Deployments run only by manual dispatch of `.github/workflows/deploy.yml`, choosing
-`environment` (`dev` or `prod`) and `integration_mode` explicitly. A guard job refuses
-any branch other than the release branch, `main`, and nothing deploys on push. Production
-releases first stand up a temporary production-shaped environment, run verification
-and seed tests against it as a hard gate, and remove it afterwards. Migrations run as a
-one-off task inside the VPC before services roll.
+Deploys run only by manual dispatch of `.github/workflows/deploy.yml` from `main`. There is no
+push trigger, a guard job refuses any other ref before the first AWS call, and the workflow
+reaches AWS through GitHub OIDC roles, with no stored keys.
 
-Secrets never go in this repository. Per-tenant provider credentials live in AWS
-Secrets Manager, and deploy-time secrets come from the pipeline.
+```bash
+gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live
+```
 
-## Working in this codebase
+A dev deploy runs these steps in order:
 
-Start with [`CLAUDE.md`](CLAUDE.md). It lists the rules that must not break (tenant
-isolation, the grounding gate, honest delivery, billing metering and webhook replay
-protection), the testing doctrine and the deploy procedure. Product and business
-documents are kept outside this repository.
+1. Build the multi-arch image, push it to an immutable ECR repository under the commit SHA, and
+   run the CVE gate on each platform's scan.
+2. Record the task definitions currently serving, as the rollback target.
+3. Migrate with the new image as a one-off ECS task inside the VPC, before any service rolls.
+   Migrations are expand-first, so the old code keeps working on the new schema during the roll.
+4. `cdk deploy` the stacks with ECS on the scanned image, then reconcile the services and sweep
+   schedules onto the revisions the stack deployed.
+5. Smoke probe (`scripts/smoke_probe.sh`): `/healthz` in the requested mode with no unexpected
+   degraded binding, both planes reachable, HTTP redirected to HTTPS, `/docs` and `/openapi.json`
+   returning 404.
+6. Database probe as the app role (`scripts/verify_probe.sql`): the audit log rejects updates;
+   both audit tables reject truncation and are not owned by the app role, which is also not a
+   member of the audit-owner role; the app role is not a superuser; and the connections table
+   has no raw-credential columns.
+7. In live mode, the strict SeedTest gate (`scripts/run-seedtest-task.sh dev --strict`), where an
+   unexpected skip counts as a failure.
+
+If the deploy or a later gate fails, `scripts/rollback_services.py` points the services and sweep
+schedules back at the previous task definitions; the schema stays where the migration left it.
+`-f paused=true` scales every service to zero and disables the schedules (`false` resumes). A
+production release adds approval on the protected `prod` environment and a temporary
+production-shaped `preprod`, built from the same gated image, that must pass the database probe
+and the SeedTest harness before production deploys; `preprod` is always destroyed afterwards.
+
+## Operations
+
+**Scheduled jobs.** Sixteen sweeps (`app/jobs/sweeps.py`) run from EventBridge Scheduler
+(`infra/lib/compute-stack.ts`). Every sweep except the platform-level model-ID check works one
+tenant per transaction under a per-sweep, per-tenant advisory lock, so overlapping runs do not
+duplicate work. A schedule whose task launch call fails is retried up to three times within an
+hour; a sweep that fails is reported by an EventBridge rule and an alarm, and because sweeps are
+idempotent, the next scheduled run picks up what it missed.
+
+| Cadence | Sweeps |
+| --- | --- |
+| Hourly | Deferred-action retries, session close and summary, the owner's morning brief (due at 07:00 local), and a backstop for the data plane's five-minute mailbox poll |
+| Every 6 hours | Connection health checks; knowledge re-sync and website re-crawl |
+| Daily | Transcript archive to S3 at 90 days, one-year retention, delete-grace expiry, closed-account purge, dunning, Stripe usage reconciliation, unverified-account purge, billing and legal notice emails, LLM model-ID check |
+| Weekly | Audit-log retention |
+
+**Alarms.** CloudWatch alarms email the operator through SNS: ALB 5xx and p95 latency, repeated
+LLM fallback, both LLM providers failing, degraded knowledge retrieval, an escalation backlog,
+sweep errors and per-tenant sweep failures, and conversation caps hit at volume. EventBridge rules
+report sweep tasks that exit non-zero or fail to start, synthesis refuses an armed environment
+with no operator address, and AWS Budgets alerts at 80% and 100% of each environment's monthly
+ceiling and on a forecast breach.
+
+**Repository automation.**
+
+| Workflow | When | What it does |
+| --- | --- | --- |
+| `image-rebuild.yml` | Weekly | Rebuilds the image from `main`, runs the CVE gate in report mode and posts the findings; never deploys |
+| `dependency-review.yml` | Monthly | Opens the month's dependency and CVE review issue: outdated packages, lock drift, waivers and their expiry, the latest scan |
+| `dependabot-auto-merge.yml` | After CI on a Dependabot PR | Merges a green minor or patch update and labels a major one for a person |
+| `dev-cost-guard.yml` | Daily | Stops a paused environment's database again, since AWS restarts a stopped RDS instance after seven days |
+
+## Project status
+
+The backend runs in a development environment in `ca-central-1` and has been verified live. Its
+last successful deploy (2026-11-02) passed every gate above in live mode. The same day, the
+SeedTest matrix of eight configurations passed against the live backend, and so did a
+customer-style end-to-end walk of the deployed product, driven from the frontend repository. A
+later deploy from `main` (2026-11-13) stopped at the strict SeedTest gate and rolled the services
+back automatically, so dev still runs the 2026-11-02 build. Production has not been stood up yet:
+the release path exists in `deploy.yml` but has never run. Stripe runs in test mode, so no real
+payments are taken.
+
+## Further reading
+
+- [`.env.example`](.env.example) covers the local settings; [`app/config.py`](app/config.py)
+  defines every setting and its default.
+
+## License
+
+Proprietary; shared for portfolio review only. All rights reserved.
