@@ -171,7 +171,7 @@ before each test, that the app role is neither superuser nor `BYPASSRLS`.
 export LUCIEL_SUPERUSER_TCP=1 LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432
 export LUCIEL_SUPERUSER=postgres PGPASSWORD=postgres LUCIEL_INTEGRATION_MODE=mock
 python -m pytest tests/isolation                               # tenant-isolation suite
-python -m pytest tests/unit tests/integration tests/contract   # everything else
+python -m pytest tests/unit tests/integration tests/contract tests/migrations   # everything else
 ruff check app tests && ruff format --check app tests && mypy app
 ```
 
@@ -184,7 +184,7 @@ a failed daily run is posted to the month's dependency-review issue.
 | --- | --- |
 | Locked install | `uv lock --check`, then `uv sync --frozen`: CI tests exactly the dependency set the image installs |
 | Lint and types | `ruff check`, `ruff format --check`, and `mypy` in strict mode over `app/` |
-| Security | `bandit`; `pip-audit --strict`, which fails on any vulnerability that has a fix; `detect-secrets` against `.secrets.baseline` |
+| Security | `bandit`; `pip-audit --strict`, which fails on any vulnerability that has a fix; `detect-secrets-hook`, which fails on any secret in a tracked file that `.secrets.baseline` does not list |
 | Migrations | `alembic upgrade head`, `downgrade base`, `upgrade head`, then the audit-log lock as superuser |
 | Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |
 
@@ -274,6 +274,12 @@ payments are taken.
 
 - [`.env.example`](.env.example) covers the local settings; [`app/config.py`](app/config.py)
   defines every setting and its default.
+- [`CLAUDE.md`](CLAUDE.md) is the working guide to this codebase: product invariants, the
+  architecture map, the test recipe and deploy rules. Most modules carry their own `CLAUDE.md`
+  (every `app/` package except `app/employee/` and `app/observability/`, plus `infra/`). Tags
+  in these guides, comments and test names, such as "round 7 WP-3c", "D6", "Arc 14", "F039" or
+  "§3.1.6a", refer to internal work packages, owner decisions, audit ids and specification
+  sections kept outside the repository.
 
 ## License
 
