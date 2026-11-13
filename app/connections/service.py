@@ -2070,9 +2070,9 @@ async def resolve_email_address(
 ) -> str | None:
     """The tenant's provisioned send+receive address, or None if not provisioned.
 
-    This is the authoritative per-tenant email identity (§3.1.6a) — the EmailAdapter
-    default is only a last-resort fallback, and the prompt composer uses this to tell
-    Luciel its own address."""
+    This is the authoritative per-tenant email identity (§3.1.6a). The EmailAdapter
+    has no fallback: a send without it fails closed (no_sender_identity), and the
+    prompt composer uses this to tell Luciel its own address."""
     conn = await _single_active(session, admin_id, instance_id, "email_sender")
     if conn is None or not conn.non_secret_config:
         return None
