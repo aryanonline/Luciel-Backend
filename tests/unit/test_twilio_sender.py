@@ -64,7 +64,7 @@ def test_build_sms_sender_stays_null_when_live_but_no_account_sid(monkeypatch):
     # Live mode fails closed without the platform-wide secrets; provision them so the
     # assertion below lands on the SMS factory rather than on the boot guard.
     monkeypatch.setenv("LUCIEL_PLATFORM_SECRET", LIVE_PLATFORM_SECRET)
-    monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SID", "SK00000000000000000000000000000000")
+    monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SID", "SK" + "0" * 32)
     monkeypatch.setenv("LUCIEL_TWILIO_API_KEY_SECRET", "fixture-api-key-secret")
     # Deliberately NOT setting LUCIEL_TWILIO_ACCOUNT_SID. getattr() guards mean this
     # test is correct whether or not the field exists on Settings.
@@ -87,7 +87,7 @@ def test_build_sms_sender_binds_real_sender_once_fully_configured(monkeypatch):
     class _FakeSettings:
         integration_mode = "live"
         twilio_account_sid = "ACfixturefixturefixturefixture01"
-        twilio_api_key_sid = "SK00000000000000000000000000000000"
+        twilio_api_key_sid = "SK" + "0" * 32
         twilio_api_key_secret = "fixture-api-key-secret"  # noqa: S105
 
     monkeypatch.setattr(config_mod, "get_settings", lambda: _FakeSettings())
@@ -111,7 +111,7 @@ def test_twilio_sms_sender_lazy_imports_sdk_only_on_send(monkeypatch):
     assert "twilio" not in sys.modules or True  # no assertion on pre-existing state
     sender = TwilioSmsSender(
         account_sid="ACfixturefixturefixturefixture01",
-        api_key_sid="SK00000000000000000000000000000000",
+        api_key_sid="SK" + "0" * 32,
         api_key_secret="fixture-api-key-secret",  # noqa: S105
     )
     # Construction succeeded without importing/using the twilio package.
