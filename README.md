@@ -187,9 +187,11 @@ a failed daily run is posted to the month's dependency-review issue.
 | Security | `bandit`; `pip-audit --strict`, which fails on any vulnerability that has a fix; `detect-secrets-hook`, which fails on any secret in a tracked file that `.secrets.baseline` does not list |
 | Migrations | `alembic upgrade head`, `downgrade base`, `upgrade head`, then the audit-log lock as superuser |
 | Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |
+| Infrastructure | A separate `infra` job: `npm ci`, `tsc --noEmit` and the CDK Jest assertions |
 
 The CDK stacks have their own Jest assertions in `infra/test/` (28 files; run `npm ci && npm test`
-in `infra/`). They are not part of the CI gate.
+in `infra/`). CI's separate `infra` job type-checks the CDK app (`tsc --noEmit`) and runs them on
+Node.js 20.
 
 ## Deployment
 

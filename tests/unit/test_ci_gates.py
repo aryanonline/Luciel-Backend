@@ -63,3 +63,17 @@ def test_lint_and_format_cover_the_scripts_ci_and_deploys_run() -> None:
     run = _step("Lint (ruff)")
     assert "ruff check app tests scripts" in run
     assert "ruff format --check app tests scripts" in run
+
+
+def test_the_infra_job_type_checks_the_cdk_app_and_runs_its_jest_assertions() -> None:
+    doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    job = doc["jobs"]["infra"]
+    assert job["defaults"]["run"]["working-directory"] == "infra"
+    setup = [s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/setup-node@")]
+    assert len(setup) == 1
+    assert setup[0]["with"]["node-version"] == "20"  # what deploy.yml synthesizes with
+    assert setup[0]["with"]["cache-dependency-path"] == "infra/package-lock.json"
+    runs = [str(s.get("run", "")) for s in job["steps"]]
+    assert runs.index("npm ci") < runs.index("npx tsc --noEmit") < runs.index("npx jest")
+    # A job-level `if:` would let a push or PR skip it.
+    assert "if" not in job
