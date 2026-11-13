@@ -1,9 +1,11 @@
-"""Embedding provider (platform-controlled, pluggable — Architecture §3.4.3 ethos).
+"""Embedding interface and the deterministic mock embedder (Architecture §3.4.3 ethos).
 
-Production uses the platform LLM provider's embedding endpoint (Anthropic/OpenAI
-class). For local dev/test and deterministic CI, a hashing-based embedder produces
-stable, L2-normalized vectors so retrieval is exercisable end-to-end with no
-external API. The interface is identical; the provider is swapped via config.
+Live mode embeds with OpenAI ``text-embedding-3-small`` (``OpenAIEmbedder``, model
+pinned by ``settings.knowledge_embedding_model``). For local dev/test and
+deterministic CI, a hashing-based embedder produces stable, L2-normalized vectors so
+retrieval is exercisable end-to-end with no external API. The interface is
+identical; ``app.knowledge.embeddings.get_embedder`` picks the embedder for the
+integration mode.
 
 Model selection is never admin-configurable (Locked Decision §7 #11).
 """
@@ -58,14 +60,3 @@ class HashingEmbedder:
             vec[0] = 1.0
             norm = 1.0
         return [x / norm for x in vec]
-
-
-_default: Embedder | None = None
-
-
-def get_embedder() -> Embedder:
-    global _default
-    if _default is None:
-        # TODO(Arc 14+): swap to the platform LLM-provider embedder via config.
-        _default = HashingEmbedder()
-    return _default
