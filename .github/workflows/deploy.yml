@@ -15,11 +15,10 @@ name: deploy
 # linux/arm64 under one tag) because every backend task definition runs on
 # Graviton (round 7 WP-8, D7); scripts/gate_image_scan.sh gates each platform child.
 #
-# Triggers (dispatch only — there is no push trigger: `main` is a stale revert and
-# the `guard` job refuses any ref but the release branch):
-#   - workflow_dispatch dev  -> manual dev deploy. Always pass
-#     `--ref feat/docs-conformance-build-20260713-r2`; a bare dispatch uses the
-#     default branch, which is now the release branch too.
+# Triggers (dispatch only — there is no push trigger, and the `guard` job refuses
+# any ref but the release branch, `main`):
+#   - workflow_dispatch dev  -> manual dev deploy. Always pass `--ref main`; a bare
+#     dispatch uses the default branch, which is the release branch too.
 #   - workflow_dispatch prod -> prod RELEASE FLOW (below). Gated by the GitHub
 #     `prod` Environment protection rule AND by the preprod §10 harness: prod is
 #     NEVER reached unless a prod-shaped preprod passed the §10 verification.
@@ -72,17 +71,17 @@ env:
 
 jobs:
   # ---- GUARD: deploys run ONLY from the release branch --------------------------
-  # `main` is a stale revert (CLAUDE.md "Branch discipline"), yet a bare
-  # `gh workflow run` dispatches the repository's default branch and every job
-  # below checks out whatever ref was dispatched. 2026-09-06: a dispatch without
-  # `--ref` deployed main to dev for 25 minutes. The default branch now IS the
-  # release branch, and this job refuses anything else before a single AWS call.
+  # Every job below checks out whatever ref was dispatched. 2026-09-06: a dispatch
+  # without `--ref` deployed the then-stale `main` to dev for 25 minutes. Since
+  # 2026-11-13 `main` IS the release branch and the default branch (the former
+  # release branch was merged into it and retired), and this job still refuses any
+  # other ref before a single AWS call (CLAUDE.md "Branch discipline").
   guard:
     runs-on: ubuntu-latest
     steps:
       - name: Refuse any ref that is not the release branch
         env:
-          RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH || 'feat/docs-conformance-build-20260713-r2' }}
+          RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH || 'main' }}
         run: |
           if [ "${{ github.ref_name }}" != "$RELEASE_BRANCH" ]; then
             echo "::error::deploys run only from $RELEASE_BRANCH (dispatched ref: ${{ github.ref_name }}). Re-run with --ref $RELEASE_BRANCH."

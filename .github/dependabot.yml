@@ -2,8 +2,8 @@
 # 2026-09-07: "automatically perform any Next migrations or CVE reviews without
 # having me and my team manage it").
 #
-# Every ecosystem this repository ships targets the RELEASE branch (the stale
-# `main` is never touched). Minor and patch updates are grouped into one weekly
+# Every ecosystem this repository ships targets the RELEASE branch, `main` (the
+# default branch). Minor and patch updates are grouped into one weekly
 # PR per ecosystem; `.github/workflows/dependabot-auto-merge.yml` squash-merges a
 # grouped or single minor/patch PR once CI is green and labels a MAJOR bump for a
 # person.
@@ -31,7 +31,7 @@ version: 2
 updates:
   - package-ecosystem: uv
     directory: /
-    target-branch: feat/docs-conformance-build-20260713-r2
+    target-branch: main
     schedule:
       interval: weekly
       day: monday
@@ -47,7 +47,7 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: feat/docs-conformance-build-20260713-r2
+    target-branch: main
     schedule:
       interval: weekly
       day: monday
@@ -61,7 +61,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /
-    target-branch: feat/docs-conformance-build-20260713-r2
+    target-branch: main
     schedule:
       interval: weekly
       day: monday
@@ -79,7 +79,7 @@ updates:
 
   - package-ecosystem: npm
     directory: /infra
-    target-branch: feat/docs-conformance-build-20260713-r2
+    target-branch: main
     schedule:
       interval: weekly
       day: monday

@@ -109,7 +109,7 @@ image for CVEs against a dated allowlist whose waivers expire.
 
 Deployments run only by manual dispatch of `.github/workflows/deploy.yml`, choosing
 `environment` (`dev` or `prod`) and `integration_mode` explicitly. A guard job refuses
-any branch other than the release branch, and nothing deploys on push. Production
+any branch other than the release branch, `main`, and nothing deploys on push. Production
 releases first stand up a temporary production-shaped environment, run verification
 and seed tests against it as a hard gate, and remove it afterwards. Migrations run as a
 one-off task inside the VPC before services roll.

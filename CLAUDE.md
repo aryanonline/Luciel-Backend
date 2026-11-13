@@ -22,8 +22,10 @@ Never put credentials, customer data, or live operational secrets in this repo.
 
 ## Branch discipline
 
-- Work only on `feat/docs-conformance-build-20260713-r2` for this change stream.
-- Treat `main` as a stale revert; never use it as the implementation base.
+- Work on `main`, the release branch and the default branch, for this change stream.
+- The former release branch `feat/docs-conformance-build-20260713-r2` was merged into
+  `main` and retired on 2026-11-13; never recreate it or use any other branch as the
+  implementation base.
 - Start by checking `git status --short --branch` and the branch tip.
 - Keep a change narrow, tested, and reviewable; do not mix product rewrites with
   opportunistic refactors.
@@ -201,9 +203,9 @@ Run focused tests while iterating, then run the full command above before commit
 ## Deploy
 
 - Dispatch the named workflow FROM THE RELEASE BRANCH, always with `--ref`:
-  `gh workflow run deploy.yml --ref feat/docs-conformance-build-20260713-r2 -f environment=dev -f integration_mode=live`.
+  `gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live`.
   The workflow's `guard` job refuses any other ref (2026-09-06: a bare dispatch shipped
-  stale `main` to dev), there is no push trigger, and an omitted `integration_mode`
+  a stale default branch to dev), there is no push trigger, and an omitted `integration_mode`
   means the `DEV_INTEGRATION_MODE` repo variable (`live`), never `mock`.
 - `environment` is `dev` or `prod`; choose `integration_mode` explicitly (`mock` or
   `live`). Do not treat a deploy command as approval for a real integration.
