@@ -172,7 +172,7 @@ export LUCIEL_SUPERUSER_TCP=1 LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432
 export LUCIEL_SUPERUSER=postgres PGPASSWORD=postgres LUCIEL_INTEGRATION_MODE=mock
 python -m pytest tests/isolation                               # tenant-isolation suite
 python -m pytest tests/unit tests/integration tests/contract tests/migrations   # everything else
-ruff check app tests && ruff format --check app tests && mypy app
+ruff check app tests scripts && ruff format --check app tests scripts && mypy app
 ```
 
 The latest CI run on `main` (2026-11-13) passed 8 isolation tests and 3,899 unit, integration and
@@ -183,7 +183,7 @@ a failed daily run is posted to the month's dependency-review issue.
 | CI step | What it enforces |
 | --- | --- |
 | Locked install | `uv lock --check`, then `uv sync --frozen`: CI tests exactly the dependency set the image installs |
-| Lint and types | `ruff check`, `ruff format --check`, and `mypy` in strict mode over `app/` |
+| Lint and types | `ruff check` and `ruff format --check` over `app/`, `tests/` and `scripts/`; `mypy` in strict mode over `app/` |
 | Security | `bandit`; `pip-audit --strict`, which fails on any vulnerability that has a fix; `detect-secrets-hook`, which fails on any secret in a tracked file that `.secrets.baseline` does not list |
 | Migrations | `alembic upgrade head`, `downgrade base`, `upgrade head`, then the audit-log lock as superuser |
 | Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |

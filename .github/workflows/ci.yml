@@ -90,8 +90,8 @@ jobs:
       - name: Lint (ruff)
         run: |
           . .venv/bin/activate
-          ruff check app tests
-          ruff format --check app tests
+          ruff check app tests scripts
+          ruff format --check app tests scripts
 
       - name: Type-check (mypy strict)
         run: |

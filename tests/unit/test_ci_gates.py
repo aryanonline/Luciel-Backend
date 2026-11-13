@@ -55,3 +55,11 @@ def test_the_secret_scan_runs_on_every_trigger_including_the_daily_schedule() ->
     assert "schedule" in triggers
     assert "pull_request" in triggers
     assert triggers["push"]["branches"] == ["main"]
+
+
+def test_lint_and_format_cover_the_scripts_ci_and_deploys_run() -> None:
+    # scripts/ runs in CI (check_doctrine_sync.py) and in every deploy (rollback,
+    # reconcile, run_sql, task_definitions); it drifted while outside the lint scope.
+    run = _step("Lint (ruff)")
+    assert "ruff check app tests scripts" in run
+    assert "ruff format --check app tests scripts" in run
