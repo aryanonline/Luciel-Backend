@@ -151,14 +151,14 @@ SUPER="host=127.0.0.1 port=5432 dbname=luciel_dev user=postgres password=postgre
 python scripts/run_sql.py --dsn "$SUPER" --file scripts/bootstrap_roles.sql   # roles and grants
 alembic upgrade head                                                          # schema, RLS, grants, as luciel_app
 python scripts/run_sql.py --dsn "$SUPER" --file scripts/lock_audit_log.sql    # append-only audit log
-uvicorn app.main:app --reload --port 8080
+uvicorn app.main:app --reload --port 8000
 ```
 
 `LUCIEL_INTEGRATION_MODE=mock` (the default) uses a deterministic model and fake senders with no
 external keys; `live` calls real providers and has to be chosen on purpose. With the default
-`LUCIEL_ENVIRONMENT=development` the OpenAPI docs are at `http://localhost:8080/docs`; deployed
+`LUCIEL_ENVIRONMENT=development` the OpenAPI docs are at `http://localhost:8000/docs`; deployed
 environments return 404 there. To run the Luciel-Frontend dashboard against this backend, set
-`LUCIEL_COOKIE_SECURE=false` here and point the frontend's HTTP adapter at `http://localhost:8080`.
+`LUCIEL_COOKIE_SECURE=false` here and point the frontend's HTTP adapter at `http://localhost:8000`.
 
 ## Tests and quality checks
 

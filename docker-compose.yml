@@ -1,15 +1,14 @@
-# Local development stack for the owner's machine (Space Instructions: local first,
-# no AWS until explicit approval). Brings up Postgres + pgvector and Redis, runs the
-# role/extension bootstrap, then the app can run migrations and serve.
+# Local development stack: PostgreSQL 17 + pgvector and Redis; the role bootstrap runs
+# on first start. Then the app can run migrations and serve.
 #
 #   docker compose up -d db redis
 #   # then, from the host (with the venv active):
 #   alembic upgrade head
-#   uvicorn app.main:app --reload --port 8080
+#   uvicorn app.main:app --reload --port 8000
 #
 # Point the frontend at this backend:
 #   NEXT_PUBLIC_API_ADAPTER=http
-#   NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+#   NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
 #   (and run the backend with LUCIEL_COOKIE_SECURE=false for http localhost)
 
 services:
