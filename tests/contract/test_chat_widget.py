@@ -73,7 +73,7 @@ async def test_bootstrap_delivers_disclosure_and_chrome(client):
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_bootstrap_never_doubles_assistant_in_name(client):
     """LIVE-VERIFIED (Harmony wave 2, item 1): a business/Luciel name that already
-    ends in the word "Assistant" (e.g. "Aryan's Front-Desk Assistant"), with NO
+    ends in the word "Assistant" (e.g. "Maya's Front-Desk Assistant"), with NO
     separate assistantName override configured, must not produce
     "...Assistant's assistant" in the opening message — the exact string the old
     default fallback (business + "'s assistant") plus the old greeting template
@@ -98,7 +98,7 @@ async def test_bootstrap_never_doubles_assistant_in_name(client):
             Instance(
                 id=admin,
                 admin_id=admin,
-                name="Aryan's Front-Desk Assistant",
+                name="Maya's Front-Desk Assistant",
                 state=LucielState.active,
                 embed_key_public_id=embed_key,
                 channels=[],
@@ -116,7 +116,7 @@ async def test_bootstrap_never_doubles_assistant_in_name(client):
     assert "assistant's assistant" not in lowered
     assert "assistant assistant" not in lowered
     # The Luciel name is used verbatim as the speaker.
-    assert opening.startswith("Hi — I'm Aryan's Front-Desk Assistant.")
+    assert opening.startswith("Hi — I'm Maya's Front-Desk Assistant.")
     # AI-disclosure requirement stays explicit.
     assert "ai assistant" in lowered
 
@@ -609,14 +609,14 @@ async def test_bootstrap_storm_from_one_address_is_bounded(client):
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_bootstrap_disclosure_clause_never_names_the_luciel(client):
-    """LIVE-VERIFIED regression: the opening greeting read "Hi — I'm Aryan's
-    Front-Desk Assistant. I'm an AI assistant for Aryan's Front-Desk Assistant,
+    """LIVE-VERIFIED regression: the opening greeting read "Hi — I'm Maya's
+    Front-Desk Assistant. I'm an AI assistant for Maya's Front-Desk Assistant,
     and I can help…" — the disclosure clause substituted the LUCIEL name where
     the BUSINESS should be. No usable short business-name field exists on the
     Instance/Personality pillar, so the disclosure clause must fall back to
     "this business" and must never repeat the Luciel name.
     """
-    luciel_name = "Aryan's Front-Desk Assistant"
+    luciel_name = "Maya's Front-Desk Assistant"
     admin = uuid.uuid4()
     embed_key = f"vm_live_{uuid.uuid4().hex[:10]}"
     async with tenant_session(admin) as s:

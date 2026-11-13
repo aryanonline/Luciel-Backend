@@ -353,7 +353,7 @@ def _compose_greeting(*, business_name: str, assistant_name: str) -> str:
     never suffixed with "'s assistant" or concatenated into "the AI assistant for
     {business}". That concatenation is what produced "...Assistant's assistant"
     when an admin's chosen name already ends in the word "Assistant" (e.g. a
-    front-desk name like "Aryan's Front-Desk Assistant"): the old fallback default
+    front-desk name like "Maya's Front-Desk Assistant"): the old fallback default
     (`f"{business}'s assistant"`) combined with the old template's own
     ", the AI assistant for {business}" suffix doubled the word "assistant".
     The AI-identity disclosure (§3.4.16) stays explicit and non-removable — it is

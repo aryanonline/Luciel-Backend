@@ -83,13 +83,13 @@ def test_backstop_noop_when_already_disclosed():
 def test_backstop_never_doubles_assistant_when_name_already_ends_in_assistant():
     """LIVE-VERIFIED (Harmony wave 2, item 1): a Luciel/business name that already
     ends in the word "Assistant" (e.g. a front-desk name an owner actually typed,
-    "Aryan's Front-Desk Assistant") must never produce "...Assistant's assistant" in
+    "Maya's Front-Desk Assistant") must never produce "...Assistant's assistant" in
     the composed greeting. The old template appended ", the AI assistant for
     {business}" directly after the speaker name, and the old default-assistant
     fallback separately appended "'s assistant" onto the business name — either
     path doubles the word when the configured name already ends in "Assistant".
     """
-    name = "Aryan's Front-Desk Assistant"
+    name = "Maya's Front-Desk Assistant"
     out = ensure_ai_identity_disclosure(
         "Our hours are 9 to 5.", business_name=name, assistant_name=name
     )
@@ -106,12 +106,12 @@ def test_backstop_never_doubles_assistant_when_name_already_ends_in_assistant():
 def test_disclosure_clause_names_business_when_luciel_name_ends_in_assistant():
     """LIVE-VERIFIED regression: the disclosure clause must name the BUSINESS, never
     the Luciel, even when the Luciel/speaker name ends in the word "Assistant" (the
-    exact live-failing shape: "Hi — I'm Aryan's Front-Desk Assistant. I'm an AI
-    assistant for Aryan's Front-Desk Assistant..." incorrectly repeated the Luciel
+    exact live-failing shape: "Hi — I'm Maya's Front-Desk Assistant. I'm an AI
+    assistant for Maya's Front-Desk Assistant..." incorrectly repeated the Luciel
     name in the disclosure clause instead of naming the business).
     """
-    luciel_name = "Aryan's Front-Desk Assistant"
-    business_name = "Aryan's Detailing Co"
+    luciel_name = "Maya's Front-Desk Assistant"
+    business_name = "Maya's Detailing Co"
     out = ensure_ai_identity_disclosure("", business_name=business_name, assistant_name=luciel_name)
     assert out.startswith(f"Hi — I'm {luciel_name}.")
     assert f"an AI assistant for {business_name}" in out
@@ -135,8 +135,8 @@ def test_disclosure_clause_falls_back_to_this_business_when_no_business_name():
 def test_disclosure_never_contains_the_luciel_name_even_when_it_ends_in_assistant():
     """Hard invariant: whatever business_name is supplied, the disclosure clause
     (the part after the speaker introduction) must never contain the Luciel name."""
-    luciel_name = "Aryan's Front-Desk Assistant"
-    for business_name in ("this business", "Aryan's Detailing Co", "GTA Premier"):
+    luciel_name = "Maya's Front-Desk Assistant"
+    for business_name in ("this business", "Maya's Detailing Co", "GTA Premier"):
         out = ensure_ai_identity_disclosure(
             "", business_name=business_name, assistant_name=luciel_name
         )

@@ -186,7 +186,7 @@ def _calendly_transport(event_types: list[dict[str, Any]]) -> _Transport:
                 {
                     "resource": {
                         "uri": "https://api.calendly.com/users/U1",
-                        "name": "Aryan",
+                        "name": "Jordan Lee",
                         "scheduling_url": "https://calendly.com/acme",
                         "current_organization": "https://api.calendly.com/organizations/O1",
                     }
@@ -229,10 +229,10 @@ async def test_calendly_with_no_active_event_type_connects_and_says_so():
 
 async def test_meta_and_instagram_name_the_account():
     meta_me = verify.meta_me_endpoint()
-    meta = _Transport({meta_me: _Resp(200, {"id": "1001", "name": "Aryan Singh"})})
+    meta = _Transport({meta_me: _Resp(200, {"id": "1001", "name": "Jordan Lee"})})
     updates = await verify.verify_meta_grant(material={"access_token": "m-tok"}, transport=meta)
     assert updates["metaUserId"] == "1001"
-    assert updates["connectedAs"] == "Meta · Aryan Singh"
+    assert updates["connectedAs"] == "Meta · Jordan Lee"
     assert updates["token_expires_at"]
 
     ig_me = verify.instagram_me_endpoint()

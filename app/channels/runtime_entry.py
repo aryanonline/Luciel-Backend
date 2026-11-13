@@ -78,7 +78,7 @@ def names(inst: Instance) -> tuple[str, str]:
     LUCIEL's own configured name, NOT the business's name. It must never be
     fed into the AI-identity disclosure's business noun; see
     ``_disclosure_business_name`` for that (the bug this fixes: the disclosure
-    naming the Luciel, e.g. "Aryan's Front-Desk Assistant", instead of the
+    naming the Luciel, e.g. "Maya's Front-Desk Assistant", instead of the
     business).
 
     When no assistantName is configured, the Luciel name itself is used

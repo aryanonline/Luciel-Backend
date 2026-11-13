@@ -253,7 +253,7 @@ def _names(inst: Instance) -> tuple[str, str]:
     When no assistantName is configured, the Luciel name itself is used
     VERBATIM as the speaker -- never suffixed with "'s assistant". That suffix is
     exactly what produced "...Assistant's assistant" when a business/Luciel name
-    already ends in the word "Assistant" (e.g. "Aryan's Front-Desk Assistant").
+    already ends in the word "Assistant" (e.g. "Maya's Front-Desk Assistant").
     """
     business = inst.name or "this business"
     personality = inst.personality or {}
@@ -265,8 +265,8 @@ def _disclosure_business_name(inst: Instance) -> str:
     """Resolve the BUSINESS name for the AI-identity disclosure clause (Sec 3.4.16).
 
     Bug fixed here: the disclosure previously named the LUCIEL (``inst.name``,
-    e.g. "Aryan's Front-Desk Assistant") instead of the business, producing
-    "I'm an AI assistant for Aryan's Front-Desk Assistant" -- the Luciel name must
+    e.g. "Maya's Front-Desk Assistant") instead of the business, producing
+    "I'm an AI assistant for Maya's Front-Desk Assistant" -- the Luciel name must
     NEVER appear in this clause.
 
     Checked the Instance model and the Personality pillar for a usable SHORT
