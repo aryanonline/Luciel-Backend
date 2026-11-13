@@ -120,11 +120,22 @@ jobs:
           uv pip freeze --exclude-editable > /tmp/audit-reqs.txt
           pip-audit --strict --desc -r /tmp/audit-reqs.txt
 
-      - name: Secret scan (detect-secrets)
+      - name: Secret scan (detect-secrets — fails on any secret not in the baseline)
         run: |
           . .venv/bin/activate
-          detect-secrets scan --baseline .secrets.baseline || \
-            (echo "New secrets detected — review .secrets.baseline" && exit 1)
+          # `detect-secrets scan --baseline` merges new findings into the baseline and
+          # always exits 0, so it could never fail this step. The pre-commit entry point
+          # (detect-secrets-hook) exits 1 on any secret missing from .secrets.baseline.
+          # It runs against a scratch copy of the baseline: exit 3 only means it
+          # refreshed line numbers (nothing new), counts as a pass, and never rewrites
+          # the committed file. xargs turns any non-zero exit into 123, so the 3 -> 0
+          # mapping happens inside each batch. A test fixture that trips it: mark the
+          # line `# pragma: allowlist secret`, or re-run
+          # `detect-secrets scan --baseline .secrets.baseline` and audit the new entry.
+          cp .secrets.baseline "$RUNNER_TEMP/secrets.baseline"
+          git ls-files -z -- ':!.secrets.baseline' | xargs -0 sh -c '
+            detect-secrets-hook --baseline "$RUNNER_TEMP/secrets.baseline" "$@"
+            rc=$?; [ "$rc" -eq 3 ] && rc=0; exit "$rc"' sh
 
       - name: Doctrine-to-code sync (Architecture §5.9.3)
         run: |
