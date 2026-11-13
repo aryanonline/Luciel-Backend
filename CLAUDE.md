@@ -7,25 +7,27 @@ control plane, embeddable chat data plane, channel webhooks, knowledge-grounded
 runtime, external connections, billing, lifecycle work, and AWS deployment
 configuration that let one owner operate one Luciel across its customer channels.
 
+Tags such as "round 7 WP-3c", "D6", "Arc 14", "F039" or "§3.1.6a" refer to internal
+work packages, owner decisions, audit ids and specification sections kept outside
+the repository.
+
 ## THE AUTHORITATIVE DOCS NOTE
 
-**Business truth does not live in this repository.** The authoritative documents
-are the Perplexity project files `VANTAGEMIND_VISION`, `VANTAGEMIND_ARCHITECTURE`,
-`VANTAGEMIND_CUSTOMER_JOURNEY`, and `VANTAGEMIND_LEGAL`, updated 2026-08-06.
-Repository documentation is deliberately minimal: this file and the module-local
-`CLAUDE.md` files are operational maps, not a competing product specification.
+**Business truth does not live in this repository.** The product specification
+(vision, architecture, customer journey, legal) is maintained privately outside this
+repository; when code and the specification conflict, resolve it with the owner
+before changing product behaviour. Repository documentation is deliberately
+minimal: this file and the module-local `CLAUDE.md` files are operational maps, not
+a competing product specification.
 
-When code, a task, and those project files conflict, resolve the conflict with the
-owner before making a product-behavior change. Do not recreate historical briefs,
-hand-offs, credentials notes, or narrative architecture documents in the repo.
-Never put credentials, customer data, or live operational secrets in this repo.
+Do not recreate historical briefs, hand-offs, secrets, or narrative architecture
+documents in the repo. Never put credentials, customer data, or live operational
+secrets in this repo.
 
 ## Branch discipline
 
-- Work on `main`, the release branch and the default branch, for this change stream.
-- The former release branch `feat/docs-conformance-build-20260713-r2` was merged into
-  `main` and retired on 2026-11-13; never recreate it or use any other branch as the
-  implementation base.
+- Work on `main`, the default and release branch; use short-lived branches merged
+  back into `main`.
 - Start by checking `git status --short --branch` and the branch tip.
 - Keep a change narrow, tested, and reviewable; do not mix product rewrites with
   opportunistic refactors.
@@ -53,6 +55,7 @@ Never put credentials, customer data, or live operational secrets in this repo.
 | `app/migrations/` | Alembic schema history; audit lock follows migration as an operations step. |
 | `app/models/` | SQLAlchemy persistence models for account, runtime, billing, and integrations. |
 | `app/notifications/` | Email/SMS notifications and deferred escalation delivery. |
+| `app/observability/` | Structured JSON logging, request context (trace id, acting tenant), and CloudWatch EMF metrics. |
 | `app/policy/` | Product entitlement and capability decisions. |
 | `app/runtime/` | Grounded orchestration, sessions, safety, handoff, LLMs, voice, and budgets. |
 | `app/schemas_api/` | API request/response schemas and wire-shape aliases. |
@@ -61,7 +64,9 @@ Never put credentials, customer data, or live operational secrets in this repo.
 | `scripts/` | Database role/bootstrap, migration, verification, sweep, and deploy helpers. |
 | `tests/` | Unit, integration, contract, migration, and non-overridable isolation coverage. |
 
-Read the local `CLAUDE.md` before changing a module. Follow execution paths across
+Most modules carry a local `CLAUDE.md` (every `app/` package except `app/employee/`
+and `app/observability/`, plus `infra/`); where one exists, read it before changing
+that module. Follow execution paths across
 modules rather than duplicating business rules in a new location.
 
 ## Non-negotiable product invariants
@@ -181,31 +186,35 @@ modules rather than duplicating business rules in a new location.
 
 ## Local test environment
 
-Use the supplied PostgreSQL and virtualenv for this branch’s full suite:
+The suite runs against the same database CI uses: PostgreSQL 17 with pgvector 0.8.0
+(`docker-compose.yml`, image `pgvector/pgvector:0.8.0-pg17`, port 5432, superuser
+`postgres`/`postgres`; first start creates the `luciel_app`, `luciel_auth` and
+`luciel_audit_owner` roles). Python 3.12, and a PostgreSQL client (`psql`) on PATH:
+the fixtures create and wipe the test database through it.
 
 ```bash
-export PATH="/tmp/vcal/bin:/usr/lib/postgresql/18/bin:$PATH"
-export LUCIEL_SUPERUSER_TCP=1
-export LUCIEL_PG_HOST=127.0.0.1
-export LUCIEL_PG_PORT=55432
-export LUCIEL_SUPERUSER=postgres
+docker compose up -d db redis
+uv sync --frozen --extra dev        # the locked set CI installs; or: pip install -e ".[dev]"
+export LUCIEL_SUPERUSER_TCP=1       # superuser psql over TCP (else: sudo -u postgres psql)
 export PGPASSWORD=postgres
 export LUCIEL_INTEGRATION_MODE=mock
-pip install -e .
-python -m pytest -v
+# Optional; these are the defaults tests/conftest.py uses:
+# export LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432 LUCIEL_SUPERUSER=postgres
+python -m pytest tests/isolation
+python -m pytest tests/unit tests/integration tests/contract tests/migrations
 ```
 
-For a fresh local environment, create/activate a Python 3.12 virtual environment,
-then install `-e .` plus the required test dependencies if the supplied environment
-does not already contain them. The expected baseline is about **1327 passed, 0 failed**.
-Run focused tests while iterating, then run the full command above before commit.
+On a host with no native `psql`, point `LUCIEL_PSQL` at a single executable (a
+wrapper script) that forwards its arguments to one, for example the client inside
+the `db` container. The expected result is about 3,900 passed,
+0 failed. Run focused tests while iterating, then the full suite before commit.
 
 ## Deploy
 
 - Dispatch the named workflow FROM THE RELEASE BRANCH, always with `--ref`:
   `gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live`.
-  The workflow's `guard` job refuses any other ref (2026-09-06: a bare dispatch shipped
-  a stale default branch to dev), there is no push trigger, and an omitted `integration_mode`
+  The workflow's `guard` job refuses any other ref (2026-09-06: a dispatch from a stale
+  ref reached dev), there is no push trigger, and an omitted `integration_mode`
   means the `DEV_INTEGRATION_MODE` repo variable (`live`), never `mock`.
 - `environment` is `dev` or `prod`; choose `integration_mode` explicitly (`mock` or
   `live`). Do not treat a deploy command as approval for a real integration.
