@@ -88,7 +88,7 @@ jobs:
           . .venv/bin/activate
           uv pip list --outdated 2>&1 | tee outdated-python.txt || true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
 

@@ -194,7 +194,7 @@ jobs:
           echo "[pause] reusing gated image tag $TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '20' }
 
       # Round 7 WP-8b (owner decision D6): every hostname this job touches comes from
@@ -432,7 +432,7 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '20' }
 
       # Owner decision D6: prod's names ARE the public names, and exactly one
@@ -679,7 +679,7 @@ jobs:
           echo "[pause] reusing gated image tag $TAG"
           echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '20' }
 
       # Same D6 refusal as preprod-standup (defense in depth: this job is what would
@@ -854,7 +854,7 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '20' }
 
       - name: Tear down ephemeral preprod (cdk destroy --force, no final snapshot)
