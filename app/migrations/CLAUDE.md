@@ -14,7 +14,7 @@ Contains the ordered Alembic schema history that establishes persistence, RLS, b
 - Treat audit locking as an explicit operations postcondition after upgrade, not a migration shortcut.
 
 ## Testing pointers
-- `tests/migrations/` when present and CI migration apply/rollback.
+- `tests/integration/test_migration_*.py` (per-revision upgrade, backfill and round-trip checks) and CI migration apply/rollback.
 - `tests/isolation/test_all_tenant_tables.py` plus audit/billing/lifecycle integrations.
 
 ## Gotchas from the 2026-08-06 truth delta

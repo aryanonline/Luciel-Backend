@@ -175,7 +175,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           . .venv/bin/activate
-          python -m pytest tests/unit tests/integration tests/contract tests/migrations -v
+          python -m pytest tests/unit tests/integration tests/contract -v
 
   # The CDK app's own guards: infra/test/*.test.ts pins the deploy posture (Stripe
   # posture, tenant-secrets IAM, the web task staying x86, cost retention, deploy

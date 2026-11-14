@@ -202,7 +202,7 @@ export LUCIEL_INTEGRATION_MODE=mock
 # Optional; these are the defaults tests/conftest.py uses:
 # export LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432 LUCIEL_SUPERUSER=postgres
 python -m pytest tests/isolation
-python -m pytest tests/unit tests/integration tests/contract tests/migrations
+python -m pytest tests/unit tests/integration tests/contract
 ```
 
 On a host with no native `psql`, point `LUCIEL_PSQL` at a single executable (a

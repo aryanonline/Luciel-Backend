@@ -123,6 +123,11 @@ exclude = ["app/migrations/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Explicit, so the locked pytest-asyncio stops warning (PytestDeprecationWarning:
+# "asyncio_default_fixture_loop_scope is unset") at the top of every CI run. Every
+# async fixture in tests/ is function-scoped, so "function" is the loop scope they
+# already ran on; nothing about how a test runs changes.
+asyncio_default_fixture_loop_scope = "function"
 # A test that runs this long gets every thread stack dumped to stderr (pytest built-in);
 # tests/conftest.py adds the watchdog that then fails the run with the asyncio tasks
 # and database sessions, instead of letting CI cancel a silent job after 35 minutes.

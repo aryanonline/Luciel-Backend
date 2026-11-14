@@ -45,7 +45,7 @@ def test_persist_names_a_seed_domain_mailbox(name: str, email: str) -> None:
 @pytest.mark.parametrize(
     "name",
     [
-        "owner@gmail.com",  # never a real customer's account
+        "owner@example.com",  # a customer-style address: never a real customer's account
         "e2e-walk@vantagemind.ai",
         "e2e-walk@seed.vantagemind.ai.evil.test",
         "",
@@ -293,4 +293,4 @@ def test_cli_persist(argv: list[str], cases: bool, persist: str | None) -> None:
 
 def test_cli_refuses_a_non_seed_persist() -> None:
     with pytest.raises(SystemExit):
-        H.parse_args(["--persist", "owner@gmail.com"], {})
+        H.parse_args(["--persist", "owner@example.com"], {})
