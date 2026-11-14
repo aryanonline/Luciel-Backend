@@ -489,8 +489,46 @@ def test_a_greeting_line_holds_at_most_two_words_as_the_tokenizer_counts_them() 
         assert _strip(answer) == answer, answer
         assert _framed(answer, chunk=chunk, question=None) == _base(answer, chunk, None), answer
     # Two words, however joined, are still a greeting.
-    for greeting in ("Hi Jean-François,", "Dear Mary-Ann!", "Hi O'Brien!", "Dear Mary Ann,"):
+    for greeting in ("Dear Mary-Ann!", "Hi O'Brien!", "Dear Mary Ann,"):
         assert _strip(f"{greeting}\n{BRUNCH_FACT}") == BRUNCH_FACT, greeting
+
+
+# Fillers (U+3164, U+FFA0, U+1160 render blank), modifier letters, and accented letters:
+# every one is a letter to the regex and a word break to the scorer's tokenizer.
+_JOINS = [chr(c) for c in (0x3164, 0xFFA0, 0x1160, 0x02BC, 0x02C8, 0xA78F, 0x30FC, 0x01C0)]
+
+
+@pytest.mark.parametrize("join", [*_JOINS, "é", "ß"])
+def test_a_greeting_name_holds_at_most_two_scored_words_whatever_letter_joins_it(
+    join: str,
+) -> None:
+    """Fixer round 2, finding 1: the name word of the greeting line matched any Unicode
+    letter, while the scorer's tokenizer reads only a-z0-9, so a filler (U+3164 renders as
+    a space), modifier letter or accented letter joined a claim of any length into one
+    "name word": "Hi Free<U+3164>Valet<U+3164>Parking<U+3164>Every<U+3164>Weekend," went,
+    claim and all, 0.750 served against the base 0.462. The name now also has to hold at
+    most two words as the scorer counts them, so the line stays in the score."""
+    claim = join.join(("Free", "Valet", "Parking", "Every", "Weekend"))
+    answer = f"Hi {claim},\n\n{BRUNCH_FACT}"
+    assert _strip(answer) == answer
+    result = _framed(answer, chunk=BRUNCH_CHUNK, question="When is brunch?")
+    assert result == _base(answer, BRUNCH_CHUNK, "When is brunch?")
+    assert result.grounded is False
+    warranty = join.join(("Lifetime", "Warranty", "Included", "Free", "Returns"))
+    answer = f"Hello {warranty}!\nOrders ship within 3 business days."
+    assert _strip(answer) == answer
+    chunk = "Orders ship within 3 business days."
+    assert _framed(answer, chunk=chunk, question=None) == _base(answer, chunk, None)
+    # No length bound escapes either: forty joined claim words stay scored.
+    long_claim = join.join(f"Claim{chr(97 + i % 26)}word" for i in range(40))
+    answer = f"Hi {long_claim},\n{BRUNCH_FACT}"
+    assert _strip(answer) == answer
+    # The accepted cost, conservative: a name the tokenizer splits into three words
+    # ("Jean-François" is jean, fran, ois) stays scored too.
+    answer = f"Hi Jean-François,\n{BRUNCH_FACT}"
+    assert _strip(answer) == answer
+    # A two-word name with a joining letter the tokenizer drops is still a greeting.
+    assert _strip(f"Dear Zoë Smith,\n{BRUNCH_FACT}") == BRUNCH_FACT
 
 
 def test_a_greeting_shaped_heading_with_no_closing_mark_is_content() -> None:
@@ -567,6 +605,11 @@ def test_a_business_name_ending_in_punctuation_ends_the_disclosure_itself() -> N
         ("Yahoo!", "I'm Aurora, an AI assistant for Yahoo!"),
         ("Joe's Pizza Co.", "I'm Aurora, an AI assistant for Joe's Pizza Co."),
         ("Acme Store", "I'm Aurora, an AI assistant for Acme Store."),
+        # Fixer round 2, finding 2: a closing "…" (or "‽", or a full-width mark) ends
+        # the sentence too, so rule 1 never quotes "Acme….".
+        ("Acme…", "I'm Aurora, an AI assistant for Acme…"),
+        ("Acme‽", "I'm Aurora, an AI assistant for Acme‽"),
+        ("Acme。", "I'm Aurora, an AI assistant for Acme。"),
     ):
         assert compose_ai_disclosure(assistant_name="Aurora", business_name=business) == sentence
         offer = input_safety.platform_disclosure_sentences(
@@ -578,7 +621,7 @@ def test_a_business_name_ending_in_punctuation_ends_the_disclosure_itself() -> N
         prompt = build_system_prompt(None, assistant_name="Aurora", business_name=business)
         rule_one = next(line for line in prompt.splitlines() if line.startswith("1. AI IDENTITY"))
         assert f'in exactly these words: "{sentence}"' in rule_one
-        assert ".." not in rule_one and "!." not in rule_one
+        assert not re.search(r"[.!?…‽。][.]", rule_one), rule_one
         names: Names = ("Aurora", (business, None))
         for framing in (sentence, offer, f"{sentence}."):
             answer = f"{framing} {T6_FACT}"

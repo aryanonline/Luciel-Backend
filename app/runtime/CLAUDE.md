@@ -100,8 +100,9 @@ make that state explicit and test it.
   (`platform_disclosure_sentences`, as a closed template over the configured names), a
   greeting alone on the first line, and a closed sign-off over configured-name lines; the
   orchestrator passes the names on every turn. Residual, accepted: a paraphrased
-  disclosure or an unconfigured signature stays scored and can hand off an honest answer
-  (never an escape); the strict SeedTest gate is the live check of prompt compliance.
+  disclosure, an unconfigured signature, or a greeting name the tokenizer reads as more
+  than two words ("Jean-François") stays scored and can hand off an honest answer (never
+  an escape); the strict SeedTest gate is the live check of prompt compliance.
 
 
 ## Judgment as an employee (round 7 WP-2, D2 2026-09-14; built 2026-09-20)

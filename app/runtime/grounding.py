@@ -14,7 +14,8 @@ greeting alone on the first line, a closed sign-off over lines that are only the
 configured names). It never interprets a disclosure the model worded itself.
 
 Accepted residual: a model that paraphrases the disclosure or signs with unconfigured
-words keeps that text in the score, which can hand off an honest answer. That is the
+words keeps that text in the score, as does a greeting to a name the tokenizer reads as
+more than two words ("Hi Jean-François,"), which can hand off an honest answer. That is the
 conservative direction, never an escape; the strict SeedTest gate is the live check
 that the model follows the prompt's exact sentence.
 """
@@ -220,16 +221,25 @@ _DELIVERY_AND_COURTESY_WORDS = frozenset(
 # --- Platform-owned framing (2026-11-13 T6) ---------------------------------------
 # A greeting alone on the first line, in one of two closed shapes: a greeting word with
 # an optional closed address ("Hi there", "Good morning, all!"), or a greeting word, at
-# most two name words and a closing "," or "!" ("Hi Jordan,", "Dear Mary Ann,"). A
-# hyphen, dot or apostrophe join counts as a word break, as the scorer's tokenizer counts
-# it ("O'Brien" and "Jean-François" are two words). A heading with no closing mark
-# ("Hello Kitty Plushies") is content, not a greeting.
+# most two name words and a closing "," or "!" ("Hi Jordan,", "Dear Mary Ann,"). The
+# name must also hold at most two words as the scorer's tokenizer counts them
+# (``_scored_word_count``): any letter outside a-z is a word break there, so a joined
+# "Free<U+3164>Valet<U+3164>Parking" or "Jean-François" (jean, fran, ois) stays scored. A
+# heading with no closing mark ("Hello Kitty Plushies") is content, not a greeting.
 _GREETING = r"(?:hi|hello|hey|dear|greetings|good\s+(?:morning|afternoon|evening))"
 _GREETING_LINE = re.compile(
     rf"{_GREETING}(?:\s+(?:there|all|everyone|folks|team))?\s*[,!]?"
-    rf"|{_GREETING}\s+[^\W\d_]+(?:(?:\s+|['’.-])[^\W\d_]+)?\s*[,!]",
+    rf"|{_GREETING}\s+(?P<name>[^\W\d_]+(?:(?:\s+|['’.-])[^\W\d_]+)?)\s*[,!]",
     re.IGNORECASE,
 )
+
+
+def _scored_word_count(text: str) -> int:
+    """Words the scorer could count in ``text``: score_grounding's tokenizer before its
+    stopword filter (runs of [a-z0-9] longer than two characters in ``text.lower()``)."""
+    return sum(len(w) > 2 for w in re.findall(r"[a-z0-9]+", text.lower()))
+
+
 # A closed sign-off phrase, alone on its line, with its punctuation.
 _SIGNOFF_LINE = re.compile(
     r"(?:best|best regards|kind regards|warm regards|warmest regards|regards|"
@@ -290,7 +300,8 @@ def strip_platform_framing(
     1. Every occurrence of a platform disclosure sentence for the configured names
        (``input_safety.platform_disclosure_sentences``, plus "I am" for "I'm"), as a
        closed template: the exact words in order, case-insensitive.
-    2. A greeting that is the whole first line (``_GREETING_LINE``).
+    2. A greeting that is the whole first line (``_GREETING_LINE``), its name at most
+       two words as the scorer counts them.
     3. A trailing sign-off block: a closed sign-off phrase line followed only by
        signature lines that are exactly a configured name or a closed role line built
        from them ("AI assistant for {business}", "{assistant}, AI assistant for
@@ -303,7 +314,8 @@ def strip_platform_framing(
         return answer
     businesses = tuple(dict.fromkeys(b.strip() for b in business_names if b and b.strip()))
     lines = answer.strip().splitlines()
-    if lines and _GREETING_LINE.fullmatch(lines[0].strip()):
+    greeting = _GREETING_LINE.fullmatch(lines[0].strip()) if lines else None
+    if greeting and _scored_word_count(greeting["name"] or "") <= 2:
         lines = lines[1:]
     signature = {_norm_line(n) for n in (assistant_name, *businesses)}
     for business in businesses:

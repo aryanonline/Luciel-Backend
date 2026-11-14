@@ -351,6 +351,10 @@ def disclosure_present(text: str) -> bool:
 PLATFORM_OFFER = "I can help answer questions, book, or connect you to a person"
 
 
+# Marks that already end a sentence, so the composer adds no period after them.
+_SENTENCE_ENDS = (".", "!", "?", "…", "‽", "。", "！", "？")
+
+
 def compose_ai_disclosure(*, assistant_name: str, business_name: str) -> str:
     """The exact first-message AI-identity sentence (§3.4.16), built from the configured
     names: "I'm {assistant}, an AI assistant for {business}."
@@ -360,10 +364,11 @@ def compose_ai_disclosure(*, assistant_name: str, business_name: str) -> str:
     (through ``platform_disclosure_sentences``) before scoring, so the two cannot drift.
     The prompt's fallbacks apply: no assistant name is "Luciel", an unnamed business is
     "this business". A business name that already ends in ". ! ?" ("Acme Inc.") ends
-    the sentence itself, so the model is never told to write "Acme Inc..".
+    the sentence itself (also "…", "‽" and the full-width marks), so the model is never
+    told to write "Acme Inc.." or "Acme….".
     """
     clause = _disclosure_clause(assistant_name=assistant_name, business_name=business_name)
-    return clause if clause.endswith((".", "!", "?")) else f"{clause}."
+    return clause if clause.endswith(_SENTENCE_ENDS) else f"{clause}."
 
 
 def _disclosure_clause(*, assistant_name: str, business_name: str) -> str:
