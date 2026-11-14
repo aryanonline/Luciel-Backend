@@ -226,6 +226,12 @@ the `db` container. The expected result is about 4,000 passed,
   down even after failure.
 - Keep deploy-time secrets out of git and do not rotate or activate production
   credentials without the owner’s explicit direction.
+- The workflows read the AWS account id from the `AWS_ACCOUNT_ID` repository variable
+  and the operator inbox from the `BUDGET_ALERT_EMAIL` secret (passed quoted through
+  the step environment, never inlined into a script). Every job that assumes a role
+  checks the variable first, every job that synthesises the CDK app checks the secret
+  too, and a missing one fails with an `::error::` that names it
+  (`tests/unit/test_workflow_repo_settings.py`).
 - Email deliverability is OUT-OF-BAND ops (no CDK): the SES identity
   `vantagemind.ai` has DKIM enabled AND a custom MAIL FROM `mail.vantagemind.ai`
   (Route53: MX → feedback-smtp.ca-central-1.amazonses.com, TXT SPF include);

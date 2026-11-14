@@ -104,12 +104,28 @@ jobs:
         continue-on-error: true
         run: python3 scripts/allowlist_expiry.py --within-days 35 --markdown expiry.md
 
+      # The account id is a repository variable, not repository text. The AWS half of
+      # this review is advisory (continue-on-error), so a missing variable is an error
+      # annotation by name and the review still posts, its scan section reading "AWS
+      # role unavailable", instead of an assume-role error on an empty account.
+      - name: Require the AWS_ACCOUNT_ID variable
+        id: aws_account
+        continue-on-error: true
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            exit 1
+          fi
+
       - name: Configure AWS credentials (OIDC, dev deploy role)
         id: aws
+        if: steps.aws_account.outcome == 'success'
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-dev-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       # The deploy pushes ONE tag that is a multi-arch index (round 7 WP-8); ECR scans

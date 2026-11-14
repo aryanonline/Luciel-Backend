@@ -67,7 +67,9 @@ concurrency:
 
 env:
   AWS_REGION: ca-central-1
-  ACCOUNT: '729005488042'
+  # The AWS account id is a repository variable (AWS_ACCOUNT_ID), not repository text.
+  # Every job that assumes a role checks it first (see each job's first step).
+  ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
 
 jobs:
   # ---- GUARD: deploys run ONLY from the release branch --------------------------
@@ -98,12 +100,33 @@ jobs:
     env:
       ENVIRONMENT: dev
     steps:
+      # The account id and the operator inbox are repository settings, not repository
+      # text: the AWS_ACCOUNT_ID variable and the BUDGET_ALERT_EMAIL secret (a secret,
+      # so GitHub masks the address in every log line). Checked before anything else,
+      # so a missing one fails here by name instead of as an assume-role error on an
+      # empty account, or as ObservabilityStack's synth refusal after the image build.
+      - name: Require the AWS_ACCOUNT_ID variable and the BUDGET_ALERT_EMAIL secret
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+        run: |
+          missing=0
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            missing=1
+          fi
+          if [ -z "$BUDGET_ALERT_EMAIL" ]; then
+            echo "::error::the secret BUDGET_ALERT_EMAIL is empty. The CDK app does not synthesise without an operator inbox (ObservabilityStack); set it under Settings > Secrets and variables > Actions > Secrets."
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-dev-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-dev-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -193,10 +216,12 @@ jobs:
       - name: Apply the deploy role's grants first (Pipeline stack)
         if: inputs.paused != 'true'
         working-directory: infra
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           npx cdk deploy "Luciel-dev-Pipeline" --exclusively \
             -c env=dev -c imageTag=$IMAGE_TAG \
-            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       # 2026-09-05 audit F008: remember what is serving BEFORE the deploy so a failed
@@ -247,6 +272,8 @@ jobs:
       - name: Deploy infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         id: deploy
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           # npm ci ran in the hostnames step above.
           # WidgetCert lives in us-east-1 and Widget (ca-central-1) consumes it via
@@ -269,7 +296,7 @@ jobs:
             -c env=dev -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || vars.DEV_INTEGRATION_MODE || 'mock' }} \
             -c paused=${{ inputs.paused || 'false' }} \
-            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       # Skipped when pausing: a pause run is taking the environment DOWN, so there is
@@ -374,6 +401,24 @@ jobs:
     env:
       ENVIRONMENT: preprod
     steps:
+      # Same check as the dev job's first step: both settings, before the image build
+      # and before preprod exists.
+      - name: Require the AWS_ACCOUNT_ID variable and the BUDGET_ALERT_EMAIL secret
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+        run: |
+          missing=0
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            missing=1
+          fi
+          if [ -z "$BUDGET_ALERT_EMAIL" ]; then
+            echo "::error::the secret BUDGET_ALERT_EMAIL is empty. The CDK app does not synthesise without an operator inbox (ObservabilityStack); set it under Settings > Secrets and variables > Actions > Secrets."
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS via OIDC (preprod deploy role)
@@ -382,7 +427,7 @@ jobs:
           # Ephemeral preprod is part of the prod release, so it uses the DURABLE
           # prod deploy role (created once by the prod PipelineStack). A per-preprod
           # role can't exist before preprod is stood up (chicken-and-egg).
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: actions/setup-node@v4
@@ -423,10 +468,12 @@ jobs:
       # condition: unlike the prod job's steps, the preprod gate runs on a paused release.
       - name: Apply the deploy role's grants first (Pipeline stack)
         working-directory: infra
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           npx cdk deploy "Luciel-prod-Pipeline" --exclusively \
             -c env=prod -c imageTag=${{ github.sha }} \
-            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       - name: Login to ECR
@@ -475,6 +522,8 @@ jobs:
 
       - name: Stand up preprod (prod-shaped, gated image + live LLM)
         working-directory: infra
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           # npm ci ran in the D6 ownership check above. Preprod answers on its OWN
           # names (preprod. / api-preprod. / embed-preprod.<apex>, round 7
@@ -482,9 +531,11 @@ jobs:
           # Full stack set: preprod is created from scratch each release. imageTag
           # points at the gated release artifact in the PROD repo (imageRepoName in
           # env-config.ts); integrationMode=live exercises real Anthropic/OpenAI for
-          # a faithful §10 production rehearsal.
+          # a faithful §10 production rehearsal. budgetAlertEmail: preprod's alarms
+          # are armed, and ObservabilityStack refuses to synthesise without an inbox.
           npx cdk deploy "Luciel-preprod-*" \
             -c env=preprod -c imageTag=${{ github.sha }} -c integrationMode=live \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       - name: Run DB migrations on preprod (one-off ECS task, inside the VPC)
@@ -498,12 +549,22 @@ jobs:
     runs-on: ubuntu-latest
     environment: prod
     steps:
+      # This job assumes a role but synthesises nothing: only the account id.
+      - name: Require the AWS_ACCOUNT_ID variable
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS via OIDC (preprod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: §10 HARD gate — verify + seedtest against preprod
@@ -529,12 +590,29 @@ jobs:
     env:
       ENVIRONMENT: prod
     steps:
+      # Same check as the dev job's first step.
+      - name: Require the AWS_ACCOUNT_ID variable and the BUDGET_ALERT_EMAIL secret
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+        run: |
+          missing=0
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            missing=1
+          fi
+          if [ -z "$BUDGET_ALERT_EMAIL" ]; then
+            echo "::error::the secret BUDGET_ALERT_EMAIL is empty. The CDK app does not synthesise without an operator inbox (ObservabilityStack); set it under Settings > Secrets and variables > Actions > Secrets."
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS via OIDC (prod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -626,10 +704,12 @@ jobs:
       - name: Apply the deploy role's grants first (Pipeline stack)
         if: inputs.paused != 'true'
         working-directory: infra
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           npx cdk deploy "Luciel-prod-Pipeline" --exclusively \
             -c env=prod -c imageTag=$IMAGE_TAG \
-            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       - name: Record the running task definitions (rollback target)
@@ -668,6 +748,8 @@ jobs:
       - name: Deploy prod infra stacks (Networking/Data/Compute/Edge/Observability/Budget/Widget)
         working-directory: infra
         id: deploy
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           # npm ci ran in the hostnames step above.
           # Networking/Data/Budget are named for the same reasons as in the dev job:
@@ -681,7 +763,7 @@ jobs:
             -c env=prod -c imageTag=$IMAGE_TAG \
             -c integrationMode=${{ inputs.integration_mode || 'live' }} \
             -c paused=${{ inputs.paused || 'false' }} \
-            -c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }} \
+            -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" \
             --require-approval never
 
       # See the dev job: a pause run takes the environment down, so there is nothing
@@ -744,12 +826,30 @@ jobs:
     env:
       ENVIRONMENT: preprod
     steps:
+      # Same check as the dev job's first step: `cdk destroy` synthesises the app too,
+      # so the teardown needs the inbox exactly as the standup did.
+      - name: Require the AWS_ACCOUNT_ID variable and the BUDGET_ALERT_EMAIL secret
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+        run: |
+          missing=0
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            missing=1
+          fi
+          if [ -z "$BUDGET_ALERT_EMAIL" ]; then
+            echo "::error::the secret BUDGET_ALERT_EMAIL is empty. The CDK app does not synthesise without an operator inbox (ObservabilityStack); set it under Settings > Secrets and variables > Actions > Secrets."
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS via OIDC (preprod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-prod-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-prod-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: actions/setup-node@v4
@@ -757,13 +857,16 @@ jobs:
 
       - name: Tear down ephemeral preprod (cdk destroy --force, no final snapshot)
         working-directory: infra
+        env:
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
         run: |
           npm ci
           echo "[teardown] destroying ephemeral preprod — it must NEVER be left running (cost)."
           # --force = non-interactive. preprod RDS uses removalPolicy DESTROY with
           # deletionProtection disabled (non-prod), so it is deleted with NO final
-          # snapshot (ephemeral test data).
-          npx cdk destroy "Luciel-preprod-*" -c env=preprod --force
+          # snapshot (ephemeral test data). budgetAlertEmail: destroy synthesises the
+          # app first, and ObservabilityStack refuses to synthesise without an inbox.
+          npx cdk destroy "Luciel-preprod-*" -c env=preprod -c budgetAlertEmail="$BUDGET_ALERT_EMAIL" --force
 
       - name: Confirm preprod is gone
         run: |

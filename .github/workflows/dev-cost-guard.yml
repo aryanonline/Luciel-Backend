@@ -50,10 +50,21 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'dev' }}
     steps:
+      # The account id is a repository variable, not repository text: fail by name
+      # rather than as an assume-role error on an empty account.
+      - name: Require the AWS_ACCOUNT_ID variable
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if ! [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::the repository variable AWS_ACCOUNT_ID is empty or not a 12-digit AWS account id. Set it under Settings > Secrets and variables > Actions > Variables."
+            exit 1
+          fi
+
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::729005488042:role/luciel-${{ inputs.environment || 'dev' }}-github-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/luciel-${{ inputs.environment || 'dev' }}-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Stop the DB if (and only if) every service in BOTH clusters is at zero
