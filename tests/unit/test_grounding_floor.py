@@ -2,14 +2,14 @@
 
 Harmony fix 2026-08-04, item 3: ``evaluate_outcome`` used to require BOTH
 ``plan_confidence < 0.6`` AND ``grounding_score < 0.50`` to fire cannot_answer.
-The live Anthropic/OpenAI providers (app/runtime/providers.py) hardcode
-``confidence=1.0`` for every real response -- there is no actual self-reported
-confidence signal in production -- so the AND was permanently unsatisfiable on
-the confidence side: a confidently fabricated, completely ungrounded answer
-(grounding_score == 0.0) would never escalate. These tests pin the fixed
-behaviour: grounding below floor is sufficient on its own (unless a resolving
-tool succeeded), and a genuinely low confidence signal is still an independent
-trigger.
+The live Anthropic/OpenAI providers (app/runtime/providers.py) then hardcoded
+``confidence=1.0`` for every real response (since round 6 WP-G they parse a
+self-reported confidence tag, and a reply without one still reads 1.0), so the
+AND was permanently unsatisfiable on the confidence side: a confidently
+fabricated, completely ungrounded answer (grounding_score == 0.0) would never
+escalate. These tests pin the fixed behaviour: grounding below floor is
+sufficient on its own (unless a resolving tool succeeded), and a genuinely low
+confidence signal is still an independent trigger.
 """
 
 from __future__ import annotations
@@ -40,8 +40,9 @@ from app.runtime.input_safety import (
 
 
 def test_confident_but_ungrounded_answer_still_escalates() -> None:
-    """The exact bug: confidence=1.0 (what every live provider call reports today)
-    with a completely ungrounded answer (no retrieval, no tool) must escalate. Before
+    """The exact bug: confidence=1.0 (what every live provider call reported then,
+    and what a reply without a confidence tag still reads) with a completely
+    ungrounded answer (no retrieval, no tool) must escalate. Before
     the fix, plan_confidence=1.0 short-circuited the AND and this fired False."""
     decision = evaluate_outcome(
         message="What's your return policy for electronics?",

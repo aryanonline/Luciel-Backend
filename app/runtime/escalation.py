@@ -11,8 +11,9 @@ Gate 1 — intake (pre-PLAN), knowable from the inbound message alone:
 Gate 2 — outcome (post-REFLECT), needs the loop's output:
   - cannot_answer (grounding < floor 0.50 OR plan confidence < 0.6, unless a
     resolving tool succeeded — see evaluate_outcome docstring: this is an OR, not
-    an AND, because live providers report a fixed confidence=1.0 today and
-    grounding must be sufficient on its own to gate a response)
+    an AND, because a self-reported confidence is the model's own claim (and reads
+    1.0 when the model gives none), so grounding must be sufficient on its own to
+    gate a response)
   - high_value_lead (normalized lead-score; budget 0.5 + time-pressure 0.3 +
     purchase/booking intent 0.4, capped at 1.0)
   Both are evaluated on every turn (round 7 WP-2, item 1): the opportunity signal
@@ -269,7 +270,7 @@ def classify_request_human(text: str) -> float:
 # Conversational (social) turns: greetings, thanks, declines, acknowledgments,
 # goodbyes. Live-caught 2026-08-18: a caller answering "No its alright thankyou"
 # to Luciel's own follow-up offer tripped the cannot_answer grounding gate — a
-# pleasantry retrieves nothing, scores 0.0, and (with live providers pinning
+# pleasantry retrieves nothing, scores 0.0, and (with live providers then pinning
 # confidence at 1.0) the grounding floor alone decided. A social turn contains no
 # factual claim to ground, so the floor does not apply to it. Deterministic on
 # purpose (same doctrine as the other classifiers in this module): regexes over a
@@ -716,16 +717,16 @@ def evaluate_outcome(
 
     Harmony fix 2026-08-04 (item 3): this was previously an AND of the two signals
     ("confidence < 0.6 AND grounding < floor"). The live Anthropic/OpenAI providers
-    (app/runtime/providers.py) report a hardcoded confidence=1.0 — no real
-    self-reported confidence signal exists in production — so the AND was
-    permanently unsatisfiable on the confidence side: an ungrounded, fabricated
+    (app/runtime/providers.py) then reported a hardcoded confidence=1.0, so the AND
+    was permanently unsatisfiable on the confidence side: an ungrounded, fabricated
     answer with grounding_score=0.0 would never escalate, because 1.0 is never
-    < 0.6. Grounding alone is real and computed (app/runtime/grounding.py); it must
-    be sufficient on its own to gate a response, not merely a necessary condition
-    alongside a signal that is currently always 1.0. Confidence remains an
-    independent OR trigger so a genuinely low-confidence signal (from EchoModel in
-    tests today, or a real one if a provider ever supplies it) still escalates even
-    when grounding happens to clear the floor.
+    < 0.6. Since round 6 WP-G (F124) the prompt asks the model for a confidence tag
+    (``providers.parse_confidence_tag``; a reply without one still reads 1.0), but a
+    self-report is the model's own claim. Grounding is computed by the platform
+    (app/runtime/grounding.py), so it must be sufficient on its own to gate a
+    response, not merely a necessary condition. Confidence remains an independent
+    OR trigger, so a low self-reported confidence (or EchoModel's in tests) still
+    escalates even when grounding happens to clear the floor.
     """
     # Answer quality is judged on EVERY turn, before the opportunity signal is even
     # looked at (round 7 WP-2, item 1). It used to be evaluated only when
