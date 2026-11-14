@@ -179,10 +179,10 @@ python -m pytest tests/unit tests/integration tests/contract   # everything else
 ruff check app tests scripts && ruff format --check app tests scripts && mypy app
 ```
 
-The latest CI run on `main` (2026-11-14) passed 8 isolation tests and 4,006 unit, integration and
-contract tests. CI (`.github/workflows/ci.yml`) runs on every pull request, every push to `main`,
-daily and on demand. The daily run makes a newly published CVE fail the build without a push, and
-a failed daily run is posted to the month's dependency-review issue.
+The suites hold 8 isolation tests and more than 4,000 unit, integration and contract tests, and CI
+(`.github/workflows/ci.yml`) runs all of them on every pull request, every push to `main`, daily
+and on demand. The daily run makes a newly published CVE fail the build without a push, and a
+failed daily run is posted to the month's dependency-review issue.
 
 | CI step | What it enforces |
 | --- | --- |
