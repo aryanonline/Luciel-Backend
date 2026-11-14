@@ -238,6 +238,14 @@ def create_app() -> FastAPI:
         docs_url="/docs" if is_local else None,
         redoc_url="/redoc" if is_local else None,
         openapi_url="/openapi.json" if is_local else None,
+        # fastapi >= 0.142 traces, meters and logs every request by itself once ANY global
+        # OpenTelemetry provider exists: an SDK that a dependency or an agent installs is
+        # enough, nothing here has to ask. Its spans keep url.path and url.query, redacting
+        # only cloud-storage signatures, so the webhook ?cap= token (F072), the export token
+        # in /api/v1/exports/{token} and OAuth code/state would ride along, and its exception
+        # logs carry messages and stack traces. Off until telemetry is a decision that brings
+        # its own redaction (tests/unit/test_fastapi_telemetry_off.py).
+        telemetry={"tracing": False, "metrics": False, "logs": False},
     )
 
     # Outermost: every line logged while serving the request carries its trace id.
