@@ -237,7 +237,11 @@ the `db` container. The expected result is about 4,000 passed,
   the step environment, never inlined into a script). Every job that assumes a role
   checks the variable first, every job that synthesises the CDK app checks the secret
   too, and a missing one fails with an `::error::` that names it
-  (`tests/unit/test_workflow_repo_settings.py`).
+  (`tests/unit/test_workflow_repo_settings.py`). The variable keeps the account id out
+  of the repository's text, not out of run logs: GitHub does not mask a variable, so the
+  id shows in the role ARN and the check step's env header (AWS does not treat an
+  account id as secret). Read it only where it is used, never from a workflow- or
+  job-level `env`, whose values every step's log header repeats.
 - Email deliverability is OUT-OF-BAND ops (no CDK): the SES identity
   `vantagemind.ai` has DKIM enabled AND a custom MAIL FROM `mail.vantagemind.ai`
   (Route53: MX → feedback-smtp.ca-central-1.amazonses.com, TXT SPF include);

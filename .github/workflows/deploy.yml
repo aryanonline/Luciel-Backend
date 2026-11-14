@@ -68,8 +68,10 @@ concurrency:
 env:
   AWS_REGION: ca-central-1
   # The AWS account id is a repository variable (AWS_ACCOUNT_ID), not repository text.
-  # Every job that assumes a role checks it first (see each job's first step).
-  ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+  # Every job that assumes a role checks it first (see each job's first step). A
+  # variable is not a secret: GitHub prints it unmasked wherever it is used (the role
+  # ARN, the check step's env), so it is read only there, never from this block or a
+  # job's env, whose values every step's log header repeats.
 
 jobs:
   # ---- GUARD: deploys run ONLY from the release branch --------------------------

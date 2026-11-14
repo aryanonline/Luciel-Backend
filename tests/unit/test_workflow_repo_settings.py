@@ -6,6 +6,11 @@ Portfolio clean-up (2026-11-14), read straight from the workflow files:
   ``AWS_ACCOUNT_ID`` repository variable, and every job that assumes a role checks that
   variable before it does anything else, failing with an ``::error::`` line that names
   it (the monthly review, whose AWS half is advisory, reports it and still posts).
+* A repository variable is not a secret. GitHub prints its value unmasked in run logs
+  (the role ARN, the check step's env header), and AWS does not treat an account id as
+  secret: the variable keeps the id out of the repository's text, not out of the logs.
+  It is read only where it is used, never from a workflow- or job-level ``env``, whose
+  values every step's log header repeats.
 * deploy.yml used to inline ``-c budgetAlertEmail=${{ vars.BUDGET_ALERT_EMAIL || '' }}``
   unquoted into its scripts: GitHub printed the address in every run log, and a value
   holding shell syntax would have run as code. Every ``cdk deploy`` and ``cdk destroy``
@@ -110,21 +115,27 @@ def test_no_workflow_carries_an_aws_account_id(name: str) -> None:
 def test_every_role_arn_reads_the_account_variable() -> None:
     found = set()
     for name in _names():
-        doc = _workflow(name)
-        account_env = doc.get("env", {}).get("ACCOUNT")
-        if account_env is not None:
-            assert account_env == ACCOUNT_VAR, name
-        for job_id, job in doc["jobs"].items():
+        for job_id, job in _workflow(name)["jobs"].items():
             for step in job.get("steps", []):
                 if not _assumes_a_role(step):
                     continue
                 found.add((name, job_id))
                 arn = str(step["with"]["role-to-assume"])
-                if arn.startswith("arn:aws:iam::${{ env.ACCOUNT }}:role/"):
-                    assert account_env == ACCOUNT_VAR, (name, arn)
-                else:
-                    assert arn.startswith(f"arn:aws:iam::{ACCOUNT_VAR}:role/"), (name, arn)
+                assert arn.startswith(f"arn:aws:iam::{ACCOUNT_VAR}:role/"), (name, arn)
     assert found == ROLE_JOBS
+
+
+def test_no_workflow_or_job_env_carries_the_account_id() -> None:
+    """GitHub does not mask a variable, and every step's log header repeats these envs.
+
+    deploy.yml set a workflow-level ``ACCOUNT`` that nothing read, and image-rebuild.yml
+    one that only its role ARN read, so every step of every job printed the id.
+    """
+    for name in _names():
+        doc = _workflow(name)
+        assert "AWS_ACCOUNT_ID" not in str(doc.get("env", {})), name
+        for job_id, job in doc["jobs"].items():
+            assert "AWS_ACCOUNT_ID" not in str(job.get("env", {})), (name, job_id)
 
 
 @pytest.mark.parametrize(("name", "job"), sorted(ROLE_JOBS))
@@ -138,7 +149,8 @@ def test_every_job_that_assumes_a_role_checks_the_account_variable_first(
         result = _run_check(check, bad, FAKE_INBOX)
         assert result.returncode != 0, (bad, result.stdout)
         assert _errors_naming(result, "AWS_ACCOUNT_ID"), result.stdout
-        # The check names the setting; it never echoes the value it was given.
+        # The script names the setting and never echoes the value it was given. (The
+        # runner still prints the step's env header, which this test cannot see.)
         assert not bad or bad.strip() not in result.stdout, result.stdout
     ok = _run_check(check, FAKE_ACCOUNT, FAKE_INBOX)
     assert ok.returncode == 0, ok.stdout + ok.stderr
