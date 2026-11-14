@@ -259,7 +259,8 @@ the `db` container. The expected result is about 4,000 passed,
   `luciel-dev-inbound` rule set and its `luciel-dev-ses-inbound` topic; the route
   still accepts that topic by name. CloudFormation never activates a receipt rule set:
   `luciel-dev-inbound-v2` was dev's active one until the 2026-11-14 pause deactivated
-  it. After a restore, once `scripts/check_sns_subscriptions.sh dev` shows the topic's
+  it and deleted it with the Compute stack; a restore creates it again, inactive.
+  After a restore, once `scripts/check_sns_subscriptions.sh dev` shows the topic's
   subscription confirmed, turn it back on with `aws ses set-active-receipt-rule-set
   --rule-set-name luciel-dev-inbound-v2 --region ca-central-1`.
 

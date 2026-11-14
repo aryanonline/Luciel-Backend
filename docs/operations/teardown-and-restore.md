@@ -38,6 +38,17 @@ Below, `<account-id>` stands for the AWS account id.
   `luciel-dev-export-bundles-<account-id>`, whose files are in the archive bucket, and
   `luciel-dev-transcript-archive-<account-id>` and `luciel-dev-voice-audio-<account-id>`, which
   held no objects.
+- SES receipt rule set `luciel-dev-inbound-v2`, deactivated first (an active rule set cannot be
+  deleted) and then deleted with the Compute stack. A restore creates it again, inactive:
+  CloudFormation never activates a receipt rule set. The SES domain identity and the verified
+  address were set up outside CDK, cost nothing and were kept.
+- Two inline policies that had been added by hand, outside CDK, to the Compute stack's task role
+  (`Luciel-dev-Compute-TaskRole…`). They went with the role. `LucielExportBundleAccess` served the
+  legacy `vm-export-bundles` bucket, which was deleted too, so it is not needed again.
+  `LucielSesSend` allowed `ses:SendEmail` and `ses:SendRawEmail` on any identity, in
+  `ca-central-1` only. While the account's SES is in the sandbox, SES also checks the recipient's
+  verified identity, which CDK's grant (VantageMind identities only) does not cover; step 6
+  says how to add it back.
 - The log groups.
 - The per-tenant `vm/*` secrets. Test tenants must reconnect their own integrations after a
   restore.
@@ -52,8 +63,6 @@ a bucket before copying files into it.
 
 ## What was disabled
 
-- SES receipt rule set `luciel-dev-inbound-v2` was deactivated. It belongs to the Compute stack,
-  so a restore creates it again, inactive: CloudFormation never activates a receipt rule set.
 - GitHub workflows `dev-cost-guard`, `image-rebuild` and `dependency-review` in this repository,
   and `image-rebuild` and `dependency-review` in Luciel-Frontend.
 - The monthly steward routine, the cloud routine outside this repository that reads the month's
@@ -151,6 +160,19 @@ the Python scripts.
 
    ```bash
    gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live -f paused=false
+   ```
+
+   While SES is still in the sandbox, add `LucielSesSend` back to the task role, or every email to
+   a verified test address fails with `AccessDenied` (see What was deleted). The policy file is not
+   in this repository; write it from that description. Moving it into CDK would mean a wildcard
+   identity in `infra/lib/compute-stack.ts`, which that file's `SendPlatformEmail` grant rules out
+   on purpose, so leave that choice to the owner.
+
+   ```bash
+   ROLE=$(aws iam list-roles --output text \
+     --query "Roles[?starts_with(RoleName, 'Luciel-dev-Compute-TaskRole')].RoleName")
+   aws iam put-role-policy --role-name "$ROLE" --policy-name LucielSesSend \
+     --policy-document file://luciel-ses-send.json
    ```
 
 7. **Workflows.** Re-enable them now, not before step 6: `dev-cost-guard` stops dev's database
