@@ -82,6 +82,13 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   archive/retention/cascade operation on S3 runs there, and the app's bucket settings
   have placeholder defaults, so an un-injected sweep addresses a phantom bucket instead
   of failing (`test/sweep-cold-storage.test.ts`).
+- An environment that names `dbSnapshotIdentifier` (env-config.ts) RESTORES its database
+  with `rds.DatabaseInstanceFromSnapshot` under the same construct id, with a new
+  generated master secret; dev names `luciel-dev-final-2026-11-14`. One-way: never unset
+  or change the field while that database lives, because DBSnapshotIdentifier is a
+  replacement property and CloudFormation would swap in an EMPTY database. The snapshot
+  is encrypted with dev's CMK, which must still exist to restore
+  (`test/db-snapshot-restore.test.ts`).
 
 ## Testing pointers
 - `infra/test/*.test.ts`, especially stripe posture, cost retention, tenant secrets, and sweep schedules.

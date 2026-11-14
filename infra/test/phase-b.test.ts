@@ -47,8 +47,24 @@ describe('Data layer (§5.3 / §4.2)', () => {
   });
 
   test('RDS storage is encrypted', () => {
-    buildDataStack().hasResourceProperties('AWS::RDS::DBInstance', {
+    // A database created empty is encrypted with the CMK (prod, preprod).
+    const app = new App();
+    const prod = getEnvConfig('prod');
+    const net = new NetworkingStack(app, 'Net', { env: ENV, envConfig: prod });
+    const sec = new SecurityStack(app, 'Sec', { env: ENV, envConfig: prod });
+    const data = new DataStack(app, 'Data', { env: ENV, envConfig: prod, vpc: net.vpc, cmk: sec.cmk });
+    Template.fromStack(data).hasResourceProperties('AWS::RDS::DBInstance', {
       StorageEncrypted: true,
+      KmsKeyId: Match.anyValue(),
+    });
+    // Dev is RESTORED from the final snapshot of its CMK-encrypted database: the
+    // restore inherits that encryption and key, and CloudFormation takes no
+    // StorageEncrypted/KmsKeyId override on an encrypted snapshot
+    // (db-snapshot-restore.test.ts pins the restore).
+    buildDataStack().hasResourceProperties('AWS::RDS::DBInstance', {
+      DBSnapshotIdentifier: 'luciel-dev-final-2026-11-14',
+      StorageEncrypted: Match.absent(),
+      KmsKeyId: Match.absent(),
     });
   });
 

@@ -202,6 +202,26 @@ export interface EnvConfig {
    * (Phase 3 infra review) — see the runbook note in deploy.yml's refusal step.
    */
   readonly ownsPublicApex: boolean;
+  /**
+   * RDS snapshot this environment's database is RESTORED from, instead of being
+   * created empty (DataStack builds `rds.DatabaseInstanceFromSnapshot` when set).
+   * Unset = a fresh, empty database, as every environment had before. Dev names the
+   * final snapshot taken when its database was deleted on 2026-11-14 to stop its AWS
+   * cost, so standing dev back up brings its data back.
+   *
+   * ONE-WAY: once an environment has been restored from a snapshot, this field must
+   * STAY set, to the same value, for as long as that database lives.
+   * DBSnapshotIdentifier is a replacement property of AWS::RDS::DBInstance: removing
+   * it (or naming another snapshot) makes CloudFormation replace the restored database
+   * with a NEW, EMPTY one. RETAIN only orphans the old instance; the app is pointed at
+   * the empty one.
+   *
+   * The restored storage stays encrypted with the KMS key the snapshot was taken under
+   * (dev's SecurityStack CMK); RDS cannot restore without it. Dev's CMK is DESTROY with
+   * a 7-day pending window, so a destroyed dev Security stack leaves 7 days to cancel
+   * the key's deletion (and re-enable it) before this snapshot becomes unrestorable.
+   */
+  readonly dbSnapshotIdentifier?: string;
 }
 
 const CONFIGS: Record<EnvName, EnvConfig> = {
@@ -237,6 +257,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // D6: dev serves the public names as a dual-host until a production environment
     // claims them (flip this and prod's together).
     ownsPublicApex: true,
+    // Restore dev's data on its next stand-up. Never unset it once dev has been
+    // restored (see the field doc: unsetting it replaces the database with an empty one).
+    dbSnapshotIdentifier: 'luciel-dev-final-2026-11-14',
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release
   // time by the prod pipeline, runs the §10 verification harness as a HARD gate

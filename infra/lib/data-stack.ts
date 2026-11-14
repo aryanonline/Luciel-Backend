@@ -3,6 +3,9 @@
  *
  * - RDS Postgres in PRIVATE_ISOLATED subnets (never public), KMS-encrypted,
  *   PITR/backup retention 7 days (Commitment 3), Multi-AZ in preprod/prod.
+ * - Created empty, or RESTORED from `envConfig.dbSnapshotIdentifier` when an
+ *   environment names a snapshot (dev: its 2026-11-14 final snapshot). One-way: see
+ *   the field doc in env-config.ts.
  * - pgvector enabled via migrations (app/migrations), not here.
  * - The app connects as the NON-superuser, NON-BYPASSRLS `luciel_app` role
  *   (bootstrapped post-deploy) so RLS tenant isolation actually binds (LD 18).
@@ -29,7 +32,13 @@ export interface DataStackProps extends StackProps {
 }
 
 export class DataStack extends Stack {
-  public readonly db: rds.DatabaseInstance;
+  /**
+   * The environment's Postgres: created empty, or restored from
+   * `envConfig.dbSnapshotIdentifier`. Either way `db.secret` is the generated master
+   * secret, attached to the instance (host, port, username, password) — what Compute
+   * injects as LUCIEL_DB_SECRET.
+   */
+  public readonly db: rds.DatabaseInstance | rds.DatabaseInstanceFromSnapshot;
   public readonly transcriptArchiveBucket: s3.Bucket;
   public readonly exportBucket: s3.Bucket;
   public readonly voiceAudioBucket: s3.Bucket;
@@ -65,7 +74,8 @@ export class DataStack extends Stack {
       'app tier (VPC-internal) to postgres',
     );
 
-    this.db = new rds.DatabaseInstance(this, 'Postgres', {
+    // What the database is, whether it is created empty or restored from a snapshot.
+    const instanceProps: rds.DatabaseInstanceSourceProps = {
       engine: rds.DatabaseInstanceEngine.postgres({
         version: rds.PostgresEngineVersion.VER_16,
       }),
@@ -76,8 +86,6 @@ export class DataStack extends Stack {
       multiAz: envConfig.multiAz,
       allocatedStorage: 20,
       maxAllocatedStorage: envConfig.envName === 'prod' ? 200 : 50,
-      storageEncrypted: true,
-      storageEncryptionKey: cmk,
       backupRetention: Duration.days(7), // Commitment 3 (PITR window)
       deleteAutomatedBackups: envConfig.envName !== 'prod',
       // 2026-09-05 audit F003 (owner decision 6): dev serves the public product, so
@@ -86,18 +94,50 @@ export class DataStack extends Stack {
       deletionProtection: envConfig.envName !== 'preprod',
       removalPolicy:
         envConfig.envName !== 'preprod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
-      databaseName: 'luciel',
-      // Master creds in Secrets Manager, KMS-encrypted. App uses luciel_app, NOT master.
-      credentials: rds.Credentials.fromGeneratedSecret('luciel_master', {
-        encryptionKey: cmk,
-      }),
       enablePerformanceInsights: envConfig.productionPosture,
       cloudwatchLogsExports: ['postgresql'],
       // RDS creates /aws/rds/instance/<id>/postgresql itself, and a group RDS creates
       // never expires. This is the one log group in the app that is NOT ours to declare
       // directly, so CDK sets its retention through a custom resource instead.
       cloudwatchLogsRetention: envConfig.logRetention,
-    });
+    };
+
+    // Same construct id on both paths, so the instance and its secret keep their
+    // logical ids and every consumer (the secret ARN Compute injects, the endpoint,
+    // the DbSg wiring) is unchanged.
+    if (envConfig.dbSnapshotIdentifier) {
+      // RESTORE (env-config.ts dbSnapshotIdentifier). ONE-WAY: once an environment
+      // has been restored, the field must stay set. Removing DBSnapshotIdentifier (or
+      // changing it) makes CloudFormation REPLACE this database with a new, EMPTY one.
+      //
+      // Inherited from the snapshot, so not set here: the storage encryption and its
+      // KMS key (the key the snapshot was taken under must still exist), the master
+      // username (luciel_master, which the secret below must match) and the
+      // `luciel` database itself (RDS does not take DBName on a PostgreSQL restore).
+      // The master password is NEW: a generated secret, encrypted with the CMK like
+      // the one it replaces, which RDS applies once the restore completes. The app's
+      // luciel_app password derives from the master password (scripts/migrate.sh), so
+      // the first migration after a restore re-sets it, as on a first deploy.
+      this.db = new rds.DatabaseInstanceFromSnapshot(this, 'Postgres', {
+        ...instanceProps,
+        snapshotIdentifier: envConfig.dbSnapshotIdentifier,
+        // Master creds in Secrets Manager, KMS-encrypted. App uses luciel_app, NOT master.
+        credentials: rds.SnapshotCredentials.fromGeneratedSecret('luciel_master', {
+          encryptionKey: cmk,
+        }),
+      });
+    } else {
+      this.db = new rds.DatabaseInstance(this, 'Postgres', {
+        ...instanceProps,
+        storageEncrypted: true,
+        storageEncryptionKey: cmk,
+        databaseName: 'luciel',
+        // Master creds in Secrets Manager, KMS-encrypted. App uses luciel_app, NOT master.
+        credentials: rds.Credentials.fromGeneratedSecret('luciel_master', {
+          encryptionKey: cmk,
+        }),
+      });
+    }
 
     // Transcript cold-storage bucket (Architecture §3.4.10 / §4.4 / Commitment #38).
     //
