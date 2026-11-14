@@ -43,7 +43,12 @@ Below, `<account-id>` stands for the AWS account id.
   restore.
 - Old orphan resources.
 
-Every fixed resource name is free again, so a restore creates each resource under its old name.
+Every fixed resource name is free again, so a restore creates each resource under its old name,
+unless someone else takes it first. S3 bucket names are global, and the five buckets a restore
+recreates follow a fixed pattern, `luciel-dev-<purpose>-<account-id>` (`knowledge-originals`,
+`transcript-archive`, `export-bundles`, `voice-audio` and `widget`), that anyone who knows the
+account id can work out. Step 3 checks that the names are still free, and step 4 checks who owns
+a bucket before copying files into it.
 
 ## What was disabled
 
@@ -88,6 +93,24 @@ the Python scripts.
    image: a paused run reuses the newest tag in `luciel-backend-dev`, which is empty, so its task
    definitions name an image that does not exist yet. Nothing starts while paused.
 
+   First check that the five bucket names are still free: each must answer `404` (`Not Found`),
+   and any other answer means the name is in use. A `403` (`Forbidden`) means another account
+   owns that name, and the Data or Widget stack would fail on it: give the bucket a new name
+   before going on. A data bucket's name is built in `infra/lib/data-stack.ts`; the widget
+   bucket's in `infra/lib/widget-stack.ts`, `infra/lib/pipeline-stack.ts` (the frontend deploy
+   role's grant) and Luciel-Frontend's `deploy.yml`. A bucket that answers without an error
+   still exists in this account and blocks its stack too.
+
+   ```bash
+   ACCOUNT=<account-id>
+   for b in knowledge-originals transcript-archive export-bundles voice-audio widget; do
+     echo "luciel-dev-$b-$ACCOUNT"
+     aws s3api head-bucket --bucket "luciel-dev-$b-$ACCOUNT" --region ca-central-1
+   done
+   ```
+
+   When all five answer `404`, deploy:
+
    ```bash
    gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live -f paused=true
    ```
@@ -97,12 +120,20 @@ the Python scripts.
    voice-audio buckets stay empty: there was nothing to archive. Do it now, while the sweeps are
    still off. The data buckets refuse requests made outside `ca-central-1`.
 
+   Copy into a bucket only after `head-bucket --expected-bucket-owner` has shown that this
+   account owns it. A `403` there means it does not: the loop stops, and those customer files
+   must not be copied until the bucket is this account's.
+
    ```bash
-   aws s3 ls s3://luciel-dev-restore-archive-<account-id>/ --region ca-central-1   # the two prefixes
-   aws s3 sync s3://luciel-dev-restore-archive-<account-id>/knowledge-originals/ \
-     s3://luciel-dev-knowledge-originals-<account-id>/ --region ca-central-1
-   aws s3 sync s3://luciel-dev-restore-archive-<account-id>/export-bundles/ \
-     s3://luciel-dev-export-bundles-<account-id>/ --region ca-central-1
+   ACCOUNT=<account-id>
+   aws s3 ls "s3://luciel-dev-restore-archive-$ACCOUNT/" --region ca-central-1   # the two prefixes
+   for b in knowledge-originals export-bundles; do
+     aws s3api head-bucket --bucket "luciel-dev-$b-$ACCOUNT" \
+       --expected-bucket-owner "$ACCOUNT" --region ca-central-1 ||
+       { echo "STOP: luciel-dev-$b-$ACCOUNT is not this account's bucket"; break; }
+     aws s3 sync "s3://luciel-dev-restore-archive-$ACCOUNT/$b/" \
+       "s3://luciel-dev-$b-$ACCOUNT/" --region ca-central-1
+   done
    ```
 
 5. **Frontend.** This pushes the web image into the recreated `luciel-dev-web` repository and the
