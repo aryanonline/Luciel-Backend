@@ -210,11 +210,18 @@ export interface EnvConfig {
    * cost, so standing dev back up brings its data back.
    *
    * ONE-WAY: once an environment has been restored from a snapshot, this field must
-   * STAY set, to the same value, for as long as that database lives.
-   * DBSnapshotIdentifier is a replacement property of AWS::RDS::DBInstance: removing
-   * it (or naming another snapshot) makes CloudFormation replace the restored database
-   * with a NEW, EMPTY one. RETAIN only orphans the old instance; the app is pointed at
-   * the empty one.
+   * STAY set, to the same value, for as long as that database lives. DBSnapshotIdentifier
+   * is not itself a replacement property (AWS::RDS::DBInstance lists it as "Some
+   * interruptions", and CloudFormation lets it be removed after a restore); the damage
+   * comes from what this stack does without the field:
+   *  - Unset: DataStack switches to `rds.DatabaseInstance`, which adds DBName,
+   *    MasterUsername, KmsKeyId and StorageEncrypted (each "Update requires:
+   *    Replacement") under the same logical id, so CloudFormation replaces the restored
+   *    database with a NEW, EMPTY one.
+   *  - Another snapshot: CloudFormation restores a new instance from THAT snapshot.
+   * Either way RETAIN orphans the current instance, data and all, outside the stack, and
+   * the app is pointed at the new one (test/db-snapshot-restore.test.ts pins the four
+   * added properties).
    *
    * The restored storage stays encrypted with the KMS key the snapshot was taken under
    * (dev's SecurityStack CMK); RDS cannot restore without it. Dev's CMK is DESTROY with
@@ -257,8 +264,9 @@ const CONFIGS: Record<EnvName, EnvConfig> = {
     // D6: dev serves the public names as a dual-host until a production environment
     // claims them (flip this and prod's together).
     ownsPublicApex: true,
-    // Restore dev's data on its next stand-up. Never unset it once dev has been
-    // restored (see the field doc: unsetting it replaces the database with an empty one).
+    // Restore dev's data on its next stand-up. Never unset or change it once dev has
+    // been restored (see the field doc: unsetting it replaces the database with an empty
+    // one).
     dbSnapshotIdentifier: 'luciel-dev-final-2026-11-14',
   },
   // EPHEMERAL pre-production. NOT a standing environment: it is created at release

@@ -86,10 +86,14 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - An environment that names `dbSnapshotIdentifier` (env-config.ts) RESTORES its database
   with `rds.DatabaseInstanceFromSnapshot` under the same construct id, with a new
   generated master secret; dev names `luciel-dev-final-2026-11-14`. One-way: never unset
-  or change the field while that database lives, because DBSnapshotIdentifier is a
-  replacement property and CloudFormation would swap in an EMPTY database. The snapshot
-  is encrypted with dev's CMK (in the kept `Luciel-dev-Security` stack), which must
-  still exist to restore (`test/db-snapshot-restore.test.ts`).
+  or change the field while that database lives. Unset, DataStack builds
+  `rds.DatabaseInstance`, which adds DBName, MasterUsername, KmsKeyId and StorageEncrypted
+  (each "Update requires: Replacement") under the same logical id, so CloudFormation
+  replaces the restored database with an EMPTY one; another snapshot restores a new
+  instance from that snapshot. Either way RETAIN orphans the current instance.
+  DBSnapshotIdentifier itself is not a replacement property. The snapshot is encrypted
+  with dev's CMK (in the kept `Luciel-dev-Security` stack), which must still exist to
+  restore (`test/db-snapshot-restore.test.ts`).
 
 ## Testing pointers
 - `infra/test/*.test.ts`, especially stripe posture, cost retention, tenant secrets, and sweep schedules.

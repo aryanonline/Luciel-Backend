@@ -107,8 +107,13 @@ export class DataStack extends Stack {
     // the DbSg wiring) is unchanged.
     if (envConfig.dbSnapshotIdentifier) {
       // RESTORE (env-config.ts dbSnapshotIdentifier). ONE-WAY: once an environment
-      // has been restored, the field must stay set. Removing DBSnapshotIdentifier (or
-      // changing it) makes CloudFormation REPLACE this database with a new, EMPTY one.
+      // has been restored, the field must stay set, to the same value. Unset, this
+      // stack builds the rds.DatabaseInstance below instead, which adds DBName,
+      // MasterUsername, KmsKeyId and StorageEncrypted (each "Update requires:
+      // Replacement") under the same logical id, so CloudFormation REPLACES this
+      // database with a new, EMPTY one. Another snapshot restores a new instance from
+      // that snapshot. RETAIN orphans the current instance either way.
+      // (DBSnapshotIdentifier itself is not a replacement property.)
       //
       // Inherited from the snapshot, so not set here: the storage encryption and its
       // KMS key (the key the snapshot was taken under must still exist), the master

@@ -149,6 +149,31 @@ describe('dev restores from the snapshot with a generated master secret', () => 
   });
 });
 
+describe('the field is one-way once dev has been restored', () => {
+  // DBSnapshotIdentifier alone may be removed after a restore (AWS::RDS::DBInstance:
+  // "Update requires: Some interruptions"). Unsetting the field is destructive because
+  // of what the fresh path adds under the SAME logical id: four properties whose
+  // AWS::RDS::DBInstance entries each say "Update requires: Replacement", so
+  // CloudFormation would replace the restored database with an empty one, and RETAIN
+  // would orphan the restored instance outside the stack.
+  const REPLACEMENT_PROPERTIES = ['DBName', 'KmsKeyId', 'MasterUsername', 'StorageEncrypted'];
+
+  test('unsetting it adds exactly the four replacement properties to the same instance', () => {
+    const [restoredId, restored] = onlyInstance(build(getEnvConfig('dev')).template);
+    const [freshId, fresh] = onlyInstance(build(devWithoutSnapshot()).template);
+    expect(freshId).toBe(restoredId);
+    const added = Object.keys(fresh.Properties).filter((key) => !(key in restored.Properties));
+    const removed = Object.keys(restored.Properties).filter((key) => !(key in fresh.Properties));
+    expect(added.sort()).toEqual(REPLACEMENT_PROPERTIES);
+    expect(removed).toEqual(['DBSnapshotIdentifier']);
+    // Nothing else differs, so these four are the whole replacement trigger.
+    for (const key of Object.keys(restored.Properties).filter((k) => k in fresh.Properties)) {
+      expect([key, fresh.Properties[key]]).toEqual([key, restored.Properties[key]]);
+    }
+    expect(restored.UpdateReplacePolicy).toBe('Retain');
+  });
+});
+
 describe('an environment without a snapshot synthesises as before', () => {
   test.each<[string, () => EnvConfig]>([
     ['prod', () => getEnvConfig('prod')],

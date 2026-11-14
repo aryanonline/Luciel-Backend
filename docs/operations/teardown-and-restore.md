@@ -158,6 +158,11 @@ the Python scripts.
 ## After the restore
 
 Keep `dbSnapshotIdentifier` set, to the same value, for as long as the restored database lives.
-`DBSnapshotIdentifier` is a replacement property, so unsetting or changing the field in
-`infra/lib/env-config.ts` makes CloudFormation replace the database with a new, empty one
+CloudFormation itself lets `DBSnapshotIdentifier` be removed after a restore; the danger is what
+the Data stack does without it. With the field unset in `infra/lib/env-config.ts`, the stack
+builds a fresh database instead, which adds `DBName`, `MasterUsername`, `KmsKeyId` and
+`StorageEncrypted` under the same logical id. Changing any of those requires replacement, so
+CloudFormation replaces the restored database with a new, empty one. Naming a different snapshot
+restores a new instance from that snapshot instead. Either way the current instance is kept
+outside the stack (`RETAIN`), with its data, and the app is pointed at the new one
 ([`infra/test/db-snapshot-restore.test.ts`](../../infra/test/db-snapshot-restore.test.ts)).
