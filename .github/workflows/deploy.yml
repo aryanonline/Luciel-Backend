@@ -123,7 +123,7 @@ jobs:
           fi
           exit "$missing"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -421,7 +421,7 @@ jobs:
           fi
           exit "$missing"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure AWS via OIDC (preprod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
@@ -561,7 +561,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure AWS via OIDC (preprod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
@@ -609,7 +609,7 @@ jobs:
           fi
           exit "$missing"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure AWS via OIDC (prod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
@@ -846,7 +846,7 @@ jobs:
           fi
           exit "$missing"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure AWS via OIDC (preprod deploy role)
         uses: aws-actions/configure-aws-credentials@v4
