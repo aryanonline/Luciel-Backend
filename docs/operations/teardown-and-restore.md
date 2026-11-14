@@ -17,7 +17,7 @@ Below, `<account-id>` stands for the AWS account id.
 | Stack `Luciel-dev-Pipeline`: the GitHub OIDC provider, the deploy roles and ECR repository `luciel-backend-dev` (emptied) | The deploy workflows reach AWS through these roles. |
 | Stack `CDKToolkit` in `ca-central-1` and in `us-east-1` | Every `cdk deploy` needs the CDK bootstrap. The CloudFront certificate's stack deploys to `us-east-1`. |
 | RDS snapshot `luciel-dev-final-2026-11-14` (PostgreSQL 16, encrypted with the KMS key above) | The database. [`infra/lib/env-config.ts`](../../infra/lib/env-config.ts) names it as dev's `dbSnapshotIdentifier`, so the next deploy restores it. |
-| S3 bucket `luciel-dev-restore-archive-<account-id>` | The files of the four data buckets, under one prefix per bucket. |
+| S3 bucket `luciel-dev-restore-archive-<account-id>` | The files of the two data buckets that had any, one prefix each: `knowledge-originals/` (18 objects) and `export-bundles/` (3 objects). The transcript-archive and voice-audio buckets held no objects when they were deleted (the versioned transcript archive had no older versions or delete markers either), so the archive has no prefix for them. |
 | Budget `luciel-paused-guard` (account-wide, $5 a month, alerts at 80% and 100% actual and at 100% forecast) | It catches anything left running or started by accident. |
 
 > [!WARNING]
@@ -34,9 +34,10 @@ Below, `<account-id>` stands for the AWS account id.
 - The database instance and Redis.
 - The load balancer, the NAT gateway, the WAF and the CloudFront widget CDN.
 - ECR repository `luciel-dev-web`.
-- The four data buckets: `luciel-dev-knowledge-originals-<account-id>`,
-  `luciel-dev-transcript-archive-<account-id>`, `luciel-dev-export-bundles-<account-id>` and
-  `luciel-dev-voice-audio-<account-id>`. Their files are in the archive bucket.
+- The four data buckets: `luciel-dev-knowledge-originals-<account-id>` and
+  `luciel-dev-export-bundles-<account-id>`, whose files are in the archive bucket, and
+  `luciel-dev-transcript-archive-<account-id>` and `luciel-dev-voice-audio-<account-id>`, which
+  held no objects.
 - The log groups.
 - The per-tenant `vm/*` secrets. Test tenants must reconnect their own integrations after a
   restore.
@@ -91,14 +92,17 @@ the Python scripts.
    gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live -f paused=true
    ```
 
-4. **Files.** Copy each archive prefix back into the bucket it came from, which step 3 recreated.
-   Do it now, while the sweeps are still off. The data buckets refuse requests made outside
-   `ca-central-1`.
+4. **Files.** Copy the two archive prefixes, `knowledge-originals/` and `export-bundles/`, back
+   into the buckets they came from, which step 3 recreated. The transcript-archive and
+   voice-audio buckets stay empty: there was nothing to archive. Do it now, while the sweeps are
+   still off. The data buckets refuse requests made outside `ca-central-1`.
 
    ```bash
-   aws s3 ls s3://luciel-dev-restore-archive-<account-id>/ --region ca-central-1
-   aws s3 sync s3://luciel-dev-restore-archive-<account-id>/<prefix>/ \
-     s3://luciel-dev-<bucket>-<account-id>/ --region ca-central-1
+   aws s3 ls s3://luciel-dev-restore-archive-<account-id>/ --region ca-central-1   # the two prefixes
+   aws s3 sync s3://luciel-dev-restore-archive-<account-id>/knowledge-originals/ \
+     s3://luciel-dev-knowledge-originals-<account-id>/ --region ca-central-1
+   aws s3 sync s3://luciel-dev-restore-archive-<account-id>/export-bundles/ \
+     s3://luciel-dev-export-bundles-<account-id>/ --region ca-central-1
    ```
 
 5. **Frontend.** This pushes the web image into the recreated `luciel-dev-web` repository and the
