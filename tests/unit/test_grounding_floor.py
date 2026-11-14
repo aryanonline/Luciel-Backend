@@ -338,7 +338,7 @@ def test_the_base_scorer_fixture_is_ba97103_verbatim() -> None:
     raw = (Path(__file__).parent / "fixtures" / "grounding_ba97103.py").read_bytes()
     body = raw.replace(b"\r\n", b"\n")
     blob = hashlib.sha1(b"blob %d\0" % len(body) + body, usedforsecurity=False).hexdigest()
-    assert blob == "ed48fdab4c5f0dbdf0cfb567c59bdec1ff31a358"
+    assert blob == "ed48fdab4c5f0dbdf0cfb567c59bdec1ff31a358"  # pragma: allowlist secret
 
 
 def test_t6_email_and_widget_shapes_are_served_at_the_hand_stripped_score() -> None:
