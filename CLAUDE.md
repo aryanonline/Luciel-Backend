@@ -219,8 +219,14 @@ the `db` container. The expected result is about 4,000 passed,
   means the `DEV_INTEGRATION_MODE` repo variable (`live`), never `mock`.
 - `environment` is `dev` or `prod`; choose `integration_mode` explicitly (`mock` or
   `live`). Do not treat a deploy command as approval for a real integration.
-- Dev is the normal target for verification. Production is only for explicit owner
-  approval and uses the protected `prod` environment.
+- Dev is the normal target for verification, but it has been PAUSED since 2026-11-14:
+  most of it was deleted to stop AWS charges, so no hostname answers and nothing live
+  (smoke probe, SeedTest, the live walk) can run against it. A plain deploy does not
+  bring it back; the restore order is in `docs/operations/teardown-and-restore.md`,
+  and a restore brings the running cost back, so it needs the owner's go-ahead. Never
+  destroy `Luciel-dev-Security`: its KMS key (DESTROY in dev) encrypts the database
+  snapshot the restore depends on. Production is only for explicit owner approval and
+  uses the protected `prod` environment.
 - A production release first creates ephemeral prod-shaped preprod, runs Verify and
   SeedTest as a hard gate, deploys production only after those pass, then tears preprod
   down even after failure.
@@ -238,15 +244,20 @@ the `db` container. The expected result is about 4,000 passed,
   `_dmarc` is `p=quarantine; adkim=s; aspf=r`. Set 2026-08-17 after live sends
   quarantined: strict-SPF DMARC with no custom MAIL FROM fails SPF alignment on
   every SES send. Do not re-strict `aspf` without keeping the MAIL FROM domain.
-- Email INBOUND for platform reply addresses is likewise out-of-band ops
-  (live-caught NXDOMAIN 2026-08-17 — the vm_subdomain addresses shipped
-  unreceivable): Route53 wildcard MX `*.reply.vantagemind.ai → 10
-  inbound-smtp.ca-central-1.amazonaws.com`; SES active receipt rule set
-  `luciel-dev-inbound` matching `.reply.vantagemind.ai` → SNS topic
-  `luciel-dev-ses-inbound` (content inline) → HTTPS subscription to
-  `/api/v1/webhooks/ses/inbound` (the route auto-confirms, signature-verified).
-  A new environment needs all three pieces; codifying them into CDK is a
-  flagged follow-up.
+- Email INBOUND for platform reply addresses (live-caught NXDOMAIN 2026-08-17 — the
+  vm_subdomain addresses shipped unreceivable): the Route53 wildcard MX
+  `*.reply.vantagemind.ai → 10 inbound-smtp.ca-central-1.amazonaws.com` stays
+  out-of-band (zone-global, so deliberately not in a per-environment stack), and
+  ComputeStack owns the rest: receipt rule set `luciel-<env>-inbound-v2` matching
+  `.reply.vantagemind.ai` → SNS topic `luciel-<env>-ses-inbound-v2` (content inline)
+  → HTTPS subscription to `/api/v1/webhooks/ses/inbound` (the route auto-confirms in
+  live mode, signature-verified). These replaced the console-created
+  `luciel-dev-inbound` rule set and its `luciel-dev-ses-inbound` topic; the route
+  still accepts that topic by name. CloudFormation never activates a receipt rule set:
+  `luciel-dev-inbound-v2` was dev's active one until the 2026-11-14 pause deactivated
+  it. After a restore, once `scripts/check_sns_subscriptions.sh dev` shows the topic's
+  subscription confirmed, turn it back on with `aws ses set-active-receipt-rule-set
+  --rule-set-name luciel-dev-inbound-v2 --region ca-central-1`.
 
 ## Before handing off
 

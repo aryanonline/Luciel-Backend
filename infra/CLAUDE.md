@@ -35,9 +35,10 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - Hostnames are per environment (owner decision D6, round 7 WP-8b): every name comes
   from `hostnames(envName)` in env-config.ts — dev `dev.` / `api-dev.` /
   `embed-dev.vantagemind.ai`, preprod the same with `preprod`, prod the public
-  names. EXACTLY ONE environment has `ownsPublicApex` (dev today, serving the apex,
-  www, api and embed names as a dual-host); `apexOwner()` refuses to synth otherwise
-  and deploy.yml refuses a prod deploy while prod does not own them. Never hard-code a
+  names. EXACTLY ONE environment has `ownsPublicApex` (dev, which serves the apex,
+  www, api and embed names as a dual-host when it runs; dev has been paused since
+  2026-11-14, so none of these names answers now); `apexOwner()` refuses to synth
+  otherwise and deploy.yml refuses a prod deploy while prod does not own them. Never hard-code a
   hostname in a stack, a workflow or a script — `npx ts-node bin/hostnames.ts <env>`
   prints them. The public records keep their original logical ids (`recordIdFor`).
 - ONE ALB per environment (D7): the web tier's target group hangs on ComputeStack's
@@ -87,8 +88,8 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   generated master secret; dev names `luciel-dev-final-2026-11-14`. One-way: never unset
   or change the field while that database lives, because DBSnapshotIdentifier is a
   replacement property and CloudFormation would swap in an EMPTY database. The snapshot
-  is encrypted with dev's CMK, which must still exist to restore
-  (`test/db-snapshot-restore.test.ts`).
+  is encrypted with dev's CMK (in the kept `Luciel-dev-Security` stack), which must
+  still exist to restore (`test/db-snapshot-restore.test.ts`).
 
 ## Testing pointers
 - `infra/test/*.test.ts`, especially stripe posture, cost retention, tenant secrets, and sweep schedules.
@@ -97,6 +98,9 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 ## Gotchas from the 2026-08-06 truth delta
 - Production release uses ephemeral prod-shaped preprod plus Verify and SeedTest hard gate, then always tears preprod down. `preprod-standup` applies `Luciel-prod-Pipeline` first: the strict gate reads its logs with that role, and `prod-deploy` cannot run until the gate passes.
 - Pause sets services to zero intentionally; it is a reversible cost control, not account deletion or a runtime bypass.
+- The 2026-11-14 pause of dev went further than that switch: most dev stacks were deleted, and the
+  Security and Pipeline stacks, the database snapshot and an S3 archive of the data buckets were kept.
+  What was kept and the restore order are in `docs/operations/teardown-and-restore.md`.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.

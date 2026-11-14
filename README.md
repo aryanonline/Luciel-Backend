@@ -44,10 +44,10 @@ site and widget live in the companion
   gated on their ECR scans (`scripts/check_image_scan.py`): a CRITICAL or HIGH finding fails
   unless `.security/cve-allowlist.json` waives it with a reason and an expiry date, and an
   expired waiver or an incomplete scan fails too.
-- **Deploys gated on live behavior.** After each dev deploy, a smoke probe, an in-VPC database
-  probe and, in live mode, SeedTest (`scripts/seed_and_livetest.py`), a strict harness that
-  drives a throwaway tenant through the real API, must pass, or the services roll back (a
-  production release runs SeedTest on preprod before deploying).
+- **Deploys gated on live behavior.** A dev deploy is not done until a smoke probe, an in-VPC
+  database probe and, in live mode, SeedTest (`scripts/seed_and_livetest.py`), a strict harness
+  that drives a throwaway tenant through the real API, have passed; if one fails, the services
+  roll back (a production release runs SeedTest on preprod before deploying).
 
 ## Architecture
 
@@ -193,13 +193,18 @@ a failed daily run is posted to the month's dependency-review issue.
 | Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |
 | Infrastructure | A separate `infra` job: `npm ci`, `tsc --noEmit` and the CDK Jest assertions |
 
-To run the CDK Jest assertions (`infra/test/`, 28 files) locally: `cd infra && npm ci && npm test`.
+To run the CDK Jest assertions (`infra/test/`, 29 files) locally: `cd infra && npm ci && npm test`.
 
 ## Deployment
 
 Deploys run only by manual dispatch of `.github/workflows/deploy.yml` from `main`. There is no
 push trigger, a guard job refuses any other ref before the first AWS call, and the workflow
-reaches AWS through GitHub OIDC roles, with no stored keys.
+reaches AWS through GitHub OIDC roles, with no stored keys. It reads the AWS account id from the
+`AWS_ACCOUNT_ID` repository variable and the operator inbox from the `BUDGET_ALERT_EMAIL` secret.
+
+Dev is paused (see [Project status](#project-status)), so it comes back through the runbook in
+[`docs/operations/teardown-and-restore.md`](docs/operations/teardown-and-restore.md), not through
+a single deploy. On a running environment, a deploy is one command:
 
 ```bash
 gh workflow run deploy.yml --ref main -f environment=dev -f integration_mode=live
@@ -226,12 +231,17 @@ A dev deploy runs these steps in order:
 
 If the deploy or a later gate fails, `scripts/rollback_services.py` points the services and sweep
 schedules back at the previous task definitions; the schema stays where the migration left it.
-`-f paused=true` scales every service to zero and disables the schedules (`false` resumes). A
-production release adds approval on the protected `prod` environment and a temporary
-production-shaped `preprod`, built from the same gated image, that must pass the database probe
-and the SeedTest harness before production deploys; `preprod` is always destroyed afterwards.
+`-f paused=true` scales every service to zero and disables the schedules (`false` resumes). It
+leaves the database, Redis, the NAT gateway and the load balancer in place, so it still costs
+money; the 2026-11-14 pause deleted most of the environment instead. A production release adds
+approval on the protected `prod` environment and a temporary production-shaped `preprod`, built
+from the same gated image, that must pass the database probe and the SeedTest harness before
+production deploys; `preprod` is always destroyed afterwards.
 
 ## Operations
+
+The scheduled jobs and alarms below belong to a deployed environment; while dev is paused, neither
+runs.
 
 **Scheduled jobs.** Sixteen sweeps (`app/jobs/sweeps.py`) run from EventBridge Scheduler
 (`infra/lib/compute-stack.ts`). Every sweep except the platform-level model-ID check works one
@@ -257,29 +267,40 @@ ceiling and on a forecast breach.
 
 | Workflow | When | What it does |
 | --- | --- | --- |
-| `image-rebuild.yml` | Weekly | Rebuilds the image from `main`, runs the CVE gate in report mode and posts the findings; never deploys |
-| `dependency-review.yml` | Monthly | Opens the month's dependency and CVE review issue: outdated packages, lock drift, waivers and their expiry, the latest scan |
+| `image-rebuild.yml` | Weekly; disabled while dev is paused | Rebuilds the image from `main`, runs the CVE gate in report mode and posts the findings; never deploys |
+| `dependency-review.yml` | Monthly; disabled while dev is paused | Opens the month's dependency and CVE review issue: outdated packages, lock drift, waivers and their expiry, the latest scan |
 | `dependabot-auto-merge.yml` | After CI on a Dependabot PR | Merges a green minor or patch update and labels a major one for a person |
-| `dev-cost-guard.yml` | Daily | Stops a paused environment's database again, since AWS restarts a stopped RDS instance after seven days |
+| `dev-cost-guard.yml` | Daily; disabled while dev is paused | Keeps the database of an environment deployed with `paused=true` stopped, since AWS restarts a stopped RDS instance after seven days |
+
+The three disabled workflows need the AWS environment; the restore runbook turns them back on.
 
 ## Project status
 
-The backend runs in a development environment in `ca-central-1` and has been verified live. The
-current build was deployed from `main` on 2026-11-14 and passed every gate above in live mode,
-including the strict SeedTest gate. A day earlier that gate had stopped a deploy and rolled the
-services back automatically: the model worded its AI disclosure freely, and on email those words
-counted against grounding, so an honest answer was handed off. The system prompt now gives the
-exact sentence and the grounding scorer removes only that platform-authored text. After the
+The backend ran in a development environment in `ca-central-1` and was verified live until
+2026-11-14. The last build was deployed from `main` that day and passed every gate above in live
+mode, including the strict SeedTest gate. A day earlier that gate had stopped a deploy and rolled
+the services back automatically: the model worded its AI disclosure freely, and on email those
+words counted against grounding, so an honest answer was handed off. The system prompt now gives
+the exact sentence and the grounding scorer removes only that platform-authored text. After the
 deploy, a customer-style end-to-end walk of the deployed product, driven from the frontend
 repository, passed again (it first passed on 2026-11-02, the day the SeedTest matrix of eight
-configurations passed against the live backend). Production has not been stood up yet: the
-release path exists in `deploy.yml` but has never run. Stripe runs in test mode, so no real
-payments are taken.
+configurations passed against the live backend).
+
+Later that day the environment was paused to stop AWS charges. Most of it was deleted; the
+database snapshot, an archive of its stored files, the platform secret and the deploy roles were
+kept so that it can be restored. Until then nothing answers on its hostnames. What was kept, what
+the pause costs and the restore runbook are in
+[`docs/operations/teardown-and-restore.md`](docs/operations/teardown-and-restore.md).
+
+Production has not been stood up yet: the release path exists in `deploy.yml` but has never run.
+Dev used Stripe in test mode, so no real payments were taken.
 
 ## Further reading
 
 - [`.env.example`](.env.example) covers the local settings; [`app/config.py`](app/config.py)
   defines every setting and its default.
+- [`docs/operations/teardown-and-restore.md`](docs/operations/teardown-and-restore.md) records
+  what the 2026-11-14 pause kept, deleted and disabled, and how to restore dev.
 - [`CLAUDE.md`](CLAUDE.md) is the working guide to this codebase: product invariants, the
   architecture map, the test recipe and deploy rules; most modules carry their own. Tags in
   these guides, comments and test names, such as "round 7 WP-3c", "D6", "Arc 14", "F039" or
