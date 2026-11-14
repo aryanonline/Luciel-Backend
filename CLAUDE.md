@@ -263,6 +263,16 @@ the `db` container. The expected result is about 4,000 passed,
   subscription confirmed, turn it back on with `aws ses set-active-receipt-rule-set
   --rule-set-name luciel-dev-inbound-v2 --region ca-central-1`.
 
+## Repository settings
+
+- `SECURITY.md` sends reporters to GitHub's private vulnerability reporting, which GitHub
+  offers only on a public repository and leaves off by default. Whoever makes this
+  repository public switches it on in the same step and checks it:
+  `gh api -X PUT repos/aryanonline/Luciel-Backend/private-vulnerability-reporting`, then
+  `gh api repos/aryanonline/Luciel-Backend/private-vulnerability-reporting --jq .enabled`
+  must print `true`. Until then the "Security contact request" issue that `SECURITY.md`
+  describes is the only way to reach the maintainer.
+
 ## Before handing off
 
 - `git status --short` contains only intentional files.
