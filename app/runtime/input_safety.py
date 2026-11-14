@@ -359,11 +359,17 @@ def compose_ai_disclosure(*, assistant_name: str, business_name: str) -> str:
     sentence word for word, and the grounding scorer removes exactly this sentence
     (through ``platform_disclosure_sentences``) before scoring, so the two cannot drift.
     The prompt's fallbacks apply: no assistant name is "Luciel", an unnamed business is
-    "this business".
+    "this business". A business name that already ends in ". ! ?" ("Acme Inc.") ends
+    the sentence itself, so the model is never told to write "Acme Inc..".
     """
+    clause = _disclosure_clause(assistant_name=assistant_name, business_name=business_name)
+    return clause if clause.endswith((".", "!", "?")) else f"{clause}."
+
+
+def _disclosure_clause(*, assistant_name: str, business_name: str) -> str:
     assistant = (assistant_name or "").strip() or "Luciel"
     business = (business_name or "").strip() or "this business"
-    return f"I'm {assistant}, an AI assistant for {business}."
+    return f"I'm {assistant}, an AI assistant for {business}"
 
 
 def platform_disclosure_sentences(*, assistant_name: str, business_name: str) -> tuple[str, ...]:
@@ -371,10 +377,10 @@ def platform_disclosure_sentences(*, assistant_name: str, business_name: str) ->
     prompt's exact sentence, that sentence with the platform offer clause, and the
     deterministic greeting line. The grounding scorer removes only these, so it never
     interprets a disclosure the model worded itself."""
-    disclosure = compose_ai_disclosure(assistant_name=assistant_name, business_name=business_name)
+    clause = _disclosure_clause(assistant_name=assistant_name, business_name=business_name)
     return (
-        disclosure,
-        f"{disclosure[:-1]}, and {PLATFORM_OFFER}.",
+        compose_ai_disclosure(assistant_name=assistant_name, business_name=business_name),
+        f"{clause}, and {PLATFORM_OFFER}.",
         _compose_greeting(business_name=business_name, assistant_name=assistant_name),
     )
 

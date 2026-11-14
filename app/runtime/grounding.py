@@ -218,12 +218,16 @@ _DELIVERY_AND_COURTESY_WORDS = frozenset(
 
 
 # --- Platform-owned framing (2026-11-13 T6) ---------------------------------------
-# A greeting alone on the first line: a greeting word, at most two name words (letters,
-# with an inner apostrophe, dot or hyphen: "O'Brien", "Jean-François"), optional "," or
-# "!". The line holds nothing else, so it cannot carry a claim.
+# A greeting alone on the first line, in one of two closed shapes: a greeting word with
+# an optional closed address ("Hi there", "Good morning, all!"), or a greeting word, at
+# most two name words and a closing "," or "!" ("Hi Jordan,", "Dear Mary Ann,"). A
+# hyphen, dot or apostrophe join counts as a word break, as the scorer's tokenizer counts
+# it ("O'Brien" and "Jean-François" are two words). A heading with no closing mark
+# ("Hello Kitty Plushies") is content, not a greeting.
+_GREETING = r"(?:hi|hello|hey|dear|greetings|good\s+(?:morning|afternoon|evening))"
 _GREETING_LINE = re.compile(
-    r"(?:hi|hello|hey|dear|greetings|good\s+(?:morning|afternoon|evening))"
-    r"(?:\s+[^\W\d_]+(?:['’.-][^\W\d_]+)*){0,2}\s*[,!]?",
+    rf"{_GREETING}(?:\s+(?:there|all|everyone|folks|team))?\s*[,!]?"
+    rf"|{_GREETING}\s+[^\W\d_]+(?:(?:\s+|['’.-])[^\W\d_]+)?\s*[,!]",
     re.IGNORECASE,
 )
 # A closed sign-off phrase, alone on its line, with its punctuation.
@@ -240,17 +244,26 @@ def _norm_line(line: str) -> str:
     return " ".join(line.replace("’", "'").casefold().split())
 
 
+# Typographic twins of a separator mark, so "Joe’s" reads as "Joe's" and "Hi - I'm" as
+# "Hi — I'm".
+_MARK_TWINS = {"'": "'’", "’": "'’", "-": "-–—", "–": "-–—", "—": "-–—"}
+
+
 def _template_regex(sentence: str) -> str:
     """The exact words of a platform sentence in order, as a regex. Between two words
-    any non-word separator matches ("Joe’s" for "Joe's", "—" for ","), but a sentence
-    or line break (. ! ? newline) only where the sentence itself has one, so "for
-    Acme. Store credit…" never reads as the name "Acme Store". Escaped literals and no
-    nested quantifier: linear time."""
+    the separator may differ only in its whitespace and in the typographic twin of the
+    sentence's own marks: a space matches only spaces, so "for Acme; Free returns" or
+    "for Acme… Free returns" never reads as the name "Acme Free Returns", and a line
+    break matches only where the sentence ends a sentence (. ! ?). Escaped literals and
+    single-character separator classes: linear time."""
     parts = re.split(r"(\w+)", sentence)
     words, gaps = parts[1::2], parts[2:-1:2]
     regex = re.escape(words[0])
     for gap, word in zip(gaps, words[1:], strict=True):
-        regex += (r"\W+" if re.search(r"[.!?]", gap) else r"[^\w.!?\n]+") + re.escape(word)
+        space = r"\s" if re.search(r"[.!?]", gap) else r"[^\S\n]"
+        marks = "".join(sorted({t for c in gap.strip() for t in _MARK_TWINS.get(c, c)}))
+        sep = f"(?:{space}|[{re.escape(marks)}])+" if marks else f"{space}+"
+        regex += sep + re.escape(word)
     return rf"\b{regex}\b"
 
 

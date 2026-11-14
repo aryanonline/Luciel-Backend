@@ -458,6 +458,133 @@ def test_greeting_and_signoff_are_closed_shapes() -> None:
         assert _strip(answer).strip() == T6_FACT, answer
 
 
+BRUNCH_CHUNK = "Brunch is served Saturday and Sunday from 10am to 2pm."
+BRUNCH_FACT = "Brunch is served Saturday and Sunday from 10am to 2pm, with live jazz."
+TOY_CHUNKS = (
+    "All toys are in stock.",
+    "Good Morning Special: two eggs, toast and coffee for $9.99, served until 11am. "
+    "Hello Kitty plushies are $12.",
+)
+
+
+def test_a_greeting_line_holds_at_most_two_words_as_the_tokenizer_counts_them() -> None:
+    """Fixer round 1, finding 1: a hyphen, dot or apostrophe chain made the "two name
+    words" limit open-ended ("Hi Free-Valet-Parking-Every-Weekend," went, claim and all,
+    0.750 served against the base 0.462). A join now counts as a word break, as the
+    scorer's tokenizer counts it, so such a line stays in the score."""
+    for greeting, body, chunk in (
+        ("Hi Free-Valet-Parking-Every-Weekend,", BRUNCH_FACT, BRUNCH_CHUNK),
+        (
+            "Hi free-overnight-shipping-lifetime-warranty-included!",
+            "Orders ship within 3 business days, returns accepted.",
+            "Orders ship within 3 business days.",
+        ),
+        ("Hello Kids.Eat.Free.Always!", BRUNCH_FACT, BRUNCH_CHUNK),
+        ("Good morning Bottomless-Mimosas-Included!", BRUNCH_FACT, BRUNCH_CHUNK),
+        ("Hello Free-Shipping-Daily!", BRUNCH_FACT, BRUNCH_CHUNK),
+        ("Hello Free'Shipping’Daily!", BRUNCH_FACT, BRUNCH_CHUNK),
+        ("Hi Jean-François Dupont,", BRUNCH_FACT, BRUNCH_CHUNK),
+    ):
+        answer = f"{greeting}\n\n{body}"
+        assert _strip(answer) == answer, answer
+        assert _framed(answer, chunk=chunk, question=None) == _base(answer, chunk, None), answer
+    # Two words, however joined, are still a greeting.
+    for greeting in ("Hi Jean-François,", "Dear Mary-Ann!", "Hi O'Brien!", "Dear Mary Ann,"):
+        assert _strip(f"{greeting}\n{BRUNCH_FACT}") == BRUNCH_FACT, greeting
+
+
+def test_a_greeting_shaped_heading_with_no_closing_mark_is_content() -> None:
+    """Fixer round 1, finding 5: a first-line heading ("Hello Kitty Plushies") read as a
+    greeting, so a fabricated heading was served (0.333 → 1.0) and a supported one was
+    handed off (0.667 → 0.0). With name words, a greeting line now needs its closing
+    "," or "!"; only a closed address ("there", "all", "everyone", "folks", "team") may
+    go without it."""
+    for answer, chunks, question in (
+        ("Hello Kitty Plushies\nIn stock.", TOY_CHUNKS[:1], None),
+        ("Hello Kitty Plushies\nIn stock.", TOY_CHUNKS[:1], "What toys do you have in stock?"),
+        ("Hello Kitty Plushies\nPrice: $12", TOY_CHUNKS, None),
+        ("Hey Dude Shoes\nIn stock.", TOY_CHUNKS[:1], None),
+        (
+            "Dear Evan Hansen\nHamilton and Wicked are playing this month.",
+            ("Now playing: Hamilton and Wicked. Matinees are Sunday at 2pm.",),
+            "What's playing?",
+        ),
+    ):
+        assert _strip(answer) == answer, answer
+        base = BASE.score_grounding(answer, list(chunks), False, question=question)
+        for assistant, businesses in (ACME, UNNAMED, ("Aurora", ("Glow", None))):
+            result = score_grounding(
+                answer,
+                list(chunks),
+                False,
+                question=question,
+                assistant_name=assistant,
+                business_names=businesses,
+            )
+            assert (result.score, result.grounded) == (base.score, base.grounded), answer
+    for greeting in ("Hi there", "Hello all", "Good morning everyone", "Hey team", "Hi"):
+        assert _strip(f"{greeting}\n{T6_FACT}") == T6_FACT, greeting
+
+
+@pytest.mark.parametrize(
+    "separator", ["; ", ": ", "… ", " — ", " - ", ", ", " • ", "/", " | ", " & ", " (", "。", "！"]
+)
+def test_a_clause_break_inside_the_business_name_is_not_the_name(separator: str) -> None:
+    """Fixer round 1, finding 2: the template's gap crossed ";", ":", "…", "—" and the
+    other clause marks, so "for Acme; Free returns" read as the configured name "Acme
+    Free Returns" and the claim "Free returns" was removed (0.556 served against a
+    parity of 0.455). A space in the platform sentence now matches only whitespace."""
+    names: Names = ("Luciel", ("Acme Free Returns", None))
+    chunk = "Orders ship within 3 business days."
+    answer = (
+        f"I'm Luciel, an AI assistant for Acme{separator}Free returns. "
+        "Orders ship within 3 business days, gift wrapped overnight, insured."
+    )
+    assert _strip(answer, names) == answer
+    result = _framed(answer, names, chunk=chunk, question=None)
+    assert result == _base(answer, chunk, None)
+    assert result.grounded is False
+    # The builder's own example, with a Unicode sentence break.
+    for mark in ("…", "。", "; ", " — "):
+        text = f"I'm Luciel, an AI assistant for Acme{mark} Store credit is instant."
+        assert _strip(text, ("Luciel", ("Acme Store", None))) == text
+    # The exact sentence, and its typographic twins, still go.
+    for sentence in (
+        "I'm Luciel, an AI assistant for Acme Free Returns.",
+        "I’m Luciel, an AI assistant for Acme  Free Returns.",
+        "I am Luciel, an AI assistant for acme free returns.",
+    ):
+        assert _words(_strip(f"{sentence} {T6_FACT}", names)) == _words(T6_FACT), sentence
+
+
+def test_a_business_name_ending_in_punctuation_ends_the_disclosure_itself() -> None:
+    """Fixer round 1, finding 3: "Acme Inc." made rule 1 quote "...for Acme Inc.." for the
+    model to copy word for word. The composer adds the period only when the name has no
+    closing mark, and the offer wording is built from the bare clause, so the model's
+    natural "Acme Inc., and I can help..." is still the platform's own sentence."""
+    for business, sentence in (
+        ("Acme Inc.", "I'm Aurora, an AI assistant for Acme Inc."),
+        ("Yahoo!", "I'm Aurora, an AI assistant for Yahoo!"),
+        ("Joe's Pizza Co.", "I'm Aurora, an AI assistant for Joe's Pizza Co."),
+        ("Acme Store", "I'm Aurora, an AI assistant for Acme Store."),
+    ):
+        assert compose_ai_disclosure(assistant_name="Aurora", business_name=business) == sentence
+        offer = input_safety.platform_disclosure_sentences(
+            assistant_name="Aurora", business_name=business
+        )[1]
+        assert offer == f"I'm Aurora, an AI assistant for {business}, and " + (
+            f"{input_safety.PLATFORM_OFFER}."
+        )
+        prompt = build_system_prompt(None, assistant_name="Aurora", business_name=business)
+        rule_one = next(line for line in prompt.splitlines() if line.startswith("1. AI IDENTITY"))
+        assert f'in exactly these words: "{sentence}"' in rule_one
+        assert ".." not in rule_one and "!." not in rule_one
+        names: Names = ("Aurora", (business, None))
+        for framing in (sentence, offer, f"{sentence}."):
+            answer = f"{framing} {T6_FACT}"
+            assert _framed(answer, names) == _base(T6_FACT), answer
+
+
 # Claim-escape corpus. Every claim-escape case found by the four review rounds of the
 # replaced design (branch fix/grounding-disclosure e81f6fa, tests/unit/test_grounding_floor.py,
 # and review result grounding-r3-result.json: R1 F1/F2/F3/F4/F12/F13/F14, R2 F1/F2/F9/F10),
