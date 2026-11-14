@@ -734,6 +734,7 @@ async def _run_inprocess_turn(
     tool_resolver=None,
 ):
     """Open a real session for the seeded tenant and run one orchestrator turn."""
+    from app.channels.runtime_entry import disclosure_business_name, names
     from app.db.engine import dispose_engine
     from app.db.session import tenant_session
     from app.models.instance import Instance
@@ -761,9 +762,10 @@ async def _run_inprocess_turn(
     # loop (see "Event-loop hygiene").
     try:
         async with tenant_session(admin_id) as s:
-            instance_id = (
-                await s.execute(select(Instance.id).where(Instance.admin_id == admin_id))
+            inst = (
+                await s.execute(select(Instance).where(Instance.admin_id == admin_id))
             ).scalar_one()
+            instance_id = inst.id
             sess, _ = await resolve_or_open_session(
                 s,
                 admin_id=admin_id,
@@ -782,6 +784,11 @@ async def _run_inprocess_turn(
                 business_context="We sell refurbished gadgets.",
                 has_payment_method=False,
                 tool_resolver=tool_resolver,
+                # The names every production entry point passes (runtime_entry), so rule
+                # 1's exact disclosure and the grounding scorer's names are the ones a
+                # real customer turn uses: T6 is the live check of prompt compliance.
+                business_name=disclosure_business_name(inst),
+                assistant_name=names(inst)[1],
             )
             return await orch.run_turn(
                 session_id=sess.id,

@@ -255,3 +255,80 @@ def test_the_harness_process_leaves_retries_to_the_durable_queue(
     monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (30.0, 120.0))
     H._harness_process_posture()
     assert escalation_dispatch.ESCALATION_RETRY_DELAYS == ()
+
+
+@pytest.mark.parametrize(
+    ("short_name", "assistant_name", "business", "assistant"),
+    [
+        ("Acme Store", "Aurora", "Acme Store", "Aurora"),
+        (None, None, "this business", "SeedTest main"),
+    ],
+)
+def test_the_in_process_turn_uses_the_names_production_passes(
+    monkeypatch: pytest.MonkeyPatch,
+    short_name: str | None,
+    assistant_name: str | None,
+    business: str,
+    assistant: str,
+) -> None:
+    """Fixer round 1, finding 4: T6 built its Orchestrator with no names, so rule 1 told
+    the model "I'm the assistant, an AI assistant for this business." - a sentence no
+    production entry point sends - and the strict gate never live-checked the real
+    wording. The harness now resolves the names as runtime_entry does."""
+    import contextlib
+    from types import SimpleNamespace
+
+    import app.db.engine
+    import app.db.session
+    import app.runtime.orchestrator
+    import app.runtime.sessions
+
+    inst = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="SeedTest main",
+        business_short_name=short_name,
+        personality={"assistantName": assistant_name} if assistant_name else {},
+    )
+    built: dict[str, object] = {}
+
+    class FakeSession:
+        async def execute(self, _stmt: object) -> object:
+            return SimpleNamespace(scalar_one=lambda: inst)
+
+    @contextlib.asynccontextmanager
+    async def fake_tenant_session(_admin_id: uuid.UUID):  # type: ignore[no-untyped-def]
+        yield FakeSession()
+
+    async def fake_resolve(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        return SimpleNamespace(id=uuid.uuid4(), mode="ai"), True
+
+    class CaptureOrchestrator:
+        def __init__(self, **kwargs: object) -> None:
+            built.update(kwargs)
+
+        async def run_turn(self, **_kwargs: object) -> str:
+            return "turn"
+
+    async def nothing(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.db.session, "tenant_session", fake_tenant_session)
+    monkeypatch.setattr(app.runtime.sessions, "resolve_or_open_session", fake_resolve)
+    monkeypatch.setattr(app.runtime.orchestrator, "Orchestrator", CaptureOrchestrator)
+    monkeypatch.setattr(app.db.engine, "dispose_engine", nothing)
+    monkeypatch.setattr(H, "_settle_background_work", nothing)
+    monkeypatch.setattr(H, "close_llm_clients", nothing)
+
+    result = asyncio.run(
+        H._run_inprocess_turn(
+            uuid.uuid4(),
+            router=None,
+            channel="email",
+            enabled_channels={"widget", "email"},
+            inbound="How many days do I have to return an item?",
+            retriever=None,
+        )
+    )
+    assert result == "turn"
+    assert (built.get("business_name"), built.get("assistant_name")) == (business, assistant)
+    assert built["instance_id"] == inst.id

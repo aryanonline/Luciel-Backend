@@ -94,6 +94,15 @@ make that state explicit and test it.
   promise is not a claim: the regex gap now refuses to cross a future/conditional modal
   (a second subject after the modal - "I can confirm it has been sent" - is still
   caught), and the operating-context stanza says "never say it has already been sent".
+- Platform-owned framing (2026-11-13 SeedTest T6, widget 0.67 vs email 0.40): rule 1 gives
+  the model the exact disclosure (`input_safety.compose_ai_disclosure`), and
+  `grounding.strip_platform_framing` removes only the platform's own wordings
+  (`platform_disclosure_sentences`, as a closed template over the configured names), a
+  greeting alone on the first line, and a closed sign-off over configured-name lines; the
+  orchestrator passes the names on every turn. Residual, accepted: a paraphrased
+  disclosure, an unconfigured signature, or a greeting name the tokenizer reads as more
+  than two words ("Jean-François") stays scored and can hand off an honest answer (never
+  an escape); the strict SeedTest gate is the live check of prompt compliance.
 
 
 ## Judgment as an employee (round 7 WP-2, D2 2026-09-14; built 2026-09-20)

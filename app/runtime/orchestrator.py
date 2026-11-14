@@ -1262,6 +1262,8 @@ class Orchestrator:
             # reach the team on any turn, or it will promise a hand-off it cannot make.
             tool_catalog=with_cognition_tools(None),
             operating_context=self.operating_context,
+            # Rule 1's exact disclosure sentence names this business.
+            business_name=self.business_name,
         )
 
     async def run_turn(
@@ -1737,6 +1739,7 @@ class Orchestrator:
                 tool_catalog=tool_defs,
                 operating_context=self.operating_context,
                 on_file=sorted(gathered),
+                business_name=self.business_name,
             )
             if tool_defs
             else self.system_prompt
@@ -1927,7 +1930,19 @@ class Orchestrator:
             and r.outcome is tool_contract.Outcome.ok
             for call, r in resp.dispatched
         )
-        grounding = score_grounding(resp.text, raw_chunks, tool_succeeded, question=inbound_text)
+        # The configured names let the scorer remove the platform's own disclosure
+        # sentence, greeting line and signature (2026-11-13 T6; see grounding.py).
+        grounding = score_grounding(
+            resp.text,
+            raw_chunks,
+            tool_succeeded,
+            question=inbound_text,
+            assistant_name=self.assistant_name,
+            business_names=(
+                self.business_name,
+                self.operating_context.business_short_name if self.operating_context else None,
+            ),
+        )
 
         # --- ESCALATION GATE 2 — OUTCOME (§3.4.5) ---------------------------- #
         outcome = evaluate_outcome(
