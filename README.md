@@ -179,7 +179,7 @@ python -m pytest tests/unit tests/integration tests/contract   # everything else
 ruff check app tests scripts && ruff format --check app tests scripts && mypy app
 ```
 
-The latest CI run on `main` (2026-11-13) passed 8 isolation tests and 3,899 unit, integration and
+The latest CI run on `main` (2026-11-14) passed 8 isolation tests and 4,006 unit, integration and
 contract tests. CI (`.github/workflows/ci.yml`) runs on every pull request, every push to `main`,
 daily and on demand. The daily run makes a newly published CVE fail the build without a push, and
 a failed daily run is posted to the month's dependency-review issue.
@@ -264,13 +264,16 @@ ceiling and on a forecast breach.
 
 ## Project status
 
-The backend runs in a development environment in `ca-central-1` and has been verified live. Its
-last successful deploy (2026-11-02) passed every gate above in live mode. The same day, the
-SeedTest matrix of eight configurations passed against the live backend, and so did a
-customer-style end-to-end walk of the deployed product, driven from the frontend repository. A
-later deploy from `main` (2026-11-13) stopped at the strict SeedTest gate and rolled the services
-back automatically, so dev still runs the 2026-11-02 build. Production has not been stood up yet:
-the release path exists in `deploy.yml` but has never run. Stripe runs in test mode, so no real
+The backend runs in a development environment in `ca-central-1` and has been verified live. The
+current build was deployed from `main` on 2026-11-14 and passed every gate above in live mode,
+including the strict SeedTest gate. A day earlier that gate had stopped a deploy and rolled the
+services back automatically: the model worded its AI disclosure freely, and on email those words
+counted against grounding, so an honest answer was handed off. The system prompt now gives the
+exact sentence and the grounding scorer removes only that platform-authored text. After the
+deploy, a customer-style end-to-end walk of the deployed product, driven from the frontend
+repository, passed again (it first passed on 2026-11-02, the day the SeedTest matrix of eight
+configurations passed against the live backend). Production has not been stood up yet: the
+release path exists in `deploy.yml` but has never run. Stripe runs in test mode, so no real
 payments are taken.
 
 ## Further reading

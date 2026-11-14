@@ -207,7 +207,7 @@ python -m pytest tests/unit tests/integration tests/contract tests/migrations
 
 On a host with no native `psql`, point `LUCIEL_PSQL` at a single executable (a
 wrapper script) that forwards its arguments to one, for example the client inside
-the `db` container. The expected result is about 3,900 passed,
+the `db` container. The expected result is about 4,000 passed,
 0 failed. Run focused tests while iterating, then the full suite before commit.
 
 ## Deploy
