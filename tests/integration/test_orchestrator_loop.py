@@ -355,6 +355,137 @@ async def test_kb_backed_answer_scores_above_floor_and_persists_the_real_score()
         assert luciel_row.grounding_score >= GROUNDING_FLOOR
 
 
+T6_CHUNK = "Our return window is 30 days from the date of delivery."
+T6_QUESTION = "How many days do I have to return an item?"
+T6_FACT = "You have 30 days from the date of delivery to return an item."
+
+
+async def _t6_retriever(_q: str) -> list[str]:
+    return [T6_CHUNK]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize(
+    ("body", "served"),
+    [(T6_FACT, True), ("We offer a lifetime warranty on every order.", False)],
+    ids=["grounded-fact", "fabricated-claim"],
+)
+async def test_first_email_turn_with_the_exact_disclosure_and_signoff_is_served(body, served):
+    """SeedTest deploy gate 2026-11-13 (run 43485158726, T6 row11 channel parity): the
+    widget served this answer and email handed it off at 0.40. The greeting line, the
+    exact disclosure rule 1 dictates and the closed sign-off are platform framing; the
+    fact is scored alone, so it is served, and a fabricated claim in the same framing
+    still hands off."""
+    from app.runtime.input_safety import compose_ai_disclosure
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    disclosure = compose_ai_disclosure(assistant_name="Luciel", business_name="Acme Store")
+    draft = f"Hi Jordan,\n\n{disclosure} {body}\n\nBest regards,\nLuciel\nAcme Store"
+    async with tenant_session(admin) as s:
+        sid = uuid.uuid4()
+        s.add(SessionModel(id=sid, admin_id=admin, instance_id=iid, channel="email", mode="ai"))
+        await s.flush()
+        primary = EchoModel(confidence=1.0, fixed_reply=draft)
+        orch = Orchestrator(
+            session=s,
+            router=LLMRouter(primary=primary, fallback=primary),
+            retriever=_t6_retriever,
+            admin_id=admin,
+            instance_id=iid,
+            enabled_channels={"widget", "email"},
+            business_name="Acme Store",
+            assistant_name="Luciel",
+            has_payment_method=False,
+        )
+        assert f'"{disclosure}"' in orch.system_prompt
+        result = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="email",
+            mode="ai",
+            inbound_text=T6_QUESTION,
+        )
+
+        if served:
+            assert result.escalation is None, result.escalation
+            assert result.grounding_score == 1.0
+            assert body in result.reply_text
+            # The model's own disclosure stands; the backstop adds no second one.
+            assert result.reply_text.count("AI assistant") == 1
+        else:
+            assert result.escalation is not None
+            assert result.escalation.signal is Signal.cannot_answer
+            assert result.grounding_score is not None
+            assert result.grounding_score < GROUNDING_FLOOR
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_widget_first_model_reply_after_the_persisted_greeting_is_served():
+    """The widget persists its deterministic greeting as the session's first luciel row
+    before the first turn runs (chat_widget, ``is_new``). The model's reply after it,
+    re-disclosing with rule 1's exact sentence, is served exactly as email serves it,
+    and the removal has no turn logic: a later turn scores the same."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.runtime.input_safety import _compose_greeting, compose_ai_disclosure
+    from app.runtime.orchestrator import persist_turn
+
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    disclosure = compose_ai_disclosure(assistant_name="Luciel", business_name="Acme Store")
+    draft = f"{disclosure} {T6_FACT}"
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid)
+        arrival = datetime.now(UTC)
+        # Exactly as chat_widget writes it for a new session.
+        await persist_turn(
+            s,
+            admin_id=admin,
+            instance_id=iid,
+            session_id=sid,
+            role="luciel",
+            text=_compose_greeting(business_name="Acme Store", assistant_name="Luciel"),
+            at=arrival - timedelta(milliseconds=1),
+            deterministic=True,
+        )
+        primary = EchoModel(confidence=1.0, fixed_reply=draft)
+        orch = Orchestrator(
+            session=s,
+            router=LLMRouter(primary=primary, fallback=primary),
+            retriever=_t6_retriever,
+            admin_id=admin,
+            instance_id=iid,
+            enabled_channels={"widget"},
+            business_name="Acme Store",
+            assistant_name="Luciel",
+            has_payment_method=False,
+        )
+        first = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text=T6_QUESTION,
+            received_at=arrival,
+        )
+
+        assert first.escalation is None, first.escalation
+        assert first.grounding_score == 1.0
+        assert "30 days" in first.reply_text
+        # The greeting row already disclosed: the backstop prepends nothing.
+        assert not first.reply_text.startswith("Hi —")
+
+        second = await orch.run_turn(
+            session_id=sid,
+            resolved_lead_id=None,
+            channel="widget",
+            mode="ai",
+            inbound_text=T6_QUESTION,
+            received_at=datetime.now(UTC),
+        )
+        assert second.escalation is None, second.escalation
+        assert second.grounding_score == first.grounding_score
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_no_kb_confidently_fabricated_answer_escalates_instead_of_confident_specifics():
     """The exact walkthrough symptom: a no-KB question answered with confident,
