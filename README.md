@@ -4,10 +4,13 @@ Luciel, by VantageMind, is an AI front-desk employee for small businesses. It an
 business's customers on its website and on the business's own email, SMS, voice, WhatsApp,
 Messenger and Instagram accounts, using that business's own knowledge. When it cannot answer
 confidently it hands the conversation to the team instead of guessing, and the owner runs it
-from a dashboard. This repository is the backend: the FastAPI service behind the dashboard and
-the website widget, the channel webhooks, knowledge ingestion and retrieval, the grounded answer
-loop, billing, scheduled jobs, and the AWS CDK infrastructure for the whole product. The
-dashboard, marketing site and widget live in the companion Luciel-Frontend repository.
+from a dashboard.
+
+This repository is the backend: the FastAPI service behind the dashboard and the website widget,
+the channel webhooks, knowledge ingestion and retrieval, the grounded answer loop, billing,
+scheduled jobs, and the AWS CDK infrastructure for the whole product. The dashboard, marketing
+site and widget live in the companion
+[Luciel-Frontend](https://github.com/aryanonline/Luciel-Frontend) repository.
 
 ## Highlights
 
@@ -16,32 +19,35 @@ dashboard, marketing site and widget live in the companion Luciel-Frontend repos
   role is neither superuser nor `BYPASSRLS`, and the isolation suite (`tests/isolation/`), a
   separate CI step, checks that every tenant table has forced RLS and a tenant policy, and that
   one tenant cannot see or change another tenant's rows.
-- **Grounding gate.** Each answer stores a grounding score: the share of its content words that
-  the retrieved knowledge supports (`app/runtime/grounding.py`). Unless a tool result backs it, a
-  draft below 0.50 grounding or 0.6 self-reported confidence becomes an honest hand-off to the
-  team (`app/runtime/escalation.py`). Tests pin the rule as an OR, never an AND.
+- **Grounding gate.** Each answer stores a grounding score: the share of its content words found
+  in the retrieved knowledge (`app/runtime/grounding.py`). Unless a tool result backs it, a draft
+  below 0.50 grounding or 0.6 self-reported confidence, either one alone, becomes a hand-off to
+  the team (`app/runtime/escalation.py`, pinned by `tests/unit/test_grounding_floor.py`).
 - **Two planes from one image.** One container image runs as two ECS services: the control plane
   (owner API, cookie sessions, credentialed CORS) and the data plane (widget, webhooks and
   `/healthz`; no cookies, a narrower IAM role). ALB path rules split them, and tests on both
-  sides pin the same prefix list (`app/main.py`, `infra/lib/compute-stack.ts`).
-- **Honest delivery.** In live mode an unconfigured sender returns no message ID, so nothing can
-  report a send that did not happen, and `/healthz` names every degraded binding
-  (`tests/unit/test_delivery_honesty.py`). Provider webhooks are verified before any runtime work
-  (Twilio by signature or a per-connection capability token); Stripe events are also replay-gated.
-- **Knowledge sync as a job.** A manual sync answers within 20 seconds or returns 202 and keeps
-  running. Liveness is a PostgreSQL advisory lock on the connection, not a timestamp, so two syncs
-  of one source never overlap and a killed job reads as interrupted (`app/knowledge/sync_job.py`).
-- **Append-only audit log.** A post-migration superuser step gives the audit tables to a role the
-  app cannot assume and adds row and `TRUNCATE` guards (`scripts/lock_audit_log.sql`). CI applies
-  it, and every migration task and a post-deploy probe verify it.
-- **Governed CVE gate.** Both platform images of the multi-arch build are gated on their ECR
-  scans (`scripts/check_image_scan.py`): a CRITICAL or HIGH finding fails unless
-  `.security/cve-allowlist.json` waives it with a reason and an expiry date, and an expired waiver
-  or an incomplete scan fails too.
-- **Deploys gated on live behaviour.** After each dev deploy, a smoke probe, an in-VPC database
-  probe and, in live mode, a strict harness that drives a throwaway tenant through the real API
-  (`scripts/seed_and_livetest.py`) must pass, or the services roll back (a production release
-  runs the harness on preprod before deploying).
+  sides pin the same prefix list (`tests/unit/test_plane_routing.py`,
+  `infra/test/plane-routing.test.ts`).
+- **Sends fail closed.** In live mode an unconfigured sender returns no message ID, so nothing can
+  report a send that did not happen, and `/healthz` lists every integration still running on a
+  stand-in (`tests/unit/test_delivery_honesty.py`). Provider webhooks are verified before any
+  runtime work (`app/channels/signatures.py`: Twilio by request signature or a secret token in the
+  tenant's webhook URL), and a replayed Stripe event is ignored (`app/billing/webhooks.py`).
+- **Knowledge sync as a job.** A manual sync that is not done within 20 seconds returns 202 and
+  keeps running. Liveness is a PostgreSQL advisory lock keyed on the source, not a timestamp, so
+  two syncs of one source never overlap and a killed job reads as interrupted
+  (`app/knowledge/sync_job.py`).
+- **Append-only audit log.** A post-migration superuser step moves the audit tables' ownership to
+  a role the app cannot assume and adds row and `TRUNCATE` guards (`scripts/lock_audit_log.sql`).
+  CI applies it, and every migration task and a post-deploy probe verify it.
+- **Image CVE gate with expiring waivers.** Both platform images of the multi-arch build are
+  gated on their ECR scans (`scripts/check_image_scan.py`): a CRITICAL or HIGH finding fails
+  unless `.security/cve-allowlist.json` waives it with a reason and an expiry date, and an
+  expired waiver or an incomplete scan fails too.
+- **Deploys gated on live behavior.** After each dev deploy, a smoke probe, an in-VPC database
+  probe and, in live mode, SeedTest (`scripts/seed_and_livetest.py`), a strict harness that
+  drives a throwaway tenant through the real API, must pass, or the services roll back (a
+  production release runs SeedTest on preprod before deploying).
 
 ## Architecture
 
@@ -57,7 +63,7 @@ flowchart LR
         subgraph backend ["Backend: one image, three task roles"]
             cp["Control plane<br/>owner API"]
             dp["Data plane<br/>widget API, webhooks, /healthz"]
-            sweeps["Sweep tasks<br/>EventBridge Scheduler, 16 schedules"]
+            sweeps["Scheduled jobs (sweeps)<br/>EventBridge Scheduler, 16 schedules"]
         end
         subgraph stores ["Data"]
             rds[("RDS PostgreSQL<br/>pgvector, row-level security")]
@@ -80,12 +86,10 @@ flowchart LR
 
 Each environment is one VPC in `ca-central-1`: the CDK app pins every stack to that region and
 the data buckets deny requests from any other region; only the CloudFront certificate lives in
-`us-east-1`. One ALB serves every app and API hostname (the widget's embed hostnames are served
-by CloudFront): app hostnames go to the frontend's Next.js service, owner-API paths on the API
-hostnames go to the control plane, and everything else falls through to the data plane. Backend
-tasks run on Graviton (arm64) in private subnets, with RDS and Redis in isolated subnets, and
-scheduled work runs as one-off ECS tasks from the same image. No secrets are committed: tenant
-credentials live in Secrets Manager under a `vm/` prefix and the database stores only pointers.
+`us-east-1`. Backend tasks run on Graviton (arm64) in private subnets, with RDS and Redis in
+isolated subnets, and scheduled work runs as one-off ECS tasks from the same image. No secrets
+are committed: tenant credentials live in Secrets Manager under a `vm/` prefix and the database
+stores only pointers.
 
 A customer message goes through four steps:
 
@@ -104,7 +108,7 @@ A customer message goes through four steps:
 | --- | --- |
 | API | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
 | Data | PostgreSQL with pgvector (RDS PostgreSQL 16 in AWS, PostgreSQL 17 locally and in CI), SQLAlchemy 2 async on asyncpg, Alembic (77 migrations), Redis |
-| AI | Anthropic Claude as the primary model, OpenAI as fallback, OpenAI embeddings; default model IDs are pinned in `app/config.py` (a deployed environment can override them through the platform secret), and a daily sweep checks them against the providers and swaps a retired chat model for its successor |
+| AI | Anthropic Claude (primary) with OpenAI fallback; OpenAI embeddings; default model IDs pinned in `app/config.py`, with a daily check that swaps a retired chat model for its successor |
 | Channels | Website widget; the business's own Outlook mailbox (Microsoft Graph) and Twilio account (SMS, voice); WhatsApp and Messenger through one Meta connection; Instagram |
 | Knowledge and tools | File upload (PDF, DOCX, CSV, text), Google Drive, Notion, website crawl, HubSpot, Salesforce; Google Calendar and Calendly booking |
 | Billing | Stripe Billing Meters, pay-as-you-go |
@@ -117,7 +121,7 @@ A customer message goes through four steps:
 | --- | --- |
 | `app/main.py`, `app/config.py` | App factory (plane-aware CORS, trace IDs, `/healthz`, routers); settings and default model pins |
 | `app/api/` | Versioned routes (`v1/admin`, auth, widget, billing, webhooks), auth dependencies, paging, error contract |
-| `app/runtime/` | The conversation loop: sessions, input safety, retrieval, grounding, escalation and hand-off, LLM router and providers, voice |
+| `app/runtime/` | The conversation loop (`orchestrator.py`): sessions, input safety, retrieval, grounding, escalation and hand-off, LLM router and providers, voice |
 | `app/knowledge/` | File parsing, provider sync and sync jobs, chunking, embeddings, knowledge graph |
 | `app/channels/`, `app/connections/` | Channel ingress, signature checks and outbound delivery; customer-owned provider connections (OAuth, verification, health, secrets) |
 | `app/tools/`, `app/billing/` | Tool catalog, authorization, broker and calendar backends; conversation metering, Stripe gateway and webhooks, dunning, notices |
@@ -158,7 +162,8 @@ uvicorn app.main:app --reload --port 8000
 external keys; `live` calls real providers and has to be chosen on purpose. With the default
 `LUCIEL_ENVIRONMENT=development` the OpenAPI docs are at `http://localhost:8000/docs`; deployed
 environments return 404 there. To run the Luciel-Frontend dashboard against this backend, set
-`LUCIEL_COOKIE_SECURE=false` here and point the frontend's HTTP adapter at `http://localhost:8000`.
+`LUCIEL_COOKIE_SECURE=false` here and start the frontend with `NEXT_PUBLIC_API_ADAPTER=http` and
+`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000`.
 
 ## Tests and quality checks
 
@@ -168,10 +173,9 @@ applies the audit lock; the isolation suite and most integration and contract te
 before each test, that the app role is neither superuser nor `BYPASSRLS`.
 
 ```bash
-export LUCIEL_SUPERUSER_TCP=1 LUCIEL_PG_HOST=127.0.0.1 LUCIEL_PG_PORT=5432
-export LUCIEL_SUPERUSER=postgres PGPASSWORD=postgres LUCIEL_INTEGRATION_MODE=mock
+export LUCIEL_SUPERUSER_TCP=1 PGPASSWORD=postgres LUCIEL_INTEGRATION_MODE=mock
 python -m pytest tests/isolation                               # tenant-isolation suite
-python -m pytest tests/unit tests/integration tests/contract tests/migrations   # everything else
+python -m pytest tests/unit tests/integration tests/contract   # everything else
 ruff check app tests scripts && ruff format --check app tests scripts && mypy app
 ```
 
@@ -189,9 +193,7 @@ a failed daily run is posted to the month's dependency-review issue.
 | Tests | The tenant-isolation suite as its own step, then the unit, integration and contract suites |
 | Infrastructure | A separate `infra` job: `npm ci`, `tsc --noEmit` and the CDK Jest assertions |
 
-The CDK stacks have their own Jest assertions in `infra/test/` (28 files; run `npm ci && npm test`
-in `infra/`). CI's separate `infra` job type-checks the CDK app (`tsc --noEmit`) and runs them on
-Node.js 20.
+To run the CDK Jest assertions (`infra/test/`, 28 files) locally: `cd infra && npm ci && npm test`.
 
 ## Deployment
 
@@ -216,9 +218,9 @@ A dev deploy runs these steps in order:
    degraded binding, both planes reachable, HTTP redirected to HTTPS, `/docs` and `/openapi.json`
    returning 404.
 6. Database probe as the app role (`scripts/verify_probe.sql`): the audit log rejects updates;
-   both audit tables reject truncation and are not owned by the app role, which is also not a
-   member of the audit-owner role; the app role is not a superuser; and the connections table
-   has no raw-credential columns.
+   both audit tables reject truncation and are not owned by the app role, which is not a
+   superuser or a member of the audit-owner role; and the connections table has no
+   raw-credential columns.
 7. In live mode, the strict SeedTest gate (`scripts/run-seedtest-task.sh dev --strict`), where an
    unexpected skip counts as a failure.
 
@@ -235,21 +237,20 @@ and the SeedTest harness before production deploys; `preprod` is always destroye
 (`infra/lib/compute-stack.ts`). Every sweep except the platform-level model-ID check works one
 tenant per transaction under a per-sweep, per-tenant advisory lock, so overlapping runs do not
 duplicate work. A schedule whose task launch call fails is retried up to three times within an
-hour; a sweep that fails is reported by an EventBridge rule and an alarm, and because sweeps are
-idempotent, the next scheduled run picks up what it missed.
+hour, and because sweeps are idempotent, the next scheduled run picks up what a failed run missed.
 
 | Cadence | Sweeps |
 | --- | --- |
 | Hourly | Deferred-action retries, session close and summary, the owner's morning brief (due at 07:00 local), and a backstop for the data plane's five-minute mailbox poll |
-| Every 6 hours | Connection health checks; knowledge re-sync and website re-crawl |
+| Every 6 hours | Connection health checks; knowledge re-sync (websites are re-crawled once a day) |
 | Daily | Transcript archive to S3 at 90 days, one-year retention, delete-grace expiry, closed-account purge, dunning, Stripe usage reconciliation, unverified-account purge, billing and legal notice emails, LLM model-ID check |
 | Weekly | Audit-log retention |
 
 **Alarms.** CloudWatch alarms email the operator through SNS: ALB 5xx and p95 latency, repeated
 LLM fallback, both LLM providers failing, degraded knowledge retrieval, an escalation backlog,
 sweep errors and per-tenant sweep failures, and conversation caps hit at volume. EventBridge rules
-report sweep tasks that exit non-zero or fail to start, synthesis refuses an armed environment
-with no operator address, and AWS Budgets alerts at 80% and 100% of each environment's monthly
+report sweep tasks that exit non-zero or fail to start, CDK synthesis fails if no operator email
+is given, and AWS Budgets alerts at 80% and 100% of each environment's monthly
 ceiling and on a forecast breach.
 
 **Repository automation.**
@@ -277,9 +278,8 @@ payments are taken.
 - [`.env.example`](.env.example) covers the local settings; [`app/config.py`](app/config.py)
   defines every setting and its default.
 - [`CLAUDE.md`](CLAUDE.md) is the working guide to this codebase: product invariants, the
-  architecture map, the test recipe and deploy rules. Most modules carry their own `CLAUDE.md`
-  (every `app/` package except `app/employee/` and `app/observability/`, plus `infra/`). Tags
-  in these guides, comments and test names, such as "round 7 WP-3c", "D6", "Arc 14", "F039" or
+  architecture map, the test recipe and deploy rules; most modules carry their own. Tags in
+  these guides, comments and test names, such as "round 7 WP-3c", "D6", "Arc 14", "F039" or
   "§3.1.6a", refer to internal work packages, owner decisions, audit ids and specification
   sections kept outside the repository.
 
