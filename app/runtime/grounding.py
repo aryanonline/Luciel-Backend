@@ -3,12 +3,30 @@
 Grounding floor is 0.50, uniform across all accounts (Architecture §9 #18).
 Below floor with no resolving tool → cannot_answer escalation. Faithful-readback:
 Luciel may only state what a tool/result actually contains. Lands in Arc 14.
+
+Platform-owned framing (SeedTest deploy gate 2026-11-13, T6 channel parity): the
+first-message AI-identity disclosure the prompt requires, and an email's greeting and
+sign-off, carry words no knowledge chunk can support, so the same grounded fact scored
+0.67 on the widget and 0.40 on email. Rule: given the configured names, the scorer
+removes only text the PLATFORM authored (the exact disclosure sentences of
+``input_safety.platform_disclosure_sentences``) or a closed, claim-free shape (a
+greeting alone on the first line, a closed sign-off over lines that are only the
+configured names). It never interprets a disclosure the model worded itself.
+
+Accepted residual: a model that paraphrases the disclosure or signs with unconfigured
+words keeps that text in the score, which can hand off an honest answer. That is the
+conservative direction, never an escape; the strict SeedTest gate is the live check
+that the model follows the prompt's exact sentence.
 """
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+
+from app.runtime.input_safety import platform_disclosure_sentences
 
 GROUNDING_FLOOR = 0.50
 
@@ -199,6 +217,98 @@ _DELIVERY_AND_COURTESY_WORDS = frozenset(
 )
 
 
+# --- Platform-owned framing (2026-11-13 T6) ---------------------------------------
+# A greeting alone on the first line: a greeting word, at most two name words (letters,
+# with an inner apostrophe, dot or hyphen: "O'Brien", "Jean-François"), optional "," or
+# "!". The line holds nothing else, so it cannot carry a claim.
+_GREETING_LINE = re.compile(
+    r"(?:hi|hello|hey|dear|greetings|good\s+(?:morning|afternoon|evening))"
+    r"(?:\s+[^\W\d_]+(?:['’.-][^\W\d_]+)*){0,2}\s*[,!]?",
+    re.IGNORECASE,
+)
+# A closed sign-off phrase, alone on its line, with its punctuation.
+_SIGNOFF_LINE = re.compile(
+    r"(?:best|best regards|kind regards|warm regards|warmest regards|regards|"
+    r"best wishes|all the best|many thanks|thanks|thanks again|thank you|cheers|"
+    r"sincerely|yours sincerely|yours truly|warmly|respectfully|take care|talk soon)"
+    r"\s*[,.!]?",
+    re.IGNORECASE,
+)
+
+
+def _norm_line(line: str) -> str:
+    return " ".join(line.replace("’", "'").casefold().split())
+
+
+def _template_regex(sentence: str) -> str:
+    """The exact words of a platform sentence in order, as a regex. Between two words
+    any non-word separator matches ("Joe’s" for "Joe's", "—" for ","), but a sentence
+    or line break (. ! ? newline) only where the sentence itself has one, so "for
+    Acme. Store credit…" never reads as the name "Acme Store". Escaped literals and no
+    nested quantifier: linear time."""
+    parts = re.split(r"(\w+)", sentence)
+    words, gaps = parts[1::2], parts[2:-1:2]
+    regex = re.escape(words[0])
+    for gap, word in zip(gaps, words[1:], strict=True):
+        regex += (r"\W+" if re.search(r"[.!?]", gap) else r"[^\w.!?\n]+") + re.escape(word)
+    return rf"\b{regex}\b"
+
+
+@functools.lru_cache(maxsize=256)
+def _disclosure_pattern(assistant_name: str, business_names: tuple[str, ...]) -> re.Pattern[str]:
+    sentences = {
+        variant
+        for business in business_names
+        for sentence in platform_disclosure_sentences(
+            assistant_name=assistant_name, business_name=business
+        )
+        for variant in (sentence, sentence.replace("I'm", "I am"))
+    }
+    # Longest first, so the offer-bearing wording wins over its bare prefix.
+    alternatives = sorted(sentences, key=len, reverse=True)
+    return re.compile("|".join(_template_regex(s) for s in alternatives), re.IGNORECASE)
+
+
+def strip_platform_framing(
+    answer: str, *, assistant_name: str | None, business_names: Sequence[str | None] = ()
+) -> str:
+    """Remove the platform-owned framing from an answer before it is scored.
+
+    1. Every occurrence of a platform disclosure sentence for the configured names
+       (``input_safety.platform_disclosure_sentences``, plus "I am" for "I'm"), as a
+       closed template: the exact words in order, case-insensitive.
+    2. A greeting that is the whole first line (``_GREETING_LINE``).
+    3. A trailing sign-off block: a closed sign-off phrase line followed only by
+       signature lines that are exactly a configured name or a closed role line built
+       from them ("AI assistant for {business}", "{assistant}, AI assistant for
+       {business}", "The {business} team"), blank lines allowed. At least one
+       signature line is required — a bare "Sincerely" ending a list is a list item.
+       Any other line keeps the whole block in the score.
+
+    Everything else is untouched. No names → the answer unchanged (base behaviour)."""
+    if not assistant_name:
+        return answer
+    businesses = tuple(dict.fromkeys(b.strip() for b in business_names if b and b.strip()))
+    lines = answer.strip().splitlines()
+    if lines and _GREETING_LINE.fullmatch(lines[0].strip()):
+        lines = lines[1:]
+    signature = {_norm_line(n) for n in (assistant_name, *businesses)}
+    for business in businesses:
+        role = f"ai assistant for {business}"
+        signature |= {_norm_line(r) for r in (role, f"{assistant_name}, {role}")}
+        signature.add(_norm_line(f"the {business} team"))
+    end, signed = len(lines), False
+    while end and (not lines[end - 1].strip() or _norm_line(lines[end - 1]) in signature):
+        signed = signed or bool(lines[end - 1].strip())
+        end -= 1
+    if signed and end and _SIGNOFF_LINE.fullmatch(lines[end - 1].strip()):
+        lines = lines[: end - 1]
+    text = "\n".join(lines)
+    if businesses:
+        text = _disclosure_pattern(assistant_name, businesses).sub(" ", text)
+    return text
+
+
 @dataclass
 class GroundingResult:
     score: float
@@ -212,6 +322,8 @@ def score_grounding(
     tool_succeeded: bool,
     *,
     question: str | None = None,
+    assistant_name: str | None = None,
+    business_names: Sequence[str | None] = (),
 ) -> GroundingResult:
     """Estimate how well an answer is grounded in retrieved knowledge / tool results.
 
@@ -225,6 +337,11 @@ def score_grounding(
     (Harmony wave 2), delivery/courtesy words (round 6 R6-6), and — when ``question``
     is given — a word the customer used that no chunk supports, which the model is
     restating, not asserting ("opening hours" in "Our opening hours are 9am-2pm").
+
+    Given the configured ``assistant_name`` and ``business_names``, platform-owned
+    framing is removed from the answer first (``strip_platform_framing``; see the
+    module docstring for the rule and its accepted residual). Without names the
+    answer is scored exactly as before.
     """
     if tool_succeeded:
         return GroundingResult(1.0, True, "tool_result")
@@ -247,6 +364,9 @@ def score_grounding(
     # a real LLM wraps around a quoted fact must not dilute the score. The support
     # side (retrieved chunks) keeps every token so a stopword that happens to be
     # part of the substantive claim (rare, but harmless either way) still counts.
+    answer = strip_platform_framing(
+        answer, assistant_name=assistant_name, business_names=business_names
+    )
     answer_tokens = toks(answer, drop_stopwords=True)
     if not answer_tokens:
         return GroundingResult(0.0, False, "no_content_tokens")
