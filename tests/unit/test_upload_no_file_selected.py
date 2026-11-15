@@ -3,16 +3,16 @@
 A browser sends an ``<input type="file">`` left empty as a part with ``filename=""`` and no
 bytes. Up to fastapi 0.149 that part reached the handler as an empty UploadFile, and two of
 the four upload routes acted on it: POST /sources/upload created a source with no content
-under the form's name, and POST /sources/{id}/replace swapped a live source's chunks for
-nothing.
+under the form's name (201), and POST /sources/{id}/replace swapped a live source's chunks
+for nothing (200). The two CSV routes refused it with their own 422 message.
 From 0.150 FastAPI reads the part as missing, so every upload route answers the contract
-422 ``{"message": "file: Field required"}`` without reading a byte. A NAMED zero-byte file
+422 ``{"message": "file: Field required"}`` before its handler runs. A NAMED zero-byte file
 is still a file and still reaches the handler (an empty .txt is a legitimate document,
 app/knowledge/parsers.py): that line is what this pins.
 
 httpx cannot build the request (it leaves out an empty filename), so the multipart body is
 written by hand, the way a browser sends it. The session gate is stubbed: it runs before
-the body is read and is pinned on its own in test_closed_account_surface.py. FastAPI's
+the body is validated and is pinned on its own in test_closed_account_surface.py. FastAPI's
 multipart parsing and validation, the handlers and the error contract are the real ones,
 and nothing here reaches the database: the knowledge handlers are stopped at their parser.
 """

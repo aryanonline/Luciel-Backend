@@ -238,13 +238,18 @@ def create_app() -> FastAPI:
         docs_url="/docs" if is_local else None,
         redoc_url="/redoc" if is_local else None,
         openapi_url="/openapi.json" if is_local else None,
-        # fastapi >= 0.142 traces, meters and logs every request by itself once ANY global
-        # OpenTelemetry provider exists: an SDK that a dependency or an agent installs is
-        # enough, nothing here has to ask. Its spans keep url.path and url.query, redacting
-        # only cloud-storage signatures, so the webhook ?cap= token (F072), the export token
-        # in /api/v1/exports/{token} and OAuth code/state would ride along, and its exception
+        # fastapi >= 0.142 traces, meters and logs every request by itself once any global
+        # OpenTelemetry provider is set: by code, an OTEL_PYTHON_*_PROVIDER entry point or an
+        # auto-instrumentation agent. Its spans keep url.path and url.query, redacting only
+        # cloud-storage signatures, so the webhook ?cap= token (F072), the export token in
+        # /api/v1/exports/{token} and OAuth code/state would ride along, and its exception
         # logs carry messages and stack traces. Off until telemetry is a decision that brings
-        # its own redaction (tests/unit/test_fastapi_telemetry_off.py).
+        # its own redaction (an agent's contrib instrumentation records URLs too, and this
+        # switch does not reach it). Off, FastAPI never reads a provider, so a provider
+        # variable naming a package that is not installed cannot fail every request. The
+        # switch comes too late for OTEL_PROPAGATORS: importing fastapi already loads the
+        # propagators it names and raises on one that is not installed. So no task sets an
+        # OTEL_* variable. tests/unit/test_fastapi_telemetry_off.py pins each of these.
         telemetry={"tracing": False, "metrics": False, "logs": False},
     )
 
