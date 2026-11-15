@@ -229,9 +229,10 @@ the Python scripts.
     paused: it now sends `anthropic-version: 2026-10-21` with `Authorization: Bearer`, and that
     request has not run live yet. A failure would not fail a turn. Every call would fall over to
     OpenAI, and only `LlmFallbackAlarm` (5 or more fallback turns in 15 minutes) would notice. The
-    services' logs must have `llm_usage` lines with `provider=anthropic` and the primary model
-    (`claude-sonnet-4-6`, unless the model-currency job has moved it), and the `LLMFallbackUsed`
-    metric (namespace `Luciel`) must stay at zero.
+    services' logs must have `llm_usage` lines with `provider=anthropic` and the primary model,
+    the one `LLM_ANTHROPIC_PRIMARY_MODEL` names in `luciel/dev/platform` (`claude-sonnet-5` when
+    dev was paused; the code default, `claude-sonnet-4-6`, applies only if the secret names none).
+    The `LLMFallbackUsed` metric (namespace `Luciel`) must stay at zero.
 
     ```bash
     for svc in data-plane control-plane; do
