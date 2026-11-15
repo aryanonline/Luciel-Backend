@@ -20,6 +20,7 @@ import itertools
 import re
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -1201,33 +1202,61 @@ def test_framing_free_answers_score_exactly_as_the_base_scorer() -> None:
         assert score_grounding(answer, [chunk], False) == _base(answer, chunk, None)
 
 
-def test_framing_strip_is_linear_on_adversarial_50kb_inputs() -> None:
-    long_name = ("Luciel", (" ".join(["a"] * 39), "Acme Store"))
-    cases: list[tuple[str, Names]] = [
-        ("I'm Luciel, an AI assistant for " + "Acme " * 10000, ACME),
-        ("I'm Luciel, an AI assistant for " + "a " * 25000, long_name),
-        ("I'm Luciel" + ", " * 25000 + "x", ACME),
-        ("I" + " " * 50000 + "m", ACME),
-        ("I'm " * 12500, ACME),
-        ("Hi — I'm Luciel. " * 3000, ACME),
-        ("Hi" + " " * 50000 + "x.\nThanks" + " " * 50000 + "y", ACME),
-        ("Hi " + "Aa" * 25000, ACME),
-        ("Hi " + "a-" * 25000 + "!", ACME),
-        ("Good morning" + " A" * 25000, ACME),
-        (T6_FACT + "\n\nBest,\n" + "Luciel\n" * 7000, ACME),
-        (T6_FACT + "\n" * 50000 + "Best,\nLuciel", ACME),
-        ("Best,\n" * 8000 + "Luciel", ACME),
-        ("x " + "\n\n Acme Store \n" * 3500, ACME),
-        ("—" * 50000, ACME),
-        # Almost-matches of every template, back to back.
-        ("I'm Luciel, an AI assistant for this " * 1400, UNNAMED),
-        ("Hi — I'm Luciel. I'm an AI assistant for Acme Store, and I can help answer " * 700, ACME),
-    ]
-    for text, names in cases:
+def _fastest_framed(text: str, names: Names, runs: int = 5) -> float:
+    """The fastest of a few timed runs. A scheduler or garbage-collection pause on a busy
+    runner can slow any one run, but not every one of them."""
+    timings = []
+    for _ in range(runs):
         started = time.perf_counter()
         _framed(text, names)
-        elapsed = time.perf_counter() - started
-        assert elapsed < 0.2, (text[:40], elapsed)
+        timings.append(time.perf_counter() - started)
+    return min(timings)
+
+
+def test_framing_strip_is_linear_on_adversarial_50kb_inputs() -> None:
+    """Each adversarial shape is timed at its original size (50 to 100 KB) and again at
+    four times its repeat count. Linear work takes about 4x as long at 4x the size;
+    catastrophic backtracking takes 16x or more (quadratic) or never finishes. Comparing
+    two sizes on the same runner keeps the check independent of how fast or busy the
+    runner is (a single run against a fixed 0.2 s once failed CI at 0.295 s, on a case
+    that takes about 7 ms unloaded). The ceiling still fails anything slow at the base
+    size."""
+    long_name = ("Luciel", (" ".join(["a"] * 39), "Acme Store"))
+    # (input at repeat count k, k, names): build(k) is the original input.
+    cases: list[tuple[Callable[[int], str], int, Names]] = [
+        (lambda k: "I'm Luciel, an AI assistant for " + "Acme " * k, 10000, ACME),
+        (lambda k: "I'm Luciel, an AI assistant for " + "a " * k, 25000, long_name),
+        (lambda k: "I'm Luciel" + ", " * k + "x", 25000, ACME),
+        (lambda k: "I" + " " * k + "m", 50000, ACME),
+        (lambda k: "I'm " * k, 12500, ACME),
+        (lambda k: "Hi — I'm Luciel. " * k, 3000, ACME),
+        (lambda k: "Hi" + " " * k + "x.\nThanks" + " " * k + "y", 50000, ACME),
+        (lambda k: "Hi " + "Aa" * k, 25000, ACME),
+        (lambda k: "Hi " + "a-" * k + "!", 25000, ACME),
+        (lambda k: "Good morning" + " A" * k, 25000, ACME),
+        (lambda k: T6_FACT + "\n\nBest,\n" + "Luciel\n" * k, 7000, ACME),
+        (lambda k: T6_FACT + "\n" * k + "Best,\nLuciel", 50000, ACME),
+        (lambda k: "Best,\n" * k + "Luciel", 8000, ACME),
+        (lambda k: "x " + "\n\n Acme Store \n" * k, 3500, ACME),
+        (lambda k: "—" * k, 50000, ACME),
+        # Almost-matches of every template, back to back.
+        (lambda k: "I'm Luciel, an AI assistant for this " * k, 1400, UNNAMED),
+        (
+            lambda k: (
+                "Hi — I'm Luciel. I'm an AI assistant for Acme Store, and I can help answer " * k
+            ),
+            700,
+            ACME,
+        ),
+    ]
+    for build, k, names in cases:
+        text = build(k)
+        base = _fastest_framed(text, names)
+        scaled = _fastest_framed(build(4 * k), names)
+        assert base < 1.0, (text[:40], base)
+        # 10x leaves room for noise over linear's 4x and still fails quadratic's 16x; the
+        # 5 ms covers timer and allocator noise on the smallest cases (about 1 ms each).
+        assert scaled < 10 * base + 0.005, (text[:40], base, scaled)
 
 
 def test_rule_one_quotes_the_composed_disclosure_and_the_scorer_removes_it() -> None:
