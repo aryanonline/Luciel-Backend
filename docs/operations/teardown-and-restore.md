@@ -225,6 +225,17 @@ the Python scripts.
     its error. Remove the card again afterwards (**Remove payment method**), so the walk account
     is back to no card on file.
 
+    Check the Stripe webhook endpoint as well. It is configured in the Stripe Dashboard (test
+    mode), not in this repository or in AWS, so the pause left it in place, delivering to a host
+    that did not answer. It must be enabled and subscribe to exactly the event types in
+    `HANDLED_EVENT_TYPES` in [`app/billing/webhooks.py`](../../app/billing/webhooks.py):
+    `invoice.paid`, `invoice.payment_failed`, `payment_method.attached` and
+    `payment_method.detached`. Stripe has no `customer.subscription.renewed`; a renewal arrives
+    as `invoice.paid`. The endpoint's API version, not `STRIPE_API_VERSION`, sets the shape of
+    every payload it sends, and this repository does not record it. The handler reads an
+    invoice's subscription in either shape: at the top level before 2025-03-31.basil, under
+    `parent.subscription_details` from basil on.
+
     Then confirm that the primary model answered. The Anthropic SDK moved to 2.x while dev was
     paused: it now sends `anthropic-version: 2026-10-21` with `Authorization: Bearer`, and that
     request has not run live yet. A failure would not fail a turn. Every call would fall over to

@@ -52,6 +52,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -76,6 +77,23 @@ _log = logging.getLogger(__name__)
 # The ``billing_reason`` of the invoice Stripe issues when a subscription "advanced into
 # a new period" (Invoice object reference). The only paid invoice that ends a period.
 _RENEWAL_BILLING_REASON = "subscription_cycle"
+
+
+class _EventHandler(Protocol):
+    """What ``handle_event`` calls for one event type; returns the action taken.
+
+    Every handler takes the same keywords, so the dispatch is one table
+    (``_HANDLERS``); a handler ignores the ones it does not need."""
+
+    async def __call__(
+        self,
+        session: AsyncSession,
+        *,
+        admin_id: uuid.UUID,
+        account: BillingAccount,
+        event: StripeEvent,
+        now: datetime,
+    ) -> str: ...
 
 
 async def _claim_event(session: AsyncSession, *, admin_id: uuid.UUID, event_id: str) -> bool:
@@ -113,18 +131,11 @@ async def handle_event(
     if not await _claim_event(session, admin_id=admin_id, event_id=event.event_id):
         return "duplicate"
 
-    if event.type == "invoice.paid":
-        action = await _on_invoice_paid(session, admin_id=admin_id, account=account, event=event)
-    elif event.type == "invoice.payment_failed":
-        action = await _on_payment_failed(
-            session, admin_id=admin_id, account=account, event=event, now=now
-        )
-    elif event.type == "payment_method.attached":
-        action = await _on_pm_attached(session, admin_id=admin_id, account=account, event=event)
-    elif event.type == "payment_method.detached":
-        action = await _on_pm_detached(session, admin_id=admin_id, account=account)
-    else:
+    handler = _HANDLERS.get(event.type)
+    if handler is None:
         action = "ignored"
+    else:
+        action = await handler(session, admin_id=admin_id, account=account, event=event, now=now)
 
     account.last_stripe_event_id = event.event_id
     await session.flush()
@@ -137,6 +148,7 @@ async def _on_invoice_paid(
     admin_id: uuid.UUID,
     account: BillingAccount,
     event: StripeEvent,
+    now: datetime,
 ) -> str:
     """invoice.paid → the NEXT period begins, dunning clears, dormant connections restore.
 
@@ -480,6 +492,7 @@ async def _on_pm_attached(
     admin_id: uuid.UUID,
     account: BillingAccount,
     event: StripeEvent,
+    now: datetime,
 ) -> str:
     """payment_method.attached → payg_enabled + store the DISPLAY tuple only.
 
@@ -649,7 +662,12 @@ async def _restore_dormant_connections(
 
 
 async def _on_pm_detached(
-    session: AsyncSession, *, admin_id: uuid.UUID, account: BillingAccount
+    session: AsyncSession,
+    *,
+    admin_id: uuid.UUID,
+    account: BillingAccount,
+    event: StripeEvent,
+    now: datetime,
 ) -> str:
     """payment_method.detached → free_cap + clear the display tuple (§3.4.1b).
 
@@ -696,3 +714,17 @@ async def _on_pm_detached(
     # round 7 WP-1 #3c). A Stripe-side detach is the one the owner may not have done.
     await notify.notify_payment_method_removed(session, admin_id=admin_id, reason="stripe_detached")
     return "payment_method.detached"
+
+
+# The whole dispatch: handle_event acts on these event types and acknowledges every other
+# one as "ignored". A handler keyed on a type Stripe never sends can never run (Axis8-F02's
+# customer.subscription.renewed), so tests/unit/test_stripe_event_types.py checks these
+# keys against stripe-python's list of webhook event types. The Stripe Dashboard endpoint
+# subscribes to exactly these (docs/operations/teardown-and-restore.md).
+_HANDLERS: dict[str, _EventHandler] = {
+    "invoice.paid": _on_invoice_paid,
+    "invoice.payment_failed": _on_payment_failed,
+    "payment_method.attached": _on_pm_attached,
+    "payment_method.detached": _on_pm_detached,
+}
+HANDLED_EVENT_TYPES = frozenset(_HANDLERS)
