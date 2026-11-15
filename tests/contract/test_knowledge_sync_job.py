@@ -102,6 +102,46 @@ class _FakeCrawl:
         )
 
 
+#: Bound on every wait of a ``_Gate``: far longer than any test holds one, so a gate that
+#: is never reached or never released fails the test instead of hanging the run.
+_GATE_SECONDS = 10
+
+
+class _Gate:
+    """Holds the fake snapshot until the test releases it.
+
+    A fixed ``plan.delay`` only bets that the request under test lands while the job is
+    still in its snapshot. On a slow runner the job can commit first: CI once kept the
+    synced page of a source whose disconnect answered after the job's commit. Installed
+    by ``_hold_snapshots``, the gate records that the job is inside its snapshot (its
+    transaction open, its lock held) and lets that snapshot, and every later one,
+    return only after ``release``."""
+
+    def __init__(self) -> None:
+        self._entered = asyncio.Event()
+        self._released = asyncio.Event()
+
+    async def hold(self) -> None:
+        self._entered.set()
+        await asyncio.wait_for(self._released.wait(), timeout=_GATE_SECONDS)
+
+    async def reached(self) -> None:
+        """Return once the job is inside its snapshot."""
+        await asyncio.wait_for(self._entered.wait(), timeout=_GATE_SECONDS)
+
+    async def release(self) -> None:
+        """Let the held snapshot return. The job must have reached it first, so a gate the
+        job never met fails here instead of holding nothing."""
+        await self.reached()
+        self._released.set()
+
+
+def _hold_snapshots(plan: _Plan) -> _Gate:
+    gate = _Gate()
+    plan.during_snapshot = gate.hold
+    return gate
+
+
 @pytest_asyncio.fixture
 async def api(client, monkeypatch) -> AsyncIterator[tuple[object, _Plan]]:
     """The client with the crawl provider faked; every job is drained before the
@@ -901,13 +941,15 @@ async def test_disconnect_mid_job_keeps_nothing_and_a_later_start_is_admitted(ap
     client, plan = api
     admin, cid = await _ready(client)
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
 
     assert (await _sync(client, cid)).status_code == 202
+    await gate.reached()  # the job is in its snapshot, its transaction and its lock held
     # It answers while the job is still running: the job holds no row lock on the connection.
     gone = await asyncio.wait_for(_disconnect(client, cid), timeout=5)
     assert gone.status_code == 200, gone.text
     assert await _job(client, cid) is None
+    await gate.release()  # only now may the snapshot return: the disconnect landed mid-job
     await _finish(cid)
 
     assert await _sources_of(admin, cid) == []
@@ -926,7 +968,6 @@ async def test_disconnect_mid_job_keeps_nothing_and_a_later_start_is_admitted(ap
     )
     assert again.status_code == 200 and again.json()["connectionId"] == cid
     _inline_wait(monkeypatch, 20.0)
-    plan.delay = 0.0
     assert (await _sync(client, cid)).status_code == 200
     assert len(await _sources_of(admin, cid)) == 1
 
