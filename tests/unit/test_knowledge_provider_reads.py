@@ -9,6 +9,7 @@ and the crawl follows same-origin links within bounds while honouring robots.txt
 
 from __future__ import annotations
 
+import io
 import uuid
 
 import httpx
@@ -154,6 +155,54 @@ async def test_drive_reports_a_file_it_could_not_read_instead_of_dropping_it():
     ).snapshot(uuid.uuid4())
     assert snap.items == []
     assert snap.failed_ids == ["doc1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("db_engine_reset")
+async def test_drive_reports_a_file_the_parser_cannot_read_and_still_reads_the_rest():
+    """A file the parsers refuse used to raise ParseError out of snapshot(), so one
+    unreadable PDF failed the whole connection's sync, on every pass: each pass downloads
+    and parses every file in scope. It is reported unreadable instead (kept and flagged,
+    F117), and the files beside it still sync."""
+    from pypdf import PdfWriter
+
+    from tests.unit.test_knowledge_parsers import _make_pdf_bytes
+
+    no_text_layer = io.BytesIO()  # a scanned page, to a text extractor
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(no_text_layer)
+
+    t = RoutedTransport()
+    pdf, txt = "application/pdf", "text/plain"
+    t.on(
+        lambda u, p: u.endswith("/v3/files"),
+        {
+            "files": [
+                {"id": "brochure", "name": "brochure.pdf", "mimeType": pdf, "modifiedTime": "t1"},
+                {"id": "broken", "name": "broken.pdf", "mimeType": pdf, "modifiedTime": "t1"},
+                {"id": "scan", "name": "scan.pdf", "mimeType": pdf, "modifiedTime": "t1"},
+                {"id": "hours", "name": "hours.txt", "mimeType": txt, "modifiedTime": "t1"},
+            ]
+        },
+    )
+    t.on(
+        lambda u, p: u.endswith("/files/brochure"),
+        _make_pdf_bytes("Decks from 40 dollars per square foot"),
+    )
+    t.on(lambda u, p: u.endswith("/files/broken"), b"not a pdf at all")
+    t.on(lambda u, p: u.endswith("/files/scan"), no_text_layer.getvalue())
+    t.on(lambda u, p: u.endswith("/files/hours"), b"Open 9-5 weekdays")
+
+    snap = await GoogleDriveProvider(
+        admin_id=ADMIN, instance_id=INSTANCE, store=Store(), transport=t
+    ).snapshot(uuid.uuid4())
+
+    assert {i.external_id: i.text for i in snap.items} == {
+        "brochure": "Decks from 40 dollars per square foot",
+        "hours": "Open 9-5 weekdays",
+    }
+    assert snap.failed_ids == ["broken", "scan"]  # unparseable_pdf, empty_document
 
 
 @pytest.mark.asyncio

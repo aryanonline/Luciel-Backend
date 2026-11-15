@@ -508,7 +508,11 @@ class GoogleDriveProvider:
             file_id, name = str(f["id"]), str(f.get("name", f["id"]))
             try:
                 text = await self._content_of(transport, headers, f)
-            except (ProviderUnavailable, ValueError):
+            except (ProviderUnavailable, ValueError, parsers.ParseError):
+                # Kept and flagged, never retired (F117). That includes a file the parsers
+                # cannot read (no text layer, an open password, a PDF pypdf refuses): its
+                # ParseError used to escape and fail the whole connection's sync, on every
+                # pass, because each pass downloads and parses every file in scope.
                 failed.append(file_id)
                 continue
             if text is None:
@@ -533,7 +537,8 @@ class GoogleDriveProvider:
         downloaded and run through the same parsers an upload uses. A test fake may
         put ``text`` on the listing entry directly; that is honoured so provider
         fakes stay small. ``None`` — nothing to ingest (a folder, a form, a drawing,
-        an unsupported binary, a file over the per-file cap)."""
+        an unsupported binary, a file over the per-file cap). A binary the parsers
+        cannot read raises ``parsers.ParseError``, which ``snapshot`` reports unreadable."""
         if isinstance(f.get("text"), str):
             return str(f["text"])
         if "mimeType" not in f:

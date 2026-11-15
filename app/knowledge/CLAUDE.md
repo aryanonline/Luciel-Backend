@@ -154,3 +154,10 @@ make that state explicit and test it.
   `tests/integration/test_migration_0077_connection_sync_job.py`,
   `tests/unit/test_llm_output_ceiling.py`, `tests/unit/test_graph_extract_llm.py`,
   `tests/unit/test_proxy_headers_launch.py` (the shutdown budget).
+
+## Unreadable files and pypdf 7 (2026-11-14)
+- Drive: a file the parsers refuse (`ParseError`: no text layer, an open password, a PDF pypdf
+  refuses) goes into `failed_ids` from `GoogleDriveProvider.snapshot`, so it is kept and flagged
+  (F117) while the other files sync. It used to escape and fail the whole connection's sync, on
+  every pass: each pass downloads and parses every in-scope file, and only the ingest is gated by
+  revision. Test: `tests/unit/test_knowledge_provider_reads.py`.
