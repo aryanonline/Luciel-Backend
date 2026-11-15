@@ -110,15 +110,17 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
 - `glob` 14 everywhere and `minimatch` 11 for test-exclude keep jest's toolchain free of
   minimatch below 11.0.1 (GHSA-g3hv-75wg-m249; the maintainer ships no 9.x/10.x fix,
   isaacs/minimatch#333). Override glob, never minimatch alone: glob 10 then matches no
-  wildcard pattern and raises no error, and glob 13's published entry point carries its
-  own minimatch 10 inside, which no override reaches.
+  wildcard pattern and raises no error, and glob's published entry point carries its own
+  copy of minimatch inside, which no override reaches. That copy is minimatch 10 in glob
+  13 and still unfixed in glob 14.0.0 to 14.0.2, so the floor is glob 14.0.3 (past glob's
+  own GHSA-3g3m-2fjr-6pw4 too, fixed in 14.0.2).
 - aws-cdk-lib bundles its own minimatch (`inBundle` in the lockfile). Overrides cannot
   reach a bundled package and GitHub's dependency graph counts it, so the alert stays open
   until an aws-cdk-lib release carries aws/aws-cdk#39595 (minimatch 11; merged to main
   2026-11-13, not in 2.277.0).
 - Drop the overrides once upstream ranges make them no-ops (jestjs/jest#16530 for glob 14;
   istanbuljs/test-exclude#79 plus a babel-plugin-istanbul release on it): without them,
-  `npm ls glob minimatch` must still show only glob 14+ and, outside aws-cdk-lib,
+  `npm ls glob minimatch` must still show only glob 14.0.3+ and, outside aws-cdk-lib,
   minimatch 11.0.1+.
 
 ## Change checklist
