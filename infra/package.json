@@ -19,5 +19,11 @@
   "dependencies": {
     "aws-cdk-lib": "^2.276.0",
     "constructs": "^10.8.1"
+  },
+  "overrides": {
+    "glob": "^14.0.6",
+    "test-exclude": {
+      "minimatch": "^11.0.1"
+    }
   }
 }

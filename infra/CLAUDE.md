@@ -106,6 +106,21 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   Security and Pipeline stacks, the database snapshot and an S3 archive of the data buckets were kept.
   What was kept and the restore order are in `docs/operations/teardown-and-restore.md`.
 
+## npm overrides (`package.json`)
+- `glob` 14 everywhere and `minimatch` 11 for test-exclude keep jest's toolchain free of
+  minimatch below 11.0.1 (GHSA-g3hv-75wg-m249; the maintainer ships no 9.x/10.x fix,
+  isaacs/minimatch#333). Override glob, never minimatch alone: glob 10 then matches no
+  wildcard pattern and raises no error, and glob 13's published entry point carries its
+  own minimatch 10 inside, which no override reaches.
+- aws-cdk-lib bundles its own minimatch (`inBundle` in the lockfile). Overrides cannot
+  reach a bundled package and GitHub's dependency graph counts it, so the alert stays open
+  until an aws-cdk-lib release carries aws/aws-cdk#39595 (minimatch 11; merged to main
+  2026-11-13, not in 2.277.0).
+- Drop the overrides once upstream ranges make them no-ops (jestjs/jest#16530 for glob 14;
+  istanbuljs/test-exclude#79 plus a babel-plugin-istanbul release on it): without them,
+  `npm ls glob minimatch` must still show only glob 14+ and, outside aws-cdk-lib,
+  minimatch 11.0.1+.
+
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
 - Add or update a test that reproduces the real condition being changed.
