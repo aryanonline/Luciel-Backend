@@ -414,7 +414,12 @@ async def test_a_text_from_a_number_an_anonymous_visitor_typed_gets_its_own_lead
     assert idents[("mention", "+16045550100")][0] == visitor.id  # kept as a mention
     (event,) = await _audit(admin, "lead_identifier_rehomed")
     assert event["kind"] == "phone" and event["reason"] == "transport_proof"
-    assert "604" not in str(event) and str(visitor.id) not in str(event)
+    # The number never rides the trail. Match its written forms rather than a bare "604":
+    # the payload carries a hex hash of the lead id, which contains "604" by chance in
+    # about 1.5% of runs (the lead id is random).
+    event_text = str(event)
+    assert not any(form in event_text for form in ("+16045550100", "6045550100", "604-555-0100"))
+    assert str(visitor.id) not in event_text
 
     # The visitor's own bound session carries on against THEIR record.
     again = await _capture(admin, iid, widget, "my email is v@example.com")
