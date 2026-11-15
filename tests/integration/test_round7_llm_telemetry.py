@@ -160,8 +160,11 @@ def _assert_never_logged(records: list[logging.LogRecord], *texts: str) -> None:
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_a_turn_the_fallback_answered_logs_why_the_primary_failed(monkeypatch, caplog):
     """LLMFallbackUsed counts the turn for LlmFallbackAlarm; the router's llm_failover
-    line, written in the same turn, says why. Never the customer's words."""
+    line, written in the same turn, says why, and names the tenant by hash: the router is
+    bound to the tenant, as production's ``build_llm_router(admin_id=...)`` binds it.
+    Never the customer's words."""
     seen = _record_metrics(monkeypatch)
+    monkeypatch.setattr(llm_cap_module, "_store", InMemoryLLMCapStore())
     admin, iid = uuid.uuid4(), uuid.uuid4()
     words = "are you open on saturday? this is Jane Roe"
     primary = _Refusing(name="anthropic", status=529, kind="OverloadedError", retryable=True)
@@ -169,7 +172,7 @@ async def test_a_turn_the_fallback_answered_logs_why_the_primary_failed(monkeypa
         sid = await _seed_session(s, admin, iid, channel="widget")
         orch = Orchestrator(
             session=s,
-            router=LLMRouter(primary=primary, fallback=EchoModel(name="openai")),
+            router=LLMRouter(primary=primary, fallback=EchoModel(name="openai"), admin_id=admin),
             retriever=_no_chunks,
             admin_id=admin,
             instance_id=iid,
@@ -187,14 +190,16 @@ async def test_a_turn_the_fallback_answered_logs_why_the_primary_failed(monkeypa
     assert result.used_fallback is True
     assert [name for name, _ in seen].count("LLMFallbackUsed") == 1
     (record,) = _cause_records(caplog)
+    tenant = admin_id_hash(admin)
     assert re.fullmatch(
-        r"llm_failover admin_id_hash=- leg=primary provider=anthropic model=- "
+        rf"llm_failover admin_id_hash={tenant} leg=primary provider=anthropic model=- "
         r"error=OverloadedError status=529 retryable=True latency_ms=\d+",
         record.getMessage(),
     )
     # The customer's words were in what the primary raised: the check is not vacuous.
     assert len(primary.raised) == 1 and words in primary.raised[0]
     _assert_never_logged([record], words, "saturday", "Jane Roe")
+    assert str(admin) not in record.getMessage()
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
