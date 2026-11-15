@@ -1532,7 +1532,7 @@ requires-dist = [
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "dnspython", specifier = ">=2.6,<3" },
     { name = "fakeredis", marker = "extra == 'dev'", specifier = ">=2.20" },
-    { name = "fastapi", specifier = ">=0.138,<0.163" },
+    { name = "fastapi", specifier = ">=0.150,<0.163" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2,<3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==2.4.1" },
