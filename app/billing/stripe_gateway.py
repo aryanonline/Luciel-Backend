@@ -113,8 +113,10 @@ from then on) without a line of this code changing. Pinned, a dependency bump ca
 change the API version Stripe applies to these requests (the SDK's own encoding still
 moves with it; tests/unit/test_stripe_wire.py checks that request by request). Moving to
 a new version is a reviewed edit of this line, made against the changelog of every
-version in between. Webhook payloads are NOT governed by this: their shape follows the
-API version set on the webhook endpoint in the Stripe Dashboard.
+version in between; the same test file fails once the installed SDK targets a different
+named release (endive, ...) than this pin, so a new release cannot arrive unread.
+Webhook payloads are NOT governed by this: their shape follows the API version set on
+the webhook endpoint in the Stripe Dashboard.
 """
 
 

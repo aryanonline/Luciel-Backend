@@ -548,6 +548,23 @@ def test_a_duplicate_meter_event_is_a_dedup_but_a_server_failure_raises(wire) ->
         assert recorder.requests[0]["stripe_version"] == STRIPE_API_VERSION
 
 
+def test_the_installed_stripe_python_targets_the_pinned_api_release() -> None:
+    """The pin fixes the version Stripe applies; the installed SDK's params, models and
+    docs still describe the version IT targets. Stripe breaks compatibility only when a
+    new named release starts (dahlia, endive, ...) and later versions within a release
+    only add, so an SDK update inside the pinned release passes. One that targets the
+    next release fails here until someone has read the changelog and moved the pin on
+    purpose: the kind of move (16.0.0, 2026-09-30.endive) that removed Checkout's
+    ``payment_method_types`` without a line of our code changing."""
+    pinned_release = STRIPE_API_VERSION.rsplit(".", 1)[1]
+    assert stripe.major_api_version == pinned_release, (
+        f"stripe-python {stripe.VERSION} targets the {stripe.major_api_version!r} API "
+        f"release, but STRIPE_API_VERSION is {STRIPE_API_VERSION!r}. Read Stripe's "
+        "changelog for every version after the pin, adapt app/billing/stripe_gateway.py "
+        "and scripts/provision_stripe_test.py, then move STRIPE_API_VERSION on purpose."
+    )
+
+
 def test_the_provisioning_script_calls_stripe_on_the_same_pinned_version(
     wire, monkeypatch, capsys
 ) -> None:
