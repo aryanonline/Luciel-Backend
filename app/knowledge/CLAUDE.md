@@ -161,3 +161,12 @@ make that state explicit and test it.
   (F117) while the other files sync. It used to escape and fail the whole connection's sync, on
   every pass: each pass downloads and parses every in-scope file, and only the ingest is gated by
   revision. Test: `tests/unit/test_knowledge_provider_reads.py`.
+- `parsers._read_abbreviated_filter_names` replaces pypdf's private
+  `pypdf.filters._deprecate_inline_image_filters` with a no-op. pypdf 7.0 refuses the abbreviated
+  filter names (/Fl, /A85, /AHx, ...) on ordinary streams with DeprecationError
+  (py-pdf/pypdf#4306), rejecting the whole document over one font, though pypdf 6 read them.
+  Remove the shim only once a pypdf release reads those names itself (py-pdf/pypdf#4371, open);
+  `tests/unit/test_knowledge_parsers.py` fails while pypdf refuses them without the shim.
+- Accepted, not worked around: pypdf 7.0 refuses an object stream whose offsets do not strictly
+  increase (security fix py-pdf/pypdf#4364), even when every pair is correct but listed out of
+  order, which pypdf 6 read. Such a file is `unparseable_pdf`; a test pins that.

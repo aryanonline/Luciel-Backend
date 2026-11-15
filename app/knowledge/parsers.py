@@ -26,6 +26,7 @@ from __future__ import annotations
 import csv
 import io
 from dataclasses import dataclass
+from types import ModuleType
 
 
 class ParseError(Exception):
@@ -129,12 +130,42 @@ def parse_file(raw: bytes, *, filename: str, content_type: str | None) -> Parsed
     return _parse_txt(raw)
 
 
+#: The function in ``pypdf.filters`` that refuses abbreviated filter names (see
+#: ``_read_abbreviated_filter_names``).
+_PYPDF_FILTER_NAME_CHECK = "_deprecate_inline_image_filters"
+
+
+def _accept_abbreviated_filter_name(filter_name: str, old_name: str, new_name: str) -> None:
+    """Stands in for pypdf's check: the abbreviated name decodes like the full one."""
+
+
+def _read_abbreviated_filter_names(filters: ModuleType) -> None:
+    """Keep decoding streams whose filters use the abbreviated names, as pypdf 6 did.
+
+    ISO 32000 (§8.9.7) reserves /AHx /A85 /LZW /Fl /RL /CCF /DCT for inline images, but
+    some producers also write them on ordinary streams (embedded fonts, ToUnicode maps,
+    page content), and pdf.js, MuPDF, pdfium and pdfminer.six all read those. pypdf 6
+    decoded them with a DeprecationWarning, which Python hides by default. pypdf 7.0 made
+    it a DeprecationError (py-pdf/pypdf#4306), so one such font made the whole document
+    unparseable_pdf, every page of it (still open upstream as py-pdf/pypdf#4371).
+
+    ``decode_stream_data`` looks this check up by name on every call, then decodes either
+    spelling with the same decoder and under the same decoding limits, so a no-op in its
+    place restores the 6.x reading and changes nothing else. The name is private: when
+    pypdf drops it this does nothing, and tests/unit/test_knowledge_parsers.py fails if
+    pypdf still refuses the abbreviations by some other route.
+    """
+    if hasattr(filters, _PYPDF_FILTER_NAME_CHECK):
+        setattr(filters, _PYPDF_FILTER_NAME_CHECK, _accept_abbreviated_filter_name)
+
+
 def _parse_pdf(raw: bytes) -> ParsedFile:
     try:
-        from pypdf import PdfReader
+        from pypdf import PdfReader, filters
         from pypdf.errors import PdfReadError
     except ImportError as exc:  # pragma: no cover — dependency is pinned in pyproject
         raise ParseError("parser_unavailable", "PDF parsing is unavailable.") from exc
+    _read_abbreviated_filter_names(filters)
     try:
         reader = PdfReader(io.BytesIO(raw))
         pages = [page.extract_text() or "" for page in reader.pages]
