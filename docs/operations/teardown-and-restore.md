@@ -228,17 +228,24 @@ the Python scripts.
     Then confirm that the primary model answered. The Anthropic SDK moved to 2.x while dev was
     paused: it now sends `anthropic-version: 2026-10-21` with `Authorization: Bearer`, and that
     request has not run live yet. A failure would not fail a turn. Every call would fall over to
-    OpenAI, and only `LlmFallbackAlarm` (5 or more fallback turns in 15 minutes) would notice. The
+    OpenAI, and the only alarm is `LlmFallbackAlarm` (5 or more fallback turns in 15 minutes). The
     services' logs must have `llm_usage` lines with `provider=anthropic` and the primary model,
     the one `LLM_ANTHROPIC_PRIMARY_MODEL` names in `luciel/dev/platform` (`claude-sonnet-5` when
     dev was paused; the code default, `claude-sonnet-4-6`, applies only if the secret names none).
-    The `LLMFallbackUsed` metric (namespace `Luciel`) must stay at zero.
+    The `LLMFallbackUsed` metric (namespace `Luciel`) must stay at zero, and so must the count of
+    `llm_failover` lines. Each of those is one failed Anthropic call: `leg=` says whether the
+    primary or the fast model failed, and `error=` and `status=` name the SDK's exception class
+    and the HTTP status, which is the cause. To read them, run the same command with
+    `--query 'events[].message'`.
 
     ```bash
     for svc in data-plane control-plane; do
-      aws logs filter-log-events --region ca-central-1 --log-group-name "/luciel/dev/$svc" \
-        --start-time $(( ($(date +%s) - 3600) * 1000 )) \
-        --filter-pattern '"llm_usage" "provider=anthropic"' --query 'length(events)' --output text
+      for pattern in '"llm_usage" "provider=anthropic"' '"llm_failover"'; do
+        printf '%s %s: ' "$svc" "$pattern"
+        aws logs filter-log-events --region ca-central-1 --log-group-name "/luciel/dev/$svc" \
+          --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+          --filter-pattern "$pattern" --query 'length(events)' --output text
+      done
     done
     ```
 
