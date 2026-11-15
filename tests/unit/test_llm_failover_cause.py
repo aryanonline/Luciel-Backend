@@ -17,9 +17,10 @@ line carries the same fields and the attempt (2 when its one 429/529 retry faile
 The exception message is never logged: an SDK message embeds the API's response body,
 which can echo the request.
 
-The router's clock is a fake that only a provider call (and the cap admission) moves, so
-every ``latency_ms`` below is exactly the failed call's own duration. The durations are
-binary fractions of a second, so the arithmetic is exact.
+The router's clock is a fake that only a provider call, the cap admission and the backoff
+before the fallback's retry move, so every ``latency_ms`` below is exactly the failed
+call's own duration. The durations are binary fractions of a second, so the arithmetic is
+exact.
 """
 
 from __future__ import annotations
@@ -56,11 +57,13 @@ FAKE_KEY = "sk-ant-fake-not-a-real-key-0000"
 USER_TEXT = "please book me in for Saturday, my name is Jane Roe"
 # The per-tenant cap admission takes time on the router's clock too: never a call's.
 ADMISSION_S = 0.0625
+# So does the backoff before the fallback's one 429/529 retry: never the retry's.
+BACKOFF_S = 0.5
 
 
 class _Clock:
     """Stands in for ``time`` inside the router. Reading it never moves it: only a
-    provider call and the cap admission do (``advance``)."""
+    provider call, the cap admission and the retry backoff do (``advance``)."""
 
     def __init__(self) -> None:
         self.now = 100.0
@@ -83,6 +86,20 @@ class _SlowAdmission(llm_cap.InMemoryLLMCapStore):
     async def aadmit(self, admin_id: str, *, cap: int = llm_cap.LLM_CAP_PER_MINUTE) -> bool:
         _elapse(ADMISSION_S)
         return await super().aadmit(admin_id, cap=cap)
+
+
+class _Asyncio:
+    """Stands in for ``asyncio`` inside the router, which uses it only for the backoff
+    before the fallback's retry. The wait passes on the router's clock, so a retry timer
+    started before it would show in ``latency_ms``. ``slept`` records each wait."""
+
+    def __init__(self) -> None:
+        self.slept: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        _elapse(seconds)
+        await asyncio.sleep(0)
 
 
 class _Leg:
@@ -116,9 +133,10 @@ class _Leg:
 
 @pytest.fixture(autouse=True)
 def _router_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The router's own ``time`` only: the event loop keeps the real clock.
+    # The router's own ``time`` and ``asyncio`` only: the event loop keeps the real ones.
     monkeypatch.setattr(llm_router, "time", _Clock())
-    monkeypatch.setattr(llm_router, "FALLBACK_RETRY_DELAY_RANGE", (0.0, 0.0))
+    monkeypatch.setattr(llm_router, "asyncio", _Asyncio())
+    monkeypatch.setattr(llm_router, "FALLBACK_RETRY_DELAY_RANGE", (BACKOFF_S, BACKOFF_S))
     monkeypatch.setattr(llm_cap, "_store", _SlowAdmission())
 
 
@@ -293,7 +311,8 @@ async def test_fast_then_primary_failing_log_one_line_each_in_order(caplog):
             [0.625],
             "error=AuthenticationError status=401 retryable=False latency_ms=625 attempt=1",
         ),
-        # The retry fails too: the line names the error that ended it and times the retry.
+        # The retry fails too: the line names the error that ended it and times the retry
+        # alone, not the backoff before it.
         (
             [
                 ProviderError(retryable=True, status_code=429, kind="RateLimitError"),
@@ -325,6 +344,8 @@ async def test_the_fallback_logs_a_line_only_when_it_fails_for_good(
                 await router.complete(SYSTEM, MSG, admin_id=admin)
             assert info.value is fallback_errors[-1]  # the fallback's own error goes up
 
+    # A retryable first error waited out the backoff on the router's clock, once.
+    assert llm_router.asyncio.slept == ([BACKOFF_S] if fallback_errors[0].retryable else [])
     expected = [
         f"llm_failover admin_id_hash={tenant} leg=primary provider=anthropic "
         "model=claude-sonnet-4-6 error=OverloadedError status=529 retryable=True latency_ms=1500"
@@ -487,6 +508,8 @@ async def test_a_failed_fallback_logs_the_sdk_cause_and_never_the_response_body(
             await fallback._client.close()
 
     assert len(openai_wire.requests) == requests  # the 429 got its one retry, no more
+    # The retry waited out the backoff on the router's clock first: 250 is its own time.
+    assert llm_router.asyncio.slept == [BACKOFF_S] * (requests - 1)
     assert _cause_lines(caplog) == [
         "llm_failover admin_id_hash=- leg=primary provider=anthropic model=- "
         "error=ProviderError status=- retryable=False latency_ms=0",
