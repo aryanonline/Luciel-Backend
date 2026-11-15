@@ -118,10 +118,14 @@ Defines CDK stacks and deployment posture for compute, data, networking, edge/wi
   reach a bundled package and GitHub's dependency graph counts it, so the alert stays open
   until an aws-cdk-lib release carries aws/aws-cdk#39595 (minimatch 11; merged to main
   2026-11-13, not in 2.277.0).
+- `test/dependency-overrides.test.ts` pins this, because plain `npx jest` never loads
+  glob, minimatch or test-exclude: the lockfile holds no glob below 14.0.3 and no
+  minimatch below 11.0.1 outside aws-cdk-lib's bundle, and the glob and test-exclude
+  copies jest loads still find files and carry the fix.
 - Drop the overrides once upstream ranges make them no-ops (jestjs/jest#16530 for glob 14;
   istanbuljs/test-exclude#79 plus a babel-plugin-istanbul release on it): without them,
-  `npm ls glob minimatch` must still show only glob 14.0.3+ and, outside aws-cdk-lib,
-  minimatch 11.0.1+.
+  that test must still pass, so `npm ls glob minimatch` shows only glob 14.0.3+ and,
+  outside aws-cdk-lib, minimatch 11.0.1+.
 
 ## Change checklist
 - Read the root `CLAUDE.md` and trace callers and dependents before editing.
