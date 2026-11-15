@@ -30,6 +30,9 @@ from app.models.conversation import EscalationEvent
 from app.models.instance import Account, AccountState, Instance, LucielState
 from app.notifications import email_notifier
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.sleep_gate import GATE_SECONDS, SleepGate
 
 pytestmark = [pytest.mark.contract]
 
@@ -289,77 +292,47 @@ async def test_unsigned_posts_cannot_blind_a_tenants_real_receipts(client, ses, 
     assert 429 in statuses and statuses[0] == 200
 
 
-#: Bound on every wait of a ``_RetryGate``: far longer than the test holds one, so a gate
-#: that is never reached or never released fails the test instead of hanging the run.
-_GATE_SECONDS = 10
-
-
-class _RouteAsyncio:
-    """What the route's module reads as ``asyncio`` while a ``_RetryGate`` holds it: the
-    real module with only ``sleep`` swapped. ``asyncio.sleep`` itself is untouched, so the
-    client, the database driver and the test keep their real timers."""
-
-    def __init__(self, sleep: Callable[[float], Awaitable[None]]) -> None:
-        self.sleep = sleep
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(asyncio, name)
-
-
-class _RetryGate:
-    """Holds the receipt route between its lookups until the test releases it.
+class _ReceiptGate(SleepGate):
+    """Holds the receipt route in its wait between lookups until the test releases it,
+    and watches the route's owner-page lookup.
 
     The route waits ``RECEIPT_LOOKUP_RETRY_DELAYS`` between lookups. A fixed sleep in the
     test only bet that the sender's commit would land inside one of those waits: on a slow
     runner it could land after the last lookup (the receipt answered ``unknown_message``
     and the test failed) or before the first (the test passed without the route ever
-    looking again). Installed by ``_hold_receipt_retries``, the gate records the outcome
-    of each owner-page lookup, says when one has missed, and ends every wait only after
-    ``release``."""
+    looking again). Installed by ``_hold_receipt_retries``, the gate holds every wait of
+    the route on the test and records, for each owner-page lookup, its outcome and the
+    session it ran in."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.lookups: list[str] = []
-        self.waits = 0
-        self._missed = asyncio.Event()
-        self._released = asyncio.Event()
+        #: The session objects themselves: an ``id()`` can be reused once one is gone.
+        self.sessions: list[AsyncSession] = []
 
     def watch(self, lookup: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
-        async def watched(*args: Any, **kwargs: Any) -> str:
-            outcome = await lookup(*args, **kwargs)
+        async def watched(session: AsyncSession, *args: Any, **kwargs: Any) -> str:
+            outcome = await lookup(session, *args, **kwargs)
             self.lookups.append(outcome)
-            if outcome == "unknown_message":
-                self._missed.set()
+            self.sessions.append(session)
             return outcome
 
         return watched
 
-    async def sleep(self, delay: float) -> None:
-        """The route's wait before it looks again: it ends on ``release``, not on a timer."""
-        self.waits += 1
-        await asyncio.wait_for(self._released.wait(), timeout=_GATE_SECONDS)
 
-    async def missed(self) -> None:
-        """Return once a lookup has found no row carrying the SID."""
-        await asyncio.wait_for(self._missed.wait(), timeout=_GATE_SECONDS)
-
-    def release(self) -> None:
-        """Let the route look again, now and after any later miss."""
-        self._released.set()
-
-
-def _hold_receipt_retries(monkeypatch: pytest.MonkeyPatch) -> _RetryGate:
-    """Put the route's owner-page lookup and its waits between lookups on a ``_RetryGate``.
-    Only the route's module sees the gated ``asyncio``; ``asyncio.sleep`` is never patched."""
+def _hold_receipt_retries(monkeypatch: pytest.MonkeyPatch) -> _ReceiptGate:
+    """Watch the route's owner-page lookup and hold its waits between lookups on a
+    ``_ReceiptGate``. Only the route's module sees the gated ``asyncio``."""
     from app.api.v1.webhooks import channels as webhooks
     from app.notifications import escalation_dispatch
 
-    gate = _RetryGate()
+    gate = _ReceiptGate()
     monkeypatch.setattr(
         escalation_dispatch,
         "record_sms_delivery_receipt",
         gate.watch(escalation_dispatch.record_sms_delivery_receipt),
     )
-    monkeypatch.setattr(webhooks, "asyncio", _RouteAsyncio(gate.sleep))
+    gate.install(monkeypatch, webhooks)
     return gate
 
 
@@ -375,8 +348,10 @@ async def test_a_receipt_that_arrives_before_the_senders_commit_is_not_dropped(
     seen — and the row is stamped from the carrier's word, not left at ``sent``.
 
     The commit lands between two lookups by construction, not by a fixed sleep: it is
-    made once the first lookup has missed, and the route's wait before the next lookup
-    ends only after it."""
+    made while the route, its first lookup missed, is held in its wait before the next
+    lookup, and that wait ends only after the commit."""
+    from app.api.v1.webhooks import channels as webhooks
+
     gate = _hold_receipt_retries(monkeypatch)
     number, sid = "+16045550188", "SM" + "2" * 32
     admin, session_id = await _seed(number, sid="SM" + "8" * 32)
@@ -392,8 +367,9 @@ async def test_a_receipt_that_arrives_before_the_senders_commit_is_not_dropped(
         client.post(f"{ROUTE}?cap=status-cap", data=_receipt(number, sid=sid, status="delivered"))
     )
     try:
-        await gate.missed()  # the first lookup found nothing ...
-        assert not receipt.done()  # ... and the route has not answered: it will look again
+        await gate.reached(unless=receipt)  # the route is held in its wait to look again,
+        assert gate.lookups == ["unknown_message"]  # its one lookup so far found nothing,
+        assert not receipt.done()  # and it has not answered: it will look again
         async with tenant_session(admin) as s:  # the sender's commit
             row = (
                 await s.execute(select(EscalationEvent).where(EscalationEvent.admin_id == admin))
@@ -402,18 +378,36 @@ async def test_a_receipt_that_arrives_before_the_senders_commit_is_not_dropped(
             row.delivery_detail = "sms:primary"
             row.delivery_provider_message_id = sid
         gate.release()  # only now may the route look again
-        response = await asyncio.wait_for(receipt, timeout=_GATE_SECONDS)
+        response = await asyncio.wait_for(receipt, timeout=GATE_SECONDS)
     finally:
         receipt.cancel()  # a no-op once it has answered; a failed step leaves no route held
         await asyncio.gather(receipt, return_exceptions=True)
 
     assert response.status_code == 200
     assert gate.lookups == ["unknown_message", "delivered"]  # missed, then saw the commit
-    assert gate.waits == 1  # and in between it waited on the gate, never on a timer
+    # In between it waited once, for the first delay of its own schedule: a route that
+    # looked again without waiting would let go of every receipt that beats the commit.
+    assert gate.delays == [webhooks.RECEIPT_LOOKUP_RETRY_DELAYS[0]]
+    # And it looked again in a session of its own, whose transaction began after the commit.
+    assert gate.sessions[1] is not gate.sessions[0]
     row = await _row(admin, session_id)
     assert row.delivery_status == "delivered"
     assert row.delivered_at is not None
     assert ses.sent == []
+
+
+async def test_the_route_looks_again_for_a_few_seconds_inside_twilios_timeout():
+    """The test above holds the route's waits on the test, so it cannot tell real waits
+    from a schedule of milliseconds, which would let go of every receipt that beats the
+    sender's commit by more than that. The schedule itself is pinned here: every retry is
+    a real wait (the route skips a zero one), together they span the few seconds the
+    route promises, and they stay inside the 15 s a Twilio webhook waits for its response
+    by default (the read and total timeouts of Twilio's connection overrides)."""
+    from app.api.v1.webhooks import channels as webhooks
+
+    delays = webhooks.RECEIPT_LOOKUP_RETRY_DELAYS
+    assert delays and all(delay > 0 for delay in delays)
+    assert 1.0 <= sum(delays) < 15.0
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
