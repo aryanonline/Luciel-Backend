@@ -226,8 +226,8 @@ the Python scripts.
     is back to no card on file.
 
     Check the Stripe webhook endpoint as well. It is configured in the Stripe Dashboard (test
-    mode), not in this repository or in AWS, so the pause left it in place, delivering to a host
-    that did not answer. It must be enabled and subscribe to exactly the event types in
+    mode), not in this repository or in AWS, so the pause left it in place, sending events to a
+    host that did not answer. It must be enabled and subscribe to exactly the event types in
     `HANDLED_EVENT_TYPES` in [`app/billing/webhooks.py`](../../app/billing/webhooks.py):
     `invoice.paid`, `invoice.payment_failed`, `payment_method.attached` and
     `payment_method.detached`. Stripe has no `customer.subscription.renewed`; a renewal arrives
