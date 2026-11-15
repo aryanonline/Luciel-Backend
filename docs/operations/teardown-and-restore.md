@@ -207,6 +207,18 @@ the Python scripts.
       -f base_url=https://vantagemind.ai -f confirm=walk-account-only
     ```
 
+    The walk skips its card step on a live deployment (it needs a real card), and nothing else
+    opens Stripe Checkout there, so save a card by hand once, signed in as the walk account. On
+    the Billing page choose **Add payment method** and pay with Stripe's test card
+    `4242 4242 4242 4242` (any future expiry, any CVC). Expect **Your card was saved.**, then
+    **VISA ending 4242** after a reload. This is the first live run of the Checkout request since
+    it moved to `allowed_payment_method_types`, because API version 2026-09-30.endive removed
+    `payment_method_types` (see `STRIPE_API_VERSION` in
+    [`app/billing/stripe_gateway.py`](../../app/billing/stripe_gateway.py)). **We could not open
+    secure checkout just now.** means Stripe refused the session, and the API service's log has
+    its error. Remove the card again afterwards (**Remove payment method**), so the walk account
+    is back to no card on file.
+
 11. **Steward routine.** Resume the monthly steward routine.
 12. **Guard budget.** Delete `luciel-paused-guard`, or raise its limit: a running dev costs about
     $4.70 a day, so at $5 a month it alerts on the first day. Dev's own ceiling comes back with
