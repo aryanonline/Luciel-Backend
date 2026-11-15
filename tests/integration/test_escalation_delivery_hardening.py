@@ -47,6 +47,9 @@ from app.runtime.integration_status import escalation_backlog
 from app.runtime.orchestrator import _record_escalation
 from sqlalchemy import select, update
 
+# The one-rung ladder held on the test, shared with the truth tests' own ladder cases.
+from tests.integration.test_escalation_delivery_truth import _hold_the_ladder, _release_the_rung
+
 OWNER_EMAIL = "owner@acme.example"
 CONTACT = "sales@acme.example"
 CONTACT_SMS = "+16045551234"
@@ -266,7 +269,7 @@ async def test_an_owner_blip_healed_by_the_ladder_completes_the_queued_item(
     minute later. The queued item has nothing left to do: it is completed right there —
     not replayed hourly for 24h, counted in the backlog, and ended with an email
     telling the owner (who heard) that the alert could not be delivered."""
-    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (0.25,))
+    rung = _hold_the_ladder(monkeypatch)
     ses.refuse = None
     admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     lead = await _seed(admin, iid, escalation={})
@@ -277,7 +280,7 @@ async def test_an_owner_blip_healed_by_the_ladder_completes_the_queued_item(
     assert item.status == "queued"
 
     ses.refuse = set()  # the blip clears before the first rung
-    await escalation_dispatch.drain_background_retries()
+    await _release_the_rung(rung)
 
     assert ses.recipients == [OWNER_EMAIL]
     row = await _row(admin, sid)

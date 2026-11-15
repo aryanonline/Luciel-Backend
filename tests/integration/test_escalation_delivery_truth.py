@@ -11,6 +11,7 @@ refusal does, and ``/healthz`` carries the backlog.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,8 @@ from app.notifications.escalation_dispatch import (
 from app.runtime.integration_status import escalation_backlog
 from app.runtime.orchestrator import _record_escalation
 from sqlalchemy import select, update
+
+from tests.sleep_gate import GATE_SECONDS, SleepGate
 
 OWNER_EMAIL = "owner@acme.example"
 CONTACT = "sales@acme.example"
@@ -272,9 +275,33 @@ async def test_owner_fallback_keeps_retrying_the_contact_without_paging_the_owne
 
 
 # --- in-process ladder -------------------------------------------------------------- #
+#: The one rung these tests give the ladder: its first production delay. The rung's wait
+#: is held on the test, so the value never decides when it fires.
+_RUNG = 30.0
+
+
+def _hold_the_ladder(monkeypatch: pytest.MonkeyPatch) -> SleepGate:
+    """A one-rung ladder whose wait ends only on ``release`` (``tests/sleep_gate.py``).
+
+    These tests used to give the rung 0.25 s and bet that their reads of the row, and the
+    provider's recovery, came first. On a slow runner the rung fired into the refusal,
+    the one-rung ladder ended, and the delivery assertions failed."""
+    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (_RUNG,))
+    rung = SleepGate()
+    rung.install(monkeypatch, escalation_dispatch)
+    return rung
+
+
+async def _release_the_rung(rung: SleepGate) -> None:
+    """Let the held rung fire and wait for the ladder to finish."""
+    rung.release()
+    await asyncio.wait_for(escalation_dispatch.drain_background_retries(), timeout=GATE_SECONDS)
+    assert rung.delays == [_RUNG]  # the refusal scheduled the rung, and it waited for us
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_the_ladder_reaches_the_contact_and_the_queued_replay_stands_down(ses, monkeypatch):
-    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (0.25,))
+    rung = _hold_the_ladder(monkeypatch)
     ses.refuse = None
     admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     lead = await _seed(admin, iid)
@@ -282,7 +309,7 @@ async def test_the_ladder_reaches_the_contact_and_the_queued_replay_stands_down(
     await _fire(admin, iid, sid, lead)  # refused everywhere → queued + ladder scheduled
     assert (await _row(admin, sid)).delivery_status == "queued"
     ses.refuse = set()  # the blip clears before the first rung
-    await escalation_dispatch.drain_background_retries()
+    await _release_the_rung(rung)
 
     assert ses.sent == [CONTACT]
     assert (await _row(admin, sid)).delivery_status == "delivered"
@@ -385,7 +412,7 @@ async def test_a_rung_that_reaches_the_owner_repoints_the_queued_item_to_the_con
     lands. The queued item was filed for everyone; left alone, the hourly sweep would
     page the owner a second time for the same escalation. The rung re-points it to the
     configured contact alone, and the replay pages only the contact."""
-    monkeypatch.setattr(escalation_dispatch, "ESCALATION_RETRY_DELAYS", (0.25,))
+    rung = _hold_the_ladder(monkeypatch)
     ses.refuse = None
     admin, iid, sid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     lead = await _seed(admin, iid)
@@ -396,7 +423,7 @@ async def test_a_rung_that_reaches_the_owner_repoints_the_queued_item_to_the_con
     assert item.payload["contacts_only"] is False
 
     ses.refuse = {CONTACT}  # the owner is reachable again; the contact still is not
-    await escalation_dispatch.drain_background_retries()
+    await _release_the_rung(rung)
 
     assert ses.sent == [OWNER_EMAIL]
     row = await _row(admin, sid)
