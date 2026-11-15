@@ -788,9 +788,12 @@ async def test_a_month_end_renewal_ends_the_next_period_on_stripes_date(stripe_s
     """A subscription anchored on Jan 31 renews on Feb 28, then on Mar 31: Stripe clamps
     the anchor's day to each month's length. The renewal's invoice.paid used to set the
     next end to add_months(Feb 28, 1) = Mar 28, so from Mar 28 the counter ran a period
-    Stripe never opened, with a second free 50. The end now comes from Stripe's
-    subscription. When Stripe cannot say, or already names a later period (the invoice
-    was paid after the next renewal), it follows from the settled period's own bounds."""
+    Stripe never opened, with a second free 50. Stripe's subscription is asked for the
+    end first. When Stripe cannot say, or already names a later period (the invoice was
+    paid after the next renewal), the end follows from the settled period's own bounds.
+    For this whole-month period both give Mar 31, so this test checks the date, not
+    where it came from: test_a_renewal_after_a_prorated_period_ends_on_stripes_date is
+    where the two differ."""
     from app.billing.stripe_gateway import set_stripe_gateway
 
     jan31 = datetime(2030, 1, 31, 14, 5, tzinfo=UTC)
@@ -860,6 +863,68 @@ async def test_a_month_end_renewal_ends_the_next_period_on_stripes_date(stripe_s
             s, admin_id=admin, instance_id=iid, now=mar31 + timedelta(hours=1)
         )
         assert (b.conversations_this_period, b.period_resets_at) == (0, apr30)
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize("stripe_says", ["the_new_period", "a_period_from_the_settled_start"])
+async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(stripe_says: str) -> None:
+    """When the settled period is not a whole month, only Stripe knows when the next one
+    ends. A subscription created on Feb 10 and anchored on the 31st bills a prorated
+    Feb 10 - Feb 28 period first, then Feb 28 - Mar 31. That pair carries no anchor day,
+    so the end computed from it is one plain month after Feb 28: Mar 28, three days
+    short, and from Mar 28 the counter would run a period Stripe never opened, with a
+    second free 50. The renewal takes Stripe's Mar 31. A period that does not start
+    where the new one starts (here, one starting at the settled period's start) is some
+    other period: it is not used, and the end is the computed Mar 28."""
+    from app.billing.stripe_gateway import set_stripe_gateway
+
+    feb10 = datetime(2030, 2, 10, 9, 0, tzinfo=UTC)
+    feb28 = datetime(2030, 2, 28, 9, 0, tzinfo=UTC)
+    mar28 = datetime(2030, 3, 28, 9, 0, tzinfo=UTC)
+    mar31 = datetime(2030, 3, 31, 9, 0, tzinfo=UTC)
+    stripe_period, expected_end = {
+        "the_new_period": ((feb28, mar31), mar31),
+        "a_period_from_the_settled_start": ((feb10, mar31), mar28),
+    }[stripe_says]
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.stripe_customer_id = "cus_prorated"
+        acct.stripe_subscription_id = "sub_prorated"
+        acct.period_start = feb10  # the prorated first period, as the bind stored it
+        acct.period_resets_at = feb28
+        acct.accrual_period_start = feb10.date()
+        await s.flush()
+    gw = FakeStripeGateway()
+    gw.subscription_periods["sub_prorated"] = stripe_period
+    renewal = StripeEvent(
+        event_id=f"evt_prorated_{stripe_says}",
+        type="invoice.paid",
+        data={
+            "object": "invoice",
+            "customer": "cus_prorated",
+            "billing_reason": "subscription_cycle",
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {"subscription": "sub_prorated"},
+            },
+            "period_start": int(feb10.timestamp()),
+            "period_end": int(feb28.timestamp()),
+        },
+    )
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            action = await billing_webhooks.handle_event(s, admin_id=admin, event=renewal)
+    finally:
+        set_stripe_gateway(None)
+
+    assert action == "invoice_paid"
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.period_start, acct.period_resets_at) == (feb28, expected_end)
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
