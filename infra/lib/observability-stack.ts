@@ -138,12 +138,14 @@ export class ObservabilityStack extends Stack {
           evaluationPeriods: 1,
           treatMissingData: cw.TreatMissingData.NOT_BREACHING,
         }).addAlarmAction({ bind: () => ({ alarmActionArn: alarmTopic.topicArn }) });
+      // The metric carries no cause; the router's per-call cause lines do
+      // (app/runtime/llm_router.py), so each LLM page names the lines to read.
       emfAlarm(
         'LlmFallbackAlarm',
         'LLMFallbackUsed',
         5,
         15,
-        'The fallback LLM answered 5+ turns in 15 minutes: the primary provider is failing.',
+        "The fallback LLM answered 5+ turns in 15 minutes: the primary provider is failing. The services' llm_failover log lines with leg=primary say why: error= is the SDK exception, status= the HTTP status.",
       );
       // Round 7 WP-6 item 4: BOTH providers failed a turn (primary, then the fallback
       // and its one 429/529 retry). LlmFallbackAlarm stays silent through this — the
@@ -154,7 +156,7 @@ export class ObservabilityStack extends Stack {
         'LLMUnavailable',
         1,
         5,
-        'No model served a turn: both LLM providers failed (outage, quota, revoked key). Customers are getting the outage line; check provider status and the platform keys.',
+        "No model served a turn: both LLM providers failed (outage, quota, revoked key). Customers are getting the outage line; check provider status and the platform keys. The services' llm_failover (leg=primary) and llm_fallback_failed log lines name each provider's error and HTTP status.",
       );
       emfAlarm(
         'SweepTenantFailureAlarm',

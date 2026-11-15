@@ -75,4 +75,19 @@ describe('a dual-provider LLM outage pages an operator (round 7 WP-6 item 4)', (
       Period: 900,
     });
   });
+
+  // The metrics carry no cause. The router logs one line per failed provider call
+  // (llm_failover before the next leg is tried, llm_fallback_failed when the fallback
+  // fails for good), and each page names the lines that say why.
+  test('each LLM page names the log lines that carry the cause', () => {
+    const obs = buildObs('dev');
+    obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      MetricName: 'LLMFallbackUsed',
+      AlarmDescription: Match.stringLikeRegexp('llm_failover log lines with leg=primary'),
+    });
+    obs.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      MetricName: 'LLMUnavailable',
+      AlarmDescription: Match.stringLikeRegexp('llm_failover \\(leg=primary\\) and llm_fallback_failed'),
+    });
+  });
 });
