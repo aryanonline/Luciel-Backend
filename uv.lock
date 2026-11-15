@@ -1509,6 +1509,7 @@ dev = [
     { name = "bandit" },
     { name = "detect-secrets" },
     { name = "fakeredis" },
+    { name = "httpx2" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pytest" },
@@ -1520,7 +1521,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
-    { name = "anthropic", specifier = ">=0.40" },
+    { name = "anthropic", specifier = ">=2.0" },
     { name = "argon2-cffi", specifier = ">=23.1" },
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "bandit", marker = "extra == 'dev'", specifier = "==1.9.4" },
@@ -1531,6 +1532,7 @@ requires-dist = [
     { name = "fakeredis", marker = "extra == 'dev'", specifier = ">=2.20" },
     { name = "fastapi", specifier = ">=0.138,<0.142" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2,<3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==2.4.1" },
     { name = "openai", specifier = ">=1.55" },
     { name = "pgvector", specifier = ">=0.3.6" },
