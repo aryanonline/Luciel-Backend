@@ -318,10 +318,37 @@ async def test_payment_failed_emits_lifecycle_notice_sent():
         assert notice.event_payload.get("notice_type") == "payment_failed_retry"
 
 
-# The renewal the Axis8-F02 tests run, in fixed dates so they cannot depend on the day
-# they run: the Stripe period that ends, and the start of the one the renewal opens.
+# The renewal the Axis8-F02 tests run: the Stripe period that ends, the start of the one
+# the renewal opens, and that period's end. Every read passes its own ``now`` and the
+# conversations are seeded rows, so the tests do not depend on the day they run.
 _RENEWED_FROM = datetime(2030, 1, 15, tzinfo=UTC)
 _RENEWED_TO = datetime(2030, 2, 15, tzinfo=UTC)
+_RENEWED_UNTIL = datetime(2030, 3, 15, tzinfo=UTC)
+# A moment inside [_RENEWED_FROM, _RENEWED_TO), for invoices paid mid-cycle.
+_MID_PERIOD = datetime(2030, 1, 25, 9, 30, tzinfo=UTC)
+
+# The shapes an invoice names its subscription in. A webhook payload follows the API
+# version set on the endpoint in the Stripe Dashboard, not STRIPE_API_VERSION, and the
+# repository does not record that version: 2025-03-31.basil and later put the
+# subscription under parent.subscription_details, earlier versions at the top level, as
+# an id or expanded (webhooks._invoice_subscription_id reads all three).
+_INVOICE_SHAPES = ("parent_subscription_details", "top_level_id", "top_level_expanded")
+
+
+def _naming(shape: str, subscription: str) -> dict[str, object]:
+    """The invoice fields that name ``subscription`` in ``shape``."""
+    if shape == "parent_subscription_details":
+        return {
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {"subscription": subscription},
+            }
+        }
+    if shape == "top_level_id":
+        return {"subscription": subscription}
+    if shape == "top_level_expanded":
+        return {"subscription": {"object": "subscription", "id": subscription}}
+    raise ValueError(shape)
 
 
 async def _seed_renewing_tenant(admin: uuid.UUID, *, counted: int) -> uuid.UUID:
@@ -353,44 +380,55 @@ async def _seed_renewing_tenant(admin: uuid.UUID, *, counted: int) -> uuid.UUID:
     return iid
 
 
-def _renewal_invoice() -> dict[str, object]:
-    """The renewal invoice as the pinned API version (endive) sends it: the period it
-    bills, the reason it exists, and the subscription under ``parent``."""
+def _renewal_invoice(shape: str = "parent_subscription_details") -> dict[str, object]:
+    """The renewal invoice of [_RENEWED_FROM, _RENEWED_TO): the period it bills, the
+    reason it exists, and the subscription, named in ``shape``."""
     return {
         "object": "invoice",
         "customer": "cus_renewing",
         "billing_reason": "subscription_cycle",
-        "parent": {
-            "type": "subscription_details",
-            "subscription_details": {"subscription": "sub_renewing"},
-        },
+        **_naming(shape, "sub_renewing"),
         "period_start": int(_RENEWED_FROM.timestamp()),
         "period_end": int(_RENEWED_TO.timestamp()),
         "status": "paid",
     }
 
 
+def _new_period_conversations(admin: uuid.UUID, iid: uuid.UUID, counted: int) -> ConversationBudget:
+    """``counted`` conversations in the period the renewal opened."""
+    return ConversationBudget(
+        id=uuid.uuid4(),
+        admin_id=admin,
+        instance_id=iid,
+        billing_period_start=_RENEWED_TO.date(),
+        counted_conversations=counted,
+        counted_session_ids=[str(uuid.uuid4()) for _ in range(counted)],
+    )
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_a_renewal_resets_the_period_once_even_on_replay() -> None:
+@pytest.mark.parametrize("shape", _INVOICE_SHAPES)
+async def test_a_renewal_resets_the_period_once_even_on_replay(shape: str) -> None:
     """Axis8-F02: a subscription renewal starts the next period at zero, once.
 
     This test used to send ``customer.subscription.renewed``, which Stripe does not send.
-    Among the real events a renewal produces are ``customer.subscription.updated`` as the
-    period advances, then ``invoice.paid`` and ``invoice.payment_succeeded`` once the
-    renewal invoice (``billing_reason`` ``subscription_cycle``) is paid. Only
-    ``invoice.paid`` is the period boundary. The anchor moves to the invoice's
-    ``period_end``. The settled period's unreported block is posted under that period's
-    own identifier, and only then do the watermarks start again at zero. The settled
-    period's ledger row stays. A replayed invoice changes nothing, so the conversations
-    counted since are kept.
+    The counter rolls at the cycle end by time (``current_period``, F030), before any
+    webhook: Stripe does not try to collect the renewal invoice until an hour after
+    creating it. Of the events the renewal then produces, ``customer.subscription.updated``
+    and ``invoice.payment_succeeded`` change nothing. ``invoice.paid`` for the renewal
+    invoice (``billing_reason`` ``subscription_cycle``) moves the stored anchor to the
+    invoice's ``period_end`` and takes the new period's end from Stripe, posts the
+    settled period's unreported block under that period's own identifier, starts the
+    watermarks again at zero and keeps the settled period's ledger row. The same invoice
+    delivered again, under the same event id or as a separate event (Stripe documents
+    both), changes nothing: the new period's block is not posted a second time.
     """
-    from app.billing.stripe_gateway import add_months, set_stripe_gateway
+    from app.billing.stripe_gateway import set_stripe_gateway
     from app.models.audit import AdminAuditLog
     from sqlalchemy import select as sa_select
 
     admin = uuid.uuid4()
     iid = await _seed_renewing_tenant(admin, counted=180)
-    next_resets_at = add_months(_RENEWED_TO, 1)
     advanced = StripeEvent(
         event_id="evt_renewal_subscription_updated",
         type="customer.subscription.updated",
@@ -405,63 +443,96 @@ async def test_a_renewal_resets_the_period_once_even_on_replay() -> None:
                     {
                         "object": "subscription_item",
                         "current_period_start": int(_RENEWED_TO.timestamp()),
-                        "current_period_end": int(next_resets_at.timestamp()),
+                        "current_period_end": int(_RENEWED_UNTIL.timestamp()),
                     }
                 ],
             },
         },
     )
-    paid = StripeEvent(event_id="evt_renewal_paid", type="invoice.paid", data=_renewal_invoice())
+    paid = StripeEvent(
+        event_id="evt_renewal_paid", type="invoice.paid", data=_renewal_invoice(shape)
+    )
     succeeded = StripeEvent(
         event_id="evt_renewal_payment_succeeded",
         type="invoice.payment_succeeded",
-        data=_renewal_invoice(),
+        data=_renewal_invoice(shape),
     )
-
+    # The same invoice as a second, separate event.
+    paid_again = StripeEvent(
+        event_id="evt_renewal_paid_again", type="invoice.paid", data=_renewal_invoice(shape)
+    )
     gw = FakeStripeGateway()
-    set_stripe_gateway(gw)
-    try:
-        async with tenant_session(admin) as s:
-            await billing_webhooks.handle_event(s, admin_id=admin, event=advanced)
+    gw.subscription_periods["sub_renewing"] = (_RENEWED_TO, _RENEWED_UNTIL)
+
+    async def marks() -> tuple[object, ...]:
         async with tenant_session(admin) as s:
             acct = await metering.get_or_create_billing_account(s, admin_id=admin)
-            assert acct.period_start == _RENEWED_FROM, "subscription.updated ended the period"
-            b = await metering.build_budget(s, admin_id=admin, instance_id=iid)
-            assert b.conversations_this_period == 180
+            return (
+                acct.period_start,
+                acct.period_resets_at,
+                acct.accrued_blocks,
+                acct.last_reported_blocks,
+                acct.accrual_period_start,
+            )
+
+    async def budget_at(now: datetime) -> tuple[int, datetime]:
+        async with tenant_session(admin) as s:
+            b = await metering.build_budget(s, admin_id=admin, instance_id=iid, now=now)
+            return b.conversations_this_period, b.period_resets_at
+
+    async def report_at(now: datetime) -> int:
+        async with tenant_session(admin) as s:
+            return await metering.report_usage(
+                s, admin_id=admin, instance_id=iid, now=now, gateway=gw
+            )
+
+    set_stripe_gateway(gw)
+    try:
+        assert await budget_at(_RENEWED_TO - timedelta(days=1)) == (180, _RENEWED_TO)
+        # The cycle has ended and no webhook has come: the counter is already on the new
+        # period, while the stored anchor still names the old one.
+        assert await budget_at(_RENEWED_TO + timedelta(minutes=5)) == (0, _RENEWED_UNTIL)
+        assert (await marks())[:2] == (_RENEWED_FROM, _RENEWED_TO)
+
+        async with tenant_session(admin) as s:
+            assert await billing_webhooks.handle_event(s, admin_id=admin, event=advanced) == (
+                "ignored"
+            )
+        assert await marks() == (_RENEWED_FROM, _RENEWED_TO, 2, 1, _RENEWED_FROM.date())
 
         async with tenant_session(admin) as s:
             assert await billing_webhooks.handle_event(s, admin_id=admin, event=paid) == (
                 "invoice_paid"
             )
         async with tenant_session(admin) as s:
-            await billing_webhooks.handle_event(s, admin_id=admin, event=succeeded)
+            assert await billing_webhooks.handle_event(s, admin_id=admin, event=succeeded) == (
+                "ignored"
+            )
+        assert await marks() == (_RENEWED_TO, _RENEWED_UNTIL, 0, 0, _RENEWED_TO.date())
 
-        # The tenant keeps talking in the new period.
+        # The tenant runs 60 conversations in the new period: its first block is posted.
         async with tenant_session(admin) as s:
-            for _ in range(3):
-                await budget.count_session_once(
-                    s, admin_id=admin, instance_id=iid, session_id=uuid.uuid4()
-                )
+            s.add(_new_period_conversations(admin, iid, 60))
+        assert await report_at(_RENEWED_TO + timedelta(days=5)) == 1
 
+        # Redelivered under the same event id, the invoice is not processed at all...
         async with tenant_session(admin) as s:
             assert await billing_webhooks.handle_event(s, admin_id=admin, event=paid) == (
                 "duplicate"
             )
+        # ...and processed again as a separate event, it settles a period already passed:
+        # the watermarks are not zeroed, so the block is not posted a second time.
+        async with tenant_session(admin) as s:
+            assert await billing_webhooks.handle_event(s, admin_id=admin, event=paid_again) == (
+                "invoice_paid"
+            )
+        assert await report_at(_RENEWED_TO + timedelta(days=6)) == 0
+        assert await marks() == (_RENEWED_TO, _RENEWED_UNTIL, 1, 1, _RENEWED_TO.date())
+        assert await budget_at(_RENEWED_TO + timedelta(days=6)) == (60, _RENEWED_UNTIL)
     finally:
         set_stripe_gateway(None)
 
     async with tenant_session(admin) as s:
-        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
-        assert (acct.period_start, acct.period_resets_at) == (_RENEWED_TO, next_resets_at)
-        assert (acct.accrued_blocks, acct.last_reported_blocks, acct.accrual_period_start) == (
-            0,
-            0,
-            _RENEWED_TO.date(),
-        )
-        b = await metering.build_budget(
-            s, admin_id=admin, instance_id=iid, now=_RENEWED_TO + timedelta(days=5)
-        )
-        assert b.conversations_this_period == 3  # a fresh period, not wiped by the replay
         ledger = (
             await s.execute(
                 sa_select(
@@ -470,34 +541,79 @@ async def test_a_renewal_resets_the_period_once_even_on_replay() -> None:
                 ).where(ConversationBudget.admin_id == admin)
             )
         ).all()
-        assert dict(ledger) == {_RENEWED_FROM.date(): 180, _RENEWED_TO.date(): 3}
+        assert dict(ledger) == {_RENEWED_FROM.date(): 180, _RENEWED_TO.date(): 60}
         resets = (
             (
                 await s.execute(
-                    sa_select(AdminAuditLog.event_payload).where(
+                    sa_select(AdminAuditLog.event_payload)
+                    .where(
                         AdminAuditLog.admin_id == admin,
                         AdminAuditLog.event_type == "invoice_paid",
                     )
+                    .order_by(AdminAuditLog.seq)
                 )
             )
             .scalars()
             .all()
         )
         assert [(p["reset"], p["previous_period_start"], p["period_start"]) for p in resets] == [
-            ("period_advanced", "2030-01-15", "2030-02-15")
+            ("period_advanced", "2030-01-15", "2030-02-15"),
+            ("none", "2030-02-15", "2030-02-15"),
         ]
-    # The settled period's second block, posted once, under the settled period's key.
+    # The settled period's second block under the settled period's key, then the new
+    # period's first block under the new period's key, each once.
+    cus = "cus_renewing"
     assert [(e.value, e.identifier) for e in gw.meter_events] == [
-        (
-            1,
-            metering.meter_event_identifier(
-                customer_id="cus_renewing",
-                period_start=_RENEWED_FROM.date(),
-                from_block=1,
-                to_block=2,
-            ),
-        )
+        (1, f"usage:{cus}:2030-01-15:1-2"),
+        (1, f"usage:{cus}:2030-02-15:0-1"),
     ]
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize("shape", _INVOICE_SHAPES)
+async def test_an_ended_subscriptions_final_invoice_is_read_in_every_shape(
+    shape: str,
+) -> None:
+    """The subscription an invoice bills decides whether it can end the period at all, so
+    every shape that names it must be read. A shape read as naming nothing would make a
+    cancelled subscription's final invoice look like this account's renewal: the anchor
+    would jump to the cancellation instant with a second free 50 (round 7 money review,
+    finding 0). The invoice carries no billing_reason, so only the subscription it names
+    keeps it from being read as the renewal."""
+    from app.billing.stripe_gateway import set_stripe_gateway
+
+    admin = uuid.uuid4()
+    iid = await _seed_renewing_tenant(admin, counted=180)
+    final_invoice = StripeEvent(
+        event_id=f"evt_final_{shape}",
+        type="invoice.paid",
+        data={
+            "object": "invoice",
+            "customer": "cus_renewing",
+            **_naming(shape, "sub_cancelled"),
+            "period_start": int(_RENEWED_FROM.timestamp()),
+            "period_end": int(_MID_PERIOD.timestamp()),
+            "status": "paid",
+        },
+    )
+    gw = FakeStripeGateway()
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            action = await billing_webhooks.handle_event(s, admin_id=admin, event=final_invoice)
+    finally:
+        set_stripe_gateway(None)
+
+    assert action == "invoice_paid"
+    assert gw.meter_events == []
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.period_start, acct.period_resets_at) == (_RENEWED_FROM, _RENEWED_TO)
+        assert (acct.accrued_blocks, acct.last_reported_blocks) == (2, 1)
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=_MID_PERIOD + timedelta(days=1)
+        )
+        assert b.conversations_this_period == 180
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
@@ -551,7 +667,9 @@ async def test_customer_subscription_renewed_is_not_treated_as_a_renewal() -> No
             _RENEWED_FROM.date(),
         )
         assert (acct.dunning_state, acct.dunning_started_at) == (dunning.RETRYING, dunning_since)
-        b = await metering.build_budget(s, admin_id=admin, instance_id=iid)
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=_RENEWED_TO - timedelta(days=1)
+        )
         assert b.conversations_this_period == 180
         paid = (
             await s.execute(
@@ -564,15 +682,7 @@ async def test_customer_subscription_renewed_is_not_treated_as_a_renewal() -> No
         assert paid == []
 
 
-# A moment inside the [_RENEWED_FROM, _RENEWED_TO) period, for invoices paid mid-cycle.
-_MID_PERIOD = datetime(2030, 1, 25, 9, 30, tzinfo=UTC)
-_ON_THE_SUBSCRIPTION = {
-    "type": "subscription_details",
-    "subscription_details": {"subscription": "sub_renewing"},
-}
-
-
-def _mid_period_invoice(billing_reason: str, parent: dict[str, object] | None) -> dict[str, object]:
+def _mid_period_invoice(billing_reason: str, subscription: str | None) -> dict[str, object]:
     """A paid invoice created mid-period. Stripe's own one-off example in the Invoice
     object reference has ``"billing_reason": "manual"``, ``"parent": null`` and
     ``period_start == period_end`` == the moment it was created."""
@@ -580,7 +690,11 @@ def _mid_period_invoice(billing_reason: str, parent: dict[str, object] | None) -
         "object": "invoice",
         "customer": "cus_renewing",
         "billing_reason": billing_reason,
-        "parent": parent,
+        **(
+            _naming("parent_subscription_details", subscription)
+            if subscription is not None
+            else {"parent": None}
+        ),
         "period_start": int(_MID_PERIOD.timestamp()),
         "period_end": int(_MID_PERIOD.timestamp()),
         "status": "paid",
@@ -592,13 +706,9 @@ def _mid_period_invoice(billing_reason: str, parent: dict[str, object] | None) -
     "invoice",
     [
         pytest.param(_mid_period_invoice("manual", None), id="one_off"),
-        pytest.param(_mid_period_invoice("subscription_update", _ON_THE_SUBSCRIPTION), id="update"),
-        pytest.param(
-            _mid_period_invoice("subscription_threshold", _ON_THE_SUBSCRIPTION), id="threshold"
-        ),
-        pytest.param(
-            _mid_period_invoice("subscription_create", _ON_THE_SUBSCRIPTION), id="creation"
-        ),
+        pytest.param(_mid_period_invoice("subscription_update", "sub_renewing"), id="update"),
+        pytest.param(_mid_period_invoice("subscription_threshold", "sub_renewing"), id="threshold"),
+        pytest.param(_mid_period_invoice("subscription_create", "sub_renewing"), id="creation"),
         # Axis8-F02's own renewal invoice with only the reason changed: the reason decides.
         pytest.param({**_renewal_invoice(), "billing_reason": "manual"}, id="renewal_shaped"),
     ],
