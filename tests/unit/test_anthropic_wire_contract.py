@@ -1,22 +1,34 @@
 """The Anthropic SDK's wire contract, driven through the REAL client (anthropic 2.x).
 
-Every other Anthropic test swaps the SDK client for an object-level fake, so a green
-suite says nothing about what the SDK sends or how it reads a reply. anthropic 2.0
-moved every request to API version 2026-10-21 (``temperature``/``top_p``/``top_k``
-are a 400 there) and the API key from ``X-Api-Key`` to ``Authorization: Bearer``;
-2.5 moved ``OverloadedError`` under ``InternalServerError``. A break in any of these
-would not crash a turn: the router would fail every call over to OpenAI, and the break
-would show only as ``LLMFallbackUsed`` on live traffic. So these tests run
-``AnthropicProvider`` through the real ``AsyncAnthropic`` over an httpx2 mock transport
-(no network) and pin what Luciel relies on: the request shape and headers, the usage
-fields metering reads, the ``max_tokens`` truncation signal, and the SDK's status ->
-exception mapping behind the fallback's one 429/529 retry and the no-retry deadline
-(F101). A future SDK major that changes any of it fails here, before a deploy.
+No other test sends a request through the real SDK client: the provider tests swap it
+for an object-level fake, and the loop-hygiene test only builds and closes it. So a
+green suite says nothing about what the SDK sends, or how it turns a reply or a failure
+into Python. anthropic 2.0 moved every request to API version 2026-10-21
+(``temperature``/``top_p``/``top_k`` are a 400 there) and the API key from ``X-Api-Key``
+to ``Authorization: Bearer``; 2.5 moved ``OverloadedError`` under
+``InternalServerError``. A break in any of these would not crash a turn: the router
+would fail every primary and fast call over to OpenAI, and live traffic would show only
+fallback turns (``LLMFallbackUsed``). So these tests run ``AnthropicProvider`` through
+the real ``AsyncAnthropic`` over an httpx2 mock transport (no network) and pin:
+
+- the request: URL, API version, auth headers, exactly the body keys we send, the
+  cached system block, two tool results merged into one user message, and the per-call
+  deadline at the transport (F101);
+- the reply as the SDK builds it: text, tool_use, the four usage fields metering reads
+  and the ``max_tokens`` truncation signal. The SDK builds reply models without
+  validating them, so this reads back what the mock wrote: it pins the SDK's parsing and
+  the field names its models declare, not what the live API returns;
+- that every failure (an error status, a timeout, a lost connection) becomes a
+  ``ProviderError`` after exactly one attempt, which is what fails the router over.
+
+A future SDK major that changes any of it fails here, before a deploy. No offline test
+can show that the live API accepts the request.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -24,6 +36,7 @@ import anthropic
 import httpx2
 import pytest
 import pytest_asyncio
+from anthropic.types import Message, TextBlock, ToolUseBlock, Usage
 from app.config import get_settings
 from app.runtime.llm_router import ProviderError
 from app.runtime.providers import AnthropicProvider
@@ -41,16 +54,32 @@ TOOLS = [
         },
     }
 ]
+# One assistant turn proposing two calls, then both results (the second a failure), in
+# the neutral shape the orchestrator builds.
 TOOL_TURNS = [
-    {"role": "user", "content": "Can I book Friday?"},
+    {"role": "user", "content": "Can I book Friday or Saturday?"},
     {
         "role": "assistant",
         "content": "Checking.",
         "tool_calls": [
-            {"call_id": "toolu_00", "tool_id": "book_appointment", "inputs": {"date": "friday"}}
+            {"call_id": "toolu_00", "tool_id": "book_appointment", "inputs": {"date": "friday"}},
+            {"call_id": "toolu_01", "tool_id": "book_appointment", "inputs": {"date": "saturday"}},
         ],
     },
-    {"role": "tool_result", "call_id": "toolu_00", "content": '{"slots": ["9:00"]}'},
+    {
+        "role": "tool_result",
+        "call_id": "toolu_00",
+        "tool_id": "book_appointment",
+        "content": '{"slots": ["9:00"]}',
+        "is_error": False,
+    },
+    {
+        "role": "tool_result",
+        "call_id": "toolu_01",
+        "tool_id": "book_appointment",
+        "content": '{"outcome": "failed"}',
+        "is_error": True,
+    },
 ]
 
 
@@ -87,6 +116,11 @@ class _Wire:
 
 @pytest.fixture
 def wire(monkeypatch: pytest.MonkeyPatch) -> _Wire:
+    # The SDK reads ANTHROPIC_BASE_URL and ANTHROPIC_CUSTOM_HEADERS even when the key is
+    # passed in, so a shell that routes Claude through a gateway would change the request
+    # asserted on below. Upstream clears ambient ANTHROPIC_* in its own tests (2.6.0).
+    for name in [key for key in os.environ if key.startswith("ANTHROPIC_")]:
+        monkeypatch.delenv(name)
     wire = _Wire()
     real_client = anthropic.AsyncAnthropic
 
@@ -135,7 +169,7 @@ async def test_request_is_api_2026_10_21_with_a_bearer_key_and_no_sampling_param
         {"type": "text", "text": "You are Luciel.", "cache_control": {"type": "ephemeral"}}
     ]
     assert body["messages"] == [
-        {"role": "user", "content": "Can I book Friday?"},
+        {"role": "user", "content": "Can I book Friday or Saturday?"},
         {
             "role": "assistant",
             "content": [
@@ -146,8 +180,16 @@ async def test_request_is_api_2026_10_21_with_a_bearer_key_and_no_sampling_param
                     "name": "book_appointment",
                     "input": {"date": "friday"},
                 },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "book_appointment",
+                    "input": {"date": "saturday"},
+                },
             ],
         },
+        # Both results in ONE user message straight after the tool_use turn, as the API
+        # documents for parallel tool calls (_to_anthropic_messages merges them).
         {
             "role": "user",
             "content": [
@@ -156,7 +198,13 @@ async def test_request_is_api_2026_10_21_with_a_bearer_key_and_no_sampling_param
                     "tool_use_id": "toolu_00",
                     "content": '{"slots": ["9:00"]}',
                     "is_error": False,
-                }
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01",
+                    "content": '{"outcome": "failed"}',
+                    "is_error": True,
+                },
             ],
         },
     ]
@@ -211,6 +259,21 @@ async def test_reply_is_read_through_the_real_message_model(
     assert (await provider.complete("sys", HI)).truncated is True
 
 
+def test_the_sdk_models_declare_the_fields_the_provider_reads() -> None:
+    """The SDK builds a reply without validating it, so the test above reads back the
+    keys the mock wrote. This pins the names on the SDK's own models: a field the SDK
+    renames fails here instead of leaving metering to read 0 from a missing attribute."""
+    assert {"content", "stop_reason", "usage"} <= set(Message.model_fields)
+    assert {"type", "text"} <= set(TextBlock.model_fields)
+    assert {"type", "id", "name", "input"} <= set(ToolUseBlock.model_fields)
+    assert {
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    } <= set(Usage.model_fields)
+
+
 @pytest.mark.parametrize(
     ("status", "error_type", "retryable"),
     [
@@ -233,8 +296,12 @@ async def test_a_status_error_maps_through_the_sdk_after_one_attempt(
 
     assert isinstance(info.value.__cause__, anthropic.APIStatusError)
     assert info.value.status_code == status
-    assert info.value.retryable is retryable
     assert len(wire.requests) == 1  # max_retries=0: the router's failover is the retry
+    # Only the router's fallback leg reads ``retryable`` (one retry for 429/529), and in
+    # production that leg is OpenAI: a ProviderError from the Anthropic primary or fast
+    # leg fails over at once, whatever the flag says. Pinned in case an Anthropic
+    # provider ever sits on the fallback leg.
+    assert info.value.retryable is retryable
 
 
 @pytest.mark.parametrize("failure", [httpx2.ReadTimeout, httpx2.ConnectError])
