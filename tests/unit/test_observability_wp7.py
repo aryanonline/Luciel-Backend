@@ -146,16 +146,20 @@ def test_inprocess_poll_runs_only_on_the_data_plane_when_asked(monkeypatch):
 @pytest.mark.asyncio
 async def test_the_loop_survives_a_failing_run_and_stops_on_request(caplog):
     calls = {"n": 0}
+    ran_again = asyncio.Event()
 
     async def run() -> None:
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("provider down")
+        ran_again.set()
 
     stop = asyncio.Event()
     with caplog.at_level(logging.ERROR, logger="app.jobs.inprocess"):
         task = asyncio.create_task(mailbox_poll_loop(stop, interval_seconds=0.01, run=run))
-        await asyncio.sleep(0.08)
+        # Stop only once the loop has run again after the failure. A fixed 0.08 s sleep bet
+        # that the second run would come first; a starved runner need not honour that.
+        await asyncio.wait_for(ran_again.wait(), timeout=10)
         stop.set()
         runs = await asyncio.wait_for(task, timeout=2)
     assert runs >= 2 and calls["n"] == runs
