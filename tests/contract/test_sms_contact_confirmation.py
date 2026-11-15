@@ -406,7 +406,7 @@ async def test_the_code_text_bounds_the_tenant_controlled_name():
     assert _code_body("123456", None).count("a Luciel") == 1
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_the_entry_throttle_answers_after_every_codes_attempts_never_before(client, twilio):
     """Round 7 delivery hardening. confirm-sms borrowed the test text's bucket: three
     entries per 30 minutes per tenant, against five attempts per code and three SMS

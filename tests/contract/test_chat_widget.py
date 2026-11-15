@@ -396,6 +396,7 @@ async def _assistant_rows(admin: uuid.UUID) -> int:
         )
 
 
+@pytest.mark.usefixtures("rate_limit_clock_held")
 async def test_widget_flood_is_rate_limited_before_budget(client):
     """B3 regression (Architecture §3.1.5): the widget /messages endpoint must run
     the pre-budget abuse gate BEFORE the budget gate / any LLM call, so a flood from
@@ -417,7 +418,7 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
     sid = first.json()["sessionId"]  # one widget session → one source bucket
     statuses = [first.status_code]
     replies_at_first_429: int | None = None
-    for _ in range(8):  # exceed burst of 5 within the same instant (no refill)
+    for _ in range(8):  # exceed the burst of 5 (the held clock refills nothing)
         r = await client.post(
             "/api/v1/chat-widget/messages",
             json={"embedKey": embed_key, "sessionId": sid, "text": "hi"},
@@ -471,7 +472,7 @@ async def test_widget_flood_is_rate_limited_before_budget(client):
     )
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_widget_flood_with_rotating_session_ids_is_still_rate_limited(client):
     """Audit F046 (denial-of-wallet): the old bucket was keyed on the CALLER-supplied
     sessionId, so a fresh random id per request minted a fresh full bucket AND opened
@@ -594,7 +595,7 @@ async def test_oversized_visitor_text_is_rejected_before_any_tenant_work(client)
     assert r.status_code == 422
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_bootstrap_storm_from_one_address_is_bounded(client):
     """The unauthenticated bootstrap performs tenant DB work; it gets its own ceiling."""
     _admin, embed_key = await _seed_active_instance()

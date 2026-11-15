@@ -250,20 +250,14 @@ async def test_a_receipt_for_a_message_this_platform_never_sent_is_a_no_op(
     assert ses.sent == []
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-async def test_unsigned_posts_cannot_blind_a_tenants_real_receipts(client, ses, monkeypatch):
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
+async def test_unsigned_posts_cannot_blind_a_tenants_real_receipts(client, ses):
     """Round 7 delivery hardening. The flood bucket was charged on the unauthenticated
     From field BEFORE verification: anyone who knew a business's number could post
     enough unsigned receipts to exhaust it (burst 10) and auto-block the key for a day
     (50 rejections), after which every real receipt for that tenant was a 429 and a
     carrier failure never reached the owner. A forgery costs the forger a 403 now and
     nothing of the tenant's; the bucket still bounds VERIFIED traffic."""
-    # The bucket's clock stands still here. It refills a token every 2 s, and on a loaded
-    # runner each post can take longer than that, so the burst below never ran out (seen
-    # under CPU load: not one 429 among the fifteen verified posts).
-    store = rate_limit.get_store()
-    frozen = store._now()
-    monkeypatch.setattr(store, "_now", lambda: frozen)
     number, sid = "+16045550187", "SM" + "1" * 32
     admin, session_id = await _seed(number, sid=sid)
 

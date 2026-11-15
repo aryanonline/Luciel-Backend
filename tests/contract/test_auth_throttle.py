@@ -93,7 +93,7 @@ async def test_reset_requests_are_throttled_without_revealing_whether_the_addres
     assert statuses == [200] * burst + [429]  # identical shape either way
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_the_per_address_ceiling_bounds_a_many_account_spray(client):
     burst = rate_limit.LIMITS["auth_login_ip"].burst
     statuses = []

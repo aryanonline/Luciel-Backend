@@ -105,7 +105,7 @@ async def test_valid_cap_accepts_and_forged_cap_403s_with_audit(client):
     assert await _audit_count(admin, "inbound_capability_rejected") == 1
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_status_route_rate_limits_per_number(client):
     number = "+16045550174"  # distinct number: the bucket store is process-global
     await _seed_capability_tenant(number)

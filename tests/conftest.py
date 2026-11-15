@@ -366,6 +366,23 @@ def _reset_rate_limiter() -> None:
     rate_limit._store = rate_limit.TokenBucketStore()
 
 
+@pytest.fixture
+def rate_limit_clock_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hold the in-memory rate limiter's clock still for the test.
+
+    A test that spends a bucket's burst and then expects the refusal bets that its
+    requests arrive faster than the bucket refills. A starved runner can lose that bet
+    with a correct build: the voice_status bucket gives a token back every 2 s, and
+    beside CPU load fifteen verified posts never ran its burst of ten out. With the
+    clock held nothing comes back, so the burst runs out on the count of requests alone.
+    Every ``TokenBucketStore`` is held (the one ``_reset_rate_limiter`` installs, and any
+    store the test builds itself)."""
+    from app.channels import rate_limit
+
+    held = time.monotonic()
+    monkeypatch.setattr(rate_limit.TokenBucketStore, "_now", lambda self: held)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _fresh_engine_per_test() -> AsyncIterator[None]:
     """Dispose the module-level async engine at the START of every async test.

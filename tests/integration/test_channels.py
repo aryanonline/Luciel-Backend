@@ -207,7 +207,7 @@ async def test_sms_adapter_signature_verified_inbound_and_send():
     assert "AI assistant" in twilio.sent[0][2]
 
 
-@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset", "rate_limit_clock_held")
 async def test_inbound_pipeline_admits_then_blocks_and_audits():
     admin = uuid.uuid4()
     iid = await _seed(admin)
