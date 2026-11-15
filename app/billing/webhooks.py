@@ -49,6 +49,7 @@ not mean anything was paid. Every other event type is acknowledged and ignored.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -77,6 +78,14 @@ _log = logging.getLogger(__name__)
 # The ``billing_reason`` of the invoice Stripe issues when a subscription "advanced into
 # a new period" (Invoice object reference). The only paid invoice that ends a period.
 _RENEWAL_BILLING_REASON = "subscription_cycle"
+
+# How long a renewal's invoice.paid waits for Stripe's subscription period before it
+# takes the end computed from the settled period (``_renewed_period_end``). The read runs
+# inside the webhook's transaction, after the event is claimed: on stripe-python's own
+# limits (80 s per attempt, two retries) a slow Stripe held that transaction, its pooled
+# connection and the event's claim for minutes. For a whole-month period the computed
+# end is the one Stripe would give.
+_PERIOD_READ_TIMEOUT_S = 5.0
 
 
 class _EventHandler(Protocol):
@@ -311,21 +320,27 @@ async def _renewed_period_end(
     """When the period that a paid cycle invoice opened at ``start`` ends.
 
     Stripe's subscription holds the answer (``items[].current_period_end``) and is asked
-    first, as it is when the subscription is bound (``metering._anchor_to_subscription``).
-    The answer counts only when it describes this period: an invoice paid after the next
-    renewal finds the subscription a period further on. Otherwise the end follows from
-    the settled period's own bounds, on Stripe's anchor day (``next_period_end``).
+    first, as it is when the subscription is bound (``metering._anchor_to_subscription``),
+    for no longer than ``_PERIOD_READ_TIMEOUT_S``. The answer counts only when it
+    describes this period: an invoice paid after the next renewal finds the subscription
+    a period further on. Otherwise the end follows from the settled period's own bounds,
+    on Stripe's anchor day (``next_period_end``).
     ``add_months(start, 1)`` used to set it, which put the renewal after a Jan-31
     anchor's Feb-28 one on Mar 28 instead of Mar 31, so the counter rolled into a new
     period, with a second free 50, three days before Stripe's period ended.
     """
     if account.stripe_subscription_id is not None:
         try:
-            bounds = await get_stripe_gateway().get_subscription_period(
-                subscription_id=account.stripe_subscription_id
+            bounds = await asyncio.wait_for(
+                get_stripe_gateway().get_subscription_period(
+                    subscription_id=account.stripe_subscription_id
+                ),
+                timeout=_PERIOD_READ_TIMEOUT_S,
             )
-        except Exception:  # noqa: BLE001 — the computed end below serves instead
-            _log.exception("subscription period read failed admin_id=%s", account.admin_id)
+        except Exception:  # noqa: BLE001 — failed or too slow: the computed end below serves
+            _log.exception(
+                "subscription period read failed or timed out admin_id=%s", account.admin_id
+            )
             bounds = None
         if bounds is not None:
             current_start, current_end = bounds[0].astimezone(UTC), bounds[1].astimezone(UTC)

@@ -32,6 +32,7 @@ raises, the route rejects.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -764,7 +765,11 @@ class RealStripeGateway:
     ) -> tuple[datetime, datetime] | None:
         client = self._get_client()
         try:
-            sub = client.Subscription.retrieve(subscription_id)  # type: ignore[attr-defined]
+            # In a worker thread: the SDK call blocks for the whole round trip (80 s per
+            # attempt and two retries by default). On the event loop it stalled every
+            # other request on the worker and left a caller's deadline nothing to cut
+            # short (a renewal's invoice.paid waits webhooks._PERIOD_READ_TIMEOUT_S).
+            sub = await asyncio.to_thread(client.Subscription.retrieve, subscription_id)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 — an unknown/cancelled subscription has no period
             _log.warning("subscription period unavailable for %s", subscription_id, exc_info=True)
             return None

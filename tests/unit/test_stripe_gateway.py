@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from hashlib import sha256
 
 import pytest
@@ -661,6 +663,45 @@ def test_subscription_create_idempotency_key_is_unique_per_attempt(monkeypatch) 
     assert all(k.startswith("payg-sub:cus_k:") for k in keys)
     assert len(set(keys)) == 2, "a cancel-then-recreate must never reuse a spent key"
     assert all(c["items"] == [{"price": "price_bound"}] for c in client.created)
+
+
+def test_the_subscription_period_read_leaves_the_event_loop_free() -> None:
+    """stripe-python's retrieve blocks for the whole round trip: 80 s per attempt and two
+    retries by default. Run on the event loop, it stalled every other request on the
+    worker, and the renewal webhook's deadline (webhooks._PERIOD_READ_TIMEOUT_S) could
+    not cut it short. It runs in a worker thread: this stand-in retrieve returns only
+    once a coroutine on the loop has run while it waits."""
+    loop_ran = threading.Event()
+    seen: list[bool] = []
+
+    class _Subscription:
+        @staticmethod
+        def retrieve(subscription_id: str) -> dict[str, object]:
+            seen.append(loop_ran.wait(timeout=2))  # a blocked loop never sets it
+            item = {"current_period_start": 1_900_000_000, "current_period_end": 1_902_000_000}
+            return {"items": {"data": [item]}}
+
+    class _Client:
+        Subscription = _Subscription
+
+    gw = _real_gateway_with(_Client())  # type: ignore[arg-type]
+
+    async def run() -> tuple[datetime, datetime] | None:
+        async def on_the_loop() -> None:
+            loop_ran.set()
+
+        marker = asyncio.create_task(on_the_loop())
+        bounds = await gw.get_subscription_period(subscription_id="sub_x")
+        await marker
+        return bounds
+
+    bounds = asyncio.run(run())
+
+    assert seen == [True]
+    assert bounds == (
+        datetime.fromtimestamp(1_900_000_000, tz=UTC),
+        datetime.fromtimestamp(1_902_000_000, tz=UTC),
+    )
 
 
 class _NoDefaultCardClient:

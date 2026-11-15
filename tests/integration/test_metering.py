@@ -9,6 +9,7 @@ reporting (no double-bill).
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, time, timedelta
 
@@ -793,6 +794,14 @@ class _SubscriptionReadFails(FakeStripeGateway):
         raise RuntimeError("stripe unavailable")
 
 
+class _SubscriptionReadIsSlow(FakeStripeGateway):
+    """Stripe answers, but only after the renewal has stopped waiting for it."""
+
+    async def get_subscription_period(self, *, subscription_id: str):  # type: ignore[override]
+        await asyncio.sleep(2)
+        return await super().get_subscription_period(subscription_id=subscription_id)
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 @pytest.mark.parametrize("stripe_says", ["the_new_period", "nothing", "a_later_period", "error"])
 async def test_a_month_end_renewal_ends_the_next_period_on_stripes_date(stripe_says: str) -> None:
@@ -877,8 +886,12 @@ async def test_a_month_end_renewal_ends_the_next_period_on_stripes_date(stripe_s
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
-@pytest.mark.parametrize("stripe_says", ["the_new_period", "a_period_from_the_settled_start"])
-async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(stripe_says: str) -> None:
+@pytest.mark.parametrize(
+    "stripe_says", ["the_new_period", "a_period_from_the_settled_start", "the_new_period_late"]
+)
+async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(
+    stripe_says: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When the settled period is not a whole month, only Stripe knows when the next one
     ends. A subscription created on Feb 10 and anchored on the 31st bills a prorated
     Feb 10 - Feb 28 period first, then Feb 28 - Mar 31. That pair carries no anchor day,
@@ -886,7 +899,11 @@ async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(stripe_say
     short, and from Mar 28 the counter would run a period Stripe never opened, with a
     second free 50. The renewal takes Stripe's Mar 31. A period that does not start
     where the new one starts (here, one starting at the settled period's start) is some
-    other period: it is not used, and the end is the computed Mar 28."""
+    other period: it is not used, and the end is the computed Mar 28.
+
+    The read runs inside the webhook's open transaction, so the renewal waits for it
+    only so long (``_PERIOD_READ_TIMEOUT_S``, shortened here). An answer that comes
+    later is treated like a failed read: the computed end serves."""
     from app.billing.stripe_gateway import set_stripe_gateway
 
     feb10 = datetime(2030, 2, 10, 9, 0, tzinfo=UTC)
@@ -896,7 +913,9 @@ async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(stripe_say
     stripe_period, expected_end = {
         "the_new_period": ((feb28, mar31), mar31),
         "a_period_from_the_settled_start": ((feb10, mar31), mar28),
+        "the_new_period_late": ((feb28, mar31), mar28),
     }[stripe_says]
+    monkeypatch.setattr(billing_webhooks, "_PERIOD_READ_TIMEOUT_S", 0.05)
     admin = uuid.uuid4()
     await _seed_tenant(admin)
     async with tenant_session(admin) as s:
@@ -908,7 +927,7 @@ async def test_a_renewal_after_a_prorated_period_ends_on_stripes_date(stripe_say
         acct.period_resets_at = feb28
         acct.accrual_period_start = feb10.date()
         await s.flush()
-    gw = FakeStripeGateway()
+    gw = _SubscriptionReadIsSlow() if stripe_says.endswith("_late") else FakeStripeGateway()
     gw.subscription_periods["sub_prorated"] = stripe_period
     renewal = StripeEvent(
         event_id=f"evt_prorated_{stripe_says}",
