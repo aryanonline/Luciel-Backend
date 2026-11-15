@@ -708,7 +708,16 @@ def _mid_period_invoice(billing_reason: str, subscription: str | None) -> dict[s
         pytest.param(_mid_period_invoice("manual", None), id="one_off"),
         pytest.param(_mid_period_invoice("subscription_update", "sub_renewing"), id="update"),
         pytest.param(_mid_period_invoice("subscription_threshold", "sub_renewing"), id="threshold"),
-        pytest.param(_mid_period_invoice("subscription_create", "sub_renewing"), id="creation"),
+        # Stripe issues a creation invoice only in classic billing mode, dated at the
+        # subscription's start: its period_end is the anchor the bind stored.
+        pytest.param(
+            {
+                **_mid_period_invoice("subscription_create", "sub_renewing"),
+                "period_start": int(_RENEWED_FROM.timestamp()),
+                "period_end": int(_RENEWED_FROM.timestamp()),
+            },
+            id="creation",
+        ),
         # Axis8-F02's own renewal invoice with only the reason changed: the reason decides.
         pytest.param({**_renewal_invoice(), "billing_reason": "manual"}, id="renewal_shaped"),
     ],
@@ -717,11 +726,13 @@ async def test_a_paid_invoice_that_is_not_the_renewal_leaves_the_period_alone(
     invoice: dict[str, object],
 ) -> None:
     """Only the renewal invoice (``billing_reason`` ``subscription_cycle``) ends a Stripe
-    period. Any other paid invoice used to start a new period at its ``period_end``:
-    a one-off invoice paid on Jan 25 opened a second free 50 inside the Jan 15 - Feb 15
-    period and zeroed the watermarks. The debt is settled (dunning clears), but the
-    anchor, the period's end, the watermarks and the counter stay, and nothing is
-    posted to the meter."""
+    period. A one-off, update or threshold invoice used to start a new period at its
+    ``period_end``: a one-off invoice paid on Jan 25 opened a second free 50 inside the
+    Jan 15 - Feb 15 period and zeroed the watermarks. A creation invoice never moved the
+    period (its ``period_end`` is the anchor already stored); it is gated for safety,
+    and only its audit row (not_a_renewal) shows that. The debt is settled (dunning
+    clears), but the anchor, the period's end, the watermarks and the counter stay, and
+    nothing is posted to the meter."""
     from app.billing.stripe_gateway import set_stripe_gateway
     from app.models.audit import AdminAuditLog
     from sqlalchemy import select as sa_select

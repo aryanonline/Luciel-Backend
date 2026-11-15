@@ -176,12 +176,18 @@ async def _on_invoice_paid(
 
     Nor is any other paid invoice that is not the renewal. Stripe marks the renewal
     ``billing_reason`` ``subscription_cycle``; a one-off invoice (``manual``, no parent,
-    ``period_start == period_end`` == the moment it was created), a subscription update,
-    a billing threshold and the $0 invoice issued at subscription creation all settle
-    debt INSIDE the Stripe period. Reading their ``period_end`` as the next period's
-    start began a new period mid-cycle, with a second free 50. They settle like the
-    ended subscription's invoice. An invoice without a ``billing_reason`` (a payload
-    from before the field existed, a bare test event) is still read as the renewal.
+    ``period_start == period_end`` == the moment it was created), a subscription update
+    and a billing threshold settle debt INSIDE the Stripe period. Reading their
+    ``period_end`` as the next period's start began a new period mid-cycle, with a
+    second free 50. They settle like the ended subscription's invoice. So does a
+    subscription creation invoice, though only for safety. Once the bind had stored
+    Stripe's period it moved nothing: its ``period_end`` is the subscription's start,
+    the anchor stored then (``metering._anchor_to_subscription``). And Stripe issues
+    none for a metered-only subscription in flexible billing mode, the default when a
+    subscription is created on API version 2025-09-30.clover or later
+    (``STRIPE_API_VERSION`` is later). An invoice without a ``billing_reason`` (a
+    payload from before the field existed, a bare test event) is still read as the
+    renewal.
     """
     billed_subscription = _invoice_subscription_id(event)
     if billed_subscription is not None and billed_subscription != account.stripe_subscription_id:
