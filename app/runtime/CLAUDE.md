@@ -244,3 +244,21 @@ make that state explicit and test it.
   providers down → `LLMUnavailable` (LlmUnavailableAlarm). The cap store is
   `redis.asyncio`, awaited (`aadmit_llm_call`), and re-binds every 60 s while Redis is down;
   the sync `with router.turn()` pays in the turn's first `complete()`.
+
+## Failover cause (2026-11-15, from the anthropic 2.8 upgrade review)
+- `LLMFallbackUsed` / LlmFallbackAlarm count fallback turns but carry no cause, so the
+  router logs ONE WARNING `llm_failover` line each time a leg's `ProviderError` moves a
+  call to the next leg, before that leg is tried: `admin_id_hash`, `leg` (`primary` → the
+  fallback answers; `fast` → the primary answers and no metric moves, so this line is the
+  only trace of a broken fast pin), `provider` (routing name), `model`
+  (`AnthropicProvider.model_name`; `-` for doubles), `error` (`ProviderError.kind`: the
+  SDK exception class, e.g. `OverloadedError`, `BadRequestError`, `NotFoundError`,
+  `APITimeoutError`; else the error's own class), `status` (`-` when there is none),
+  `retryable`, and the failed call's `latency_ms`. Never the exception message (the
+  SDK's embeds the API's response body, which can echo the request), never `exc_info`,
+  never prompt/reply/tool content.
+- One line per failed call, not per turn: a tool loop can log several, and session
+  summaries and ingest-time graph extraction (fast-leg callers) log it too. The
+  fallback's own failures log none: its 429/529 retry stays on the same leg, and when it
+  fails too (`LLMUnavailable`) only the primary's cause is on record
+  (`tests/unit/test_llm_failover_cause.py`).

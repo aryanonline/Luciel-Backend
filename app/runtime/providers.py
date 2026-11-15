@@ -107,14 +107,16 @@ def emit_usage_metrics(usage: LLMUsage | None) -> None:
 def _provider_error(prefix: str, exc: BaseException) -> ProviderError:
     """Map an SDK exception to ``ProviderError`` (§3.4.3), carrying its HTTP status so
     the router can tell a 429/529 refusal (worth ONE retry on the fallback leg, round 7
-    WP-2 item 6) from everything else. The exception type name is safe to surface; the
-    message is not — it may embed request content."""
+    WP-2 item 6) from everything else. The exception type name is safe to surface (it
+    is ``kind``, which the router's ``llm_failover`` line logs); the message is not —
+    it may embed request content."""
     raw = getattr(exc, "status_code", None)
     status = int(raw) if isinstance(raw, int) else None
     return ProviderError(
         f"{prefix}:{type(exc).__name__}",
         retryable=status in RETRYABLE_PROVIDER_STATUSES,
         status_code=status,
+        kind=type(exc).__name__,
     )
 
 
@@ -251,6 +253,11 @@ class AnthropicProvider:
         self._model = model
         self._max_output_tokens = max_output_tokens
         self._client: object | None = None
+
+    @property
+    def model_name(self) -> str:
+        """The model pin this provider calls (§7 #11), named by ``llm_failover``."""
+        return self._model
 
     def _get_client(self) -> object:
         """Lazily construct the async SDK client (no network at construction)."""

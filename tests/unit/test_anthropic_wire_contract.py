@@ -19,7 +19,9 @@ the real ``AsyncAnthropic`` over an httpx2 mock transport (no network) and pin:
   validating them, so this reads back what the mock wrote: it pins the SDK's parsing and
   the field names its models declare, not what the live API returns;
 - that every failure (an error status, a timeout, a lost connection) becomes a
-  ``ProviderError`` after exactly one attempt, which is what fails the router over.
+  ``ProviderError`` after exactly one attempt, which is what fails the router over, and
+  carries the SDK's class name as its ``kind``: the cause the router's ``llm_failover``
+  line logs, never the SDK's message, which embeds the response body.
 
 A future SDK major that changes any of it fails here, before a deploy. No offline test
 can show that the live API accepts the request.
@@ -28,7 +30,9 @@ can show that the live API accepts the request.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -38,8 +42,10 @@ import pytest
 import pytest_asyncio
 from anthropic.types import Message, TextBlock, ToolUseBlock, Usage
 from app.config import get_settings
-from app.runtime.llm_router import ProviderError
+from app.observability.logging import StructuredFormatter
+from app.runtime.llm_router import LLMRouter, ProviderError
 from app.runtime.providers import AnthropicProvider
+from app.runtime.testing import EchoModel
 
 KEY = "wire-contract-test-key"  # not a real key; the transport is a mock
 HI = [{"role": "user", "content": "hi"}]
@@ -275,18 +281,23 @@ def test_the_sdk_models_declare_the_fields_the_provider_reads() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "error_type", "retryable"),
+    ("status", "error_type", "retryable", "kind"),
     [
-        (429, "rate_limit_error", True),
-        (529, "overloaded_error", True),
-        (400, "invalid_request_error", False),
-        (401, "authentication_error", False),
-        (500, "api_error", False),
-        (503, "api_error", False),
+        (429, "rate_limit_error", True, "RateLimitError"),
+        (529, "overloaded_error", True, "OverloadedError"),
+        (400, "invalid_request_error", False, "BadRequestError"),
+        (401, "authentication_error", False, "AuthenticationError"),
+        (500, "api_error", False, "InternalServerError"),
+        (503, "api_error", False, "ServiceUnavailableError"),
     ],
 )
 async def test_a_status_error_maps_through_the_sdk_after_one_attempt(
-    provider: AnthropicProvider, wire: _Wire, status: int, error_type: str, retryable: bool
+    provider: AnthropicProvider,
+    wire: _Wire,
+    status: int,
+    error_type: str,
+    retryable: bool,
+    kind: str,
 ) -> None:
     wire.reply = lambda _request: httpx2.Response(
         status, json={"type": "error", "error": {"type": error_type, "message": "refused"}}
@@ -296,6 +307,8 @@ async def test_a_status_error_maps_through_the_sdk_after_one_attempt(
 
     assert isinstance(info.value.__cause__, anthropic.APIStatusError)
     assert info.value.status_code == status
+    # The SDK's own class for the status: what the router's llm_failover line logs.
+    assert info.value.kind == kind == type(info.value.__cause__).__name__
     assert len(wire.requests) == 1  # max_retries=0: the router's failover is the retry
     # Only the router's fallback leg reads ``retryable`` (one retry for 429/529), and in
     # production that leg is OpenAI: a ProviderError from the Anthropic primary or fast
@@ -304,9 +317,12 @@ async def test_a_status_error_maps_through_the_sdk_after_one_attempt(
     assert info.value.retryable is retryable
 
 
-@pytest.mark.parametrize("failure", [httpx2.ReadTimeout, httpx2.ConnectError])
+@pytest.mark.parametrize(
+    ("failure", "kind"),
+    [(httpx2.ReadTimeout, "APITimeoutError"), (httpx2.ConnectError, "APIConnectionError")],
+)
 async def test_a_timeout_or_lost_connection_fails_over_after_one_attempt(
-    provider: AnthropicProvider, wire: _Wire, failure: type[httpx2.TransportError]
+    provider: AnthropicProvider, wire: _Wire, failure: type[httpx2.TransportError], kind: str
 ) -> None:
     def _fail(request: httpx2.Request) -> httpx2.Response:
         raise failure("simulated", request=request)
@@ -317,4 +333,41 @@ async def test_a_timeout_or_lost_connection_fails_over_after_one_attempt(
 
     assert isinstance(info.value.__cause__, anthropic.APIConnectionError)
     assert info.value.status_code is None and info.value.retryable is False
+    assert info.value.kind == kind
     assert len(wire.requests) == 1
+
+
+async def test_a_failed_primary_logs_the_sdk_cause_and_never_the_response_body(
+    provider: AnthropicProvider, wire: _Wire, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The live break the failover alarm cannot explain: the API refuses what the SDK
+    sent. The router's line names it by the SDK's class and status. The SDK's own
+    message embeds the response body, which can echo the request (here a key-shaped
+    string and the customer's words), and none of it may reach the log."""
+    fake_key = "sk-ant-fake-not-a-real-key-0000"
+    words = "please book me in for Saturday, my name is Jane Roe"
+    body = {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": f"{fake_key}: {words}"},
+    }
+    wire.reply = lambda _request: httpx2.Response(400, json=body)
+    turn = [{"role": "user", "content": words}]
+    # The content really is in the SDK's message: the test below is not vacuous.
+    with pytest.raises(ProviderError) as info:
+        await provider.complete("sys", turn)
+    assert fake_key in str(info.value.__cause__) and words in str(info.value.__cause__)
+
+    router = LLMRouter(primary=provider, fallback=EchoModel(name="openai"))
+    with caplog.at_level(logging.INFO, logger="app.runtime.llm_router"):
+        resp = await router.complete("sys", turn)
+
+    assert resp.used_fallback is True
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm_failover")]
+    assert re.fullmatch(
+        r"llm_failover admin_id_hash=- leg=primary provider=anthropic model=claude-sonnet-4-6 "
+        r"error=BadRequestError status=400 retryable=False latency_ms=\d+",
+        line,
+    )
+    for record in caplog.records:
+        rendered = StructuredFormatter().format(record)
+        assert fake_key not in rendered and words not in rendered and "Jane Roe" not in rendered

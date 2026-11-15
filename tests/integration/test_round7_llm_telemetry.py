@@ -9,6 +9,7 @@ refusal keeps its own ``LLMCapExceeded`` and is NOT an outage.
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 import pytest
@@ -18,7 +19,7 @@ from app.runtime import llm_cap as llm_cap_module
 from app.runtime import orchestrator as orchestrator_module
 from app.runtime.escalation import Signal
 from app.runtime.llm_cap import LLM_CAP_PER_MINUTE, InMemoryLLMCapStore
-from app.runtime.llm_router import LLMRouter
+from app.runtime.llm_router import LLMRouter, ProviderError
 from app.runtime.orchestrator import Orchestrator
 from app.runtime.testing import EchoModel
 
@@ -106,3 +107,51 @@ async def test_a_cap_refusal_is_not_an_outage(monkeypatch):
     assert result.escalation.signal is Signal.llm_unavailable
     names = [name for name, _ in seen]
     assert "LLMCapExceeded" in names and "LLMUnavailable" not in names
+
+
+class _OverloadedPrimary(EchoModel):
+    """The Anthropic primary refusing with a 529, its message echoing the customer."""
+
+    async def complete(self, system_prompt, messages, *, tools=None):
+        echoed = messages[-1]["content"]
+        raise ProviderError(
+            f"anthropic_error: {echoed}", retryable=True, status_code=529, kind="OverloadedError"
+        )
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_turn_the_fallback_answered_logs_why_the_primary_failed(monkeypatch, caplog):
+    """LLMFallbackUsed counts the turn for LlmFallbackAlarm; the router's llm_failover
+    line, written in the same turn, says why. Never the customer's words."""
+    seen = _record_metrics(monkeypatch)
+    admin, iid = uuid.uuid4(), uuid.uuid4()
+    words = "are you open on saturday? this is Jane Roe"
+    primary = _OverloadedPrimary(name="anthropic")
+    async with tenant_session(admin) as s:
+        sid = await _seed_session(s, admin, iid, channel="widget")
+        orch = Orchestrator(
+            session=s,
+            router=LLMRouter(primary=primary, fallback=EchoModel(name="openai")),
+            retriever=_no_chunks,
+            admin_id=admin,
+            instance_id=iid,
+            enabled_channels={"widget"},
+            has_payment_method=False,
+        )
+        with caplog.at_level(logging.WARNING, logger="app.runtime.llm_router"):
+            result = await orch.run_turn(
+                session_id=sid,
+                resolved_lead_id=None,
+                channel="widget",
+                mode="ai",
+                inbound_text=words,
+            )
+    assert result.used_fallback is True
+    assert [name for name, _ in seen].count("LLMFallbackUsed") == 1
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm_failover ")]
+    assert len(lines) == 1
+    assert (
+        " leg=primary provider=anthropic model=- error=OverloadedError status=529 retryable=True "
+        in lines[0]
+    )
+    assert "saturday" not in lines[0] and "Jane Roe" not in lines[0]

@@ -19,6 +19,7 @@ import enum
 import hashlib
 import logging
 import random
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -125,14 +126,26 @@ class ProviderError(Exception):
 
     ``retryable`` (round 7 WP-2, item 6) is True for the 429/529 class — a refusal
     that may clear within a second — and False for everything else (auth, bad
-    request, timeout, connection). Only the fallback leg ever acts on it, once."""
+    request, timeout, connection). Only the fallback leg ever acts on it, once.
+
+    ``kind`` names what failed and says nothing about the request: the SDK exception's
+    class name (``OverloadedError``, ``BadRequestError``, ``APITimeoutError``), or None
+    when the raiser knows no more (the router's ``llm_failover`` line then logs this
+    error's own class name). The message is never logged: an SDK message can carry the
+    API's response body."""
 
     def __init__(
-        self, message: str = "", *, retryable: bool = False, status_code: int | None = None
+        self,
+        message: str = "",
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+        kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.kind = kind
 
 
 def _fallback_retry_delay() -> float:
@@ -147,6 +160,41 @@ def _fallback_retry_delay() -> float:
     except Exception:  # noqa: BLE001 — settings unavailable → the range alone binds
         return delay
     return max(0.0, min(delay, ceiling))
+
+
+def _log_failover(
+    leg: ModelClass,
+    provider: object,
+    exc: ProviderError,
+    *,
+    started: float,
+    admin_id: uuid.UUID | None,
+) -> None:
+    """Log WHY a leg failed, once, as the router moves the call to the next leg.
+
+    ``leg=primary``: the fallback answers next, so these are the calls behind
+    LLMFallbackUsed and LlmFallbackAlarm, which carry no cause of their own.
+    ``leg=fast``: the primary answers next and no metric moves, so this line is the
+    only trace of a broken fast leg. Every field is content-free: routing name, model
+    pin, exception class, HTTP status, retryable flag, latency, tenant hash. Never
+    the exception message (an SDK message embeds the API's response body, which can
+    echo the request) and never ``exc_info`` (its traceback prints that message).
+    Attributes are read defensively: this line must not be able to break the
+    failover it reports."""
+    status = getattr(exc, "status_code", None)
+    # key=value in the message: the structured formatter renders no extras.
+    logger.warning(
+        "llm_failover admin_id_hash=%s leg=%s provider=%s model=%s error=%s status=%s "
+        "retryable=%s latency_ms=%d",
+        admin_id_hash(admin_id),
+        leg.value,
+        getattr(provider, "name", None) or "-",
+        getattr(provider, "model_name", None) or "-",
+        getattr(exc, "kind", None) or type(exc).__name__,
+        "-" if status is None else status,
+        bool(getattr(exc, "retryable", False)),
+        int((time.monotonic() - started) * 1000),
+    )
 
 
 def should_route_fast(*, requires_tools: bool, context_tokens: int, complexity: float) -> bool:
@@ -321,6 +369,7 @@ class LLMRouter:
             complexity=complexity,
         )
         if use_fast:
+            started = time.monotonic()
             try:
                 resp = await self._fast.complete(  # type: ignore[union-attr]
                     system_prompt, messages, tools=tools, **extra
@@ -329,20 +378,34 @@ class LLMRouter:
                 resp.used_fallback = False
                 self._note_usage(resp)
                 return resp
-            except ProviderError:
+            except ProviderError as exc:
                 # Fast provider failing is NOT the primary/fallback doctrine (§3.4.3
                 # governs primary→fallback only) — fall through to the normal primary
                 # path below rather than treating this as a tenant-visible failure.
-                pass
+                # Its cause is still logged (``llm_failover leg=fast``): the fast leg
+                # runs the same SDK as the primary, and nothing else records it.
+                _log_failover(
+                    ModelClass.fast, self._fast, exc, started=started, admin_id=effective_admin_id
+                )
 
+        started = time.monotonic()
         try:
             resp = await self._primary.complete(system_prompt, messages, tools=tools, **extra)
             resp.used_fallback = False
             self._note_usage(resp)
             return resp
-        except ProviderError:
+        except ProviderError as primary_error:
             # Immediate failover, NO retry on primary (§3.4.3). The neutral message
-            # shape replays any tool turns correctly through the other provider.
+            # shape replays any tool turns correctly through the other provider. The
+            # cause is logged BEFORE the fallback is tried, so it survives a fallback
+            # that hangs or fails too.
+            _log_failover(
+                ModelClass.primary,
+                self._primary,
+                primary_error,
+                started=started,
+                admin_id=effective_admin_id,
+            )
             try:
                 resp = await self._fallback.complete(system_prompt, messages, tools=tools, **extra)
             except ProviderError as exc:
