@@ -265,8 +265,8 @@ make that state explicit and test it.
   does to every line there (F035).
 - Lines are per failed call, not per turn, so no count of them is a metric: a tool loop
   can log several; `leg=fast` lines move no metric (the only per-call trace of a failing
-  fast leg; the model-currency watchdog catches only a retired pin, daily); session
-  summaries and ingest-time graph extraction log them with no metric; and a
+  fast leg; the model-currency watchdog catches a retired pin or a rejected key, daily);
+  session summaries and ingest-time graph extraction log them with no metric; and a
   `leg=primary` line comes before `llm_fallback_failed` when the fallback fails too. For
   a LlmFallbackAlarm page read `"llm_failover" "leg=primary"` (on an HTTP-triggered turn
   the line shares its `trace_id` with that turn's `llm_fallback_used session=` line); for

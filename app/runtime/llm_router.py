@@ -426,7 +426,8 @@ class LLMRouter:
                 # path below rather than treating this as a tenant-visible failure.
                 # Its cause is still logged (``llm_failover leg=fast``): the fast leg
                 # runs the same SDK as the primary, and nothing else records it per
-                # call (the model-currency watchdog catches only a retired pin, daily).
+                # call (the model-currency watchdog catches a retired pin or a rejected
+                # key, daily).
                 _log_failover(
                     ModelClass.fast, self._fast, exc, started=started, admin_id=effective_admin_id
                 )
