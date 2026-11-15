@@ -14,6 +14,7 @@ notices, and the once-only notice email sweep worker.
 - Price is $0/first 50 conversations then $39 CAD per 100-conversation PAYG block; no tiers, seats, or model picker.
 - Use Stripe Billing Meter event `luciel_payg_blocks`, idempotent delta reporting, persisted watermark, and replay-gated events.
 - Flush residual blocks on card detach and reset after `invoice.paid`.
+- A renewal arrives as the renewal invoice's `invoice.paid` (`billing_reason=subscription_cycle`); Stripe has no `customer.subscription.renewed`. Handle only event types Stripe sends (`tests/unit/test_stripe_event_types.py` checks them against stripe-python's list).
 
 ## Testing pointers
 - `tests/integration/test_metering.py` and `test_usage_reporting.py`.

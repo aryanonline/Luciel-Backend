@@ -29,7 +29,14 @@ Events handled:
                                       (owner decision D1, 2026-09-14): connections keep
                                       their status; only the day-7 dunning reduction
                                       dormants action tools.
-  * customer.subscription.renewed   → same as invoice.paid (§3.4.1b).
+
+A subscription renewal arrives as ``invoice.paid``: Stripe has no
+``customer.subscription.renewed`` event (the branch Axis8-F02 added for one never ran).
+When a period ends Stripe invoices it (``billing_reason`` ``subscription_cycle``), and
+the ``invoice.paid`` for that invoice is the period boundary. The
+``customer.subscription.updated`` sent as the period advances is not: it fires on any
+change to a subscription and does not mean anything was paid. Every other event type
+is acknowledged and ignored.
 """
 
 from __future__ import annotations
@@ -99,9 +106,6 @@ async def handle_event(
         action = await _on_pm_attached(session, admin_id=admin_id, account=account, event=event)
     elif event.type == "payment_method.detached":
         action = await _on_pm_detached(session, admin_id=admin_id, account=account)
-    elif event.type == "customer.subscription.renewed":
-        # §3.4.1b: subscription renewal triggers same period-reset as invoice.paid.
-        action = await _on_invoice_paid(session, admin_id=admin_id, account=account, event=event)
     else:
         action = "ignored"
 
