@@ -22,8 +22,10 @@ The contract pinned here:
   - the per-source re-sync is the same job;
   - a shutdown that cancels a running job stamps it "interrupted by a restart".
 
-The provider is a fake whose snapshot awaits ``asyncio.sleep``; the inline wait is
-monkeypatched down so a "slow" sync takes well under a second.
+The provider is a fake. A "slow" sync is one whose snapshot a ``_Gate`` holds until the
+request under test has answered, never a fixed sleep; the inline wait is monkeypatched
+down so a held job answers 202 at once. Only the shutdown tests still sleep (30 s): their
+job is cancelled long before that.
 """
 
 from __future__ import annotations
@@ -264,7 +266,7 @@ async def test_a_slow_sync_answers_202_and_the_row_then_reads_synced(api, monkey
     client, plan = api
     _admin, cid = await _ready(client)
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.6
+    gate = _hold_snapshots(plan)
 
     r = await _sync(client, cid)
     assert r.status_code == 202, r.text
@@ -285,6 +287,7 @@ async def test_a_slow_sync_answers_202_and_the_row_then_reads_synced(api, monkey
     assert running is not None and running["state"] == "syncing"
     assert running["result"] is None
 
+    await gate.release()
     await _finish(cid)
     job = await _job(client, cid)
     assert job is not None
@@ -298,16 +301,17 @@ async def test_a_second_start_while_syncing_is_a_409(api, monkeypatch):
     client, plan = api
     _admin, cid = await _ready(client)
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.6
+    gate = _hold_snapshots(plan)
 
     assert (await _sync(client, cid)).status_code == 202
+    await gate.reached()  # the first job is in its snapshot: its one provider call is made
     again = await _sync(client, cid)
     assert again.status_code == 409
     assert again.json()["message"] == sync_job.ALREADY_RUNNING
     assert plan.calls == 1  # the refused start ran nothing
 
+    await gate.release()
     await _finish(cid)
-    plan.delay = 0.0
     _inline_wait(monkeypatch, 20.0)
     assert (await _sync(client, cid)).status_code == 200  # finished: free to start again
 
@@ -354,11 +358,12 @@ async def test_a_job_in_this_process_past_the_grace_still_reads_syncing(api, mon
     _admin, cid = await _ready(client)
     _inline_wait(monkeypatch, 0.05)
     monkeypatch.setattr(get_settings(), "knowledge_sync_job_start_grace_seconds", 0)
-    plan.delay = 0.4
+    gate = _hold_snapshots(plan)
 
     assert (await _sync(client, cid)).status_code == 202
     assert (await _job(client, cid))["state"] == "syncing"
     assert (await _sync(client, cid)).status_code == 409
+    await gate.release()
     await _finish(cid)
     assert (await _job(client, cid))["state"] == "synced"
 
@@ -399,13 +404,14 @@ async def test_two_simultaneous_starts_are_one_job_and_one_409(api, monkeypatch)
     client, plan = api
     _admin, cid = await _ready(client)
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
 
     first, second = await asyncio.gather(_sync(client, cid), _sync(client, cid))
 
     assert sorted([first.status_code, second.status_code]) == [202, 409]
     refused = first if first.status_code == 409 else second
     assert refused.json()["message"] == sync_job.ALREADY_RUNNING
+    await gate.release()
     await _finish(cid)
     assert plan.calls == 1
 
@@ -496,8 +502,9 @@ async def test_a_down_embedder_is_the_shared_503_inline_and_failed_deferred(api,
     assert job is not None and job["state"] == "failed" and job["error"] == EMBEDDING_DOWN
 
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
     assert (await _sync(client, cid)).status_code == 202
+    await gate.release()
     await _finish(cid)
     job = await _job(client, cid)
     assert job is not None and job["state"] == "failed" and job["error"] == EMBEDDING_DOWN
@@ -725,9 +732,10 @@ async def test_a_shrink_is_409_inline_and_shrink_pending_deferred_then_confirm_c
     assert job["error"] == message
 
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.4
+    gate = _hold_snapshots(plan)
     deferred = await _sync(client, cid)
     assert deferred.status_code == 202
+    await gate.release()
     await _finish(cid)
     job = await _job(client, cid)
     assert job is not None
@@ -737,7 +745,6 @@ async def test_a_shrink_is_409_inline_and_shrink_pending_deferred_then_confirm_c
     assert job["result"] is None
 
     _inline_wait(monkeypatch, 20.0)
-    plan.delay = 0.0
     confirmed = await _sync(client, cid, confirm=True)
     assert confirmed.status_code == 200, confirmed.text
     assert sorted(confirmed.json()["removed"]) == [f"{SITE}/a", f"{SITE}/b", f"{SITE}/c"]
@@ -761,9 +768,10 @@ async def test_an_unreachable_site_is_the_same_409_inline_and_failed_deferred(ap
     assert job["state"] == "failed" and job["error"] == message
 
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.4
+    gate = _hold_snapshots(plan)
     deferred = await _sync(client, cid)
     assert deferred.status_code == 202
+    await gate.release()
     await _finish(cid)
     job = await _job(client, cid)
     assert job is not None
@@ -789,8 +797,9 @@ async def test_any_other_failure_is_a_503_with_the_owner_message_never_a_bare_50
     assert job["state"] == "failed" and job["error"] == sync_job.FAILED_GENERIC
 
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
     assert (await _sync(client, cid)).status_code == 202
+    await gate.release()
     await _finish(cid)
     job = await _job(client, cid)
     assert job is not None
@@ -1130,12 +1139,13 @@ async def test_resync_source_while_a_job_runs_is_a_409_with_one_provider_call(ap
     sid = (await _sources_of(admin, cid))[0].id
     calls_before = plan.calls
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
 
     assert (await _sync(client, cid)).status_code == 202
     r = await client.post(f"/api/v1/admin/knowledge/sources/{sid}/resync")
     assert r.status_code == 409
     assert r.json()["message"] == sync_job.ALREADY_RUNNING
+    await gate.release()
     await _finish(cid)
     assert plan.calls == calls_before + 1
 
@@ -1152,11 +1162,12 @@ async def test_resync_source_deferred_is_a_202_and_inline_is_the_refreshed_sourc
     assert (await _job(client, cid))["state"] == "synced"  # a stamped record, as the sync route
 
     _inline_wait(monkeypatch, 0.05)
-    plan.delay = 0.3
+    gate = _hold_snapshots(plan)
     deferred = await client.post(f"/api/v1/admin/knowledge/sources/{sid}/resync")
     assert deferred.status_code == 202, deferred.text
     body = deferred.json()
     assert body["connectionId"] == cid and body["state"] == "syncing" and body["startedAt"]
+    await gate.release()
     await _finish(cid)
     assert (await _job(client, cid))["startedAt"] == body["startedAt"]
     assert (await _job(client, cid))["state"] == "synced"
