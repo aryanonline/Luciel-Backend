@@ -368,6 +368,8 @@ async def test_a_failed_primary_logs_the_sdk_cause_and_never_the_response_body(
         r"error=BadRequestError status=400 retryable=False latency_ms=\d+",
         line,
     )
+    # Not in what the JSON formatter writes, nor anywhere else on a record (args, extras,
+    # exc_info): a handler that exports record attributes would ship those too.
     for record in caplog.records:
-        rendered = StructuredFormatter().format(record)
-        assert fake_key not in rendered and words not in rendered and "Jane Roe" not in rendered
+        for where in (StructuredFormatter().format(record), repr(vars(record))):
+            assert fake_key not in where and words not in where and "Jane Roe" not in where

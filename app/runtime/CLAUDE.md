@@ -246,19 +246,29 @@ make that state explicit and test it.
   the sync `with router.turn()` pays in the turn's first `complete()`.
 
 ## Failover cause (2026-11-15, from the anthropic 2.8 upgrade review)
-- `LLMFallbackUsed` / LlmFallbackAlarm count fallback turns but carry no cause, so the
-  router logs ONE WARNING `llm_failover` line each time a leg's `ProviderError` moves a
-  call to the next leg, before that leg is tried: `admin_id_hash`, `leg` (`primary` → the
-  fallback answers; `fast` → the primary answers and no metric moves, so this line is the
-  only trace of a broken fast pin), `provider` (routing name), `model`
-  (`AnthropicProvider.model_name`; `-` for doubles), `error` (`ProviderError.kind`: the
-  SDK exception class, e.g. `OverloadedError`, `BadRequestError`, `NotFoundError`,
-  `APITimeoutError`; else the error's own class), `status` (`-` when there is none),
-  `retryable`, and the failed call's `latency_ms`. Never the exception message (the
-  SDK's embeds the API's response body, which can echo the request), never `exc_info`,
-  never prompt/reply/tool content.
-- One line per failed call, not per turn: a tool loop can log several, and session
-  summaries and ingest-time graph extraction (fast-leg callers) log it too. The
-  fallback's own failures log none: its 429/529 retry stays on the same leg, and when it
-  fails too (`LLMUnavailable`) only the primary's cause is on record
-  (`tests/unit/test_llm_failover_cause.py`).
+- `LLMFallbackUsed` / LlmFallbackAlarm and `LLMUnavailable` / LlmUnavailableAlarm count
+  turns but carry no cause, so the router logs WARNING cause lines: `llm_failover` each
+  time a leg's `ProviderError` moves a call to the next leg, before that leg is tried,
+  and `llm_fallback_failed` when the fallback fails for good, just before its error goes
+  up. Fields: `admin_id_hash`, `leg` (`fast`: the primary is tried next; `primary`: the
+  fallback is tried next; `fallback`), `provider` (routing name), `model` (the
+  provider's `model_name`; `-` for doubles), `error` (`ProviderError.kind`: the SDK
+  exception class, e.g. `OverloadedError`, `BadRequestError`, `NotFoundError`,
+  `AuthenticationError`, `APITimeoutError`; else the error's own class), `status` (`-`
+  when there is none), `retryable`, the failed call's own `latency_ms`, and on
+  `llm_fallback_failed` the `attempt` (2 when the one 429/529 retry failed too, timed
+  alone). Never the exception message (an SDK's embeds the API's response body, which can
+  echo the request), never `exc_info`, never prompt/reply/tool content.
+- The message names the tenant only by `admin_id_hash`. On an admin-plane request,
+  though (an owner's paste, upload or CSV ingest reaching graph extraction's fast leg),
+  the JSON formatter attaches the acting tenant's raw `admin_id` to the record, as it
+  does to every line there (F035).
+- Lines are per failed call, not per turn, so no count of them is a metric: a tool loop
+  can log several; `leg=fast` lines move no metric (the only per-call trace of a failing
+  fast leg; the model-currency watchdog catches only a retired pin, daily); session
+  summaries and ingest-time graph extraction log them with no metric; and a
+  `leg=primary` line comes before `llm_fallback_failed` when the fallback fails too. For
+  a LlmFallbackAlarm page read `"llm_failover" "leg=primary"` (on an HTTP-triggered turn
+  the line shares its `trace_id` with that turn's `llm_fallback_used session=` line); for
+  LlmUnavailableAlarm add `"llm_fallback_failed"` (`tests/unit/test_llm_failover_cause.py`,
+  `tests/integration/test_round7_llm_telemetry.py`).

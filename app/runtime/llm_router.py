@@ -130,9 +130,9 @@ class ProviderError(Exception):
 
     ``kind`` names what failed and says nothing about the request: the SDK exception's
     class name (``OverloadedError``, ``BadRequestError``, ``APITimeoutError``), or None
-    when the raiser knows no more (the router's ``llm_failover`` line then logs this
-    error's own class name). The message is never logged: an SDK message can carry the
-    API's response body."""
+    when the raiser knows no more (the router's cause lines, ``llm_failover`` and
+    ``llm_fallback_failed``, then log this error's own class name). The message is never
+    logged: an SDK message can carry the API's response body."""
 
     def __init__(
         self,
@@ -162,6 +162,40 @@ def _fallback_retry_delay() -> float:
     return max(0.0, min(delay, ceiling))
 
 
+# The fields every cause line carries (``llm_failover``, ``llm_fallback_failed``), as
+# key=value in the message: the structured formatter renders no extras.
+_CAUSE_FIELDS = (
+    "admin_id_hash=%s leg=%s provider=%s model=%s error=%s status=%s retryable=%s latency_ms=%d"
+)
+
+
+def _cause(
+    leg: str,
+    provider: object,
+    exc: ProviderError,
+    *,
+    started: float,
+    admin_id: uuid.UUID | None,
+) -> tuple[object, ...]:
+    """The values for ``_CAUSE_FIELDS``, every one content-free: tenant hash, leg,
+    routing name, model pin, exception class, HTTP status, retryable flag, and how long
+    the failed call took. Never the exception message (an SDK message embeds the API's
+    response body, which can echo the request) and never ``exc_info`` (its traceback
+    prints that message). Attributes are read defensively: a cause line must not be
+    able to break the call it reports."""
+    status = getattr(exc, "status_code", None)
+    return (
+        admin_id_hash(admin_id),
+        leg,
+        getattr(provider, "name", None) or "-",
+        getattr(provider, "model_name", None) or "-",
+        getattr(exc, "kind", None) or type(exc).__name__,
+        "-" if status is None else status,
+        bool(getattr(exc, "retryable", False)),
+        int((time.monotonic() - started) * 1000),
+    )
+
+
 def _log_failover(
     leg: ModelClass,
     provider: object,
@@ -170,30 +204,38 @@ def _log_failover(
     started: float,
     admin_id: uuid.UUID | None,
 ) -> None:
-    """Log WHY a leg failed, once, as the router moves the call to the next leg.
+    """Log WHY a leg failed, once, as the router moves the call to the next leg, and
+    before that leg is tried.
 
-    ``leg=primary``: the fallback answers next, so these are the calls behind
-    LLMFallbackUsed and LlmFallbackAlarm, which carry no cause of their own.
-    ``leg=fast``: the primary answers next and no metric moves, so this line is the
-    only trace of a broken fast leg. Every field is content-free: routing name, model
-    pin, exception class, HTTP status, retryable flag, latency, tenant hash. Never
-    the exception message (an SDK message embeds the API's response body, which can
-    echo the request) and never ``exc_info`` (its traceback prints that message).
-    Attributes are read defensively: this line must not be able to break the
-    failover it reports."""
-    status = getattr(exc, "status_code", None)
-    # key=value in the message: the structured formatter renders no extras.
+    ``leg=primary``: the fallback is tried next. If it answers, an orchestrator turn
+    counts in LLMFallbackUsed (LlmFallbackAlarm), which carries no cause of its own; if
+    it fails too, ``llm_fallback_failed`` follows and the turn counts in LLMUnavailable.
+    Session summaries and ingest-time graph extraction call the router too, and their
+    lines move no metric. ``leg=fast``: the primary is tried next and no metric moves,
+    so this is the only per-call trace of a failing fast leg. One line per failed call,
+    not per turn, so counting these lines does not count LLMFallbackUsed turns."""
     logger.warning(
-        "llm_failover admin_id_hash=%s leg=%s provider=%s model=%s error=%s status=%s "
-        "retryable=%s latency_ms=%d",
-        admin_id_hash(admin_id),
-        leg.value,
-        getattr(provider, "name", None) or "-",
-        getattr(provider, "model_name", None) or "-",
-        getattr(exc, "kind", None) or type(exc).__name__,
-        "-" if status is None else status,
-        bool(getattr(exc, "retryable", False)),
-        int((time.monotonic() - started) * 1000),
+        "llm_failover " + _CAUSE_FIELDS,
+        *_cause(leg.value, provider, exc, started=started, admin_id=admin_id),
+    )
+
+
+def _log_fallback_failed(
+    provider: object,
+    exc: ProviderError,
+    *,
+    started: float,
+    admin_id: uuid.UUID | None,
+    attempt: int,
+) -> None:
+    """Log WHY the fallback failed for good, just before its error goes up: no leg is
+    left. On an orchestrator turn the llm_unavailable path follows (LLMUnavailable,
+    LlmUnavailableAlarm), and it logs no cause of its own. ``attempt`` is 2 when the
+    failure ended the one 429/529 retry, and ``latency_ms`` is then the retry's own."""
+    logger.warning(
+        "llm_fallback_failed " + _CAUSE_FIELDS + " attempt=%d",
+        *_cause("fallback", provider, exc, started=started, admin_id=admin_id),
+        attempt,
     )
 
 
@@ -383,7 +425,8 @@ class LLMRouter:
                 # governs primary→fallback only) — fall through to the normal primary
                 # path below rather than treating this as a tenant-visible failure.
                 # Its cause is still logged (``llm_failover leg=fast``): the fast leg
-                # runs the same SDK as the primary, and nothing else records it.
+                # runs the same SDK as the primary, and nothing else records it per
+                # call (the model-currency watchdog catches only a retired pin, daily).
                 _log_failover(
                     ModelClass.fast, self._fast, exc, started=started, admin_id=effective_admin_id
                 )
@@ -406,10 +449,14 @@ class LLMRouter:
                 started=started,
                 admin_id=effective_admin_id,
             )
+            started = time.monotonic()
             try:
                 resp = await self._fallback.complete(system_prompt, messages, tools=tools, **extra)
             except ProviderError as exc:
                 if not exc.retryable:
+                    _log_fallback_failed(
+                        self._fallback, exc, started=started, admin_id=effective_admin_id, attempt=1
+                    )
                     raise
                 # ONE bounded retry on the fallback leg for the 429/529 class only
                 # (round 7 WP-2, item 6): a 529 on the primary and a 429 on the
@@ -417,7 +464,20 @@ class LLMRouter:
                 # and hand the customer the outage line. Anything else — auth, a bad
                 # request, a timeout — still fails immediately.
                 await asyncio.sleep(_fallback_retry_delay())
-                resp = await self._fallback.complete(system_prompt, messages, tools=tools, **extra)
+                started = time.monotonic()
+                try:
+                    resp = await self._fallback.complete(
+                        system_prompt, messages, tools=tools, **extra
+                    )
+                except ProviderError as retry_error:
+                    _log_fallback_failed(
+                        self._fallback,
+                        retry_error,
+                        started=started,
+                        admin_id=effective_admin_id,
+                        attempt=2,
+                    )
+                    raise
             resp.used_fallback = True
             self._note_usage(resp)
             return resp
