@@ -175,6 +175,12 @@ the Python scripts.
      --policy-document file://luciel-ses-send.json
    ```
 
+   Leave every `OTEL_*` variable off the task definitions, console edits included. fastapi 0.162
+   reads `OTEL_PROPAGATORS` when it is imported, so a propagator that is not installed (the usual
+   X-Ray value, for one) stops the app from starting.
+   [`tests/unit/test_fastapi_telemetry_off.py`](../../tests/unit/test_fastapi_telemetry_off.py)
+   checks the Dockerfile, the entrypoint and the CDK app, but it cannot see the console.
+
 7. **Workflows.** Re-enable them now, not before step 6: `dev-cost-guard` stops dev's database
    whenever every service is at zero.
 
@@ -218,6 +224,22 @@ the Python scripts.
     secure checkout just now.** means Stripe refused the session, and the API service's log has
     its error. Remove the card again afterwards (**Remove payment method**), so the walk account
     is back to no card on file.
+
+    Then confirm that the primary model answered. The Anthropic SDK moved to 2.x while dev was
+    paused: it now sends `anthropic-version: 2026-10-21` with `Authorization: Bearer`, and that
+    request has not run live yet. A failure would not fail a turn. Every call would fall over to
+    OpenAI, and only `LlmFallbackAlarm` (5 or more fallback turns in 15 minutes) would notice. The
+    services' logs must have `llm_usage` lines with `provider=anthropic` and the primary model
+    (`claude-sonnet-4-6`, unless the model-currency job has moved it), and the `LLMFallbackUsed`
+    metric (namespace `Luciel`) must stay at zero.
+
+    ```bash
+    for svc in data-plane control-plane; do
+      aws logs filter-log-events --region ca-central-1 --log-group-name "/luciel/dev/$svc" \
+        --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+        --filter-pattern '"llm_usage" "provider=anthropic"' --query 'length(events)' --output text
+    done
+    ```
 
 11. **Steward routine.** Resume the monthly steward routine.
 12. **Guard budget.** Delete `luciel-paused-guard`, or raise its limit: a running dev costs about
