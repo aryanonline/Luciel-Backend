@@ -71,8 +71,17 @@ def current_period(
     (a failed invoice under dunning, a cancelled subscription, a delayed webhook), the
     anchor rolls forward by whole billing cycles here rather than freezing (audit
     F030: the free 50 stopped resetting the first time a webhook never came).
+
+    This roll is also what moves the counter at an ordinary renewal: Stripe does not try
+    to collect the renewal invoice until an hour after creating it, so its
+    ``invoice.paid`` lands after the cycle has already ended here. Each rolled
+    cycle keeps Stripe's anchor day (``next_period_end``): a Jan-31 anchor rolls Feb 28
+    → Mar 31, not Feb 28 → Mar 28, which opened a second free 50 three days early.
     """
-    from app.billing.stripe_gateway import add_months  # noqa: PLC0415 — avoid import cycle
+    from app.billing.stripe_gateway import (  # noqa: PLC0415 — avoid import cycle
+        add_months,
+        next_period_end,
+    )
 
     now = now or datetime.now(UTC)
     if account is None or account.period_start is None:
@@ -86,7 +95,7 @@ def current_period(
     if resets <= start:
         resets = add_months(start, 1)
     while now >= resets:
-        start, resets = resets, add_months(resets, 1)
+        start, resets = resets, next_period_end(start, resets)
     return start.date(), resets
 
 

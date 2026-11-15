@@ -47,9 +47,14 @@ from app.config import FAKE_STRIPE_WEBHOOK_SECRET
 _log = logging.getLogger(__name__)
 
 
-def add_months(moment: datetime, months: int) -> datetime:
+def add_months(moment: datetime, months: int, *, day: int | None = None) -> datetime:
     """``moment`` shifted by whole months, clamping the day the way Stripe anchors do
-    (a Jan-31 anchor bills on Feb-28, then Mar-31)."""
+    (a Jan-31 anchor bills on Feb-28, then Mar-31).
+
+    ``day`` is the anchor's day of the month and defaults to ``moment``'s own. Pass it
+    whenever ``moment`` may itself be a clamped date: Feb 28 + 1 month is Mar 28, but
+    the renewal after a Jan-31 anchor's Feb-28 one is Mar 31 (``day=31``). Use
+    :func:`next_period_end` to step from one billing period to the next."""
     month_index = moment.month - 1 + months
     year = moment.year + month_index // 12
     month = month_index % 12 + 1
@@ -59,7 +64,25 @@ def add_months(moment: datetime, months: int) -> datetime:
     else:
         first_of_next = datetime(year, month + 1, 1, tzinfo=moment.tzinfo)
         last_day = (first_of_next - datetime(year, month, 1, tzinfo=moment.tzinfo)).days
-    return moment.replace(year=year, month=month, day=min(moment.day, last_day))
+    return moment.replace(year=year, month=month, day=min(day or moment.day, last_day))
+
+
+def next_period_end(start: datetime, end: datetime) -> datetime:
+    """When the monthly billing period after ``[start, end)`` ends.
+
+    Stripe keeps the anchor's day of the month and clamps it to each month's length: a
+    Jan-31 anchor renews on Feb 28, Mar 31, Apr 30, May 31
+    (docs.stripe.com/billing/subscriptions/billing-cycle). ``add_months(end, 1)`` loses
+    that day as soon as ``end`` is a clamped date (Feb 28 + 1 month = Mar 28), so the
+    day is read from the pair instead. Of two consecutive months one always has 31
+    days, where no anchor day is clamped, so the larger of the two days is the anchor's.
+    A pair that is not one whole monthly period on that day (a prorated or
+    threshold-cut period) has no anchor day to read; the next period is then one plain
+    month after ``end``."""
+    day = max(start.day, end.day)
+    if add_months(start, 0, day=day) == start and add_months(start, 1, day=day) == end:
+        return add_months(end, 1, day=day)
+    return add_months(end, 1)
 
 
 @dataclass(frozen=True)

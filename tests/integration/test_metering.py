@@ -564,6 +564,91 @@ async def test_customer_subscription_renewed_is_not_treated_as_a_renewal() -> No
         assert paid == []
 
 
+class _SubscriptionReadFails(FakeStripeGateway):
+    async def get_subscription_period(self, *, subscription_id: str):  # type: ignore[override]
+        raise RuntimeError("stripe unavailable")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize("stripe_says", ["the_new_period", "nothing", "a_later_period", "error"])
+async def test_a_month_end_renewal_ends_the_next_period_on_stripes_date(stripe_says: str) -> None:
+    """A subscription anchored on Jan 31 renews on Feb 28, then on Mar 31: Stripe clamps
+    the anchor's day to each month's length. The renewal's invoice.paid used to set the
+    next end to add_months(Feb 28, 1) = Mar 28, so from Mar 28 the counter ran a period
+    Stripe never opened, with a second free 50. The end now comes from Stripe's
+    subscription. When Stripe cannot say, or already names a later period (the invoice
+    was paid after the next renewal), it follows from the settled period's own bounds."""
+    from app.billing.stripe_gateway import set_stripe_gateway
+
+    jan31 = datetime(2030, 1, 31, 14, 5, tzinfo=UTC)
+    feb28 = datetime(2030, 2, 28, 14, 5, tzinfo=UTC)
+    mar31 = datetime(2030, 3, 31, 14, 5, tzinfo=UTC)
+    apr30 = datetime(2030, 4, 30, 14, 5, tzinfo=UTC)
+    admin = uuid.uuid4()
+    iid = await _seed_tenant(admin)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.billing_state = "payg_enabled"
+        acct.stripe_customer_id = "cus_month_end"
+        acct.stripe_subscription_id = "sub_month_end"
+        acct.period_start = jan31  # the bounds the subscription had when it was bound
+        acct.period_resets_at = feb28
+        acct.accrual_period_start = jan31.date()
+        await s.flush()
+    gw = _SubscriptionReadFails() if stripe_says == "error" else FakeStripeGateway()
+    if stripe_says == "the_new_period":
+        gw.subscription_periods["sub_month_end"] = (feb28, mar31)
+    elif stripe_says == "a_later_period":
+        gw.subscription_periods["sub_month_end"] = (mar31, apr30)
+    renewal = StripeEvent(
+        event_id=f"evt_month_end_{stripe_says}",
+        type="invoice.paid",
+        data={
+            "object": "invoice",
+            "customer": "cus_month_end",
+            "billing_reason": "subscription_cycle",
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {"subscription": "sub_month_end"},
+            },
+            "period_start": int(jan31.timestamp()),
+            "period_end": int(feb28.timestamp()),
+        },
+    )
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            action = await billing_webhooks.handle_event(s, admin_id=admin, event=renewal)
+    finally:
+        set_stripe_gateway(None)
+    assert action == "invoice_paid"
+
+    async with tenant_session(admin) as s:
+        s.add(
+            ConversationBudget(
+                id=uuid.uuid4(),
+                admin_id=admin,
+                instance_id=iid,
+                billing_period_start=feb28.date(),
+                counted_conversations=70,
+                counted_session_ids=[str(uuid.uuid4()) for _ in range(70)],
+            )
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.period_start, acct.period_resets_at) == (feb28, mar31)
+        # Mar 29 is still inside Stripe's Feb 28 - Mar 31 period: the same 70 conversations.
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=datetime(2030, 3, 29, tzinfo=UTC)
+        )
+        assert (b.conversations_this_period, b.period_resets_at) == (70, mar31)
+        # The next period opens on Stripe's renewal date and ends on the next one.
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=mar31 + timedelta(hours=1)
+        )
+        assert (b.conversations_this_period, b.period_resets_at) == (0, apr30)
+
+
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_invoice_paid_restores_dormant_connections():
     """Axis8-F04: invoice.paid must restore dormant connections to unconfigured."""

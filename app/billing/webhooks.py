@@ -52,7 +52,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audit import log as audit
 from app.billing import dunning, metering
 from app.billing.metering import get_or_create_billing_account
-from app.billing.stripe_gateway import StripeEvent, add_months, get_stripe_gateway
+from app.billing.stripe_gateway import (
+    StripeEvent,
+    add_months,
+    get_stripe_gateway,
+    next_period_end,
+)
 from app.models.audit import ActorType
 from app.models.billing import BillingAccount, ProcessedStripeEvent
 from app.models.connection import InstanceConnection
@@ -128,6 +133,8 @@ async def _on_invoice_paid(
     invoice's ``period_end`` (which is the next period's start) — the old code wrote
     ``period_start`` back as the anchor, re-opening the period that had just been paid
     for (audit F005). When the invoice carries no period the anchor advances one cycle.
+    The new period's end is Stripe's own (``_renewed_period_end``), never a month added
+    to a clamped date: a Jan-31 anchor's Feb-28 period ends on Mar 31.
 
     The counter is keyed by period start, so the new period reads zero without deleting
     anything: the settled period's ``conversation_budgets`` / ``counted_sessions`` rows
@@ -148,25 +155,18 @@ async def _on_invoice_paid(
         return await _on_ended_subscription_paid(
             session, admin_id=admin_id, account=account, subscription_id=billed_subscription
         )
-    prev_start = account.period_start
-    ps = event.data.get("period_start")
-    pe = event.data.get("period_end")
-    if isinstance(pe, (int, float)):
-        new_start = datetime.fromtimestamp(pe, tz=UTC)
-    elif isinstance(ps, (int, float)):
-        new_start = add_months(datetime.fromtimestamp(ps, tz=UTC), 1)
-    elif account.period_resets_at is not None:
-        new_start = account.period_resets_at.astimezone(UTC)
-    elif account.period_start is not None:
-        new_start = add_months(account.period_start.astimezone(UTC), 1)
-    else:
-        new_start = datetime.now(UTC)
+    prev_start = account.period_start.astimezone(UTC) if account.period_start else None
+    settled_from, new_start = _settled_period(account, event)
     # Never move the anchor backwards: a late-delivered invoice for a period the anchor
     # has already rolled past (current_period advances on its own) must not re-open it.
-    if prev_start is not None and new_start <= prev_start.astimezone(UTC):
-        new_start = prev_start.astimezone(UTC)
-    account.period_start = new_start
-    account.period_resets_at = add_months(new_start, 1)
+    # Such an invoice leaves the period exactly as it is, end included.
+    if prev_start is not None and new_start <= prev_start:
+        new_start = prev_start
+    else:
+        account.period_start = new_start
+        account.period_resets_at = await _renewed_period_end(
+            account, start=new_start, settled_from=settled_from
+        )
 
     # The usage watermarks reset ONLY when they still describe the period this invoice
     # settled. Two cases must leave them alone: the $0 invoice Stripe issues at
@@ -203,9 +203,7 @@ async def _on_invoice_paid(
             "rollover": False,
             "ledger_retained": True,
             "period_start": new_start.date().isoformat(),
-            "previous_period_start": (
-                prev_start.astimezone(UTC).date().isoformat() if prev_start else None
-            ),
+            "previous_period_start": prev_start.date().isoformat() if prev_start else None,
         },
     )
     if prev_dunning != account.dunning_state:
@@ -220,6 +218,61 @@ async def _on_invoice_paid(
     # Legal §A3: restore dormant connections on successful payment.
     await _restore_dormant_connections(session, admin_id=admin_id, reason="invoice_paid")
     return "invoice_paid"
+
+
+def _settled_period(
+    account: BillingAccount, event: StripeEvent
+) -> tuple[datetime | None, datetime]:
+    """The period a paid invoice settled, as ``(start, end)``: ``end`` is where the next
+    period starts, ``start`` is None when nothing says where the settled one began.
+
+    A cycle invoice states both (``period_start`` / ``period_end``). An event without
+    them falls back to the account's own period, then to one cycle on from its anchor.
+    """
+    ps = event.data.get("period_start")
+    pe = event.data.get("period_end")
+    start = datetime.fromtimestamp(ps, tz=UTC) if isinstance(ps, (int, float)) else None
+    if isinstance(pe, (int, float)):
+        return start, datetime.fromtimestamp(pe, tz=UTC)
+    if start is not None:
+        return start, add_months(start, 1)
+    anchor = account.period_start.astimezone(UTC) if account.period_start else None
+    if account.period_resets_at is not None:
+        return anchor, account.period_resets_at.astimezone(UTC)
+    if anchor is not None:
+        return anchor, add_months(anchor, 1)
+    return None, datetime.now(UTC)
+
+
+async def _renewed_period_end(
+    account: BillingAccount, *, start: datetime, settled_from: datetime | None
+) -> datetime:
+    """When the period that a paid cycle invoice opened at ``start`` ends.
+
+    Stripe's subscription holds the answer (``items[].current_period_end``) and is asked
+    first, as it is when the subscription is bound (``metering._anchor_to_subscription``).
+    The answer counts only when it describes this period: an invoice paid after the next
+    renewal finds the subscription a period further on. Otherwise the end follows from
+    the settled period's own bounds, on Stripe's anchor day (``next_period_end``).
+    ``add_months(start, 1)`` used to set it, which put the renewal after a Jan-31
+    anchor's Feb-28 one on Mar 28 instead of Mar 31, so the counter rolled into a new
+    period, with a second free 50, three days before Stripe's period ended.
+    """
+    if account.stripe_subscription_id is not None:
+        try:
+            bounds = await get_stripe_gateway().get_subscription_period(
+                subscription_id=account.stripe_subscription_id
+            )
+        except Exception:  # noqa: BLE001 — the computed end below serves instead
+            _log.exception("subscription period read failed admin_id=%s", account.admin_id)
+            bounds = None
+        if bounds is not None:
+            current_start, current_end = bounds[0].astimezone(UTC), bounds[1].astimezone(UTC)
+            if current_start == start and current_end > start:
+                return current_end
+    if settled_from is not None and settled_from < start:
+        return next_period_end(settled_from, start)
+    return add_months(start, 1)
 
 
 def _invoice_subscription_id(event: StripeEvent) -> str | None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
-from app.billing.stripe_gateway import add_months
+from app.billing.stripe_gateway import add_months, next_period_end
 from app.models.billing import BillingAccount
 from app.runtime.budget import current_period, period_start_for
 
@@ -71,3 +71,50 @@ def test_add_months_clamps_like_a_stripe_billing_anchor():
     assert add_months(datetime(2028, 1, 31, tzinfo=UTC), 1) == datetime(2028, 2, 29, tzinfo=UTC)
     assert add_months(datetime(2026, 12, 15, tzinfo=UTC), 1) == datetime(2027, 1, 15, tzinfo=UTC)
     assert add_months(datetime(2026, 3, 31, tzinfo=UTC), 1) == datetime(2026, 4, 30, tzinfo=UTC)
+
+
+def _utc(*parts: int) -> datetime:
+    return datetime(*parts, tzinfo=UTC)
+
+
+def test_add_months_steps_a_clamped_date_on_the_anchors_day():
+    """A clamped date has lost its anchor's day: Feb 28 + 1 month is Mar 28, while the
+    renewal after a Jan-31 anchor's Feb 28 one is Mar 31. ``day`` carries the anchor's."""
+    assert add_months(_utc(2030, 2, 28), 1) == _utc(2030, 3, 28)
+    assert add_months(_utc(2030, 2, 28), 1, day=31) == _utc(2030, 3, 31)
+    assert add_months(_utc(2030, 4, 30), 1, day=31) == _utc(2030, 5, 31)
+    assert add_months(_utc(2032, 1, 30), 1, day=30) == _utc(2032, 2, 29)  # leap year
+    assert add_months(_utc(2030, 1, 31, 14, 5), 0, day=31) == _utc(2030, 1, 31, 14, 5)
+
+
+def test_the_next_period_keeps_stripes_anchor_day():
+    """docs.stripe.com/billing/subscriptions/billing-cycle: a Jan-31 anchor bills Feb 28
+    (Feb 29 in a leap year), then Mar 31, Apr 30. The day is read off the pair of
+    boundaries, the time of day is kept, and a pair that is not one whole monthly period
+    (a prorated first period) steps one plain month."""
+    assert next_period_end(_utc(2030, 1, 31), _utc(2030, 2, 28)) == _utc(2030, 3, 31)
+    assert next_period_end(_utc(2030, 2, 28), _utc(2030, 3, 31)) == _utc(2030, 4, 30)
+    assert next_period_end(_utc(2030, 3, 31), _utc(2030, 4, 30)) == _utc(2030, 5, 31)
+    assert next_period_end(_utc(2032, 1, 31), _utc(2032, 2, 29)) == _utc(2032, 3, 31)
+    assert next_period_end(_utc(2030, 1, 30), _utc(2030, 2, 28)) == _utc(2030, 3, 30)
+    assert next_period_end(_utc(2030, 1, 29), _utc(2030, 2, 28)) == _utc(2030, 3, 29)
+    assert next_period_end(_utc(2030, 2, 28), _utc(2030, 3, 28)) == _utc(2030, 4, 28)
+    assert next_period_end(_utc(2030, 11, 30), _utc(2030, 12, 31)) == _utc(2031, 1, 31)
+    assert next_period_end(_utc(2030, 1, 15), _utc(2030, 2, 15)) == _utc(2030, 3, 15)
+    assert next_period_end(_utc(2030, 1, 31, 14, 5, 9), _utc(2030, 2, 28, 14, 5, 9)) == _utc(
+        2030, 3, 31, 14, 5, 9
+    )
+    assert next_period_end(_utc(2030, 1, 10), _utc(2030, 2, 1)) == _utc(2030, 3, 1)
+
+
+def test_a_month_end_anchor_rolls_on_stripes_dates():
+    """The roll used to chain add_months on its own clamped result: a Jan-31 anchor rolled
+    to Feb 28 and then Mar 28, so from Mar 28 to Mar 31 the counter sat in a period
+    Stripe never opened, with a second free 50, and periodResetsAt named the wrong day."""
+    bound = _account(_utc(2030, 1, 31), _utc(2030, 2, 28))
+    assert current_period(bound, _utc(2030, 3, 29)) == (date(2030, 2, 28), _utc(2030, 3, 31))
+    assert current_period(bound, _utc(2030, 3, 31)) == (date(2030, 3, 31), _utc(2030, 4, 30))
+    assert current_period(bound, _utc(2030, 5, 1)) == (date(2030, 4, 30), _utc(2030, 5, 31))
+    renewed = _account(_utc(2030, 2, 28), _utc(2030, 3, 31))
+    assert current_period(renewed, _utc(2030, 3, 29)) == (date(2030, 2, 28), _utc(2030, 3, 31))
+    assert current_period(renewed, _utc(2030, 4, 30)) == (date(2030, 4, 30), _utc(2030, 5, 31))
