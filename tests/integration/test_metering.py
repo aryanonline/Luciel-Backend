@@ -867,6 +867,50 @@ async def test_a_late_invoice_never_moves_the_anchor_backwards() -> None:
 
 
 @pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+async def test_a_late_invoice_leaves_the_period_end_alone() -> None:
+    """An invoice that does not advance the anchor changes nothing about the period. It
+    used to rewrite the end as add_months(anchor, 1), which for a Jan-31 anchor's Feb-28
+    period replaced Stripe's Mar 31 with Mar 28. The audit row does not claim the period
+    advanced either."""
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    await _seed_tenant(admin)
+    feb28, mar31 = datetime(2030, 2, 28, tzinfo=UTC), datetime(2030, 3, 31, tzinfo=UTC)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.period_start = feb28
+        acct.period_resets_at = mar31
+        await s.flush()
+    event = StripeEvent(
+        event_id="evt_late_month_end",
+        type="invoice.paid",
+        data={
+            "billing_reason": "subscription_cycle",
+            "period_start": int(datetime(2029, 12, 31, tzinfo=UTC).timestamp()),
+            "period_end": int(datetime(2030, 1, 31, tzinfo=UTC).timestamp()),
+        },
+    )
+    async with tenant_session(admin) as s:
+        assert await billing_webhooks.handle_event(s, admin_id=admin, event=event) == (
+            "invoice_paid"
+        )
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.period_start, acct.period_resets_at) == (feb28, mar31)
+        payload = (
+            await s.execute(
+                sa_select(AdminAuditLog.event_payload).where(
+                    AdminAuditLog.admin_id == admin,
+                    AdminAuditLog.event_type == "invoice_paid",
+                )
+            )
+        ).scalar_one()
+        assert (payload["reset"], payload["reason"]) == ("none", "period_already_current")
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
 async def test_pm_attached_clears_dunning_and_makes_the_card_the_invoice_default() -> None:
     """A new card is the remedy for a failing one (F012): dunning clears on attach instead
     of holding the account in reduced service until an invoice happens to succeed. And the

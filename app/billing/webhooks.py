@@ -33,13 +33,18 @@ Events handled:
                                       their status; only the day-7 dunning reduction
                                       dormants action tools.
 
-A subscription renewal arrives as ``invoice.paid``: Stripe has no
+A subscription renewal reaches this module as the renewal invoice's ``invoice.paid``
+(``billing_reason`` ``subscription_cycle``). Stripe has no
 ``customer.subscription.renewed`` event (the branch Axis8-F02 added for one never ran).
-When a period ends Stripe invoices it (``billing_reason`` ``subscription_cycle``), and
-the ``invoice.paid`` for that invoice is the period boundary. The
-``customer.subscription.updated`` sent as the period advances is not: it fires on any
-change to a subscription and does not mean anything was paid. Every other event type
-is acknowledged and ignored.
+The counter itself rolls at the cycle end by time (``budget.current_period``, F030):
+Stripe does not try to collect the renewal invoice until an hour after creating it, so
+the period has already turned when this event lands. The renewal's ``invoice.paid``
+then moves the stored anchor to the invoice's ``period_end`` and takes the new period's
+end from Stripe, flushes the settled period's residual under that period's own
+identifiers, resets the watermarks unless a counted turn already rolled them, clears
+dunning and restores dormant connections. The ``customer.subscription.updated`` sent as
+the period advances changes nothing: it fires on any change to a subscription and does
+not mean anything was paid. Every other event type is acknowledged and ignored.
 """
 
 from __future__ import annotations
@@ -188,10 +193,12 @@ async def _on_invoice_paid(
     settled_from, new_start = _settled_period(account, event)
     # Never move the anchor backwards: a late-delivered invoice for a period the anchor
     # has already rolled past (current_period advances on its own) must not re-open it.
-    # Such an invoice leaves the period exactly as it is, end included.
+    # Such an invoice, or the same invoice delivered again as a separate event, leaves
+    # the period exactly as it is, end included.
     if prev_start is not None and new_start <= prev_start:
-        new_start = prev_start
+        new_start, advanced = prev_start, False
     else:
+        advanced = True
         account.period_start = new_start
         account.period_resets_at = await _renewed_period_end(
             account, start=new_start, settled_from=settled_from
@@ -222,13 +229,20 @@ async def _on_invoice_paid(
     account.dunning_started_at = None
     await session.flush()
 
+    # "period_advanced" only when the anchor moved: the owner's log renders it as "billing
+    # period advanced", which a late or repeated invoice did not do.
+    reset: dict[str, object] = (
+        {"reset": "period_advanced"}
+        if advanced
+        else {"reset": "none", "reason": "period_already_current"}
+    )
     await audit.emit(
         session,
         admin_id=admin_id,
         actor_type=ActorType.platform,
         event_type="invoice_paid",
         payload={
-            "reset": "period_advanced",
+            **reset,
             "rollover": False,
             "ledger_retained": True,
             "period_start": new_start.date().isoformat(),

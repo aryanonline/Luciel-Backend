@@ -13,8 +13,10 @@ notices, and the once-only notice email sweep worker.
 ## Contracts this module owns
 - Price is $0/first 50 conversations then $39 CAD per 100-conversation PAYG block; no tiers, seats, or model picker.
 - Use Stripe Billing Meter event `luciel_payg_blocks`, idempotent delta reporting, persisted watermark, and replay-gated events.
-- Flush residual blocks on card detach and reset after `invoice.paid`.
-- A renewal arrives as the renewal invoice's `invoice.paid` (`billing_reason=subscription_cycle`); Stripe has no `customer.subscription.renewed`. Handle only event types Stripe sends (`tests/unit/test_stripe_event_types.py` checks them against stripe-python's list).
+- Flush residual blocks on card detach and reset after the renewal's `invoice.paid` (next line).
+- A renewal is the renewal invoice's `invoice.paid` (`billing_reason=subscription_cycle`); Stripe has no `customer.subscription.renewed`. The counter rolls at the cycle end by time (`budget.current_period`, F030), before Stripe even attempts that invoice. Its `invoice.paid` moves the stored anchor to the invoice's `period_end`, takes the new period's end from Stripe, flushes the settled period's residual, resets the watermarks unless a counted turn already rolled them, and clears dunning. Any other paid invoice (one-off, update, threshold, creation, or the final invoice of a subscription the account no longer holds) only settles: dunning clears and dormant tools return, the period and the watermarks stay. An invoice without a `billing_reason` is still read as the renewal.
+- Period ends keep Stripe's anchor day (`stripe_gateway.next_period_end`: Jan 31 → Feb 28 → Mar 31); never chain `add_months` on a clamped date.
+- Handle only event types Stripe sends (`tests/unit/test_stripe_event_types.py` checks them against stripe-python's list).
 
 ## Testing pointers
 - `tests/integration/test_metering.py` and `test_usage_reporting.py`.
