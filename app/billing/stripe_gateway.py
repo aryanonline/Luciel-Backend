@@ -10,9 +10,11 @@ swappable seam (HARD CONSTRAINT, Arc 18 objective #1):
     It reads the Stripe TEST secret/publishable/webhook-signing keys from the
     platform secret blob (mirrors ``app.runtime.provider_factory``'s LLM GATE 2
     cutover shape) — NEVER a hardcoded literal, and NEVER the sk_live_ key (that
-    binding does not exist in this codebase). It is NOT invoked by the test suite
-    (tests always inject FakeStripeGateway); CI leaves ``stripe_integration_posture``
-    at its "mock" default so no key is read and no network call is possible.
+    binding does not exist in this codebase). The flows under test never bind it
+    (tests inject FakeStripeGateway); CI leaves ``stripe_integration_posture`` at its
+    "mock" default so no key is read and no network call is possible. Its wire format
+    is checked through the real stripe-python against an in-process HTTP recorder
+    (tests/unit/test_stripe_wire.py), never the network.
   * NO live/production Stripe — ever (objective DO-NOT); "live" is not a value
     ``stripe_integration_posture`` accepts.
 
@@ -97,6 +99,22 @@ METER_EVENT_NAME = "luciel_payg_blocks"
 Ops creates the meter with exactly this ``event_name`` and binds the PAYG price to it;
 the name is the contract between the two, so it lives here rather than in config — a
 per-environment override would silently meter into a meter no price reads.
+"""
+
+
+STRIPE_API_VERSION = "2026-10-28.endive"
+"""The Stripe API version every request goes out on: pinned here, never inherited.
+
+stripe-python sends its OWN pinned ``Stripe-Version`` header on every request (the
+account's default version never applies to SDK calls) and moves that pin on its own
+release schedule. 16.0.0 moved it to 2026-09-30.endive, which removed
+``payment_method_types`` from Checkout Session create (per Stripe's changelog, a 400
+from then on) without a line of this code changing. Pinned, a dependency bump cannot
+change the API version Stripe applies to these requests (the SDK's own encoding still
+moves with it; tests/unit/test_stripe_wire.py checks that request by request). Moving to
+a new version is a reviewed edit of this line, made against the changelog of every
+version in between. Webhook payloads are NOT governed by this: their shape follows the
+API version set on the webhook endpoint in the Stripe Dashboard.
 """
 
 
@@ -529,9 +547,9 @@ class RealStripeGateway:
     NEVER hardcode a key literal here — construction fails loudly (RuntimeError,
     naming only the missing key names, never a value) if a required key is absent,
     mirroring ``provider_factory._build_live_router``'s fail-closed discipline.
-    The ``stripe`` package itself is imported LAZILY so CI (no stripe-python
-    installed, no network) still imports this module cleanly — it is never invoked
-    by the test suite, which always injects :class:`FakeStripeGateway`.
+    The ``stripe`` package itself is imported LAZILY, so importing this module never
+    loads it; the flows under test inject :class:`FakeStripeGateway`, and every request
+    this class builds goes out on :data:`STRIPE_API_VERSION`.
 
     ``verify_and_parse`` uses the SAME v1 HMAC-SHA256 scheme as the fake (Stripe's
     real wire format), keyed by ``STRIPE_TEST_WEBHOOK_SECRET`` — the webhook route's
@@ -554,9 +572,11 @@ class RealStripeGateway:
 
     def _get_client(self) -> object:
         if self._client is None:
-            import stripe  # noqa: PLC0415 — lazy/guarded import (CI has no stripe-python)
+            import stripe  # noqa: PLC0415 — lazy: only the "test" posture loads stripe-python
 
             stripe.api_key = self._secret_key
+            # Explicit, so an SDK upgrade cannot silently move the API version.
+            stripe.api_version = STRIPE_API_VERSION
             self._client = stripe
         return self._client
 
@@ -574,7 +594,9 @@ class RealStripeGateway:
         session = client.checkout.Session.create(  # type: ignore[attr-defined]
             customer=customer_id,
             mode="setup",  # add-a-card, NO charge at save (CJ §6)
-            payment_method_types=["card"],
+            # Card only. 2026-09-30.endive removed ``payment_method_types`` (a 400 since);
+            # this filter replaces it, and with it set, setup mode needs no ``currency``.
+            allowed_payment_method_types=["card"],
             success_url=success_url,
             cancel_url=cancel_url,
         )
@@ -634,11 +656,11 @@ class RealStripeGateway:
 
         This used to post to the usage-records endpoint on the subscription item, with
         an explicit ``action="set"`` because the value sent was a period-cumulative
-        total. That endpoint is REMOVED as of API version 2025-03-31 "basil", which the
-        platform account is pinned to: a metered price must now be backed by a Billing
-        Meter (creating one without a meter is refused outright), and usage is reported
-        as meter events. The old call could therefore never have billed anything — the
-        "test" posture was broken for as long as it stood.
+        total. That endpoint is REMOVED as of API version 2025-03-31 "basil", and every
+        request goes out on :data:`STRIPE_API_VERSION`, a later version: a metered price
+        must now be backed by a Billing Meter (creating one without a meter is refused
+        outright), and usage is reported as meter events. The old call could therefore
+        never have billed anything — the "test" posture was broken for as long as it stood.
         """
         client = self._get_client()
         try:

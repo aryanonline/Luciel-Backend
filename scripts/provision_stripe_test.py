@@ -60,7 +60,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.billing.stripe_gateway import METER_EVENT_NAME  # noqa: E402
+from app.billing.stripe_gateway import METER_EVENT_NAME, STRIPE_API_VERSION  # noqa: E402
 from app.config import get_settings  # noqa: E402
 
 PRODUCT_KEY = "payg_block"
@@ -338,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
     import stripe  # noqa: PLC0415 — lazy import, mirrors the gateway (CI-safe)
 
     stripe.api_key = secret_key
+    # The gateway's pinned version, so the objects are provisioned on the API version
+    # the platform then calls them with (not whatever the installed SDK defaults to).
+    stripe.api_version = STRIPE_API_VERSION
     return provision(stripe, verify_only=args.verify)
 
 

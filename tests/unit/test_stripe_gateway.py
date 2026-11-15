@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 import uuid
+from hashlib import sha256
 
 import pytest
 from app.billing.stripe_gateway import (
@@ -116,10 +117,10 @@ def _real_gateway_with(client: _RecordingStripeClient) -> RealStripeGateway:
 
 
 def test_real_gateway_posts_a_meter_event_with_the_configured_event_name() -> None:
-    """The account is pinned to API version 2025-03-31 "basil", where metered prices
-    must be meter-backed and the usage-records endpoint is gone. The value must go to
-    /v1/billing/meter_events, keyed on the customer, with the identifier carried through
-    so Stripe can dedupe a retry."""
+    """Since API version 2025-03-31 "basil" (so also on the later version the gateway
+    pins), metered prices must be meter-backed and the usage-records endpoint is gone.
+    The value must go to /v1/billing/meter_events, keyed on the customer, with the
+    identifier carried through so Stripe can dedupe a retry."""
     client = _RecordingStripeClient()
     gw = _real_gateway_with(client)
 
@@ -479,6 +480,33 @@ def test_a_non_numeric_signature_timestamp_is_rejected_not_crashed() -> None:
     payload = json.dumps({"id": "evt_b", "type": "invoice.paid", "data": {"object": {}}}).encode()
     with pytest.raises(SignatureError):
         gw.verify_and_parse(payload=payload, signature_header="t=abc,v1=deadbeef")
+
+
+def test_signature_diagnostic_metadata_is_ignored_not_trusted() -> None:
+    """stripe-python 17 reads optional diagnostic fields Stripe may append to the
+    Stripe-Signature header: ``secret=`` (masked), ``destination=`` and ``payload=`` (a
+    body-hash suffix). The verifier is our own, so it must keep deciding on ``t`` and
+    ``v1`` alone: no crash on the extra fields, and no field standing in for a signature
+    or rescuing a stale one."""
+    gw = FakeStripeGateway()
+    payload = json.dumps({"id": "evt_m", "type": "invoice.paid", "data": {"object": {}}}).encode()
+    meta = f",secret=whsec_****abcd,destination=we_test, payload={sha256(payload).hexdigest()[-8:]}"
+
+    signed = build_signature_header(gw.WEBHOOK_SECRET, payload) + meta
+    assert gw.verify_and_parse(payload=payload, signature_header=signed).event_id == "evt_m"
+
+    with pytest.raises(SignatureError):  # wrong secret, metadata attached
+        gw.verify_and_parse(
+            payload=payload, signature_header=build_signature_header("whsec_wrong", payload) + meta
+        )
+    with pytest.raises(SignatureError):  # stale, metadata attached
+        stale = int(time.time()) - SIGNATURE_TOLERANCE_SECONDS - 60
+        gw.verify_and_parse(
+            payload=payload,
+            signature_header=build_signature_header(gw.WEBHOOK_SECRET, payload, stale) + meta,
+        )
+    with pytest.raises(SignatureError):  # metadata alone is not a signature
+        gw.verify_and_parse(payload=payload, signature_header=meta.lstrip(","))
 
 
 def test_the_real_gateway_verifies_identically_to_the_fake() -> None:

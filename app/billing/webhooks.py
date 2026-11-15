@@ -221,9 +221,11 @@ async def _on_invoice_paid(
 def _invoice_subscription_id(event: StripeEvent) -> str | None:
     """The subscription an ``invoice.paid`` bills, or None when it names none.
 
-    API 2025-03-31 "basil" (the platform pin) moved ``invoice.subscription`` under
-    ``invoice.parent.subscription_details.subscription``; an older-shaped payload
-    still carries it at the top level (possibly expanded). Read either."""
+    API 2025-03-31 "basil" moved ``invoice.subscription`` under
+    ``invoice.parent.subscription_details.subscription``. A webhook payload has the shape
+    of the API version set on its webhook endpoint in the Stripe Dashboard (the gateway's
+    ``STRIPE_API_VERSION`` governs only our requests), so an endpoint on a version before
+    basil still sends it at the top level (possibly expanded). Read either."""
     if event.type != "invoice.paid":
         return None
     data = event.data
