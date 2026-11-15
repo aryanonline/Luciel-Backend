@@ -14,9 +14,12 @@ Events handled:
                                       The settled period's ledger rows are KEPT: they are
                                       the evidence behind the invoice (audit F005/F042).
                                       The final invoice of a subscription the account
-                                      no longer holds (closure / card removal) settles
-                                      WITHOUT advancing the anchor or the watermarks.
-  * invoice.payment_failed          → drive dunning none→retrying, email notification +
+                                      no longer holds (closure / card removal), and any
+                                      paid invoice that is not a renewal (one-off,
+                                      update, threshold, the $0 creation invoice),
+                                      settle WITHOUT advancing the anchor or the
+                                      watermarks.
+  * invoice.payment_failed         → drive dunning none→retrying, email notification +
                                       lifecycle_notice_sent audit (Legal §A3 / §3.6.7).
                                       The attempt number is Stripe's own ``attempt_count``.
   * payment_method.attached         → flip billingState→payg_enabled + store display tuple,
@@ -64,6 +67,10 @@ from app.models.connection import InstanceConnection
 from app.notifications import notifier as notify
 
 _log = logging.getLogger(__name__)
+
+# The ``billing_reason`` of the invoice Stripe issues when a subscription "advanced into
+# a new period" (Invoice object reference). The only paid invoice that ends a period.
+_RENEWAL_BILLING_REASON = "subscription_cycle"
 
 
 async def _claim_event(session: AsyncSession, *, admin_id: uuid.UUID, event_id: str) -> bool:
@@ -149,11 +156,33 @@ async def _on_invoice_paid(
     reopened account a second free 50 inside the Stripe period it had already used,
     with the watermarks zeroed under it. That payment clears dunning like any other,
     but the anchor and the watermarks stay where they are.
+
+    Nor is any other paid invoice that is not the renewal. Stripe marks the renewal
+    ``billing_reason`` ``subscription_cycle``; a one-off invoice (``manual``, no parent,
+    ``period_start == period_end`` == the moment it was created), a subscription update,
+    a billing threshold and the $0 invoice issued at subscription creation all settle
+    debt INSIDE the Stripe period. Reading their ``period_end`` as the next period's
+    start began a new period mid-cycle, with a second free 50. They settle like the
+    ended subscription's invoice. An invoice without a ``billing_reason`` (a payload
+    from before the field existed, a bare test event) is still read as the renewal.
     """
     billed_subscription = _invoice_subscription_id(event)
     if billed_subscription is not None and billed_subscription != account.stripe_subscription_id:
-        return await _on_ended_subscription_paid(
-            session, admin_id=admin_id, account=account, subscription_id=billed_subscription
+        return await _settle_without_period_change(
+            session,
+            admin_id=admin_id,
+            account=account,
+            reason="ended_subscription_settled",
+            detail={"subscription_id": billed_subscription},
+        )
+    billing_reason = event.data.get("billing_reason")
+    if isinstance(billing_reason, str) and billing_reason != _RENEWAL_BILLING_REASON:
+        return await _settle_without_period_change(
+            session,
+            admin_id=admin_id,
+            account=account,
+            reason="not_a_renewal",
+            detail={"billing_reason": billing_reason, "subscription_id": billed_subscription},
         )
     prev_start = account.period_start.astimezone(UTC) if account.period_start else None
     settled_from, new_start = _settled_period(account, event)
@@ -299,21 +328,26 @@ def _invoice_subscription_id(event: StripeEvent) -> str | None:
     return nested if isinstance(nested, str) and nested else None
 
 
-async def _on_ended_subscription_paid(
+async def _settle_without_period_change(
     session: AsyncSession,
     *,
     admin_id: uuid.UUID,
     account: BillingAccount,
-    subscription_id: str,
+    reason: str,
+    detail: dict[str, object],
 ) -> str:
-    """The final invoice of a subscription that is no longer the account's was paid.
+    """A paid invoice that does not end the period: the debt is settled, nothing else.
 
-    Closure and card removal both cancel the metered subscription with ``invoice_now``
-    after flushing the residual, so this invoice collects blocks the watermarks already
-    record as reported. The period the counter is keyed on has NOT ended: it keeps its
-    anchor (rolling by whole cycles on its own, ``current_period``) and its watermarks,
-    so a reopen or a re-added card continues it instead of starting a fresh free 50.
-    The debt is settled, so dunning clears and dormant tools return as for any payment.
+    Two kinds reach here. The final invoice of a subscription that is no longer the
+    account's (``ended_subscription_settled``): closure and card removal both cancel the
+    metered subscription with ``invoice_now`` after flushing the residual, so it
+    collects blocks the watermarks already record as reported. And a paid invoice that
+    is not the renewal (``not_a_renewal``, see ``_on_invoice_paid``). Either way the
+    period the counter is keyed on has NOT ended: it keeps its anchor (rolling by whole
+    cycles on its own, ``current_period``) and its watermarks, so a reopen or a re-added
+    card continues it instead of starting a fresh free 50, and a mid-period payment
+    never opens one. The debt is settled, so dunning clears and dormant tools return as
+    for any payment.
     """
     period_start = account.period_start
     prev_dunning = account.dunning_state
@@ -328,8 +362,8 @@ async def _on_ended_subscription_paid(
         event_type="invoice_paid",
         payload={
             "reset": "none",
-            "reason": "ended_subscription_settled",
-            "subscription_id": subscription_id,
+            "reason": reason,
+            **detail,
             "rollover": False,
             "ledger_retained": True,
             "period_start": anchor,

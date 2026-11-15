@@ -564,6 +564,109 @@ async def test_customer_subscription_renewed_is_not_treated_as_a_renewal() -> No
         assert paid == []
 
 
+# A moment inside the [_RENEWED_FROM, _RENEWED_TO) period, for invoices paid mid-cycle.
+_MID_PERIOD = datetime(2030, 1, 25, 9, 30, tzinfo=UTC)
+_ON_THE_SUBSCRIPTION = {
+    "type": "subscription_details",
+    "subscription_details": {"subscription": "sub_renewing"},
+}
+
+
+def _mid_period_invoice(billing_reason: str, parent: dict[str, object] | None) -> dict[str, object]:
+    """A paid invoice created mid-period. Stripe's own one-off example in the Invoice
+    object reference has ``"billing_reason": "manual"``, ``"parent": null`` and
+    ``period_start == period_end`` == the moment it was created."""
+    return {
+        "object": "invoice",
+        "customer": "cus_renewing",
+        "billing_reason": billing_reason,
+        "parent": parent,
+        "period_start": int(_MID_PERIOD.timestamp()),
+        "period_end": int(_MID_PERIOD.timestamp()),
+        "status": "paid",
+    }
+
+
+@pytest.mark.usefixtures("assert_no_bypass", "db_engine_reset")
+@pytest.mark.parametrize(
+    "invoice",
+    [
+        pytest.param(_mid_period_invoice("manual", None), id="one_off"),
+        pytest.param(_mid_period_invoice("subscription_update", _ON_THE_SUBSCRIPTION), id="update"),
+        pytest.param(
+            _mid_period_invoice("subscription_threshold", _ON_THE_SUBSCRIPTION), id="threshold"
+        ),
+        pytest.param(
+            _mid_period_invoice("subscription_create", _ON_THE_SUBSCRIPTION), id="creation"
+        ),
+        # Axis8-F02's own renewal invoice with only the reason changed: the reason decides.
+        pytest.param({**_renewal_invoice(), "billing_reason": "manual"}, id="renewal_shaped"),
+    ],
+)
+async def test_a_paid_invoice_that_is_not_the_renewal_leaves_the_period_alone(
+    invoice: dict[str, object],
+) -> None:
+    """Only the renewal invoice (``billing_reason`` ``subscription_cycle``) ends a Stripe
+    period. Any other paid invoice used to start a new period at its ``period_end``:
+    a one-off invoice paid on Jan 25 opened a second free 50 inside the Jan 15 - Feb 15
+    period and zeroed the watermarks. The debt is settled (dunning clears), but the
+    anchor, the period's end, the watermarks and the counter stay, and nothing is
+    posted to the meter."""
+    from app.billing.stripe_gateway import set_stripe_gateway
+    from app.models.audit import AdminAuditLog
+    from sqlalchemy import select as sa_select
+
+    admin = uuid.uuid4()
+    iid = await _seed_renewing_tenant(admin, counted=180)
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        acct.dunning_state = dunning.RETRYING
+        acct.dunning_started_at = _MID_PERIOD - timedelta(days=2)
+        await s.flush()
+    gw = FakeStripeGateway()
+    set_stripe_gateway(gw)
+    try:
+        async with tenant_session(admin) as s:
+            action = await billing_webhooks.handle_event(
+                s,
+                admin_id=admin,
+                event=StripeEvent(event_id="evt_not_renewal", type="invoice.paid", data=invoice),
+            )
+    finally:
+        set_stripe_gateway(None)
+
+    assert action == "invoice_paid"
+    assert gw.meter_events == []
+    async with tenant_session(admin) as s:
+        acct = await metering.get_or_create_billing_account(s, admin_id=admin)
+        assert (acct.period_start, acct.period_resets_at) == (_RENEWED_FROM, _RENEWED_TO)
+        assert (acct.accrued_blocks, acct.last_reported_blocks, acct.accrual_period_start) == (
+            2,
+            1,
+            _RENEWED_FROM.date(),
+        )
+        assert (acct.dunning_state, acct.dunning_started_at) == (dunning.NONE, None)
+        b = await metering.build_budget(
+            s, admin_id=admin, instance_id=iid, now=_MID_PERIOD + timedelta(days=1)
+        )
+        assert (b.conversations_this_period, b.period_resets_at) == (180, _RENEWED_TO)
+        payloads = (
+            (
+                await s.execute(
+                    sa_select(AdminAuditLog.event_payload).where(
+                        AdminAuditLog.admin_id == admin,
+                        AdminAuditLog.event_type == "invoice_paid",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(p["reset"], p["reason"], p["billing_reason"]) for p in payloads] == [
+            ("none", "not_a_renewal", invoice["billing_reason"])
+        ]
+
+
 class _SubscriptionReadFails(FakeStripeGateway):
     async def get_subscription_period(self, *, subscription_id: str):  # type: ignore[override]
         raise RuntimeError("stripe unavailable")
