@@ -46,7 +46,7 @@ jobs:
           ref: main
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           # Same pin as ci.yml and the Dockerfile (uv.lock was written by it).
           version: '0.12.23'
