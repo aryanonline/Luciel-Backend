@@ -57,7 +57,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           # Pinned (round 7 WP-9): uv.lock was written by this version and the
           # Dockerfile copies the same one (ghcr.io/astral-sh/uv:<version>). Bump the
