@@ -55,7 +55,7 @@ jobs:
           ref: ${{ env.RELEASE_BRANCH }}
 
       - name: Configure AWS via OIDC (dev deploy role — dev ECR is the scratch registry)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           # Read here, not from the workflow's env: GitHub does not mask a variable, and
           # every step's log header repeats the workflow-level env.
