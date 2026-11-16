@@ -142,7 +142,7 @@ jobs:
       # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
       - uses: docker/setup-qemu-action@v3
         if: inputs.paused != 'true'
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: inputs.paused != 'true'
 
       - name: Build, scan, push image
@@ -489,7 +489,7 @@ jobs:
       # buildx + QEMU: the arm64 half of the multi-arch image is cross-built on
       # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build, scan, push image (prod repo — the release artifact)
         env:
@@ -630,7 +630,7 @@ jobs:
       # the amd64 runner (round 7 WP-8, D7 Graviton). See the build step below.
       - uses: docker/setup-qemu-action@v3
         if: inputs.paused != 'true'
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: inputs.paused != 'true'
 
       - name: Build, scan, push image
