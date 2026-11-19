@@ -215,10 +215,12 @@ the `db` container. The expected result is about 4,000 passed,
 `docker compose up` (no arguments) runs the whole product on one computer for people
 trying Luciel: db, redis, mailpit, a one-shot `migrate`, `api`, `scheduler`, a one-shot
 `seed` (demo@example.com, a fictional dental clinic and its documents), and `web` +
-`demo-site` built from Luciel-Frontend (`LUCIEL_FRONTEND_SOURCE`, default its GitHub
-`main`). The README's "Run Luciel on your computer" is the user guide;
-`scripts/local/` holds the helpers and `.github/workflows/quickstart.yml` builds and
-smoke-checks the stack without a key. Rules it depends on:
+`demo-site` built from the Luciel-Frontend checkout beside this repository
+(`LUCIEL_FRONTEND_SOURCE`, default `../Luciel-Frontend`; a git URL is not the default
+because Compose v5 on Windows cannot build from one, 2026-11-19). The README's "Run
+Luciel on your computer" is the user guide; `scripts/local/` holds the helpers and
+`.github/workflows/quickstart.yml` checks out both repositories side by side, builds the
+stack without a key and smoke-checks it. Rules it depends on:
 
 - It stays `LUCIEL_INTEGRATION_MODE=mock` (no AWS). Real AI comes from
   `LUCIEL_LLM_POSTURE=live` (`Settings.real_ai` / `real_embeddings`): the real router and
