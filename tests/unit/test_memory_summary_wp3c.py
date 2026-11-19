@@ -179,12 +179,18 @@ async def test_an_unusable_model_answer_falls_back_to_the_deterministic_summary(
     assert "jane@" not in summary and "0143" not in summary
 
 
+# What memory reads: whether the LLM is real (live mode, or the local stack's
+# llm_posture="live").
+_MOCK_SETTINGS = SimpleNamespace(integration_mode="mock", real_ai=False)
+_LIVE_SETTINGS = SimpleNamespace(integration_mode="live", real_ai=True)
+
+
 async def test_mock_posture_never_builds_a_router_and_uses_the_structurer(monkeypatch):
     def _never(**_kw):  # noqa: ANN003
         raise AssertionError("no router may be built in mock posture")
 
     monkeypatch.setattr(provider_factory, "build_llm_router", _never)
-    monkeypatch.setattr(memory, "get_settings", lambda: SimpleNamespace(integration_mode="mock"))
+    monkeypatch.setattr(memory, "get_settings", lambda: _MOCK_SETTINGS)
     assert await memory.summarize_session(HISTORY, admin_id=ADMIN) == memory.summarize(HISTORY)
 
 
@@ -200,7 +206,7 @@ async def test_live_posture_binds_the_tenant_capped_router(monkeypatch):
         return router
 
     monkeypatch.setattr(provider_factory, "build_llm_router", _build)
-    monkeypatch.setattr(memory, "get_settings", lambda: SimpleNamespace(integration_mode="live"))
+    monkeypatch.setattr(memory, "get_settings", lambda: _LIVE_SETTINGS)
     summary = await memory.summarize_session(HISTORY, admin_id=ADMIN)
     assert built == [ADMIN]
     assert summary.startswith("Intent: a deck quote | Actions taken: passed to the team")
@@ -211,7 +217,7 @@ async def test_a_router_that_cannot_be_built_in_live_posture_falls_back(monkeypa
         raise RuntimeError("integration_mode=live but platform secret is missing keys")
 
     monkeypatch.setattr(provider_factory, "build_llm_router", _broken)
-    monkeypatch.setattr(memory, "get_settings", lambda: SimpleNamespace(integration_mode="live"))
+    monkeypatch.setattr(memory, "get_settings", lambda: _LIVE_SETTINGS)
     assert await memory.summarize_session(HISTORY, admin_id=ADMIN) == memory.summarize(HISTORY)
 
 

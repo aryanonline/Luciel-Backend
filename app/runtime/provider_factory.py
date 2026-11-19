@@ -8,6 +8,8 @@ depend only on the returned ``LLMRouter`` — they never branch on mode themselv
 RUNTIME-UNCHANGED GUARANTEE: with ``integration_mode`` unset or ``mock`` this returns
 exactly the pre-cutover wiring — ``LLMRouter(EchoModel, EchoModel)`` — so no external
 key is read and no network call is possible. Only ``live`` reads the platform secret.
+The one exception is opt-in and development-only: ``llm_posture="live"`` (the local
+Docker stack) binds the real providers under mock mode from whichever keys are set.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ def build_llm_router(
 
     if settings.integration_mode == "live":
         return _build_live_router(settings, admin_id=admin_id)
+    if settings.llm_posture == "live":
+        return _build_local_router(settings, admin_id=admin_id)
 
     # Default / mock — exactly as before the cutover.
     from app.runtime.testing import EchoModel  # noqa: PLC0415 — keep import local
@@ -93,6 +97,54 @@ def _build_live_router(settings: Settings, *, admin_id: uuid.UUID | None) -> LLM
         name="anthropic_fast",
     )
     return LLMRouter(primary=primary, fallback=fallback, admin_id=admin_id, fast=fast)
+
+
+def _build_local_router(settings: Settings, *, admin_id: uuid.UUID | None) -> LLMRouter:
+    """The router for ``llm_posture="live"``: real AI on a developer's own computer.
+
+    Built from whichever vendor keys the platform secret carries (config refuses the
+    posture outside development and without any key). With both keys it is the
+    production shape: Anthropic primary + fast, OpenAI fallback. With one, that vendor
+    serves every leg; ``LLMRouter`` needs a fallback, and a second call to the same
+    vendor is an honest retry. The production router keeps its both-keys rule
+    (``_build_live_router``): this one exists so a person trying Luciel needs one key.
+    """
+    from app.runtime.providers import AnthropicProvider, OpenAIProvider  # noqa: PLC0415
+
+    secret = parse_platform_secret(settings.platform_secret, live=True)
+    anthropic_key = secret.get("ANTHROPIC_API_KEY", "").strip()
+    openai_key = secret.get("OPENAI_API_KEY", "").strip()
+    if not anthropic_key and not openai_key:
+        # Unreachable through Settings (boot refuses it); kept for a hand-built Settings.
+        raise RuntimeError(
+            "llm_posture=live but the platform secret has neither ANTHROPIC_API_KEY nor "
+            "OPENAI_API_KEY"
+        )
+
+    openai = (
+        OpenAIProvider(
+            api_key=openai_key,
+            model=settings.llm_openai_fallback_model,
+            max_output_tokens=settings.llm_max_output_tokens,
+        )
+        if openai_key
+        else None
+    )
+    if not anthropic_key and openai is not None:
+        return LLMRouter(primary=openai, fallback=openai, admin_id=admin_id, fast=None)
+
+    primary = AnthropicProvider(
+        api_key=anthropic_key,
+        model=settings.llm_anthropic_primary_model,
+        max_output_tokens=settings.llm_max_output_tokens,
+    )
+    fast = AnthropicProvider(
+        api_key=anthropic_key,
+        model=settings.llm_anthropic_fast_model,
+        max_output_tokens=settings.llm_max_output_tokens,
+        name="anthropic_fast",
+    )
+    return LLMRouter(primary=primary, fallback=openai or primary, admin_id=admin_id, fast=fast)
 
 
 # --- text-to-speech provider factory (§3.1.2 / §5.12) -------------------------- #

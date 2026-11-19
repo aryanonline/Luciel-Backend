@@ -447,8 +447,9 @@ def shape_llm_summary(text: str, history: list[Transcript]) -> str | None:
 
 
 def _live_summary_router(admin_id: uuid.UUID) -> LLMRouter | None:
-    """The tenant-capped router in live posture; None (→ deterministic) otherwise."""
-    if get_settings().integration_mode != "live":
+    """The tenant-capped router when the LLM is real (live mode, or the local stack's
+    ``llm_posture="live"``); None (→ deterministic) otherwise."""
+    if not get_settings().real_ai:
         return None
     try:
         return provider_factory.build_llm_router(admin_id=admin_id)

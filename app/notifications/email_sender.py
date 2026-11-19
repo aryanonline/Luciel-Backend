@@ -6,6 +6,9 @@ Closes the AWS-DEFERRED notifier seam. Two implementations behind one Protocol:
   by ``build_email_sender`` from the platform config.
 - ``NullEmailSender``  — mock/CI: records sends in-memory, makes NO network call, so
   the suite stays hermetic and deterministic. This is the default.
+- ``SmtpEmailSender``  — a developer's own computer: plain SMTP to a local inbox (the
+  Docker stack's Mailpit), so sign-up verification, password resets and hand-off pages
+  can be read and clicked. Mock mode + development only (``LUCIEL_SMTP_HOST``).
 
 The dispatcher (``email_dispatcher.py``) renders templates and calls this; the
 notifier/auth/lifecycle/export code call the dispatcher. Secrets are never logged.
@@ -14,7 +17,10 @@ notifier/auth/lifecycle/export code call the dispatcher. Secrets are never logge
 from __future__ import annotations
 
 import asyncio
+import smtplib
 from dataclasses import dataclass, field
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from typing import Protocol
 
 
@@ -141,8 +147,45 @@ class SesEmailSender:
         return str(resp.get("MessageId", ""))
 
 
+@dataclass(frozen=True)
+class SmtpEmailSender:
+    """Local-inbox sender: plain SMTP (no auth, no TLS) to a mail catcher on the same
+    machine — the Docker stack's Mailpit. Config refuses ``LUCIEL_SMTP_HOST`` outside
+    development, and ``build_email_sender`` binds this only in mock mode."""
+
+    host: str
+    port: int
+    sender: str
+
+    async def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body_text: str,
+        from_address: str | None = None,
+        tags: dict[str, str] | None = None,
+    ) -> str | None:
+        message = EmailMessage()
+        message["From"] = from_address or self.sender
+        message["To"] = to
+        message["Subject"] = subject
+        message["Date"] = formatdate(usegmt=True)
+        message_id = make_msgid(domain="luciel.localhost")
+        message["Message-ID"] = message_id
+        message.set_content(body_text)
+        # smtplib is synchronous: off the event loop, like the SES call.
+        await asyncio.to_thread(self._deliver, message)
+        return message_id.strip("<>")
+
+    def _deliver(self, message: EmailMessage) -> None:
+        with smtplib.SMTP(self.host, self.port, timeout=10) as smtp:
+            smtp.send_message(message)
+
+
 def build_email_sender() -> EmailSender:
-    """Return the SES sender in live mode, else the Null sender (mock/CI).
+    """Return the SES sender in live mode, the local-inbox SMTP sender when a developer's
+    own computer names one (mock mode, ``LUCIEL_SMTP_HOST``), else the Null sender.
 
     Live requires a configured platform sender identity; if absent, we fall back to
     Null and the dispatcher records the send as audit-only (honest degradation rather
@@ -153,4 +196,6 @@ def build_email_sender() -> EmailSender:
     s = get_settings()
     if s.integration_mode == "live" and s.platform_email_sender:
         return SesEmailSender(sender_identity=s.platform_email_sender, region_name=s.aws_region)
+    if s.integration_mode != "live" and s.smtp_host:
+        return SmtpEmailSender(host=s.smtp_host, port=s.smtp_port, sender=s.smtp_from)
     return NullEmailSender()

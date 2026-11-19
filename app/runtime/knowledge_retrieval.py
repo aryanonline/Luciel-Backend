@@ -119,8 +119,9 @@ def is_retrieval_unavailable(chunks: list[dict[str, object]] | None) -> bool:
 
 
 def _relevance_floor_active() -> bool:
-    # Hashed mock vectors carry no distance meaning; the floor is a live-only rule.
-    return get_settings().integration_mode == "live"
+    # Hashed vectors carry no distance meaning; the floor applies only when the real
+    # embedding model wrote them (live mode, or the local stack with an OpenAI key).
+    return get_settings().real_embeddings
 
 
 def apply_relevance_floor[Hit: tuple[Any, float | None]](

@@ -272,3 +272,13 @@ make that state explicit and test it.
   the line shares its `trace_id` with that turn's `llm_fallback_used session=` line); for
   LlmUnavailableAlarm add `"llm_fallback_failed"` (`tests/unit/test_llm_failover_cause.py`,
   `tests/integration/test_round7_llm_telemetry.py`).
+
+## Local AI posture (2026-11-19, the local Docker stack)
+- `LUCIEL_LLM_POSTURE=live` (development only, at least one vendor key, strict secret
+  parse) binds the REAL providers under mock mode: `provider_factory._build_local_router`
+  (both keys = production shape; one key = that vendor on every leg), `get_embedder`
+  (OpenAI with an OpenAI key, else hashing, named `embeddings:HashingEmbedder` on
+  /healthz), and through `Settings.real_ai` / `real_embeddings` the session summaries,
+  graph extraction, the relevance floor and the LLM cap store. `/healthz` serves
+  `llmPosture`. Delivery seams still ask `live_mode()`. Tests:
+  `tests/unit/test_local_ai_posture.py`.

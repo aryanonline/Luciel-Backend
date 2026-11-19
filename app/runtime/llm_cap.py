@@ -307,7 +307,9 @@ def get_llm_cap_store() -> InMemoryLLMCapStore | RedisLLMCapStore:
         from app.config import get_settings  # noqa: PLC0415 — avoid import cycle
 
         settings = get_settings()
-        if settings.integration_mode == "live":
+        # Wherever the LLM is real (live mode, or the local stack's llm_posture="live",
+        # which spends the person's own key) the cap counts in Redis.
+        if settings.real_ai:
             _store = _build_redis_store(settings.redis_url) or InMemoryLLMCapStore()
         else:
             _store = InMemoryLLMCapStore()

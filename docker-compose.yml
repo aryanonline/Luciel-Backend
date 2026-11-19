@@ -1,25 +1,70 @@
-# Local development stack: PostgreSQL 17 + pgvector and Redis; the role bootstrap runs
-# on first start. Then the app can run migrations and serve.
+# Luciel on your computer: the whole product with one command.
 #
-#   docker compose up -d db redis
-#   # then, from the host (with the venv active):
-#   alembic upgrade head
-#   uvicorn app.main:app --reload --port 8000
+#   cp .env.example .env          # Windows: copy .env.example .env
+#   # put OPENAI_API_KEY and/or ANTHROPIC_API_KEY in .env
+#   docker compose up             # the first build takes about ten minutes
 #
-# Point the frontend at this backend:
-#   NEXT_PUBLIC_API_ADAPTER=http
-#   NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
-#   (and run the backend with LUCIEL_COOKIE_SECURE=false for http localhost)
+# Then open http://localhost:3000 and sign in as demo@example.com / luciel-demo.
+# Use "localhost", not 127.0.0.1: the session cookie and the chat widget expect it.
+#
+#   db         PostgreSQL 17 + pgvector (roles are created on first start)
+#   redis      Redis 7
+#   mailpit    the email inbox: http://localhost:8025
+#   migrate    one-shot: AI-key check, schema, row-level security, audit-log lock
+#   api        the FastAPI backend: http://localhost:8000 (API docs at /docs)
+#   scheduler  runs the scheduled sweeps (session close + summary, retries, re-sync)
+#   seed       one-shot: the demo account, a fictional dental clinic and its documents
+#   web        the dashboard: http://localhost:3000
+#   demo-site  a demo website with the chat widget: http://localhost:8080
+#
+# Integration mode stays "mock": nothing here talks to AWS, Stripe, Twilio or Meta. The
+# AI is real (LUCIEL_LLM_POSTURE=live) and uses only the keys you put in .env.
+#
+# The test suite needs only the database and Redis:  docker compose up -d db redis
+#
+# web and demo-site are built from Luciel-Frontend's main branch on GitHub. To build your
+# own checkout instead, clone it beside this repository and add to .env:
+#   LUCIEL_FRONTEND_SOURCE=../Luciel-Frontend
+
+x-luciel-env: &luciel-env
+  LUCIEL_ENVIRONMENT: development
+  LUCIEL_INTEGRATION_MODE: mock
+  # Real AI from your own key. CI sets LUCIEL_LLM_POSTURE=follow to run without a key
+  # (the deterministic test model then answers).
+  LUCIEL_LLM_POSTURE: ${LUCIEL_LLM_POSTURE:-live}
+  LUCIEL_PLATFORM_SECRET: '{"OPENAI_API_KEY":"${OPENAI_API_KEY:-}","ANTHROPIC_API_KEY":"${ANTHROPIC_API_KEY:-}"}'
+  # GPT-5 models spend part of this budget on reasoning before they answer.
+  LUCIEL_LLM_MAX_OUTPUT_TOKENS: "4096"
+  LUCIEL_DATABASE_URL: postgresql+asyncpg://luciel_app:luciel_dev_pw@db:5432/luciel_dev # pragma: allowlist secret
+  LUCIEL_DATABASE_URL_SYNC: postgresql+psycopg://luciel_app:luciel_dev_pw@db:5432/luciel_dev # pragma: allowlist secret
+  LUCIEL_REDIS_URL: redis://redis:6379/0
+  LUCIEL_JWT_SIGNING_KEY: local-docker-stack-only-not-a-secret # pragma: allowlist secret
+  LUCIEL_COOKIE_SECURE: "false"
+  LUCIEL_APP_BASE_URL: http://localhost:3000
+  LUCIEL_PUBLIC_API_BASE_URL: http://localhost:8000
+  LUCIEL_DASHBOARD_ORIGINS: '["http://localhost:3000"]'
+  LUCIEL_WIDGET_EMBED_URL: http://localhost:8080/v1/luciel.js
+  LUCIEL_SMTP_HOST: mailpit
+  LUCIEL_SMTP_PORT: "1025"
+  LUCIEL_SMTP_FROM: Luciel <luciel@example.com>
+
+# One image for migrate, api, scheduler and seed. Only `migrate` builds it (four builds of
+# one tag collide); the other three use the result and never try to pull it.
+x-backend-image: &backend-image
+  image: luciel-backend:local
+  pull_policy: never
+
+x-frontend-source: &frontend-source ${LUCIEL_FRONTEND_SOURCE:-https://github.com/aryanonline/Luciel-Frontend.git#main}
 
 services:
   db:
     image: pgvector/pgvector:0.8.0-pg17
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: postgres # pragma: allowlist secret
       POSTGRES_DB: luciel_dev
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${LUCIEL_DB_PORT:-5432}:5432"
     volumes:
       - luciel_pgdata:/var/lib/postgresql/data
       # Bootstrap roles + per-db setup run on first init (alphabetical order).
@@ -34,12 +79,111 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${LUCIEL_REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  mailpit:
+    image: axllent/mailpit:v1.33.0
+    ports:
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    image: luciel-backend:local
+    command: ["python", "scripts/local/migrate.py"]
+    environment:
+      <<: *luciel-env
+      LUCIEL_SUPERUSER_DSN: host=db port=5432 dbname=luciel_dev user=postgres password=postgres # pragma: allowlist secret
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend-image
+    environment: *luciel-env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status != 200)"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  scheduler:
+    <<: *backend-image
+    command: ["python", "scripts/local/scheduler.py"]
+    environment: *luciel-env
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  seed:
+    <<: *backend-image
+    command: ["python", "scripts/local/seed_demo.py"]
+    environment:
+      <<: *luciel-env
+      LUCIEL_DEMO_API: http://api:8000
+      LUCIEL_DEMO_PASSWORD: ${LUCIEL_DEMO_PASSWORD:-luciel-demo}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+
+  web:
+    build:
+      context: *frontend-source
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_ADAPTER: http
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+        NEXT_PUBLIC_WIDGET_SCRIPT_URL: http://localhost:8080/v1/luciel.js
+        NEXT_PUBLIC_DEMO_SITE_URL: http://localhost:8080
+    image: luciel-web:local
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  demo-site:
+    build:
+      context: *frontend-source
+      dockerfile: apps/widget/Dockerfile
+      args:
+        VITE_WIDGET_ADAPTER: http
+        VITE_WIDGET_API_BASE_URL: http://localhost:8000
+    image: luciel-demo-site:local
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   luciel_pgdata:

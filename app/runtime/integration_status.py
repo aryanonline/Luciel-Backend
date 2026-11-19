@@ -123,8 +123,12 @@ def degraded_bindings() -> list[str]:
         # card-update portal at all (POST /billing/portal fails at Stripe). Named here
         # for the same reason as the price: loud before the first admin clicks it.
         degraded.append("stripe_portal_configuration:unset")
-    if not live_mode():
+    if not settings.real_ai:
         degraded.append("llm:EchoModel")
+    elif not live_mode() and not settings.real_embeddings:
+        # The local stack's llm_posture="live" with only an Anthropic key: real answers,
+        # but knowledge is searched with hashed vectors (no OpenAI embeddings).
+        degraded.append("embeddings:HashingEmbedder")
     # Round 5B item 17: hCaptcha in live mode. With no secret configured, captcha
     # enforcement is OFF and live signups run unprotected — a binding problem
     # this list exists to surface. (A configured-but-failing hCaptcha service
@@ -172,7 +176,7 @@ def degraded_bindings() -> list[str]:
     # Round 7 WP-6 item 7: the embedding provider's last N calls all failed (quota,
     # outage, key) — every knowledge answer is a hand-off until it answers again. A
     # read of a process-level flag (app/knowledge/embeddings.py); mock embeds locally.
-    if live_mode():
+    if settings.real_embeddings:
         from app.knowledge.embeddings import embeddings_degraded  # noqa: PLC0415
 
         if embeddings_degraded():
@@ -227,7 +231,12 @@ def log_resolved_bindings() -> None:
             ", ".join(degraded),
         )
         return
-    logger.info("integration_mode=%s degraded_bindings=%s", mode, ", ".join(degraded) or "none")
+    logger.info(
+        "integration_mode=%s llm_posture=%s degraded_bindings=%s",
+        mode,
+        get_settings().llm_posture,
+        ", ".join(degraded) or "none",
+    )
 
 
 async def escalation_backlog() -> dict[str, object] | None:
