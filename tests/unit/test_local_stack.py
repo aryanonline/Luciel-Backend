@@ -71,6 +71,19 @@ def test_the_test_suite_can_still_start_only_the_database_and_redis() -> None:
     assert db_env["POSTGRES_DB"] == "luciel_dev"  # the suite uses its own luciel_test
 
 
+def test_the_frontend_builds_from_the_checkout_beside_this_repository() -> None:
+    """Docker Compose v5 on Windows cannot build from a git URL ("failed to evaluate
+    path", bake and classic builder alike; 2026-11-19), so the default must stay a local
+    path: the README has people clone both repositories side by side."""
+    text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "${LUCIEL_FRONTEND_SOURCE:-../Luciel-Frontend}" in text
+    for name in ("web", "demo-site"):
+        context = _compose()["services"][name]["build"]["context"]
+        assert context == "${LUCIEL_FRONTEND_SOURCE:-../Luciel-Frontend}", name
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "git clone https://github.com/aryanonline/Luciel-Frontend" in readme
+
+
 def test_the_app_waits_for_the_migration_and_the_seed_waits_for_the_app() -> None:
     services = _compose()["services"]
     assert services["api"]["depends_on"]["migrate"]["condition"] == (

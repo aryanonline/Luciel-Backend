@@ -1,5 +1,6 @@
 # Luciel on your computer: the whole product with one command.
 #
+# Clone both repositories into the same folder, then from Luciel-Backend:
 #   cp .env.example .env          # Windows: copy .env.example .env
 #   # put OPENAI_API_KEY and/or ANTHROPIC_API_KEY in .env
 #   docker compose up             # the first build takes about ten minutes
@@ -22,9 +23,10 @@
 #
 # The test suite needs only the database and Redis:  docker compose up -d db redis
 #
-# web and demo-site are built from Luciel-Frontend's main branch on GitHub. To build your
-# own checkout instead, clone it beside this repository and add to .env:
-#   LUCIEL_FRONTEND_SOURCE=../Luciel-Frontend
+# web and demo-site are built from the Luciel-Frontend checkout beside this repository
+# (../Luciel-Frontend). Elsewhere, set LUCIEL_FRONTEND_SOURCE in .env to its path. A git
+# URL works on Linux and macOS, but Docker Compose v5 on Windows cannot build from one
+# ("failed to evaluate path"), so the default is the local folder.
 
 x-luciel-env: &luciel-env
   LUCIEL_ENVIRONMENT: development
@@ -54,7 +56,7 @@ x-backend-image: &backend-image
   image: luciel-backend:local
   pull_policy: never
 
-x-frontend-source: &frontend-source ${LUCIEL_FRONTEND_SOURCE:-https://github.com/aryanonline/Luciel-Frontend.git#main}
+x-frontend-source: &frontend-source ${LUCIEL_FRONTEND_SOURCE:-../Luciel-Frontend}
 
 services:
   db:

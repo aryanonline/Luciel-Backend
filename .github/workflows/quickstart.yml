@@ -1,14 +1,14 @@
 name: quickstart
 
-# The README's "Run Luciel on your computer" path, end to end: `docker compose up` builds
-# this repository's image and Luciel-Frontend's main branch (dashboard + demo website),
-# migrates, seeds the demo account and starts everything; scripts/local/smoke.py then
-# signs in, opens a widget conversation and finds the demo owner's email in Mailpit.
+# The README's "Run Luciel on your computer" path, end to end: with Luciel-Frontend checked
+# out beside this repository, `docker compose up` builds both, migrates, seeds the demo
+# account and starts everything; scripts/local/smoke.py then signs in, opens a widget
+# conversation and finds the demo owner's email in Mailpit.
 #
 # CI has no AI key, so the stack runs with LUCIEL_LLM_POSTURE=follow (the deterministic
 # test model answers). The real-key path is the same stack with a key in .env.
 #
-# Runs when the stack's own files change, weekly (the frontend is built from its main
+# Runs when the stack's own files change, weekly (the frontend is Luciel-Frontend's main
 # branch, so a change there can break the quickstart without touching this repository),
 # and on demand. Not a required check.
 
@@ -40,8 +40,18 @@ jobs:
     timeout-minutes: 40
     env:
       LUCIEL_LLM_POSTURE: follow
+    defaults:
+      run:
+        working-directory: Luciel-Backend
     steps:
+      # The README's layout: the two repositories side by side.
       - uses: actions/checkout@v7
+        with:
+          path: Luciel-Backend
+      - uses: actions/checkout@v7
+        with:
+          repository: aryanonline/Luciel-Frontend
+          path: Luciel-Frontend
 
       - name: Build and start the stack
         run: docker compose up -d --build

@@ -30,14 +30,16 @@ knowledge search; with only an Anthropic key, Luciel searches with built-in keyw
 
 ```bash
 git clone https://github.com/aryanonline/Luciel-Backend
+git clone https://github.com/aryanonline/Luciel-Frontend
 cd Luciel-Backend
 cp .env.example .env          # Windows: copy .env.example .env
 # open .env and set OPENAI_API_KEY and/or ANTHROPIC_API_KEY
 docker compose up
 ```
 
-The first run builds the images, which takes about ten minutes. The stack is ready when the log
-prints `Luciel is ready`.
+Keep the two folders side by side: the stack builds the dashboard and the widget from
+`../Luciel-Frontend`. The first run builds the images, which takes about ten minutes. The stack is
+ready when the log prints `Luciel is ready`.
 
 | Open                         | What it is                                                                |
 | ---------------------------- | ------------------------------------------------------------------------- |
@@ -94,8 +96,9 @@ git pull && docker compose up --build    # update to the latest code
   (8025) keep their ports.
 - **Every answer is handed to the team**: read `docker compose logs api` for a provider error such
   as an invalid key or an exhausted quota.
-- **Your own frontend changes**: clone Luciel-Frontend beside this repository and add
-  `LUCIEL_FRONTEND_SOURCE=../Luciel-Frontend` to `.env`.
+- **`path ... Luciel-Frontend not found`**: clone Luciel-Frontend beside this repository, or set
+  `LUCIEL_FRONTEND_SOURCE` in `.env` to where it is. Frontend changes you make there are built by
+  `docker compose up --build`.
 
 How it works: the stack runs this repository's production image with
 `LUCIEL_INTEGRATION_MODE=mock`, so every delivery seam stays a local stand-in and no AWS service
