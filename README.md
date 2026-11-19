@@ -12,6 +12,99 @@ scheduled jobs, and the AWS CDK infrastructure for the whole product. The dashbo
 site and widget live in the companion
 [Luciel-Frontend](https://github.com/aryanonline/Luciel-Frontend) repository.
 
+Luciel is open source under the [GNU AGPL-3.0](LICENSE).
+
+![A local install: the demo clinic's website, where Luciel answers a visitor from the clinic's own documents](docs/images/local-demo-site.png)
+
+## Run Luciel on your computer
+
+The whole product runs locally with Docker: the dashboard, this backend with real AI answers,
+the chat widget on a demo website, a sample business with its documents, and an email inbox that
+catches every email Luciel sends. Nothing talks to AWS, Stripe, Twilio or Meta.
+
+You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or Docker Engine
+with Compose v2), about 8 GB of free memory, and an
+[OpenAI](https://platform.openai.com/api-keys) or
+[Anthropic](https://console.anthropic.com/settings/keys) API key. An OpenAI key also powers the
+knowledge search; with only an Anthropic key, Luciel searches with built-in keyword vectors.
+
+```bash
+git clone https://github.com/aryanonline/Luciel-Backend
+cd Luciel-Backend
+cp .env.example .env          # Windows: copy .env.example .env
+# open .env and set OPENAI_API_KEY and/or ANTHROPIC_API_KEY
+docker compose up
+```
+
+The first run builds the images, which takes about ten minutes. The stack is ready when the log
+prints `Luciel is ready`.
+
+| Open                         | What it is                                                                |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `http://localhost:3000`      | The dashboard. Sign in as `demo@example.com` with the password `luciel-demo` |
+| `http://localhost:8080`      | A demo website for Maple Lane Dental, a fictional clinic, with the chat   |
+| `http://localhost:8025`      | The email inbox: verification, password-reset and hand-off emails         |
+| `http://localhost:8000/docs` | The API reference                                                         |
+
+Type `localhost` in the address bar, not `127.0.0.1`: the session cookie and the widget expect it.
+
+### A five-minute tour
+
+1. Sign in to the dashboard. The overview shows the clinic's Luciel, and Configure lists the
+   three documents it answers from.
+2. Open **Embed & launch** and click **Try it on the demo website**. Ask the chat "Are you open on
+   Saturdays?" or "How much is teeth whitening?": the answer comes from the clinic's documents.
+3. Ask something they do not cover, such as "Can I bring my dog to my appointment?", or say "I'd
+   like to speak to a person". Luciel tells the visitor the team will follow up instead of
+   guessing, and the hand-off email arrives in the inbox at `http://localhost:8025`.
+4. In the dashboard, **Conversations** shows the transcript with each answer's grounding score and
+   sources. Take over a conversation and reply as a person; the widget shows the reply on its next
+   poll.
+
+   ![The same conversation in the dashboard, with the documents that backed the answer](docs/images/local-dashboard-conversation.png)
+
+5. Sign up your own account at `http://localhost:3000/signup` (the verification email lands in the
+   local inbox), create your Luciel, add your documents or a website to crawl, and try it on the
+   demo website with your own embed key.
+
+### What works locally, and what needs real accounts
+
+| Works locally                                                 | Needs real accounts or a public URL                         |
+| ------------------------------------------------------------- | ----------------------------------------------------------- |
+| Sign-up, email verification and password reset (local inbox)  | Replies from your own mailbox (Microsoft 365)               |
+| Knowledge from pasted text, uploaded files, CSV and web crawls | Google Drive, Notion, HubSpot and Salesforce sync (OAuth)   |
+| The website chat widget, hand-offs and human takeover         | SMS, voice, WhatsApp, Messenger and Instagram (Twilio, Meta) |
+| Conversations, grounding scores, leads, analytics, audit log  | Card checkout and invoices (Stripe; billing runs simulated) |
+| Session summaries and the morning brief email                 | Downloading a data export (it needs S3)                     |
+
+A connection that needs a real provider says so instead of pretending to connect.
+
+### Stop, reset and update
+
+```bash
+docker compose down          # stop; your data stays
+docker compose down -v       # stop and delete all local data (the demo account comes back on the next start)
+git pull && docker compose up --build    # update to the latest code
+```
+
+- **"Luciel needs an AI key"**: the `migrate` step stops the stack when `.env` has no key. Add one
+  and run `docker compose up` again.
+- **A port is already in use**: move Postgres or Redis with `LUCIEL_DB_PORT` or
+  `LUCIEL_REDIS_PORT` in `.env`; the dashboard (3000), API (8000), demo website (8080) and inbox
+  (8025) keep their ports.
+- **Every answer is handed to the team**: read `docker compose logs api` for a provider error such
+  as an invalid key or an exhausted quota.
+- **Your own frontend changes**: clone Luciel-Frontend beside this repository and add
+  `LUCIEL_FRONTEND_SOURCE=../Luciel-Frontend` to `.env`.
+
+How it works: the stack runs this repository's production image with
+`LUCIEL_INTEGRATION_MODE=mock`, so every delivery seam stays a local stand-in and no AWS service
+is used, and `LUCIEL_LLM_POSTURE=live`, a development-only switch that binds the real LLM and
+embeddings to the keys in `.env`. Platform email goes to [Mailpit](https://mailpit.axllent.org/)
+over SMTP. A scheduler container runs the sweeps a local install needs (closing and summarising
+idle conversations, retrying hand-off emails, re-syncing crawled sites, the morning brief).
+Everything is in [`docker-compose.yml`](docker-compose.yml) and [`scripts/local/`](scripts/local).
+
 ## Highlights
 
 - **Tenant isolation in PostgreSQL.** Every tenant table gets forced row-level security and a
@@ -130,12 +223,16 @@ A customer message goes through four steps:
 | `app/analytics/`, `app/audit/`, `app/policy/`, `app/observability/` | Owner analytics, append-only audit log, entitlements, structured logs and metrics |
 | `app/models/`, `app/schemas_api/`, `app/db/`, `app/migrations/` | ORM models, wire schemas, engine, sessions and RLS helpers, Alembic history |
 | `infra/` | CDK app: `bin/` entrypoint, `lib/` stacks, `test/` Jest assertions |
-| `scripts/` | Database bootstrap and audit lock, ECS task runners, CVE gate, smoke probe, rollback, SeedTest harness |
+| `scripts/` | Database bootstrap and audit lock, ECS task runners, CVE gate, smoke probe, rollback, SeedTest harness; `scripts/local/` runs the local Docker stack (migrate, scheduler, demo seed, smoke check) |
 | `tests/` | `unit/`, `integration/`, `contract/` (frontend wire contracts) and `isolation/` suites |
 | `.github/workflows/`, `.security/` | CI, deploy and maintenance workflows; dated, expiring waivers for the image CVE gate |
-| `Dockerfile`, `docker-compose.yml`, `pyproject.toml`, `uv.lock` | Multi-stage, non-root image; local PostgreSQL and Redis; dependencies, tool configuration and the lock that CI tests and the image installs |
+| `Dockerfile`, `docker-compose.yml`, `pyproject.toml`, `uv.lock` | Multi-stage, non-root image; the local stack (the whole product, or only PostgreSQL and Redis for the tests); dependencies, tool configuration and the lock that CI tests and the image installs |
 
 ## Local development
+
+To try the product, use the Docker stack in
+[Run Luciel on your computer](#run-luciel-on-your-computer). To work on the backend itself, run
+it from a virtual environment against the stack's database and Redis.
 
 Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/) (CI and the image pin 0.12.23),
 Docker, and a `psql` client for the test suite. The CDK app in `infra/` uses Node.js 20, as the
@@ -159,7 +256,11 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 `LUCIEL_INTEGRATION_MODE=mock` (the default) uses a deterministic model and fake senders with no
-external keys; `live` calls real providers and has to be chosen on purpose. With the default
+external keys; `live` calls real providers and has to be chosen on purpose. For real AI answers
+under mock mode on your own computer, set `LUCIEL_LLM_POSTURE=live` and put your key in
+`LUCIEL_PLATFORM_SECRET`, a JSON object with `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`; `LUCIEL_SMTP_HOST`
+sends platform email to a local inbox such as the stack's Mailpit (`localhost`, port 1025 from
+the host after publishing it). Both switches refuse to start outside `development`. With the default
 `LUCIEL_ENVIRONMENT=development` the OpenAPI docs are at `http://localhost:8000/docs`; deployed
 environments return 404 there. To run the Luciel-Frontend dashboard against this backend, set
 `LUCIEL_COOKIE_SECURE=false` here and start the frontend with `NEXT_PUBLIC_API_ADAPTER=http` and
@@ -295,6 +396,10 @@ the pause costs and the restore runbook are in
 Production has not been stood up yet: the release path exists in `deploy.yml` but has never run.
 Dev used Stripe in test mode, so no real payments were taken.
 
+Since 2026-11-19 the whole product also runs on one computer with `docker compose up` (see
+[Run Luciel on your computer](#run-luciel-on-your-computer)), and the `quickstart` workflow
+builds and checks that stack on every change to it and once a week.
+
 ## Further reading
 
 - [`.env.example`](.env.example) covers the local settings; [`app/config.py`](app/config.py)
@@ -309,4 +414,10 @@ Dev used Stripe in test mode, so no real payments were taken.
 
 ## License
 
-Proprietary; shared for portfolio review only. All rights reserved.
+Copyright © 2026 VantageMind. Luciel is free software: you can redistribute it and modify it
+under the terms of the [GNU Affero General Public License, version 3](LICENSE). If you run a
+modified version as a network service, the licence requires you to offer its users the
+corresponding source code.
+
+Issues and questions are welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md). To report a
+vulnerability, see [`SECURITY.md`](SECURITY.md).

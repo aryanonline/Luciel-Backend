@@ -210,6 +210,31 @@ wrapper script) that forwards its arguments to one, for example the client insid
 the `db` container. The expected result is about 4,000 passed,
 0 failed. Run focused tests while iterating, then the full suite before commit.
 
+## Local Docker stack (2026-11-19)
+
+`docker compose up` (no arguments) runs the whole product on one computer for people
+trying Luciel: db, redis, mailpit, a one-shot `migrate`, `api`, `scheduler`, a one-shot
+`seed` (demo@example.com, a fictional dental clinic and its documents), and `web` +
+`demo-site` built from Luciel-Frontend (`LUCIEL_FRONTEND_SOURCE`, default its GitHub
+`main`). The README's "Run Luciel on your computer" is the user guide;
+`scripts/local/` holds the helpers and `.github/workflows/quickstart.yml` builds and
+smoke-checks the stack without a key. Rules it depends on:
+
+- It stays `LUCIEL_INTEGRATION_MODE=mock` (no AWS). Real AI comes from
+  `LUCIEL_LLM_POSTURE=live` (`Settings.real_ai` / `real_embeddings`): the real router and
+  embedder from whichever of ANTHROPIC_API_KEY / OPENAI_API_KEY the platform secret
+  carries (one vendor may serve every leg; `_build_live_router` keeps its both-keys rule).
+  Platform email goes to Mailpit through `SmtpEmailSender` (`LUCIEL_SMTP_HOST`). Both
+  switches refuse to boot outside `environment == "development"`; delivery seams keep
+  asking `live_mode()`, never the posture.
+- Only `migrate` builds `luciel-backend:local`; the other backend services use it with
+  `pull_policy: never` (four builds of one tag collide). Every host port binds 127.0.0.1.
+- The scheduler runs `session_finalize`, `deferred`, `knowledge_sync`, `daily_brief` and
+  `unverified_reap` only: `health` and `transcript_archive` read per-process in-memory
+  stores under mock mode. Local sweeps are never added to `SWEEPS`' CDK schedule.
+- A developer's old `luciel_dev` volume can predate a migration (an existing local
+  database failed `uq_escalation_once` on 2026-11-19); `docker compose down -v` resets it.
+
 ## Deploy
 
 - Dispatch the named workflow FROM THE RELEASE BRANCH, always with `--ref`:
