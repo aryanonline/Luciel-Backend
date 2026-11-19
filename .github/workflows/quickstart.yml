@@ -1,0 +1,66 @@
+name: quickstart
+
+# The README's "Run Luciel on your computer" path, end to end: `docker compose up` builds
+# this repository's image and Luciel-Frontend's main branch (dashboard + demo website),
+# migrates, seeds the demo account and starts everything; scripts/local/smoke.py then
+# signs in, opens a widget conversation and finds the demo owner's email in Mailpit.
+#
+# CI has no AI key, so the stack runs with LUCIEL_LLM_POSTURE=follow (the deterministic
+# test model answers). The real-key path is the same stack with a key in .env.
+#
+# Runs when the stack's own files change, weekly (the frontend is built from its main
+# branch, so a change there can break the quickstart without touching this repository),
+# and on demand. Not a required check.
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.yml
+      - Dockerfile
+      - .dockerignore
+      - scripts/local/**
+      - scripts/docker/**
+      - app/config.py
+      - .github/workflows/quickstart.yml
+  schedule:
+    - cron: '41 7 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickstart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+    # A cold run (both images built from scratch) is ~10 minutes.
+    timeout-minutes: 40
+    env:
+      LUCIEL_LLM_POSTURE: follow
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the demo account
+        run: |
+          set -euo pipefail
+          # `wait` returns the seed container's exit code once it stops.
+          timeout 600 docker compose wait seed
+
+      - name: Smoke-check the running stack
+        env:
+          SMOKE_EXPECT_POSTURE: follow
+        run: python3 scripts/local/smoke.py
+
+      - name: Show the logs
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

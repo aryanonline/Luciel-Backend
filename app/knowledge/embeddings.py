@@ -190,9 +190,19 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
 
     - ``mock`` (default): ``HashingEmbedder`` — deterministic, no key, no network.
     - ``live``: ``OpenAIEmbedder`` with the platform ``OPENAI_API_KEY``.
+    - ``mock`` with ``llm_posture="live"`` (the local Docker stack): ``OpenAIEmbedder``
+      when an ``OPENAI_API_KEY`` is set, else ``HashingEmbedder`` — Anthropic has no
+      embeddings API, so an Anthropic-only stack searches with hashed vectors and
+      ``/healthz`` names ``embeddings:HashingEmbedder``.
     """
     settings = settings if settings is not None else get_settings()
     if settings.integration_mode != "live":
+        if settings.real_embeddings:
+            local_key = parse_platform_secret(settings.platform_secret, live=True)
+            return OpenAIEmbedder(
+                api_key=local_key["OPENAI_API_KEY"].strip(),
+                model=settings.knowledge_embedding_model,
+            )
         return HashingEmbedder()
 
     api_key = parse_platform_secret(settings.platform_secret, live=True).get("OPENAI_API_KEY", "")

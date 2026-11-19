@@ -79,8 +79,10 @@ async def test_the_relevance_floor_drops_unrelated_chunks_in_live_mode_only(monk
     assert texts == ["relevant", "noise"]
 
 
-def test_the_floor_is_live_only_by_construction():
-    assert get_settings().integration_mode != "live"
+def test_the_floor_needs_real_embeddings_by_construction():
+    """Off wherever vectors are hashed (mock/CI here); on with the real embedding model —
+    live mode, or the local stack with an OpenAI key (tests/unit/test_local_ai_posture.py)."""
+    assert get_settings().real_embeddings is False
     assert knowledge_retrieval._relevance_floor_active() is False
 
 

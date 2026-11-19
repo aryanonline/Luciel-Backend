@@ -134,7 +134,8 @@ def test_the_seam_binds_the_llm_extractor_only_in_live_mode(monkeypatch: pytest.
     try:
         assert isinstance(ge.get_extractor(), ge.DeterministicGraphExtractor)  # mock mode
         ge.reset_extractor()
-        monkeypatch.setattr("app.config.live_mode", lambda: True)
+        # Where the LLM is real: live mode, or the local stack's llm_posture="live".
+        monkeypatch.setattr("app.config.real_ai", lambda: True)
         assert isinstance(ge.get_extractor(), ge.LlmGraphExtractor)
     finally:
         ge.reset_extractor()

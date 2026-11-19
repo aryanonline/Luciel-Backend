@@ -316,6 +316,9 @@ def create_app() -> FastAPI:
         return {
             "status": "ok" if database_reason is None else "degraded",
             "integrationMode": settings.integration_mode,
+            # "live" only on a developer's own computer (the local Docker stack's real
+            # AI under mock delivery seams); every deployed environment reads "follow".
+            "llmPosture": settings.llm_posture,
             "degraded": degraded,
             "escalationBacklog": backlog,
         }

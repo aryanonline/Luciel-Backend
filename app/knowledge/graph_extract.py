@@ -440,16 +440,17 @@ _default: GraphExtractor | None = None
 def get_extractor() -> GraphExtractor:
     """Return the bound extractor (§3.2.1).
 
-    ``LUCIEL_GRAPH_EXTRACTOR`` decides: ``llm`` binds the LLM-backed extractor — in
-    live mode only, so mock/CI never reaches a vendor — behind this same seam. Unset, the
-    config resolves it by posture (D10): ``llm`` in live, ``deterministic`` elsewhere.
+    ``LUCIEL_GRAPH_EXTRACTOR`` decides: ``llm`` binds the LLM-backed extractor — only
+    where the LLM is real (live mode, or the local stack's ``llm_posture="live"``), so
+    mock/CI never reaches a vendor — behind this same seam. Unset, the config resolves it
+    by posture (D10): ``llm`` where the LLM is real, ``deterministic`` elsewhere.
     The ingest path depends only on the GraphExtractor Protocol.
     """
     global _default
     if _default is None:
-        from app.config import get_settings, live_mode  # noqa: PLC0415 — import cycle
+        from app.config import get_settings, real_ai  # noqa: PLC0415 — import cycle
 
-        if get_settings().graph_extractor == "llm" and live_mode():
+        if get_settings().graph_extractor == "llm" and real_ai():
             _default = LlmGraphExtractor()
         else:
             _default = DeterministicGraphExtractor()

@@ -114,3 +114,11 @@ make that state explicit and test it.
 - Code texts spend a per-tenant `escalation_code_sms` budget (refusal
   `code_send_rate_limited`, audited); dashboard code entries spend `escalation_code_entry`,
   sized to 3 SMS contacts × `MAX_CODE_ATTEMPTS` — the per-code counter is the brute-force guard.
+
+## Local inbox (2026-11-19, the local Docker stack)
+- `SmtpEmailSender` (plain SMTP via `asyncio.to_thread`, returns the Message-ID) is bound
+  by `build_email_sender` only in mock mode with `LUCIEL_SMTP_HOST` set; config refuses
+  that setting outside development. The Docker stack points it at Mailpit
+  (http://localhost:8025). Live mode always uses SES; without the host mock keeps the
+  Null sender, so the suite's Null-sender tests are unchanged.
+  Tests: `tests/unit/test_smtp_email_sender.py`.

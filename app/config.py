@@ -156,6 +156,13 @@ _PROVIDER_KEYS: tuple[str, ...] = (
     "STRIPE_TEST_PUBLISHABLE_KEY",  # billing/stripe_gateway.py (optional)
 )
 
+# The LLM vendor keys. The local posture (``llm_posture="live"``) needs at least one.
+LLM_PROVIDER_KEYS: tuple[str, ...] = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+# ``Settings.llm_posture`` values: "follow" = AI follows integration_mode; "live" = the
+# real LLM + embeddings on a developer's own computer while integration_mode stays mock.
+LLM_POSTURES: tuple[str, ...] = ("follow", "live")
+
 # THE accepted key set. Anything outside it is a typo as far as the runtime is concerned.
 PLATFORM_SECRET_KEYS: frozenset[str] = frozenset(
     {
@@ -352,6 +359,28 @@ class Settings(BaseSettings):
     # populated and the DPA/no-training terms are confirmed. Read from
     # LUCIEL_INTEGRATION_MODE (ECS injects it; currently "mock").
     integration_mode: str = "mock"
+
+    # --- AI posture on a developer's own computer (the local Docker stack) ----
+    # "follow" (the default): the LLM, knowledge embeddings, session summaries and
+    # graph extraction follow integration_mode — the deterministic doubles in mock,
+    # the real providers in live. "live": the REAL LLM and embeddings while
+    # integration_mode stays "mock", so `docker compose up` answers with real AI and
+    # touches no AWS service (secrets stay in the local store, Stripe stays fake,
+    # channel senders stay off). Development-only: refused in any deployed
+    # environment, and it needs ANTHROPIC_API_KEY and/or OPENAI_API_KEY in the platform
+    # secret, which is then parsed strictly (see ``Settings.real_ai``).
+    # LUCIEL_LLM_POSTURE.
+    llm_posture: str = "follow"
+
+    # --- Local inbox (the local Docker stack) ---------------------------------
+    # SMTP relay for PLATFORM email (verification, password reset, hand-off pages, the
+    # morning brief) on a developer's own computer: the Docker stack points it at
+    # Mailpit, whose inbox is http://localhost:8025. Mock mode + development only (boot
+    # refuses it elsewhere); live mode always sends through SES. Empty = the Null sender.
+    # LUCIEL_SMTP_HOST / LUCIEL_SMTP_PORT / LUCIEL_SMTP_FROM.
+    smtp_host: str = ""
+    smtp_port: int = 1025
+    smtp_from: str = "Luciel <luciel@example.com>"
 
     # JSON blob injected from AWS Secrets Manager (LUCIEL_PLATFORM_SECRET). In
     # "mock" mode this stays the empty-object placeholder "{}" and is never read.
@@ -645,7 +674,41 @@ class Settings(BaseSettings):
         # past both of them and booted live with a forgeable session key. Every
         # overlay below is already written as `blob.get(...)`, so an empty mapping is
         # a no-op for them; only the guards change behaviour.
-        blob = parse_platform_secret(self.platform_secret, live=self.integration_mode == "live")
+        local_ai = self.integration_mode != "live" and self.llm_posture == "live"
+        blob = parse_platform_secret(
+            self.platform_secret, live=self.integration_mode == "live" or local_ai
+        )
+        if self.llm_posture not in LLM_POSTURES:
+            raise RuntimeError(
+                f"LUCIEL_LLM_POSTURE must be one of {', '.join(LLM_POSTURES)} — refusing to "
+                "start with an unknown AI posture."
+            )
+        if local_ai:
+            # The local Docker stack's real-AI switch. A deployed environment binds real
+            # providers with integration_mode=live instead, where every delivery seam is
+            # real too; real AI behind mock senders there would read as working while
+            # nothing could be delivered.
+            if self.environment != LOCAL_ENVIRONMENT:
+                raise RuntimeError(
+                    f"LUCIEL_LLM_POSTURE=live is only for a developer's own computer "
+                    f"(LUCIEL_ENVIRONMENT={LOCAL_ENVIRONMENT}) — refusing to start in "
+                    f"{self.environment!r}. A deployed environment uses "
+                    "LUCIEL_INTEGRATION_MODE=live."
+                )
+            if not any(blob.get(key, "").strip() for key in LLM_PROVIDER_KEYS):
+                raise RuntimeError(
+                    "Luciel needs an AI key to answer: set OPENAI_API_KEY and/or "
+                    "ANTHROPIC_API_KEY (in .env for the Docker stack) — refusing to start "
+                    "with LUCIEL_LLM_POSTURE=live and no key."
+                )
+        if self.smtp_host and self.environment != LOCAL_ENVIRONMENT:
+            # The local inbox is plain, unauthenticated SMTP to a catcher on the same
+            # machine; a deployed environment sends platform email through SES.
+            raise RuntimeError(
+                f"LUCIEL_SMTP_HOST is only for a developer's own computer "
+                f"(LUCIEL_ENVIRONMENT={LOCAL_ENVIRONMENT}) — refusing to start in "
+                f"{self.environment!r}."
+            )
         # app_base_url has a non-empty localhost DEFAULT, so the `not getattr` guard
         # below would skip it. Bridge it explicitly: the platform secret's APP_BASE_URL
         # (the public frontend origin used in customer-facing links, e.g. the verify
@@ -869,7 +932,7 @@ class Settings(BaseSettings):
             object.__setattr__(
                 self,
                 "graph_extractor",
-                "llm" if self.integration_mode == "live" else "deterministic",
+                "llm" if self.real_ai else "deterministic",
             )
 
         # Bool bridge (non-production seam): the platform secret may carry the
@@ -881,6 +944,24 @@ class Settings(BaseSettings):
                 "allow_captcha_bypass_token",
                 str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"},
             )
+
+    @property
+    def real_ai(self) -> bool:
+        """True when the LLM is a real provider: live mode, or the development-only
+        ``llm_posture="live"`` of the local Docker stack (validated at boot)."""
+        return self.integration_mode == "live" or self.llm_posture == "live"
+
+    @property
+    def real_embeddings(self) -> bool:
+        """True when knowledge vectors come from the real embedding model. Live mode
+        always; under the local posture only with an OpenAI key (Anthropic has no
+        embeddings API, so an Anthropic-only stack keeps the hashing embedder)."""
+        if self.integration_mode == "live":
+            return True
+        if self.llm_posture != "live":
+            return False
+        secret = parse_platform_secret(self.platform_secret, live=True)
+        return bool(secret.get("OPENAI_API_KEY", "").strip())
 
     def accepted_api_origins(self) -> tuple[str, ...]:
         """The API origins a registered redirect URI may use, in precedence order:
@@ -1051,3 +1132,10 @@ def live_mode() -> bool:
     it without importing anything heavier than config.
     """
     return get_settings().integration_mode == "live"
+
+
+def real_ai() -> bool:
+    """True when the LLM is a real provider (live mode, or the local stack's
+    ``llm_posture="live"``). The delivery seams still ask ``live_mode()``: under the local
+    posture they stay the mock-mode stand-ins."""
+    return get_settings().real_ai
